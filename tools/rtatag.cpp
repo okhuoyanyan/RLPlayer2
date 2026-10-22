@@ -29,6 +29,7 @@
 #include "meta/enrich.h"
 #include "meta/writeback.h"
 #include "meta/knowledge.h"
+#include "meta/retrieval.h"
 #include "audio/media_info.h"
 #include <chrono>
 #include <cstdio>
@@ -53,7 +54,9 @@ static void usage() {
            "  rtatag write --library [--apply]      整库写回（打印 written/skipped/failed 与失败队列路径）\n"
            "  rtatag llm-smoke                      DeepSeek chat/search/fetch 连通性自检（需要 api_key）\n"
            "  rtatag knowledge --kind <kind> --name <name> [--lang zh] [--refresh] [--json] [--metabase <dir>]\n"
-           "                                        查询实体权威文本材料（维基/萌娘百科 + 本地缓存/离线回退）\n");
+           "                                        查询实体权威文本材料（维基/萌娘百科 + 本地缓存/离线回退）\n"
+           "  rtatag summary --kind <kind> --name <name> [--lang zh] [--refresh] [--json] [--metabase <dir>]\n"
+           "                                        查询实体检索综合摘要（L2+L3检索综合 + 引用溯源纪律）\n");
 }
 
 // ---------------- 小工具 ----------------
@@ -580,6 +583,105 @@ static int cmd_knowledge(const int argc, char** argv) {
     return res.materials.empty() ? 1 : 0;
 }
 
+// ---------------- summary ----------------
+
+static int cmd_summary(const int argc, char** argv) {
+    std::string kindStr = "person";
+    std::string name;
+    std::string lang = "zh";
+    bool refresh = false;
+    bool json_output = false;
+    std::string metabase;
+    RetrievalOptions opts;
+
+    for (int i = 2; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--kind" && i + 1 < argc) {
+            kindStr = argv[++i];
+        } else if (a == "--name" && i + 1 < argc) {
+            name = argv[++i];
+        } else if (a == "--lang" && i + 1 < argc) {
+            lang = argv[++i];
+        } else if (a == "--refresh") {
+            refresh = true;
+        } else if (a == "--json") {
+            json_output = true;
+        } else if (a == "--metabase" && i + 1 < argc) {
+            metabase = argv[++i];
+        } else if (a == "--offline") {
+            opts.offline = true;
+        } else if (name.empty() && a.rfind("--", 0) != 0) {
+            name = a; // 容许直接传名：rtatag summary ZARD
+        }
+    }
+
+    if (name.empty()) {
+        printf("用法:\n  rtatag summary --kind <kind> --name <name> [--lang zh] [--refresh] [--json] [--metabase <dir>]\n");
+        return 2;
+    }
+
+    EntityKind k = EntityKind::Person;
+    if (!kindStr.empty()) {
+        if (!entity_kind_from_tag(kindStr, k)) {
+            printf("[错误] 未知实体种类: %s（支持 person / group / label / series / work / recording / release / track）\n",
+                   kindStr.c_str());
+            return 2;
+        }
+    }
+
+    opts.refresh = refresh;
+    opts.metabase = metabase;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const SummaryResult res = retrieval_fetch(k, name, lang, opts);
+    const double elapsed_s = ms_since(t0) / 1000.0;
+
+    if (json_output) {
+        printf("%s\n", summary_to_json(res).c_str());
+        return res.ok ? 0 : 1;
+    }
+
+    const std::string eid = entity_id(k, name);
+    printf("== summary: kind=%s name=\"%s\" id=%s  (耗时 %.2f s)\n",
+           entity_kind_tag(k), name.c_str(), eid.c_str(), elapsed_s);
+    printf("  [状态] from_cache=%s  offline=%s  引用校验=%s\n",
+           res.from_cache ? "是" : "否",
+           res.offline ? "是" : "否",
+           (res.ok && res.validation_ok) ? "通过" : "失败");
+    if (!res.disclaimer.empty()) {
+        printf("  [免责声明] %s\n", res.disclaimer.c_str());
+    }
+    if (!res.error.empty()) {
+        printf("  [说明/错误] %s\n", res.error.c_str());
+    }
+
+    printf("  [章节概览] (共 %zu 节)\n", res.sections.size());
+    for (size_t i = 0; i < res.sections.size(); ++i) {
+        const auto& sec = res.sections[i];
+        printf("    §%zu %s (%zu 个段落)\n", i + 1, sec.heading.c_str(), sec.paragraphs.size());
+        for (size_t j = 0; j < sec.paragraphs.size(); ++j) {
+            const auto& p = sec.paragraphs[j];
+            std::string cits;
+            for (size_t c = 0; c < p.citations.size(); ++c) {
+                if (c) cits += ",";
+                cits += p.citations[c];
+            }
+            printf("       P%zu: %s [%s]\n", j + 1, first_n(p.text, 140).c_str(), cits.c_str());
+        }
+    }
+
+    printf("  [引用来源] (共 %zu 条)\n", res.citations.size());
+    for (size_t i = 0; i < res.citations.size(); ++i) {
+        const auto& c = res.citations[i];
+        printf("    [%s] 标题: %s\n", c.id.c_str(), c.title.c_str());
+        printf("         来源: %s | 取回: %lld (%s)\n",
+               c.source.c_str(), c.fetched_at, fmt_ts(c.fetched_at).c_str());
+        printf("         链接: %s\n", c.url.c_str());
+    }
+
+    return res.ok ? 0 : 1;
+}
+
 // ---------------- main ----------------
 
 int wmain(int argc, wchar_t** argv) {
@@ -602,6 +704,7 @@ int wmain(int argc, wchar_t** argv) {
     if (cmd == "write")     return cmd_write(argc, u8argv);
     if (cmd == "llm-smoke") return cmd_llm_smoke();
     if (cmd == "knowledge") return cmd_knowledge(argc, u8argv);
+    if (cmd == "summary")   return cmd_summary(argc, u8argv);
     if (cmd == "store") {
         if (argc >= 3 && std::string(u8argv[2]) == "show") {
             if (argc < 4) { usage(); return 2; }

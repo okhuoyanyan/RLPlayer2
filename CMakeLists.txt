@@ -393,6 +393,12 @@ target_include_directories(test_knowledge PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_knowledge PRIVATE winhttp)
 add_test(NAME knowledge COMMAND test_knowledge)
 
+# P3 资料层③ 检索层：DeepSeek search/fetch + rerank/authority/白名单过滤 + 引用纪律
+add_executable(test_retrieval tests/test_retrieval.cpp)
+target_include_directories(test_retrieval PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_retrieval PRIVATE winhttp)
+add_test(NAME retrieval COMMAND test_retrieval)
+
 # 测试素材生成器：调制器 -> DSF/DFF（本机原本一个 DSD 文件都没有）
 add_executable(make_dsd tools/make_dsd.cpp)
 target_link_libraries(make_dsd PRIVATE rtadsp)
