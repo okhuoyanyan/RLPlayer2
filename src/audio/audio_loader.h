@@ -275,8 +275,9 @@ inline AudioBuffer read_via_ffmpeg(const std::string& path, LoadNote* note) {
     //      纯 ASCII 名 + 独占占用 → exit=-13(Permission denied)。即 -42 是【掩码】不是原因。
     //   ② 触发这类瞬时不可读的现实场景：标签写回(备份 rename + 替换 rename 的窗口)、
     //      同步客户端/杀毒扫描短暂占用、用户在资源管理器里改名。
-    // 所以：失败后先用 Win32 自己问一次「此刻到底能不能读、为什么读不了」，再决定重试。
-    // 只要源文件此刻读得了，重试没有意义（那是真解码错误），立刻退出重试循环。
+    // 所以：失败后用 Win32 问「此刻到底能不能读、为什么读不了」。
+    // 注意：首次失败（i == 0）后必须至少再试一次，「此刻可读」不能排除「刚刚在 ffmpeg 运行期间才释放独占」；
+    // 只有在已重试（i >= 1）且探针证明此刻仍可读时，才说明是真正的解码错误并提前退出。
     constexpr int kDecodeTries = 3;
     int rc = -1;
     int attempts = 0;
@@ -293,7 +294,15 @@ inline AudioBuffer read_via_ffmpeg(const std::string& path, LoadNote* note) {
         rc = run_hidden(cmd, &fflog);
         if (rc == 0) break;
         unreadable = source_read_probe(path);
-        if (unreadable.empty()) break;     // 源文件读得了 ⟹ 不是瞬时占用/缺失，重试无益
+        // 关键判据修正（2026-10-23 回归）：除 rc==0 退出外，首轮失败（i == 0）必须至少再试一次。
+        // 根因：在真实场景（标签写回 rename 窗口、杀毒扫描或同步客户端短暂独占）以及 CI 云机环境中，
+        // 占用方极可能恰好在 ffmpeg 尝试期间松手；ffmpeg 进程退出时探针虽然检测到「此刻可读」
+        // （unreadable 为空），但这恰恰证明瞬时占用刚刚解除，进行第二轮重试即可成功！
+        // 若在 i==0 时因「此刻可读」就 break，就会把本可恢复的瞬时占用直接报成解码失败（现场那种
+        // 「重试一下就好」的用户痛点，以及 CI 云机上 ffmpeg 耗时 >150ms 导致尝试 1 次即失败的竞态）。
+        // 因此：只有在已经至少重试过一次之后（i >= 1），且探针明确说明源文件此刻可读时，
+        // 才能证明故障并非瞬时占用引起（而是真正的格式/解码损坏），此时方可提前 break 退出。
+        if (i >= 1 && unreadable.empty()) break;
     }
 
     // ffmpeg 输出压成单行、截断，方便进一行的错误日志

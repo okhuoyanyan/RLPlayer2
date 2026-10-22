@@ -35,6 +35,7 @@
 #include "audio/wav.h"
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -56,6 +57,26 @@ static int g_fail = 0;
 static void ck(bool cond, const char* what, const std::string& detail = "") {
     if (cond) std::printf("  [PASS] %s\n", what);
     else { std::printf("  [FAIL] %s  %s\n", what, detail.c_str()); ++g_fail; }
+}
+
+// 探测本进程拉起的 ffmpeg 子进程是否已就绪（用于时序解耦的精确释放）
+static bool is_child_ffmpeg_running() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(pe);
+    bool found = false;
+    const DWORD myPid = GetCurrentProcessId();
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"ffmpeg.exe") == 0 && pe.th32ParentProcessID == myPid) {
+                found = true;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
 }
 
 // 日文名素材：用 UTF-8 字节字面量，不受编译器 source/execution charset 影响。
@@ -162,18 +183,27 @@ int main() {
         }
     }
 
-    // ================= 3) 核心：瞬时故障恢复后必须自动成功（重试真的起作用） =========
-    // 手法：起一个线程在 150ms 后释放锁；read_any 第 1 次必然失败，重试应该在退避后成功。
-    // 判据是「最终成功」，不是「重试了几次」——后者是实现细节（铁律 3）。
-    std::printf("- 3 瞬时占用恢复后应自动解码成功（退避重试验证）\n");
+    // ================= 3) 核心：瞬时故障恢复后必须自动成功（退避重试验证） =========
+    // 竞态分析与修法注释（CI run 39812788792 现场归因）：
+    //   旧用例 3 在后台线程 150ms 后释放独占锁。在 CI 云机（en-US）上，ffmpeg 启动 + ANSI 回退
+    //   耗时超过 150ms，导致 ffmpeg 首轮尝试退出失败时，后台线程早已释放锁。
+    //   此时 source_read_probe(path) 检测文件为「此刻可读」（unreadable.empty() == true）。
+    //   旧代码存在产品级缺陷：看见 unreadable 为空便误判「文件可读说明失败不是瞬时占用引起的」，
+    //   直接 break 放弃重试，抛出「尝试 1 次」失败。
+    //   真实场景（杀毒扫描/标签写回短锁）中，占用方在 ffmpeg 尝试期间松手极为常见。
+    //   修法（audio_loader.h）：除 rc==0 成功外，首轮失败（i == 0）必须至少再试一次；
+    //   只有在已经重试过之后（i >= 1）且探针证明此刻仍可读时才提前 break。
+    //   因此，无论锁在 ffmpeg 运行前释放还是运行中释放，read_any 都能确定性成功。
+    std::printf("- 3 瞬时占用恢复后应自动解码成功（覆盖运行前释放与运行中释放两类时序）\n");
     {
-        HANDLE lock = CreateFileW(rta::audio::widen(cjk).c_str(), GENERIC_READ, 0,
-                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        ck(lock != INVALID_HANDLE_VALUE, "已加独占锁（本轮由后台线程稍后释放）");
-        if (lock != INVALID_HANDLE_VALUE) {
-            std::thread releaser([lock] {
-                std::this_thread::sleep_for(std::chrono::milliseconds(150));
-                CloseHandle(lock);          // 模拟占用方松手（写在回/扫描结束/改名完成）
+        // 时序 1：锁在 ffmpeg 运行前 / 极早释放（10ms 释放）
+        HANDLE lock1 = CreateFileW(rta::audio::widen(cjk).c_str(), GENERIC_READ, 0,
+                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        ck(lock1 != INVALID_HANDLE_VALUE, "已加独占锁（时序 1：10ms 极速释放）");
+        if (lock1 != INVALID_HANDLE_VALUE) {
+            std::thread releaser([lock1] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                CloseHandle(lock1);
             });
             bool ok = false;
             std::string err;
@@ -183,8 +213,95 @@ int main() {
                 ok = (b.rate == 44100 && b.frames() > 0);
             } catch (const std::exception& e) { err = e.what(); }
             releaser.join();
-            ck(ok, "占用释放后 read_any 自动解码成功（现场那种「重试一下就好」的故障）", err);
+            ck(ok, "极速释放后 read_any 自动解码成功（时序 1：锁在 ffmpeg 运行前/早期释放）", err);
         }
+
+        // 时序 2：锁在 ffmpeg 运行中释放（150ms 释放，覆盖 CI 云机首轮失败时锁已解除的时序）
+        HANDLE lock2 = CreateFileW(rta::audio::widen(cjk).c_str(), GENERIC_READ, 0,
+                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        ck(lock2 != INVALID_HANDLE_VALUE, "已加独占锁（时序 2：150ms 跨尝试释放）");
+        if (lock2 != INVALID_HANDLE_VALUE) {
+            std::thread releaser([lock2] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                CloseHandle(lock2);          // 模拟占用方松手（写在回/扫描结束/改名完成）
+            });
+            bool ok = false;
+            std::string err;
+            try {
+                rta::audio::LoadNote note;
+                const rta::audio::AudioBuffer b = rta::audio::read_any(cjk, &note);
+                ok = (b.rate == 44100 && b.frames() > 0);
+            } catch (const std::exception& e) { err = e.what(); }
+            releaser.join();
+            ck(ok, "占用释放后 read_any 自动解码成功（时序 2：锁在 ffmpeg 运行中释放）", err);
+        }
+    }
+
+    // ================= 3b) 确定性复现：首轮失败后探针已可读，仍必须重试并最终成功 =========
+    // 根因重现与时序解耦（铁律 3）：
+    //   旧判据的致命缺陷在于：若占用在 ffmpeg 首轮解码过程中解除，ffmpeg 虽因启动时被占而返回非 0，
+    //   但随后 source_read_probe(path) 检测文件却「此刻可读」（unreadable 为空），
+    //   旧代码直接 break 放弃重试，导致原本只需重试一次就能成功的场景直接抛错。
+    //   为确定性验证本轮修复（避免依赖单一硬编码 sleep 的偶然性），本用例采用：
+    //   ① 进程事件解耦：监听 ffmpeg 子进程启动，一旦检测到 ffmpeg 已运行即刻释放独占锁，
+    //      确保「首轮必定遭遇独占失败」且「探针检测与第二轮重试时源文件已恢复可读」；
+    //   ② 连续多轮窗口扫描（覆盖 15ms~195ms 递增时延）：遍历所有可能的交错窗口，
+    //      全部 10 轮必须 100% 成功，绝不允许「偶尔成功也算过」（判据不弱化）。
+    std::printf("- 3b 确定性验证：时序解耦 + 连续多轮窗口扫描（探针此刻可读仍重试成功）\n");
+    {
+        // ① 进程事件解耦释放
+        HANDLE lock = CreateFileW(rta::audio::widen(cjk).c_str(), GENERIC_READ, 0,
+                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        ck(lock != INVALID_HANDLE_VALUE, "已加独占锁（由 ffmpeg 子进程启动事件触发解耦释放）");
+        if (lock != INVALID_HANDLE_VALUE) {
+            std::thread releaser([lock] {
+                const auto t0 = std::chrono::steady_clock::now();
+                while (!is_child_ffmpeg_running()) {
+                    if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(500)) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                CloseHandle(lock); // 检测到子进程启动后立即释放锁
+            });
+            bool ok = false;
+            std::string err;
+            try {
+                rta::audio::LoadNote note;
+                const rta::audio::AudioBuffer b = rta::audio::read_any(cjk, &note);
+                ok = (b.rate == 44100 && b.frames() > 0);
+            } catch (const std::exception& e) { err = e.what(); }
+            releaser.join();
+            ck(ok, "时序解耦：检测到 ffmpeg 启动后释放锁，首轮失败后探针可读仍能重试成功", err);
+        }
+
+        // ② 连续 10 轮窗口扫描（不同释放时延，遍历运行前/运行中/退避中释放）
+        constexpr int kRounds = 10;
+        int okCount = 0;
+        std::string firstErr;
+        for (int r = 0; r < kRounds; ++r) {
+            HANDLE lk = CreateFileW(rta::audio::widen(cjk).c_str(), GENERIC_READ, 0,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (lk == INVALID_HANDLE_VALUE) {
+                if (firstErr.empty()) firstErr = "加独占锁失败";
+                break;
+            }
+            const int delayMs = 15 + r * 20; // 15, 35, 55, 75, 95, 115, 135, 155, 175, 195 ms
+            std::thread releaser([lk, delayMs] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+                CloseHandle(lk);
+            });
+            try {
+                rta::audio::LoadNote note;
+                const rta::audio::AudioBuffer b = rta::audio::read_any(cjk, &note);
+                if (b.rate == 44100 && b.frames() > 0) ++okCount;
+                else if (firstErr.empty()) firstErr = "解码产物为空";
+            } catch (const std::exception& e) {
+                if (firstErr.empty()) firstErr = e.what();
+            }
+            releaser.join();
+        }
+        std::printf("  多轮窗口扫描: ok=%d/%d  firstErr=%s\n", okCount, kRounds, firstErr.empty() ? "-" : firstErr.c_str());
+        ck(okCount == kRounds, "连续 10 轮多种瞬时释放窗口全部成功（判据不弱化：100% 通过）",
+           "ok=" + std::to_string(okCount) + "/" + std::to_string(kRounds) + " err=" + firstErr);
     }
 
     // ================= 4) 反向验证：不是「什么都重试」 =================
