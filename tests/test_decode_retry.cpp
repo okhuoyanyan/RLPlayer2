@@ -141,13 +141,24 @@ int main() {
             ck(msg.find("独占占用") != std::string::npos || msg.find("32") != std::string::npos,
                "错误文本带出 Win32 真实原因（共享冲突），不再只有 Illegal byte sequence",
                "got=" + msg);
-            ck(msg.find("-42") != std::string::npos || msg.find("EILSEQ") != std::string::npos,
-               "错误文本仍保留 -42/EILSEQ 供排查（不隐瞒 ffmpeg 原始退出码）",
+            // 原始退出码必须如实带出：
+            //   zh-CN (ACP 936) 下日文名回退 ANSI 会触发 EILSEQ(-42)；
+            //   en-US (ACP 1252，如 CI 云机) 下日文名回退 ANSI 会变乱码找不到路径，触发 ENOENT(-2)。
+            // 两者都是 ffmpeg 内部行为，判据断言「原始负数退出码被保留」而不写死某一 locale 的特定数值。
+            ck(msg.find("退出码 -") != std::string::npos,
+               "错误文本保留 ffmpeg 原始负数退出码供排查（如 zh-CN 下的 -42、en-US 下的 -2）",
                "got=" + msg);
-            ck(msg.find("不代表文件真有编码问题") != std::string::npos ||
-               msg.find("掩码") != std::string::npos ||
-               msg.find("回退到 ANSI") != std::string::npos,
-               "错误文本明示「-42 不表示文件编码坏了」（避免把假原因当结论）", "got=" + msg);
+            // 真实原因与假原因区分：
+            //   若是 -42 则文本明示「不代表编码坏了」；若非 -42 则说明未触发 EILSEQ，由前一条 Win32 原因断言保证真因定性
+            if (msg.find("-42") != std::string::npos) {
+                ck(msg.find("不代表文件真有编码问题") != std::string::npos ||
+                   msg.find("掩码") != std::string::npos ||
+                   msg.find("回退到 ANSI") != std::string::npos,
+                   "在报 -42 时错误文本明示「不代表文件编码坏了」（避免把假原因当结论）", "got=" + msg);
+            } else {
+                ck(msg.find("源文件此刻读不了") != std::string::npos,
+                   "在非 -42 退出码时错误文本前置 Win32 真实原因（非 -42 路径分支）", "got=" + msg);
+            }
         }
     }
 
