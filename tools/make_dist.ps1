@@ -15,7 +15,7 @@
 #
 # Usage: powershell -File tools/make_dist.ps1 [-Version 1.0.2] [-SkipGpuBuild]
 param(
-    [string]$Version = "1.0.10",
+    [string]$Version = "1.1.0",
     [switch]$SkipGpuBuild
 )
 
@@ -135,7 +135,7 @@ if ($postPakCount -ne 2) { Fail "Locales 守卫失败: .pak 数量必须恰为 2
 
 $tools = @('rtaplay.exe', 'dsdconv.exe', 'make_dsd.exe', 'rtanet_rx.exe', 'dopinfo.exe',
            'wavcmp.exe', 'wasapi_probe.exe', 'naa_scan.exe', 'naa_probe.exe', 'upnp_scan.exe',
-           'aidecode.exe', 'rtatag.exe')
+           'aidecode.exe', 'rtatag.exe', 'rtacapture.exe', 'rtacast.exe', 'filter_report.exe')
 foreach ($f in $tools) {
     $p = Join-Path $B $f
     if (Test-Path $p) { Copy-Item $p (Join-Path $out 'tools') -Force }
