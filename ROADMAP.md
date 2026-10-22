@@ -155,7 +155,7 @@
 | CPU | SSE4.2 + POPCNT（2009+；官方支持写得保守：**Zen 1 / Intel 6 代**起） |
 | 运行库 | **不需要** VC++ 运行库（CRT 静态链接），Win7 不需要 UCRT 补丁 |
 | 界面 | Win10/11 内置 WebView2；无 WebView2 退回 Edge；再没有用默认浏览器；Win7 只能浏览器（需 Chrome/Edge 109/新版 Firefox） |
-| GPU | 包内内置 `rtagpu.dll`（25 种 AMD 架构）+ `amdhip64_7.dll`；无 AMD 卡/驱动时自动纯 CPU。NVIDIA 仍无 CUDA 后端 |
+| GPU | 包内内置 `rtagpu.dll`（25 种 AMD 架构）+ `amdhip64_7.dll`；**另有 `rtagpu_cuda.dll`（CUDA 12.9，19 档 arch：Maxwell→Blackwell，见 docs/GPU-CUDA后端纪要.md）**；无独显/驱动时自动纯 CPU |
 
 **构建约束（已落地）**
 

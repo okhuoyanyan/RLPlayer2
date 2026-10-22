@@ -28,12 +28,37 @@ $ntest = 0
 if ($sum -match 'out of (\d+)') { $ntest = [int]$Matches[1] }
 Step ('Test suite (' + $ntest + ')') ($ctExit -eq 0) $sum
 
-# 3 GPU library (multi-arch fat binary: every AMD family the compiler can target)
-$dll = Join-Path $B 'rtagpu.dll'
-if (Test-Path 'C:\Program Files\AMD\ROCm\7.2\bin\hipcc.bat') {
-  $gout = (& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'tools\build_gpu.ps1') -Out $dll 2>&1 | Out-String)
-  Step 'rtagpu.dll (multi-arch)' ((Test-Path $dll) -and ($LASTEXITCODE -eq 0)) ($gout.Trim())
-} else { Step 'rtagpu.dll (multi-arch)' $false 'hipcc missing' }
+# 3 GPU backend（按本机可用工具链编对应后端：AMD=HIP，NVIDIA=CUDA fatbin）
+#   两个后端导出同一组符号，管线按 gpu_pref.h 的候选顺序自动挑；所以判据是
+#   "至少一条通路编译+加载成功"，而不是"必须存在 rtagpu.dll"。
+#   注意：CUDA 组件可以只装编译器那几包（约 140 MB），见 docs/GPU-CUDA后端纪要.md §4。
+$dllHip  = Join-Path $B 'rtagpu.dll'
+$dllCuda = Join-Path $B 'rtagpu_cuda.dll'
+$hipcc = 'C:\Program Files\AMD\ROCm\7.2\bin\hipcc.bat'
+$nvccPath = $null
+if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin\nvcc.exe'))) {
+  $nvccPath = Join-Path $env:CUDA_PATH 'bin\nvcc.exe'
+} elseif (Test-Path 'C:\Users\garaxc\Documents\player\toolchain\cuda-12.9\bin\nvcc.exe') {
+  $nvccPath = 'C:\Users\garaxc\Documents\player\toolchain\cuda-12.9\bin\nvcc.exe'
+} else {
+  $n = Get-Command nvcc.exe -ErrorAction SilentlyContinue
+  if ($n) { $nvccPath = $n.Source }
+}
+$gpuOk = $false
+if (Test-Path $hipcc) {
+  $gout = (& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'tools\build_gpu.ps1') -Out $dllHip 2>&1 | Out-String)
+  $okHip = (Test-Path $dllHip) -and ($LASTEXITCODE -eq 0)
+  if ($okHip) { $gpuOk = $true }
+  Step 'rtagpu.dll (HIP multi-arch)' $okHip ($gout.Trim())
+}
+if ($nvccPath) {
+  $cudaRoot = Split-Path -Parent (Split-Path -Parent $nvccPath)
+  $cout = (& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'tools\build_gpu_cuda.ps1') -Out $dllCuda -CudaRoot $cudaRoot 2>&1 | Out-String)
+  $okCuda = (Test-Path $dllCuda) -and ($LASTEXITCODE -eq 0)
+  if ($okCuda) { $gpuOk = $true }
+  Step 'rtagpu_cuda.dll (CUDA fatbin)' $okCuda ($cout.Trim())
+}
+if (-not $gpuOk) { Step 'GPU backend' $false 'no usable GPU toolchain (hipcc / nvcc)' }
 
 # 4 GPU convolution correctness
 # 用 test_gpu_bridge（由 CMake 构建、也进了 ctest）：它走的是真正的 GpuBridge 动态加载路径。

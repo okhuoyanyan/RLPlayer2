@@ -2,6 +2,152 @@
 
 > **接手请先读**：[HANDOVER.md](HANDOVER.md)（架构/构建/已知坑）→ [ROADMAP.md](ROADMAP.md)（待开发与判据）。
 > 本文件按回合记录“做过什么、实测多少”，越往下越旧。
+# 第二十四轮:输出链路三链路打通 + 高 DPI + GPU 选项(2026-10-23)
+
+> 用户指令依次为:「UI 没有做高 DPI 适配」「设置中 GPU 后端没看到 cuda」「asio 不行, wsapi 独占不行,
+> wsapi 共享电平不对」「我对比的正是 asio 和 wsapi 独占」「44.1 独占可用」。
+
+## 1. 改动
+
+| 文件 | 改动 |
+|---|---|
+| `src/audio/wasapi_out.h` | 独占格式改 **32 容器/24 有效**;对齐重试**换新 client**(且 `dev` 用 RAII 持有到 Initialize 完成);首写 `pad==bufferFrames` 时强制试满缓冲;多配方 Initialize(5 组)并把每个 HRESULT 带进错误串 |
+| `src/audio/wasapi_shared.h` | `pack()` 按 **reqBits_** 归一化(原来一律 ÷2^31 → 24-bit 源被压 −48.16 dB);新增 `out_peak()` 遥测 |
+| `src/audio/render_loop.h` | STAT 行输出 `fpeak=`(后端实际写出的 float 峰值);`OutSink::out_peak()` 虚函数 |
+| `src/audio/pcm_dump.h` | 新增:跨后端 PCM 取证(exe 目录放 `rlplayer-pcmdump.on` 启用,落 int24 等长 1 秒) |
+| `tools/wasapi_ex_probe.cpp` | 新增:格式×配方矩阵 + 流测试(写全零静音),支持 `--stream <rate> <bufMs> [--poll] [--per0]` |
+| `tools/rtaweb.cpp` | 共享 sink 位深透传(原 `int /*bits*/` 硬编码 32);独占缓冲封顶 20ms;ASIO 空驱动逐个 preflight;device 为空时解析 ACTIVE 端点 |
+| `tools/launcher.cpp` | 高 DPI:`enable_high_dpi()`(PerMonitorV2→PerMonitor→System,Win7 兜底)、`WM_DPICHANGED`、初始尺寸按窗口 DPI 校正、边带/热区走 `dp()` |
+| `src/net/ui_script.h` | GPU 后端下拉补 `NVIDIA（CUDA）` 档 + 状态标注;说明文字改为候选顺序 |
+| `tests/test_wasapi_shared.cpp` | 16 条防回归断言(含「旧路径会把 24-bit 压到 0.0039」这条反向证据) |
+
+## 2. 三个独立缺陷(叠加才表现为「独占不可用」)
+
+1. **格式**:驱动只认 `WAVEFORMATEXTENSIBLE` + `wBitsPerSample=32` / `wValidBitsPerSample=24` / `blockAlign=ch*4`;紧凑 24(`ch*3`)被判 `AUDCLNT_E_UNSUPPORTED_FORMAT`
+2. **对齐重试**:`BUFFER_SIZE_NOT_ALIGNED` 后必须 Release+重新 Activate;原实现复用 client(→`BUFFER_SIZE_ERROR`),且 `open()` 早退了 `dev`(分支从未生效)
+3. **首写死锁**:`pad==bufferFrames` 时 `toWrite` 恒 0 → 永不写 → `RENDERFAIL` → 回退共享
+
+## 3. 共享 −48.16 dB 的定位方法(可复用)
+
+先加 `fpeak`(后端实际写出的 float 峰值)与管线侧 `peak` 并列输出,一次读数就定死:
+
+```
+peak=0.988647  fpeak=0.0038619   比值 = 1/256 = 2^23/2^31
+```
+
+根因在 `WasapiSharedSink::open` 把位深参数注释掉、硬编码传 32。**判据必须落在"真正送出去的那一层"**,否则内部所有读数都显示正常。
+
+## 4. 未解决/待办
+
+- `pcm-asio-24.raw` 只落了 ASIO 一份(独占当时写不进去),跨后端 SHA256 比对未完成
+- 共享路径曾出现 `STARVING`(吞吐 0.000)与 `w0` 增长,未单独归因
+- 24 个终端 + 45 个 ctest 未在全量重建后复跑(本轮只重建 rtaweb/launcher)
+
+
+
+> 用户指令:「认可，继续，完成后构建新的基线build并且run」。承接 DBX 调研（docs/DBX跨平台与精简架构纪要.md §2.3），
+> 把「loader 必须 1.0.902.49」那句注释落成可执行改动，然后 clean 重建并实跑。
+
+## 1. 改动
+
+| 文件 | 改动 |
+|---|---|
+| `third_party/webview2/x64/WebView2Loader.dll` | 1.0.4258.31 → **1.0.902.49**（官方 NuGet，sha256 `fdf978ba…6909`，与 DBX pin 逐字节一致） |
+| `tools/check_compat.ps1` | 新增第 4 条规则「Win8+/WinRT 禁用导入」；`WebView2Loader.dll` 列入检查；第三方 DLL 跳过反汇编；工具定位改为 PATH→LLVM_HOME→同级 toolchain→ROCm |
+| `.gitignore` | 加 `!third_party/webview2/x64/WebView2Loader.dll`（原先 `*.dll` 把必要件挡在仓库外，clone 后 POST_BUILD 必失败） |
+| `tests/test_pipeline.cpp` | 素材路径 `D:\RTA-hqplayer\build\testdata\` → `%TEMP%`；main 外包 try/catch |
+
+## 2. test_pipeline 崩溃的根因(不是玄学)
+
+`0xC0000409` + **零输出**：测试第一段 `write_wav` 写死路径 `D:\…`，本机无 D 盘 →
+产品侧正确 `throw std::runtime_error("无法写入: …")` → main 未捕获 → `std::terminate` → fail-fast；
+stdout 全缓冲未刷出，所以"一行都没有"。修法在**测试侧**（产品侧行为是对的），并加 try/catch 让下次能看见原因。
+
+## 3. 基线实测(clean 重建)
+
+| 项 | 结果 |
+|---|---|
+| 构建 | 66/66 产物（clang 23.1.4 + lld + Ninja；首次有一次链接期 `file is being used`，重试即过，见 §4） |
+| CUDA 后端 | 19 档 arch，766,464 B |
+| `check_compat` | **FAIL count 0**（`WebView2Loader.dll subsystem=5.2 win7imports=ok`） |
+| `ctest` | **45/45 通过**（上一轮 41/45：3 个"exe 消失"实为构建未完成，1 个是 §2 的崩溃） |
+| run | `RLPlayer.exe` 界面起来（`MainWindowHandle` 非 0、日志 `已用内置 WebView2 打开界面`、`wvmsg: theme:dark`）；8899 的 `/api/ping`、`/api/gpu`（`cuda:true`）正常；备用 8911 同样通过；WM_CLOSE 退出，无残留进程 |
+
+## 4. 未解决(如实)
+
+1. 首次构建偶发 `The process cannot access the file because it is being used by another process.`（链接阶段，随机落在一个 target；重试即过）。已排除 OneDrive（`Documents` 不是 reparse point）与 Defender（实时保护已关）。
+2. 全 arch fatbin 中 18 档仍只是"编进去了"，本机只有 sm_89。
+3. `verify.ps1` 的 CUDA 分支仍未实跑。
+
+# 第二十二轮:CUDA 后端(从「只有加载路径」到实测可用,19 档 arch)(2026-10-22)
+
+> 用户指令:「拉一下这个项目准备开始工程，我们的目标是做cuda适配」→ 追加裁定「用 cuda12 尽可能做支持」。
+> 本轮结果:新增 CUDA 后端(**加载层零改动**)，全 arch fatbin **748 KB / 19 档**(sm_50→sm_121)，
+> 四级判据全绿；ctest 41/45(4 项失败与本改动无关，见 §5)。
+
+## 1. 为什么加载层不用改
+
+`src/dsp/gpu_pref.h` 的 auto 候选顺序本来就写着 `rtagpu.dll → rtagpu_dx12.dll → rtagpu_cuda.dll`，
+`GpuBridge` 会逐个 `LoadLibrary` 并**真的跑一次平凡 kernel** 才算可用。所以 CUDA 适配的全部工作量
+= 产出一个导出同名 4 个符号的 `rtagpu_cuda.dll`；管线、界面、`/api/gpu` 一行未改。
+
+## 2. 交付件
+
+| 文件 | 作用 |
+|---|---|
+| `src/gpu/gpu_conv_cuda.cu` | 分块卷积（与 `_hip` 逐行对应，**不抽公共层**：两份互为参照物） |
+| `src/gpu/gpu_resample_cuda.cu` | 多相升频（保留「相位表只上传一次」的原优化） |
+| `tools/build_gpu_cuda.ps1` | 多 arch fatbin；`-Fast` 只编本机卡；`cuobjdump -lelf` + `dumpbin /exports` 双校验；自动 `-ccbin` 定位 MSVC |
+| `tools/fetch_cuda_redist.js` | 从 `redistrib_12.9.0.json` 取组件版本与 sha256 |
+| `tools/gpubench_conv.cpp` | 生产路径性能（走 `GpuBridge`，不是独立 demo —— 上一代就是独立 demo 掩盖了「GPU 从未启用」） |
+| `tools/gpu_resample_test.cpp` | 改：硬编码 `rtagpu.dll` → 复用 `gpu_pref.h` 候选列表（测试与管线同源） |
+| `CMakeLists.txt` | 改：MSVC 分支加 `/utf-8`；`gpu_resample_test` 加 `src` include |
+| `verify.ps1` | 改：第 3 步按可用工具链编 HIP **或** CUDA，两者都没有才 FAIL（原实现硬编码 `hipcc`，N 卡机上必红） |
+
+## 3. 工具链:只装编译器组件(CUDA 13 已移除 Maxwell/Pascal)
+
+用户要求「尽可能做支持」⟹ 必须留在 **CUDA 12.x**（13.x 从 `sm_75` 起步）。
+
+- 组件取自 NVIDIA redistrib（**约 140 MB**，不是 3.7 GB 全量包）：
+  `cuda_nvcc 12.9.41` / `cuda_cudart 12.9.37` / `cuda_cuobjdump 12.9.26` / `cuda_cccl 12.9.27`，逐个校验 sha256。
+- `nvcc --list-gpu-arch` 实测：请求 20 档，**支持 19 档**
+  （`compute_50,52,53,60,61,62,70,72,75,80,86,87,89,90,100,101,103,120,121`；唯一缺 `compute_110`）。
+- 全 arch 产物 **748 KB**，`cuobjdump -lelf` 逐档可查（cubin 名如 `rtagpu_cuda_full.5.sm_61.cubin`）。
+- `-cudart static` + `-Xcompiler=/MT` ⟹ 用户机不需要装 CUDA 运行时，只需显卡驱动（与铁律 6 一致）。
+
+## 4. 四级实测(本机 RTX 4080 / 驱动 617.42 / sm_89)
+
+| 级 | 判据 | 实测 |
+|---|---|---|
+| L0 | 平凡 kernel 真执行并读回常数 | `rta_gpu_available()`=1；launch/sync/copy 三错码全 0 |
+| L1 | `test_gpu_bridge` 相对 RMS < 1e-4 | **6.019e-08**（maxAbs 1.311e-06；8192 样本 / IR 4096） |
+| L2 | `gpu_resample_test` maxAbs/rms < 1e-12 | **2.210e-14**（maxAbs 3.253e-17）；GPU 稳定 1.20 ms，CPU 参考 22–87 ms ⟹ 18–72×（区间来自 CPU 参考缓存冷热） |
+| L3 | `/api/gpu` 如实上报 | `{"cuda":true,"available":true,"status":"GPU 卷积可用（rtagpu_cuda.dll）"}` |
+| L4 | 生产路径 IR 262144 / 48000 帧 | CPU 分块 FFT **27.3–29.8 ms** vs GPU 端到端 **10.6–11.1 ms**（2.6–2.7×），相对偏差 **−138.0 dB** |
+
+**口径警告（铁律 3）**：第十三~十五轮记的「GPU 端到端 2.0 ms」从 kernel 启动开始计时，
+不含 CPU 端为 256 个 IR 分区做 FFT 的准备；本轮 L4 是 `GpuBridge::convolve` 全程。
+**11 ms 与 2.0 ms 不能直接比**，同口径比较是 27–30 ms → 10.6 ms。
+
+## 5. 未解决(如实,铁律 4)
+
+1. **本机 ctest 41/45**。失败 4 项均与本改动无关，但**未定位**：
+   `emby` / `subsonic` / `rtanet_e2e` —— ninja 报链接成功（exit 0），产物 exe 却在 build 目录不存在
+   （`Test-Path` 曾为 True，下一次调用即消失）；`pipeline` —— `0xC0000409`（STACK_BUFFER_OVERRUN）
+   且在打印任何一行前退出，该测试依赖原开发机路径 `D:\RTA-hqplayer\build\testdata\rt24.wav`。
+2. **MSVC 不能构建主程序**：`dsd_reader.h:63` 的 `__builtin_popcount`、
+   `ui_script.h` 7 处超 16380 字节的字符串（C2026）。本机走 LLVM clang 23.1.4 + lld + Ninja。
+3. **`third_party/webview2/x64/WebView2Loader.dll` 未入库**，clone 后 `RLPlayer.exe` POST_BUILD 拷贝失败。
+   本轮从 NuGet `Microsoft.Web.WebView2 1.0.4258.31` 取了一份放本地（**未提交**，需用户决定是否入库）。
+4. **其余 18 档 arch 只证明了「编进去了」**，无法在本机证明「能在对应卡上跑」（本机只有 sm_89）。
+5. `verify.ps1` 的 CUDA 分支尚未实跑（改完后只做了语法检查）。
+
+## 6. 下一步(按性价比)
+
+1. **IR 频谱缓存**：`GpuBridge::convolve` 每次重算 P=256 个 2048 点 FFT，而 IR 在一首歌里不变 → 最大收益。
+2. `verify.ps1` 实跑一次（CUDA 分支会重编 19 档，约 5 分钟）。
+3. `tools/make_dist.ps1` 把 `rtagpu_cuda.dll` 打进正式发布版（铁律 6）。
+
 # 第二十一轮:用户反馈双通道首次启用(2 份 BUG + 1 份管理员需求,共 11 条)(2026-10-22)
 
 > 用户指令:先把「反馈和开发」目录规范写进开发规范,再处理两份反馈。**主管只做验收与回测,编码全部派子代理**。

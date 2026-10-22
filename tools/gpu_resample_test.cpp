@@ -12,23 +12,43 @@
 #include <windows.h>
 #include <cstdio>
 #include <vector>
+#include <string>
 #include <cmath>
 #include <random>
 #include <chrono>
+#include "dsp/gpu_pref.h"   // 与 GpuBridge 共用同一份候选 DLL 顺序（单一真相源）
 
 typedef int (*fn_resample)(const double*, int, long long,
                            const double*, int, int,
                            const int*, const int*, long long, double*);
 
-int main() {
+int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     setvbuf(stdout, nullptr, _IONBF, 0);
 
-    HMODULE h = LoadLibraryA("rtagpu.dll");
-    if (!h) { printf("加载 rtagpu.dll 失败\n"); return 1; }
-    auto fn = (fn_resample)GetProcAddress(h, "rta_gpu_resample");
-    if (!fn) { printf("找不到 rta_gpu_resample 导出（dllexport 可能未生效）\n"); return 1; }
-    printf("已加载 rta_gpu_resample\n\n");
+    // 候选 DLL 顺序与管线完全一致（gpu_pref.h）；也可显式指定：
+    //   gpu_resample_test.exe rtagpu_cuda.dll
+    std::vector<std::string> cands;
+    if (argc > 1) cands.push_back(argv[1]);
+    else for (const char* nm : rta::dsp::gpu_dll_candidates()) cands.push_back(nm);
+
+    HMODULE h = nullptr;
+    fn_resample fn = nullptr;
+    std::string used;
+    std::string tried;
+    for (const auto& nm : cands) {
+        h = LoadLibraryA(nm.c_str());
+        if (!h) { tried += nm + "(缺失) "; continue; }
+        fn = (fn_resample)GetProcAddress(h, "rta_gpu_resample");
+        if (!fn) { FreeLibrary(h); h = nullptr; tried += nm + "(无导出) "; continue; }
+        used = nm;
+        break;
+    }
+    if (!h || !fn) {
+        printf("没有可加载的 GPU 后端（尝试过：%s）\n", tried.c_str());
+        return 1;
+    }
+    printf("已加载 %s 的 rta_gpu_resample\n\n", used.c_str());
 
     const int ch = 2, L = 16, T = 16384;
     const long long nOut = 4096;

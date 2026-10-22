@@ -1628,8 +1628,10 @@ function renderSettingsPage() {
      + sgroup('GPU',
          sel('sp_gpu', 'GPU 后端',
              opt('auto', '自动', ADV.gpuvendor || 'auto') + opt('amd', 'AMD（HIP）', ADV.gpuvendor || 'auto') +
+             opt('nvidia', 'NVIDIA（CUDA）', ADV.gpuvendor || 'auto') +
              opt('off', '关闭（纯 CPU）', ADV.gpuvendor || 'auto'),
-             '本版本只提供 AMD（HIP）后端；没有可用 GPU/运行库时自动退回 CPU，并在信号链里写明。NVIDIA CUDA 后端尚未提供')
+             '自动＝按 rtagpu.dll（AMD/HIP）→ rtagpu_dx12.dll → rtagpu_cuda.dll（NVIDIA/CUDA）的顺序挑第一个能真正跑起来的后端；' +
+             '选了具体厂商就只试该厂商的 DLL。后端缺失或 kernel 不可执行时自动退回 CPU 分块 FFT，并在信号链里写明实际用的哪个 DLL。')
        + '<div class="sfld wide"><div id=sp_gpumsg class=hint></div></div>'
        + '<div class="sfld wide"><div id=sp_asiomsg class=hint></div></div>')
      + sgroup('EQ 与房间校正', 'FIR 用 WAV，EQ 用 REW / AutoEq 文本',
@@ -1637,7 +1639,7 @@ function renderSettingsPage() {
              '每行形如「Filter 1: ON PK Fc 1000 Hz Gain -3.0 dB Q 1.41」，或用 AutoEq 的 Preamp / Low Shelf / Peaking 段落',
              'D:\Music\headphone-eq.txt')
        + txt('sp_ir', 'IR 文件路径（WAV）', ADV.ir, '留空 = 不做卷积。路径形如 D:\Music\room.wav', 'D:\Music\room.wav')
-       + chk('sp_irgpu', '卷积走 GPU', ADV.irgpu == 1, '需要 rtagpu.dll'))
+       + chk('sp_irgpu', '卷积走 GPU', ADV.irgpu == 1, '需要 GPU 后端就位：rtagpu.dll（AMD/HIP）或 rtagpu_cuda.dll（NVIDIA/CUDA）'))
      + sgroup('流媒体服务器', 'Navidrome / Subsonic / Emby（只取原始文件，不用转码流）',
          '<div class="sfld wide"><div class=hint>DLNA/UPnP 是"发现网络上的播放器"，与这里的"登录音乐服务器"是两件事。' +
          '要连 Emby / Navidrome，在这一栏填地址与账号。</div></div>'
@@ -1841,11 +1843,15 @@ function renderSettingsPage() {
     if (sg) {
       Array.prototype.forEach.call(sg.options, function (o) {
         if (o.value === 'amd') o.text = j.amd ? 'AMD（HIP）· 后端已就位' : 'AMD（HIP）· 本目录无 rtagpu.dll';
+        if (o.value === 'nvidia') o.text = j.cuda ? 'NVIDIA（CUDA）· 后端已就位' : 'NVIDIA（CUDA）· 本目录无 rtagpu_cuda.dll';
       });
     }
     var m = D('sp_gpumsg');
     if (m) m.textContent = (j.available ? '当前 GPU 可用：' : '当前走 CPU：') + (j.status || '') +
-      '；本目录 rtagpu.dll=' + (j.amd ? '有' : '无') + '，AMD HIP 运行库=' + (j.hip ? '有' : '无');
+      '；本目录 rtagpu.dll=' + (j.amd ? '有' : '无') +
+      '，rtagpu_cuda.dll=' + (j.cuda ? '有' : '无') +
+      '，AMD HIP 运行库=' + (j.hip ? '有' : '无') +
+      '；厂商偏好=' + (j.vendor || 'auto');
   }).catch(function () { });
   // ASIO 驱动列表（Native DSD 需要 ASIO 后端）
   api('/api/asio').then(function (j) {

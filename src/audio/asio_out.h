@@ -29,6 +29,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cmath>
+#include "pcm_dump.h"
 
 namespace rta::audio {
 
@@ -305,6 +306,7 @@ public:
     }
     // 推交错 int32；返回实际接收帧数
     size_t push(const int32_t* pcm, size_t frames) {
+        detail::pcm_dump("asio", pcm, frames * (size_t)ch_, srcBits_);   // 取证（默认关闭）
         size_t ok = 0;
         {
             std::lock_guard<std::mutex> lk(mx_);

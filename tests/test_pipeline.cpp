@@ -5,6 +5,8 @@
 #include <vector>
 #include <cmath>
 #include <string>
+#include <filesystem>
+#include <exception>
 
 using namespace rta::engine;
 using rta::audio::AudioBuffer;
@@ -35,8 +37,20 @@ static AudioBuffer make_test(uint32_t rate, int ch, int bits, size_t frames, uin
     return a;
 }
 
-int main() {
-    const std::string dir = "D:\\RTA-hqplayer\\build\\testdata\\";
+static int run() {
+    // 素材放 %TEMP%：原实现写死原开发机路径 D:\RTA-hqplayer\build\testdata\。
+    // 本机没有 D 盘 → write_wav 里 `throw std::runtime_error("无法写入: …")`（产品侧行为正确）
+    // → main 未捕获 → std::terminate → 0xC0000409，且 stdout 还是全缓冲、一行都没刷出，
+    // 表现为"毫无输出的崩溃"（2026-10-22 基线构建现场）。测试不该依赖开发机路径。
+    std::filesystem::path tmpDir;
+    try {
+        tmpDir = std::filesystem::temp_directory_path() / "rlplayer-pipeline-test";
+        std::filesystem::create_directories(tmpDir);
+    } catch (...) {
+        tmpDir = std::filesystem::path(".");
+    }
+    std::string dir = tmpDir.string();
+    if (!dir.empty() && dir.back() != '\\' && dir.back() != '/') dir += '\\';
 
     printf("=== 1. WAV 读写的逐位往返 ===\n");
     {
@@ -173,4 +187,20 @@ int main() {
 
     printf("\n%s (失败项 %d)\n", fails == 0 ? "全部通过" : "存在失败", fails);
     return fails == 0 ? 0 : 1;
+}
+
+// 未捕获异常一律打印原因并返回 1，而不是让 terminate 把它变成
+// 0xC0000409 + 零输出 —— 那种失败现场无法归因（见 2026-10-22 基线构建的教训）。
+int main() {
+    try {
+        return run();
+    } catch (const std::exception& e) {
+        printf("\n[FAIL] 未捕获异常: %s\n", e.what());
+        std::fflush(stdout);
+        return 1;
+    } catch (...) {
+        printf("\n[FAIL] 未捕获的非标准异常\n");
+        std::fflush(stdout);
+        return 1;
+    }
 }

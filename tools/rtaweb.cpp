@@ -391,7 +391,12 @@ class WasapiSink : public OutSink {
 public:
     bool open(const SinkOpenOpts& o, uint32_t rate, int ch, int bits) override {
         fail_ = OpenFail{};   // 每次打开重置：失败原因只属于最近一次尝试
-        ok_ = ao_.open(o.device, rate, ch, bits, (double)o.bufferMs, &fail_);
+        // ★ 2026-10-23：独占缓冲封顶 20ms。设置里的 100ms 在 MOTU 上会被对齐成
+        // **8192 帧（186ms）**，Initialize 虽接受，但 Start 后设备流不推进（现场：
+        // RENDERFAIL「4.02 秒未接受数据」，zp=201 pad=full、wr 只有 76、GetBuffer 从未被调用）。
+        // 20ms（约 882 帧）是这类 USB 声卡独占的常见可用区间。
+        const double ms = (o.bufferMs > 0 && o.bufferMs < 20) ? (double)o.bufferMs : 20.0;
+        ok_ = ao_.open(o.device, rate, ch, bits, ms, &fail_);
         return ok_;
     }
     // HF-01/02：open 失败时的结构化原因（请求格式 / 支持列表 / HRESULT / 端点 id）。
@@ -431,8 +436,13 @@ private:
 // 声道数排管线 —— open 里做一致性校验，不匹配即拒绝并说明（防止静默二次重采样/声道错乱）。
 class WasapiSharedSink : public OutSink {
 public:
-    bool open(const SinkOpenOpts& o, uint32_t rate, int ch, int /*bits*/) override {
-        ok_ = so_.open(o.device, rate, ch, 32, 200.0);
+    bool open(const SinkOpenOpts& o, uint32_t rate, int ch, int bits) override {
+        // ★ 2026-10-23：这里原来把位深硬编码成 32（`int /*bits*/` 直接丢弃），理由是
+        // "共享模式位深由混音引擎决定"。混音引擎确实是 float32，但 WasapiShared 的 reqBits_
+        // 不是描述引擎，而是描述**管线交来的 int32 是按几个 bit 定标的**——pack() 要用它把
+        // ±2^23（24-bit）归一化到 float。传 32 → 相当于除以 2^31 → 输出 −48.16 dB。
+        // 现场实测：peak=0.9886 而 fpeak=0.0038619，比值 1/256，正好是这一处。
+        ok_ = so_.open(o.device, rate, ch, bits > 0 ? bits : 32, 200.0);
         if (!ok_) return false;
         if (so_.mix_rate() != rate || so_.mix_channels() != ch) {
             char b[160];
@@ -458,6 +468,7 @@ public:
     long long last_pad() const override { return so_.last_pad(); }
     size_t write_one_period(const int32_t* pcm, size_t frames) override { return so_.write_available(pcm, frames); }
     size_t write_available(const int32_t* pcm, size_t frames) override { return so_.write_available(pcm, frames); }
+    double out_peak() const override { return so_.out_peak(); }
     void pause() override { so_.pause(); }
     void resume() override { so_.resume(); }
     void close() override { so_.close(); }
@@ -762,9 +773,28 @@ public:
         if (!is_asio_clsid(clsid)) {
             clsid.clear();
             for (const auto& e : list) if (e.name == o.device) { clsid = e.clsid; break; }
-            if (!is_asio_clsid(clsid)) clsid = list[0].clsid;
         }
-        if (!asio_preflight(clsid, rate, ch, err_)) return false;
+        if (!is_asio_clsid(clsid)) {
+            // 设备没指定（或名字对不上）：逐个 preflight，第一个通过的就用。
+            // 不能只看 list[0] —— 本机 [0] 是未连接的 Audient，会把真正可用的 MOTU 挡在后面，
+            // 表现就是"选了 ASIO 但没声音/直接失败"（2026-10-23 现场）。
+            std::string tried;
+            for (const auto& e : list) {
+                std::string why;
+                if (asio_preflight(e.clsid, rate, ch, why)) { clsid = e.clsid; break; }
+                tried += e.name + "[" + why + "] ";
+            }
+            if (!is_asio_clsid(clsid)) {
+                err_ = "没有可用的 ASIO 驱动：" + tried;
+                play_log("ASIO_NODRIVER " + err_);
+                return false;
+            }
+            play_log("ASIO_AUTOPICK 未指定驱动，自动选中 " + clsid);
+        }
+        if (!asio_preflight(clsid, rate, ch, err_)) {
+            play_log("ASIO_PREFLIGHT_FAIL " + err_);
+            return false;
+        }
         if (!drv_.open(clsid, (double)rate, ch, bits > 0 ? bits : 24, err_)) return false;
         period_ = (size_t)drv_.buffer_size();
         return true;
@@ -1028,6 +1058,7 @@ static bool play_one_direct(const std::string& file, const PlayParams& p) {
                     ls << "STAT pos=" << (double)played / (double)carrier
                        << " rate=" << carrier << " pad=" << ps.dbgPad.load()
                        << " peak=" << g_dbgPeak.load() << " clip=" << g_dbgClip.load()
+                       << " fpeak=" << sink->out_peak()   // 后端实际写出峰值（float 域）
                        << " w0=" << g_dbgW0.load() << " wr=" << g_dbgWr.load();
                     play_log(ls.str());
                 }
@@ -1168,6 +1199,24 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         // 否则永远走不到"回退默认端点"这一步（交接单 §2.1 的并行嫌疑）。
         PlayParams pEff = p;
         if (p.backend.empty() || p.backend == "wasapi") {
+            if (p.device.empty()) {
+                // 空 device = "系统默认端点"。但 probe_formats("") 解析不出任何设备
+                //（它只在 id 或名字精确匹配时命中），于是后续独占能力检查拿到空列表，
+                // 报出的却是"设备独占模式不支持 44100 Hz…端点不存在或已禁用: 默认端点"——
+                // 归因误导（2026-10-23 现场：用户明明有一块 ACTIVE 的 UltraLite-mk5）。
+                // 这里先把空 id 解析成真实的 ACTIVE 端点（优先系统默认），后续全线用真实 id。
+                const auto devs = WasapiOutput::enumerate();
+                const DeviceInfo* pick = nullptr;
+                for (const auto& d : devs) {
+                    if (d.state != DEVICE_STATE_ACTIVE) continue;
+                    if (!pick) pick = &d;
+                    if (d.isDefault) { pick = &d; break; }
+                }
+                if (pick) {
+                    pEff.device = pick->id;
+                    appendNote("设备未指定，解析为 ACTIVE 端点(" + pick->name + ")");
+                }
+            }
             if (!p.device.empty()) {
                 const FormatProbe ep = WasapiOutput::probe_formats(p.device);
                 if (!ep.endpointAlive) {

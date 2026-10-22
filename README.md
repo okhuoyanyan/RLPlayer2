@@ -126,15 +126,32 @@ cmake --build build
 
 ### GPU 后端（可选）
 
-没有 GPU 也能正常工作（纯 CPU 卷积）。有 AMD 卡时：
+没有 GPU 也能正常工作（纯 CPU 卷积）。两个后端导出同一组符号，管线按
+`src/dsp/gpu_pref.h` 的顺序自动挑：`rtagpu.dll`(AMD/HIP) → `rtagpu_dx12.dll` → `rtagpu_cuda.dll`(NVIDIA)。
+
+**AMD（HIP）**：
 
 ```powershell
 hipcc --offload-arch=gfx1201 -O3 -shared -Isrc `
       src/gpu/gpu_conv_hip.cpp src/gpu/gpu_resample_hip.cpp -o build/rtagpu.dll
 ```
 
-> ⚠️ `--offload-arch` **必须**写对（本机 RX 9070 XT = Navi 48 = `gfx1201`）。
+> ⚠️ `--offload-arch` **必须**写对（开发机 RX 9070 XT = Navi 48 = `gfx1201`）。
 > 写错时 kernel 会**静默失败**而 `hipDeviceSynchronize()` 仍返回成功 —— 详见 [AGENTS.md](AGENTS.md) 铁律 5。
+
+**NVIDIA（CUDA 12）**：
+
+```powershell
+powershell -File tools\build_gpu_cuda.ps1        # 全 arch（Maxwell → Blackwell，19 档）
+powershell -File tools\build_gpu_cuda.ps1 -Fast  # 只编本机卡（开发用）
+```
+
+> 只装编译器组件即可（约 140 MB，不是 3.7 GB 全量安装包）：
+> `node tools/fetch_cuda_redist.js 12.9.0` 取版本与 sha256，见
+> [docs/GPU-CUDA后端纪要.md](docs/GPU-CUDA后端纪要.md) §4。
+> ⚠️ CUDA 侧的陷阱与 HIP 不同：fatbin 带 PTX 时驱动会 JIT，**arch 不对也"看起来能跑"** ⟹
+> 构建脚本用 `cuobjdump -lelf` 校验 cubin、用 `dumpbin /exports` 校验导出符号，
+> 运行时再用平凡 kernel 读回常数（判据见纪要 §3）。
 
 ### 出发布包
 
@@ -219,7 +236,9 @@ node tools\uicheck.js http://127.0.0.1:8911/ build\uicheck_out   # 界面自检 
 - **UPnP/DLNA 投放**：只做发现，不做推送
 - **DSD 域重采样**：同速率 DirectSDM 逐位直通已可用；**速率不同时的 DSD→DSD 重采样未做**
 - **Native DSD（ASIO）**：需驱动支持 ASIODSD* 通道类型
-- **NVIDIA/CUDA 后端**：只有加载路径，仓库内无 CUDA 源码
+- **NVIDIA/CUDA 后端**：**已可用**。`src/gpu/gpu_conv_cuda.cu` + `src/gpu/gpu_resample_cuda.cu` 编出
+  `rtagpu_cuda.dll`（CUDA 12.9，19 档 arch：Maxwell 到 Blackwell），与 HIP 后端共用同一套加载层与判据；
+  实测见 [docs/GPU-CUDA后端纪要.md](docs/GPU-CUDA后端纪要.md)
 - **NAA 协议兼容**：已探测到标准 NAA 5.x，卡在未公开的 16 字节握手
 - **7 阶 1-bit 调制器**：只在 DSD128 以上稳定
 

@@ -27,6 +27,11 @@ rta-*.conf
 *.ilk
 *.exe
 *.dll
+# 例外：WebView2 loader 是「构建必需 + 版本决定 Win7 可用性」的第三方件，
+# 不能靠各机器自己找（clone 后 RLPlayer.exe 的 POST_BUILD 拷贝会直接失败）。
+# 版本必须是 1.0.902.49：>=1.0.1054.31 的 loader import EventSetInformation，
+# Win7 / Server 2012 R2 没有该 API（详见 docs/DBX跨平台与精简架构纪要.md §2.3 与 §10）。
+!third_party/webview2/x64/WebView2Loader.dll
 *.log
 *.log.*
 CMakeCache.txt
