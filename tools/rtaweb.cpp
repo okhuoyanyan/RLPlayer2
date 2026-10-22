@@ -1568,12 +1568,12 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             fname = (in.rate >= 88200 && !p.filterNx.empty()) ? p.filterNx : p.filter;
         }
         if (!fname.empty()) {
-            for (const auto& fp : rta::dsp::filter_presets()) {
-                if (fname == fp.name) {
-                    cfg.taps = fp.taps; cfg.transition = fp.transition; cfg.attenDb = fp.attenDb;
-                    cfg.filterWindow = fp.window; cfg.filterPhase = fp.phase;
-                    break;
-                }
+            const auto* fp = rta::dsp::find_preset(fname, in.rate >= 88200);
+            if (fp) {
+                cfg.taps = fp->taps; cfg.transition = fp->transition; cfg.attenDb = fp->attenDb;
+                cfg.filterWindow = fp->window; cfg.filterPhase = fp->phase;
+                cfg.twoStage = fp->twoStage;
+                if (fp->twoStage && fp->stage2Taps > 0) cfg.stage2Taps = fp->stage2Taps;
             }
         }
 
@@ -4146,7 +4146,9 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             j << "{\"name\":\"" << jesc(fp.name) << "\""
               << ",\"phase\":\"" << ph << "\""
               << ",\"phaseName\":\"" << phCn << "\""
-              << ",\"taps\":" << fp.taps << "}";
+              << ",\"taps\":" << fp.taps
+              << ",\"twoStage\":" << (fp.twoStage ? "true" : "false")
+              << ",\"forNx\":" << (fp.forNx ? "true" : "false") << "}";
         }
         j << "]}";
         return j.str();
@@ -4930,6 +4932,7 @@ static std::string page() {
     // 设置页的 #sp_phasemsg 也从这份数据取真实值（/api/filters），不靠前端硬编码。
     for (const auto& fp : rta::dsp::filter_presets()) {
         fo += "<option value=\"" + std::string(fp.name) + "\">" + fp.name
+            + (fp.twoStage ? "  [两段式]" : "")
             + (fp.phase == rta::dsp::PhaseKind::Minimum ? "  [最小相位]"
              : fp.phase == rta::dsp::PhaseKind::Intermediate ? "  [混合相位]"
              : "  [线性相位]")

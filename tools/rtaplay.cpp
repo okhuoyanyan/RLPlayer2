@@ -126,9 +126,12 @@ int main(int argc, char** argv) {
     if (first == "--list-filters") {
         printf("可用滤波器（%zu 个）：\n", rta::dsp::filter_presets().size());
         for (const auto& p : rta::dsp::filter_presets())
-            printf("  %-24s 抽头 %8d  过渡 %.3f  阻带 %.0f dB  %s\n",
+            printf("  %-26s 抽头 %8d  过渡 %.3f  阻带 %.0f dB  %s%s%s\n",
                    p.name, p.taps, p.transition, p.attenDb,
-                   p.phase == rta::dsp::PhaseKind::Minimum ? "最小相位" : "线性相位");
+                   p.phase == rta::dsp::PhaseKind::Minimum ? "最小相位" :
+                   (p.phase == rta::dsp::PhaseKind::Intermediate ? "混合相位" : "线性相位"),
+                   p.twoStage ? "  [两段式]" : "",
+                   p.forNx ? "  [Nx专用]" : "");
         return 0;
     }
     if (first == "--gen") {
@@ -224,9 +227,12 @@ int main(int argc, char** argv) {
     if (listFilters) {
         printf("可用滤波器（%zu 个）：\n", rta::dsp::filter_presets().size());
         for (const auto& p : rta::dsp::filter_presets())
-            printf("  %-24s 抽头 %8d  过渡 %.3f  阻带 %.0f dB  %s\n",
+            printf("  %-26s 抽头 %8d  过渡 %.3f  阻带 %.0f dB  %s%s%s\n",
                    p.name, p.taps, p.transition, p.attenDb,
-                   p.phase == rta::dsp::PhaseKind::Minimum ? "最小相位" : "线性相位");
+                   p.phase == rta::dsp::PhaseKind::Minimum ? "最小相位" :
+                   (p.phase == rta::dsp::PhaseKind::Intermediate ? "混合相位" : "线性相位"),
+                   p.twoStage ? "  [两段式]" : "",
+                   p.forNx ? "  [Nx专用]" : "");
         return 0;
     }
 
@@ -244,18 +250,20 @@ int main(int argc, char** argv) {
 
     // ---- 命名滤波器（手册 4.6）----
     if (!filterName.empty()) {
-        const auto& fps = rta::dsp::filter_presets();
-        const rta::dsp::FilterPreset* fp = nullptr;
-        for (const auto& p : fps) if (filterName == p.name) { fp = &p; break; }
+        const auto* fp = rta::dsp::find_preset(filterName, in.rate >= 88200);
         if (!fp) { printf("!! 未知滤波器 '%s'；用 --list-filters 查看全部\n", filterName.c_str()); return 1; }
         cfg.taps         = fp->taps;
         cfg.transition   = fp->transition;
         cfg.attenDb      = fp->attenDb;
         cfg.filterWindow = fp->window;
         cfg.filterPhase  = fp->phase;
-        printf("滤波器: %s (%d 抽头, 过渡 %.3f, 阻带 %.0f dB, %s)\n",
+        cfg.twoStage     = fp->twoStage;
+        if (fp->twoStage && fp->stage2Taps > 0) cfg.stage2Taps = fp->stage2Taps;
+        printf("滤波器: %s (%d 抽头, 过渡 %.3f, 阻带 %.0f dB, %s%s)\n",
                fp->name, fp->taps, fp->transition, fp->attenDb,
-               fp->phase == rta::dsp::PhaseKind::Minimum ? "最小相位" : "线性相位");
+               fp->phase == rta::dsp::PhaseKind::Minimum ? "最小相位" :
+               (fp->phase == rta::dsp::PhaseKind::Intermediate ? "混合相位" : "线性相位"),
+               fp->twoStage ? ", 两段式" : "");
     }
 
     // ---- 载入配置文件（key=value，命令行参数优先）----
@@ -295,11 +303,13 @@ int main(int argc, char** argv) {
             else if (key == "device" && deviceId.empty())  { deviceId = val; ++applied; }
             else if (key == "filter" && filterName.empty()) {
                 filterName = val;
-                const auto& fps = rta::dsp::filter_presets();
-                for (const auto& p : fps) if (filterName == p.name) {
-                    cfg.taps = p.taps; cfg.transition = p.transition; cfg.attenDb = p.attenDb;
-                    cfg.filterWindow = p.window; cfg.filterPhase = p.phase;
-                    ++applied; break;
+                const auto* fp = rta::dsp::find_preset(filterName, in.rate >= 88200);
+                if (fp) {
+                    cfg.taps = fp->taps; cfg.transition = fp->transition; cfg.attenDb = fp->attenDb;
+                    cfg.filterWindow = fp->window; cfg.filterPhase = fp->phase;
+                    cfg.twoStage = fp->twoStage;
+                    if (fp->twoStage && fp->stage2Taps > 0) cfg.stage2Taps = fp->stage2Taps;
+                    ++applied;
                 }
             }
             else if (key == "dsd")                         { dsdMultiple = atoi(val.c_str()); ++applied; }
