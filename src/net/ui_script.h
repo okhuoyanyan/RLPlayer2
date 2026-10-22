@@ -2018,6 +2018,249 @@ function stopInputCapture() {
   });
 }
 
+/* ---------------- UPnP/DLNA 媒体投放 ---------------- */
+var _castPollTimer = null;
+var _castDevices = [];
+
+function fmtBytes(b) {
+  if (!b || b <= 0) return '0 B';
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+  if (b < 1024 * 1024 * 1024) return (b / (1024 * 1024)).toFixed(1) + ' MB';
+  return (b / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+function updateCastStateUi(st) {
+  if (!st) return;
+  var running = !!st.running;
+  var btnStart = D('sp_cast_start');
+  var btnStop = D('sp_cast_stop');
+  if (btnStart) btnStart.disabled = running;
+  if (btnStop) btnStop.disabled = !running;
+
+  var pEl = D('sp_cast_stat_phase');
+  if (pEl) {
+    var pMap = {
+      'discovering': '设备发现中',
+      'serving': '本地供源就绪',
+      'playing': '投放播放中',
+      'stopped': '已停止',
+      'error': '发生错误'
+    };
+    pEl.textContent = pMap[st.phase] || (st.phase || '已停止');
+    if (st.phase === 'playing') pEl.style.color = 'var(--ok)';
+    else if (st.phase === 'error') pEl.style.color = 'var(--err)';
+    else if (running) pEl.style.color = 'var(--acc)';
+    else pEl.style.color = '';
+  }
+
+  var devEl = D('sp_cast_stat_dev');
+  if (devEl) {
+    devEl.textContent = st.device || '-';
+  }
+
+  var posEl = D('sp_cast_stat_pos');
+  if (posEl) {
+    posEl.textContent = fmt(st.positionSec || 0);
+  }
+
+  var trEl = D('sp_cast_stat_transport');
+  if (trEl) {
+    trEl.textContent = st.transportState || 'STOPPED';
+    if (st.transportState === 'PLAYING') trEl.style.color = 'var(--ok)';
+    else if (st.transportState === 'PAUSED_PLAYBACK') trEl.style.color = 'var(--warn, #eab308)';
+    else trEl.style.color = '';
+  }
+
+  var bEl = D('sp_cast_stat_bytes');
+  if (bEl) {
+    bEl.textContent = fmtBytes(st.servedBytes || 0);
+  }
+
+  var reqEl = D('sp_cast_stat_reqs');
+  if (reqEl) {
+    reqEl.textContent = (st.requestCount || 0) + ' 次';
+  }
+
+  var portEl = D('sp_cast_stat_port');
+  if (portEl) {
+    portEl.textContent = String(st.servePort || 8912);
+  }
+
+  var rmEl = D('sp_cast_stat_ratematch');
+  if (rmEl) {
+    if (st.rateMatch === 'match') {
+      rmEl.textContent = '匹配（Bit-Perfect）';
+      rmEl.style.color = 'var(--ok)';
+    } else if (st.rateMatch === 'mismatch') {
+      rmEl.textContent = '失配（可能重采样）';
+      rmEl.style.color = 'var(--err)';
+    } else {
+      rmEl.textContent = '未声明（需硬件确证）';
+      rmEl.style.color = 'var(--mut2)';
+    }
+  }
+
+  var warnBox = D('sp_cast_stat_warn_box');
+  var warnEl = D('sp_cast_stat_warn');
+  if (st.warning) {
+    if (warnEl) warnEl.textContent = st.warning;
+    if (warnBox) warnBox.style.display = 'block';
+  } else {
+    if (warnBox) warnBox.style.display = 'none';
+  }
+
+  var errBox = D('sp_cast_stat_err_box');
+  var errEl = D('sp_cast_stat_err');
+  if (st.error) {
+    if (errEl) errEl.textContent = st.error;
+    if (errBox) errBox.style.display = 'block';
+    if (D('sp_cast_msg')) D('sp_cast_msg').textContent = st.error;
+  } else {
+    if (errBox) errBox.style.display = 'none';
+  }
+}
+
+function pollCastState() {
+  clearTimeout(_castPollTimer);
+  var outPane = document.querySelector('#setpage .spane[data-g=out]');
+  var isTabOn = outPane && outPane.classList.contains('on');
+  var isSetOpen = D('setpage') && D('setpage').classList.contains('on');
+
+  api('/api/cast/state').then(function (st) {
+    updateCastStateUi(st);
+    if ((isSetOpen && isTabOn) || (st && st.running)) {
+      _castPollTimer = setTimeout(pollCastState, 1000);
+    }
+  }).catch(function () {
+    if (isSetOpen && isTabOn) {
+      _castPollTimer = setTimeout(pollCastState, 1500);
+    }
+  });
+}
+
+function scanCastDevices(force) {
+  var s = D('sp_cast_dev');
+  var msg = D('sp_cast_devmsg');
+  var btn = D('sp_cast_scan');
+  if (btn) btn.disabled = true;
+  if (msg) msg.textContent = '正在发现渲染器…';
+
+  var url = '/api/cast/devices' + (force ? '?scan=1' : '');
+  api(url).then(function (j) {
+    if (btn) btn.disabled = false;
+    _castDevices = (j && j.devices) || [];
+    if (s) {
+      if (_castDevices.length === 0) {
+        s.innerHTML = '<option value="">（未发现 UPnP 渲染器）</option>';
+        if (msg) msg.textContent = '未发现 UPnP/DLNA 渲染器（可能未开机或不在同一子网）';
+      } else {
+        var h = '';
+        _castDevices.forEach(function (d) {
+          var label = (d.friendlyName || d.name || d.host) + (d.model ? (' · ' + d.model) : '');
+          h += '<option value="' + esc(d.friendlyName || d.name || d.host) + '">' + esc(label) + '</option>';
+        });
+        s.innerHTML = h;
+        if (msg) msg.textContent = '共发现 ' + _castDevices.length + ' 个渲染器';
+      }
+    }
+  }).catch(function () {
+    if (btn) btn.disabled = false;
+    if (msg) msg.textContent = '扫描失败';
+  });
+}
+
+function initCastControls() {
+  var devSel = D('sp_cast_dev');
+  var dopChk = D('sp_cast_dop');
+  var btnScan = D('sp_cast_scan');
+  var btnUseCur = D('sp_cast_usecur');
+  var btnStart = D('sp_cast_start');
+  var btnStop = D('sp_cast_stop');
+
+  if (devSel) {
+    devSel.onchange = function () {
+      var d = _castDevices.find(function(x) { return (x.friendlyName || x.name || x.host) === devSel.value; });
+      if (d) {
+        var msg = D('sp_cast_devmsg');
+        if (msg) msg.textContent = (d.model ? ('型号: ' + d.model + ' · ') : '') + (d.hasAVTransport ? '支持 AVTransport' : '未知传输服务');
+      }
+    };
+  }
+  if (dopChk) {
+    dopChk.onchange = function () {
+      // DoP 开关状态切换
+    };
+  }
+  if (D('sp_cast_file')) {
+    D('sp_cast_file').oninput = function () {
+      // 用户输入音频路径
+    };
+  }
+  if (btnScan) {
+    btnScan.onclick = function () {
+      scanCastDevices(true);
+    };
+  }
+  if (btnUseCur) {
+    btnUseCur.onclick = function () {
+      api('/api/status').then(function (j) {
+        if (j && j.cur) {
+          var f = D('sp_cast_file');
+          if (f) f.value = j.cur;
+          toast('已填入当前播放文件');
+        } else {
+          toast('当前没有正在播放的文件');
+        }
+      }).catch(function () {
+        toast('获取当前曲目失败');
+      });
+    };
+  }
+  if (btnStart) {
+    btnStart.onclick = function () {
+      var file = D('sp_cast_file') ? D('sp_cast_file').value.trim() : '';
+      if (!file) {
+        toast('请先填入源音频文件路径');
+        return;
+      }
+      var dev = devSel ? devSel.value : '';
+      var dop = (dopChk && dopChk.checked) ? 1 : 0;
+      btnStart.disabled = true;
+      if (D('sp_cast_msg')) D('sp_cast_msg').textContent = '正在启动投放…';
+
+      var body = 'dev=' + encodeURIComponent(dev) +
+                 '&file=' + encodeURIComponent(file) +
+                 '&port=8912&dop=' + dop;
+      api('/api/cast/start', body).then(function (j) {
+        if (!j.ok) {
+          toast(j.error || '投放启动失败');
+          if (D('sp_cast_msg')) D('sp_cast_msg').textContent = j.error || '投放启动失败';
+          btnStart.disabled = false;
+        } else {
+          toast('投放已启动');
+          if (D('sp_cast_msg')) D('sp_cast_msg').textContent = '';
+          pollCastState();
+        }
+      }).catch(function (e) {
+        toast('请求失败');
+        btnStart.disabled = false;
+      });
+    };
+  }
+  if (btnStop) {
+    btnStop.onclick = function () {
+      btnStop.disabled = true;
+      api('/api/cast/stop', '').then(function (j) {
+        toast('投放已停止');
+        pollCastState();
+      }).catch(function () {
+        btnStop.disabled = false;
+      });
+    };
+  }
+}
+
 /* ---------------- 输出模式 / DSD 比特率 / 封装 ---------------- */
 function outModeOf() { return (D('sDSD') && D('sDSD').value !== '0') ? 'dsd' : 'pcm'; }
 function dsdRateOf() {
@@ -2228,6 +2471,41 @@ function renderSettingsPage() {
      + sgroup('声道音量微调', '按声道名标注，0 dB = 不动',
          '<div class="sfld wide"><div class=trimgrid>'+ trimFields(CH) + '</div>' +
          '<div class=hint>显示的是「输出声道数」对应的实际声道。2 = 左/右；5.1 = 左/右/中置/低音/左环绕/右环绕；7.1 再加左后/右后</div></div>')
+     + sgroup('投放（UPnP）', '将本地音频流式推送到网络播放器/音箱（DLNA MediaRenderer）',
+         sel('sp_cast_dev', '目标渲染器', '<option value="">（未发现 UPnP 渲染器）</option>', '选择局域网内的 DLNA/UPnP MediaRenderer 设备')
+       + '<div class="sfld" style="display:flex;align-items:flex-end">'
+       + '<button class=btn id=sp_cast_scan>重新扫描</button>'
+       + '<span id=sp_cast_devmsg class=hint style="margin-left:10px;line-height:30px"></span>'
+       + '</div>'
+       + '<div class="sfld wide"><label>源音频文件</label>'
+       + '<div style="display:flex;gap:8px">'
+       + '<input type=text id=sp_cast_file placeholder="输入音频文件绝对路径（如 D:\\Music\\test.wav）" style="flex:1">'
+       + '<button class=btn id=sp_cast_usecur style="white-space:nowrap">用当前播放文件</button>'
+       + '</div>'
+       + '<div class=hint id=sp_cast_filehint>支持 WAV、FLAC、DSF/DFF 等本地音频格式</div>'
+       + '</div>'
+       + chk('sp_cast_dop', 'DoP 打包（DSD 源必须勾选）', false,
+             'DSD 素材（.dsf / .dff）打包为 DoP v1.1 24-bit WAV 供源；若未勾选遇 DSD 源，后端为保证音质将明确拒绝（铁律 3）')
+       + '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;margin-top:6px">'
+       + '<button class="btn pri" id=sp_cast_start>开始投放</button>'
+       + '<button class=btn id=sp_cast_stop disabled>停止投放</button>'
+       + '<span id=sp_cast_msg class=hint style="margin:0"></span>'
+       + '</div>')
+     + sgroup('投放实时状态', '1 秒自动轮询',
+         '<div class=in-stat-grid>'
+       + '<div class=in-stat-item><span class=lbl>运行阶段</span><span class=val id=sp_cast_stat_phase>已停止</span></div>'
+       + '<div class=in-stat-item><span class=lbl>目标渲染器</span><span class=val id=sp_cast_stat_dev>-</span></div>'
+       + '<div class=in-stat-item><span class=lbl>播放进度</span><span class=val id=sp_cast_stat_pos>0:00</span></div>'
+       + '<div class=in-stat-item><span class=lbl>传输状态</span><span class=val id=sp_cast_stat_transport>STOPPED</span></div>'
+       + '<div class=in-stat-item><span class=lbl>供源传输字节</span><span class=val id=sp_cast_stat_bytes>0 B</span></div>'
+       + '<div class=in-stat-item><span class=lbl>供源请求数</span><span class=val id=sp_cast_stat_reqs>0 次</span></div>'
+       + '<div class=in-stat-item><span class=lbl>供源端口</span><span class=val id=sp_cast_stat_port>8912</span></div>'
+       + '<div class=in-stat-item><span class=lbl>采样率取证</span><span class=val id=sp_cast_stat_ratematch>未取证</span></div>'
+       + '<div class=in-stat-item id=sp_cast_stat_warn_box style="grid-column:1/-1;display:none;color:var(--warn, #eab308)">'
+       + '<span class=lbl style="color:var(--warn, #eab308)">采样率告警</span><span class=val id=sp_cast_stat_warn></span></div>'
+       + '<div class=in-stat-item id=sp_cast_stat_err_box style="grid-column:1/-1;display:none;color:var(--err)">'
+       + '<span class=lbl style="color:var(--err)">错误信息</span><span class=val id=sp_cast_stat_err></span></div>'
+       + '</div>')
      + '</div>';
 
   // ---------- PCM ----------
@@ -2506,6 +2784,9 @@ function renderSettingsPage() {
       if (b.dataset.g === 'in') {
         loadInputDevices();
         pollInputState();
+      } else if (b.dataset.g === 'out') {
+        scanCastDevices(false);
+        pollCastState();
       }
     };
   });
@@ -2660,6 +2941,9 @@ function renderSettingsPage() {
   };
   drawRoots();
   initOpraControls();
+  initCastControls();
+  scanCastDevices(false);
+  pollCastState();
 }
 
 var OPRA_INDEX = null;
