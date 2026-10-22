@@ -1,0 +1,61 @@
+# ============================================================
+# RLPlayer .gitignore
+# 原则：只提交【源码 + 文档 + 资源】；产物/隐私/密钥/第三方专有软件一律不进仓库
+# ============================================================
+
+# ---------- 1. 密钥（最重要：泄露即等于把 key 公开）----------
+rlplayer-llm.conf
+**/rlplayer-llm.conf
+*.key
+*.pem
+.env
+# 本地运行配置（含曲库路径 / 设备名，属于本机状态）
+rlplayer-settings.conf
+rlplayer-library.conf
+rta-*.conf
+
+# ---------- 2. 构建产物 ----------
+/build/
+/buildwebview2/
+/dist/
+/out/
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.log
+*.log.*
+CMakeCache.txt
+CMakeFiles/
+.ninja_deps
+.ninja_log
+build.ninja
+compile_commands.json
+
+# ---------- 3. 用户数据 / 隐私 ----------
+/MUSIC/
+/rlplayer-meta/
+/rta-index.tsv
+/反馈和开发/
+/dumps/
+
+# ---------- 4. 第三方【专有软件】，不进仓库（版权/许可原因）----------
+/Tool/
+/research/naa/
+/research/strings/
+/research/strings-*.txt
+HQPlayer*.exe
+/research/hqplayer6-manual.txt
+
+# ---------- 5. 编辑器 / 工具缓存 ----------
+/.zcode/
+/.vs/
+/.vscode/
+*.user
+*.suo
+Thumbs.db
+desktop.ini

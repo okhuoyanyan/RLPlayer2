@@ -1,0 +1,361 @@
+// test_media_duration.cpp — probe_media 的时长字段（2026-10-22 跨模块缺陷的回归守卫）
+//
+// 缺陷：src/audio/media_info.h 的 MediaInfo::duration 从未被赋值 —— ffprobe 只问了
+// format_tags，没问 format=duration。后果链：
+//   ① enrich.h 的 fileSec 恒 0
+//   ② match.h 的 mf_duration 因 fileSec<=0 恒走「缺失 → 0.5 中性」
+//   ③ 于是 docs/元数据补全调研与规划.md §3 写的「时长差 ±3s 强信号」从 P1 起从未生效
+// 四源 + 未来 P3 资料层全部受影响。
+//
+// 判据设计（铁律 3）——「能证明以前是假的、现在是真的」：
+//   * 已知时长的合成 WAV（44.1kHz / 2ch / 16bit / 帧数 N）：理论值 N/44100 由测试自己算，
+//     不依赖 ffprobe 的四舍五入。断言 probe_media().duration 与理论值差 < 0.05s。
+//     缺陷态（参数里没有 format=duration）下这里是 0 → 必 FAIL（反向验证见报告）。
+//   * 端到端：拿真实 171.69s 的 FLAC 的 fileSec 喂给 rta::meta::match_detail::mf_duration，
+//     打印「fileSec=0（旧）→ 0.5 中性 / fileSec=172（新）→ 1.0 实分」对照表 —— 证明
+//     缺陷真实存在、修复真的把强信号接通了，而不只是「字段有值了」。
+//
+// 为什么单独一个文件而不并入 test_hotfix_guard.cpp：
+//   test_hotfix_guard.cpp 的头注明确承诺「全部离线：不打开音频设备、不依赖 ffmpeg」，
+//   它的合法 WAV 由 write_wav 生成、被测代码不碰外部工具。本测试的被测对象恰恰是
+//   ffprobe 的调用与输出解析，必然依赖环境里的 ffprobe（与 test_writeback.cpp 同类，
+//   属「工具缺失即失败」的环境门禁，不跳过）。把工具依赖塞进 hotfix_guard 会破坏它
+//   已写明的离线契约，也让「hotfix_guard 红了」的含义变模糊。
+//
+// ⚠️ 未解决项（铁律 4）：
+//   * 真实 FLAC 用例依赖开发机上的素材路径（可用环境变量 RTA_DURATION_FLAC 覆盖）。
+//     素材不存在时该段打印 SKIP 并把「素材缺失」计入 note，不判失败 —— 否则这个
+//     测试在别的机器上会因为「没有那首歌」而红，那是被判据误伤，不是缺陷。
+//     ⚠️ 因此「真实 FLAC 那一段」在无素材的机器上等于未验证；回归基线以合成 WAV +
+//     mf_duration 对照表为准（这两段恒执行、恒断言）。
+//   * DSD（.dsf/.dff）的真实时长未单独验证：本机 ffprobe 9.0 对 .dsf 的 format=duration
+//     读的是 data 块实际长度而不是 header 里的 sample count（实测改 header 的样本数
+//     不改变输出），也就是说 DSD 时长的口径由 ffprobe 决定，本测试不假设它。
+//     → 当前以「probe_media 对 DSD 拿不到时长则 duration=0 → match 中性」为回归基线。
+// 抑制 CRT 的 getenv 弃用警告与 C++20 u8path 弃用警告（测试里都用得到，且语义正确）
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#ifndef _SILENCE_CXX20_U8PATH_DEPRECATION_WARNING
+#define _SILENCE_CXX20_U8PATH_DEPRECATION_WARNING
+#endif
+#include "audio/media_info.h"
+#include "meta/match.h"
+#include <cstdio>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
+
+#ifdef _WIN32
+extern "C" __declspec(dllimport) int __stdcall SetConsoleOutputCP(unsigned int);
+#endif
+#ifndef CP_UTF8
+#define CP_UTF8 65001
+#endif
+
+using rta::audio::MediaInfo;
+using rta::audio::probe_media;
+
+static int g_fail = 0;
+static void ck(bool cond, const std::string& what, const std::string& detail = "") {
+    if (cond) std::printf("  [PASS] %s\n", what.c_str());
+    else { std::printf("  [FAIL] %s  %s\n", what.c_str(), detail.c_str()); ++g_fail; }
+}
+
+// UTF-8 字节串 → 文件系统路径（恒按 UTF-8 解释，不受本机 ACP=936 影响）
+static std::filesystem::path u8p(const std::string& s) {
+    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(s.data()), s.size()));
+}
+
+// ---------------- 临时文件 ----------------
+static std::string temp_dir() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path p = fs::temp_directory_path(ec);
+    if (ec || p.empty()) p = fs::path(".");
+    return p.string();
+}
+static std::string temp_file(const char* name) {
+    namespace fs = std::filesystem;
+    std::string p = (fs::path(temp_dir()) / name).string();
+    return p;
+}
+static bool write_bytes(const std::string& path, const std::vector<uint8_t>& b) {
+    std::ofstream f(u8p(path), std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    if (!b.empty()) f.write(reinterpret_cast<const char*>(b.data()), (std::streamsize)b.size());
+    f.close();
+    return true;
+}
+static void remove_file(const std::string& path) {
+    std::error_code ec;
+    std::filesystem::remove(u8p(path), ec);
+}
+
+// ---------------- 合成素材 ----------------
+// 已知帧数的 WAV：用仓库既有的 write_wav（不自己重写头，避免测试与实现同时错）
+static bool make_wav(const std::string& path, uint32_t rate, int channels, int bits, size_t frames) {
+    rta::audio::AudioBuffer a;
+    a.rate = rate; a.channels = channels; a.bits = bits; a.isFloat = false;
+    a.raw.assign(frames * (size_t)channels, 0);      // 全零样本（静音；不出声、不碰设备）
+    try { rta::audio::write_wav(path, a); } catch (const std::exception&) { return false; }
+    return true;
+}
+
+int main() {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+#endif
+    std::printf("== probe_media 时长字段：format=duration 接线回归（2026-10-22）==\n");
+
+    // ================= 0) 工具前置：本测试的被测对象就是 ffprobe 调用 =================
+    std::printf("- 0 环境前置\n");
+    {
+        const std::string ff = rta::audio::find_tool("ffprobe");
+        ck(!ff.empty(), "环境有 ffprobe（门禁前提，缺失即失败而不是跳过）",
+           "find_tool(\"ffprobe\") 为空");
+        if (ff.empty()) { std::printf("\n缺 ffprobe，门禁无法执行\n"); return 1; }
+        std::printf("    ffprobe = %s\n", ff.c_str());
+    }
+
+    // ================= 1) 解析容错（纯函数，不碰 ffprobe） =================
+    // 为什么单独测：duration 行在播放链路上被解析，「N/A → 抛异常」会让整进程死；
+    // 把 NaN/inf 交给 match 的加权和会让所有候选分数变 NaN，比不取时长更坏。
+    std::printf("- 1 duration 文本解析容错（N/A / 空 / 非数字 / 负 / NaN / inf）\n");
+    {
+        auto eq = [&](const char* text, double want, const char* what) {
+            const double got = rta::audio::probe_parse_duration(text);
+            ck(got == want, what,
+               "probe_parse_duration(\"" + std::string(text) + "\") = " + std::to_string(got) +
+               "，期望 " + std::to_string(want));
+        };
+        eq("N/A",          0.0, "字面 N/A（ffprobe 判不出时长的标准输出）→ 0");
+        eq("",             0.0, "空串 → 0");
+        eq("   ",          0.0, "全空白 → 0");
+        eq("abc",          0.0, "非数字 → 0");
+        eq("-3.5",         0.0, "负数 → 0");
+        eq("0",            0.0, "0 → 0（0 即未知）");
+        eq("nan",          0.0, "nan → 0");
+        eq("inf",          0.0, "inf → 0");
+        eq("1e400",        0.0, "1e400（strtod 溢出成 inf）→ 0");
+        eq("171.6x",       0.0, "尾部残留（不可信值）→ 0");
+        eq("171.692290", 171.692290, "正常值原样保留");
+        eq("  12.5  \r\n", 12.5, "前后空白被容忍");
+        // 最关键的一条：全程不许抛（std::stod 在 "N/A" 上会抛）
+        bool threw = false;
+        try { (void)rta::audio::probe_parse_duration("N/A"); } catch (...) { threw = true; }
+        ck(!threw, "解析不抛异常（这是播放链路，抛 = 整进程死）");
+    }
+
+    // ================= 2) 已知时长的合成 WAV：duration 必须与理论值一致 =================
+    // 判据不依赖 ffprobe 的四舍五入：理论值 = frames / rate，由测试自己算。
+    std::printf("- 2 已知时长合成素材（44.1kHz / 2ch / 16bit）\n");
+    const uint32_t kRate = 44100;
+    const size_t   kFrames = 155337;                       // 刻意不是整数秒，避免「整秒巧合」蒙对
+    const double   kTheory = (double)kFrames / (double)kRate;
+    const std::string wav = temp_file("rta_dur_known.wav");
+    MediaInfo known;
+    {
+        ck(make_wav(wav, kRate, 2, 16, kFrames), "合成 WAV 落盘（write_wav，%TEMP%）",
+           "写 "+wav+" 失败");
+        known = probe_media(wav);
+        std::printf("    理论时长 = %zu / %u = %.6f s；probe_media().duration = %.6f s\n",
+                    kFrames, kRate, kTheory, known.duration);
+        // 缺陷态下这里 duration==0 → |0-theory| = 3.52 > 0.05 → FAIL（反向验证会贴出来）
+        ck(std::fabs(known.duration - kTheory) < 0.05,
+           "duration 与理论值误差 < 0.05s（缺陷态是 0，必 FAIL）",
+           "duration=" + std::to_string(known.duration) + " theory=" + std::to_string(kTheory));
+        ck(known.duration > 0.0, "duration > 0（不再是「字段恒 0」）",
+           "duration=" + std::to_string(known.duration));
+        ck(std::isfinite(known.duration), "duration 是有限值（无 NaN/inf）");
+        // 顺带确认标签没被 format=duration 这条改动带坏（同一个解析循环）
+        ck(known.sampleRate == (int)kRate && known.channels == 2,
+           "同一命令里流级参数/标签解析未被破坏",
+           "rate=" + std::to_string(known.sampleRate) + " ch=" + std::to_string(known.channels));
+    }
+
+    // ================= 3) 损坏 / 空 / 判不出时长的文件 → duration == 0，不 NaN、不抛 =================
+    std::printf("- 3 损坏/空/无时长文件 → 0（不 NaN、不抛）\n");
+    {
+        auto expect_zero = [&](const char* name, const std::vector<uint8_t>& bytes, const char* what) {
+            const std::string p = temp_file(name);
+            ck(write_bytes(p, bytes), std::string("构造 ") + name, "写盘失败");
+            bool threw = false;
+            MediaInfo mi;
+            try { mi = probe_media(p); } catch (...) { threw = true; }
+            ck(!threw, std::string(what) + "：不抛异常");
+            ck(mi.duration == 0.0, std::string(what) + "：duration == 0",
+               "duration=" + std::to_string(mi.duration));
+            ck(std::isfinite(mi.duration), std::string(what) + "：duration 有限");
+            remove_file(p);
+        };
+        expect_zero("rta_dur_empty.wav", {}, "空文件（ffprobe 非 0 退出）");
+        expect_zero("rta_dur_junk.bin", std::vector<uint8_t>(512, 0x5A), "垃圾字节（ffprobe 非 0 退出）");
+
+        // 1x1 PNG：ffprobe 退出码 0，但输出字面量 "duration=N/A" —— 专测 N/A 分支
+        // （空文件走的是「非 0 退出码」分支，测不到 N/A；两者都要覆盖）
+        static const uint8_t png[] = {
+            0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,0,0,0,0x0D,0x49,0x48,0x44,0x52,
+            0,0,0,1,0,0,0,1,8,6,0,0,0,0x1F,0x15,0xC4,0x89,0,0,0,0x0A,0x49,0x44,0x41,
+            0x54,0x78,0x9C,0x63,0,1,0,0,5,0,1,0x0D,0x0A,0x2D,0xB4,0,0,0,0,0x49,
+            0x45,0x4E,0x44,0xAE,0x42,0x60,0x82
+        };
+        expect_zero("rta_dur_px.png", std::vector<uint8_t>(png, png + sizeof(png)),
+                    "1x1 PNG（ffprobe 输出 duration=N/A）");
+
+        // 0 帧的合法 WAV：同样走 N/A
+        const std::string zeroWav = temp_file("rta_dur_zero.wav");
+        if (make_wav(zeroWav, 44100, 2, 16, 0)) {
+            MediaInfo mi;
+            bool threw = false;
+            try { mi = probe_media(zeroWav); } catch (...) { threw = true; }
+            ck(!threw && mi.duration == 0.0, "0 帧合法 WAV：duration == 0 且不抛",
+               "duration=" + std::to_string(mi.duration));
+            remove_file(zeroWav);
+        } else {
+            ck(false, "0 帧合法 WAV：构造失败（write_wav 不接受空缓冲？）");
+        }
+        // 不存在的文件：不得抛（播放链路里路径可能刚被移走）
+        {
+            bool threw = false;
+            MediaInfo mi;
+            try { mi = probe_media(temp_file("rta_dur_no_such_file.flac")); } catch (...) { threw = true; }
+            ck(!threw && mi.duration == 0.0, "不存在的文件：duration == 0 且不抛",
+               "threw=" + std::to_string((int)threw));
+        }
+    }
+
+    // ================= 4) enrich 侧派生：整秒转换（含溢出防御） =================
+    std::printf("- 4 enrich 侧派生 (int)(duration+0.5) 与溢出防御\n");
+    {
+        using rta::audio::media_duration_sec;
+        const int secTheory = (int)(kTheory + 0.5);      // 3.522... → 4
+        ck(media_duration_sec(known.duration) == secTheory,
+           "合成素材 → fileSec 等于理论整秒（四舍五入）",
+           "got=" + std::to_string(media_duration_sec(known.duration)) +
+           " want=" + std::to_string(secTheory));
+        ck(media_duration_sec(171.692290) == 172, "171.692290 → 172（真实 FLAC 的值）",
+           "got=" + std::to_string(media_duration_sec(171.692290)));
+        ck(media_duration_sec(0.0) == 0 && media_duration_sec(-1.0) == 0,
+           "0 / 负数 → 0（未知）");
+        ck(media_duration_sec(std::nan("")) == 0, "NaN → 0");
+        ck(media_duration_sec(HUGE_VAL) == 0 && media_duration_sec(-HUGE_VAL) == 0, "±inf → 0");
+        ck(media_duration_sec(86400.0) == 86400, "恰好 24 小时 → 保留 86400（上限本身不算越界）",
+           "got=" + std::to_string(media_duration_sec(86400.0)));
+        ck(media_duration_sec(86401.0) == 0, "超过 24 小时 → 判为头损坏，退回 0（未知）",
+           "got=" + std::to_string(media_duration_sec(86401.0)));
+        // 这条是「溢出真的会发生」的证据：旧公式 (int)(d+0.5) 在 d+0.5 > INT_MAX 时是
+        // 未定义行为（本机 clang/x86-64 实测 1e10 → -4）。测试不重演 UB，只断言新转换
+        // 在这段区间给 0，并打印旧公式的越界区间。
+        ck((double)2147483647 > kTheory, "理论值远在 int 可表示范围内（正常素材不受上限影响）");
+        ck(media_duration_sec(1e10) == 0,
+           "1e10 秒（> INT_MAX 秒）→ 0，不产生负数",
+           "got=" + std::to_string(media_duration_sec(1e10)));
+        std::printf("    旧公式越界区间: d+0.5 > 2147483647 ⇔ d > 2147483646.5 秒（≈68 年）；"
+                    "新转换在此区间返回 0 = 未知\n");
+    }
+
+    // ================= 5) 端到端证据：时长强信号真的接通了 =================
+    // 这是本缺陷的核心判据：不是「字段有值」，而是「match 的分数从恒中性变成实分」。
+    std::printf("- 5 端到端：mf_duration / match_score_detail 的旧/新对照\n");
+    {
+        using namespace rta::meta;
+        // 真实文件 171.692290s → 旧 fileSec=0 / 新 fileSec=172；候选按 171s 报（常见平台口径）
+        const int candMs = 171000;
+        const int oldSec = 0;                       // 缺陷态：probe_media 不取时长 → enrich 恒 0
+        const int newSec = rta::audio::media_duration_sec(171.692290);   // = 172
+
+        const match_detail::mf_tagged dOld = match_detail::mf_duration(oldSec, candMs);
+        const match_detail::mf_tagged dNew = match_detail::mf_duration(newSec, candMs);
+        std::printf("    | fileSec | candMs | durScore | dur tag | 语义                 |\n");
+        std::printf("    | %7d | %6d | %8.2f | %-7s | 缺失 → 中性降级      |\n",
+                    oldSec, candMs, dOld.score, dOld.tag.c_str());
+        std::printf("    | %7d | %6d | %8.2f | %-7s | 差 1s → 强信号命中   |\n",
+                    newSec, candMs, dNew.score, dNew.tag.c_str());
+
+        ck(oldSec == 0, "缺陷态 fileSec == 0（旧行为）");
+        ck(dOld.score == 0.5 && dOld.tag == "na", "旧：fileSec=0 → 0.5 中性 / tag=na",
+           "score=" + std::to_string(dOld.score) + " tag=" + dOld.tag);
+        ck(newSec == 172, "新：171.692290s → fileSec=172",
+           "got=" + std::to_string(newSec));
+        ck(dNew.score == 1.0 && dNew.tag == "ok:1s", "新：|172000-171000|=1000ms ≤ 3s → 1.0 / tag=ok:1s",
+           "score=" + std::to_string(dNew.score) + " tag=" + dNew.tag);
+        ck(dNew.score > dOld.score, "强信号确实从「中性」变成「命中」（这就是缺陷的实体）");
+
+        // 错候选对照：差 > 10s 时新口径直接判 far=0，中性则放过 —— 说明修好之后既
+        // 会加分、也会减分（这才是有判别力的信号）
+        const int wrongMs = 200000;                 // 200s，与 172s 差 28s
+        const match_detail::mf_tagged wOld = match_detail::mf_duration(oldSec, wrongMs);
+        const match_detail::mf_tagged wNew = match_detail::mf_duration(newSec, wrongMs);
+        std::printf("    | %7d | %6d | %8.2f | %-7s | 错候选（差 28s）中性放过 |\n",
+                    oldSec, wrongMs, wOld.score, wOld.tag.c_str());
+        std::printf("    | %7d | %6d | %8.2f | %-7s | 错候选被时长否掉          |\n",
+                    newSec, wrongMs, wNew.score, wNew.tag.c_str());
+        ck(wOld.score == 0.5 && wNew.score == 0.0 && wNew.tag == "far",
+           "新口径会把错候选判 far=0（旧口径恒 0.5，无判别力）",
+           "old=" + std::to_string(wOld.score) + " new=" + std::to_string(wNew.score) +
+           " tag=" + wNew.tag);
+
+        // 总分层面（0.55*title + 0.30*artist + 0.15*duration）：title/artist 都对时，
+        // 时长信号把总分从 0.925 抬到 1.000
+        Candidate c;
+        c.title = "T"; c.artist = "A"; c.album = ""; c.durationMs = candMs;
+        const Scored so = match_score_detail("T", "A", "", oldSec, c);
+        const Scored sn = match_score_detail("T", "A", "", newSec, c);
+        std::printf("    match_score_detail: 旧 total=%.3f (%s) / 新 total=%.3f (%s)\n",
+                    so.score, so.why.c_str(), sn.score, sn.why.c_str());
+        ck(so.score == 0.925 && sn.score == 1.0,
+           "总分 0.55+0.30+0.15：旧 0.925 → 新 1.000",
+           "old=" + std::to_string(so.score) + " new=" + std::to_string(sn.score));
+        ck(so.why.find("dur:na") != std::string::npos && sn.why.find("dur:ok:") != std::string::npos,
+           "why 串如实反映 dur 分项（na → ok:1s）", sn.why);
+    }
+
+    // ================= 6) 真实 FLAC（素材存在时） =================
+    // 路径用 UTF-8 字节拼（不受编译器 source/execution charset 影响）；可用环境变量覆盖。
+    std::printf("- 6 真实 FLAC 时长（ffprobe 端到端；素材缺失则如实标注未验证）\n");
+    {
+        // D:\RTA-hqplayer\MUSIC\专辑-原创&同人\22号咖啡馆的平安夜 @ 熊青嵐\1 姜饼游行.flac
+        const std::string u8path = std::string(
+            "\x44\x3A\x5C\x52\x54\x41\x2D\x68\x71\x70\x6C\x61\x79\x65\x72\x5C\x4D\x55\x53\x49\x43"
+            "\x5C\xE4\xB8\x93\xE8\xBE\x91\x2D\xE5\x8E\x9F\xE5\x88\x9B\x26\xE5\x90\x8C\xE4\xBA\xBA"
+            "\x5C\x32\x32\xE5\x8F\xB7\xE5\x92\x96\xE5\x95\xA1\xE9\xA6\x86\xE7\x9A\x84\xE5\xB9\xB3"
+            "\xE5\xAE\x89\xE5\xA4\x9C\x20\x40\x20\xE7\x86\x8A\xE9\x9D\x92\xE5\xB5\x90\x5C\x31\x20"
+            "\xE5\xA7\x9C\xE9\xA5\xBC\xE6\xB8\xB8\xE8\xA1\x8C\x2E\x66\x6C\x61\x63");
+        std::string path = u8path;
+        if (const char* env = std::getenv("RTA_DURATION_FLAC")) path = env;
+
+        std::error_code ec;
+        const bool exists = std::filesystem::exists(u8p(path), ec) && !ec;
+        if (!exists) {
+            std::printf("    [SKIP] 素材不存在，此段未验证（铁律 4 如实标注）：%s\n", path.c_str());
+            std::printf("    可用环境变量 RTA_DURATION_FLAC=<flac 路径> 指定素材后复跑。\n");
+        } else {
+            const MediaInfo mi = probe_media(path);
+            std::printf("    真实 FLAC duration = %.6f s，fileSec = %d\n",
+                        mi.duration, rta::audio::media_duration_sec(mi.duration));
+            ck(mi.duration > 0.0, "真实 FLAC 能取到时长（旧代码这里是 0）",
+               "duration=" + std::to_string(mi.duration));
+            ck(std::fabs(mi.duration - 171.692290) < 1.0,
+               "真实 FLAC 时长 ≈ 171.69s（ffprobe 实测 171.692290）",
+               "duration=" + std::to_string(mi.duration));
+            ck(rta::audio::media_duration_sec(mi.duration) == 172,
+               "真实 FLAC → fileSec = 172（喂给 match 的就是这个值）",
+               "fileSec=" + std::to_string(rta::audio::media_duration_sec(mi.duration)));
+            // 标签没被这条改动带坏（同一个解析循环，回归守卫）
+            ck(!mi.title.empty() && !mi.artist.empty() && !mi.album.empty(),
+               "真实 FLAC 的 title/artist/album 照旧解析出来",
+               "title=[" + mi.title + "] artist=[" + mi.artist + "] album=[" + mi.album + "]");
+        }
+    }
+
+    remove_file(wav);
+
+    std::printf("\n%s\n", g_fail == 0 ? "全部通过" : (std::to_string(g_fail) + " 项失败").c_str());
+    return g_fail == 0 ? 0 : 1;
+}

@@ -1,0 +1,458 @@
+// uicheck.js — 用 CDP 真跑一遍网页界面（点专辑、看曲目、抓 JS 异常）
+//
+// 为什么需要它：界面里任何一个 null 元素都会让后续所有事件绑定静默失效
+// （本项目真踩过：D('bStop') 为 null，导致下一首/暂停/拖动进度全部失灵，
+//   而页面本身看起来完全正常）。所以必须真的在浏览器里跑一遍并收集异常。
+//
+// 用法：node tools/uicheck.js <url> [截图输出目录]
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const URL_ = process.argv[2] || 'http://127.0.0.1:8902/';
+const OUT = process.argv[3] || path.join(os.tmpdir(), 'rta_uicheck');
+fs.mkdirSync(OUT, { recursive: true });
+
+const EDGE = ['C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+              'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'].find(p => fs.existsSync(p));
+if (!EDGE) { console.error('找不到 Edge'); process.exit(2); }
+
+// 端口和用户目录都带随机后缀：否则上一次没退干净的 headless Edge 会占着 9333，
+// 新实例连不上，自检就假失败（本项目刚踩过）
+const PORT = 9400 + Math.floor(Math.random() * 400);
+const udd = path.join(os.tmpdir(), 'edge_uicheck_' + process.pid + '_' + Date.now());
+const child = spawn(EDGE, ['--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+  '--user-data-dir=' + udd, '--remote-debugging-port=' + PORT, '--window-size=1600,1000', 'about:blank'],
+  { stdio: 'ignore' });
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function targets() {
+  for (let i = 0; i < 60; i++) {
+    try {
+      const r = await fetch('http://127.0.0.1:' + PORT + '/json/list');
+      const j = await r.json();
+      const p = j.filter(t => t.type === 'page');
+      if (p.length) return p;
+    } catch (e) { /* 还没起来 */ }
+    await sleep(250);
+  }
+  throw new Error('DevTools 端口没起来');
+}
+
+let ws, msgId = 0;
+const pending = new Map();
+const errors = [];
+
+function send(method, params) {
+  return new Promise((res, rej) => {
+    const id = ++msgId;
+    pending.set(id, { res, rej });
+    ws.send(JSON.stringify({ id, method, params: params || {} }));
+  });
+}
+async function evalJs(expr) {
+  const r = await send('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true });
+  if (r.exceptionDetails) {
+    const d = r.exceptionDetails;
+    const msg = (d.exception && (d.exception.description || d.exception.value)) || d.text || JSON.stringify(d);
+    throw new Error('JS 异常: ' + msg + '\n  表达式: ' + String(expr).slice(0, 160));
+  }
+  return r.result && r.result.value;
+}
+async function shot(name) {
+  const r = await send('Page.captureScreenshot', { format: 'png' });
+  const p = path.join(OUT, name + '.png');
+  fs.writeFileSync(p, Buffer.from(r.data, 'base64'));
+  return p;
+}
+async function waitFor(expr, ms = 8000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    if (await evalJs('!!(' + expr + ')')) return true;
+    await sleep(120);
+  }
+  return false;
+}
+
+(async () => {
+  const pages = await targets();
+  ws = new WebSocket(pages[0].webSocketDebuggerUrl);
+  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.id && pending.has(m.id)) {
+      const p = pending.get(m.id); pending.delete(m.id);
+      m.error ? p.rej(new Error(JSON.stringify(m.error))) : p.res(m.result);
+    } else if (m.method === 'Runtime.exceptionThrown') {
+      errors.push('exception: ' + (m.params.exceptionDetails.exception && m.params.exceptionDetails.exception.description || m.params.exceptionDetails.text));
+    } else if (m.method === 'Runtime.consoleAPICalled' && m.params.type === 'error') {
+      errors.push('console.error: ' + m.params.args.map(a => a.value || a.description || '').join(' '));
+    }
+  };
+  await send('Runtime.enable');
+  await send('Page.enable');
+  await send('Log.enable');
+
+  const results = [];
+  const ck = (ok, what, detail) => { results.push((ok ? '  [PASS] ' : '  [FAIL] ') + what + (detail ? '  ' + detail : '')); return ok; };
+
+  await send('Page.navigate', { url: URL_ });
+  await sleep(400);
+  ck(await waitFor("document.querySelector('#list') && document.querySelector('#list').children.length"), '首屏渲染出内容');
+  await sleep(900);
+  const cards = await evalJs("document.querySelectorAll('.card').length");
+  ck(cards > 0, '专辑卡片渲染', cards + ' 张');
+  // 注意：判据要限定在 #list 内 —— 队列为空时右侧也会有一个 .empty，
+  // 用 document.querySelector 会误判（这个判据本身错过一次）
+  ck(await evalJs("!document.querySelector('#list .empty')"), '主内容区没有落到空状态');
+  const p1 = await shot('01-albums');
+
+  // 点第一张专辑
+  await evalJs("document.querySelector('.card').click()");
+  ck(await waitFor("document.querySelector('.ahead') || document.querySelector('.empty')"), '专辑页打开');
+  await sleep(500);
+  const tr = await evalJs("document.querySelectorAll('.trow').length");
+  ck(tr > 0, '曲目列表非空', tr + ' 首');
+  const p2 = await shot('02-album');
+
+  // 曲目视图
+  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='tracks').click()");
+  await sleep(700);
+  ck(await evalJs("document.querySelectorAll('.trow').length > 0"), '曲目视图有内容');
+  const p3 = await shot('03-tracks');
+
+  // 艺术家
+  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='artists').click()");
+  await sleep(700);
+  const arts = await evalJs("document.querySelectorAll('.card').length");
+  ck(arts > 0, '艺术家视图有内容', arts + ' 位');
+
+  // 文件夹
+  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='files').click()");
+  await sleep(700);
+  ck(await evalJs("document.querySelectorAll('.row').length > 0"), '文件夹视图有内容');
+  const p4 = await shot('04-files');
+
+  // 设置面板 + 队列面板
+  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='settings').click()");
+  await sleep(400);
+  ck(await evalJs("document.getElementById('setpage').classList.contains('on')"), '设置页可打开');
+  ck(await evalJs("document.getElementById('app').classList.contains('noq')"), '设置页隐藏右侧队列栏');
+  ck(await evalJs("document.getElementById('roots2').children.length >= 0"), '库目录列表已渲染');
+  const p5 = await shot('05-settings');
+
+  // ---- 新增：主题 / 完整设置页 ----
+  ck(await evalJs("document.querySelectorAll('.sw').length === 3"), '三个主题切换按钮存在');
+  await evalJs("document.querySelector('.sw[data-theme=light]').click()");
+  await sleep(300);
+  ck(await evalJs("document.documentElement.dataset.theme === 'light'"), '可以切到白色主题');
+  const th1 = await shot('17-theme-light');
+  await evalJs("document.querySelector('.sw[data-theme=blue]').click()");
+  await sleep(300);
+  ck(await evalJs("document.documentElement.dataset.theme === 'blue'"), '可以切到浅蓝主题');
+  const th2 = await shot('18-theme-blue');
+  await evalJs("document.querySelector('.sw[data-theme=dark]').click()");
+  await sleep(250);
+  ck(await evalJs("document.documentElement.dataset.theme === 'dark'"), '可以切回深色主题');
+
+  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='settings').click()");
+  await sleep(600);
+  ck(await evalJs("document.getElementById('setpage').classList.contains('on')"), '设置页可打开');
+  const tabOrder = await evalJs("Array.from(document.querySelectorAll('.stab')).map(e=>e.textContent).join('/')");
+  // 2026-10-22 功能3：「诊断」独立成页，排在元数据之后
+  ck(tabOrder === '输入/输出/PCM/SDM/高级/元数据/诊断',
+     '设置页签顺序为 输入/输出/PCM/SDM/高级/元数据/诊断', tabOrder);
+  await evalJs("document.querySelector('.stab[data-g=pcm]').click()");
+  await sleep(200);
+  ck(await evalJs("!document.getElementById('sp_trim0') || !document.getElementById('sp_trim0').offsetParent"), '声道微调只出现在输出页');
+  ck(await evalJs("!!document.getElementById('sp_sdmo1') && !!document.getElementById('sp_dsdrate')"), 'SDM 页有 Oversampling 与比特率');
+  ck(await evalJs("!!document.getElementById('sp_dsdkind') && !!document.getElementById('sp_dsdconv') && !!document.getElementById('sp_dsdkind').onchange && !!document.getElementById('sp_dsdconv').onchange"), 'SDM 页有 DSD 源抽取器 / Conversion 下拉且已绑定');
+  // ---- DirectSDM 开关（本轮新增）：存在 / 在 SDM 页 / 能落盘 / 跑完还原 ----
+  const origDm = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>({dm:j.kv.directsdm||'0', vol:j.kv.volume||'0'}))");
+  await evalJs("document.querySelector('.stab[data-g=sdm]').click()");
+  await sleep(200);
+  ck(await evalJs("(function(){var e=document.getElementById('sp_directsdm');return !!e&&e.type==='checkbox'&&e.closest('.spane')&&e.closest('.spane').dataset.g==='sdm';})()"),
+     'SDM 页有 DirectSDM 开关（且只在 SDM 页）');
+  ck(await evalJs("!!document.getElementById('sp_directsdm').onchange"), 'DirectSDM 开关已绑定事件');
+  await evalJs("var e=document.getElementById('sp_directsdm'); e.checked=true; e.dispatchEvent(new Event('change'));");
+  await sleep(1500);
+  const dm1 = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.directsdm)");
+  ck(String(dm1) === '1', 'DirectSDM 开关能保存到后端', 'directsdm=' + dm1);
+  await evalJs("var e=document.getElementById('sp_directsdm'); e.checked=" + (origDm.dm === '1') + "; e.dispatchEvent(new Event('change'));");
+  await sleep(1500);
+  const dm2 = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.directsdm)");
+  ck(String(dm2) === String(origDm.dm), 'DirectSDM 开关还原', 'directsdm=' + dm2 + '（原值 ' + origDm.dm + '）');
+  // 开关会把音量压到 0 dB，必须一起还原（自检不许改用户设置）
+  await evalJs("S.vol=" + Number(origDm.vol) + "; var v=document.getElementById('vol'); if(v) v.value=" + Number(origDm.vol) + "; saveSettings();");
+  await sleep(1200);
+  const volBack = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.volume)");
+  ck(String(volBack) === String(origDm.vol), 'DirectSDM 自检后音量还原', 'volume=' + volBack + '（原值 ' + origDm.vol + '）');
+  // ---- 本轮新增：元数据补全页（分组 / 动态源开关 / metaon 往返 / 诊断按钮）----
+  await evalJs("document.querySelector('.stab[data-g=meta]').click()");
+  await sleep(250);
+  ck(await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=meta]');if(!p||!p.classList.contains('on'))return false;var g=false;Array.prototype.forEach.call(p.querySelectorAll('.sghead'),function(e){if(e.textContent.indexOf('元数据补全')>=0)g=true});return g;})()"),
+     '元数据页有「元数据补全」分组（且页签能切过去）');
+  // P1.5：源开关动态渲染 —— /api/providers 返回注册表，页面必须按 items 逐源渲染出
+  // sp_meta_<id> 开关（旧的六开关硬编码断言已改为动态版）。
+  const provs = await evalJs("fetch('/api/providers').then(r=>r.json())");
+  // 注册表项数随「新增数据源」增长（P1.5 四源 → 2026-10-22 dizzylab 接入后五源）。
+  // 判据：至少 4 项 + 下面按 id 逐项核对能力位；**不写死总数**，否则每次加源都要改测试
+  //（这与「加源=一个描述符+两函数，零接线」的设计目标相悖）。
+  ck(provs && provs.ok === true && Array.isArray(provs.items) && provs.items.length >= 4,
+     '/api/providers 返回 ≥4 项注册表', JSON.stringify(provs && provs.items && provs.items.map(i => i.id)));
+  if (provs && provs.ok && Array.isArray(provs.items)) {
+    const caps = provs.items.map(i => i.id + ':' + (i.canSearch ? 'S' : '-') + (i.canLyric ? 'L' : '-') + ':' + i.name).join(' ');
+    ck(provs.items.some(i => i.id === 'qq' && i.canSearch && i.canLyric) &&
+       provs.items.some(i => i.id === 'netease' && i.canSearch && i.canLyric) &&
+       provs.items.some(i => i.id === 'itunes' && i.canSearch && !i.canLyric) &&
+       provs.items.some(i => i.id === 'lrclib' && !i.canSearch && i.canLyric),
+       '注册表能力位正确(qq/netease=搜索+歌词, itunes=仅搜索, lrclib=仅歌词)', caps);
+    // dizzylab（2026-10-22 接入）：同人第一优先源，只搜不取词 —— 如实标注 canLyric=false
+    ck(provs.items.some(i => i.id === 'dizzylab' && i.canSearch && !i.canLyric),
+       'dizzylab 已注册且 canLyric=false（无歌词接口，如实）', caps);
+    // 顺序也断言：dizzylab 必须排在 qq 之前（同人优先），但采纳门槛不变
+    ck(provs.items.findIndex(i => i.id === 'dizzylab') >= 0 &&
+       provs.items.findIndex(i => i.id === 'dizzylab') < provs.items.findIndex(i => i.id === 'qq'),
+       '注册表顺序：dizzylab 排在 qq 之前（同人优先）', caps);
+    const metaMiss = await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=meta]');var miss=[];var items=" + JSON.stringify(provs.items.map(i => i.id)) + ";items.forEach(function(id){var i='sp_meta_'+id;var e=document.getElementById(i);if(!e||e.type!=='checkbox'||!p.contains(e)||!e.onchange)miss.push(i)});var box=document.getElementById('sp_metasrc');if(!box||!p.contains(box))miss.push('sp_metasrc:容器缺失');return miss;})()");
+    ck(Array.isArray(metaMiss) && metaMiss.length === 0,
+       '页面按 /api/providers 渲染出对应源开关且已绑定事件', JSON.stringify(metaMiss));
+    // 动态开关往返：关 metasrc_qq → 落盘 → 还原（不裸 POST，走 UI onchange → saveSettings）
+    const qqItem = provs.items.find(i => i.id === 'qq');
+    const origQq = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasrc_qq||j.kv.metaqq||'1')"));
+    await evalJs("var e=document.getElementById('sp_meta_qq'); e.checked=false; e.dispatchEvent(new Event('change'));");
+    await sleep(1300);
+    const qOff = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasrc_qq)"));
+    ck(qOff === '0' && String(qqItem.on) === String(origQq === '1'),
+       '关「QQ音乐」源开关能保存到后端(metasrc_qq)', 'metasrc_qq=' + qOff + '（原值 ' + origQq + '）');
+    await evalJs("var e=document.getElementById('sp_meta_qq'); e.checked=" + (origQq === '1') + "; e.dispatchEvent(new Event('change'));");
+    await sleep(1300);
+    const qBack = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasrc_qq)"));
+    ck(qBack === origQq, '「QQ音乐」源开关往返还原', 'metasrc_qq=' + qBack + '（原值 ' + origQq + '）');
+  }
+  // 总开关与 DeepSeek 开关保持固定
+  const metaFix = await evalJs("(function(){var ids=['sp_metaon','sp_metallm'];var p=document.querySelector('#setpage .spane[data-g=meta]');var miss=[];ids.forEach(function(i){var e=document.getElementById(i);if(!e||e.type!=='checkbox'||!p.contains(e)||!e.onchange)miss.push(i)});return miss;})()");
+  ck(Array.isArray(metaFix) && metaFix.length === 0, '总开关与 DeepSeek 开关存在且已绑定', JSON.stringify(metaFix));
+  // metaon 关→开：走 UI 开关（onchange → saveSettings → POST /api/settings），往返一致。
+  // 注意不能裸 POST 单键：/api/settings 的 POST 是整文件重写，只发一个键会把其余设置全抹掉。
+  const origMetaon = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metaon||'1')"));
+  await evalJs("var e=document.getElementById('sp_metaon'); e.checked=false; e.dispatchEvent(new Event('change'));");
+  await sleep(1300);
+  const mOff = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metaon)"));
+  ck(mOff === '0', '关闭「自动补全」能保存到后端', 'metaon=' + mOff);
+  await evalJs("var e=document.getElementById('sp_metaon'); e.checked=" + (origMetaon === '1') + "; e.dispatchEvent(new Event('change'));");
+  await sleep(1300);
+  const mBack = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metaon)"));
+  ck(mBack === origMetaon, '「自动补全」往返还原', 'metaon=' + mBack + '（原值 ' + origMetaon + '）');
+  // ---- 功能4（2026-10-22）：DeepSeek API Key 的界面入口 ----
+  // 判据是可判定的三条红线，不看文案：
+  //   ① 输入框在「元数据补全」分组里、type=password、初始为空（不回填明文）；
+  //   ② GET /api/llm 只回「是否已配置 + 掩码」，响应文本里不得有任何完整 sk- key；
+  //   ③ 空 POST 必须被拒绝 —— 否则 GET/POST 撞车或前端 bug 一次就能清空用户 key。
+  // 本自检【绝不写真实 key】：不点保存、不清除，只验存在性与掩码契约。
+  ck(await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=meta]');var e=document.getElementById('sp_llmkey');if(!p||!e||!p.contains(e))return 'missing-or-not-in-meta';if(e.type!=='password')return 'type='+e.type;if(String(e.value)!=='')return 'value-not-empty';return 'ok';})()") === 'ok',
+     '元数据页有 API Key 输入框（password 类型、在元数据分组内、初始为空）');
+  ck(await evalJs("!!document.getElementById('sp_llmsave') && !!document.getElementById('sp_llmsave').onclick && !!document.getElementById('sp_llmtest') && !!document.getElementById('sp_llmtest').onclick && !!document.getElementById('sp_llmclear') && !!document.getElementById('sp_llmclear').onclick"),
+     '保存 Key / 测试连接 / 清除 Key 三个按钮存在且已绑定');
+  const llm1 = await evalJs("fetch('/api/llm').then(function(r){return r.json()})");
+  const llmMaskOk = await evalJs("fetch('/api/llm').then(r=>r.json()).then(function(j){if(!j||j.ok!==true)return 'no-ok';if(typeof j.configured!=='boolean')return 'no-configured';if(!j.path||!/rlplayer-llm\\.conf$/.test(j.path))return 'path='+j.path;if(!j.configured)return j.masked===''?'ok':'masked-nonempty';return (/^\\*{4}$/.test(j.masked)||/^.{3}\\*{4}.{4}$/.test(j.masked))?'ok':'masked='+j.masked;})");
+  ck(llmMaskOk === 'ok', 'GET /api/llm 只返回「已配置 + 掩码」且路径指向 rlplayer-llm.conf', String(llmMaskOk));
+  ck(llm1 && llm1.ok === true && llm1.apiKey === undefined && llm1.key === undefined,
+     'GET /api/llm 没有 apiKey/key 明文字段', JSON.stringify(Object.keys(llm1 || {})));
+  ck(await evalJs("fetch('/api/llm').then(r=>r.text()).then(function(t){return !/sk-[A-Za-z0-9_-]{16,}/.test(t);})"),
+     'GET /api/llm 响应文本中没有任何完整 key（无 sk- 长串）');
+  ck(await evalJs("(function(){var m=document.getElementById('sp_llmmsg');if(!m)return false;var t=m.textContent||'';return t.length>0 && !/sk-[A-Za-z0-9_-]{16,}/.test(t);})()"),
+     '状态提示只显示掩码，不含明文 key');
+  ck(await evalJs("!/sk-[A-Za-z0-9_-]{16,}/.test(document.documentElement.outerHTML)"),
+     '整个页面 DOM 不含任何 key 明文');
+  const emptyPost = await evalJs("fetch('/api/llm',{method:'POST',body:''}).then(r=>r.json())");
+  ck(!!emptyPost && emptyPost.ok === false, '空 POST 被拒绝（不会误清空已配置的 key）', JSON.stringify(emptyPost));
+  ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=meta] a[href^=http]').length === 0"), 'API Key 小节无外链');
+  // ---- 诊断页签（2026-10-22 功能3：从元数据组独立出来，且改为导出 ZIP）----
+  // 判据按用户原话来：
+  //   ① 独立选项卡（在 .stabs 里，与输入/输出/PCM/SDM/高级/元数据平级）；
+  //   ② 不再藏在元数据分组里；
+  //   ③ 导出的是【一个 ZIP】，不是三份文件 —— 用端点真实返回的魔数验证，不看文案。
+  ck(await evalJs("Array.from(document.querySelectorAll('.stab')).map(function(e){return e.textContent}).indexOf('诊断') >= 0"),
+     '设置页有独立的「诊断」页签');
+  ck(await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=diag]');return !!p && p.dataset.g==='diag';})()"),
+     '「诊断」是独立分页（.spane[data-g=diag]），不是塞在别的页里');
+  ck(await evalJs("(function(){var m=document.querySelector('#setpage .spane[data-g=meta]');return m ? !m.contains(document.getElementById('sp_diagzip')) : false;})()"),
+     '诊断导出按钮不在元数据分组里（已移出）');
+  ck(await evalJs("!document.getElementById('sp_diag')"), '旧的单一 JSON「导出诊断信息」按钮已移除（sp_diag 不存在）');
+  await evalJs("document.querySelector('.stab[data-g=diag]').click()");
+  await sleep(250);
+  ck(await evalJs("document.querySelector('#setpage .spane[data-g=diag]').classList.contains('on')"),
+     '诊断页签能切过去');
+  ck(await evalJs("!!document.getElementById('sp_diagzip') && !!document.getElementById('sp_diagzip').onclick && document.getElementById('sp_diagzip').textContent.indexOf('zip') >= 0"),
+     '「导出诊断包（.zip）」按钮存在且已绑定');
+  ck(await evalJs("!!document.getElementById('sp_diagjson') && document.getElementById('sp_diagjson').onclick"),
+     '「只要 JSON」按钮保留（有人只想贴文本）');
+  ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=diag] a[href^=http]').length === 0"),
+     '诊断页无外链');
+  // 端点必须真的返回 ZIP（PK\3\4）。只看文案会被"接口挂了但按钮还在"骗过。
+  const zipSig = await evalJs("fetch('/api/diagzip').then(function(r){return r.arrayBuffer()}).then(function(b){var v=new Uint8Array(b);return b.byteLength+':'+v[0]+','+v[1]+','+v[2]+','+v[3]}).catch(function(){return 'fail'})");
+  const zipOk = typeof zipSig === 'string' && zipSig.indexOf(':80,75,3,4') > 0;
+  ck(zipOk, '/api/diagzip 返回真 ZIP（魔数 PK\\3\\4）', 'sig=' + zipSig);
+  // 打诊断包会读日志（最大 2MB×3），HTTP 服务是阻塞式单线程（webui.h 头注）——
+  // 不等它排空，后面的设置/搜索断言会被排队拖慢而假失败。
+  await sleep(900);
+  // ---- P2：标签写回小节（说明 / 预览 / 执行按钮）----
+  // 注意：这里【绝不点「执行写回」】—— 自检可能跑在有 MetaStore 记录的实例上，
+  // 点了会真的写标签。只验元素存在、预览（纯只读扫描）出 toast、按钮绑定齐全。
+  const wbSec = await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=meta]');var d=document.getElementById('sp_wbdesc');var a=document.getElementById('sp_wbdry');var b=document.getElementById('sp_wbapply');if(!p)return 'no-meta-pane';if(!d||!a||!b)return 'missing';if(!p.contains(d)||!p.contains(a)||!p.contains(b))return 'not-in-meta';if(d.textContent.indexOf('写回')<0||d.textContent.indexOf('逐位不变')<0||d.textContent.indexOf('backups')<0)return 'desc-text';return 'ok';})()");
+  ck(wbSec === 'ok', '写回小节：说明（逐位不变 + 备份到 backups）与两按钮存在', String(wbSec));
+  ck(await evalJs("!!document.getElementById('sp_wbdry').onclick && !!document.getElementById('sp_wbapply').onclick && document.getElementById('sp_wbdry').classList.contains('btn') && document.getElementById('sp_wbapply').classList.contains('btn')"), '预览/执行按钮是 .btn 且已绑定事件');
+  ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=meta] a[href^=http]').length === 0"), '写回小节无外链');
+  await evalJs("document.getElementById('sp_wbdry').click()");
+  ck(await waitFor("(function(){var t=document.getElementById('toast');return t&&t.classList.contains('on')&&t.textContent.indexOf('首可写')>=0&&t.textContent.indexOf('首跳过')>=0})()", 10000), '预览写回出现「N 首可写，M 首跳过」toast');
+  const wbToast = await evalJs("(function(){var t=document.getElementById('toast');return (t&&t.classList.contains('on'))?t.textContent:''})()");
+  ck(await evalJs("fetch('/api/writeback/status').then(function(r){return r.json()}).then(function(j){return j.ok===true&&typeof j.running==='boolean'&&typeof j.done==='number'&&typeof j.total==='number'&&typeof j.written==='number'&&typeof j.skipped==='number'&&typeof j.failed==='number'&&Array.isArray(j.lastFailures)})"), 'status 端点字段齐全(running/done/total/written/skipped/failed/lastFailures)');
+  ck(await evalJs("!document.getElementById('sp_wbdry').disabled && !document.getElementById('sp_wbapply').disabled"), '预览完成后两按钮恢复可用', 'toast=' + wbToast);
+  await evalJs("document.querySelector('.stab[data-g=out]').click()");
+  await sleep(150);
+  const nGroups = await evalJs("document.querySelectorAll('#setpage .sgroup').length");
+  ck(nGroups >= 6, '设置页分了多组', nGroups + ' 组');
+  const nFields = await evalJs("document.querySelectorAll('#setpage select, #setpage input').length");
+  ck(nFields >= 15, '设置项数量足够', nFields + ' 个控件');
+  ck(await evalJs("!!document.getElementById('sp_taps') && !!document.getElementById('sp_atten') && !!document.getElementById('sp_ir') && !!document.getElementById('sp_eq')"), '包含抽头/衰减/卷积/EQ 等高级项');
+  ck(await evalJs("document.querySelectorAll('#sp_device option').length > 1"), '输出设备下拉有内容', (await evalJs("document.querySelectorAll('#sp_device option').length")) + ' 项');
+  // ---- 本轮新增：WASAPI 共享后端（选项存在 / 说明文案 / 能保存；!! 跑完必须还原，
+  //      与 taps 同一原则 —— 自检不许改用户的输出后端）----
+  const origBackend = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.backend||'wasapi')"));
+  ck(await evalJs("(function(){var s=document.getElementById('sp_backend');if(!s)return false;for(var i=0;i<s.options.length;++i)if(s.options[i].value==='wasapi-shared')return true;return false})()"), '后端下拉含「WASAPI 共享」选项');
+  await evalJs("var s=document.getElementById('sp_backend'); s.value='wasapi-shared'; s.dispatchEvent(new Event('change'));");
+  await sleep(1200);
+  const bkHint = String(await evalJs("(document.getElementById('sp_backendmsg')||{textContent:''}).textContent"));
+  ck(bkHint.indexOf('共享') >= 0 && bkHint.indexOf('bit-perfect') >= 0, '选共享后端出现说明文案', bkHint.slice(0, 60));
+  ck(await evalJs("ADV.backend === 'wasapi-shared'"), '切共享后端后 ADV.backend 更新');
+  const savedBk = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.backend)"));
+  ck(savedBk === 'wasapi-shared', '共享后端能保存到后端', 'backend=' + savedBk);
+  await evalJs("var s=document.getElementById('sp_backend'); s.value='" + origBackend + "'; s.dispatchEvent(new Event('change'));");
+  await sleep(1200);
+  const bkBack = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.backend)"));
+  ck(bkBack === origBackend, '自检跑完后把输出后端还原', 'backend=' + bkBack + '（原值 ' + origBackend + '）');
+  // 改一个参数并保存，验证后端确实收到。
+  // !! 必须还原：自检跑在用户真实实例上时，曾经把 taps 写成 131072 并落盘，
+  //    用户打开设置页就看到一个莫名其妙的"原型抽头数"。自检不许改用户的设置。
+  const origTaps = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.taps)"));
+  await evalJs("document.getElementById('sp_taps').value='131072'");
+  await evalJs("document.getElementById('sp_save').click()");
+  await sleep(900);
+  const savedTaps = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.taps)");
+  ck(String(savedTaps) === '131072', '设置能保存到后端', 'taps=' + savedTaps);
+  await evalJs("document.getElementById('sp_taps').value='" + origTaps + "'");
+  await evalJs("document.getElementById('sp_save').click()");
+  await sleep(900);
+  const restored = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.taps)");
+  ck(String(restored) === origTaps, '自检跑完后把设置还原', 'taps=' + restored + '（原值 ' + origTaps + '）');
+  // 1x / Nx 分开选：改 Nx 必须真的落到 filterNx，且不能连 1x 一起改掉
+  const before = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>({f:j.kv.filter||'',nx:j.kv.filterNx||''}))");
+  await evalJs("document.getElementById('sFiltNx').value='poly-sinc-short-mp'");
+  await evalJs("saveSettings()");
+  await sleep(1000);
+  const after = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>({f:j.kv.filter||'',nx:j.kv.filterNx||''}))");
+  ck(after.nx === 'poly-sinc-short-mp', 'Nx 滤波器单独保存到 filterNx', 'filterNx=' + after.nx);
+  ck(after.f === before.f, '改 Nx 不影响 1x', 'filter=' + after.f + '（原值 ' + before.f + '）');
+  await evalJs("document.getElementById('sFiltNx').value='" + before.nx + "'");
+  await evalJs("saveSettings()");
+  await sleep(1000);
+  const back = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.filterNx||'')");
+  ck(back === before.nx, 'Nx 还原', 'filterNx=' + back);
+  const p10 = await shot('19-settings-page');
+  // ---- 右栏标签页 / 歌词 / 播放列表 / 信号链 ----
+  await evalJs("document.querySelector('.rtab[data-t=l]').click()");
+  await sleep(500);
+  ck(await evalJs("document.getElementById('lyricbox').style.display !== 'none'"), '歌词标签页可切换');
+  ck(await evalJs("document.getElementById('lyricbox').innerHTML.length > 0"), '歌词区有内容（无歌词时也有提示）');
+  const p7 = await shot('07-lyrics');
+  await evalJs("document.querySelector('.rtab[data-t=q]').click()");
+  await sleep(400);
+  ck(await evalJs("document.getElementById('qlist').style.display !== 'none'"), '右栏队列标签页可切换');
+  await evalJs("document.getElementById('bChain').click()");
+  await sleep(600);
+  ck(await evalJs("document.getElementById('modal').classList.contains('on')"), '信号链弹层可打开');
+  ck(await evalJs("document.getElementById('mbody').innerHTML.length > 10"), '信号链有内容');
+  const p9 = await shot('09-chain');
+  await evalJs("document.getElementById('mclose').click()");
+  await sleep(200);
+  ck(await evalJs("!document.getElementById('modal').classList.contains('on')"), '信号链弹层可关闭');
+
+  // 搜索
+  await evalJs("var q=document.getElementById('q'); q.value='Isobel'; q.dispatchEvent(new Event('input'));");
+  await sleep(900);
+  const hits = await evalJs("document.querySelectorAll('.trow').length");
+  ck(hits > 0, '全局搜索有结果', hits + ' 条');
+  const p6 = await shot('06-search');
+
+  // 交互元素是否都绑定上了（这是本项目真踩过的坑）
+  const bound = await evalJs(`
+    (function(){
+      // 两类要分开看：
+      //  needBind：点了/改了就要有反应，必须有事件处理
+      //  valueOnly：参数类控件，值在"下一次播放"时被 params() 读取，本来就不该有处理函数
+      //            （早期把两类混在一起判，导致把正常控件误报成"未绑定"）
+      //  P1.5：元数据源开关是动态的（/api/providers 注册表）—— 在静态清单之外逐源补查
+      //  P2：标签写回的预览/执行按钮也是要点了有反应的
+      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol'];
+      (META_PROVIDERS || []).forEach(function (p) { needBind.push('sp_meta_' + p.id); });
+      var valueOnly=['sRate','sFilt','sFiltNx','sShap','sBuf','sDSD','sIsp','s2s'];
+      var miss=[];
+      needBind.forEach(function(i){ var e=document.getElementById(i); if(!e) miss.push(i+':缺失'); else if(!e.onclick && !e.onchange && !e.oninput) miss.push(i+':未绑定'); });
+      valueOnly.forEach(function(i){ if(!document.getElementById(i)) miss.push(i+':缺失'); });
+      return miss;
+    })()`);
+  ck(Array.isArray(bound) && bound.length === 0, '所有控件都存在且已绑定事件', JSON.stringify(bound));
+
+  // ---- 本轮新增：队列主视图 / 文件夹地址栏 / 正在播放页 / 循环键 / 拖拽遮罩 ----
+  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='queue').click()");
+  await sleep(700);
+  ck(await evalJs("!!document.querySelector('#list .qrow') || !!document.querySelector('#list .empty')"), '播放队列有内容或明确的空状态');
+  ck(await evalJs("document.getElementById('pth').textContent.indexOf('播放队列') >= 0"), '队列页标题正确');
+
+  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='files').click()");
+  await sleep(700);
+  ck(await evalJs("!!document.getElementById('fPath')"), '文件夹有地址栏输入框');
+  const addr = await evalJs("document.getElementById('fPath').value");
+  ck(!!addr, '地址栏显示了当前目录', addr);
+
+  await evalJs("document.getElementById('npOpen').click()");
+  await sleep(400);
+  ck(await evalJs("document.getElementById('npPage').classList.contains('on')"), '点封面可以打开正在播放页');
+  ck(await evalJs("!!document.getElementById('npMeta') && document.getElementById('npMeta').closest('#npPage') !== null"), '正在播放页有 #npMeta 芯片容器');
+  // 空态文案要用「清掉歌词后的 renderNpLyric」来验：实例上可能正停着一首带在线歌词的曲子
+  // （LY.lines 非空 → 显示的是歌词而不是空态），那是正常业务态，不是文案缺失。
+  ck(await evalJs("(function(){var keep=LY.lines;LY.lines=[];renderNpLyric();var ok=document.getElementById('npLyric').innerHTML.indexOf('在线补全')>=0;LY.lines=keep;var b=document.getElementById('npLyric');if(b){b.dataset.n='';}renderNpLyric();return ok;})()"), '歌词空态提示「播放时自动在线补全」');
+  await evalJs("document.getElementById('npClose').click()");
+  await sleep(250);
+  ck(await evalJs("!!document.getElementById('npPlay') && !!document.getElementById('npSeek') && !!document.getElementById('npPrev')"), '正在播放页有播放控件');
+  ck(await evalJs("!document.getElementById('npPage').classList.contains('on')"), '正在播放页可以关闭');
+
+  const rep0 = await evalJs("document.getElementById('sRep').value");
+  await evalJs("document.getElementById('bRep').click()");
+  await sleep(200);
+  const rep1 = await evalJs("document.getElementById('sRep').value");
+  ck(rep0 !== rep1, '循环键能切换循环方式', rep0 + ' -> ' + rep1);
+
+  ck(await evalJs("!!document.getElementById('dropmask')"), '拖拽提示层已就绪');
+
+  // 设计契约：UI 永不出现外部页面 —— 全页面不允许有任何 http(s) 外链锚点
+  ck(await evalJs("document.querySelectorAll('a[href^=http]').length === 0"), '全页面无 http 外链（永不跳转外部页面）');
+
+  ck(errors.length === 0, '没有 JS 异常 / console.error', errors.slice(0, 4).join(' | '));
+
+  console.log(results.join(String.fromCharCode(10)));
+  console.log('');
+  console.log('截图目录: ' + OUT);
+  ['01-albums', '02-album', '03-tracks', '04-files', '05-settings', '06-search'].forEach(n => {
+    const p = path.join(OUT, n + '.png');
+    if (fs.existsSync(p)) console.log('  ' + n + ': ' + fs.statSync(p).size + ' 字节');
+  });
+  const bad = results.filter(r => r.includes('[FAIL]')).length;
+  console.log('');
+  console.log(bad === 0 ? '界面检查全部通过' : (bad + ' 项失败'));
+  ws.close(); child.kill();
+  process.exit(bad === 0 ? 0 : 1);
+})().catch(e => { console.error('检查失败: ' + e.message); try { child.kill(); } catch (_) {} process.exit(2); });
