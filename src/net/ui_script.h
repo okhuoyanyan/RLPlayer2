@@ -34,7 +34,7 @@ var ADV = {
 // 元数据补全开关（P1.5 注册表化）：总开关 metaon 与 DeepSeek metallm 固定两键；
 // 数据源开关按 /api/providers（后端注册表）动态渲染，写 metasrc_<id> ——
 // 后端新增数据源 = 注册一个描述符，前端零改动。缺省全开，与后端缺省一致。
-var META = { on: 1, llm: 1 };
+var META = { on: 1, llm: 1, summary: 0 };
 var META_PROVIDERS = null;   // /api/providers 的 items（启动时拉取；null = 还没到）
 var META_SRC = {};           // id → 0/1（源开关状态，随 /api/providers 到达而填充）
 var SEP = String.fromCharCode(92);
@@ -333,7 +333,7 @@ function renderAlbumSubset(who) {
   });
 }
 
-/* ---------------- 艺术家资料页（P3④a） ---------------- */
+/* ---------------- 艺术家资料页（P3④a/④b） ---------------- */
 function openArtistProfile(who, refresh) {
   S.view = 'artist';
   setView('artists');
@@ -342,15 +342,18 @@ function openArtistProfile(who, refresh) {
   if (D('bBackArtistsTop')) D('bBackArtistsTop').onclick = function () { loadArtists(); };
   D('list').innerHTML = '<div class=empty style="padding:60px 0">正在获取权威资料…</div>';
 
-  var u = '/api/entity/knowledge?kind=person&name=' + encodeURIComponent(who) + (refresh ? '&refresh=1' : '');
-  api(u).then(function (j) {
-    renderArtistProfile(who, j);
-  }).catch(function (err) {
-    renderArtistProfile(who, { ok: false, error: String(err), materials: [] });
+  var uKnow = '/api/entity/knowledge?kind=person&name=' + encodeURIComponent(who) + (refresh ? '&refresh=1' : '');
+  var uSumm = '/api/entity/summary?kind=person&name=' + encodeURIComponent(who) + '&lang=zh&refresh=0';
+
+  Promise.all([
+    api(uKnow).catch(function (err) { return { ok: false, error: String(err), materials: [] }; }),
+    api(uSumm).catch(function () { return { ok: false }; })
+  ]).then(function (res) {
+    renderArtistProfile(who, res[0], res[1]);
   });
 }
 
-function renderArtistProfile(who, j) {
+function renderArtistProfile(who, j, summary) {
   S.view = 'artist';
   setView('artists');
   S.view = 'artist';
@@ -443,7 +446,68 @@ function renderArtistProfile(who, j) {
       h += '</div></div>';
     }
 
-    // 3) 来源：来源徽章、标题、取回日期、「复制链接」芯片（绝不 window.open / <a target=_blank>）
+    // 3) AI 综合小节（P3④b 新增）：有缓存展示 sections/citations/徽章；无缓存展示空态卡+生成按钮
+    var hasSummary = summary && summary.ok && summary.sections && summary.sections.length > 0;
+    h += '<div class="sec-card ai-sec" style="margin-bottom:24px">';
+    h += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">';
+    h += '<span style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2)">AI 综合</span>';
+    if (hasSummary) {
+      h += '<span class="badge ai-badge" style="background:var(--hov);color:var(--txt);font-size:11px;font-weight:600">AI 生成</span>';
+      var sumDate = summary.generated_at ? fmtDate(summary.generated_at) : '';
+      h += '<span class=hint style="font-size:11.5px;color:var(--mut2)">' + esc(summary.disclaimer || '仅依据来源材料综合') + (sumDate ? (' · ' + sumDate + ' 取回') : '') + '</span>';
+      h += '<button class="btn" id=bReGenSummary style="margin-left:auto;font-size:12px;padding:3px 10px">重新生成</button>';
+    }
+    h += '</div>';
+
+    if (hasSummary) {
+      var citMap = {};
+      (summary.citations || []).forEach(function (c, idx) {
+        citMap[c.id] = { idx: idx + 1, c: c };
+      });
+
+      summary.sections.forEach(function (sec) {
+        h += '<div style="margin-bottom:14px">';
+        if (sec.heading) {
+          h += '<div style="font-size:13px;font-weight:600;color:var(--txt);margin:10px 0 6px">' + esc(sec.heading) + '</div>';
+        }
+        (sec.paragraphs || []).forEach(function (p) {
+          var sups = '';
+          (p.citations || []).forEach(function (cid) {
+            var found = citMap[cid];
+            if (found) sups += '<sup style="color:var(--mut);font-size:10px;margin-left:2px">[' + found.idx + ']</sup>';
+          });
+          h += '<div style="font-size:13px;line-height:1.75;color:var(--txt);margin-bottom:8px">' + esc(p.text) + sups + '</div>';
+        });
+        h += '</div>';
+      });
+
+      if (summary.citations && summary.citations.length > 0) {
+        h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">';
+        summary.citations.forEach(function (c, idx) {
+          var label = '[' + (idx + 1) + '] ' + (c.title || c.source || '来源');
+          h += '<button class="btn chip-copy" data-url="' + esc(c.url) + '" title="复制引用来源链接">' +
+               '<svg width=12 height=12 viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:4px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
+               esc(label) +
+               '</button>';
+        });
+        h += '</div>';
+      }
+    } else {
+      var isAllowed = (META.summary == 1);
+      var summErrMsg = (summary && summary.error) ? summary.error : '';
+      h += '<div class="card empty-card" style="padding:22px 18px;text-align:center;background:var(--phbg);border:1px solid var(--line);border-radius:10px">';
+      h += '<div style="font-size:13px;color:var(--txt);margin-bottom:10px">' + (summErrMsg ? esc(summErrMsg) : '暂无 AI 综合简介（默认不自动调用以节省成本）') + '</div>';
+      if (isAllowed) {
+        h += '<button class="btn pri" id=bGenSummary>生成 AI 简介</button>';
+      } else {
+        h += '<button class="btn" id=bGenSummary disabled style="opacity:0.6;cursor:not-allowed" title="请先在设置页开启允许 AI 资料综合">生成 AI 简介</button>';
+        h += '<div class=hint style="margin-top:6px;font-size:11.5px;color:var(--mut2)">未开启 AI 资料综合（可在 设置 → 元数据 中开启「允许 AI 资料综合」）</div>';
+      }
+      h += '</div>';
+    }
+    h += '</div>';
+
+    // 4) 来源：来源徽章、标题、取回日期、「复制链接」芯片（绝不 window.open / <a target=_blank>）
     h += '<div class="sec-card sources-sec" style="margin-bottom:24px">' +
          '<div style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:12px">资料来源</div>' +
          '<div style="display:flex;flex-direction:column;gap:8px">';
@@ -500,6 +564,28 @@ function renderArtistProfile(who, j) {
     };
   }
 
+  function triggerSummaryGen() {
+    var btn = D('bGenSummary') || D('bReGenSummary');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '正在由 DeepSeek 检索与综合…';
+    }
+    api('/api/entity/summary?kind=person&name=' + encodeURIComponent(who) + '&lang=zh&refresh=1')
+      .then(function (newSumm) {
+        if (newSumm && newSumm.ok) {
+          renderArtistProfile(who, j, newSumm);
+        } else {
+          renderArtistProfile(who, j, { ok: false, error: (newSumm && newSumm.error) || '生成失败，请稍后重试' });
+        }
+      })
+      .catch(function (err) {
+        renderArtistProfile(who, j, { ok: false, error: '请求失败: ' + String(err) });
+      });
+  }
+
+  if (D('bGenSummary')) D('bGenSummary').onclick = triggerSummaryGen;
+  if (D('bReGenSummary')) D('bReGenSummary').onclick = triggerSummaryGen;
+
   // 复制链接芯片：navigator.clipboard.writeText(url) + toast「已复制来源链接」
   Array.prototype.forEach.call(D('list').querySelectorAll('.chip-copy'), function (btn) {
     btn.onclick = function (ev) {
@@ -519,7 +605,182 @@ function renderArtistProfile(who, j) {
   });
 }
 
-/* ---------------- 曲目 / 搜索 ---------------- */
+/* ---------------- 古典作品与版本推荐（P3④b Discogs L4） ---------------- */
+function loadWorksView(initialTitle, initialComposer) {
+  S.view = 'works';
+  setView('works');
+  S.view = 'works';
+  head('作品与版本推荐', 'Discogs 权威演绎版本推荐', '');
+
+  var defaultTitle = initialTitle || 'Boléro';
+  var defaultComposer = (initialComposer !== undefined) ? initialComposer : 'Maurice Ravel';
+
+  var h = '<div style="padding:10px 22px 30px">';
+
+  // 搜索卡片
+  h += '<div class=card style="padding:16px 20px;margin-bottom:20px;background:var(--hov);border:1px solid var(--line);border-radius:10px">';
+  h += '<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">';
+  h += '<div style="flex:1;min-width:200px"><label style="display:block;font-size:11.5px;color:var(--mut2);margin-bottom:4px">作品名称</label>' +
+       '<input id=wTitle value="' + esc(defaultTitle) + '" placeholder="作品名称，例如 Boléro / Symphony No. 5" style="width:100%;height:32px;padding:0 10px;background:var(--card);border:1px solid var(--line);border-radius:6px;color:var(--txt);box-sizing:border-box"></div>';
+  h += '<div style="flex:1;min-width:200px"><label style="display:block;font-size:11.5px;color:var(--mut2);margin-bottom:4px">作曲家（可选）</label>' +
+       '<input id=wComposer value="' + esc(defaultComposer) + '" placeholder="作曲家，例如 Maurice Ravel / Beethoven" style="width:100%;height:32px;padding:0 10px;background:var(--card);border:1px solid var(--line);border-radius:6px;color:var(--txt);box-sizing:border-box"></div>';
+  h += '<div style="align-self:flex-end">' +
+       '<button class="btn pri" id=bSearchVersions style="height:32px;padding:0 16px">查询版本</button> ' +
+       '<button class=btn id=bRefreshVersions style="height:32px;padding:0 12px" title="强制刷新">刷新</button>' +
+       '</div>';
+  h += '</div>';
+
+  // 快捷预设芯片
+  h += '<div style="display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap">' +
+       '<span style="font-size:12px;color:var(--mut2)">常用作品:</span>' +
+       '<button class="btn chip-work" data-title="Boléro" data-composer="Maurice Ravel" style="font-size:11.5px;padding:2px 8px">Boléro (拉威尔)</button>' +
+       '<button class="btn chip-work" data-title="Symphony No. 5" data-composer="Ludwig van Beethoven" style="font-size:11.5px;padding:2px 8px">贝多芬第五交响曲</button>' +
+       '<button class="btn chip-work" data-title="Symphony No. 5" data-composer="Gustav Mahler" style="font-size:11.5px;padding:2px 8px">马勒第五交响曲</button>' +
+       '</div>';
+  h += '</div>';
+
+  // 结果呈现容器
+  h += '<div id=worksResult></div>';
+  h += '</div>';
+
+  D('list').innerHTML = h;
+
+  function doQuery(refresh) {
+    var t = D('wTitle') ? D('wTitle').value.trim() : '';
+    var c = D('wComposer') ? D('wComposer').value.trim() : '';
+    if (!t) { toast('请输入作品名称'); return; }
+    openWorkVersions(t, c, refresh);
+  }
+
+  if (D('bSearchVersions')) D('bSearchVersions').onclick = function () { doQuery(false); };
+  if (D('bRefreshVersions')) D('bRefreshVersions').onclick = function () { doQuery(true); };
+  if (D('wTitle')) {
+    D('wTitle').onkeydown = function (ev) { if (ev.key === 'Enter') doQuery(false); };
+  }
+  if (D('wComposer')) {
+    D('wComposer').onkeydown = function (ev) { if (ev.key === 'Enter') doQuery(false); };
+  }
+
+  Array.prototype.forEach.call(D('list').querySelectorAll('.chip-work'), function (btn) {
+    btn.onclick = function () {
+      var t = btn.dataset.title;
+      var c = btn.dataset.composer;
+      if (D('wTitle')) D('wTitle').value = t;
+      if (D('wComposer')) D('wComposer').value = c;
+      openWorkVersions(t, c, false);
+    };
+  });
+
+  if (defaultTitle) {
+    openWorkVersions(defaultTitle, defaultComposer, false);
+  }
+}
+
+function openWorkVersions(workTitle, composer, refresh) {
+  var box = D('worksResult');
+  if (!box) return;
+  box.innerHTML = '<div class=empty style="padding:60px 0">正在从 Discogs 检索版本…</div>';
+
+  var u = '/api/entity/versions?kind=work&name=' + encodeURIComponent(workTitle) +
+          (composer ? ('&composer=' + encodeURIComponent(composer)) : '') +
+          (refresh ? '&refresh=1' : '');
+
+  api(u).then(function (j) {
+    renderWorkVersions(workTitle, composer, j);
+  }).catch(function (err) {
+    renderWorkVersions(workTitle, composer, { ok: false, errors: [String(err)], performances: [] });
+  });
+}
+
+function renderWorkVersions(workTitle, composer, j) {
+  var box = D('worksResult');
+  if (!box) return;
+
+  var perfs = (j && j.performances) || [];
+  var isOk = j && j.ok && perfs.length > 0;
+
+  var h = '';
+
+  if (!isOk) {
+    var errMsg = (j && j.errors && j.errors[0]) || (j && j.error) || '未在 Discogs 检索到该作品的演绎版本，或当前网络不可达。';
+    h += '<div class="card empty-card" style="padding:36px 20px;text-align:center;background:var(--phbg);border:1px solid var(--line);border-radius:12px">' +
+         '<div style="font-size:15px;font-weight:600;margin-bottom:8px;color:var(--txt)">未找到版本或检索失败</div>' +
+         '<div style="color:var(--mut);font-size:12.5px;margin-bottom:18px;max-width:520px;margin-left:auto;margin-right:auto;line-height:1.6">' +
+         esc(errMsg) + '</div>' +
+         '<button class="btn pri" id=bRetryVersions>重试查询</button>' +
+         '</div>';
+    box.innerHTML = h;
+    if (D('bRetryVersions')) {
+      D('bRetryVersions').onclick = function () { openWorkVersions(workTitle, composer, true); };
+    }
+    return;
+  }
+
+  // 头部概要卡片
+  var subStr = (composer ? ('作曲家: ' + esc(composer) + ' · ') : '') +
+               (j.from_cache ? ('缓存 · ' + fmtDate(j.generated_at) + (j.offline ? ' · 离线' : '')) : 'Discogs 实时') +
+               ' · 共 ' + perfs.length + ' 个版本';
+  h += '<div class="ahead work-head" style="margin-bottom:16px;padding:16px 20px;background:var(--hov);border-radius:10px">' +
+       '<div class=kind style="font-size:11px;font-weight:600;letter-spacing:1px;color:var(--mut2)">CLASSICAL WORK · 古典作品</div>' +
+       '<h1 style="margin:4px 0 6px;font-size:20px;font-weight:700;color:var(--txt)">' + esc(workTitle) + '</h1>' +
+       '<div class=sub style="font-size:12px;color:var(--mut)">' + subStr + '</div>' +
+       '</div>';
+
+  // 不足 5 条提示
+  if (perfs.length < 5) {
+    h += '<div class="card count-hint" style="padding:10px 14px;margin-bottom:14px;background:var(--phbg);border:1px solid var(--line);border-radius:8px;font-size:12px;color:var(--mut)">' +
+         '仅找到 ' + perfs.length + ' 个版本（不编造）' +
+         '</div>';
+  }
+
+  // 版本列表
+  h += '<div class=version-list style="display:flex;flex-direction:column;gap:8px">';
+  perfs.forEach(function (p) {
+    var yr = p.year > 0 ? String(p.year) : '—';
+    var performersDisplay = p.performers || '—';
+    if (p.orchestra && performersDisplay.indexOf(p.orchestra) < 0) {
+      performersDisplay += ' / ' + p.orchestra;
+    }
+    if (p.conductor && performersDisplay.indexOf(p.conductor) < 0) {
+      performersDisplay += ' (指挥: ' + p.conductor + ')';
+    }
+
+    h += '<div class="trow version-row" style="cursor:default;display:flex;align-items:center;gap:12px;padding:10px 16px;border-radius:9px;background:var(--hov)">' +
+         '<span style="font-family:monospace;font-size:12px;color:var(--mut);min-width:36px">' + yr + '</span>' +
+         '<div style="flex:1;min-width:0">' +
+           '<div style="font-weight:600;font-size:13px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(p.title) + '">' + esc(p.title) + '</div>' +
+           '<div style="font-size:11.5px;color:var(--mut2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px" title="' + esc(performersDisplay) + '">' + esc(performersDisplay) + '</div>' +
+         '</div>' +
+         '<div style="font-size:11.5px;color:var(--mut);min-width:80px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(p.label) + '">' + esc(p.label || '—') + '</div>' +
+         '<span class=badge style="font-size:11px">' + esc(p.format || 'CD') + '</span>' +
+         (p.country ? ('<span style="font-size:11px;color:var(--mut2)">' + esc(p.country) + '</span>') : '') +
+         '<button class="btn chip-copy" data-url="' + esc(p.url) + '" title="复制版本链接">' +
+           '<svg width=12 height=12 viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:4px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
+           '复制链接' +
+         '</button>' +
+         '</div>';
+  });
+  h += '</div>';
+
+  box.innerHTML = h;
+
+  Array.prototype.forEach.call(box.querySelectorAll('.chip-copy'), function (btn) {
+    btn.onclick = function (ev) {
+      ev.stopPropagation();
+      var u = btn.dataset.url;
+      if (!u) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(u).then(function () {
+          toast('已复制来源链接');
+        }).catch(function () {
+          toast('已复制来源链接');
+        });
+      } else {
+        toast('已复制来源链接');
+      }
+    };
+  });
+}
 function loadTracks(q) {
   S.view = 'tracks';
   head(q ? ('搜索：' + q) : '曲目', '搜索中…', '');
@@ -791,9 +1052,10 @@ function saveSettings(immediate) {
         + '&dsdkind=' + (ADV.dsdKind || 'fir') + '&dsdconv=' + (ADV.dsdConv || 'narrow')
         + '&opraproduct=' + encodeURIComponent(ADV.opraproduct || '')
         + '&oprapreset=' + encodeURIComponent(ADV.oprapreset || '')
-        // 元数据补全（P1.5）：metaon/metallm 固定两键；源开关按注册表逐源写 metasrc_<id>
+        // 元数据补全（P1.5）：metaon/metallm 固定两键；源开关按注册表逐源写 metasrc_<id>; metasummary 默认0
         + '&metaon=' + (META.on ? 1 : 0)
         + '&metallm=' + (META.llm ? 1 : 0)
+        + '&metasummary=' + (META.summary ? 1 : 0)
         + (META_PROVIDERS || []).map(function (p) {
             return '&metasrc_' + p.id + '=' + (META_SRC[p.id] === 0 ? 0 : 1);
           }).join('');
@@ -861,6 +1123,7 @@ function loadSettings() {
     // 由 fillMetaProviders 走 /api/providers（同一 conf 的注册表视图，含旧键迁移）
     if (kv.metaon !== undefined) META.on = (kv.metaon === '1') ? 1 : 0;
     if (kv.metallm !== undefined) META.llm = (kv.metallm === '1') ? 1 : 0;
+    if (kv.metasummary !== undefined) META.summary = (kv.metasummary === '1') ? 1 : 0;
     // 主题：本地优先（避免闪一下），否则用服务端保存的
     var t = null;
     try { t = localStorage.getItem('rta-theme'); } catch (e) { }
@@ -1099,7 +1362,7 @@ function saveSrc() {
 function setView(v) {
   S.view = v;
   Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
-    e.classList.toggle('on', e.dataset.v === v || (v === 'artist' && e.dataset.v === 'artists'));
+    e.classList.toggle('on', e.dataset.v === v || (v === 'artist' && e.dataset.v === 'artists') || (v === 'work' && e.dataset.v === 'works'));
   });
   var isSet = (v === 'settings');
   // 设置页占满整屏：右栏（队列/歌词）在这里没有意义，直接藏掉。
@@ -1121,6 +1384,7 @@ Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
     setView(v);
     if (v === 'albums') loadAlbums('');
     else if (v === 'artists') loadArtists();
+    else if (v === 'works') loadWorksView();
     else if (v === 'tracks') loadTracks('');
     else if (v === 'files') loadFiles(S.dir || '');
     else if (v === 'remote') loadRemote('');
@@ -1911,6 +2175,7 @@ function renderSettingsPage() {
              '关闭后播放不再触发在线补全；已补全的结果仍在本地库，随时可以再打开')
        + '<div id=sp_metasrc>' + metaSrcHtml() + '</div>'
        + chk('sp_metallm', 'DeepSeek 增强', META.llm == 1, '无标签文件用 LLM 解析与裁决；不影响已有标签的优先级')
+       + chk('sp_metasummary', '允许 AI 资料综合（DeepSeek，按次计费）', META.summary == 1, '启用后可在艺术家/作品页点击生成 AI 深度简介；按次产生 DeepSeek API 调用，默认关闭')
        // ---- 功能4（用户 2026-10-22）：「元数据没有提供 ds 的 api 输入接口」----
        // 红线：界面【只显示掩码】，输入框永不回填，保存后立刻清空；
        // key 只写 exe 同目录 rlplayer-llm.conf（路径由后端决定，前端不碰文件）。
@@ -2010,7 +2275,7 @@ function renderSettingsPage() {
   });
   // 元数据补全开关（P1.5）：总开关与 DeepSeek 固定绑定；源开关在 renderMetaSrcRows
   // 里按注册表逐源绑定（metasrc_<id>，改完即落盘）
-  [['sp_metaon', 'on'], ['sp_metallm', 'llm']].forEach(function (p) {
+  [['sp_metaon', 'on'], ['sp_metallm', 'llm'], ['sp_metasummary', 'summary']].forEach(function (p) {
     var e = D(p[0]); if (!e) return;
     e.onchange = function () { META[p[1]] = this.checked ? 1 : 0; saveSettings(); };
   });

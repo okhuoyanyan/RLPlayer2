@@ -44,6 +44,8 @@ using rta::render::SinkOpenOpts;
 #include "meta/enrich.h"            // 单曲元数据补全编排(播放触发 + /api/enrich + /api/meta 兜底)
 #include "meta/writeback.h"         // P2 标签写回(remux + PCM 逐位门禁;/api/writeback 三端点)
 #include "meta/knowledge.h"         // P3 资料层直连与缓存(/api/entity/knowledge)
+#include "meta/retrieval.h"         // P3 资料层③ AI 综合检索(/api/entity/summary)
+#include "meta/discogs.h"           // P3 资料层④b Discogs 版本推荐(/api/entity/versions)
 #include "net/rtanet_stream.h"
 #include "dsp/filter_families.h"
 #include "dsp/oversample_peak.h"
@@ -2058,6 +2060,7 @@ static void play_log_rotate() {
 struct MetaSettings {
     bool on = true;                          // metaon 总开关
     bool llm = true;                         // metallm
+    bool summary = false;                    // metasummary 默认 0（成本策略：显式开启）
     std::map<std::string, bool> srcOn;       // 注册表 id → 开关(缺省 true)
 };
 static bool meta_bool_val(const std::string& v) {
@@ -2074,8 +2077,9 @@ static MetaSettings meta_settings_load() {
         if (e == std::string::npos) continue;
         const std::string k = line.substr(0, e);
         const std::string v = line.substr(e + 1);
-        if      (k == "metaon")  ms.on  = meta_bool_val(v);
-        else if (k == "metallm") ms.llm = meta_bool_val(v);
+        if      (k == "metaon")      ms.on      = meta_bool_val(v);
+        else if (k == "metallm")     ms.llm     = meta_bool_val(v);
+        else if (k == "metasummary") ms.summary = meta_bool_val(v);
         else if (k.rfind("metasrc_", 0) == 0) ms.srcOn[k.substr(8)] = meta_bool_val(v);
         else if (k == "metaqq")      legacy["qq"]      = v;
         else if (k == "metanetease") legacy["netease"] = v;
@@ -3382,6 +3386,107 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
           << "}";
         return j.str();
     }
+
+    // ---------------- 资料层(P3③ AI 检索综合): GET /api/entity/summary ----------------
+    if (rq.path.rfind("/api/entity/summary", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        std::string kindStr = "person";
+        std::string name;
+        std::string lang = "zh";
+        bool refresh = false;
+
+        const size_t qpos = rq.path.find('?');
+        if (qpos != std::string::npos) {
+            std::istringstream is(rq.path.substr(qpos + 1));
+            std::string tok;
+            while (std::getline(is, tok, '&')) {
+                const size_t eq = tok.find('=');
+                if (eq == std::string::npos) continue;
+                const std::string k = urlDecode(tok.substr(0, eq));
+                const std::string v = urlDecode(tok.substr(eq + 1));
+                if (k == "kind") kindStr = v;
+                else if (k == "name") name = v;
+                else if (k == "refresh") refresh = (v == "1" || v == "true");
+                else if (k == "lang") lang = v;
+            }
+        }
+        if (name.empty()) {
+            return "{\"ok\":false,\"error\":\"未指定实体名称\"}";
+        }
+        rta::meta::EntityKind ek = rta::meta::EntityKind::Person;
+        if (!rta::meta::entity_kind_from_tag(kindStr, ek)) {
+            return "{\"ok\":false,\"error\":\"未知实体类型: " + jesc(kindStr) + "\"}";
+        }
+
+        const MetaSettings ms = meta_settings_load();
+        const std::string metabaseDir = path_in_exe_dir("rlplayer-meta");
+        const std::string eid = rta::meta::entity_id(ek, name);
+
+        // 成本策略：默认不自动生成
+        // 1. 若未请求 refresh：优先检查未过期/离线缓存；若无缓存则如实返回 ok:false，绝不静默调 LLM
+        if (!refresh) {
+            rta::meta::SummaryResult cached;
+            std::string cache_err;
+            if (rta::meta::summary_load_cache(metabaseDir, eid, lang, cached, &cache_err) && cached.ok) {
+                cached.from_cache = true;
+                return rta::meta::summary_to_json(cached);
+            }
+            return "{\"ok\":false,\"error\":\"未生成 AI 简介（请点击「生成 AI 简介」）\",\"from_cache\":false,\"offline\":false}";
+        }
+
+        // 2. 显式请求 refresh=1：必须检查设置开关 metasummary
+        if (!ms.summary) {
+            return "{\"ok\":false,\"error\":\"未开启 AI 资料综合（请在设置-元数据页开启）\",\"from_cache\":false,\"offline\":false}";
+        }
+
+        rta::meta::RetrievalOptions ropts;
+        ropts.metabase = metabaseDir;
+        ropts.refresh = true;
+        ropts.timeout_ms = 25000;
+
+        const rta::meta::SummaryResult sr = rta::meta::retrieval_fetch(ek, name, lang, ropts);
+        if (!sr.ok) {
+            return "{\"ok\":false,\"error\":\"" + jesc(sr.error.empty() ? "AI 检索综合失败" : sr.error) + "\"}";
+        }
+        return rta::meta::summary_to_json(sr);
+    }
+
+    // ---------------- 资料层(P3④b Discogs L4 古典作品版本推荐): GET /api/entity/versions ----------------
+    if (rq.path.rfind("/api/entity/versions", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        std::string kindStr = "work";
+        std::string name;
+        std::string composer;
+        bool refresh = false;
+
+        const size_t qpos = rq.path.find('?');
+        if (qpos != std::string::npos) {
+            std::istringstream is(rq.path.substr(qpos + 1));
+            std::string tok;
+            while (std::getline(is, tok, '&')) {
+                const size_t eq = tok.find('=');
+                if (eq == std::string::npos) continue;
+                const std::string k = urlDecode(tok.substr(0, eq));
+                const std::string v = urlDecode(tok.substr(eq + 1));
+                if (k == "name" || k == "title") name = v;
+                else if (k == "composer") composer = v;
+                else if (k == "refresh") refresh = (v == "1" || v == "true");
+                else if (k == "kind") kindStr = v;
+            }
+        }
+        if (name.empty()) {
+            return "{\"ok\":false,\"error\":\"未指定作品名称\"}";
+        }
+
+        rta::meta::DiscogsOptions dopts;
+        dopts.metabase = path_in_exe_dir("rlplayer-meta");
+        dopts.refresh = refresh;
+        dopts.timeout_ms = 15000;
+
+        const rta::meta::WorkVersionsResult wr = rta::meta::discogs_versions(name, composer, dopts);
+        return rta::meta::work_versions_to_json(wr);
+    }
+
     if (rq.path.rfind("/api/cover", 0) == 0) {
         std::string file;
         const size_t q = rq.path.find("?file=");
@@ -3717,8 +3822,9 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                                            // 耳机 EQ (OPRA)
                                            "opraproduct", "oprapreset", "opravendor",
                                            // 元数据补全(P1.5):总开关与 LLM 固定两键;
-                                           // 源开关 metasrc_<id> 按注册表动态放行(见下)
-                                           "metaon", "metallm" })
+                                           // 源开关 metasrc_<id> 按注册表动态放行(见下);
+                                           // P3④b AI 综合开关 metasummary (默认0)
+                                           "metaon", "metallm", "metasummary" })
                     if (k == allow) okKey = true;
                 if (!okKey && k.rfind("metasrc_", 0) == 0) {
                     const std::string id = k.substr(8);
@@ -3760,6 +3866,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         };
         injectKv("metaon", "1");
         injectKv("metallm", "1");
+        injectKv("metasummary", "0");
         for (const rta::meta::ProviderDesc& pd : rta::meta::provider_registry()) {
             const std::string nk = std::string("metasrc_") + pd.id;
             if (seen.count(nk) != 0) continue;

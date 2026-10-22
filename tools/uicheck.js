@@ -116,7 +116,7 @@ async function waitFor(expr, ms = 8000) {
 
   // 点第一张专辑
   await evalJs("document.querySelector('.card').click()");
-  ck(await waitFor("document.querySelector('.ahead') || document.querySelector('.empty')"), '专辑页打开');
+  ck(await waitFor("document.querySelector('#list .ahead') || document.querySelector('#list .empty')", 8000), '专辑页打开');
   await sleep(500);
   const tr = await evalJs("document.querySelectorAll('.trow').length");
   ck(tr > 0, '曲目列表非空', tr + ' 首');
@@ -176,9 +176,43 @@ async function waitFor(expr, ms = 8000) {
      '点击来源芯片弹出「已复制来源链接」toast');
   ck(await evalJs("document.querySelectorAll('a[href^=http]').length === 0"),
      '带资料页面无 http 外链（永不跳转外部浏览器）');
+  // P3④b: 检查 ZARD 页面已缓存的 AI 综合小节
+  ck(await evalJs("!!document.querySelector('.ai-sec')"), '艺术家资料页包含 AI 综合小节');
+  ck(await evalJs("(function(){ var b = document.querySelector('.ai-badge'); return !!b && b.textContent.indexOf('AI 生成') >= 0; })()"),
+     'AI 综合小节常显「AI 生成」徽章');
+  ck(await evalJs("document.querySelectorAll('.ai-sec .chip-copy').length >= 1"),
+     'AI 综合小节包含来源引用复制芯片');
+  ck(await evalJs("document.querySelectorAll('.ai-sec sup').length >= 1"),
+     'AI 综合段落带有上标引用序号 [1][2]');
   const pZard = await shot('21-artist-profile-zard');
   await evalJs("document.getElementById('bBackArtists').click()");
   await sleep(500);
+
+  // ---- P3④b：作品与 Discogs 版本推荐页 ----
+  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='works').click()");
+  await sleep(600);
+  ck(await evalJs("S.view === 'works'"), '作品导航可进入且当前视图为 works');
+  ck(await evalJs("!!document.getElementById('wTitle') && !!document.getElementById('wComposer') && !!document.getElementById('bSearchVersions')"),
+     '作品页搜索控件完整（作品名、作曲家输入框与查询按钮存在）');
+  ck(await evalJs("document.querySelectorAll('.chip-work').length >= 3"),
+     '常用古典作品快速芯片存在（≥3 个）');
+  ck(await waitFor("document.querySelectorAll('.version-row').length >= 5 || !!document.querySelector('.empty-card')", 15000),
+     'Discogs 版本列表成功渲染或显示明确空态卡');
+  const nVers = await evalJs("document.querySelectorAll('.version-row').length");
+  if (nVers > 0) {
+    ck(nVers >= 5, 'Boléro 权威版本列表条数 >= 5', nVers + ' 条');
+    ck(await evalJs("document.querySelectorAll('.version-row .chip-copy').length === " + nVers),
+       '每个版本行均有复制链接芯片');
+    await evalJs("document.querySelector('.version-row .chip-copy').click()");
+    ck(await waitFor("(function(){ var t=document.getElementById('toast'); return t && t.classList.contains('on') && t.textContent.indexOf('已复制来源链接') >= 0; })()", 4000),
+       '点击版本复制芯片弹出「已复制来源链接」toast');
+  } else {
+    ck(await evalJs("!!document.querySelector('.empty-card') && !!document.getElementById('bRetryVersions')"),
+       '网络离线时显示空态卡与重试按钮');
+  }
+  ck(await evalJs("document.querySelectorAll('a[href^=http]').length === 0"),
+     '作品版本推荐页无 http 外链（永不跳转外部浏览器）');
+  const pWorks = await shot('22-work-versions');
 
   // 文件夹
   await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='files').click()");
@@ -227,11 +261,11 @@ async function waitFor(expr, ms = 8000) {
   ck(await evalJs("(function(){var e=document.getElementById('sp_directsdm');return !!e&&e.type==='checkbox'&&e.closest('.spane')&&e.closest('.spane').dataset.g==='sdm';})()"),
      'SDM 页有 DirectSDM 开关（且只在 SDM 页）');
   ck(await evalJs("!!document.getElementById('sp_directsdm').onchange"), 'DirectSDM 开关已绑定事件');
-  await evalJs("var e=document.getElementById('sp_directsdm'); e.checked=true; e.dispatchEvent(new Event('change'));");
+  await evalJs("var e=document.getElementById('sp_directsdm'); e.checked=true; if (e.onchange) e.onchange(); else e.dispatchEvent(new Event('change'));");
   await sleep(1500);
   const dm1 = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.directsdm)");
   ck(String(dm1) === '1', 'DirectSDM 开关能保存到后端', 'directsdm=' + dm1);
-  await evalJs("var e=document.getElementById('sp_directsdm'); e.checked=" + (origDm.dm === '1') + "; e.dispatchEvent(new Event('change'));");
+  await evalJs("var e=document.getElementById('sp_directsdm'); e.checked=" + (origDm.dm === '1') + "; if (e.onchange) e.onchange(); else e.dispatchEvent(new Event('change'));");
   await sleep(1500);
   const dm2 = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.directsdm)");
   ck(String(dm2) === String(origDm.dm), 'DirectSDM 开关还原', 'directsdm=' + dm2 + '（原值 ' + origDm.dm + '）');
@@ -283,9 +317,21 @@ async function waitFor(expr, ms = 8000) {
     const qBack = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasrc_qq)"));
     ck(qBack === origQq, '「QQ音乐」源开关往返还原', 'metasrc_qq=' + qBack + '（原值 ' + origQq + '）');
   }
-  // 总开关与 DeepSeek 开关保持固定
-  const metaFix = await evalJs("(function(){var ids=['sp_metaon','sp_metallm'];var p=document.querySelector('#setpage .spane[data-g=meta]');var miss=[];ids.forEach(function(i){var e=document.getElementById(i);if(!e||e.type!=='checkbox'||!p.contains(e)||!e.onchange)miss.push(i)});return miss;})()");
-  ck(Array.isArray(metaFix) && metaFix.length === 0, '总开关与 DeepSeek 开关存在且已绑定', JSON.stringify(metaFix));
+  // 总开关、DeepSeek 开关与 AI 综合开关保持固定
+  const metaFix = await evalJs("(function(){var ids=['sp_metaon','sp_metallm','sp_metasummary'];var p=document.querySelector('#setpage .spane[data-g=meta]');var miss=[];ids.forEach(function(i){var e=document.getElementById(i);if(!e||e.type!=='checkbox'||!p.contains(e)||!e.onchange)miss.push(i)});return miss;})()");
+  ck(Array.isArray(metaFix) && metaFix.length === 0, '总开关、DeepSeek 开关与 AI 综合开关存在且已绑定', JSON.stringify(metaFix));
+
+  // P3④b: metasummary 默认关(0)，可保存并往返还原
+  const origSummary = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasummary||'0')"));
+  ck(origSummary === '0', 'metasummary 默认关闭 (0)');
+  await evalJs("var e=document.getElementById('sp_metasummary'); e.checked=true; e.dispatchEvent(new Event('change'));");
+  await sleep(1300);
+  const sOn = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasummary)"));
+  ck(sOn === '1', '打开「允许 AI 资料综合」能保存到后端', 'metasummary=' + sOn);
+  await evalJs("var e=document.getElementById('sp_metasummary'); e.checked=" + (origSummary === '1') + "; e.dispatchEvent(new Event('change'));");
+  await sleep(1300);
+  const sBack = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasummary)"));
+  ck(sBack === origSummary, '「允许 AI 资料综合」往返还原', 'metasummary=' + sBack);
   // metaon 关→开：走 UI 开关（onchange → saveSettings → POST /api/settings），往返一致。
   // 注意不能裸 POST 单键：/api/settings 的 POST 是整文件重写，只发一个键会把其余设置全抹掉。
   const origMetaon = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metaon||'1')"));
@@ -374,15 +420,15 @@ async function waitFor(expr, ms = 8000) {
   //      与 taps 同一原则 —— 自检不许改用户的输出后端）----
   const origBackend = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.backend||'wasapi')"));
   ck(await evalJs("(function(){var s=document.getElementById('sp_backend');if(!s)return false;for(var i=0;i<s.options.length;++i)if(s.options[i].value==='wasapi-shared')return true;return false})()"), '后端下拉含「WASAPI 共享」选项');
-  await evalJs("var s=document.getElementById('sp_backend'); s.value='wasapi-shared'; s.dispatchEvent(new Event('change'));");
-  await sleep(1200);
+  await evalJs("var s=document.getElementById('sp_backend'); s.value='wasapi-shared'; if (s.onchange) s.onchange(); else s.dispatchEvent(new Event('change'));");
+  await sleep(1400);
   const bkHint = String(await evalJs("(document.getElementById('sp_backendmsg')||{textContent:''}).textContent"));
   ck(bkHint.indexOf('共享') >= 0 && bkHint.indexOf('bit-perfect') >= 0, '选共享后端出现说明文案', bkHint.slice(0, 60));
   ck(await evalJs("ADV.backend === 'wasapi-shared'"), '切共享后端后 ADV.backend 更新');
   const savedBk = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.backend)"));
   ck(savedBk === 'wasapi-shared', '共享后端能保存到后端', 'backend=' + savedBk);
-  await evalJs("var s=document.getElementById('sp_backend'); s.value='" + origBackend + "'; s.dispatchEvent(new Event('change'));");
-  await sleep(1200);
+  await evalJs("var s=document.getElementById('sp_backend'); s.value='" + origBackend + "'; if (s.onchange) s.onchange(); else s.dispatchEvent(new Event('change'));");
+  await sleep(1400);
   const bkBack = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.backend)"));
   ck(bkBack === origBackend, '自检跑完后把输出后端还原', 'backend=' + bkBack + '（原值 ' + origBackend + '）');
   // 改一个参数并保存，验证后端确实收到。
@@ -391,27 +437,18 @@ async function waitFor(expr, ms = 8000) {
   const origTaps = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.taps)"));
   await evalJs("document.getElementById('sp_taps').value='131072'");
   await evalJs("document.getElementById('sp_save').click()");
-  await sleep(900);
-  const savedTaps = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.taps)");
-  ck(String(savedTaps) === '131072', '设置能保存到后端', 'taps=' + savedTaps);
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.taps)==='131072')", 4000), '设置能保存到后端');
   await evalJs("document.getElementById('sp_taps').value='" + origTaps + "'");
   await evalJs("document.getElementById('sp_save').click()");
-  await sleep(900);
-  const restored = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.taps)");
-  ck(String(restored) === origTaps, '自检跑完后把设置还原', 'taps=' + restored + '（原值 ' + origTaps + '）');
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.taps)==='" + origTaps + "')", 4000), '自检跑完后把设置还原');
   // 1x / Nx 分开选：改 Nx 必须真的落到 filterNx，且不能连 1x 一起改掉
   const before = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>({f:j.kv.filter||'',nx:j.kv.filterNx||''}))");
-  await evalJs("document.getElementById('sFiltNx').value='poly-sinc-short-mp'");
-  await evalJs("saveSettings()");
-  await sleep(1000);
+  await evalJs("document.getElementById('sFiltNx').value='poly-sinc-short-mp'; if (D('sp_filtNx')) D('sp_filtNx').value='poly-sinc-short-mp'; saveSettings();");
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.filterNx==='poly-sinc-short-mp')", 4000), 'Nx 滤波器单独保存到 filterNx');
   const after = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>({f:j.kv.filter||'',nx:j.kv.filterNx||''}))");
-  ck(after.nx === 'poly-sinc-short-mp', 'Nx 滤波器单独保存到 filterNx', 'filterNx=' + after.nx);
   ck(after.f === before.f, '改 Nx 不影响 1x', 'filter=' + after.f + '（原值 ' + before.f + '）');
-  await evalJs("document.getElementById('sFiltNx').value='" + before.nx + "'");
-  await evalJs("saveSettings()");
-  await sleep(1000);
-  const back = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.filterNx||'')");
-  ck(back === before.nx, 'Nx 还原', 'filterNx=' + back);
+  await evalJs("document.getElementById('sFiltNx').value='" + before.nx + "'; if (D('sp_filtNx')) D('sp_filtNx').value='" + before.nx + "'; saveSettings();");
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.filterNx||'')==='" + before.nx + "')", 4000), 'Nx 还原');
   const p10 = await shot('19-settings-page');
 
   // ---- 耳机 EQ（OPRA）小节自检 ----
@@ -451,8 +488,8 @@ async function waitFor(expr, ms = 8000) {
 
   // 搜索
   await evalJs("var q=document.getElementById('q'); q.value='Isobel'; q.dispatchEvent(new Event('input'));");
-  await waitFor("document.querySelectorAll('.trow').length > 0", 5000);
-  const hits = await evalJs("document.querySelectorAll('.trow').length");
+  await waitFor("document.querySelectorAll('#list .trow').length > 0", 6000);
+  const hits = await evalJs("document.querySelectorAll('#list .trow').length");
   ck(hits > 0, '全局搜索有结果', hits + ' 条');
   const p6 = await shot('06-search');
 
@@ -465,7 +502,7 @@ async function waitFor(expr, ms = 8000) {
       //            （早期把两类混在一起判，导致把正常控件误报成"未绑定"）
       //  P1.5：元数据源开关是动态的（/api/providers 注册表）—— 在静态清单之外逐源补查
       //  P2：标签写回的预览/执行按钮也是要点了有反应的
-      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_opra_search','sp_opra_product','sp_opra_preset','sp_opra_apply','sp_opra_copychip'];
+      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_metasummary','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_opra_search','sp_opra_product','sp_opra_preset','sp_opra_apply','sp_opra_copychip'];
       (META_PROVIDERS || []).forEach(function (p) { needBind.push('sp_meta_' + p.id); });
       var valueOnly=['sRate','sFilt','sFiltNx','sShap','sBuf','sDSD','sIsp','s2s'];
       var miss=[];
