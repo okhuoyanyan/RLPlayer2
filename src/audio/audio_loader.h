@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <new>
+#include <chrono>
 
 namespace rta::audio {
 
@@ -184,6 +185,9 @@ inline int probe_bit_depth(const std::string& ffprobe, const std::string& file) 
 
 struct LoadNote {
     std::string text;
+    double ffmpegMs = 0.0;   // ffmpeg 转码写入临时 WAV 耗时 (ms)
+    double wavReadMs = 0.0;  // 读取临时/原生 WAV 耗时 (ms)
+    double totalMs = 0.0;    // 解码总耗时 (ms)
 };
 
 // DSD 源抽取设置（由 rtaweb / rtaplay 按配置写入；默认 FIR + narrow）
@@ -201,6 +205,7 @@ inline DsdPcmSettings& dsd_pcm_settings() { static DsdPcmSettings s; return s; }
 // 现在读原始位流，按设置用 FIR / IIR / CIC 抽取到 DSD/16（上限 705.6 kHz），
 // 后续升频/抖动/SDM 完全不变。读取失败仍回退 ffmpeg（保持可用）。
 inline AudioBuffer read_dsd_native(const std::string& path, LoadNote* note) {
+    const auto t_dsd_0 = std::chrono::steady_clock::now();
     DsdStream s = read_dsd(path);
     const uint32_t outRate = std::min<uint32_t>(s.rate / 16u, 705600u);
     const DsdPcmSettings st = dsd_pcm_settings();
@@ -220,6 +225,7 @@ inline AudioBuffer read_dsd_native(const std::string& path, LoadNote* note) {
         for (int c = 0; c < s.channels; ++c)
             out.setSample(i, c, planes[(size_t)c][i]);
 
+    const auto t_dsd_1 = std::chrono::steady_clock::now();
     if (note) {
         char buf[320];
         std::snprintf(buf, sizeof(buf),
@@ -228,6 +234,7 @@ inline AudioBuffer read_dsd_native(const std::string& path, LoadNote* note) {
                       dsp::integrator_name(cfg.kind), dsp::conversion_name(st.conversion),
                       cfg.passbandHz / 1000.0, dec.stopbandStartHz() / 1000.0);
         note->text = buf;
+        note->totalMs = std::chrono::duration<double, std::milli>(t_dsd_1 - t_dsd_0).count();
     }
     return out;
 }
@@ -278,11 +285,13 @@ inline AudioBuffer read_via_ffmpeg(const std::string& path, LoadNote* note) {
     // 所以：失败后用 Win32 问「此刻到底能不能读、为什么读不了」。
     // 注意：首次失败（i == 0）后必须至少再试一次，「此刻可读」不能排除「刚刚在 ffmpeg 运行期间才释放独占」；
     // 只有在已重试（i >= 1）且探针证明此刻仍可读时，才说明是真正的解码错误并提前退出。
+    const auto t_total_0 = std::chrono::steady_clock::now();
     constexpr int kDecodeTries = 3;
     int rc = -1;
     int attempts = 0;
     std::string fflog;                     // ffmpeg 的 stderr（错误时进错误文本，不吞不瞒）
     std::string unreadable;                // 非空 = 此刻源文件读不了（Win32 权威原因）
+    double ffmpeg_ms = 0.0;
     for (int i = 0; i < kDecodeTries; ++i) {
         ++attempts;
         fflog.clear();
@@ -291,7 +300,10 @@ inline AudioBuffer read_via_ffmpeg(const std::string& path, LoadNote* note) {
             DeleteFileW(widen(tmpPath).c_str());
             Sleep(120u * (DWORD)i);        // 退避 120ms / 240ms，等占用方松手
         }
+        const auto t_ff_0 = std::chrono::steady_clock::now();
         rc = run_hidden(cmd, &fflog);
+        const auto t_ff_1 = std::chrono::steady_clock::now();
+        ffmpeg_ms += std::chrono::duration<double, std::milli>(t_ff_1 - t_ff_0).count();
         if (rc == 0) break;
         unreadable = source_read_probe(path);
         // 关键判据修正（2026-10-23 回归）：除 rc==0 退出外，首轮失败（i == 0）必须至少再试一次。
@@ -325,6 +337,7 @@ inline AudioBuffer read_via_ffmpeg(const std::string& path, LoadNote* note) {
     const std::string tmpBytesTxt = (tmpBytes < 0) ? "未知(文件不存在)" : (std::to_string(tmpBytes) + " 字节");
 
     AudioBuffer buf;
+    double wav_ms = 0.0;
     try {
         if (rc != 0) {
             // -42 = -EILSEQ。ffmpeg 对非 ASCII 路径会用它掩盖真实原因（详见上面重试循环的注释），
@@ -349,14 +362,23 @@ inline AudioBuffer read_via_ffmpeg(const std::string& path, LoadNote* note) {
         if (tmpBytes < 44)
             throw std::runtime_error("ffmpeg 解码产物异常: 临时 WAV 缺失或过小(源文件=" + path +
                                      "，临时WAV=" + tmpPath + "，大小=" + tmpBytesTxt + "，退出码=0)");
+        const auto t_wav_0 = std::chrono::steady_clock::now();
         buf = read_wav(tmpPath);
+        const auto t_wav_1 = std::chrono::steady_clock::now();
+        wav_ms = std::chrono::duration<double, std::milli>(t_wav_1 - t_wav_0).count();
     } catch (...) {
         DeleteFileW(widen(tmpPath).c_str());
         throw;
     }
     DeleteFileW(widen(tmpPath).c_str());
 
-    if (note) note->text = std::string("已用 ffmpeg 解码 ") + ext + " -> " + codec;
+    const auto t_total_1 = std::chrono::steady_clock::now();
+    if (note) {
+        note->text = std::string("已用 ffmpeg 解码 ") + ext + " -> " + codec;
+        note->ffmpegMs = ffmpeg_ms;
+        note->wavReadMs = wav_ms;
+        note->totalMs = std::chrono::duration<double, std::milli>(t_total_1 - t_total_0).count();
+    }
     return buf;
 }
 
@@ -365,13 +387,26 @@ inline AudioBuffer read_via_ffmpeg(const std::string& path, LoadNote* note) {
 // 转成带文件与阶段的明确错误 —— 捕获只为带上下文重抛，绝不吞掉后继续（交接单 §6 红线）。
 inline AudioBuffer read_any(const std::string& path, LoadNote* note = nullptr) {
     const std::string ext = lowerExt(path);
+    const auto t_any_0 = std::chrono::steady_clock::now();
     try {
         if (ext == ".wav" || ext == ".wave" || ext.empty()) {
-            return read_wav(path);
+            AudioBuffer b = read_wav(path);
+            if (note) {
+                const auto t_any_1 = std::chrono::steady_clock::now();
+                const double ms = std::chrono::duration<double, std::milli>(t_any_1 - t_any_0).count();
+                note->wavReadMs = ms;
+                note->totalMs = ms;
+            }
+            return b;
         }
         if (ext == ".dsf" || ext == ".dff") {
             try {
-                return read_dsd_native(path, note);
+                AudioBuffer b = read_dsd_native(path, note);
+                if (note && note->totalMs <= 0.0) {
+                    const auto t_any_1 = std::chrono::steady_clock::now();
+                    note->totalMs = std::chrono::duration<double, std::milli>(t_any_1 - t_any_0).count();
+                }
+                return b;
             } catch (const std::length_error& e) {
                 throw std::runtime_error(std::string("解码阶段异常: ") + e.what() +
                                          "(文件=" + path + ",阶段=read_dsd_native)");
@@ -384,7 +419,12 @@ inline AudioBuffer read_any(const std::string& path, LoadNote* note = nullptr) {
                 // 被这个回退吞掉后继续播放。
                 LoadNote tmp;
                 AudioBuffer b = read_via_ffmpeg(path, &tmp);
-                if (note) note->text = std::string("DSD 原生读取失败（") + e.what() + "），已回退 ffmpeg：" + tmp.text;
+                if (note) {
+                    note->text = std::string("DSD 原生读取失败（") + e.what() + "），已回退 ffmpeg：" + tmp.text;
+                    note->ffmpegMs = tmp.ffmpegMs;
+                    note->wavReadMs = tmp.wavReadMs;
+                    note->totalMs = tmp.totalMs;
+                }
                 return b;
             }
         }

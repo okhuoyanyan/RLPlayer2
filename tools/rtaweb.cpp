@@ -184,11 +184,20 @@ struct PlayerState {
     std::atomic<double> volDb{0.0};    // 用户当前请求的音量（拖动滑块即时生效）
     std::atomic<double> startDb{0.0};  // 本次播放起点音量（DSP 里已按它做过抖动量化）
 
+    // 耗时统计（ROADMAP P6a 可观测性）
+    std::atomic<long long> decodeMs{0};     // 解码总耗时 (ms)
+    std::atomic<long long> ffmpegMs{0};     // 临时 WAV 转码写耗时 (ms)
+    std::atomic<long long> wavReadMs{0};    // 临时 WAV / WAV 读取耗时 (ms)
+    std::atomic<long long> dspChunkUs{0};   // 最近一块 DSP 处理耗时 (微秒)
+    std::atomic<long long> dspTotalUs{0};   // 累计 DSP 处理耗时 (微秒)
+    std::atomic<long long> dspChunks{0};    // 处理的 DSP 块数
+
     void joinIfDone() {
         if (th.joinable()) th.join();
     }
 };
 static PlayerState g_ps;
+static std::atomic<bool> g_exitReq{false};
 // 播放线程诊断计数（出问题时第一手证据，比猜快得多）
 static std::atomic<long long> g_dbgW0{0}, g_dbgPulls{0}, g_dbgWf{0}, g_dbgWr{0}, g_dbgPer{0};
 static std::atomic<double> g_dbgPeak{0.0};    // 最近一个写入周期的峰值（0..1）
@@ -845,7 +854,17 @@ static bool play_one_direct(const std::string& file, const PlayParams& p) {
     RtTune rt = rta::audio::apply_playback_tuning();
     struct RtGuard { RtTune* t; ~RtGuard() { rta::audio::release_playback_tuning(*t); } } rtg{ &rt };
     try {
+        ps.decodeMs.store(0);
+        ps.ffmpegMs.store(0);
+        ps.wavReadMs.store(0);
+        ps.dspChunkUs.store(0);
+        ps.dspTotalUs.store(0);
+        ps.dspChunks.store(0);
+        const auto t_dsd_0 = std::chrono::steady_clock::now();
         const DsdStream src = read_dsd(file);
+        const auto t_dsd_1 = std::chrono::steady_clock::now();
+        const double dsdMs = std::chrono::duration<double, std::milli>(t_dsd_1 - t_dsd_0).count();
+        ps.decodeMs.store((long long)(dsdMs + 0.5));
         if (src.rate == 0 || src.bits == 0) {
             std::lock_guard<std::mutex> lk(ps.mtx);
             ps.error = "DSD 解码结果为空：" + file;
@@ -928,6 +947,10 @@ static bool play_one_direct(const std::string& file, const PlayParams& p) {
                 << ",\"gpuVendor\":\"\",\"gpuStatus\":\"\""
                 << ",\"volRamp\":0,\"bits\":24,\"eq\":false"
                 << ",\"directSdm\":true"
+                << ",\"decodeMs\":" << dsdMs
+                << ",\"ffmpegMs\":0"
+                << ",\"wavReadMs\":0"
+                << ",\"scanMs\":" << Library::instance().lastScanMs()
                 << "}";
             recent_add(file, stem_or_self(file), "", "");
             play_log(std::string("PLAY v") + RLPLAYER_VERSION + " " + sig.str());
@@ -1141,9 +1164,23 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         LoadNote note;
         // HF-03 可观测性：read_any 之前先写 START —— 2.log 那种"END 有 error、前面没有 PLAY"
         // 的失败，靠 START 与 DECODE 的有无就能把故障段定位到解码/临时 WAV。
+        ps.decodeMs.store(0);
+        ps.ffmpegMs.store(0);
+        ps.wavReadMs.store(0);
+        ps.dspChunkUs.store(0);
+        ps.dspTotalUs.store(0);
+        ps.dspChunks.store(0);
         play_log("START file=" + file);
+        const auto t_dec_0 = std::chrono::steady_clock::now();
         if (buf.raw.empty()) buf = read_any(file, &note);
         else note.text = "预解码命中（整曲已在内存）";
+        const auto t_dec_1 = std::chrono::steady_clock::now();
+        if (note.totalMs <= 0.0) {
+            note.totalMs = std::chrono::duration<double, std::milli>(t_dec_1 - t_dec_0).count();
+        }
+        ps.decodeMs.store((long long)(note.totalMs + 0.5));
+        ps.ffmpegMs.store((long long)(note.ffmpegMs + 0.5));
+        ps.wavReadMs.store((long long)(note.wavReadMs + 0.5));
         AudioBuffer& in = buf;
         if (!note.text.empty()) { std::lock_guard<std::mutex> lk(ps.mtx); ps.info = note.text; }
         if (!directNote.empty()) { std::lock_guard<std::mutex> lk(ps.mtx); ps.info += " ｜ " + directNote; }
@@ -1728,6 +1765,10 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 << ",\"eq\":" << (eqLoaded ? "true" : "false")
                 << ",\"directSdm\":false"
                 << ",\"directNote\":\"" << jesc(directNote) << "\""
+                << ",\"decodeMs\":" << note.totalMs
+                << ",\"ffmpegMs\":" << note.ffmpegMs
+                << ",\"wavReadMs\":" << note.wavReadMs
+                << ",\"scanMs\":" << Library::instance().lastScanMs()
                 << "}";
             recent_add(file, mi.title.empty() ? stem_or_self(file) : mi.title,
                        mi.artist, mi.album);
@@ -1790,6 +1831,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                     c.raw.assign(in.raw.begin() + (long long)(pos * (size_t)in.channels),
                                  in.raw.begin() + (long long)((pos + n) * (size_t)in.channels));
                     pos += n;
+                    const auto t_dsp_0 = std::chrono::steady_clock::now();
                     AudioBuffer o = pl->process(c, nullptr);
                     if (!RQ.gpu.load()) RQ.gpu.store(pl->gpuResampleActive());
                     if (skipOut > 0 && !o.raw.empty()) {
@@ -1820,6 +1862,11 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                         nb.raw = std::move(packed);
                         o = std::move(nb);
                     }
+                    const auto t_dsp_1 = std::chrono::steady_clock::now();
+                    const long long dsp_us = std::chrono::duration_cast<std::chrono::microseconds>(t_dsp_1 - t_dsp_0).count();
+                    ps.dspChunkUs.store(dsp_us);
+                    ps.dspTotalUs.fetch_add(dsp_us, std::memory_order_relaxed);
+                    ps.dspChunks.fetch_add(1, std::memory_order_relaxed);
                     if (o.raw.empty()) continue;
                     {
                         std::unique_lock<std::mutex> lk(RQ.mtx);
@@ -2759,13 +2806,17 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
               << ",\"scanning\":" << (lib.scanning() ? "true" : "false")
               << ",\"scanned\":" << lib.scanned()
               << ",\"total\":" << lib.scanTotal()
+              << ",\"scanThreads\":" << lib.scanThreads()
+              << ",\"lastScanMs\":" << lib.lastScanMs()
+              << ",\"probed\":" << lib.lastScanProbed()
+              << ",\"cached\":" << lib.lastScanCached()
               << ",\"msg\":\"" << jesc(lib.scanMsg()) << "\",\"roots\":[";
             for (size_t i = 0; i < roots.size(); ++i) { if (i) j << ","; j << "\"" << jesc(roots[i]) << "\""; }
             j << "]}";
             return j.str();
         }
-        if (rq.path.rfind("/api/lib/scan", 0) == 0) {
-            lib.startScan(rq.body.find("full=1") != std::string::npos);
+        if (rq.path.rfind("/api/lib/scan", 0) == 0 || rq.path.rfind("/api/rescan", 0) == 0) {
+            lib.startScan(rq.body.find("full=1") != std::string::npos || rq.path.rfind("/api/rescan", 0) == 0);
             return "{\"ok\":true}";
         }
         if (rq.path.rfind("/api/lib/roots", 0) == 0) {
@@ -4032,7 +4083,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                                            // 元数据补全(P1.5):总开关与 LLM 固定两键;
                                            // 源开关 metasrc_<id> 按注册表动态放行(见下);
                                            // P3④b AI 综合开关 metasummary (默认0)
-                                           "metaon", "metallm", "metasummary" })
+                                           "metaon", "metallm", "metasummary", "scanthreads", "scanThreads" })
                     if (k == allow) okKey = true;
                 if (!okKey && k.rfind("metasrc_", 0) == 0) {
                     const std::string id = k.substr(8);
@@ -4042,6 +4093,10 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                 if (!okKey) continue;
                 std::string clean;
                 for (char ch : v) if (ch != 10 && ch != 13) clean += ch;
+                if (k == "scanThreads" || k == "scanthreads") {
+                    const int st = atoi(clean.c_str());
+                    if (st > 0) Library::instance().setScanThreads((size_t)st);
+                }
                 f << k << "=" << clean << (char)10;
             }
             return "{\"ok\":true}";
@@ -4813,7 +4868,32 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         ct = "application/json; charset=utf-8";
         std::lock_guard<std::mutex> lk(ps.mtx);
         if (ps.signal.empty()) return "{\"ok\":false}";
-        return "{\"ok\":true,\"path\":" + ps.signal + "}";
+        const long long dspCnt = ps.dspChunks.load();
+        const long long dspTotUs = ps.dspTotalUs.load();
+        const double avgDspBlockMs = dspCnt > 0 ? (double)dspTotUs / (dspCnt * 1000.0) : 0.0;
+        const double totalDspMs = (double)dspTotUs / 1000.0;
+        std::string s = ps.signal;
+        if (!s.empty() && s.back() == '}') {
+            s.pop_back();
+            std::ostringstream dyn;
+            dyn << ",\"dspBlockMs\":" << avgDspBlockMs
+                << ",\"dspTotalMs\":" << totalDspMs
+                << ",\"dspChunkUs\":" << ps.dspChunkUs.load()
+                << ",\"scanMs\":" << Library::instance().lastScanMs()
+                << "}";
+            s += dyn.str();
+        }
+        return "{\"ok\":true,\"path\":" + s + "}";
+    }
+
+    if (rq.path.rfind("/api/rescan", 0) == 0) {
+        Library::instance().startScan(true);
+        return "{\"ok\":true}";
+    }
+
+    if (rq.path.rfind("/api/quit", 0) == 0 || rq.path.rfind("/api/shutdown", 0) == 0) {
+        g_exitReq.store(true);
+        return "{\"ok\":true}";
     }
 
     if (rq.path.rfind("/api/dbg", 0) == 0) {
@@ -4916,6 +4996,13 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
           << ",\"peak\":" << g_dbgPeak.load() << ",\"clip\":" << g_dbgClip.load()
           << ",\"wf\":" << g_dbgWf.load() << ",\"pulls\":" << g_dbgPulls.load()
           << ",\"per\":" << g_dbgPer.load()
+          << ",\"decodeMs\":" << ps.decodeMs.load()
+          << ",\"ffmpegMs\":" << ps.ffmpegMs.load()
+          << ",\"wavReadMs\":" << ps.wavReadMs.load()
+          << ",\"dspChunkUs\":" << ps.dspChunkUs.load()
+          << ",\"dspBlockMs\":" << (ps.dspChunks.load() > 0 ? (double)ps.dspTotalUs.load() / (ps.dspChunks.load() * 1000.0) : 0.0)
+          << ",\"dspTotalMs\":" << ((double)ps.dspTotalUs.load() / 1000.0)
+          << ",\"scanMs\":" << Library::instance().lastScanMs()
           << "}";
         return j.str();
     }
@@ -4989,6 +5076,21 @@ int main(int argc, char** argv) {
     rta::meta::MetaStore::instance().setBaseDir(path_in_exe_dir("rlplayer-meta"));
     rta::meta::EntityStore::instance().setBaseDir(path_in_exe_dir("rlplayer-meta"));
     rta::dsp::OpraService::instance().init(path_in_exe_dir("data\\opra_index.json"), path_in_exe_dir(""));
+    {
+        std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
+        std::string line;
+        while (std::getline(f, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            const size_t e = line.find('=');
+            if (e == std::string::npos) continue;
+            const std::string k = line.substr(0, e);
+            const std::string v = line.substr(e + 1);
+            if (k == "scanThreads" || k == "scanthreads") {
+                const int st = atoi(v.c_str());
+                if (st > 0) Library::instance().setScanThreads((size_t)st);
+            }
+        }
+    }
     if (Library::instance().trackCount() == 0) {
         printf("音乐库为空，开始首次扫描（根目录见 rlplayer-library.conf）…\n");
         Library::instance().startScan();
@@ -5020,6 +5122,8 @@ int main(int argc, char** argv) {
     printf("  打开浏览器访问: http://127.0.0.1:%u/\n", (unsigned)ui.port());
     printf("  （只监听本机；播放会以独占模式接管音频设备）\n");
     printf("  按 Ctrl+C 退出\n");
-    for (;;) std::this_thread::sleep_for(std::chrono::seconds(3600));
+    while (!g_exitReq.load()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ui.stop();
+    return 0;
     return 0;
 }

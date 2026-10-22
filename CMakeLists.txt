@@ -270,6 +270,10 @@ add_executable(test_library tests/test_library.cpp)
 target_include_directories(test_library PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME library COMMAND test_library)
 
+add_executable(test_scanpool tests/test_scanpool.cpp)
+target_include_directories(test_scanpool PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME scanpool COMMAND test_scanpool)
+
 add_executable(test_stream_baseline tests/test_stream_baseline.cpp)
 target_link_libraries(test_stream_baseline PRIVATE rtadsp)
 add_test(NAME stream_baseline COMMAND test_stream_baseline)

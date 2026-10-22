@@ -16,6 +16,8 @@
 //   之前定义它们，行为不变；留着只会让"这个头依赖 Windows"看起来像真的。）
 #include "audio/audio_loader.h"
 #include "audio/media_info.h"
+#include "net/scan_pool.h"
+#include <memory>
 #include <string>
 #include <vector>
 #include <map>
@@ -97,6 +99,32 @@ public:
     size_t trackCount() const { std::lock_guard<std::mutex> lk(mtx_); return tracks_.size(); }
     size_t albumCount() const { std::lock_guard<std::mutex> lk(mtx_); return albumVecLocked().size(); }
 
+    void setScanThreads(size_t n) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        scanThreads_ = n;
+    }
+    size_t scanThreads() const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (scanThreads_ > 0) return scanThreads_;
+        return defaultScanThreads();
+    }
+    static size_t defaultScanThreads() {
+        unsigned int h = std::thread::hardware_concurrency();
+        return std::min(std::max(1u, h), 8u);
+    }
+    double lastScanMs() const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return lastScanMs_;
+    }
+    int lastScanProbed() const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return lastScanProbed_;
+    }
+    int lastScanCached() const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return lastScanCached_;
+    }
+
     // ---- 查询 ----
     std::vector<LibAlbum> albums() const {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -123,7 +151,15 @@ public:
     // ---- 扫描 ----
     void load();            // 读配置与索引
     void startScan(bool forceFull = false);
-    void stopScan() { cancel_.store(true); }
+    void stopScan() {
+        cancel_.store(true);
+        std::shared_ptr<ScanPool> p;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            p = activePool_;
+        }
+        if (p) p->cancel();
+    }
     void joinScan();
 
 private:
@@ -150,6 +186,12 @@ private:
     std::atomic<int>  scanned_{0};
     std::atomic<int>  total_{0};
     std::string scanMsg_;
+
+    size_t scanThreads_ = 0;
+    double lastScanMs_ = 0.0;
+    int lastScanProbed_ = 0;
+    int lastScanCached_ = 0;
+    std::shared_ptr<ScanPool> activePool_;
 };
 
 // ---------------------------------------------------------------------------
@@ -177,10 +219,10 @@ inline bool lib_is_audio(const fsx::path& p) {
 }
 
 // 一次 ffprobe 取全部信息（比 media_info.h 的两次调用快一倍）
-inline LibTrack lib_probe_one(const std::string& file) {
+inline LibTrack lib_probe_one(const std::string& file, const std::string& ffprobePath = "") {
     LibTrack t;
     t.path = file;
-    const std::string ffprobe = rta::audio::find_tool("ffprobe");
+    const std::string ffprobe = !ffprobePath.empty() ? ffprobePath : rta::audio::find_tool("ffprobe");
     if (ffprobe.empty()) return t;
 
     std::string out;
@@ -257,7 +299,9 @@ inline void Library::writeFile(const std::string& p, const std::string& s) {
 
 inline void Library::load() {
     {
-        const std::string conf = readFile(confPath());
+        std::string conf = readFile(confPath());
+        if (conf.size() >= 3 && (unsigned char)conf[0] == 0xEF && (unsigned char)conf[1] == 0xBB && (unsigned char)conf[2] == 0xBF)
+            conf = conf.substr(3);
         std::lock_guard<std::mutex> lk(mtx_);
         roots_.clear();
         std::string line;
@@ -290,7 +334,9 @@ inline void Library::load() {
         }
     }
     // 索引
-    const std::string idx = readFile(indexPath());
+    std::string idx = readFile(indexPath());
+    if (idx.size() >= 3 && (unsigned char)idx[0] == 0xEF && (unsigned char)idx[1] == 0xBB && (unsigned char)idx[2] == 0xBF)
+        idx = idx.substr(3);
     std::vector<LibTrack> loaded;
     if (!idx.empty()) {
         std::string line;
@@ -331,6 +377,30 @@ inline void Library::load() {
         std::lock_guard<std::mutex> lk(mtx_);
         tracks_.swap(loaded);
         albumsDirty_ = true;
+    }
+    std::string sconf = readFile("rlplayer-settings.conf");
+    if (sconf.size() >= 3 && (unsigned char)sconf[0] == 0xEF && (unsigned char)sconf[1] == 0xBB && (unsigned char)sconf[2] == 0xBF)
+        sconf = sconf.substr(3);
+    if (!sconf.empty()) {
+        std::string line;
+        for (size_t i = 0; i <= sconf.size(); ++i) {
+            if (i == sconf.size() || sconf[i] == '\n') {
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+                const size_t e = line.find('=');
+                if (e != std::string::npos) {
+                    const std::string k = line.substr(0, e);
+                    const std::string v = line.substr(e + 1);
+                    if (k == "scanThreads" || k == "scanthreads") {
+                        const int st = atoi(v.c_str());
+                        if (st > 0) {
+                            std::lock_guard<std::mutex> lk(mtx_);
+                            scanThreads_ = (size_t)st;
+                        }
+                    }
+                }
+                line.clear();
+            } else line += sconf[i];
+        }
     }
 }
 
@@ -459,7 +529,11 @@ inline void Library::startScan(bool forceFull) {
     total_.store(0);
     { std::lock_guard<std::mutex> lk(mtx_); scanMsg_ = "正在遍历目录…"; }
 
-    th_ = std::thread([this, roots, old, forceFull]() {
+    const size_t thCount = this->scanThreads();
+
+    th_ = std::thread([this, roots, old, forceFull, thCount]() {
+        const auto tStart = std::chrono::steady_clock::now();
+
         // 老记录按路径建索引，便于复用
         std::unordered_map<std::string, size_t> oldByPath;
         oldByPath.reserve(old.size() * 2);
@@ -491,41 +565,103 @@ inline void Library::startScan(bool forceFull) {
 
         const int n = (int)walked.size();
         total_.store(n);
-        fresh.reserve((size_t)n);
+        if (n == 0) {
+            const auto tEnd = std::chrono::steady_clock::now();
+            const double durMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+            std::lock_guard<std::mutex> lk(mtx_);
+            tracks_.clear();
+            albumsDirty_ = true;
+            lastScanMs_ = durMs;
+            lastScanProbed_ = 0;
+            lastScanCached_ = 0;
+            scanMsg_ = "完成：0 首";
+            saveIndexLocked();
+            scanning_.store(false);
+            return;
+        }
+
+        fresh.resize((size_t)n);
+        std::atomic<int> completed{0};
+        std::atomic<int> probedCount{0};
+        std::atomic<int> cachedCount{0};
+
+        const std::string ffprobe = rta::audio::find_tool("ffprobe");
+
+        auto pool = std::make_shared<ScanPool>(thCount);
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            activePool_ = pool;
+        }
+
         for (int i = 0; i < n; ++i) {
             if (cancel_.load()) break;
-            const std::string& p = walked[(size_t)i];
-            long long mt = 0, sz = 0;
-            {
-                std::error_code e2;
-                auto wp = p8(p);
-                auto ft = fsx::last_write_time(wp, e2);
-                if (!e2) mt = (long long)ft.time_since_epoch().count();
-                auto s = fsx::file_size(wp, e2);
-                if (!e2) sz = (long long)s;
-            }
-            auto oit = oldByPath.find(p);
-            if (!forceFull && oit != oldByPath.end()) {
-                const LibTrack& o = old[oit->second];
-                if (o.mtime == mt && o.size == sz) { fresh.push_back(o); scanned_.store(i + 1); continue; }
-            }
-            { std::lock_guard<std::mutex> lk(mtx_); scanMsg_ = "读取标签 " + std::to_string(i + 1) + "/" + std::to_string(n); }
-            LibTrack t = lib_probe_one(p);
-            t.mtime = mt; t.size = sz;
-            // 标签全空时用文件名兜底，避免整库出现一堆空白行
-            if (t.title.empty()) {
-                std::string sn = u8s(p8(p).stem().u8string());
-                t.title = sn.empty() ? p : sn;
-            }
-            fresh.push_back(t);
-            scanned_.store(i + 1);
+            const bool submitted = pool->submit([this, i, n, &walked, &oldByPath, &old, forceFull, &ffprobe,
+                                                 &fresh, &completed, &probedCount, &cachedCount]() {
+                if (cancel_.load()) return;
+                const std::string& p = walked[(size_t)i];
+                long long mt = 0, sz = 0;
+                {
+                    std::error_code e2;
+                    auto wp = p8(p);
+                    auto ft = fsx::last_write_time(wp, e2);
+                    if (!e2) mt = (long long)ft.time_since_epoch().count();
+                    auto s = fsx::file_size(wp, e2);
+                    if (!e2) sz = (long long)s;
+                }
+                auto oit = oldByPath.find(p);
+                if (!forceFull && oit != oldByPath.end()) {
+                    const LibTrack& o = old[oit->second];
+                    if (o.mtime == mt && o.size == sz) {
+                        fresh[(size_t)i] = o;
+                        cachedCount.fetch_add(1, std::memory_order_relaxed);
+                        const int c = completed.fetch_add(1, std::memory_order_relaxed) + 1;
+                        scanned_.store(c);
+                        return;
+                    }
+                }
+                LibTrack t = lib_probe_one(p, ffprobe);
+                t.mtime = mt;
+                t.size = sz;
+                if (t.title.empty()) {
+                    std::string sn = u8s(p8(p).stem().u8string());
+                    t.title = sn.empty() ? p : sn;
+                }
+                fresh[(size_t)i] = std::move(t);
+                probedCount.fetch_add(1, std::memory_order_relaxed);
+                const int c = completed.fetch_add(1, std::memory_order_relaxed) + 1;
+                scanned_.store(c);
+                if (c % 8 == 0 || c == n) {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    scanMsg_ = "读取标签 " + std::to_string(c) + "/" + std::to_string(n);
+                }
+            });
+            if (!submitted) break;
         }
+
+        pool->wait(false);
+
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            activePool_.reset();
+        }
+
+        if (cancel_.load()) {
+            scanning_.store(false);
+            return;
+        }
+
+        const auto tEnd = std::chrono::steady_clock::now();
+        const double durMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+
         {
             std::lock_guard<std::mutex> lk(mtx_);
             tracks_.swap(fresh);
             albumsDirty_ = true;
+            lastScanMs_ = durMs;
+            lastScanProbed_ = probedCount.load();
+            lastScanCached_ = cachedCount.load();
             const size_t nt = tracks_.size();
-            scanMsg_ = "完成：" + std::to_string(nt) + " 首";
+            scanMsg_ = "完成：" + std::to_string(nt) + " 首 (" + std::to_string((int)(durMs + 0.5)) + " ms)";
             saveIndexLocked();
         }
         scanning_.store(false);
