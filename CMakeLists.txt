@@ -324,6 +324,16 @@ add_executable(test_writeback tests/test_writeback.cpp)
 target_include_directories(test_writeback PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME writeback COMMAND test_writeback)
 
+# P1 精简 ffmpeg 的音频格式矩阵门禁（2026-10-22）：
+# 用产品自己的 rta::audio::read_any 逐格式断言 rate/channels/frames/电平，样本由 ffmpeg
+# 现场合成（−60 dBFS，不打开任何音频设备）。被测二进制是 build/ffmpeg-lite/（自建精简版）；
+# 该目录不存在时打印 [SKIP] 不判失败（CI 云机没有 MSYS2，编不出精简版）。
+# RTA_SOURCE_DIR 用于读取 tools/ffmpeg_lite_required.txt（与出包守卫同一份白名单）。
+add_executable(test_ffmpeg_matrix tests/test_ffmpeg_matrix.cpp)
+target_include_directories(test_ffmpeg_matrix PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_ffmpeg_matrix PRIVATE RTA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME ffmpeg_matrix COMMAND test_ffmpeg_matrix)
+
 # 热修复守卫（HF-03 解码/临时WAV/分配加固 + HF-01/02 probe/OpenFail 地基）：全离线，不开设备
 add_executable(test_hotfix_guard tests/test_hotfix_guard.cpp)
 target_include_directories(test_hotfix_guard PRIVATE ${CMAKE_SOURCE_DIR}/src)
