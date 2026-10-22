@@ -102,6 +102,7 @@ int main(int argc, char** argv) {
         printf("  --net <host:port> 走 RTANet 网络输出     --analyze   只跑管线不开设备\n");
         printf("  --buffer <ms> 独占缓冲   --seconds N 限时   --device <ID>   --loop\n");
         printf("  --list-filters    列出全部命名滤波器（不需要输入文件）\n");
+        printf("  --list-modulators 列出全部调制器族（不需要输入文件）\n");
         return 1;
     }
     std::string first = argv[1];
@@ -114,6 +115,14 @@ int main(int argc, char** argv) {
         return 0;
     }
     // 选项解析从 argv[2] 开始（argv[1] 当输入文件），所以这类"单参数命令"必须在这里拦下
+    if (first == "--list-modulators") {
+        printf("可用调制器族（4 个）：\n");
+        printf("  %-12s %s\n", "dsd", "DSD 标准（Butterworth NTF，1-bit 经典）");
+        printf("  %-12s %s\n", "chebyshev", "7 阶 Chebyshev（可配带外增益与截止，带低采样率降阶保护）");
+        printf("  %-12s %s\n", "ec", "EC 误差反馈（通带 Chebyshev 零点分布，扩展误差消除）");
+        printf("  %-12s %s\n", "ahm", "AHM 多电平（6~8 bit 风格，64~256 电平，极低带外能量与超高稳定性）");
+        return 0;
+    }
     if (first == "--list-filters") {
         printf("可用滤波器（%zu 个）：\n", rta::dsp::filter_presets().size());
         for (const auto& p : rta::dsp::filter_presets())
@@ -147,6 +156,9 @@ int main(int argc, char** argv) {
     bool lowLat = false;         // 低延迟起播：边处理边喂设备
     int  dsdMultiple = 0;        // >0 表示输出 DoP 封装的 DSD
     int  modOrder = 5;           // SDM 调制器阶数（DSD128 以上才建议 7）
+    std::string modFamily = "dsd";   // SDM 调制器族：dsd | chebyshev | ec | ahm
+    double oobGain = 5.0;            // Chebyshev 带外增益 dB
+    int  ahmBits = 8;                // AHM 多电平位深 (6~8 bit)
     std::string filterName;      // 命名滤波器（手册 4.6）
     bool listFilters = false;
 
@@ -188,6 +200,9 @@ int main(int argc, char** argv) {
         else if (k == "--chunk")       chunkFrames = (size_t)atoi(next("0").c_str());
         else if (k == "--lowlat")      lowLat = true;
         else if (k == "--mod-order")   modOrder = atoi(next("5").c_str());
+        else if (k == "--mod-family")  modFamily = next("dsd");
+        else if (k == "--oob-gain")    oobGain = atof(next("5.0").c_str());
+        else if (k == "--ahm-bits")    ahmBits = atoi(next("8").c_str());
         else if (k == "--dsd")         { dsdMultiple = atoi(next("64").c_str()); cfg.outRate = rta::dsp::dop_carrier_rate(dsdMultiple) * 16; }
         else if (k == "--filter")       filterName = next("");
         else if (k == "--list-filters") listFilters = true;
@@ -518,8 +533,11 @@ int main(int argc, char** argv) {
         if (useOrder != wantOrder)
             printf("!! %d 阶调制器在 DSD%d 上不稳定（实测会饱和），已自动改用 %d 阶\n",
                    wantOrder, dsdMultiple, useOrder);
+        mcfg.family = rta::dsp::parse_modulator_family(modFamily);
         mcfg.order = useOrder;
-        mcfg.levels = 2;                // 1-bit
+        mcfg.levels = (mcfg.family == rta::dsp::ModulatorFamily::Ahm ? (1 << ahmBits) : 2);
+        mcfg.oobGainDb = oobGain;
+        mcfg.ahmBits = ahmBits;
         mcfg.cutoffHz = 100000.0;
         mcfg.ditherLsb = 0.01;          // 依 Round 45 实验：抑制空闲音
         std::vector<std::vector<double>> sdm((size_t)out.channels);
