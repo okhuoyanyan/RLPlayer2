@@ -53,6 +53,10 @@ target_link_libraries(asio_probe PRIVATE ole32 uuid)
 add_executable(rtaplay tools/rtaplay.cpp)
 target_link_libraries(rtaplay PRIVATE rtadsp ole32 uuid mmdevapi ws2_32)
 
+# ---------------- WASAPI 采集 CLI ----------------
+add_executable(rtacapture tools/rtacapture.cpp)
+target_link_libraries(rtacapture PRIVATE rtadsp ole32 uuid mmdevapi ws2_32)
+
 # ---------------- UPnP 设备发现（只读探测） ----------------
 add_executable(upnp_scan tools/upnp_scan.cpp)
 target_link_libraries(upnp_scan PRIVATE ws2_32)
@@ -418,4 +422,11 @@ target_link_libraries(make_dsd PRIVATE rtadsp)
 # DSD 域转换：抽取 / DirectSDM / 信息（命令行闭环验证）
 add_executable(dsdconv tools/dsdconv.cpp)
 target_link_libraries(dsdconv PRIVATE rtadsp)
+
+# WASAPI 采集核心（ROADMAP P4a）：环形缓冲 / 格式转换 / 离线分析 / --src null 门禁
+add_executable(test_capture tests/test_capture.cpp)
+target_include_directories(test_capture PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_capture PRIVATE rtadsp ole32 uuid mmdevapi ws2_32)
+target_compile_definitions(test_capture PRIVATE RTA_CAPTURE_EXE="$<TARGET_FILE:rtacapture>")
+add_test(NAME capture COMMAND test_capture)
 
