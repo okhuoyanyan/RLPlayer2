@@ -6,13 +6,6 @@
 #ifndef _WINSOCK_DEPRECATED_NO_WARNINGS
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
 #include "net/upnp.h"
 #include "net/upnp_control.h"
 #include "audio/wav.h"
@@ -42,12 +35,12 @@ inline std::string cast_lower_str(std::string s) {
 }
 
 inline std::string make_cast_temp_wav_path(const char* tag) {
-    char tmpDir[MAX_PATH] = {0};
-    GetTempPathA(MAX_PATH, tmpDir);
-    char path[MAX_PATH] = {0};
-    std::snprintf(path, sizeof(path), "%srtacast_%lu_%s.wav",
-                  tmpDir, (unsigned long)GetCurrentProcessId(), tag);
-    return std::string(path);
+    std::error_code ec;
+    auto td = fs::temp_directory_path(ec);
+    static std::atomic<uint64_t> s_seq{0};
+    auto name = "rtacast_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())
+                + "_" + std::to_string(++s_seq) + "_" + (tag ? tag : "") + ".wav";
+    return (td / name).string();
 }
 
 struct CastState {
