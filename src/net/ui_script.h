@@ -994,6 +994,20 @@ function tick() {
     S.startDb = (typeof j.startDb === 'number') ? j.startDb : S.vol;
     // 信号链弹层开着时，音量节点要跟着实时变（否则就是在显示过期数据）
     if (D('chainVol') && D('modal').classList.contains('on')) D('chainVol').textContent = volText(S.volDb);
+    if (D('chainTiming') && D('modal').classList.contains('on')) {
+      var dspB = (typeof j.dspBlockMs === 'number' && j.dspBlockMs > 0) ? j.dspBlockMs.toFixed(2) + ' ms/块' : '';
+      var dspT = (typeof j.dspTotalMs === 'number' && j.dspTotalMs > 0) ? '（累计 ' + j.dspTotalMs.toFixed(1) + ' ms）' : '';
+      var dspStr = (dspB || dspT) ? (dspB + dspT) : '–';
+      var decStr = (typeof j.decodeMs === 'number' && j.decodeMs > 0) ? (j.decodeMs >= 1000 ? (j.decodeMs/1000).toFixed(2) + ' s' : j.decodeMs.toFixed(1) + ' ms') : '–';
+      var wavStr = '–';
+      if (typeof j.ffmpegMs === 'number' && j.ffmpegMs > 0) {
+        wavStr = '转码写 ' + j.ffmpegMs.toFixed(1) + ' ms' + (typeof j.wavReadMs === 'number' && j.wavReadMs > 0 ? ' / 读 ' + j.wavReadMs.toFixed(1) + ' ms' : '');
+      } else if (typeof j.wavReadMs === 'number' && j.wavReadMs > 0) {
+        wavStr = '读取 ' + j.wavReadMs.toFixed(1) + ' ms';
+      }
+      var scanStr = (typeof j.scanMs === 'number' && j.scanMs > 0) ? (j.scanMs >= 1000 ? (j.scanMs/1000).toFixed(2) + ' s' : j.scanMs.toFixed(0) + ' ms') : '–';
+      D('chainTiming').textContent = '解码 ' + decStr + '  \u00b7  临时WAV ' + wavStr + '  \u00b7  DSP ' + dspStr + '  \u00b7  库扫描 ' + scanStr;
+    }
     var pct = (j.dur > 0 ? Math.min(100, j.pos / j.dur * 100) : 0) + '%';
     if (D('bar')) D('bar').style.width = pct;
     D('tpos').textContent = fmt(j.pos);
@@ -1053,6 +1067,7 @@ function saveSettings(immediate) {
         + '&sdmfiltnx=' + encodeURIComponent(ADV.sdmFiltNx || '')
         + '&directsdm=' + (ADV.directsdm ? 1 : 0)
         + '&dsdkind=' + (ADV.dsdKind || 'fir') + '&dsdconv=' + (ADV.dsdConv || 'narrow')
+        + '&scanthreads=' + (ADV.scanThreads !== undefined ? ADV.scanThreads : 0)
         + '&opraproduct=' + encodeURIComponent(ADV.opraproduct || '')
         + '&oprapreset=' + encodeURIComponent(ADV.oprapreset || '')
         // 元数据补全（P1.5）：metaon/metallm 固定两键；源开关按注册表逐源写 metasrc_<id>; metasummary 默认0
@@ -1072,6 +1087,9 @@ function saveSettings(immediate) {
 function loadSettings() {
   api('/api/settings').then(function (j) {
     var kv = j.kv || {};
+    if (kv.scanThreads !== undefined || kv.scanthreads !== undefined) {
+      ADV.scanThreads = parseInt(kv.scanThreads || kv.scanthreads, 10) || 0;
+    }
     SET_KEYS.forEach(function (p) {
       var e = D(p[0]); if (!e || kv[p[1]] === undefined) return;
       if (e.type === 'checkbox') e.checked = (kv[p[1]] === '1');
@@ -1721,6 +1739,33 @@ function showChain() {
     nodes.push({ k: '输出', v: p.device + '  \u00b7  ' + p.outRate + ' Hz / ' + p.outBits + ' bit / ' + p.outCh +
       ' ch  \u00b7  ' + ((ADV.backend === 'wasapi-shared') ? '共享模式（非 bit-perfect）' : '独占模式') +
       '  \u00b7  缓冲 ' + p.buffer + ' ms' });
+
+    var tDec = (typeof p.decodeMs === 'number' && p.decodeMs > 0)
+      ? (p.decodeMs >= 1000 ? (p.decodeMs / 1000).toFixed(2) + ' s' : p.decodeMs.toFixed(1) + ' ms')
+      : '–';
+    var tWav = '–';
+    if (typeof p.ffmpegMs === 'number' && p.ffmpegMs > 0) {
+      tWav = '转码写 ' + p.ffmpegMs.toFixed(1) + ' ms' +
+             (typeof p.wavReadMs === 'number' && p.wavReadMs > 0 ? ' / 读 ' + p.wavReadMs.toFixed(1) + ' ms' : '');
+    } else if (typeof p.wavReadMs === 'number' && p.wavReadMs > 0) {
+      tWav = '读取 ' + p.wavReadMs.toFixed(1) + ' ms';
+    }
+    var tDsp = '–';
+    if (typeof p.dspBlockMs === 'number' && p.dspBlockMs > 0) {
+      tDsp = p.dspBlockMs.toFixed(2) + ' ms/块' +
+             (typeof p.dspTotalMs === 'number' && p.dspTotalMs > 0 ? '（累计 ' + p.dspTotalMs.toFixed(1) + ' ms）' : '');
+    } else if (typeof p.dspTotalMs === 'number' && p.dspTotalMs > 0) {
+      tDsp = '累计 ' + p.dspTotalMs.toFixed(1) + ' ms';
+    }
+    var tScan = (typeof p.scanMs === 'number' && p.scanMs > 0)
+      ? (p.scanMs >= 1000 ? (p.scanMs / 1000).toFixed(2) + ' s' : p.scanMs.toFixed(0) + ' ms')
+      : '–';
+
+    nodes.push({
+      k: '耗时统计',
+      v: '解码 ' + tDec + '  \u00b7  临时WAV ' + tWav + '  \u00b7  DSP ' + tDsp + '  \u00b7  库扫描 ' + tScan,
+      id: 'chainTiming'
+    });
     var h = '<div class=chain>';
     nodes.forEach(function (n, i) {
       h += '<div class="cnode' + (n.gpu ? ' gpu' : '') + '"><div class=dot></div><div><div class=k>' + esc(n.k) + '</div>' +
@@ -2352,6 +2397,7 @@ function renderSettingsPage() {
      + sgroup('音乐库与网络', '',
          txt('sp_root', '添加音乐目录', '', '填好后点下面的按钮', 'D:\Music')
        + '<div class="sfld wide"><button class="btn" id=sp_addroot>添加目录</button> <button class="btn" id=sp_rescan>重新扫描全部</button> <button class="btn" id=sp_upnp>发现 DLNA 设备</button></div>'
+       + num({id:'sp_scanthreads', label:'扫描线程数'}, ADV.scanThreads || 0, 0, 32, 1, '库扫描并行线程数，0 为自动（默认 min(CPU, 8)）')
        + '<div class="sfld wide"><div id=sp_roots class=rootlist></div></div>'
        + '<div class="sfld wide"><div id=sp_upnpmsg style="font-size:11px;color:var(--mut2)"></div></div>')
      + sgroup('播放', '',
@@ -2598,6 +2644,12 @@ function renderSettingsPage() {
     });
   };
   D('sp_rescan').onclick = function () { api('/api/lib/scan', 'full=1').then(function () { toast('开始重新扫描'); loadLibStats(); }); };
+  if (D('sp_scanthreads')) {
+    D('sp_scanthreads').onchange = function () {
+      ADV.scanThreads = parseInt(this.value, 10) || 0;
+      saveSettings();
+    };
+  }
   D('sp_upnp').onclick = function () {
     D('sp_upnpmsg').textContent = '正在搜索…';
     api('/api/upnp').then(function (j) {
