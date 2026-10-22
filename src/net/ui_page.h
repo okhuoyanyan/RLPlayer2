@@ -138,7 +138,11 @@ inline std::string rta_ui_page() {
     h += ".ahead .info{min-width:0;padding-bottom:5px}";
     h += ".ahead .kind{font-size:10px;letter-spacing:1.4px;color:var(--mut2);font-weight:600}";
     h += ".ahead h1{font-size:26px;line-height:1.2;font-weight:750;letter-spacing:-.4px;margin:5px 0 7px;word-break:break-word}";
-    h += ".ahead .sub{font-size:12.5px;color:var(--mut);margin-bottom:13px}";
+        h += ".ahead .sub{font-size:12.5px;color:var(--mut);margin-bottom:13px}";
+    h += ".bio-box{font-size:13px;line-height:1.75;color:var(--txt2);white-space:pre-wrap;word-break:break-word}";
+    h += ".bio-box.collapsed{max-height:140px;overflow:hidden;-webkit-mask-image:linear-gradient(180deg,#000 65%,transparent)}";
+    h += ".chip-copy{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;padding:4px 10px;border-radius:6px;background:var(--hov);border:1px solid var(--line);color:var(--txt2);cursor:pointer;transition:.14s;white-space:nowrap}";
+    h += ".chip-copy:hover{background:var(--hov2);color:var(--txt)}";
     // 曲目行
     h += ".trow{display:grid;grid-template-columns:34px 1fr 88px 58px;gap:11px;align-items:center;padding:8px 20px;cursor:pointer;border-radius:7px;margin:0 10px;font-size:12.5px}";
     h += ".trow:hover{background:var(--hov)}";

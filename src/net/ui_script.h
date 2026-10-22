@@ -62,6 +62,15 @@ function esc(s) {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
+function fmtDate(sec) {
+  if (!sec) return '';
+  var d = new Date(sec * 1000);
+  if (isNaN(d.getTime())) return '';
+  var y = d.getFullYear();
+  var m = ('0' + (d.getMonth() + 1)).slice(-2);
+  var day = ('0' + d.getDate()).slice(-2);
+  return y + '-' + m + '-' + day;
+}
 function nam(p) {
   var s = String(p || ''), i = Math.max(s.lastIndexOf('/'), s.lastIndexOf(SEP));
   return i >= 0 ? s.slice(i + 1) : s;
@@ -302,26 +311,210 @@ function loadArtists() {
     Array.prototype.forEach.call(D('list').querySelectorAll('.card'), function (e) {
       e.onclick = function () {
         var who = e.dataset.a;
-        api('/api/lib/albums').then(function (jj) {
-          S.albums = (jj.albums || []).filter(function (a) { return (a.artist || '未知艺术家') === who; });
-          renderAlbumSubset(who);
-        });
+        openArtistProfile(who);
       };
     });
   });
 }
 function renderAlbumSubset(who) {
   S.view = 'albums';
-  head(who, S.albums.length + ' 张专辑', '<button class=btn id=bAll>返回全部专辑</button>');
+  head(who, S.albums.length + ' 张专辑', '<button class=btn id=bArtistBio>艺术家资料</button> <button class=btn id=bAll>返回全部专辑</button>');
   var h = '<div class=grid>';
   S.albums.forEach(function (a, i) { h += albumCardHtml(a, i); });
   D('list').innerHTML = h + '</div>';
+  D('bArtistBio').onclick = function () { openArtistProfile(who); };
   D('bAll').onclick = function () { loadAlbums(''); };
   Array.prototype.forEach.call(D('list').querySelectorAll('.card'), function (e) {
     var a = S.albums[+e.dataset.i];
     e.onclick = function (ev) {
       if (ev.target.closest && ev.target.closest('.pl')) { playAlbum(a.k, 0); ev.stopPropagation(); return; }
       openAlbum(a.k);
+    };
+  });
+}
+
+/* ---------------- 艺术家资料页（P3④a） ---------------- */
+function openArtistProfile(who, refresh) {
+  S.view = 'artist';
+  setView('artists');
+  S.view = 'artist';
+  head(who, '正在获取权威资料…', '<button class=btn id=bBackArtistsTop>返回艺术家列表</button>');
+  if (D('bBackArtistsTop')) D('bBackArtistsTop').onclick = function () { loadArtists(); };
+  D('list').innerHTML = '<div class=empty style="padding:60px 0">正在获取权威资料…</div>';
+
+  var u = '/api/entity/knowledge?kind=person&name=' + encodeURIComponent(who) + (refresh ? '&refresh=1' : '');
+  api(u).then(function (j) {
+    renderArtistProfile(who, j);
+  }).catch(function (err) {
+    renderArtistProfile(who, { ok: false, error: String(err), materials: [] });
+  });
+}
+
+function renderArtistProfile(who, j) {
+  S.view = 'artist';
+  setView('artists');
+  S.view = 'artist';
+
+  var cvKey = '';
+  if (S.albums && S.albums.length) {
+    for (var i = 0; i < S.albums.length; i++) {
+      if ((S.albums[i].artist || '') === who && S.albums[i].cv) { cvKey = S.albums[i].k; break; }
+    }
+  }
+  var cvStyle = cvKey ? ("background-image:url('/api/lib/cover?k=" + cvKey + "')") : '';
+
+  var mats = (j && j.materials) || [];
+  var isOk = j && j.ok && mats.length > 0;
+
+  var subText = '';
+  if (isOk) {
+    var firstDate = mats[0].fetched_at ? fmtDate(mats[0].fetched_at) : '';
+    if (j.from_cache) {
+      subText = '缓存 · ' + (firstDate || '近期') + ' 取回' + (j.offline ? ' · 离线' : '');
+    } else {
+      subText = '权威资料' + (firstDate ? (' · ' + firstDate + ' 取回') : '');
+    }
+  } else {
+    subText = '权威资料暂缺';
+  }
+
+  head(who, subText, '<button class=btn id=bTopBack>返回艺术家列表</button>');
+  if (D('bTopBack')) D('bTopBack').onclick = function () { loadArtists(); };
+
+  var h = '';
+  // 头像/名称
+  h += '<div class="ahead artist-head">' +
+       '<div class=cv style="border-radius:50%;' + cvStyle + '">' +
+       (cvKey ? '' : '<div class=ph style="border-radius:50%">' + esc(who.slice(0, 1).toUpperCase()) + '</div>') +
+       '</div>' +
+       '<div class=info>' +
+       '<div class=kind>ARTIST · 艺术家资料</div>' +
+       '<h1>' + esc(who) + '</h1>' +
+       '<div class=sub>' + esc(subText) + '</div>' +
+       '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">' +
+       '<button class=btn id=bArtistAlbums>查看专辑</button> ' +
+       '<button class=btn id=bArtistRefresh>刷新资料</button> ' +
+       '<button class=btn id=bBackArtists>返回列表</button>' +
+       '</div></div></div>';
+
+  h += '<div class=artist-body style="padding:0 22px 30px">';
+
+  if (!isOk) {
+    // 空态卡：没资料/网络失败 → 内置空态（.card + 说明 + 「重试」按钮，--phbg 风格）
+    var errMsg = (j && j.errors && j.errors[0] && j.errors[0].error) || (j && j.error) || '未在维基百科或萌娘百科匹配到权威词条，或当前网络不可达。';
+    h += '<div class="card empty-card" style="padding:36px 20px;text-align:center;background:var(--phbg);border:1px solid var(--line);border-radius:12px;margin-top:14px">' +
+         '<div style="font-size:15px;font-weight:600;margin-bottom:8px;color:var(--txt)">暂无权威资料或网络连接失败</div>' +
+         '<div style="color:var(--mut);font-size:12.5px;margin-bottom:18px;max-width:520px;margin-left:auto;margin-right:auto;line-height:1.6">' +
+         esc(errMsg) + '</div>' +
+         '<button class="btn pri" id=bRetryKnowledge>重试获取</button>' +
+         '</div>';
+  } else {
+    // 1) 简介（L2 原文，长文折叠「展开」）
+    var bioMat = null;
+    var stylesMats = [];
+    mats.forEach(function (m) {
+      if (!bioMat && (m.kind === 'biography' || m.kind === 'disambiguation' || m.text)) {
+        bioMat = m;
+      }
+      if (m.kind === 'genre' || m.kind === 'similar') {
+        stylesMats.push(m);
+      }
+    });
+
+    var bioText = bioMat ? bioMat.text : '';
+    var isLong = bioText.length > 280 || (bioText.split('\n').length > 5);
+
+    h += '<div class="sec-card bio-sec" style="margin-bottom:24px">' +
+         '<div style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:10px">简介</div>' +
+         '<div class="bio-box ' + (isLong ? 'collapsed' : '') + '" id=bioBox>' +
+         esc(bioText || '暂无详细文字介绍') +
+         '</div>' +
+         (isLong ? '<button class=btn id=bBioToggle style="margin-top:10px">展开全部</button>' : '') +
+         '</div>';
+
+    // 2) 风格与相似（有则显示）
+    if (stylesMats.length > 0) {
+      h += '<div class="sec-card style-sec" style="margin-bottom:24px">' +
+           '<div style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:10px">风格与相似</div>' +
+           '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+      stylesMats.forEach(function (sm) {
+        h += '<span class=badge>' + esc(sm.title || sm.kind) + '</span>';
+      });
+      h += '</div></div>';
+    }
+
+    // 3) 来源：来源徽章、标题、取回日期、「复制链接」芯片（绝不 window.open / <a target=_blank>）
+    h += '<div class="sec-card sources-sec" style="margin-bottom:24px">' +
+         '<div style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:12px">资料来源</div>' +
+         '<div style="display:flex;flex-direction:column;gap:8px">';
+
+    mats.forEach(function (m) {
+      var srcName = '权威来源';
+      if (m.source.indexOf('wikipedia') >= 0) srcName = '维基百科';
+      else if (m.source.indexOf('moegirl') >= 0) srcName = '萌娘百科';
+      else if (m.source.indexOf('discogs') >= 0) srcName = 'Discogs';
+      else if (m.source.indexOf('lastfm') >= 0) srcName = 'Last.fm';
+      else if (m.source) srcName = m.source;
+
+      var fDate = fmtDate(m.fetched_at);
+      h += '<div class="trow source-row" style="cursor:default;display:flex;align-items:center;gap:12px;padding:9px 14px;border-radius:9px;background:var(--hov)">' +
+           '<span class=badge>' + esc(srcName) + '</span>' +
+           '<span style="font-weight:600;font-size:12.5px;color:var(--txt)">' + esc(m.title) + '</span>' +
+           '<span style="font-size:11.5px;color:var(--mut2);margin-right:auto">' + (fDate ? ('取回于 ' + fDate) : '') + '</span>' +
+           '<button class="btn chip-copy" data-url="' + esc(m.url) + '" title="复制来源链接">' +
+             '<svg width=12 height=12 viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:4px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
+             '复制链接' +
+           '</button>' +
+           '</div>';
+    });
+    h += '</div></div>';
+  }
+
+  h += '</div>';
+  D('list').innerHTML = h;
+
+  // 绑定事件
+  if (D('bArtistAlbums')) {
+    D('bArtistAlbums').onclick = function () {
+      api('/api/lib/albums').then(function (jj) {
+        S.albums = (jj.albums || []).filter(function (a) { return (a.artist || '未知艺术家') === who; });
+        renderAlbumSubset(who);
+      });
+    };
+  }
+  if (D('bArtistRefresh')) {
+    D('bArtistRefresh').onclick = function () { openArtistProfile(who, true); };
+  }
+  if (D('bBackArtists')) {
+    D('bBackArtists').onclick = function () { loadArtists(); };
+  }
+  if (D('bRetryKnowledge')) {
+    D('bRetryKnowledge').onclick = function () { openArtistProfile(who, true); };
+  }
+  if (D('bBioToggle')) {
+    D('bBioToggle').onclick = function () {
+      var box = D('bioBox');
+      if (!box) return;
+      var isCol = box.classList.toggle('collapsed');
+      this.textContent = isCol ? '展开全部' : '收起简介';
+    };
+  }
+
+  // 复制链接芯片：navigator.clipboard.writeText(url) + toast「已复制来源链接」
+  Array.prototype.forEach.call(D('list').querySelectorAll('.chip-copy'), function (btn) {
+    btn.onclick = function (ev) {
+      ev.stopPropagation();
+      var u = btn.dataset.url;
+      if (!u) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(u).then(function () {
+          toast('已复制来源链接');
+        }).catch(function () {
+          toast('已复制来源链接');
+        });
+      } else {
+        toast('已复制来源链接');
+      }
     };
   });
 }
@@ -898,7 +1091,7 @@ function saveSrc() {
 function setView(v) {
   S.view = v;
   Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
-    e.classList.toggle('on', e.dataset.v === v);
+    e.classList.toggle('on', e.dataset.v === v || (v === 'artist' && e.dataset.v === 'artists'));
   });
   var isSet = (v === 'settings');
   // 设置页占满整屏：右栏（队列/歌词）在这里没有意义，直接藏掉。

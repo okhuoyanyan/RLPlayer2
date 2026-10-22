@@ -43,6 +43,7 @@ using rta::render::OutSink;
 using rta::render::SinkOpenOpts;
 #include "meta/enrich.h"            // 单曲元数据补全编排(播放触发 + /api/enrich + /api/meta 兜底)
 #include "meta/writeback.h"         // P2 标签写回(remux + PCM 逐位门禁;/api/writeback 三端点)
+#include "meta/knowledge.h"         // P3 资料层直连与缓存(/api/entity/knowledge)
 #include "net/rtanet_stream.h"
 #include "dsp/filter_families.h"
 #include "dsp/oversample_peak.h"
@@ -3293,6 +3294,90 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         return j.str();
     }
 
+    // ---------------- 资料层(P3④a 实体权威文本与来源 materials): GET /api/entity/knowledge ----------------
+    if (rq.path.rfind("/api/entity/knowledge", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        std::string kindStr = "person";
+        std::string name;
+        std::string lang = "zh";
+        bool refresh = false;
+
+        const size_t qpos = rq.path.find('?');
+        if (qpos != std::string::npos) {
+            std::istringstream is(rq.path.substr(qpos + 1));
+            std::string tok;
+            while (std::getline(is, tok, '&')) {
+                const size_t eq = tok.find('=');
+                if (eq == std::string::npos) continue;
+                const std::string k = urlDecode(tok.substr(0, eq));
+                const std::string v = urlDecode(tok.substr(eq + 1));
+                if (k == "kind") kindStr = v;
+                else if (k == "name") name = v;
+                else if (k == "refresh") refresh = (v == "1" || v == "true");
+                else if (k == "lang") lang = v;
+            }
+        }
+        if (name.empty()) {
+            return "{\"ok\":false,\"entity\":{\"id\":\"\",\"kind\":\"" + jesc(kindStr) +
+                   "\",\"name\":\"\"},\"materials\":[],\"errors\":[{\"source\":\"params\",\"error\":\"未指定实体名称\"}],\"from_cache\":false,\"offline\":false}";
+        }
+        rta::meta::EntityKind ek = rta::meta::EntityKind::Person;
+        if (!rta::meta::entity_kind_from_tag(kindStr, ek)) {
+            return "{\"ok\":false,\"entity\":{\"id\":\"\",\"kind\":\"" + jesc(kindStr) +
+                   "\",\"name\":\"" + jesc(name) + "\"},\"materials\":[],\"errors\":[{\"source\":\"params\",\"error\":\"未知实体类型: " + jesc(kindStr) + "\"}],\"from_cache\":false,\"offline\":false}";
+        }
+
+        rta::meta::KnowledgeOpts opts;
+        opts.metabase = path_in_exe_dir("rlplayer-meta");
+        opts.refresh = refresh;
+        if (!lang.empty()) opts.lang = lang;
+
+        const rta::meta::KnowledgeResult kr = rta::meta::knowledge_fetch(ek, name, opts);
+        const bool ok = !kr.materials.empty();
+        const std::string entId = kr.entityId.empty() ? rta::meta::entity_id(ek, name) : kr.entityId;
+        const std::string kindTag = rta::meta::entity_kind_tag(ek);
+
+        std::ostringstream j;
+        j << "{\"ok\":" << (ok ? "true" : "false")
+          << ",\"entity\":{"
+          << "\"id\":\"" << jesc(entId) << "\","
+          << "\"kind\":\"" << jesc(kindTag) << "\","
+          << "\"name\":\"" << jesc(name) << "\""
+          << "},"
+          << "\"materials\":[";
+        for (size_t i = 0; i < kr.materials.size(); ++i) {
+            if (i) j << ",";
+            const auto& m = kr.materials[i];
+            j << "{"
+              << "\"source\":\"" << jesc(m.source) << "\","
+              << "\"kind\":\"" << jesc(m.kind) << "\","
+              << "\"subject\":\"" << jesc(m.subject) << "\","
+              << "\"title\":\"" << jesc(m.title) << "\","
+              << "\"text\":\"" << jesc(m.text) << "\","
+              << "\"url\":\"" << jesc(m.url) << "\","
+              << "\"lang\":\"" << jesc(m.lang) << "\","
+              << "\"fetched_at\":" << m.fetched_at << ","
+              << "\"expires_at\":" << m.expires_at << ","
+              << "\"authority\":" << m.authority
+              << "}";
+        }
+        j << "],\"errors\":[";
+        bool firstErr = true;
+        for (const auto& ep : kr.errors) {
+            if (!firstErr) j << ",";
+            firstErr = false;
+            j << "{\"source\":\"" << jesc(ep.first) << "\",\"error\":\"" << jesc(ep.second) << "\"}";
+        }
+        if (!ok && kr.errors.empty()) {
+            const std::string errText = !kr.error.empty() ? kr.error : "未找到任何相关权威材料";
+            j << "{\"source\":\"general\",\"error\":\"" << jesc(errText) << "\"}";
+        }
+        j << "],"
+          << "\"from_cache\":" << (kr.from_cache ? "true" : "false") << ","
+          << "\"offline\":" << (kr.offline ? "true" : "false")
+          << "}";
+        return j.str();
+    }
     if (rq.path.rfind("/api/cover", 0) == 0) {
         std::string file;
         const size_t q = rq.path.find("?file=");
@@ -4244,6 +4329,7 @@ int main(int argc, char** argv) {
     // MetaBase 存放 exe 同目录 rlplayer-meta/(与播放日志/设置同位置约定);
     // 播放触发补全与 /api/enrich、/api/meta、/api/cover、/api/lyrics 都走这个单例
     rta::meta::MetaStore::instance().setBaseDir(path_in_exe_dir("rlplayer-meta"));
+    rta::meta::EntityStore::instance().setBaseDir(path_in_exe_dir("rlplayer-meta"));
     if (Library::instance().trackCount() == 0) {
         printf("音乐库为空，开始首次扫描（根目录见 rlplayer-library.conf）…\n");
         Library::instance().startScan();
