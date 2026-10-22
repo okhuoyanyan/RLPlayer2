@@ -5,6 +5,7 @@
 #pragma once
 #include "net/subsonic.h"
 #include "net/emby.h"
+#include "platform/path.h"          // exe 目录 / 数据目录 / UTF-8 拼接（本文件不再碰 Win32）
 #include <string>
 #include <vector>
 #include <map>
@@ -135,34 +136,18 @@ private:
     std::map<std::string, std::string> cache_;
     std::string  confPath_;
 
+    // 远程缓存目录 = <数据目录>/remote-cache。
+    // 迁移前后等价：数据目录在 Windows 上就是 exe 同目录（platform/path.h §6 规则）。
+    // 迁移前这里还先调了一次 GetTempPathW，但结果从未被使用（死调用），迁移时移除，行为无变化。
     static std::string cache_dir() {
-        wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
-        wchar_t buf[MAX_PATH];
-        GetModuleFileNameW(nullptr, buf, MAX_PATH);
-        std::wstring dir(buf);
-        const size_t s = dir.find_last_of(L"\\/");
-        if (s != std::wstring::npos) dir = dir.substr(0, s);
-        std::wstring full = dir + L"\\remote-cache";
-        const int n = WideCharToMultiByte(CP_UTF8, 0, full.c_str(), -1, nullptr, 0, nullptr, nullptr);
-        std::string o((size_t)n, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, full.c_str(), -1, o.data(), n, nullptr, nullptr);
-        if (!o.empty() && o.back() == '\0') o.pop_back();
-        return o;
+        return rta::platform::join(rta::platform::data_dir_utf8(), "remote-cache");
     }
 
     void save_locked() {
         if (confPath_.empty()) {
-            wchar_t buf[MAX_PATH];
-            GetModuleFileNameW(nullptr, buf, MAX_PATH);
-            std::wstring dir(buf);
-            const size_t s = dir.find_last_of(L"\\/");
-            if (s != std::wstring::npos) dir = dir.substr(0, s);
-            std::wstring full = dir + L"\\rlplayer-sources.conf";
-            const int n = WideCharToMultiByte(CP_UTF8, 0, full.c_str(), -1, nullptr, 0, nullptr, nullptr);
-            std::string o((size_t)n, '\0');
-            WideCharToMultiByte(CP_UTF8, 0, full.c_str(), -1, o.data(), n, nullptr, nullptr);
-            if (!o.empty() && o.back() == '\0') o.pop_back();
-            confPath_ = o;
+            // 配置 = <配置目录>/rlplayer-sources.conf（Windows: exe 同目录）
+            confPath_ = rta::platform::join(rta::platform::config_dir_utf8(),
+                                            "rlplayer-sources.conf");
         }
         std::ofstream f(confPath_, std::ios::trunc);
         if (!f) return;

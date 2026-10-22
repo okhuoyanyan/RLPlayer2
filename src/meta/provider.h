@@ -48,12 +48,8 @@
 // 详细实测依据、搜索策略与降级边界见「dizzylab」大节的头注(文件中部)。它排注册表第一位,
 // 但 canLyric=false(无歌词接口,如实标注),采纳门槛一行未改。
 #pragma once
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
+// （原 WIN32_LEAN_AND_MEAN / NOMINMAX 前导已删：http_client.h -> platform/http.h 会在
+//   windows.h 之前自己定义，行为不变。）
 #include "net/http_client.h"
 #include "net/json.h"
 #include "meta/match.h"          // Candidate 的唯一定义(评分与 provider 共用,2026-10-21 统一)

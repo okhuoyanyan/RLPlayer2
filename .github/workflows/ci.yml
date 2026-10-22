@@ -97,6 +97,12 @@ jobs:
       - name: 测试（ctest）
         shell: pwsh
         run: |
+          # ctest --output-on-failure 只在失败时打印用例 stdout ⟹ test_parallel 的
+          # "[SKIP] 硬件线程=2 < 4，跳过加速比断言（正确性断言已 PASS，非放水）" 会被吞掉。
+          # 单独用 -V 跑一次 parallel，让"有条件跳过"在 CI 日志里【可见】（铁律 3）。
+          # 这条同样是硬门禁：正确性断言挂了一样红。
+          ctest --test-dir build -R "^parallel$" -V 2>&1 | Tee-Object -FilePath parallel-log.txt
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           ctest --test-dir build --output-on-failure -E "wasapi_shared" 2>&1 | Tee-Object -FilePath ctest-log.txt
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
@@ -108,6 +114,7 @@ jobs:
           path: |
             build-log.txt
             ctest-log.txt
+            parallel-log.txt
             build/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
           retention-days: 14

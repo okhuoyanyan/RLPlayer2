@@ -27,20 +27,18 @@
 //
 // 无异常纪律(与 meta/ 其它头一致):全 error_code / 返回值路径,不抛。
 #pragma once
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
 #include "meta/store.h"
-#include "audio/audio_loader.h"     // find_tool / run_hidden / widen
+#include "platform/fs.h"        // 删除 / 搬移 / 复制 + 系统错误码（写回安全红线全靠这几个操作）
+#include "platform/path.h"      // UTF-8 <-> 原生路径、临时目录、小写扩展名
+#include "platform/process.h"   // 调 ffmpeg / ffprobe（隐藏窗口、收日志）
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <functional>
+#include <iterator>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -139,18 +137,20 @@ inline std::vector<WbField> writeback_collect(const TrackMeta& tm, bool vorbisFa
 // UTF-8 参数 → 带引号的宽命令行片段。MSVCRT 解析规则:值内 " → \" ;
 // 紧邻引号的反斜杠翻倍(含结尾!结尾不翻倍会把闭引号转义掉 —— 2026-10-22 探针实测踩到)。
 // 实测(同日探针 + 写回门禁):中文、双引号、\n、\r\n、\=、结尾反斜杠全部无损往返。
-inline std::wstring wb_quoted(const std::string& u8) {
-    std::wstring v = rta::audio::widen(u8);
-    std::wstring o = L"\"";
+// 返回值从 std::wstring 改成 UTF-8 std::string：命令行整串在平台层内部才转宽字符。
+// 转义算法逐字符不变，且对 UTF-8 字节逐字节仍然等价 —— 多字节序列的续字节都 >= 0x80，
+// 不可能等于 '"' 或 '\\'，所以"按 wchar_t 遍历"与"按 UTF-8 字节遍历"结果一致。
+inline std::string wb_quoted(const std::string& u8) {
+    std::string o = "\"";
     int bs = 0;
-    for (const wchar_t c : v) {
-        if (c == L'\\') { ++bs; o += c; continue; }
-        if (c == L'"')  { o.append((size_t)bs + 1, L'\\'); o += c; }
+    for (const char c : u8) {
+        if (c == '\\') { ++bs; o += c; continue; }
+        if (c == '"')  { o.append((size_t)bs + 1, '\\'); o += c; }
         else o += c;
         bs = 0;
     }
-    o.append((size_t)bs, L'\\');
-    o += L'"';
+    o.append((size_t)bs, '\\');
+    o += '"';
     return o;
 }
 
@@ -184,14 +184,15 @@ inline std::string wb_preview(const std::string& s, const size_t n = 32) {
 inline bool writeback_remux(const std::string& ffmpeg, const std::string& src, const std::string& dst,
                             const std::string& muxer, const bool isMp3,
                             const std::vector<WbField>& kvs, std::string& err) {
-    std::wstring cmd = L"\"" + rta::audio::widen(ffmpeg) + L"\" -v error -y -i " + wb_quoted(src) +
-                       L" -map 0 -c copy -f " + wb_quoted(muxer);
-    if (isMp3) cmd += L" -write_id3v2 1 -id3v2_version 4";
+    std::string cmd = "\"" + ffmpeg + "\" -v error -y -i " + wb_quoted(src) +
+                      " -map 0 -c copy -f " + wb_quoted(muxer);
+    if (isMp3) cmd += " -write_id3v2 1 -id3v2_version 4";
     for (const WbField& f : kvs)
-        cmd += L" -metadata " + wb_quoted(std::string(f.key) + "=" + f.value);
-    cmd += L" " + wb_quoted(dst);
-    std::string log;
-    const int rc = rta::audio::run_hidden(cmd, &log);
+        cmd += " -metadata " + wb_quoted(std::string(f.key) + "=" + f.value);
+    cmd += " " + wb_quoted(dst);
+    const rta::platform::ProcessResult pr = rta::platform::run_hidden(cmd, true);
+    const std::string& log = pr.output;
+    const int rc = pr.exit_code;
     if (rc != 0) {
         err = "ffmpeg remux 失败(退出码 " + std::to_string(rc) + ")" +
               (log.empty() ? "" : ":" + wb_log_tail(log));
@@ -205,10 +206,11 @@ inline bool writeback_remux(const std::string& ffmpeg, const std::string& src, c
 // wav 单流限制直接失败,音乐曲目取首流即是要比较的对象)。两份解码参数完全一致。
 inline bool writeback_decode_pcm(const std::string& ffmpeg, const std::string& in,
                                  const std::string& outWav, std::string& err) {
-    const std::wstring cmd = L"\"" + rta::audio::widen(ffmpeg) + L"\" -v error -y -i " + wb_quoted(in) +
-                             L" -map 0:a:0 -vn -map_metadata -1 -f wav -c:a pcm_s32le " + wb_quoted(outWav);
-    std::string log;
-    const int rc = rta::audio::run_hidden(cmd, &log);
+    const std::string cmd = "\"" + ffmpeg + "\" -v error -y -i " + wb_quoted(in) +
+                            " -map 0:a:0 -vn -map_metadata -1 -f wav -c:a pcm_s32le " + wb_quoted(outWav);
+    const rta::platform::ProcessResult pr = rta::platform::run_hidden(cmd, true);
+    const std::string& log = pr.output;
+    const int rc = pr.exit_code;
     if (rc != 0) {
         err = "ffmpeg 解码失败(输入=" + in + ",退出码 " + std::to_string(rc) + ")" +
               (log.empty() ? "" : ":" + wb_log_tail(log));
@@ -276,7 +278,7 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
     r.file = file;
 
     // ① 扩展名门(安全红线③:绝不写 DSD 与不可识别扩展)
-    const std::string ext = rta::audio::lowerExt(file);
+    const std::string ext = rta::platform::lower_extension(file);
     if (ext == ".dsf" || ext == ".dff") {
         r.skipped = true;
         r.note = "DSD(" + ext + ")按安全红线绝不写回";
@@ -308,7 +310,7 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
     for (const WbField& f : kvs) r.writtenFields.push_back(f.field);
 
     // ③ 工具与源文件
-    const std::string ffmpeg = rta::audio::find_tool("ffmpeg");
+    const std::string ffmpeg = rta::platform::find_executable("ffmpeg");
     if (ffmpeg.empty()) {
         r.err = "找不到 ffmpeg(find_tool):无法 remux 与 PCM 校验。把 ffmpeg.exe 放到程序同目录或加入 PATH";
         return r;
@@ -325,12 +327,10 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
     // 但悄悄丢内嵌封面不符合「不静默」纪律 → 检测到即跳过,请用户先重建封面。
     // 正常封面(绝大多数文件)走 attached_pic 流被 -c copy 保留,不受影响。
     {
-        const std::string ffprobe = rta::audio::find_tool("ffprobe");
+        const std::string ffprobe = rta::platform::find_executable("ffprobe");
         if (!ffprobe.empty()) {
-            std::string warn;
-            const std::wstring cmd = L"\"" + rta::audio::widen(ffprobe) + L"\" -hide_banner " +
-                                     wb_quoted(file);
-            rta::audio::run_hidden(cmd, &warn);
+            const std::string cmd = "\"" + ffprobe + "\" -hide_banner " + wb_quoted(file);
+            const std::string warn = rta::platform::run_hidden(cmd, true).output;
             if (warn.find("attached picture") != std::string::npos) {
                 r.skipped = true;
                 r.note = "源文件的 PICTURE 块畸形(ffmpeg 读不出内嵌封面),remux 会静默丢失该"
@@ -342,26 +342,24 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
 
     // ④ remux 到同目录 .rtatmp 临时文件(先清掉上次崩溃可能留下的残留)
     const std::string temp = file + ".rtatmp";
-    DeleteFileW(meta_path_of(temp).c_str());
+    rta::platform::remove_file(meta_path_of(temp));
     std::string err;
     if (!writeback_remux(ffmpeg, file, temp, muxer, ext == ".mp3", kvs, err)) {
-        DeleteFileW(meta_path_of(temp).c_str());
+        rta::platform::remove_file(meta_path_of(temp));
         r.err = err;
         return r;
     }
 
     // ⑤ PCM 门禁:两份同参数解码(pcm_s32le)逐字节比较(含长度)
-    wchar_t tmpDir[MAX_PATH] = {0};
-    GetTempPathW(MAX_PATH, tmpDir);
+    // temp_dir_utf8() 返回带尾分隔符的临时目录（语义 = GetTempPathW），下面直接后缀拼接
+    const std::string tmpDir = rta::platform::temp_dir_utf8();
     const std::string tag = MetaStore::hashOf(file);
-    const std::string pcmOld = rta::audio::wide_to_utf8(std::wstring(tmpDir) + L"rta_wb_" +
-                               rta::audio::widen(tag) + L"_old.wav");
-    const std::string pcmNew = rta::audio::wide_to_utf8(std::wstring(tmpDir) + L"rta_wb_" +
-                               rta::audio::widen(tag) + L"_new.wav");
+    const std::string pcmOld = tmpDir + "rta_wb_" + tag + "_old.wav";
+    const std::string pcmNew = tmpDir + "rta_wb_" + tag + "_new.wav";
     auto cleanup = [&]() {
-        DeleteFileW(meta_path_of(temp).c_str());
-        DeleteFileW(meta_path_of(pcmOld).c_str());
-        DeleteFileW(meta_path_of(pcmNew).c_str());
+        rta::platform::remove_file(meta_path_of(temp));
+        rta::platform::remove_file(meta_path_of(pcmOld));
+        rta::platform::remove_file(meta_path_of(pcmNew));
     };
     if (!writeback_decode_pcm(ffmpeg, file, pcmOld, err) ||
         !writeback_decode_pcm(ffmpeg, temp, pcmNew, err)) {
@@ -376,8 +374,8 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
         r.err = "PCM 校验失败:写回前后解码不一致(" + diff + ");已删除临时文件,原文件未动";
         return r;
     }
-    DeleteFileW(meta_path_of(pcmOld).c_str());
-    DeleteFileW(meta_path_of(pcmNew).c_str());
+    rta::platform::remove_file(meta_path_of(pcmOld));
+    rta::platform::remove_file(meta_path_of(pcmNew));
 
     // ⑥ 字段清单进 note
     std::string listed;
@@ -410,13 +408,13 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
             backup = backupDir / (hash + ".r" + std::to_string(n) + ext);
         }
         backupUsed = backup;
-        const std::wstring& srcW = meta_path_of(file).wstring();
-        if (MoveFileExW(srcW.c_str(), backup.wstring().c_str(), 0)) {
+        const fsx::path srcP = meta_path_of(file);
+        if (rta::platform::move_file(srcP, backup, false)) {
             movedNotCopied = true;
         } else {
             // 跨盘(move 不支持)或其它失败:退化为复制;原文件仍在,替换用 REPLACE_EXISTING
-            const DWORD gle = GetLastError();
-            if (!CopyFileW(srcW.c_str(), backup.wstring().c_str(), FALSE)) {
+            const int gle = rta::platform::last_error_code();
+            if (!rta::platform::copy_file(srcP, backup, false)) {
                 cleanup();
                 r.err = "备份失败(move 与 copy 均失败,GetLastError=" + std::to_string(gle) +
                         ");原文件未动";
@@ -429,18 +427,15 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
     }
 
     // ⑧ 替换:临时文件 rename 成原路径;失败则把原文件从备份搬回(防御)
-    if (!MoveFileExW(meta_path_of(temp).wstring().c_str(), meta_path_of(file).wstring().c_str(),
-                     MOVEFILE_REPLACE_EXISTING)) {
-        const DWORD gle = GetLastError();
+    if (!rta::platform::move_file(meta_path_of(temp), meta_path_of(file), true)) {
+        const int gle = rta::platform::last_error_code();
         std::string restore = "未恢复";
         if (movedNotCopied) {
-            const bool ok = MoveFileExW(backupUsed.wstring().c_str(),
-                                        meta_path_of(file).wstring().c_str(),
-                                        MOVEFILE_REPLACE_EXISTING) != 0;
+            const bool ok = rta::platform::move_file(backupUsed, meta_path_of(file), true);
             restore = ok ? "已从备份搬回" : "搬回失败(备份在 " + meta_string_of(backupUsed) + ")";
         } else if (opts.backup) {
             // 跨盘复制路径:原文件还在,只需删掉复制物与临时件
-            DeleteFileW(backupUsed.c_str());
+            rta::platform::remove_file(backupUsed);
             restore = "原文件未被动过(跨盘复制路径)";
         }
         cleanup();

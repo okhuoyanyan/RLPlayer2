@@ -1,0 +1,44 @@
+name: platform-boundary
+
+# 独立的平台边界门禁（刻意与 ci.yml 分开：ci.yml 管构建/ctest，这份只管道分层）。
+# 两道关：
+#   1) 扫描 src/dsp、src/engine、src/net、src/meta 是否出现 Windows 头文件/类型
+#   2) 门禁自检（铁律 3）：往临时目录塞一个 #include <windows.h>，脚本必须变红
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  boundary:
+    name: 平台边界（dsp/engine/net/meta）
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 扫描内核目录的平台越界
+        shell: pwsh
+        run: |
+          ./tools/check_platform_boundary.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 门禁自检（注入违规样例必须失败）
+        shell: pwsh
+        run: |
+          $probe = Join-Path $env:RUNNER_TEMP 'boundary-probe'
+          New-Item -ItemType Directory -Force -Path (Join-Path $probe 'src/dsp') | Out-Null
+          Set-Content -LiteralPath (Join-Path $probe 'src/dsp/bad.h') -Value '#include <windows.h>' -Encoding utf8
+          ./tools/check_platform_boundary.ps1 -Root $probe
+          $rc = $LASTEXITCODE
+          Remove-Item -Recurse -Force $probe -ErrorAction SilentlyContinue
+          if ($rc -eq 0) {
+            Write-Error '门禁自检失败：注入了 #include <windows.h> 却仍然通过（判据失效）'
+            exit 1
+          }
+          Write-Host "门禁自检通过：注入违规后退出码 = $rc"
+          # 上面那次"故意失败"会把 $LASTEXITCODE 留成 1；GitHub 的 pwsh 外壳在
+          # 步骤末尾会拿它当步骤退出码，不重置就会把成功的自检判成失败。
+          $global:LASTEXITCODE = 0
+          exit 0

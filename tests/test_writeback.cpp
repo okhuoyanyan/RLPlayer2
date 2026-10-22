@@ -13,6 +13,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "audio/audio_loader.h"   // 测试自己要用 run_hidden/find_tool/widen（writeback.h 已不再转出这些）
 #include "meta/writeback.h"
 #include <cstdio>
 #include <map>
@@ -38,10 +39,10 @@ static std::vector<unsigned char> read_bytes(const std::string& p) {
 static std::map<std::string, std::string> probe_tags(const std::string& ffprobe,
                                                      const std::string& file, bool* ok) {
     std::map<std::string, std::string> tags;
-    const std::wstring cmd = L"\"" + rta::audio::widen(ffprobe) +
-        L"\" -v error -show_entries format_tags -of json " + wb_quoted(file);
-    std::string out;
-    *ok = rta::audio::run_hidden(cmd, &out) == 0 && !out.empty();
+    const std::string cmd = "\"" + ffprobe +
+        "\" -v error -show_entries format_tags -of json " + wb_quoted(file);
+    std::string out = rta::platform::run_hidden(cmd, true).output;
+    *ok = !out.empty();
     if (!*ok) return tags;
     const rta::net::Json j = rta::net::json_parse(out);
     if (j.type != rta::net::Json::Obj || !j.has("format")) return tags;
@@ -68,9 +69,9 @@ static bool independent_pcm_same(const std::string& ffmpeg, const std::string& a
                               rta::audio::widen(std::to_string(GetCurrentProcessId())) + L"_" +
                               rta::audio::widen(std::to_string(sn++)) + L"b.wav");
     auto dec = [&](const std::string& in, const std::string& out) {
-        const std::wstring cmd = L"\"" + rta::audio::widen(ffmpeg) + L"\" -v error -y -i " +
-            wb_quoted(in) + L" -map 0:a:0 -vn -map_metadata -1 -f wav -c:a pcm_s32le " + wb_quoted(out);
-        return rta::audio::run_hidden(cmd, nullptr);
+        const std::string cmd = "\"" + ffmpeg + "\" -v error -y -i " +
+            wb_quoted(in) + " -map 0:a:0 -vn -map_metadata -1 -f wav -c:a pcm_s32le " + wb_quoted(out);
+        return rta::platform::run_hidden(cmd, false).exit_code;
     };
     const int ra = dec(a, wa), rb = dec(b, wb);
     if (ra != 0 || rb != 0) { detail = "测试解码失败"; return false; }
@@ -112,10 +113,10 @@ int main() {
     std::printf("-- FLAC 写回全流程 --\n");
     const std::string flac = sandbox + "\\t1.flac";
     {
-        const std::wstring cmd = L"\"" + rta::audio::widen(ffmpeg) +
-            L"\" -v error -y -f lavfi -i sine=frequency=1000:duration=1:sample_rate=44100"
-            L" -ac 2 -c:a flac -sample_fmt s16 " + wb_quoted(flac);
-        const int rc = rta::audio::run_hidden(cmd, nullptr);
+        const std::string cmd = "\"" + ffmpeg +
+            "\" -v error -y -f lavfi -i sine=frequency=1000:duration=1:sample_rate=44100"
+            " -ac 2 -c:a flac -sample_fmt s16 " + wb_quoted(flac);
+        const int rc = rta::platform::run_hidden(cmd, false).exit_code;
         ck(rc == 0 && fs::file_size(meta_path_of(flac), ec) > 44, "ffmpeg 造 1s 正弦 FLAC 成功",
            "rc=" + std::to_string(rc));
     }
@@ -263,10 +264,10 @@ int main() {
     std::printf("-- MP3 写回(ID3v2.4 规范键) --\n");
     const std::string mp3 = sandbox + "\\t2.mp3";
     {
-        const std::wstring cmd = L"\"" + rta::audio::widen(ffmpeg) +
-            L"\" -v error -y -f lavfi -i sine=frequency=1000:duration=1:sample_rate=44100"
-            L" -ac 2 -c:a libmp3lame -b:a 128k " + wb_quoted(mp3);
-        const int rc = rta::audio::run_hidden(cmd, nullptr);
+        const std::string cmd = "\"" + ffmpeg +
+            "\" -v error -y -f lavfi -i sine=frequency=1000:duration=1:sample_rate=44100"
+            " -ac 2 -c:a libmp3lame -b:a 128k " + wb_quoted(mp3);
+        const int rc = rta::platform::run_hidden(cmd, false).exit_code;
         ck(rc == 0 && fs::exists(meta_path_of(mp3), ec), "ffmpeg 造 MP3 成功",
            "rc=" + std::to_string(rc));
     }
@@ -354,10 +355,8 @@ int main() {
         }
         // 素材自检:ffprobe 确实报 attached picture(证明造对了)
         {
-            std::string warn;
-            const std::wstring cmd = L"\"" + rta::audio::widen(ffprobe) + L"\" -hide_banner " +
-                                     wb_quoted(badPic);
-            rta::audio::run_hidden(cmd, &warn);
+            const std::string cmd = "\"" + ffprobe + "\" -hide_banner " + wb_quoted(badPic);
+            const std::string warn = rta::platform::run_hidden(cmd, true).output;
             ck(warn.find("attached picture") != std::string::npos,
                "素材自检:畸形 PICTURE 触发 ffprobe 警告");
         }
@@ -447,10 +446,10 @@ int main() {
     {
         // 再造一首入库曲目 + 一条损坏记录
         const std::string flac2 = sandbox + "\\t4.flac";
-        const std::wstring cmd = L"\"" + rta::audio::widen(ffmpeg) +
-            L"\" -v error -y -f lavfi -i sine=frequency=1000:duration=1:sample_rate=44100"
-            L" -ac 2 -c:a flac -sample_fmt s16 " + wb_quoted(flac2);
-        rta::audio::run_hidden(cmd, nullptr);
+        const std::string cmd = "\"" + ffmpeg +
+            "\" -v error -y -f lavfi -i sine=frequency=1000:duration=1:sample_rate=44100"
+            " -ac 2 -c:a flac -sample_fmt s16 " + wb_quoted(flac2);
+        rta::platform::run_hidden(cmd, false);
         TrackMeta tm4;
         tm4.path = flac2;
         tm4.fields["title"] = {"整库第二首", "user", 1792000000, 1.0f};

@@ -1,0 +1,16 @@
+# tools/platform_boundary_allowlist.txt — 平台边界门禁的例外清单
+#
+# 格式（用 | 分隔，一行一条；# 开头是注释）：
+#   路径（相对仓库根，正斜杠）| 原因（为什么本轮不能改）| 清理期限（yyyy-MM-dd）| 责任人
+#
+# 纪律（PLATFORM.md §2）：
+#   * 只写"确实需要"的例外，不许为了让门禁变绿而塞文件
+#   * 每条必须能说清"下一轮怎么消掉"，并给出到期日
+#   * 到期未清理 = 技术债，评审时按违规处理
+#
+# ---- 本轮（p0/platform-layer）的例外 ----
+# 这三份是网络传输本体（TCP/UDP socket），socket 抽象（platform/net.h）不在本轮接口清单里，
+# 属于"下一轮"的独立平台接口。除此之外 src/dsp、src/engine、src/net、src/meta 全部干净。
+src/net/webui.h|winsock2 直连（内置 HTTP 服务器本体）；socket 抽象 platform/net.h 未在本轮范围|2026-12-31|平台层/Mac 组
+src/net/upnp.h|winsock2 直连（SSDP/UDP 发现本体）；socket 抽象 platform/net.h 未在本轮范围|2026-12-31|平台层/Mac 组
+src/net/rtanet.h|winsock2 直连（RTANet 端点传输本体；已有 POSIX 分支）；socket 抽象未在本轮范围|2026-12-31|平台层/Mac 组

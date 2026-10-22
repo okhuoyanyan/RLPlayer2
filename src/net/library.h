@@ -12,12 +12,8 @@
 //     对外用 16 位十六进制哈希，避免 URL 里出现任意字符
 //   * 扫描在后台线程做，查询永远不阻塞（读的是上一份完整的索引）
 #pragma once
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
+// （原 WIN32_LEAN_AND_MEAN / NOMINMAX 前导已删：include 链下方的平台头自己会在 windows.h
+//   之前定义它们，行为不变；留着只会让"这个头依赖 Windows"看起来像真的。）
 #include "audio/audio_loader.h"
 #include "audio/media_info.h"
 #include <string>

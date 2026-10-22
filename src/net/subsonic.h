@@ -7,6 +7,7 @@
 #include "net/http_client.h"
 #include "net/md5.h"
 #include "net/json.h"
+#include "platform/time.h"          // 认证盐的熵源（单调毫秒）—— 不直接碰平台 API
 #include <string>
 #include <vector>
 #include <random>
@@ -123,7 +124,7 @@ private:
 
     void make_salt() {
         static const char* cs = "abcdefghijklmnopqrstuvwxyz0123456789";
-        std::mt19937 rng((unsigned)GetTickCount64());
+        std::mt19937 rng((unsigned)rta::platform::monotonic_ms());
         salt_.clear();
         for (int i = 0; i < 10; ++i) salt_ += cs[rng() % 36];
     }
