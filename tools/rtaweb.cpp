@@ -1486,11 +1486,17 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                     // 而且若该列表恰好含源率，就等于完全不用重采样 —— 最优解）
                     int      effBitsFB = 0;
                     uint32_t pickedRate = 0;
+                    std::string pickedWhy;
                     for (int i = 0; i < nBits && effBitsFB == 0; ++i) {
                         const std::vector<uint32_t>& rates = (i < (int)ratesByBits.size())
                             ? ratesByBits[(size_t)i] : ratesByBits[0];
-                        const uint32_t r = rta::audio::pick_supported_rate(wantDevRate, in.rate, rates);
-                        if (r > 0) { effBitsFB = bitsCand[i]; pickedRate = r; }
+                        uint32_t outR = wantDevRate;
+                        const auto dec = rta::audio::decide_capability_failure(rateAuto, wantDevRate, rates, outR, in.rate);
+                        if (dec.action == rta::audio::CapAction::FallbackRate && outR > 0) {
+                            effBitsFB = bitsCand[i];
+                            pickedRate = outR;
+                            pickedWhy = dec.userMessage;
+                        }
                     }
                     if (effBitsFB != 0 && pickedRate != 0) {
                         // 设备真正打开的是 pickedRate：cfg.outRate 与 deviceRate 必须同时改。
@@ -1500,9 +1506,11 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                         cfg.outRate = pickedRate;
                         deviceRate  = pickedRate;   // 本分支只在 !dop 时进入（DoP 走上面的硬失败）
                         // 不能悄悄换率：note / ps.info / 信号链 JSON 都要写明（HF-01 同理）
-                        std::string why = "目标 " + std::to_string(wantDevRate) + " Hz 独占不支持，已用 " +
-                                          std::to_string(pickedRate) + " Hz（源 " +
-                                          std::to_string(in.rate) + " Hz 重采样，非 bit-perfect）";
+                        std::string why = pickedWhy.empty()
+                                          ? ("目标 " + std::to_string(wantDevRate) + " Hz 独占不支持，已用 " +
+                                             std::to_string(pickedRate) + " Hz（源 " +
+                                             std::to_string(in.rate) + " Hz 重采样，非 bit-perfect）")
+                                          : pickedWhy;
                         appendNote(why);
                         bitNote = bitNote.empty() ? why : (bitNote + "；" + why);
                         play_log("RATEFALLBACK " + why + " bits=" + std::to_string(effBitsFB) +
@@ -1535,10 +1543,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                        << srcDesc;    // 源采样率 + 后端：日志要能自证是哪首源、哪个后端
                     if (!rateAuto) {
                         // 明确选择档：绝不自动改率，但必须让用户清楚「做不到的是你选的那个率」
-                        es << "。你在设置里明确指定了 " << wantDevRate
-                           << " Hz，设备独占模式做不了这个采样率；"
-                              "已按你的选择报错（不会自动改成别的率，请在设置里改选设备支持的率，"
-                              "或把采样率改成\"最大\"让它自动挑）";
+                        const auto dec = rta::audio::decide_capability_failure(false, wantDevRate, {});
+                        es << "。" << dec.userMessage;
                     }
                     std::lock_guard<std::mutex> lk(ps.mtx);
                     ps.error = es.str();

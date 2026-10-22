@@ -177,4 +177,99 @@ inline uint32_t pick_supported_rate(uint32_t want, uint32_t sourceRate,
     return v.back();
 }
 
+// ---------------------------------------------------------------------------
+// 能力失败决策结果
+// ---------------------------------------------------------------------------
+enum class CapAction {
+    Matched,        // want 就在 supported 中（无需改动）
+    FallbackRate,   // rateAuto=true 且在 supported 中挑到了替代采样率（换率）
+    RetryProbe,     // rateAuto=true 但 supported 为空（探测为空，建议探测重试或保持）
+    HardFail,       // rateAuto=false 明确选择做不到（硬失败报错，不换率）或空列表无可挑
+};
+
+struct CapDecision {
+    CapAction   action = CapAction::HardFail;
+    uint32_t    outRate = 0;        // 决定的采样率
+    bool        changed = false;    // 是否改动了采样率（outRate != want 且 outRate > 0）
+    std::string userMessage;        // 用户提示 / 报错文案（明确选择报错或换率原因说明）
+    std::string logTag;             // "RATEFALLBACK" / "RATEPROBE_EMPTY" / "EXPLICIT_REJECT" / ""
+};
+
+// ---------------------------------------------------------------------------
+// 设备独占能力检查失败策略（纯函数，零设备依赖）：
+//   - rateAuto == false（明确选择档）：硬失败，绝不自动改率，生成如实报错文案；outRate 保持 want；
+//   - rateAuto == true  （自动/跟随档）：
+//       - supported 非空：用 pick_supported_rate 挑最近可用率；
+//       - supported 为空：给出 RetryProbe 建议，outRate 保持 want；
+//   - want 恰好在 supported 中：Matched，outRate = want，不改率。
+// ---------------------------------------------------------------------------
+inline CapDecision decide_capability_failure(bool rateAuto, uint32_t want,
+                                            const std::vector<uint32_t>& supported,
+                                            uint32_t& outRate,
+                                            uint32_t sourceRate = 0) {
+    CapDecision d;
+    const auto v = ratepick_detail::normalized(supported);
+
+    // 边界：want 已经在支持列表中
+    if (!v.empty() && std::binary_search(v.begin(), v.end(), want)) {
+        d.action = CapAction::Matched;
+        d.outRate = want;
+        d.changed = false;
+        outRate = want;
+        return d;
+    }
+
+    // 明确选择档：硬失败，绝不自动改率，保持原率并给出错误文案
+    if (!rateAuto) {
+        d.action = CapAction::HardFail;
+        d.outRate = want;
+        d.changed = false;
+        d.logTag = "EXPLICIT_REJECT";
+        d.userMessage = "你在设置里明确指定了 " + std::to_string(want) +
+                        " Hz，设备独占模式做不了这个采样率；已按你的选择报错（不会自动改成别的率，"
+                        "请在设置里改选设备支持的率，或把采样率改成\"最大\"让它自动挑）";
+        outRate = want;
+        return d;
+    }
+
+    // 自动档：列表为空 -> 探测为空，建议重试/保持
+    if (v.empty()) {
+        d.action = CapAction::RetryProbe;
+        d.outRate = want;
+        d.changed = false;
+        d.logTag = "RATEPROBE_EMPTY";
+        d.userMessage = "设备独占支持率探测为空（端点可能正在重配置），建议探测重试或保持现有采样率";
+        outRate = want;
+        return d;
+    }
+
+    // 自动档且列表非空：自适应换率
+    const uint32_t src = (sourceRate > 0) ? sourceRate : want;
+    const uint32_t picked = pick_supported_rate(want, src, v);
+    if (picked > 0) {
+        d.action = CapAction::FallbackRate;
+        d.outRate = picked;
+        d.changed = (picked != want);
+        d.logTag = "RATEFALLBACK";
+        d.userMessage = "目标 " + std::to_string(want) + " Hz 独占不支持，已用 " +
+                        std::to_string(picked) + " Hz（源 " +
+                        std::to_string(src) + " Hz 重采样，非 bit-perfect）";
+        outRate = picked;
+        return d;
+    }
+
+    // 极端异常（picked == 0）：无可挑
+    d.action = CapAction::HardFail;
+    d.outRate = want;
+    d.changed = false;
+    outRate = want;
+    return d;
+}
+
+inline CapDecision decide_capability_failure(bool rateAuto, uint32_t want,
+                                            const std::vector<uint32_t>& supported) {
+    uint32_t dummy = want;
+    return decide_capability_failure(rateAuto, want, supported, dummy, 0);
+}
+
 }  // namespace rta::audio
