@@ -2,6 +2,76 @@
 
 > **接手请先读**：[HANDOVER.md](HANDOVER.md)（架构/构建/已知坑）→ [ROADMAP.md](ROADMAP.md)（待开发与判据）。
 > 本文件按回合记录“做过什么、实测多少”，越往下越旧。
+# 第二十二轮:基建收口(P3 双轨 WebView2 合并 / P1 裁 ffmpeg / P2 裁 Locales / 1.0.9 出包)(2026-10-23)
+
+> 用户指令:本轮只做核验与派单,编码全部派 Gemini 3.8 Flash(思考强度 high)子代理;按 P3 合并 → P1 收口 → P2 实施 → 出 1.0.9 → 更新文档。
+> 本轮结果:**P3/P1/P2 全部合入 main**;ctest 45 → **46 套**(新增 ffmpeg_matrix);**1.0.9 正式包 369.4 MB**(1.0.8 是 555.7 MB,−33.5%);修掉一个 **CI 偶发红**与一个**产品级重试缺陷**。
+
+## 0. 子代理模型核验(用户钦定:Gemini 3.8 Flash / high)
+
+- 探针子代理自报 `MODEL=gemini-3.8-flash-tiered / EFFORT=high / PROVIDER=agy`;
+- 独立复核:会话记录 `modelSelection.lastUsed = {provider: agy, model: gemini-3.8-flash-tiered, reasoningEffort: high}`;与探针自报一致。
+- 注意:上一会话遗留的 P1 子代理仍是 deepseek-flash(无法中途换模型/中止),其实现由本轮新派的 Gemini 子代理复核、跑门禁并提交。
+
+## 1. P3:WebView2 双轨运行时(合并 71beda7 → a882bab)
+
+- `tools/wv2_host.h` +408/−17:读系统 Evergreen 版本(EdgeUpdate 注册表 pv,回退扫 Application\\<ver>\\msedgewebview2.exe 文件版本)与包内固定版版本,逐段比较(短的一方补 0);
+- **auto(默认)**:系统版 ≥ 包内版 → 系统版(能跟随安全更新),否则包内版(自包含兜底);首选失败自动改试另一条;两条都失败时**两条原因都写日志与错误文本**;
+- `RLPLAYER_WEBVIEW2_MODE=auto|system|bundled` 可强制单轨(排障/验收);
+- 每次选轨向 launcher.log 写一行「用了哪条 + 版本 + 原因」;
+- 审查证据:合并前分支自带 `build/_wv2test/guard_test` 10 个用例(同版本/系统旧/系统新/版本读不出/单轨/强制)、三模式截图同 sha256、干净重建 0 error、ctest 45/45。
+- **取舍决定(交接 §9.1)**:同版本时**保持选系统版**(`c >= 0`)。理由:同 build 行为一致、可跟随后续安全更新;包内版作为自包含兜底仍在。若要改选包内版,把 `>= 0` 改成 `> 0` 一行即可。**未擅自改。**
+
+## 2. 修 CI 偶发红:decode_retry 时序竞态(产品级缺陷,836dacf)
+
+- 现场:push a882bab 后 CI 首次红,唯一失败 `decode_retry` 用例 3(ctest 44/45);同一 commit 重跑即绿 ⟹ 偶发。
+- 根因(`src/audio/audio_loader.h` 重试循环):失败后探针发现「此刻可读」就 `break`,只尝试 1 次。但**占用方可能恰在 ffmpeg 运行期间松手**——「此刻可读」恰恰证明刚解除,应当再试;旧判据会把本可恢复的瞬时占用直接报成失败(现场「重试一下就好」的真痛点)。云机 ffmpeg 启动+ANSI 回退 >150ms,正好踩中。
+- 修法:`if (i >= 1 && unreadable.empty()) break;` ——**首轮失败必须至少再试一次**;只有已经重试过且探针仍证明可读,才认定是真解码错误。
+- 测试硬化(不弱化判据):用例 3 拆两时序(10ms 极早释放 / 150ms 跨尝试释放);新增 3b 用「监听 ffmpeg 子进程启动即释放锁」做**时序解耦的确定性复现** + 10 轮递增时延窗口扫描(15~195ms),断言 10/10 全过。
+- 门禁:repeat-until-fail:10 全绿;全量 ctest 45/45;平台边界 PASS。
+
+## 3. P1:自建精简版 ffmpeg/ffprobe(b33169f → 合并 f49462c)
+
+| 项 | 1.0.8(gyan full) | 1.0.9(自建精简版) | 变化 |
+|---|---|---|---|
+| ffmpeg.exe | 212.0 MB | **12.18 MB** | −94.3% |
+| ffprobe.exe | 211.8 MB | **11.97 MB** | −94.4% |
+| 音频解码器 | 227(gyan 口径) | **219(源码音频全集口径)+ mjpeg/png/bmp/gif 封面** | 不降 |
+| 运行时依赖 | 无(静态) | 无(只依赖系统 DLL;裸 PATH=System32 实测) | 持平 |
+
+- 交付: `tools/build_ffmpeg_lite.ps1`(MSYS2 base + winlibs GCC 16.2 + nasm,缓存 `build/_fflite`,从零可复现:实测 00:43→00:46 重建成功)、`tools/ffmpeg_lite_required.txt`(50 项必需音频解码器**运行时名**白名单,修掉 gyan 名与源码名不一致的坑)、`tools/verify_ffmpeg_lite.ps1`(三层守卫:裸环境可执行 + 白名单 + 产品路径格式矩阵)、`tests/test_ffmpeg_matrix.cpp`(35 断言,把精简版与测试自身复制到临时目录,确保子进程**一定**用精简版)、`make_dist.ps1` 出包前调守卫(不过即拒绝出包)。
+- 证据:守卫绿「白名单 50 项齐全 / 解码器共 219 个 / pass=35 fail=0」;红→绿演练过(临时换成缺解码器构建 → 守卫红 → 还原绿);ctest 46/46(新增 ffmpeg_matrix 3.78s)。
+- ⚠️ 未做到(详见 `P1-调查.md` §9):ape/mpc7/mpc8/tak/shorten/dst 无真实样本(只有解码器存在断言);DSF/DFF 是自造 1-bit 流(无 ffmpeg DSD 编码器);精简版**无编码器**(产品只用解码+pcm/png 编码);工具链 URL 用 latest 别名未钉 SHA256;Win7 的 UCRT 依赖未验证。
+
+## 4. P2:裁 WebView2 Locales(4341fed)
+
+- `make_dist.ps1` 复制 WebView2 运行时后:Locales 只留 `en-US.pak`(Chromium 强制根语言回退)+`zh-CN.pak`;守卫:en-US 必须存在、.pak 数必须恰为 2,否则拒绝出包;打印裁剪前后体积。
+- 实测:Locales **168 个 pak / 128.88 MB → 2 个 / 1.79 MB**(未压缩 −127.09 MB,−98.6%)。
+- **启动实测(8910 接管法,全程未碰 8899)**:
+  - 先把手动 `rtaweb.exe --port 8910` 起在测试包内,再启动 `RLPlayer.exe` → 日志「发现已有实例在 8910,接管界面」→ **不会自己 spawn 服务占用 8899**;
+  - bundled 模式:窗口 RLPlayerMain 可见,日志「已选用 包内固定版」,**新拉起 7 个 msedgewebview2 全部来自包内 `WebView2Runtime\\msedgewebview2.exe`**(裁剪后运行时真的被用上的硬证据);关闭后全部自动退出、无残留;
+  - auto 模式回归:日志「已选用 系统版」、6 个 webview2 来自 Program Files,窗口正常;
+  - 8899 在实验前后全程 FREE。
+- **EBWebView 取证(推翻交接 §9.2 的「死重」怀疑)**:把 `WebView2Runtime\\EBWebView` 改名后再 bundled 启动 → `CreateCoreWebView2EnvironmentWithOptions` 返回 **0x80070002**、窗口建不出来、退回 Edge。**结论:EBWebView 不可删**(它含 x64/x86 下的 EmbeddedBrowserWebView.dll 等运行时模块,不是纯种子 profile)。已还原;1.0.9 包内保留。
+
+## 5. 1.0.9 正式包(本轮交付物)
+
+- 出处:main(含 P3+P1+P2+decode 修复),版本号真相源 `src/version.h` bump 到 `1.0.9`,
+  `powershell -File tools\\make_dist.ps1 -Version 1.0.9`(内部依次:构建 → GPU 后端 → 兼容门禁 → **ffmpeg 精简版守卫** → 复制 → **Locales 裁剪+守卫** → GPU 裸 PATH smoke → zip → sha256)。
+- 体积:**369.4 MB(387,305,245 字节)**,1.0.8 的 555.7 MB 上 **−186.3 MB(−33.5%)**;构成变化:ffmpeg 两项 −150 MB 量级、Locales −35~40 MB(zip 内)。
+- 审计:包内 Locales 仅 2 个 pak;ffmpeg/ffprobe 12.18/11.97 MB;无 `rlplayer-llm.conf`、无 `*.log`、无 `webview2\\` profile;无真实 `sk-` 密钥;出包后解包目录保持未启动干净状态。
+- 最终产物: `dist\\RLPlayer-1.0.9-win64.zip` = **387,305,245 字节(369.4 MB)**,
+  sha256 `831FE3462B0137FF0247C4BDDEE936FA4D169338A2BD1CE3C54FDEC61A308569`;
+  启动横幅 `STARTUP v1.0.9` 实测(8910 接管法,8899 全程未碰);包内 README.txt 已替换为 1.0.9。
+
+## 6. 本轮已知未解决项(铁律 4)
+
+1. P3 的版本比较逻辑**只有本地 `build/_wv2test/guard_test` 证据,未固化成仓库内 ctest 用例**;后续可把它提升为 `tests/test_wv2_version.cpp` + CMake 目标(纯函数,无需 WebView2)。
+2. EBWebView 不可删,但其中确实含一批**种子 profile 文件**(History/Login Data 等空壳)——是否能「只删种子、保留 x64/x86 运行时」未验证;风险高,本轮不动。
+3. 精简版 ffmpeg 的冷门格式(ape/mpc/tak/shorten/dst)只有解码器存在断言,无真实样本解码。
+4. `writeback` 用例在素材缺失时会 SEGFAULT(测试自身健壮性,非产品崩溃),本轮未修。
+5. decode_retry 在 CI 上仍依赖 ffmpeg 子进程启动时序;已用确定性用例覆盖,但云机极端负载下仍可能变慢(不影响判据)。
+
 # 第二十一轮:用户反馈双通道首次启用(2 份 BUG + 1 份管理员需求,共 11 条)(2026-10-22)
 
 > 用户指令:先把「反馈和开发」目录规范写进开发规范,再处理两份反馈。**主管只做验收与回测,编码全部派子代理**。
