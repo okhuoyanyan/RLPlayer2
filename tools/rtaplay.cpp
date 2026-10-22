@@ -301,8 +301,10 @@ int main(int argc, char** argv) {
         auto spec = rta::dsp::parse_eq_text(ss.str());
         auto chain = rta::dsp::build_eq_filters(spec, (double)in.rate);
         cfg.channel.resize((size_t)in.channels);
-        for (int c = 0; c < in.channels; ++c) cfg.channel[(size_t)c].eq = chain;
-        if (cfg.volumeEnabled && spec.preampDb != 0.0) cfg.volumeDb += spec.preampDb;
+        for (int c = 0; c < in.channels; ++c) {
+            cfg.channel[(size_t)c].eq = chain;
+            if (spec.preampDb != 0.0) cfg.channel[(size_t)c].gainDb += spec.preampDb;
+        }
         printf("EQ: %s -> %zu 个启用波段, preamp %+.1f dB\n", eqFile.c_str(), chain.size(), spec.preampDb);
     }
     if (!irFile.empty()) {

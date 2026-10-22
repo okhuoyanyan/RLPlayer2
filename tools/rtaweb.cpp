@@ -48,6 +48,7 @@ using rta::render::SinkOpenOpts;
 #include "dsp/filter_families.h"
 #include "dsp/oversample_peak.h"
 #include "dsp/eq_text.h"
+#include "dsp/opra.h"
 #include "dsp/dop.h"
 #include "dsp/modulator.h"
 #include "dsp/direct_sdm.h"
@@ -1586,10 +1587,13 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 try {
                     auto spec = rta::dsp::parse_eq_text(text);
                     auto chain = rta::dsp::build_eq_filters(spec, (double)in.rate);
-                    if (!chain.empty()) {
+                    if (!chain.empty() || spec.preampDb != 0.0) {
                         const size_t maxCh = (size_t)std::max(in.channels, 2);
                         if (cfg.channel.size() < maxCh) cfg.channel.resize(maxCh);
-                        for (size_t c = 0; c < maxCh; ++c) cfg.channel[c].eq = chain;
+                        for (size_t c = 0; c < maxCh; ++c) {
+                            cfg.channel[c].eq = chain;
+                            if (spec.preampDb != 0.0) cfg.channel[c].gainDb += spec.preampDb;
+                        }
                         eqLoaded = true;
                     }
                 } catch (...) { /* 解析失败就当没配 */ }
@@ -3574,6 +3578,116 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         return out;
     }
 
+    // ---------------- 耳机 EQ（OPRA 预设管理）----------------
+    if (rq.path.rfind("/api/opra/index", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        rta::dsp::OpraService::instance().init();
+        const auto& index = rta::dsp::OpraService::instance().index();
+        std::string q;
+        const size_t qpos = rq.path.find("?q=");
+        if (qpos != std::string::npos) {
+            q = urlDecode(rq.path.substr(qpos + 3));
+        }
+        std::ostringstream j;
+        if (!q.empty()) {
+            auto items = index.filter(q, 100);
+            j << "{\"ok\":true,\"count\":" << items.size() << ",\"items\":[";
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (i) j << ",";
+                j << "[\"" << jesc(items[i].id) << "\",\"" << jesc(items[i].vendor) << "\",\"" << jesc(items[i].name) << "\"]";
+            }
+            j << "]}";
+        } else {
+            j << "{\"ok\":true,\"count\":" << index.size() << ",\"items\":[";
+            bool first = true;
+            for (const auto& it : index.items()) {
+                if (!first) j << ",";
+                first = false;
+                j << "[\"" << jesc(it.id) << "\",\"" << jesc(it.vendor) << "\",\"" << jesc(it.name) << "\"]";
+            }
+            j << "]}";
+        }
+        return j.str();
+    }
+    if (rq.path.rfind("/api/opra/presets", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        rta::dsp::OpraService::instance().init();
+        std::string productId;
+        bool forceRefresh = false;
+        const size_t qpos = rq.path.find('?');
+        if (qpos != std::string::npos) {
+            std::istringstream qs(rq.path.substr(qpos + 1));
+            std::string tok;
+            while (std::getline(qs, tok, '&')) {
+                const size_t eq = tok.find('=');
+                if (eq == std::string::npos) continue;
+                const std::string k = urlDecode(tok.substr(0, eq));
+                const std::string v = urlDecode(tok.substr(eq + 1));
+                if (k == "productId" || k == "id") productId = v;
+                else if (k == "refresh") forceRefresh = (v == "1" || v == "true");
+            }
+        }
+        if (productId.empty()) {
+            return "{\"ok\":false,\"error\":\"缺少 productId 参数\"}";
+        }
+        std::vector<rta::dsp::OpraPreset> presets;
+        bool fromCache = false;
+        std::string err;
+        bool ok = rta::dsp::OpraService::instance().get_presets(productId, presets, fromCache, err, forceRefresh);
+        if (!ok && presets.empty()) {
+            std::ostringstream j;
+            j << "{\"ok\":false,\"error\":\"" << jesc(err.empty() ? "获取预设失败" : err) << "\"}";
+            return j.str();
+        }
+        std::ostringstream j;
+        j << "{\"ok\":true,\"fromCache\":" << (fromCache ? "true" : "false");
+        if (!err.empty()) j << ",\"msg\":\"" << jesc(err) << "\"";
+        j << ",\"items\":[";
+        for (size_t i = 0; i < presets.size(); ++i) {
+            const auto& p = presets[i];
+            if (i) j << ",";
+            j << "{\"id\":\"" << jesc(p.id) << "\""
+              << ",\"author\":\"" << jesc(p.author) << "\""
+              << ",\"details\":\"" << jesc(p.details) << "\""
+              << ",\"link\":\"" << jesc(p.link) << "\""
+              << ",\"gainDb\":" << p.gainDb
+              << ",\"bandsCount\":" << p.bands.size()
+              << "}";
+        }
+        j << "]}";
+        return j.str();
+    }
+    if (rq.path.rfind("/api/opra/apply", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        rta::dsp::OpraService::instance().init();
+        std::string productId, presetId;
+        std::istringstream is(rq.body);
+        std::string tok;
+        while (std::getline(is, tok, '&')) {
+            const size_t eq = tok.find('=');
+            if (eq == std::string::npos) continue;
+            const std::string k = urlDecode(tok.substr(0, eq));
+            const std::string v = urlDecode(tok.substr(eq + 1));
+            if (k == "productId") productId = v;
+            else if (k == "presetId") presetId = v;
+        }
+        if (productId.empty() || presetId.empty()) {
+            return "{\"ok\":false,\"error\":\"缺少 productId 或 presetId 参数\"}";
+        }
+        std::string outRelPath, err;
+        bool ok = rta::dsp::OpraService::instance().apply_preset(productId, presetId, "", outRelPath, err);
+        if (!ok) {
+            std::ostringstream j;
+            j << "{\"ok\":false,\"error\":\"" << jesc(err) << "\"}";
+            return j.str();
+        }
+        std::ostringstream j;
+        j << "{\"ok\":true,\"path\":\"" << jesc(outRelPath) << "\""
+          << ",\"productId\":\"" << jesc(productId) << "\""
+          << ",\"presetId\":\"" << jesc(presetId) << "\"}";
+        return j.str();
+    }
+
     // 局域网监听状态（控制面默认只对本机开放）
     // ---------------- 播放设置持久化 ----------------
     // 没有这个，用户每次重启都要重新选滤波器/抖动/缓冲 —— 日常用起来很烦。
@@ -3600,6 +3714,8 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                                            "backend", "naahost", "channels", "trim",
                                            "inbackend", "indev", "inoffset", "inbuf", "inmon",
                                            "sdmfilt", "sdmfiltnx",
+                                           // 耳机 EQ (OPRA)
+                                           "opraproduct", "oprapreset", "opravendor",
                                            // 元数据补全(P1.5):总开关与 LLM 固定两键;
                                            // 源开关 metasrc_<id> 按注册表动态放行(见下)
                                            "metaon", "metallm" })

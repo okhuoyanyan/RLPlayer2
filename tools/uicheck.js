@@ -413,6 +413,24 @@ async function waitFor(expr, ms = 8000) {
   const back = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.filterNx||'')");
   ck(back === before.nx, 'Nx 还原', 'filterNx=' + back);
   const p10 = await shot('19-settings-page');
+
+  // ---- 耳机 EQ（OPRA）小节自检 ----
+  await evalJs("document.querySelector('.stab[data-g=adv]').click()");
+  await sleep(250);
+  ck(await evalJs("!!document.getElementById('sp_opra_search') && !!document.getElementById('sp_opra_product') && !!document.getElementById('sp_opra_preset') && !!document.getElementById('sp_opra_apply')"),
+     '设置页高级页签包含 OPRA 耳机 EQ 控件（搜索/产品/预设/应用）');
+  ck(await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=adv]');if(!p)return false;return p.textContent.indexOf('CC BY-SA 4.0')>=0&&p.textContent.indexOf('OPRA')>=0;})()"),
+     '耳机 EQ 小节包含 CC BY-SA 4.0 归属声明');
+  ck(await evalJs("!!document.getElementById('sp_opra_copychip') && document.getElementById('sp_opra_copychip').classList.contains('chip')"),
+     '存在复制官网链接芯片（.chip）');
+  ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=adv] a[href^=http]').length === 0"),
+     '耳机 EQ 与高级页签无外链');
+  // 实时搜索测试
+  await evalJs("var s=document.getElementById('sp_opra_search'); s.value='HD 600'; s.dispatchEvent(new Event('input'));");
+  await sleep(300);
+  const opraProdCount = await evalJs("document.querySelectorAll('#sp_opra_product option').length");
+  ck(opraProdCount > 1, 'OPRA 本地实时搜索 HD 600 成功过滤出产品型号', opraProdCount + ' 款');
+
   // ---- 右栏标签页 / 歌词 / 播放列表 / 信号链 ----
   await evalJs("document.querySelector('.rtab[data-t=l]').click()");
   await sleep(500);
@@ -433,7 +451,7 @@ async function waitFor(expr, ms = 8000) {
 
   // 搜索
   await evalJs("var q=document.getElementById('q'); q.value='Isobel'; q.dispatchEvent(new Event('input'));");
-  await sleep(900);
+  await waitFor("document.querySelectorAll('.trow').length > 0", 5000);
   const hits = await evalJs("document.querySelectorAll('.trow').length");
   ck(hits > 0, '全局搜索有结果', hits + ' 条');
   const p6 = await shot('06-search');
@@ -447,7 +465,7 @@ async function waitFor(expr, ms = 8000) {
       //            （早期把两类混在一起判，导致把正常控件误报成"未绑定"）
       //  P1.5：元数据源开关是动态的（/api/providers 注册表）—— 在静态清单之外逐源补查
       //  P2：标签写回的预览/执行按钮也是要点了有反应的
-      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol'];
+      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_opra_search','sp_opra_product','sp_opra_preset','sp_opra_apply','sp_opra_copychip'];
       (META_PROVIDERS || []).forEach(function (p) { needBind.push('sp_meta_' + p.id); });
       var valueOnly=['sRate','sFilt','sFiltNx','sShap','sBuf','sDSD','sIsp','s2s'];
       var miss=[];

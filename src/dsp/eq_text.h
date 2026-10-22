@@ -114,16 +114,25 @@ inline std::vector<Biquad> build_eq_filters(const EqSpec& spec, double fs) {
     out.reserve(spec.bands.size());
     for (const auto& b : spec.bands) {
         if (!b.enabled) continue;
+        if (b.fc <= 0.0) continue;
+        // Nyquist 保护：上限钳位到 0.49 * fs，避免 Biquad 系数在 Nyquist 发散
+        const double fc = (fs > 0.0 && b.fc >= 0.49 * fs) ? 0.49 * fs : b.fc;
         Biquad q;
         const std::string t = detail::upper(b.type);
-        if      (t == "PK")  biquad_design::peak(q, fs, b.fc, b.q, b.gain);
-        else if (t == "LS" || t == "LSC") biquad_design::lowShelf(q, fs, b.fc, 0.7, b.gain);
-        else if (t == "HS" || t == "HSC") biquad_design::highShelf(q, fs, b.fc, 0.7, b.gain);
-        else if (t == "LP")  biquad_design::lowpass(q, fs, b.fc, b.q);
-        else if (t == "HP")  biquad_design::highpass(q, fs, b.fc, b.q);
-        else if (t == "BP")  biquad_design::bandpass(q, fs, b.fc, b.q);
-        else if (t == "NO")  biquad_design::notch(q, fs, b.fc, b.q);
-        else if (t == "AP")  biquad_design::allpass(q, fs, b.fc, b.q);
+        if      (t == "PK")  biquad_design::peak(q, fs, fc, b.q, b.gain);
+        else if (t == "LS" || t == "LSC") {
+            if (b.hasQ) biquad_design::lowShelfQ(q, fs, fc, b.q, b.gain);
+            else        biquad_design::lowShelf(q, fs, fc, 0.7, b.gain);
+        }
+        else if (t == "HS" || t == "HSC") {
+            if (b.hasQ) biquad_design::highShelfQ(q, fs, fc, b.q, b.gain);
+            else        biquad_design::highShelf(q, fs, fc, 0.7, b.gain);
+        }
+        else if (t == "LP")  biquad_design::lowpass(q, fs, fc, b.q);
+        else if (t == "HP")  biquad_design::highpass(q, fs, fc, b.q);
+        else if (t == "BP")  biquad_design::bandpass(q, fs, fc, b.q);
+        else if (t == "NO")  biquad_design::notch(q, fs, fc, b.q);
+        else if (t == "AP")  biquad_design::allpass(q, fs, fc, b.q);
         else continue;
         out.push_back(q);
     }
