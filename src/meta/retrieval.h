@@ -693,7 +693,9 @@ inline std::string summary_to_json(const SummaryResult& sr) {
         if (i) o << ", ";
         o << "\"" << meta_jesc(sr.materials_used[i]) << "\"";
     }
-    o << "]\n"
+    o << "],\n"
+      << "  \"from_cache\": " << (sr.from_cache ? "true" : "false") << ",\n"
+      << "  \"offline\": " << (sr.offline ? "true" : "false") << "\n"
       << "}\n";
     return o.str();
 }
@@ -717,6 +719,8 @@ inline bool summary_from_json(const std::string& text,
         sr_out.expires_at = sr_out.generated_at + 7 * 86400; // 默认 TTL 7 天
     }
     sr_out.disclaimer = j["disclaimer"].s();
+    if (j.has("from_cache")) sr_out.from_cache = j["from_cache"].b;
+    if (j.has("offline")) sr_out.offline = j["offline"].b;
 
     // citations
     const rta::net::Json& carr = j["citations"];

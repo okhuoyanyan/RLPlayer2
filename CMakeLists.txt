@@ -405,6 +405,12 @@ target_include_directories(test_opra_eq PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_opra_eq PRIVATE rtadsp winhttp ws2_32)
 add_test(NAME opra_eq COMMAND test_opra_eq)
 
+# P3 资料层④b：Discogs L4 古典作品版本推荐（令牌桶/熔断 + 缓存 + 版本推荐列表）
+add_executable(test_discogs tests/test_discogs.cpp)
+target_include_directories(test_discogs PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_discogs PRIVATE winhttp)
+add_test(NAME discogs COMMAND test_discogs)
+
 # 测试素材生成器：调制器 -> DSF/DFF（本机原本一个 DSD 文件都没有）
 add_executable(make_dsd tools/make_dsd.cpp)
 target_link_libraries(make_dsd PRIVATE rtadsp)
