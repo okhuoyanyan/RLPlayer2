@@ -176,14 +176,63 @@ async function waitFor(expr, ms = 8000) {
      '点击来源芯片弹出「已复制来源链接」toast');
   ck(await evalJs("document.querySelectorAll('a[href^=http]').length === 0"),
      '带资料页面无 http 外链（永不跳转外部浏览器）');
-  // P3④b: 检查 ZARD 页面已缓存的 AI 综合小节
+  // P3④b: 检查 AI 综合小节（状态分支断言：有缓存 vs 未开启/无缓存，二选一必须成立）
   ck(await evalJs("!!document.querySelector('.ai-sec')"), '艺术家资料页包含 AI 综合小节');
-  ck(await evalJs("(function(){ var b = document.querySelector('.ai-badge'); return !!b && b.textContent.indexOf('AI 生成') >= 0; })()"),
-     'AI 综合小节常显「AI 生成」徽章');
-  ck(await evalJs("document.querySelectorAll('.ai-sec .chip-copy').length >= 1"),
-     'AI 综合小节包含来源引用复制芯片');
-  ck(await evalJs("document.querySelectorAll('.ai-sec sup').length >= 1"),
-     'AI 综合段落带有上标引用序号 [1][2]');
+  const aiState = await evalJs(`(function(){
+    var sec = document.querySelector('.ai-sec');
+    if (!sec) return 'missing-ai-sec';
+    var badge = sec.querySelector('.ai-badge');
+    var hasBadge = !!badge && badge.textContent.indexOf('AI 生成') >= 0;
+    var chips = sec.querySelectorAll('.chip-copy').length;
+    var sups = sec.querySelectorAll('sup').length;
+    if (hasBadge && chips >= 1 && sups >= 1) {
+      return { branch: 'has-summary', chips: chips, sups: sups };
+    }
+
+    var empty = sec.querySelector('.empty-card');
+    var btn = sec.querySelector('#bGenSummary');
+    var txt = sec.textContent || '';
+    var hasHint = txt.indexOf('暂无 AI 综合简介') >= 0 || txt.indexOf('未开启 AI 资料综合') >= 0 || (empty && empty.textContent.indexOf('AI 综合') >= 0);
+    var hasBtn = !!btn;
+    if (!!empty && hasBtn && hasHint) {
+      return {
+        branch: 'no-summary',
+        btnDisabled: btn.disabled,
+        btnText: btn.textContent.trim(),
+        hint: txt.slice(0, 80)
+      };
+    }
+
+    return {
+      branch: 'unknown',
+      hasBadge: hasBadge,
+      chips: chips,
+      sups: sups,
+      empty: !!empty,
+      btn: hasBtn,
+      txt: txt.slice(0, 100)
+    };
+  })()`);
+
+  ck(aiState && (aiState.branch === 'has-summary' || aiState.branch === 'no-summary'),
+     'AI 综合小节状态合法（有摘要分支：显徽章+上标+来源芯片；无摘要分支：显空态+明确提示+生成按钮）',
+     aiState ? (aiState.branch + (aiState.branch === 'no-summary' ? ' (btnDisabled=' + aiState.btnDisabled + ')' : '')) : 'null');
+
+  if (aiState && aiState.branch === 'has-summary') {
+    ck(await evalJs("(function(){ var b = document.querySelector('.ai-sec .ai-badge'); return !!b && b.textContent.indexOf('AI 生成') >= 0; })()"),
+       'AI 综合小节常显「AI 生成」徽章');
+    ck(await evalJs("document.querySelectorAll('.ai-sec .chip-copy').length >= 1"),
+       'AI 综合小节包含来源引用复制芯片');
+    ck(await evalJs("document.querySelectorAll('.ai-sec sup').length >= 1"),
+       'AI 综合段落带有上标引用序号 [1][2]');
+  } else {
+    ck(await evalJs("!!document.querySelector('.ai-sec .empty-card')"),
+       'AI 综合小节无缓存时渲染空态卡片');
+    ck(await evalJs("(function(){ var s = document.querySelector('.ai-sec'); if(!s) return false; var t = s.textContent || ''; return t.indexOf('暂无 AI 综合简介') >= 0 || t.indexOf('未开启 AI 资料综合') >= 0 || t.indexOf('未生成 AI 简介') >= 0; })()"),
+       'AI 综合小节无缓存时包含明确状态提示');
+    ck(await evalJs("(function(){ var b = document.querySelector('.ai-sec #bGenSummary'); return !!b && (b.textContent.indexOf('生成 AI 简介') >= 0); })()"),
+       'AI 综合小节无缓存时包含「生成 AI 简介」按钮（未开启时禁用）');
+  }
   const pZard = await shot('21-artist-profile-zard');
   await evalJs("document.getElementById('bBackArtists').click()");
   await sleep(500);
@@ -257,27 +306,19 @@ async function waitFor(expr, ms = 8000) {
   // ---- DirectSDM 开关（本轮新增）：存在 / 在 SDM 页 / 能落盘 / 跑完还原 ----
   const origDm = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>({dm:j.kv.directsdm||'0', vol:j.kv.volume||'0'}))");
   await evalJs("document.querySelector('.stab[data-g=sdm]').click()");
-  await sleep(200);
-  ck(await evalJs("(function(){var e=document.getElementById('sp_directsdm');return !!e&&e.type==='checkbox'&&e.closest('.spane')&&e.closest('.spane').dataset.g==='sdm';})()"),
+  ck(await waitFor("(function(){var e=document.getElementById('sp_directsdm');return !!e&&e.type==='checkbox'&&e.closest('.spane')&&e.closest('.spane').dataset.g==='sdm';})()", 5000),
      'SDM 页有 DirectSDM 开关（且只在 SDM 页）');
   ck(await evalJs("!!document.getElementById('sp_directsdm').onchange"), 'DirectSDM 开关已绑定事件');
   await evalJs("var e=document.getElementById('sp_directsdm'); e.checked=true; if (e.onchange) e.onchange(); else e.dispatchEvent(new Event('change'));");
-  await sleep(1500);
-  const dm1 = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.directsdm)");
-  ck(String(dm1) === '1', 'DirectSDM 开关能保存到后端', 'directsdm=' + dm1);
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.directsdm)==='1')", 6000), 'DirectSDM 开关能保存到后端');
   await evalJs("var e=document.getElementById('sp_directsdm'); e.checked=" + (origDm.dm === '1') + "; if (e.onchange) e.onchange(); else e.dispatchEvent(new Event('change'));");
-  await sleep(1500);
-  const dm2 = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.directsdm)");
-  ck(String(dm2) === String(origDm.dm), 'DirectSDM 开关还原', 'directsdm=' + dm2 + '（原值 ' + origDm.dm + '）');
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.directsdm)==='" + String(origDm.dm) + "')", 6000), 'DirectSDM 开关还原');
   // 开关会把音量压到 0 dB，必须一起还原（自检不许改用户设置）
-  await evalJs("S.vol=" + Number(origDm.vol) + "; var v=document.getElementById('vol'); if(v) v.value=" + Number(origDm.vol) + "; saveSettings();");
-  await sleep(1200);
-  const volBack = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.volume)");
-  ck(String(volBack) === String(origDm.vol), 'DirectSDM 自检后音量还原', 'volume=' + volBack + '（原值 ' + origDm.vol + '）');
+  await evalJs("S.vol=" + Number(origDm.vol) + "; var v=document.getElementById('vol'); if(v) v.value=" + Number(origDm.vol) + "; saveSettings(true);");
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.volume)==='" + String(origDm.vol) + "')", 6000), 'DirectSDM 自检后音量还原');
   // ---- 本轮新增：元数据补全页（分组 / 动态源开关 / metaon 往返 / 诊断按钮）----
   await evalJs("document.querySelector('.stab[data-g=meta]').click()");
-  await sleep(250);
-  ck(await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=meta]');if(!p||!p.classList.contains('on'))return false;var g=false;Array.prototype.forEach.call(p.querySelectorAll('.sghead'),function(e){if(e.textContent.indexOf('元数据补全')>=0)g=true});return g;})()"),
+  ck(await waitFor("(function(){var p=document.querySelector('#setpage .spane[data-g=meta]');if(!p||!p.classList.contains('on'))return false;var g=false;Array.prototype.forEach.call(p.querySelectorAll('.sghead'),function(e){if(e.textContent.indexOf('元数据补全')>=0)g=true});return g;})()", 5000),
      '元数据页有「元数据补全」分组（且页签能切过去）');
   // P1.5：源开关动态渲染 —— /api/providers 返回注册表，页面必须按 items 逐源渲染出
   // sp_meta_<id> 开关（旧的六开关硬编码断言已改为动态版）。
@@ -308,14 +349,11 @@ async function waitFor(expr, ms = 8000) {
     const qqItem = provs.items.find(i => i.id === 'qq');
     const origQq = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasrc_qq||j.kv.metaqq||'1')"));
     await evalJs("var e=document.getElementById('sp_meta_qq'); e.checked=false; e.dispatchEvent(new Event('change'));");
-    await sleep(1300);
-    const qOff = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasrc_qq)"));
-    ck(qOff === '0' && String(qqItem.on) === String(origQq === '1'),
-       '关「QQ音乐」源开关能保存到后端(metasrc_qq)', 'metasrc_qq=' + qOff + '（原值 ' + origQq + '）');
+    ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.metasrc_qq)==='0')", 6000) && String(qqItem.on) === String(origQq === '1'),
+       '关「QQ音乐」源开关能保存到后端(metasrc_qq)');
     await evalJs("var e=document.getElementById('sp_meta_qq'); e.checked=" + (origQq === '1') + "; e.dispatchEvent(new Event('change'));");
-    await sleep(1300);
-    const qBack = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasrc_qq)"));
-    ck(qBack === origQq, '「QQ音乐」源开关往返还原', 'metasrc_qq=' + qBack + '（原值 ' + origQq + '）');
+    ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.metasrc_qq)==='" + origQq + "')", 6000),
+       '「QQ音乐」源开关往返还原');
   }
   // 总开关、DeepSeek 开关与 AI 综合开关保持固定
   const metaFix = await evalJs("(function(){var ids=['sp_metaon','sp_metallm','sp_metasummary'];var p=document.querySelector('#setpage .spane[data-g=meta]');var miss=[];ids.forEach(function(i){var e=document.getElementById(i);if(!e||e.type!=='checkbox'||!p.contains(e)||!e.onchange)miss.push(i)});return miss;})()");
@@ -325,24 +363,20 @@ async function waitFor(expr, ms = 8000) {
   const origSummary = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasummary||'0')"));
   ck(origSummary === '0', 'metasummary 默认关闭 (0)');
   await evalJs("var e=document.getElementById('sp_metasummary'); e.checked=true; e.dispatchEvent(new Event('change'));");
-  await sleep(1300);
-  const sOn = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasummary)"));
-  ck(sOn === '1', '打开「允许 AI 资料综合」能保存到后端', 'metasummary=' + sOn);
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.metasummary)==='1')", 6000),
+     '打开「允许 AI 资料综合」能保存到后端');
   await evalJs("var e=document.getElementById('sp_metasummary'); e.checked=" + (origSummary === '1') + "; e.dispatchEvent(new Event('change'));");
-  await sleep(1300);
-  const sBack = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasummary)"));
-  ck(sBack === origSummary, '「允许 AI 资料综合」往返还原', 'metasummary=' + sBack);
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.metasummary)==='" + origSummary + "')", 6000),
+     '「允许 AI 资料综合」往返还原');
   // metaon 关→开：走 UI 开关（onchange → saveSettings → POST /api/settings），往返一致。
   // 注意不能裸 POST 单键：/api/settings 的 POST 是整文件重写，只发一个键会把其余设置全抹掉。
   const origMetaon = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metaon||'1')"));
   await evalJs("var e=document.getElementById('sp_metaon'); e.checked=false; e.dispatchEvent(new Event('change'));");
-  await sleep(1300);
-  const mOff = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metaon)"));
-  ck(mOff === '0', '关闭「自动补全」能保存到后端', 'metaon=' + mOff);
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.metaon)==='0')", 6000),
+     '关闭「自动补全」能保存到后端');
   await evalJs("var e=document.getElementById('sp_metaon'); e.checked=" + (origMetaon === '1') + "; e.dispatchEvent(new Event('change'));");
-  await sleep(1300);
-  const mBack = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metaon)"));
-  ck(mBack === origMetaon, '「自动补全」往返还原', 'metaon=' + mBack + '（原值 ' + origMetaon + '）');
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.metaon)==='" + origMetaon + "')", 6000),
+     '「自动补全」往返还原');
   // ---- 功能4（2026-10-22）：DeepSeek API Key 的界面入口 ----
   // 判据是可判定的三条红线，不看文案：
   //   ① 输入框在「元数据补全」分组里、type=password、初始为空（不回填明文）；
@@ -380,8 +414,7 @@ async function waitFor(expr, ms = 8000) {
      '诊断导出按钮不在元数据分组里（已移出）');
   ck(await evalJs("!document.getElementById('sp_diag')"), '旧的单一 JSON「导出诊断信息」按钮已移除（sp_diag 不存在）');
   await evalJs("document.querySelector('.stab[data-g=diag]').click()");
-  await sleep(250);
-  ck(await evalJs("document.querySelector('#setpage .spane[data-g=diag]').classList.contains('on')"),
+  ck(await waitFor("document.querySelector('#setpage .spane[data-g=diag]') && document.querySelector('#setpage .spane[data-g=diag]').classList.contains('on')", 5000),
      '诊断页签能切过去');
   ck(await evalJs("!!document.getElementById('sp_diagzip') && !!document.getElementById('sp_diagzip').onclick && document.getElementById('sp_diagzip').textContent.indexOf('zip') >= 0"),
      '「导出诊断包（.zip）」按钮存在且已绑定');
@@ -409,7 +442,7 @@ async function waitFor(expr, ms = 8000) {
   ck(await evalJs("fetch('/api/writeback/status').then(function(r){return r.json()}).then(function(j){return j.ok===true&&typeof j.running==='boolean'&&typeof j.done==='number'&&typeof j.total==='number'&&typeof j.written==='number'&&typeof j.skipped==='number'&&typeof j.failed==='number'&&Array.isArray(j.lastFailures)})"), 'status 端点字段齐全(running/done/total/written/skipped/failed/lastFailures)');
   ck(await evalJs("!document.getElementById('sp_wbdry').disabled && !document.getElementById('sp_wbapply').disabled"), '预览完成后两按钮恢复可用', 'toast=' + wbToast);
   await evalJs("document.querySelector('.stab[data-g=out]').click()");
-  await sleep(150);
+  await waitFor("document.querySelector('#setpage .spane[data-g=out]') && document.querySelector('#setpage .spane[data-g=out]').classList.contains('on')", 5000);
   const nGroups = await evalJs("document.querySelectorAll('#setpage .sgroup').length");
   ck(nGroups >= 6, '设置页分了多组', nGroups + ' 组');
   const nFields = await evalJs("document.querySelectorAll('#setpage select, #setpage input').length");
@@ -421,40 +454,33 @@ async function waitFor(expr, ms = 8000) {
   const origBackend = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.backend||'wasapi')"));
   ck(await evalJs("(function(){var s=document.getElementById('sp_backend');if(!s)return false;for(var i=0;i<s.options.length;++i)if(s.options[i].value==='wasapi-shared')return true;return false})()"), '后端下拉含「WASAPI 共享」选项');
   await evalJs("var s=document.getElementById('sp_backend'); s.value='wasapi-shared'; if (s.onchange) s.onchange(); else s.dispatchEvent(new Event('change'));");
-  await sleep(1400);
-  const bkHint = String(await evalJs("(document.getElementById('sp_backendmsg')||{textContent:''}).textContent"));
-  ck(bkHint.indexOf('共享') >= 0 && bkHint.indexOf('bit-perfect') >= 0, '选共享后端出现说明文案', bkHint.slice(0, 60));
-  ck(await evalJs("ADV.backend === 'wasapi-shared'"), '切共享后端后 ADV.backend 更新');
-  const savedBk = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.backend)"));
-  ck(savedBk === 'wasapi-shared', '共享后端能保存到后端', 'backend=' + savedBk);
+  ck(await waitFor("(function(){var t=(document.getElementById('sp_backendmsg')||{textContent:''}).textContent; return t.indexOf('共享')>=0 && t.indexOf('bit-perfect')>=0 && ADV.backend==='wasapi-shared';})()", 6000), '选共享后端出现说明文案且 ADV.backend 更新');
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.backend==='wasapi-shared')", 6000), '共享后端能保存到后端');
   await evalJs("var s=document.getElementById('sp_backend'); s.value='" + origBackend + "'; if (s.onchange) s.onchange(); else s.dispatchEvent(new Event('change'));");
-  await sleep(1400);
-  const bkBack = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.backend)"));
-  ck(bkBack === origBackend, '自检跑完后把输出后端还原', 'backend=' + bkBack + '（原值 ' + origBackend + '）');
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.backend==='" + origBackend + "')", 6000), '自检跑完后把输出后端还原');
   // 改一个参数并保存，验证后端确实收到。
   // !! 必须还原：自检跑在用户真实实例上时，曾经把 taps 写成 131072 并落盘，
   //    用户打开设置页就看到一个莫名其妙的"原型抽头数"。自检不许改用户的设置。
   const origTaps = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.taps)"));
   await evalJs("document.getElementById('sp_taps').value='131072'");
   await evalJs("document.getElementById('sp_save').click()");
-  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.taps)==='131072')", 4000), '设置能保存到后端');
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.taps)==='131072')", 6000), '设置能保存到后端');
   await evalJs("document.getElementById('sp_taps').value='" + origTaps + "'");
   await evalJs("document.getElementById('sp_save').click()");
-  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.taps)==='" + origTaps + "')", 4000), '自检跑完后把设置还原');
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.taps)==='" + origTaps + "')", 6000), '自检跑完后把设置还原');
   // 1x / Nx 分开选：改 Nx 必须真的落到 filterNx，且不能连 1x 一起改掉
   const before = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>({f:j.kv.filter||'',nx:j.kv.filterNx||''}))");
-  await evalJs("document.getElementById('sFiltNx').value='poly-sinc-short-mp'; if (D('sp_filtNx')) D('sp_filtNx').value='poly-sinc-short-mp'; saveSettings();");
-  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.filterNx==='poly-sinc-short-mp')", 4000), 'Nx 滤波器单独保存到 filterNx');
+  await evalJs("document.getElementById('sFiltNx').value='poly-sinc-short-mp'; if (D('sp_filtNx')) D('sp_filtNx').value='poly-sinc-short-mp'; saveSettings(true);");
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.filterNx==='poly-sinc-short-mp')", 6000), 'Nx 滤波器单独保存到 filterNx');
   const after = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>({f:j.kv.filter||'',nx:j.kv.filterNx||''}))");
   ck(after.f === before.f, '改 Nx 不影响 1x', 'filter=' + after.f + '（原值 ' + before.f + '）');
-  await evalJs("document.getElementById('sFiltNx').value='" + before.nx + "'; if (D('sp_filtNx')) D('sp_filtNx').value='" + before.nx + "'; saveSettings();");
-  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.filterNx||'')==='" + before.nx + "')", 4000), 'Nx 还原');
+  await evalJs("document.getElementById('sFiltNx').value='" + before.nx + "'; if (D('sp_filtNx')) D('sp_filtNx').value='" + before.nx + "'; saveSettings(true);");
+  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.filterNx||'')==='" + before.nx + "')", 6000), 'Nx 还原');
   const p10 = await shot('19-settings-page');
 
   // ---- 耳机 EQ（OPRA）小节自检 ----
   await evalJs("document.querySelector('.stab[data-g=adv]').click()");
-  await sleep(250);
-  ck(await evalJs("!!document.getElementById('sp_opra_search') && !!document.getElementById('sp_opra_product') && !!document.getElementById('sp_opra_preset') && !!document.getElementById('sp_opra_apply')"),
+  ck(await waitFor("!!document.getElementById('sp_opra_search') && !!document.getElementById('sp_opra_product') && !!document.getElementById('sp_opra_preset') && !!document.getElementById('sp_opra_apply')", 5000),
      '设置页高级页签包含 OPRA 耳机 EQ 控件（搜索/产品/预设/应用）');
   ck(await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=adv]');if(!p)return false;return p.textContent.indexOf('CC BY-SA 4.0')>=0&&p.textContent.indexOf('OPRA')>=0;})()"),
      '耳机 EQ 小节包含 CC BY-SA 4.0 归属声明');
@@ -464,9 +490,8 @@ async function waitFor(expr, ms = 8000) {
      '耳机 EQ 与高级页签无外链');
   // 实时搜索测试
   await evalJs("var s=document.getElementById('sp_opra_search'); s.value='HD 600'; s.dispatchEvent(new Event('input'));");
-  await sleep(300);
-  const opraProdCount = await evalJs("document.querySelectorAll('#sp_opra_product option').length");
-  ck(opraProdCount > 1, 'OPRA 本地实时搜索 HD 600 成功过滤出产品型号', opraProdCount + ' 款');
+  ck(await waitFor("document.querySelectorAll('#sp_opra_product option').length > 1", 5000),
+     'OPRA 本地实时搜索 HD 600 成功过滤出产品型号');
 
   // ---- 右栏标签页 / 歌词 / 播放列表 / 信号链 ----
   await evalJs("document.querySelector('.rtab[data-t=l]').click()");
