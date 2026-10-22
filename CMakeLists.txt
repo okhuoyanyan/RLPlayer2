@@ -468,3 +468,9 @@ target_include_directories(test_cast_service PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_cast_service PRIVATE rtadsp winhttp ws2_32)
 add_test(NAME cast_service COMMAND test_cast_service)
 
+# ---------------- 解码免临时 WAV（流式读 ffmpeg 输出，ROADMAP P6b） ----------------
+add_executable(test_stream_decode tests/test_stream_decode.cpp)
+target_include_directories(test_stream_decode PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_stream_decode PRIVATE rtadsp)
+add_test(NAME stream_decode COMMAND test_stream_decode)
+
