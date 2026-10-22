@@ -1,13 +1,15 @@
 // discogs.h — P3 资料层④b：Discogs L4 古典作品版本推荐（header-only，禁止 windows.h）
 //
 // 对应 docs/P3-资料层接口契约.md §4 与任务书要求：
-//   * 匿名 API 实测可用：GET https://api.discogs.com/database/search?q=...&type=master|release
+//   * 匿名 API 实测可用：GET https://api.discogs.com/database/search?q=...&type=release|master
 //   * 匿名限频约 25 req/min，内置令牌桶限流与 HTTP 429 熔断
 //   * UA 明确 "RLPlayer/1.0.10 (metadata; contact: local)"
-//   * 搜索流程：search master/release -> (master 则 /masters/{id}/versions) -> 产出 performances[]
-//   * 字段提取：id/title/performers/conductor/orchestra/year/label/format/country/url/source/fetched_at
-//   * 缓存：<metabase>/entities/<id>/versions.json，TTL 7 天；原子写 tmp+rename；离线回退
-//   * complete 判定：performances.size() >= 5 且每条都有有效 url
+//   * 详情解析：GET https://api.discogs.com/releases/{id} 提取 credits:
+//     conductor、orchestra/ensemble、soloist[]、composer、year、label、country、format
+//   * 演绎去重：dedupKey 规范化（conductor+ensemble+soloists）；非空按 dedupKey 去重（最早 year 为主，otherEditions 折叠计数）；
+//     dedupKey 空时不猜，标记 dedupUnknown: true；
+//   * complete 升级判定：去重后 distinct 演绎数 >= 5 且每条都有有效 url
+//   * 缓存：<metabase>/entities/<id>/versions.json 向后兼容；release 详情缓存 7 天
 //
 // 平台边界：
 //   * 禁止 include windows.h / winsock2.h / winhttp.h 等系统头
@@ -47,7 +49,10 @@ struct DiscogsPerformance {
     std::string title;
     std::string performers;
     std::string conductor;
-    std::string orchestra;
+    std::string ensemble;
+    std::string orchestra;     // 兼容旧字段，与 ensemble 保持同步
+    std::vector<std::string> soloists;
+    std::string composer;
     int year = 0;
     std::string label;
     std::string format;
@@ -55,6 +60,10 @@ struct DiscogsPerformance {
     std::string url;            // "https://www.discogs.com/release/..."
     std::string source = "discogs";
     long long fetched_at = 0;
+    bool detailFetched = false;
+    std::string dedupKey;
+    int otherEditions = 0;
+    bool dedupUnknown = false;
 };
 
 struct WorkVersionsResult {
@@ -64,8 +73,10 @@ struct WorkVersionsResult {
         std::string title;
         std::string composer;
     } work;
+    int releaseCount = 0;       // 发行版本总数（去重前）
+    int distinctCount = 0;      // 不同演绎数（去重后）
     std::vector<DiscogsPerformance> performances;
-    bool complete = false;      // performances.size() >= 5 且每条都有有效 url
+    bool complete = false;      // 去重后 distinct 演绎数 >= 5 且每条都有有效 url
     std::vector<std::string> errors;
     long long generated_at = 0;
     long long expires_at = 0;
@@ -78,6 +89,22 @@ struct DiscogsOptions {
     bool refresh = false;
     bool offline = false;
     int timeout_ms = 15000;
+    int max_releases = 12;      // 抓取 release 详情的上限条数（默认 12）
+};
+
+struct DiscogsReleaseDetail {
+    int64_t id = 0;
+    std::string title;
+    std::string composer;
+    std::string conductor;
+    std::string ensemble;
+    std::vector<std::string> soloists;
+    int year = 0;
+    std::string label;
+    std::string format;
+    std::string country;
+    std::string url;
+    long long fetched_at = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -198,7 +225,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// 纯函数辅助：URL 编码、文本清洗与古典标题解析
+// 纯函数辅助：URL 编码、文本清洗、规范化与古典标题解析
 // ---------------------------------------------------------------------------
 
 inline std::string discogs_url_encode(const std::string& val) {
@@ -252,7 +279,7 @@ inline bool is_likely_orchestra(const std::string& name) {
     for (const char* kw : { "orchestra", "philharmonic", "philharmoniker", "orkest",
                             "symphon", "staatskapelle", "ensemble", "kammerorchester",
                             "chamber", "academy of", "sinfonieorchester", "sinfonica",
-                            "baroque", "consort", "collegium" }) {
+                            "baroque", "consort", "collegium", "chorus", "choir" }) {
         if (lower.find(kw) != std::string::npos) return true;
     }
     return false;
@@ -350,6 +377,197 @@ inline void parse_classical_title(const std::string& rawTitle,
     if (performers_out.empty()) {
         performers_out = clean_discogs_artist(artistPart);
     }
+}
+
+// 规范化演绎 Token：转小写、折叠拉丁重音变体、去消歧义后缀、标点收敛为空格
+inline std::string normalize_dedup_token(const std::string& raw) {
+    std::string s = clean_discogs_artist(raw);
+    std::string out;
+    out.reserve(s.size());
+
+    for (size_t i = 0; i < s.size(); ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) {
+            if (c >= 'A' && c <= 'Z') {
+                out.push_back((char)(c - 'A' + 'a'));
+            } else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+                out.push_back((char)c);
+            } else if (c == ' ' || c == '	') {
+                if (!out.empty() && out.back() != ' ') out.push_back(' ');
+            } else {
+                // 标点转为空格
+                if (!out.empty() && out.back() != ' ') out.push_back(' ');
+            }
+        } else if (c == 0xC3 && i + 1 < s.size()) {
+            // Latin-1 Supplement (0xC3 0x80-0xBF)
+            unsigned char c2 = (unsigned char)s[++i];
+            if ((c2 >= 0x80 && c2 <= 0x85) || (c2 >= 0xA0 && c2 <= 0xA5)) {
+                out.push_back('a');
+            } else if (c2 == 0x87 || c2 == 0xA7) {
+                out.push_back('c');
+            } else if ((c2 >= 0x88 && c2 <= 0x8B) || (c2 >= 0xA8 && c2 <= 0xAB)) {
+                out.push_back('e');
+            } else if ((c2 >= 0x8C && c2 <= 0x8F) || (c2 >= 0xAC && c2 <= 0xAF)) {
+                out.push_back('i');
+            } else if (c2 == 0x91 || c2 == 0xB1) {
+                out.push_back('n');
+            } else if ((c2 >= 0x92 && c2 <= 0x96) || c2 == 0x98 ||
+                       (c2 >= 0xB2 && c2 <= 0xB6) || c2 == 0xB8) {
+                out.push_back('o');
+            } else if ((c2 >= 0x99 && c2 <= 0x9C) || (c2 >= 0xB9 && c2 <= 0xBC)) {
+                out.push_back('u');
+            } else if (c2 == 0x9D || c2 == 0xBD || c2 == 0xBF) {
+                out.push_back('y');
+            } else {
+                if (!out.empty() && out.back() != ' ') out.push_back(' ');
+            }
+        } else if (c == 0xC4 && i + 1 < s.size()) {
+            unsigned char c2 = (unsigned char)s[++i];
+            if (c2 == 0x8C || c2 == 0x8D || c2 == 0x86 || c2 == 0x87) out.push_back('c');
+            else if (!out.empty() && out.back() != ' ') out.push_back(' ');
+        } else if (c == 0xC5 && i + 1 < s.size()) {
+            unsigned char c2 = (unsigned char)s[++i];
+            if (c2 == 0xA0 || c2 == 0xA1) out.push_back('s');
+            else if (c2 == 0xBD || c2 == 0xBE) out.push_back('z');
+            else if (!out.empty() && out.back() != ' ') out.push_back(' ');
+        } else {
+            // 跳过多字节尾字节
+            while (i + 1 < s.size() && ((unsigned char)s[i + 1] & 0xC0) == 0x80) {
+                ++i;
+            }
+        }
+    }
+
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    while (!out.empty() && out.front() == ' ') out.erase(out.begin());
+    return out;
+}
+
+// 组合 dedupKey：由 conductor + ensemble + soloists 规范化组成；全空则返回空串
+inline std::string build_dedup_key(const std::string& conductor,
+                                   const std::string& ensemble,
+                                   const std::vector<std::string>& soloists) {
+    const std::string c = normalize_dedup_token(conductor);
+    const std::string e = normalize_dedup_token(ensemble);
+    std::vector<std::string> sList;
+    for (const auto& s : soloists) {
+        std::string ns = normalize_dedup_token(s);
+        if (!ns.empty()) sList.push_back(ns);
+    }
+    std::sort(sList.begin(), sList.end());
+    sList.erase(std::unique(sList.begin(), sList.end()), sList.end());
+
+    std::string sJoined;
+    for (size_t i = 0; i < sList.size(); ++i) {
+        if (i) sJoined += "+";
+        sJoined += sList[i];
+    }
+
+    // 若指挥、乐团与独奏均缺失，返回空串
+    if (c.empty() && e.empty() && sJoined.empty()) {
+        return "";
+    }
+    return c + "|" + e + "|" + sJoined;
+}
+
+// 格式化可读的演出人员字符串
+inline std::string format_performers_string(const std::string& conductor,
+                                            const std::string& ensemble,
+                                            const std::vector<std::string>& soloists,
+                                            const std::string& fallback) {
+    std::ostringstream oss;
+    if (!soloists.empty()) {
+        for (size_t i = 0; i < soloists.size(); ++i) {
+            if (i) oss << ", ";
+            oss << soloists[i];
+        }
+    }
+    if (!conductor.empty()) {
+        if (oss.tellp() > 0) oss << ", ";
+        oss << conductor;
+    }
+    if (!ensemble.empty()) {
+        if (oss.tellp() > 0) oss << ", ";
+        oss << ensemble;
+    }
+    std::string res = oss.str();
+    return !res.empty() ? res : fallback;
+}
+
+// 按演绎去重核心纯函数
+//   * dedupKey 非空：按 dedupKey 归组，保留最早 year 的记录为主条目，其余折叠计数 otherEditions
+//   * dedupKey 为空：不臆造合并，保留并标记 dedupUnknown: true
+inline std::vector<DiscogsPerformance> deduplicate_performances(
+    const std::vector<DiscogsPerformance>& rawList,
+    int& releaseCount_out,
+    int& distinctCount_out) {
+
+    releaseCount_out = (int)rawList.size();
+
+    std::vector<std::pair<std::string, std::vector<size_t>>> groups;
+    std::map<std::string, size_t> keyToGroupIdx;
+    std::vector<size_t> unknownIndices;
+
+    for (size_t i = 0; i < rawList.size(); ++i) {
+        const auto& p = rawList[i];
+        if (p.dedupKey.empty()) {
+            unknownIndices.push_back(i);
+        } else {
+            auto it = keyToGroupIdx.find(p.dedupKey);
+            if (it == keyToGroupIdx.end()) {
+                keyToGroupIdx[p.dedupKey] = groups.size();
+                groups.push_back({p.dedupKey, {i}});
+            } else {
+                groups[it->second].second.push_back(i);
+            }
+        }
+    }
+
+    std::vector<DiscogsPerformance> result;
+    result.reserve(groups.size() + unknownIndices.size());
+
+    // 1. 已知演绎组：挑出最早年份的那条
+    for (const auto& grp : groups) {
+        const auto& indices = grp.second;
+        size_t bestIdx = indices[0];
+        int bestYear = rawList[bestIdx].year;
+
+        for (size_t k = 1; k < indices.size(); ++k) {
+            size_t idx = indices[k];
+            int y = rawList[idx].year;
+            if (bestYear <= 0 && y > 0) {
+                bestIdx = idx;
+                bestYear = y;
+            } else if (bestYear > 0 && y > 0 && y < bestYear) {
+                bestIdx = idx;
+                bestYear = y;
+            }
+        }
+
+        DiscogsPerformance primary = rawList[bestIdx];
+        primary.otherEditions = (int)indices.size() - 1;
+        primary.dedupUnknown = false;
+        result.push_back(std::move(primary));
+    }
+
+    // 2. 未明演绎项：不臆造，独立保留
+    for (size_t idx : unknownIndices) {
+        DiscogsPerformance item = rawList[idx];
+        item.otherEditions = 0;
+        item.dedupUnknown = true;
+        result.push_back(std::move(item));
+    }
+
+    // 3. 排序：已知年份升序，年份未知置后
+    std::stable_sort(result.begin(), result.end(), [](const DiscogsPerformance& a, const DiscogsPerformance& b) {
+        if (a.year > 0 && b.year > 0) return a.year < b.year;
+        if (a.year > 0 && b.year <= 0) return true;
+        if (a.year <= 0 && b.year > 0) return false;
+        return false;
+    });
+
+    distinctCount_out = (int)result.size();
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +695,240 @@ inline bool parse_discogs_versions_json(const std::string& text,
     return true;
 }
 
+// 解析 GET /releases/{id} 详情及 credits
+inline bool parse_discogs_release_json(const std::string& text,
+                                       DiscogsReleaseDetail& det_out,
+                                       std::string* err_out = nullptr) {
+    const rta::net::Json j = rta::net::json_parse(text);
+    if (j.type != rta::net::Json::Obj) {
+        if (err_out) *err_out = "release json 不是合法对象";
+        return false;
+    }
+    if (j.has("message")) {
+        if (err_out) *err_out = "Discogs API 错误: " + j["message"].s();
+        return false;
+    }
+
+    det_out.id = (int64_t)j["id"].n();
+    det_out.title = j["title"].s();
+
+    // 年份提取
+    if (j["year"].n() > 0) {
+        det_out.year = (int)j["year"].n();
+    } else if (j.has("released")) {
+        std::string rs = j["released"].s();
+        if (rs.size() >= 4) det_out.year = std::atoi(rs.substr(0, 4).c_str());
+    }
+
+    // 国家
+    det_out.country = j["country"].s();
+
+    // 厂牌
+    if (j["labels"].type == rta::net::Json::Arr && j["labels"].size() > 0) {
+        const auto& l0 = j["labels"].at(0);
+        if (l0.type == rta::net::Json::Obj) det_out.label = l0["name"].s();
+        else if (l0.type == rta::net::Json::Str) det_out.label = l0.s();
+    } else if (j["label"].type == rta::net::Json::Str) {
+        det_out.label = j["label"].s();
+    }
+
+    // 格式
+    if (j["formats"].type == rta::net::Json::Arr && j["formats"].size() > 0) {
+        const auto& f0 = j["formats"].at(0);
+        if (f0.type == rta::net::Json::Obj) {
+            std::string fname = f0["name"].s();
+            std::string fdesc;
+            if (f0["descriptions"].type == rta::net::Json::Arr) {
+                for (size_t d = 0; d < f0["descriptions"].size(); ++d) {
+                    if (!fdesc.empty()) fdesc += ", ";
+                    fdesc += f0["descriptions"].at(d).s();
+                }
+            }
+            if (!fname.empty() && !fdesc.empty()) det_out.format = fname + ", " + fdesc;
+            else if (!fname.empty()) det_out.format = fname;
+            else det_out.format = fdesc;
+        } else if (f0.type == rta::net::Json::Str) {
+            det_out.format = f0.s();
+        }
+    } else if (j["format"].type == rta::net::Json::Str) {
+        det_out.format = j["format"].s();
+    }
+
+    // URL
+    if (j.has("uri")) {
+        std::string u = j["uri"].s();
+        if (u.rfind("http", 0) == 0) det_out.url = u;
+        else if (!u.empty() && u.front() == '/') det_out.url = "https://www.discogs.com" + u;
+    }
+    if (det_out.url.empty() && det_out.id > 0) {
+        det_out.url = "https://www.discogs.com/release/" + std::to_string(det_out.id);
+    }
+
+    // 直接键提取（支持 fixture 与简化 mock）
+    if (j.has("conductor")) det_out.conductor = clean_discogs_artist(j["conductor"].s());
+    if (j.has("ensemble")) det_out.ensemble = clean_discogs_artist(j["ensemble"].s());
+    else if (j.has("orchestra")) det_out.ensemble = clean_discogs_artist(j["orchestra"].s());
+    if (j.has("composer")) det_out.composer = clean_discogs_artist(j["composer"].s());
+    if (j.has("soloists") && j["soloists"].type == rta::net::Json::Arr) {
+        for (size_t i = 0; i < j["soloists"].size(); ++i) {
+            std::string s = clean_discogs_artist(j["soloists"].at(i).s());
+            if (!s.empty()) det_out.soloists.push_back(s);
+        }
+    } else if (j.has("soloist") && j["soloist"].type == rta::net::Json::Str) {
+        std::string s = clean_discogs_artist(j["soloist"].s());
+        if (!s.empty()) det_out.soloists.push_back(s);
+    }
+
+    // credits 条目处理闭包
+    auto process_artist_entry = [&](const rta::net::Json& a) {
+        if (a.type != rta::net::Json::Obj) return;
+        std::string rawName = a["name"].s();
+        std::string name = clean_discogs_artist(rawName);
+        if (name.empty()) return;
+
+        std::string role = a["role"].s();
+        std::string roleLower = role;
+        for (char& ch : roleLower) if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+
+        // 排除制作/技术角色
+        for (const char* prodKw : {
+            "mastered", "producer", "engineer", "recorded by", "mixed by", "artwork",
+            "design", "photography", "liner notes", "lacquer", "management", "layout",
+            "illustration", "typography", "published by", "manufactured by", "distributed by",
+            "legal", "score", "libretto", "text by", "lyrics by", "reissue", "compiled by",
+            "direct metal mastering" }) {
+            if (roleLower.find(prodKw) != std::string::npos) return;
+        }
+
+        // 作曲家识别
+        if (roleLower.find("composed by") != std::string::npos ||
+            roleLower.find("composer") != std::string::npos ||
+            roleLower.find("music by") != std::string::npos ||
+            roleLower.find("written-by") != std::string::npos ||
+            roleLower.find("written by") != std::string::npos) {
+            if (det_out.composer.empty()) det_out.composer = name;
+            return;
+        }
+
+        // 指挥识别
+        if (roleLower.find("conductor") != std::string::npos ||
+            roleLower.find("conducted by") != std::string::npos ||
+            roleLower.find("dirigent") != std::string::npos ||
+            roleLower.find("direction") != std::string::npos ||
+            roleLower.find("chorus master") != std::string::npos) {
+            if (det_out.conductor.empty()) det_out.conductor = name;
+            return;
+        }
+
+        // 乐团/合奏识别
+        if (roleLower.find("orchestra") != std::string::npos ||
+            roleLower.find("ensemble") != std::string::npos ||
+            roleLower.find("philharmonic") != std::string::npos ||
+            roleLower.find("philharmoniker") != std::string::npos ||
+            roleLower.find("symphony") != std::string::npos ||
+            roleLower.find("sinfonieorchester") != std::string::npos ||
+            roleLower.find("staatskapelle") != std::string::npos ||
+            roleLower.find("orkest") != std::string::npos ||
+            roleLower.find("kammerorchester") != std::string::npos ||
+            roleLower.find("chorus") != std::string::npos ||
+            roleLower.find("choir") != std::string::npos ||
+            roleLower.find("consort") != std::string::npos ||
+            roleLower.find("collegium") != std::string::npos ||
+            roleLower.find("baroque") != std::string::npos ||
+            roleLower.find("quartet") != std::string::npos ||
+            is_likely_orchestra(name)) {
+            if (det_out.ensemble.empty()) det_out.ensemble = name;
+            return;
+        }
+
+        // 独奏识别
+        if (roleLower.find("soloist") != std::string::npos ||
+            roleLower.find("solo") != std::string::npos) {
+            if (std::find(det_out.soloists.begin(), det_out.soloists.end(), name) == det_out.soloists.end()) {
+                det_out.soloists.push_back(name);
+            }
+            return;
+        }
+
+        // 独奏乐器/人声声部识别
+        for (const char* instKw : {
+            "piano", "violin", "cello", "violoncello", "viola", "flute", "oboe",
+            "clarinet", "bassoon", "trumpet", "horn", "trombone", "tuba", "harp",
+            "harpsichord", "organ", "guitar", "lute", "soprano", "tenor", "baritone",
+            "contralto", "vocals" }) {
+            if (roleLower.find(instKw) != std::string::npos) {
+                if (std::find(det_out.soloists.begin(), det_out.soloists.end(), name) == det_out.soloists.end()) {
+                    det_out.soloists.push_back(name);
+                }
+                return;
+            }
+        }
+    };
+
+    // 1. 处理 extraartists
+    if (j.has("extraartists") && j["extraartists"].type == rta::net::Json::Arr) {
+        for (size_t i = 0; i < j["extraartists"].size(); ++i) {
+            process_artist_entry(j["extraartists"].at(i));
+        }
+    }
+
+    // 2. 处理 artists (若 conductor 或 ensemble 仍空)
+    if (j.has("artists") && j["artists"].type == rta::net::Json::Arr) {
+        for (size_t i = 0; i < j["artists"].size(); ++i) {
+            const auto& a = j["artists"].at(i);
+            std::string rawName = a["name"].s();
+            std::string name = clean_discogs_artist(rawName);
+            if (name.empty()) continue;
+            std::string role = a["role"].s();
+            if (!role.empty()) {
+                process_artist_entry(a);
+            } else {
+                if (det_out.ensemble.empty() && is_likely_orchestra(name)) {
+                    det_out.ensemble = name;
+                } else if (det_out.conductor.empty() && is_likely_conductor(name)) {
+                    det_out.conductor = name;
+                }
+            }
+        }
+    }
+
+    // 3. 处理 tracklist 中的 extraartists / artists
+    if (j.has("tracklist") && j["tracklist"].type == rta::net::Json::Arr) {
+        for (size_t i = 0; i < j["tracklist"].size(); ++i) {
+            const auto& tr = j["tracklist"].at(i);
+            if (tr.type != rta::net::Json::Obj) continue;
+            if (tr.has("extraartists") && tr["extraartists"].type == rta::net::Json::Arr) {
+                for (size_t k = 0; k < tr["extraartists"].size(); ++k) {
+                    process_artist_entry(tr["extraartists"].at(k));
+                }
+            }
+            if (tr.has("artists") && tr["artists"].type == rta::net::Json::Arr) {
+                for (size_t k = 0; k < tr["artists"].size(); ++k) {
+                    const auto& a = tr["artists"].at(k);
+                    std::string name = clean_discogs_artist(a["name"].s());
+                    if (det_out.ensemble.empty() && is_likely_orchestra(name)) {
+                        det_out.ensemble = name;
+                    } else if (det_out.conductor.empty() && is_likely_conductor(name)) {
+                        det_out.conductor = name;
+                    } else {
+                        process_artist_entry(a);
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. 仍缺失时使用标题解析兜底
+    if (det_out.conductor.empty() || det_out.ensemble.empty()) {
+        std::string p, c, o, wt;
+        parse_classical_title(det_out.title, det_out.composer, p, c, o, wt);
+        if (det_out.conductor.empty() && !c.empty()) det_out.conductor = c;
+        if (det_out.ensemble.empty() && !o.empty()) det_out.ensemble = o;
+    }
+
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // 缓存与 JSON 序列化
 // ---------------------------------------------------------------------------
@@ -489,6 +941,14 @@ inline fsx::path versions_cache_path(const std::string& baseDir, const std::stri
     return p;
 }
 
+inline fsx::path release_detail_cache_path(const std::string& baseDir, int64_t release_id) {
+    fsx::path p = baseDir.empty() ? meta_path_of("rlplayer-meta") : meta_path_of(baseDir);
+    p /= "discogs";
+    p /= "releases";
+    p /= (std::to_string(release_id) + ".json");
+    return p;
+}
+
 inline std::string work_versions_to_json(const WorkVersionsResult& r) {
     std::ostringstream o;
     o << "{\n"
@@ -498,6 +958,10 @@ inline std::string work_versions_to_json(const WorkVersionsResult& r) {
       << "    \"title\": \"" << meta_jesc(r.work.title) << "\",\n"
       << "    \"composer\": \"" << meta_jesc(r.work.composer) << "\"\n"
       << "  },\n"
+      << "  \"releaseCount\": " << r.releaseCount << ",\n"
+      << "  \"distinctCount\": " << r.distinctCount << ",\n"
+      << "  \"release_count\": " << r.releaseCount << ",\n"
+      << "  \"distinct_count\": " << r.distinctCount << ",\n"
       << "  \"performances\": [\n";
     for (size_t i = 0; i < r.performances.size(); ++i) {
         const auto& p = r.performances[i];
@@ -506,14 +970,26 @@ inline std::string work_versions_to_json(const WorkVersionsResult& r) {
           << "      \"title\": \"" << meta_jesc(p.title) << "\",\n"
           << "      \"performers\": \"" << meta_jesc(p.performers) << "\",\n"
           << "      \"conductor\": \"" << meta_jesc(p.conductor) << "\",\n"
-          << "      \"orchestra\": \"" << meta_jesc(p.orchestra) << "\",\n"
+          << "      \"ensemble\": \"" << meta_jesc(p.ensemble) << "\",\n"
+          << "      \"orchestra\": \"" << meta_jesc(!p.orchestra.empty() ? p.orchestra : p.ensemble) << "\",\n"
+          << "      \"composer\": \"" << meta_jesc(p.composer) << "\",\n"
+          << "      \"soloists\": [";
+        for (size_t k = 0; k < p.soloists.size(); ++k) {
+            if (k) o << ", ";
+            o << "\"" << meta_jesc(p.soloists[k]) << "\"";
+        }
+        o << "],\n"
           << "      \"year\": " << p.year << ",\n"
           << "      \"label\": \"" << meta_jesc(p.label) << "\",\n"
           << "      \"format\": \"" << meta_jesc(p.format) << "\",\n"
           << "      \"country\": \"" << meta_jesc(p.country) << "\",\n"
           << "      \"url\": \"" << meta_jesc(p.url) << "\",\n"
           << "      \"source\": \"" << meta_jesc(p.source) << "\",\n"
-          << "      \"fetched_at\": " << p.fetched_at << "\n"
+          << "      \"fetched_at\": " << p.fetched_at << ",\n"
+          << "      \"detailFetched\": " << (p.detailFetched ? "true" : "false") << ",\n"
+          << "      \"dedupKey\": \"" << meta_jesc(p.dedupKey) << "\",\n"
+          << "      \"otherEditions\": " << p.otherEditions << ",\n"
+          << "      \"dedupUnknown\": " << (p.dedupUnknown ? "true" : "false") << "\n"
           << "    }" << (i + 1 < r.performances.size() ? ",\n" : "\n");
     }
     o << "  ],\n"
@@ -546,6 +1022,11 @@ inline bool work_versions_from_json(const std::string& text,
         r_out.work.title = j["work"]["title"].s();
         r_out.work.composer = j["work"]["composer"].s();
     }
+    if (j.has("releaseCount")) r_out.releaseCount = (int)j["releaseCount"].n();
+    else if (j.has("release_count")) r_out.releaseCount = (int)j["release_count"].n();
+    if (j.has("distinctCount")) r_out.distinctCount = (int)j["distinctCount"].n();
+    else if (j.has("distinct_count")) r_out.distinctCount = (int)j["distinct_count"].n();
+
     r_out.complete = j.has("complete") ? j["complete"].b : false;
     r_out.generated_at = (long long)j["generated_at"].n();
     r_out.expires_at = (long long)j["expires_at"].n();
@@ -566,7 +1047,18 @@ inline bool work_versions_from_json(const std::string& text,
             p.title = item["title"].s();
             p.performers = item["performers"].s();
             p.conductor = item["conductor"].s();
-            p.orchestra = item["orchestra"].s();
+            if (item.has("ensemble")) p.ensemble = item["ensemble"].s();
+            if (item.has("orchestra")) p.orchestra = item["orchestra"].s();
+            if (p.orchestra.empty()) p.orchestra = p.ensemble;
+            if (p.ensemble.empty()) p.ensemble = p.orchestra;
+
+            p.soloists.clear();
+            if (item.has("soloists") && item["soloists"].type == rta::net::Json::Arr) {
+                for (size_t k = 0; k < item["soloists"].size(); ++k) {
+                    p.soloists.push_back(item["soloists"].at(k).s());
+                }
+            }
+            if (item.has("composer")) p.composer = item["composer"].s();
             p.year = (int)item["year"].n();
             p.label = item["label"].s();
             p.format = item["format"].s();
@@ -575,8 +1067,22 @@ inline bool work_versions_from_json(const std::string& text,
             p.source = item["source"].s();
             if (p.source.empty()) p.source = "discogs";
             p.fetched_at = (long long)item["fetched_at"].n();
+
+            p.detailFetched = item.has("detailFetched") ? item["detailFetched"].b : false;
+            p.dedupKey = item.has("dedupKey") ? item["dedupKey"].s() : "";
+            p.otherEditions = item.has("otherEditions") ? (int)item["otherEditions"].n() : 0;
+            p.dedupUnknown = item.has("dedupUnknown") ? item["dedupUnknown"].b : (p.dedupKey.empty());
+
             r_out.performances.push_back(std::move(p));
         }
+    }
+    if (r_out.distinctCount == 0 && !r_out.performances.empty()) {
+        r_out.distinctCount = (int)r_out.performances.size();
+    }
+    if (r_out.releaseCount == 0 && !r_out.performances.empty()) {
+        int totalRel = 0;
+        for (const auto& p : r_out.performances) totalRel += (1 + p.otherEditions);
+        r_out.releaseCount = totalRel;
     }
     r_out.errors.clear();
     if (j.has("errors") && j["errors"].type == rta::net::Json::Arr) {
@@ -620,6 +1126,48 @@ inline bool versions_is_expired(const WorkVersionsResult& r, long long now_sec =
     return now_sec >= exp;
 }
 
+inline bool release_detail_load_cache(const std::string& baseDir,
+                                      int64_t release_id,
+                                      std::string& json_out,
+                                      long long now_sec = 0) {
+    if (release_id <= 0) return false;
+    const fsx::path p = release_detail_cache_path(baseDir, release_id);
+    std::string text;
+    if (!entity_read_file(p, text)) return false;
+    if (now_sec <= 0) now_sec = (long long)std::time(nullptr);
+
+    // 检查缓存内记录的过期时间
+    const rta::net::Json j = rta::net::json_parse(text);
+    if (j.type == rta::net::Json::Obj && j.has("_expires_at")) {
+        long long exp = (long long)j["_expires_at"].n();
+        if (exp > 0 && now_sec >= exp) {
+            return false; // 已过期
+        }
+    }
+    json_out = std::move(text);
+    return true;
+}
+
+inline bool release_detail_save_cache(const std::string& baseDir,
+                                      int64_t release_id,
+                                      const std::string& json_str) {
+    if (release_id <= 0 || json_str.empty()) return false;
+    const fsx::path p = release_detail_cache_path(baseDir, release_id);
+
+    // 注入 TTL 字段 (_cached_at, _expires_at 7天)
+    const long long now_sec = (long long)std::time(nullptr);
+    const long long exp_sec = now_sec + 7 * 86400;
+
+        std::string toWrite = json_str;
+    size_t firstBrace = toWrite.find('{');
+    if (firstBrace != std::string::npos) {
+        std::string inject = "{\n  \"_cached_at\": " + std::to_string(now_sec) +
+                             ",\n  \"_expires_at\": " + std::to_string(exp_sec) + ",\n";
+        toWrite.replace(firstBrace, 1, inject);
+    }
+    return entity_write_atomic(p, toWrite);
+}
+
 // ---------------------------------------------------------------------------
 // 核心接口：discogs_versions
 // ---------------------------------------------------------------------------
@@ -643,12 +1191,12 @@ inline WorkVersionsResult discogs_versions(const std::string& workTitle,
     res.work.id = eid;
 
     const std::string baseDir = !opts.metabase.empty() ? opts.metabase : EntityStore::instance().baseDir();
+    const long long now_sec = (long long)std::time(nullptr);
 
     // 1. 检查缓存
     WorkVersionsResult cached;
     std::string cache_err;
     const bool have_cache = versions_load_cache(baseDir, eid, cached, &cache_err);
-    const long long now_sec = (long long)std::time(nullptr);
     const bool cache_unexpired = have_cache && cached.ok && !versions_is_expired(cached, now_sec);
 
     if (opts.offline) {
@@ -663,7 +1211,19 @@ inline WorkVersionsResult discogs_versions(const std::string& workTitle,
         return res;
     }
 
-    if (!opts.refresh && cache_unexpired) {
+    // 检查缓存中的演绎详情是否完整（旧缓存缺 detailFetched 或为 false 视为未取详情，可刷新）
+    bool cachedDetailsComplete = false;
+    if (have_cache && cached.ok && !cached.performances.empty()) {
+        cachedDetailsComplete = true;
+        for (const auto& cp : cached.performances) {
+            if (!cp.detailFetched) {
+                cachedDetailsComplete = false;
+                break;
+            }
+        }
+    }
+
+    if (!opts.refresh && cache_unexpired && cachedDetailsComplete) {
         cached.from_cache = true;
         cached.offline = false;
         return cached;
@@ -695,23 +1255,23 @@ inline WorkVersionsResult discogs_versions(const std::string& workTitle,
         return res;
     }
 
-    // 3. 执行搜索 (search master/release)
+    // 3. 执行搜索 (优先 type=release 检索独立发行版)
     const std::vector<std::string> reqHeaders = {
         "User-Agent: RLPlayer/1.0.10 (metadata; contact: local)",
         "Accept: application/json"
     };
 
-    // 优先用 release_title + artist 搜索，更精准
+    const int targetFetchCount = opts.max_releases > 0 ? opts.max_releases : 12;
     std::string searchUrl;
     if (!composer.empty()) {
         searchUrl = "https://api.discogs.com/database/search?release_title=" +
                     discogs_url_encode(workTitle) +
                     "&artist=" + discogs_url_encode(composer) +
-                    "&type=master&per_page=5";
+                    "&type=release&per_page=" + std::to_string(targetFetchCount + 3);
     } else {
         searchUrl = "https://api.discogs.com/database/search?q=" +
                     discogs_url_encode(workTitle) +
-                    "&type=master&per_page=5";
+                    "&type=release&per_page=" + std::to_string(targetFetchCount + 3);
     }
 
     auto httpResp = rta::net::http_get(searchUrl, reqHeaders, opts.timeout_ms);
@@ -733,17 +1293,33 @@ inline WorkVersionsResult discogs_versions(const std::string& workTitle,
     const std::string respBody(httpResp.body.begin(), httpResp.body.end());
     parse_discogs_search_json(respBody, searchHits, &parseErr);
 
-    // 如果精准搜索为空且存在 composer，退化至全文字词搜索 q=<composer> <workTitle>
+    // 回退一：若精准搜索为空且存在 composer，退化至全文字词搜索 q=<composer> <workTitle>&type=release
     if (searchHits.empty() && !composer.empty()) {
         std::string fallbackUrl = "https://api.discogs.com/database/search?q=" +
                                   discogs_url_encode(composer + " " + workTitle) +
-                                  "&type=master&per_page=5";
+                                  "&type=release&per_page=" + std::to_string(targetFetchCount + 3);
         if (limiter.acquire(opts.timeout_ms)) {
             auto fbResp = rta::net::http_get(fallbackUrl, reqHeaders, opts.timeout_ms);
             if (fbResp.status == 429) {
                 limiter.trip_circuit(60);
             } else if (fbResp.ok) {
                 const std::string fbBody(fbResp.body.begin(), fbResp.body.end());
+                parse_discogs_search_json(fbBody, searchHits);
+            }
+        }
+    }
+
+    // 回退二：若仍无结果，尝试不限定 type（可能命中 master 或 fixture）
+    if (searchHits.empty()) {
+        std::string fallbackUrl2 = "https://api.discogs.com/database/search?q=" +
+                                   discogs_url_encode(workTitle) +
+                                   "&per_page=" + std::to_string(targetFetchCount + 3);
+        if (limiter.acquire(opts.timeout_ms)) {
+            auto fbResp2 = rta::net::http_get(fallbackUrl2, reqHeaders, opts.timeout_ms);
+            if (fbResp2.status == 429) {
+                limiter.trip_circuit(60);
+            } else if (fbResp2.ok) {
+                const std::string fbBody(fbResp2.body.begin(), fbResp2.body.end());
                 parse_discogs_search_json(fbBody, searchHits);
             }
         }
@@ -756,22 +1332,33 @@ inline WorkVersionsResult discogs_versions(const std::string& workTitle,
             cached.errors.push_back("网络搜索无结果，已回退至本地缓存");
             return cached;
         }
-        res.ok = true; // 契约：搜索无版本不是协议错误，而是如实返回 0 条
+        res.ok = true; // 契约：搜索无版本不是协议错误，如实返回 0 条
         res.complete = false;
+        res.releaseCount = 0;
+        res.distinctCount = 0;
         res.generated_at = now_sec;
         res.expires_at = now_sec + 7 * 86400;
         return res;
     }
 
-    // 4. 对命中的 master 拉取 /masters/{id}/versions
-    std::vector<DiscogsPerformance> perfs;
-    size_t masterIdx = 0;
-    while (masterIdx < searchHits.size() && perfs.size() < 10) {
-        const auto& hit = searchHits[masterIdx++];
-        std::string perfArtists, perfConductor, perfOrchestra, perfWorkTitle;
-        parse_classical_title(hit.title, composer, perfArtists, perfConductor, perfOrchestra, perfWorkTitle);
+    // 4. 收集待抓取详情的候选 release 列表（最多 targetFetchCount 条）
+    struct CandidateItem {
+        int64_t id = 0;
+        std::string type;
+        std::string title;
+        int year = 0;
+        std::string label;
+        std::string format;
+        std::string country;
+        std::string uri;
+    };
+    std::vector<CandidateItem> candidates;
+
+    for (const auto& hit : searchHits) {
+        if ((int)candidates.size() >= targetFetchCount) break;
 
         if (hit.type == "master" && hit.id > 0) {
+            // master 类型拉取其 versions
             std::string vUrl = "https://api.discogs.com/masters/" + std::to_string(hit.id) + "/versions?per_page=10";
             if (limiter.acquire(opts.timeout_ms)) {
                 auto vResp = rta::net::http_get(vUrl, reqHeaders, opts.timeout_ms);
@@ -782,91 +1369,134 @@ inline WorkVersionsResult discogs_versions(const std::string& workTitle,
                     std::vector<MasterVersionItem> vItems;
                     if (parse_discogs_versions_json(vBody, vItems)) {
                         for (const auto& vi : vItems) {
-                            DiscogsPerformance dp;
-                            dp.id = "discogs-release:" + std::to_string(vi.id);
-                            dp.title = !vi.title.empty() ? vi.title : (!perfWorkTitle.empty() ? perfWorkTitle : workTitle);
-                            dp.performers = perfArtists;
-                            dp.conductor = perfConductor;
-                            dp.orchestra = perfOrchestra;
-                            dp.year = vi.year > 0 ? vi.year : hit.year;
-                            dp.label = vi.label;
-                            dp.format = vi.format;
-                            dp.country = vi.country;
-                            dp.url = "https://www.discogs.com/release/" + std::to_string(vi.id);
-                            dp.source = "discogs";
-                            dp.fetched_at = now_sec;
-                            perfs.push_back(std::move(dp));
-                            if (perfs.size() >= 10) break;
+                            if (vi.id <= 0) continue;
+                            bool exists = false;
+                            for (const auto& c : candidates) {
+                                if (c.id == vi.id) { exists = true; break; }
+                            }
+                            if (!exists) {
+                                CandidateItem ci;
+                                ci.id = vi.id;
+                                ci.type = "release";
+                                ci.title = !vi.title.empty() ? vi.title : hit.title;
+                                ci.year = vi.year > 0 ? vi.year : hit.year;
+                                ci.label = vi.label;
+                                ci.format = vi.format;
+                                ci.country = vi.country;
+                                ci.uri = "/release/" + std::to_string(vi.id);
+                                candidates.push_back(std::move(ci));
+                                if ((int)candidates.size() >= targetFetchCount) break;
+                            }
                         }
                     }
                 }
             }
         } else {
-            // 直接由搜索命中项产生
-            DiscogsPerformance dp;
-            dp.id = (hit.type == "master" ? "discogs-master:" : "discogs-release:") + std::to_string(hit.id);
-            dp.title = !perfWorkTitle.empty() ? perfWorkTitle : hit.title;
-            dp.performers = perfArtists;
-            dp.conductor = perfConductor;
-            dp.orchestra = perfOrchestra;
-            dp.year = hit.year;
-            dp.label = hit.label;
-            dp.format = hit.format;
-            dp.country = hit.country;
-            dp.url = hit.type == "master"
-                ? ("https://www.discogs.com/master/" + std::to_string(hit.id))
-                : ("https://www.discogs.com/release/" + std::to_string(hit.id));
-            dp.source = "discogs";
-            dp.fetched_at = now_sec;
-            perfs.push_back(std::move(dp));
-        }
-    }
-
-    // 若拉取 versions 后条目不足 5 条，将剩余 searchHits 补充加入
-    if (perfs.size() < 5) {
-        for (const auto& hit : searchHits) {
-            std::string hid = (hit.type == "master" ? "discogs-master:" : "discogs-release:") + std::to_string(hit.id);
             bool exists = false;
-            for (const auto& p : perfs) {
-                if (p.id == hid) { exists = true; break; }
+            for (const auto& c : candidates) {
+                if (c.id == hit.id) { exists = true; break; }
             }
             if (!exists) {
-                std::string perfArtists, perfConductor, perfOrchestra, perfWorkTitle;
-                parse_classical_title(hit.title, composer, perfArtists, perfConductor, perfOrchestra, perfWorkTitle);
-                DiscogsPerformance dp;
-                dp.id = hid;
-                dp.title = !perfWorkTitle.empty() ? perfWorkTitle : hit.title;
-                dp.performers = perfArtists;
-                dp.conductor = perfConductor;
-                dp.orchestra = perfOrchestra;
-                dp.year = hit.year;
-                dp.label = hit.label;
-                dp.format = hit.format;
-                dp.country = hit.country;
-                dp.url = hit.type == "master"
-                    ? ("https://www.discogs.com/master/" + std::to_string(hit.id))
-                    : ("https://www.discogs.com/release/" + std::to_string(hit.id));
-                dp.source = "discogs";
-                dp.fetched_at = now_sec;
-                perfs.push_back(std::move(dp));
-                if (perfs.size() >= 5) break;
+                CandidateItem ci;
+                ci.id = hit.id;
+                ci.type = hit.type;
+                ci.title = hit.title;
+                ci.year = hit.year;
+                ci.label = hit.label;
+                ci.format = hit.format;
+                ci.country = hit.country;
+                ci.uri = hit.uri;
+                candidates.push_back(std::move(ci));
             }
         }
     }
 
+    // 5. 对候选 release 抓取 GET /releases/{id} 详情并解析 credits
+    std::vector<DiscogsPerformance> rawList;
+
+    for (const auto& cand : candidates) {
+        DiscogsPerformance dp;
+        dp.id = (cand.type == "master" ? "discogs-master:" : "discogs-release:") + std::to_string(cand.id);
+        dp.source = "discogs";
+        dp.fetched_at = now_sec;
+
+        bool detailSuccess = false;
+        std::string detailJson;
+
+        // 若不是 master，调用 releases API 抓取 credits
+        if (cand.type != "master" && cand.id > 0) {
+            // 先查本地 release 缓存
+            if (!opts.refresh && release_detail_load_cache(baseDir, cand.id, detailJson, now_sec)) {
+                detailSuccess = true;
+            } else if (!opts.offline) {
+                if (limiter.acquire(opts.timeout_ms < 5000 ? opts.timeout_ms : 5000)) {
+                    std::string relUrl = "https://api.discogs.com/releases/" + std::to_string(cand.id);
+                    auto relResp = rta::net::http_get(relUrl, reqHeaders, opts.timeout_ms);
+                    if (relResp.status == 429) {
+                        limiter.trip_circuit(60);
+                    } else if (relResp.ok) {
+                        detailJson = std::string(relResp.body.begin(), relResp.body.end());
+                        release_detail_save_cache(baseDir, cand.id, detailJson);
+                        detailSuccess = true;
+                    }
+                }
+            }
+        }
+
+        DiscogsReleaseDetail det;
+        if (detailSuccess && parse_discogs_release_json(detailJson, det)) {
+            dp.title = !det.title.empty() ? det.title : cand.title;
+            dp.conductor = det.conductor;
+            dp.ensemble = det.ensemble;
+            dp.orchestra = det.ensemble;
+            dp.soloists = det.soloists;
+            dp.composer = !det.composer.empty() ? det.composer : composer;
+            dp.year = det.year > 0 ? det.year : cand.year;
+            dp.label = !det.label.empty() ? det.label : cand.label;
+            dp.country = !det.country.empty() ? det.country : cand.country;
+            dp.format = !det.format.empty() ? det.format : cand.format;
+            dp.url = !det.url.empty() ? det.url : ("https://www.discogs.com/release/" + std::to_string(cand.id));
+            dp.detailFetched = true;
+            dp.performers = format_performers_string(dp.conductor, dp.ensemble, dp.soloists, cand.title);
+        } else {
+            // 详情不可达时，回退至基础标题解析
+            std::string perfArtists, perfConductor, perfOrchestra, perfWorkTitle;
+            parse_classical_title(cand.title, composer, perfArtists, perfConductor, perfOrchestra, perfWorkTitle);
+            dp.title = !perfWorkTitle.empty() ? perfWorkTitle : cand.title;
+            dp.performers = perfArtists;
+            dp.conductor = perfConductor;
+            dp.ensemble = perfOrchestra;
+            dp.orchestra = perfOrchestra;
+            dp.composer = composer;
+            dp.year = cand.year;
+            dp.label = cand.label;
+            dp.format = cand.format;
+            dp.country = cand.country;
+            dp.url = cand.type == "master"
+                ? ("https://www.discogs.com/master/" + std::to_string(cand.id))
+                : ("https://www.discogs.com/release/" + std::to_string(cand.id));
+            dp.detailFetched = false;
+        }
+
+        dp.dedupKey = build_dedup_key(dp.conductor, dp.ensemble, dp.soloists);
+        rawList.push_back(std::move(dp));
+    }
+
+    // 6. 按演绎去重（dedupKey 相同保留最早 year，折叠计数 otherEditions；空 key 保留并标 dedupUnknown: true）
+    res.performances = deduplicate_performances(rawList, res.releaseCount, res.distinctCount);
+
     res.ok = true;
-    res.performances = std::move(perfs);
     res.generated_at = now_sec;
     res.expires_at = now_sec + 7 * 86400;
 
-    // complete 判定：>= 5 条且每条都有有效 url
+    // complete 判定升级：去重后 distinct 演绎数 >= 5 且每条都有有效 url
     bool allUrlsOk = !res.performances.empty();
     for (const auto& p : res.performances) {
         if (p.url.empty()) { allUrlsOk = false; break; }
     }
-    res.complete = (res.performances.size() >= 5) && allUrlsOk;
+    res.complete = (res.distinctCount >= 5) && allUrlsOk;
 
-    // 5. 落盘缓存（仅在成功拿到条目时）
+    // 7. 落盘持久化缓存
     if (!res.performances.empty()) {
         versions_save_cache(baseDir, eid, res);
     }

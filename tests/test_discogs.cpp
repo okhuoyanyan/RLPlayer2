@@ -126,6 +126,93 @@ static const char* kFixtureVersionsEmpty = R"json({
 // 测试主体
 // ---------------------------------------------------------------------------
 
+
+// 8. 正常 release 详情 JSON（包含 Conductor, Orchestra, Composed By, Direct Metal Mastering By）
+static const char* kFixtureReleaseFull = R"json({
+  "id": 915325,
+  "title": "Bolero",
+  "year": 1985,
+  "country": "Germany",
+  "labels": [ { "name": "TELDEC", "catno": "6.20413" } ],
+  "formats": [ { "name": "Vinyl", "descriptions": ["12\"", "45 RPM", "Maxi-Single"] } ],
+  "extraartists": [
+    { "name": "Maurice Ravel", "role": "Composed By", "id": 216140 },
+    { "name": "Franz André", "role": "Conductor", "id": 872648 },
+    { "name": "Horst Angenendt", "role": "Direct Metal Mastering By", "id": 3389511 },
+    { "name": "Orchestre Symphonique De La Radiodiffusion Nationale Belge, Bruxelles", "role": "Orchestra", "id": 872649 }
+  ]
+})json";
+
+// 多种键写法与角色的 release 详情（Dirigent / Philharmonic Orchestra / Soloist, Violin / Music By）
+static const char* kFixtureReleaseAlternativeRoles = R"json({
+  "id": 11854520,
+  "title": "Symphony No. 5",
+  "released": "1963-04",
+  "country": "UK",
+  "labels": [ { "name": "EMI" } ],
+  "formats": [ { "name": "CD", "descriptions": ["Album"] } ],
+  "extraartists": [
+    { "name": "Ludwig van Beethoven", "role": "Music By" },
+    { "name": "Herbert von Karajan", "role": "Dirigent" },
+    { "name": "Philharmonia Orchestra", "role": "Philharmonic Orchestra" },
+    { "name": "Anne-Sophie Mutter", "role": "Soloist, Violin" }
+  ]
+})json";
+
+// 直接键写法（简化 mock / 直接对象）
+static const char* kFixtureReleaseDirectKeys = R"json({
+  "id": 1234567,
+  "title": "Boléro",
+  "year": 1990,
+  "country": "France",
+  "label": "Deutsche Grammophon",
+  "format": "CD",
+  "conductor": "Claudio Abbado",
+  "orchestra": "London Symphony Orchestra",
+  "soloists": ["Martha Argerich"],
+  "composer": "Maurice Ravel"
+})json";
+
+// 缺失演职人员信息的 release 详情
+static const char* kFixtureReleaseMissingCredits = R"json({
+  "id": 9999999,
+  "title": "Just Classical Music",
+  "year": 1970,
+  "extraartists": []
+})json";
+
+// 旧缓存（缺少 ensemble, soloists, detailFetched, dedupKey, otherEditions, dedupUnknown）
+static const char* kFixtureLegacyVersionsCache = R"json({
+  "ok": true,
+  "work": {
+    "id": "work:maurice-ravel:bolero",
+    "title": "Boléro",
+    "composer": "Maurice Ravel"
+  },
+  "performances": [
+    {
+      "id": "discogs-release:915325",
+      "title": "Boléro",
+      "performers": "Franz André, Orchestre Symphonique",
+      "conductor": "Franz André",
+      "orchestra": "Orchestre Symphonique",
+      "year": 1985,
+      "label": "TELDEC",
+      "format": "Vinyl 12\"",
+      "country": "Germany",
+      "url": "https://www.discogs.com/release/915325",
+      "source": "discogs",
+      "fetched_at": 1792690000
+    }
+  ],
+  "complete": false,
+  "generated_at": 1792690000,
+  "expires_at": 1793294800,
+  "errors": [],
+  "from_cache": true,
+  "offline": false
+})json";
+
 int main() {
     SetConsoleOutputCP(CP_UTF8);
     std::printf("== meta/discogs.h Discogs L4 版本推荐单元测试 ==\n");
@@ -317,8 +404,188 @@ int main() {
         ck(r.complete == false, "虽然条数 >= 5，但有缺少 url 的条目时 complete 为 false (硬门生效)");
     }
 
-    // 7. 真实网络用例 opt-in
-    std::printf("-- 7. 真实网络用例 opt-in --\n");
+    // 7. credits JSON 解析（Conductor/Orchestra/Soloists/Composed By 多种写法）
+    std::printf("-- 7. credits JSON 解析 --\n");
+    {
+        DiscogsReleaseDetail det1;
+        ck(parse_discogs_release_json(kFixtureReleaseFull, det1), "正常 release JSON 解析成功");
+        ck(det1.conductor == "Franz André", "提取指挥: " + det1.conductor);
+        ck(det1.ensemble.find("Orchestre Symphonique") != std::string::npos, "提取乐团: " + det1.ensemble);
+        ck(det1.composer == "Maurice Ravel", "提取作曲家: " + det1.composer);
+        ck(det1.year == 1985 && det1.label == "TELDEC" && det1.country == "Germany", "年份、厂牌与国家提取正确");
+        ck(det1.format.find("Vinyl") != std::string::npos, "格式包含 Vinyl");
+        ck(det1.soloists.empty(), "母带制作工程师未被误判为独奏");
+
+        DiscogsReleaseDetail det2;
+        ck(parse_discogs_release_json(kFixtureReleaseAlternativeRoles, det2), "多种角色别名解析成功");
+        ck(det2.conductor == "Herbert von Karajan", "Dirigent 别名识别为指挥: " + det2.conductor);
+        ck(det2.ensemble == "Philharmonia Orchestra", "Philharmonic Orchestra 别名识别为乐团: " + det2.ensemble);
+        ck(det2.composer == "Ludwig van Beethoven", "Music By 识别为作曲家: " + det2.composer);
+        ck(det2.soloists.size() == 1 && det2.soloists[0] == "Anne-Sophie Mutter", "Soloist, Violin 识别为独奏");
+        ck(det2.year == 1963, "从 released 日期前缀提取年份 1963");
+
+        DiscogsReleaseDetail det3;
+        ck(parse_discogs_release_json(kFixtureReleaseDirectKeys, det3), "直接键解析成功");
+        ck(det3.conductor == "Claudio Abbado", "直接键指挥正确");
+        ck(det3.ensemble == "London Symphony Orchestra", "直接键乐团正确");
+        ck(det3.soloists.size() == 1 && det3.soloists[0] == "Martha Argerich", "直接键独奏数组正确");
+
+        DiscogsReleaseDetail det4;
+        ck(parse_discogs_release_json(kFixtureReleaseMissingCredits, det4), "无演职人员 release 安全解析");
+        ck(det4.conductor.empty() && det4.ensemble.empty() && det4.soloists.empty(), "演职字段安全为空");
+    }
+
+    // 8. dedupKey 规范化
+    std::printf("-- 8. dedupKey 规范化 --\n");
+    {
+        std::string k1 = build_dedup_key("Herbert von Karajan", "Berliner Philharmoniker", {});
+        std::string k2 = build_dedup_key("HERBERT VON KARAJAN", "BERLINER PHILHARMONIKER", {});
+        ck(k1 == k2 && !k1.empty(), "大小写不敏感且一致: " + k1);
+
+        std::string k3 = build_dedup_key("Karajan*", "Berliner Philharmoniker (2)", {});
+        std::string k4 = build_dedup_key("Karajan", "Berliner Philharmoniker", {});
+        ck(k3 == k4, "消歧义星号与序号清理后键一致");
+
+        std::string k5 = build_dedup_key("Franz André", "Orchestre", {});
+        std::string k6 = build_dedup_key("Franz Andre", "Orchestre", {});
+        ck(k5 == k6, "法语重音字符折叠后键一致: " + k5);
+
+        std::string k7 = build_dedup_key("Carlo Rizzi", "NPO", {"Gordan Nikolitch", "Carlo Rizzi"});
+        std::string k8 = build_dedup_key("Carlo Rizzi", "NPO", {"Carlo Rizzi", "Gordan Nikolitch"});
+        ck(k7 == k8, "独奏列表顺序无关 (经内部排序后一致)");
+
+        std::string kEmpty = build_dedup_key("", "", {});
+        ck(kEmpty.empty(), "演职人员全缺失时 dedupKey 为空串");
+    }
+
+    // 9. 按演绎去重（最早 year 优先、otherEditions 计数、dedupUnknown 标记）
+    std::printf("-- 9. 按演绎去重与折叠计数 --\n");
+    {
+        std::vector<DiscogsPerformance> raw;
+        // 同一演绎的 3 个不同年份发行版
+        DiscogsPerformance p1; p1.id = "r1"; p1.year = 1985; p1.dedupKey = "karajan|bpo|"; p1.url = "http://r1"; raw.push_back(p1);
+        DiscogsPerformance p2; p2.id = "r2"; p2.year = 1963; p2.dedupKey = "karajan|bpo|"; p2.url = "http://r2"; raw.push_back(p2);
+        DiscogsPerformance p3; p3.id = "r3"; p3.year = 2000; p3.dedupKey = "karajan|bpo|"; p3.url = "http://r3"; raw.push_back(p3);
+        // 另一个演绎单版本
+        DiscogsPerformance p4; p4.id = "r4"; p4.year = 1970; p4.dedupKey = "bernstein|nyp|"; p4.url = "http://r4"; raw.push_back(p4);
+        // 2 个未知演职人员版本（空 dedupKey）
+        DiscogsPerformance p5; p5.id = "r5"; p5.year = 1990; p5.dedupKey = ""; p5.url = "http://r5"; raw.push_back(p5);
+        DiscogsPerformance p6; p6.id = "r6"; p6.year = 1995; p6.dedupKey = ""; p6.url = "http://r6"; raw.push_back(p6);
+
+        int relCount = 0, distCount = 0;
+        auto deduped = deduplicate_performances(raw, relCount, distCount);
+        ck(relCount == 6, "去重前发行版本总数=6");
+        ck(distCount == 4, "去重后不同演绎数=4 (1个Karajan + 1个Bernstein + 2个未明)");
+
+        // 验证 Karajan 组保留了最早年份 1963 且 otherEditions==2
+        bool foundKarajanEarliest = false;
+        for (const auto& it : deduped) {
+            if (it.dedupKey == "karajan|bpo|") {
+                if (it.year == 1963 && it.otherEditions == 2 && !it.dedupUnknown && it.id == "r2") {
+                    foundKarajanEarliest = true;
+                }
+            }
+        }
+        ck(foundKarajanEarliest, "同演绎去重正确保留最早年份 1963 主条目，且 otherEditions=2");
+
+        // 验证未明演绎不被合并，标记 dedupUnknown: true 且 otherEditions==0
+        int unknownCount = 0;
+        for (const auto& it : deduped) {
+            if (it.dedupUnknown) {
+                ck(it.otherEditions == 0, "未明演绎 otherEditions=0");
+                ++unknownCount;
+            }
+        }
+        ck(unknownCount == 2, "2 条未明演绎独立保留，未臆造合并");
+    }
+
+    // 10. complete 新判定规则（distinct >= 5 且全带 url）
+    std::printf("-- 10. complete 新判定规则 --\n");
+    {
+        WorkVersionsResult wr;
+        // 5 个相同演绎版本（总发行数 5，但 distinct 演绎只有 1）
+        for (int i = 0; i < 5; ++i) {
+            DiscogsPerformance p;
+            p.id = "rel_" + std::to_string(i);
+            p.dedupKey = "same_conductor|same_orchestra|";
+            p.year = 1970 + i;
+            p.url = "https://www.discogs.com/release/" + std::to_string(i);
+            wr.performances.push_back(p);
+        }
+        int relC = 0, distC = 0;
+        auto deduped1 = deduplicate_performances(wr.performances, relC, distC);
+        bool allUrlsOk = !deduped1.empty();
+        for (const auto& it : deduped1) if (it.url.empty()) allUrlsOk = false;
+        bool comp1 = (distC >= 5) && allUrlsOk;
+        ck(!comp1 && distC == 1 && relC == 5, "5 个相同演绎虽有 5 个发行，但 distinct=1，complete 判定为 false");
+
+        // 5 个不同演绎版本
+        std::vector<DiscogsPerformance> distinct5;
+        for (int i = 0; i < 5; ++i) {
+            DiscogsPerformance p;
+            p.id = "rel_" + std::to_string(i);
+            p.dedupKey = "conductor_" + std::to_string(i) + "|orchestra|";
+            p.year = 1970 + i;
+            p.url = "https://www.discogs.com/release/" + std::to_string(i);
+            distinct5.push_back(p);
+        }
+        auto deduped5 = deduplicate_performances(distinct5, relC, distC);
+        allUrlsOk = !deduped5.empty();
+        for (const auto& it : deduped5) if (it.url.empty()) allUrlsOk = false;
+        bool comp5 = (distC >= 5) && allUrlsOk;
+        ck(comp5 && distC == 5, "5 个不同演绎且均有 url，complete 判定为 true");
+
+        // 其中某条缺少 url
+        distinct5[0].url.clear();
+        auto deduped5NoUrl = deduplicate_performances(distinct5, relC, distC);
+        allUrlsOk = !deduped5NoUrl.empty();
+        for (const auto& it : deduped5NoUrl) if (it.url.empty()) allUrlsOk = false;
+        bool comp5NoUrl = (distC >= 5) && allUrlsOk;
+        ck(!comp5NoUrl, "distinct=5 但存在 url 为空时 complete 为 false (硬门生效)");
+    }
+
+    // 11. 旧缓存向后兼容
+    std::printf("-- 11. 旧缓存向后兼容 --\n");
+    {
+        WorkVersionsResult legacyRes;
+        std::string legErr;
+        ck(work_versions_from_json(kFixtureLegacyVersionsCache, legacyRes, &legErr), "旧格式缓存成功解析");
+        ck(legacyRes.performances.size() == 1, "条目数量正常加载");
+        const auto& p = legacyRes.performances[0];
+        ck(p.detailFetched == false, "旧缓存缺少 detailFetched 字段时解析为 false (便于后续刷新)");
+        ck(p.ensemble == "Orchestre Symphonique", "旧缓存 orchestra 字段平滑填充至 ensemble: " + p.ensemble);
+        ck(p.soloists.empty(), "旧缓存 soloists 安全为空数组");
+        ck(p.dedupUnknown == true, "旧缓存缺少 dedupKey 标记为 dedupUnknown");
+        ck(legacyRes.distinctCount == 1 && legacyRes.releaseCount == 1, "旧缓存安全推导 distinctCount 与 releaseCount");
+    }
+
+    // 12. 限流与详情抓取失败容错
+    std::printf("-- 12. 限流与详情抓取失败容错 --\n");
+    {
+        // 熔断状态下 discogs_versions 降级
+        auto& lim = DiscogsRateLimiter::instance();
+        lim.trip_circuit(30);
+        DiscogsOptions tripOpts;
+        tripOpts.offline = false;
+        WorkVersionsResult tripRes = discogs_versions("AnyWork", "AnyComposer", tripOpts);
+        ck(!tripRes.ok && tripRes.errors.size() > 0, "熔断期请求安全阻断返回错误说明");
+        lim.reset_circuit();
+
+        // 构造候选 items 抓取详情模拟失败时，降级到 parse_classical_title
+        DiscogsPerformance fallbackP;
+        std::string titlePart;
+        parse_classical_title("Herbert von Karajan, Berliner Philharmoniker - Beethoven: Symphony No. 5",
+                              "Ludwig van Beethoven",
+                              fallbackP.performers, fallbackP.conductor, fallbackP.orchestra, titlePart);
+        fallbackP.ensemble = fallbackP.orchestra;
+        fallbackP.dedupKey = build_dedup_key(fallbackP.conductor, fallbackP.ensemble, fallbackP.soloists);
+        ck(fallbackP.conductor == "Herbert von Karajan", "标题解析提取指挥成功: " + fallbackP.conductor);
+        ck(fallbackP.ensemble == "Berliner Philharmoniker", "标题解析提取乐团成功: " + fallbackP.ensemble);
+        ck(!fallbackP.dedupKey.empty(), "标题降级提取可成功计算 dedupKey: " + fallbackP.dedupKey);
+    }
+
+    // 13. 真实网络用例 opt-in (Boléro 抓取详情)
+    std::printf("-- 13. 真实网络用例 opt-in --\n");
     {
         char* net_env = nullptr;
         size_t len = 0;
@@ -330,6 +597,7 @@ int main() {
             DiscogsOptions nOpts;
             nOpts.refresh = true;
             nOpts.timeout_ms = 15000;
+            nOpts.max_releases = 5;
             WorkVersionsResult liveRes = discogs_versions("Boléro", "Maurice Ravel", nOpts);
             ck(liveRes.ok, "真实 Discogs 请求成功");
             ck(liveRes.performances.size() >= 5, "Boléro 演绎版本 >= 5 条", "条数=" + std::to_string(liveRes.performances.size()));

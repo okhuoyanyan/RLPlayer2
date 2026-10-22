@@ -717,45 +717,70 @@ function renderWorkVersions(workTitle, composer, j) {
     return;
   }
 
+  // 统计数值（不同演绎 X / 发行版本 Y）
+  var distinctCount = (typeof j.distinctCount === 'number') ? j.distinctCount : ((typeof j.distinct_count === 'number') ? j.distinct_count : perfs.length);
+  var releaseCount = (typeof j.releaseCount === 'number') ? j.releaseCount : ((typeof j.release_count === 'number') ? j.release_count : perfs.length);
+
   // 头部概要卡片
   var subStr = (composer ? ('作曲家: ' + esc(composer) + ' · ') : '') +
                (j.from_cache ? ('缓存 · ' + fmtDate(j.generated_at) + (j.offline ? ' · 离线' : '')) : 'Discogs 实时') +
-               ' · 共 ' + perfs.length + ' 个版本';
+               ' · 不同演绎 ' + distinctCount + ' / 发行版本 ' + releaseCount;
   h += '<div class="ahead work-head" style="margin-bottom:16px;padding:16px 20px;background:var(--hov);border-radius:10px">' +
        '<div class=kind style="font-size:11px;font-weight:600;letter-spacing:1px;color:var(--mut2)">CLASSICAL WORK · 古典作品</div>' +
        '<h1 style="margin:4px 0 6px;font-size:20px;font-weight:700;color:var(--txt)">' + esc(workTitle) + '</h1>' +
        '<div class=sub style="font-size:12px;color:var(--mut)">' + subStr + '</div>' +
        '</div>';
 
-  // 不足 5 条提示
-  if (perfs.length < 5) {
+  // 不足 5 条演绎提示
+  if (distinctCount < 5) {
     h += '<div class="card count-hint" style="padding:10px 14px;margin-bottom:14px;background:var(--phbg);border:1px solid var(--line);border-radius:8px;font-size:12px;color:var(--mut)">' +
-         '仅找到 ' + perfs.length + ' 个版本（不编造）' +
+         '不同演绎仅 ' + distinctCount + ' 个（目标 ≥5，未做臆造）' +
          '</div>';
   }
+
+  // 版本列表 表头
+  h += '<div class="trow trow-head" style="cursor:default;display:flex;align-items:center;gap:12px;padding:6px 16px;margin-bottom:4px;border-radius:6px;font-size:11px;font-weight:600;color:var(--mut2);text-transform:uppercase;letter-spacing:0.5px">' +
+       '<span style="font-family:monospace;min-width:38px">年份</span>' +
+       '<span style="flex:1.3;min-width:0">标题 / 发行</span>' +
+       '<span style="flex:0.9;min-width:0">指挥</span>' +
+       '<span style="flex:1.2;min-width:0">乐团</span>' +
+       '<span style="flex:0.9;min-width:0">独奏</span>' +
+       '<span style="min-width:75px">厂牌</span>' +
+       '<span style="min-width:55px">格式</span>' +
+       '<span style="min-width:80px;text-align:right">操作</span>' +
+       '</div>';
 
   // 版本列表
   h += '<div class=version-list style="display:flex;flex-direction:column;gap:8px">';
   perfs.forEach(function (p) {
     var yr = p.year > 0 ? String(p.year) : '—';
-    var performersDisplay = p.performers || '—';
-    if (p.orchestra && performersDisplay.indexOf(p.orchestra) < 0) {
-      performersDisplay += ' / ' + p.orchestra;
+    var conductorDisplay = p.conductor || '–';
+    var ensembleDisplay = p.ensemble || p.orchestra || '–';
+    var soloistsDisplay = (p.soloists && p.soloists.length > 0) ? p.soloists.join(', ') : '–';
+
+    var badges = '';
+    if (p.otherEditions && p.otherEditions > 0) {
+      badges += '<span class=badge style="margin-left:6px;font-size:10px;background:var(--hov2);color:var(--mut)" title="同演绎其他发行 +' + p.otherEditions + ' 版">+' + p.otherEditions + ' 版</span>';
     }
-    if (p.conductor && performersDisplay.indexOf(p.conductor) < 0) {
-      performersDisplay += ' (指挥: ' + p.conductor + ')';
+    if (p.dedupUnknown) {
+      badges += '<span class=badge style="margin-left:6px;font-size:10px;background:var(--phbg);border:1px dashed var(--line);color:var(--mut2)" title="演绎信息未明，未做去重合并">未明演绎</span>';
     }
 
     h += '<div class="trow version-row" style="cursor:default;display:flex;align-items:center;gap:12px;padding:10px 16px;border-radius:9px;background:var(--hov)">' +
-         '<span style="font-family:monospace;font-size:12px;color:var(--mut);min-width:36px">' + yr + '</span>' +
-         '<div style="flex:1;min-width:0">' +
-           '<div style="font-weight:600;font-size:13px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(p.title) + '">' + esc(p.title) + '</div>' +
-           '<div style="font-size:11.5px;color:var(--mut2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px" title="' + esc(performersDisplay) + '">' + esc(performersDisplay) + '</div>' +
+         '<span style="font-family:monospace;font-size:12px;color:var(--mut);min-width:38px">' + yr + '</span>' +
+         '<div style="flex:1.3;min-width:0">' +
+           '<div style="display:flex;align-items:center">' +
+             '<span style="font-weight:600;font-size:13px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(p.title) + '">' + esc(p.title) + '</span>' +
+             badges +
+           '</div>' +
+           '<div style="font-size:11px;color:var(--mut2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px" title="' + esc(p.performers || '—') + '">' + esc(p.performers || '—') + '</div>' +
          '</div>' +
-         '<div style="font-size:11.5px;color:var(--mut);min-width:80px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(p.label) + '">' + esc(p.label || '—') + '</div>' +
-         '<span class=badge style="font-size:11px">' + esc(p.format || 'CD') + '</span>' +
-         (p.country ? ('<span style="font-size:11px;color:var(--mut2)">' + esc(p.country) + '</span>') : '') +
-         '<button class="btn chip-copy" data-url="' + esc(p.url) + '" title="复制版本链接">' +
+         '<div style="flex:0.9;min-width:0;font-size:12px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(conductorDisplay) + '">' + esc(conductorDisplay) + '</div>' +
+         '<div style="flex:1.2;min-width:0;font-size:12px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(ensembleDisplay) + '">' + esc(ensembleDisplay) + '</div>' +
+         '<div style="flex:0.9;min-width:0;font-size:12px;color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(soloistsDisplay) + '">' + esc(soloistsDisplay) + '</div>' +
+         '<div style="font-size:11.5px;color:var(--mut);min-width:75px;max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(p.label || '—') + '">' + esc(p.label || '—') + '</div>' +
+         '<span class=badge style="font-size:11px;min-width:45px;text-align:center">' + esc(p.format || 'CD') + '</span>' +
+         '<button class="btn chip-copy" data-url="' + esc(p.url) + '" title="复制版本链接" style="margin-left:auto">' +
            '<svg width=12 height=12 viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:4px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
            '复制链接' +
          '</button>' +
