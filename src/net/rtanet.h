@@ -153,7 +153,15 @@ public:
         const size_t pb = packed_bytes(h.bits, h.frames, h.channels);
         if (pkt.size() < RTANET_HEADER + pb) return false;
 
-        if (started_ && h.seq < nextSeq_) { stats_.late++; return false; }
+        if (started_ && h.seq < nextSeq_) {
+            // 还没交付过任何包时，更靠前的序号不是"迟到"，而是流真正的开头：
+            // 预滚只看"收到几个包"，并不保证序号 0 已经在手（乱序时第 preroll 个包可能是 5）。
+            // 旧行为：直接按此时的最小序号定起始点 ⟹ 之后才到的 0/1 被当迟到整段丢弃，
+            // 输出只剩 10/12 包、序号从 2 开始，而 stats.lost 仍为 0（丢包计数根本看不出来）。
+            // 一旦已经交付过数据，更早的序号才是真迟到，必须丢弃（不能回头重排已播出的时间轴）。
+            if (!delivered_) nextSeq_ = h.seq;      // 回退起始点，把流头接回来
+            else { stats_.late++; return false; }
+        }
         if (map_.count(h.seq)) {
             // 同序号重发：若时间戳一致视为重复，否则视为乱序重排
             if (map_[h.seq].header.timestamp == h.timestamp) { stats_.duplicate++; return false; }
@@ -188,6 +196,7 @@ public:
         outPayload = std::move(it->second.payload);
         map_.erase(it);
         nextSeq_++;
+        delivered_ = true;      // 时间轴已经开始推进：此后 < nextSeq_ 才是真迟到
         return true;
     }
 
@@ -223,6 +232,7 @@ public:
         nextSeq_++;
         stats_.lost++;
         outPayload.assign(packed_bytes(lastBits_, lastFrames_, lastChannels_), 0);
+        delivered_ = true;      // 补静音同样推进了时间轴
         return true;
     }
 
@@ -235,9 +245,10 @@ public:
 
     size_t pending() const { return map_.size(); }
     bool started() const { return started_; }
+    bool delivered() const { return delivered_; }
     const JitterStats& stats() const { return stats_; }
     void reset() {
-        map_.clear(); started_ = false; firstSeq_ = -1; nextSeq_ = 0;
+        map_.clear(); started_ = false; delivered_ = false; firstSeq_ = -1; nextSeq_ = 0;
         maxSeq_ = 0; sealedEnd_ = 0; sealed_ = false;
         stats_ = JitterStats{};
     }
@@ -247,6 +258,7 @@ private:
     std::map<uint32_t, Slot> map_;
     size_t preroll_ = 8;
     bool started_ = false;
+    bool delivered_ = false;      // 是否已经交付过数据（区分"流头乱序到达"与"真迟到"）
     int64_t firstSeq_ = -1;
     uint32_t nextSeq_ = 0;
     uint32_t maxSeq_ = 0;

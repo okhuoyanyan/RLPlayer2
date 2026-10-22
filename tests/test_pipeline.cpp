@@ -5,6 +5,8 @@
 #include <vector>
 #include <cmath>
 #include <string>
+#include <filesystem>
+#include <exception>
 
 using namespace rta::engine;
 using rta::audio::AudioBuffer;
@@ -35,8 +37,22 @@ static AudioBuffer make_test(uint32_t rate, int ch, int bits, size_t frames, uin
     return a;
 }
 
-int main() {
-    const std::string dir = "D:\\RTA-hqplayer\\build\\testdata\\";
+static int run_tests() {
+    // ⚠️ 曾经写死 "D:\\RTA-hqplayer\\build\\testdata\\"（开发机绝对路径）⟹ CI 上该目录不存在
+    //    ⟹ write_wav 抛 std::runtime_error ⟹ main 没人接 ⟹ std::terminate ⟹ abort()
+    //    ⟹ 退出码 0xC0000409（STATUS_STACK_BUFFER_OVERRUN）。CI 日志里连一行输出都没有，
+    //    极易被误判成"栈缓冲区越界 / 真实 UB"。根因只是"测试把本机路径当成了事实"。
+    // 修法：运行期创建目录，用相对当前工作目录的 ASCII 路径（ctest 的 cwd 就是 build/）。
+    const std::string dir = "testdata\\";
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec) {
+            printf("!! 无法创建测试素材目录 %s（%s）\n", dir.c_str(), ec.message().c_str());
+            return 1;
+        }
+        printf("测试素材目录（相对当前工作目录）: %s\n", dir.c_str());
+    }
 
     printf("=== 1. WAV 读写的逐位往返 ===\n");
     {
@@ -173,4 +189,15 @@ int main() {
 
     printf("\n%s (失败项 %d)\n", fails == 0 ? "全部通过" : "存在失败", fails);
     return fails == 0 ? 0 : 1;
+}
+
+int main() {
+    // 未捕获异常必须变成【可见的 FAIL + 退出码 1】，而不是 abort 出来的 0xC0000409。
+    // （环境性失败本身由各断言负责打印；这里只兜住"路径打不开"这类异常。）
+    try {
+        return run_tests();
+    } catch (const std::exception& e) {
+        printf("\n  [FAIL] 未捕获异常（测试或环境问题，不是静默跳过）: %s\n", e.what());
+        return 1;
+    }
 }

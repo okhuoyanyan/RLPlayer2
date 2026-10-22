@@ -34,6 +34,35 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      # A 类失败（writeback / media_duration / decode_retry）的真因：云机本来没有 ffmpeg/ffprobe，
+      # 而这三条用例把"缺工具"判为 FAIL（这是正确的门禁设计，绝不改成跳过）。
+      # 所以门禁必须自己把环境补齐：装 ffmpeg，并当场验证 ffmpeg/ffprobe 两个二进制都能执行。
+      - name: 安装 ffmpeg（A 类门禁用例的环境前提）
+        shell: pwsh
+        run: |
+          choco install ffmpeg -y --no-progress
+          if ($LASTEXITCODE -ne 0) { Write-Error "choco 安装 ffmpeg 失败（退出码 $LASTEXITCODE）"; exit 1 }
+          # choco 只改注册表里的机器 PATH，当前进程要显式刷新，否则 ffmpeg 仍不在 PATH 上
+          $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
+                      [Environment]::GetEnvironmentVariable('Path','User') + ';' + $env:Path
+          $ff = (Get-Command ffmpeg  -ErrorAction SilentlyContinue).Source
+          $fp = (Get-Command ffprobe -ErrorAction SilentlyContinue).Source
+          if (-not $ff) { Write-Error "装上后仍找不到 ffmpeg —— 门禁前提不成立，直接失败"; exit 1 }
+          if (-not $fp) { Write-Error "装上后仍找不到 ffprobe —— 门禁前提不成立，直接失败"; exit 1 }
+          Write-Host "ffmpeg  = $ff"
+          Write-Host "ffprobe = $fp"
+          # 必须真的能跑（不只是文件存在）：两条 -version 都要 0 退出。
+          # 先收完输出再截取首行 —— 直接 | Select-Object -First 1 会提前掐断管道，
+          # ffmpeg 可能因写入失败返回非 0，制造"装了却说跑不起来"的假警报。
+          $ffVer = & $ff -version 2>&1
+          if ($LASTEXITCODE -ne 0) { Write-Error "ffmpeg -version 失败（退出码 $LASTEXITCODE）"; exit 1 }
+          $ffVer | Select-Object -First 1
+          $fpVer = & $fp -version 2>&1
+          if ($LASTEXITCODE -ne 0) { Write-Error "ffprobe -version 失败（退出码 $LASTEXITCODE）"; exit 1 }
+          $fpVer | Select-Object -First 1
+          # 让后续步骤（构建/ctest）也走同一个目录，不靠"可能没刷新的机器 PATH"
+          Split-Path $ff | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
       - name: 定位 clang++（找不到就用 choco 装）
         shell: pwsh
         run: |

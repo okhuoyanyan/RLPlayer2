@@ -101,35 +101,51 @@ int main() {
 
     printf("\n=== 3. 抖动缓冲：乱序必须还原 ===\n");
     {
-        JitterBuffer jb(4);
         const int bits = 24, ch = 2; const size_t F = 128; const size_t NP = 12;
-        // 按打乱的顺序投入
+
+        // 一个乱序用例：按给定顺序把 12 包全部投入（中途不 pop），再按顺序全部取出核对。
+        auto reorder_case = [&](const std::vector<size_t>& order, const std::string& what) {
+            printf("  投入顺序:");
+            for (size_t p : order) printf(" %zu", p);
+            printf("\n");
+            JitterBuffer jb(4);
+            for (size_t p : order) {
+                auto s = make_samples(F, ch, bits, 2000u + (uint32_t)p);
+                jb.push(build_packet((uint32_t)p, (uint64_t)p * F, 48000, ch, bits, s.data(), F, 5));
+            }
+            RtaHeader h{}; std::vector<uint8_t> pay; size_t cnt = 0; bool ordered = true;
+            std::vector<uint32_t> seqs;
+            while (jb.pop(h, pay)) {
+                seqs.push_back(h.seq);
+                auto s = make_samples(F, ch, bits, 2000u + (uint32_t)h.seq);
+                std::vector<int32_t> gotv(s.size());
+                unpack_samples(gotv.data(), pay.data(), gotv.size(), bits);
+                for (size_t i = 0; i < s.size(); ++i) if (s[i] != gotv[i]) { ordered = false; break; }
+                ++cnt;
+                jb.observe_format(h);
+            }
+            bool seqOk = true;
+            for (size_t i = 0; i < seqs.size(); ++i) if (seqs[i] != i) seqOk = false;
+            char buf[200];
+            std::snprintf(buf, sizeof(buf), "(输出 %zu 包, 序号连续=%s, 丢失 %llu, 迟到 %llu)",
+                          cnt, seqOk ? "是" : "否",
+                          (unsigned long long)jb.stats().lost, (unsigned long long)jb.stats().late);
+            check(ordered && seqOk && cnt == NP, what, buf);
+        };
+
+        // 3a：完全打乱。注意 std::shuffle 的排列是【实现定义】的（本机 MSVC STL 14.44 与
+        //     CI runner 上的版本不同，同一个 seed 给的顺序不同），所以把实际顺序打印出来，
+        //     失败时能直接照这个顺序复现。
         std::vector<size_t> order;
         for (size_t i = 0; i < NP; ++i) order.push_back(i);
         std::mt19937 rng(7); std::shuffle(order.begin(), order.end(), rng);
+        reorder_case(order, "乱序输入被还原为正确顺序");
 
-        for (size_t k = 0; k < order.size(); ++k) {
-            const size_t p = order[k];
-            auto s = make_samples(F, ch, bits, 2000u + (uint32_t)p);
-            jb.push(build_packet((uint32_t)p, (uint64_t)p * F, 48000, ch, bits, s.data(), F, 5));
-        }
-        RtaHeader h{}; std::vector<uint8_t> pay; size_t cnt = 0; bool ordered = true;
-        std::vector<uint32_t> seqs;
-        while (jb.pop(h, pay)) {
-            seqs.push_back(h.seq);
-            auto s = make_samples(F, ch, bits, 2000u + (uint32_t)h.seq);
-            std::vector<int32_t> gotv(s.size());
-            unpack_samples(gotv.data(), pay.data(), gotv.size(), bits);
-            for (size_t i = 0; i < s.size(); ++i) if (s[i] != gotv[i]) { ordered = false; break; }
-            ++cnt;
-            jb.observe_format(h);
-        }
-        bool seqOk = true;
-        for (size_t i = 0; i < seqs.size(); ++i) if (seqs[i] != i) seqOk = false;
-        char buf[200];
-        std::snprintf(buf, sizeof(buf), "(投入顺序被完全打乱, 输出 %zu 包, 序号连续=%s, 丢失 %llu)",
-                      cnt, seqOk ? "是" : "否", (unsigned long long)jb.stats().lost);
-        check(ordered && seqOk && cnt == NP, "乱序输入被还原为正确顺序", buf);
+        // 3b：流头被推迟到最后才到（决定性用例，不依赖标准库的 shuffle 排列）。
+        //     CI 上失败的真因就在这条路径：预滚满 4 包时把起始序号定成"已收到的最小序号"，
+        //     之后才到的 0/1 被当"迟到"丢弃 ⟹ 输出 10 包、序号从 2 开始、lost 仍为 0。
+        reorder_case({2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 1},
+                     "流头最后到达也能还原出完整 0..11");
     }
 
     printf("\n=== 4. 抖动缓冲：丢包必须补静音且时间轴连续 ===\n");
