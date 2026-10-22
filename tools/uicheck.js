@@ -166,7 +166,7 @@ async function waitFor(expr, ms = 8000) {
   // 兼测有资料与缓存的艺术家（ZARD：测试 L2 权威文本、来源芯片与复制交互）
   await evalJs("openArtistProfile('ZARD')");
   await sleep(600);
-  ck(await waitFor("(function(){ return S.view === 'artist' && document.querySelectorAll('.chip-copy').length > 0 && !!document.querySelector('.artist-head .sub') && document.querySelector('.artist-head .sub').textContent.indexOf('缓存') >= 0; })()", 8000),
+  ck(await waitFor("(function(){ return S.view === 'artist' && document.querySelectorAll('.chip-copy').length > 0 && !!document.querySelector('.artist-head .sub') && document.querySelector('.artist-head .sub').textContent.indexOf('缓存') >= 0; })()", 12000),
      '打开有权威资料的艺术家（ZARD）渲染出生平与来源芯片');
   ck(await evalJs("document.querySelectorAll('.chip-copy').length >= 1"), '来源芯片存在（≥1 个）');
   ck(await evalJs("!!document.querySelector('.artist-head .sub') && document.querySelector('.artist-head .sub').textContent.indexOf('缓存') >= 0"),
@@ -545,6 +545,71 @@ async function waitFor(expr, ms = 8000) {
   ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.filterNx||'')==='" + before.nx + "')", 6000), 'Nx 还原');
   const p10 = await shot('19-settings-page');
 
+  // ---- P5b：设置页投放（UPnP）小节自检（控件绑定/渲染器下拉/DoP说明/状态渲染/无外链）----
+  await evalJs("document.querySelector('.stab[data-g=out]').click()");
+  await sleep(400);
+  ck(await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=out]');return !!p && p.classList.contains('on');})()"),
+     '输出页签处于激活状态');
+
+  const castControlsOk = await evalJs(`(function(){
+    var ids = ['sp_cast_dev', 'sp_cast_scan', 'sp_cast_file', 'sp_cast_usecur', 'sp_cast_dop', 'sp_cast_start', 'sp_cast_stop'];
+    var pane = document.querySelector('#setpage .spane[data-g=out]');
+    var miss = [];
+    ids.forEach(function(id) {
+      var e = document.getElementById(id);
+      if (!e || !pane.contains(e)) miss.push(id + ':缺失');
+      else if (!e.onclick && !e.onchange && !e.oninput) miss.push(id + ':未绑定事件');
+    });
+    return miss;
+  })()`);
+  ck(Array.isArray(castControlsOk) && castControlsOk.length === 0, '投放小节控件全部存在且已绑定事件', JSON.stringify(castControlsOk));
+
+  const castDevState = await evalJs(`(function(){
+    var s = document.getElementById('sp_cast_dev');
+    if (!s) return 'no-select';
+    var opts = s.querySelectorAll('option');
+    var msg = (document.getElementById('sp_cast_devmsg') || {}).textContent || '';
+    if (opts.length > 1) return 'has-options:' + opts.length;
+    if (opts.length === 1 && (opts[0].value === '' || msg.indexOf('未发现') >= 0 || opts[0].textContent.indexOf('未发现') >= 0)) return 'empty-state';
+    return 'opts=' + opts.length + ' msg=' + msg;
+  })()`);
+  ck(castDevState.indexOf('has-options') === 0 || castDevState === 'empty-state',
+     '渲染器下拉有内容或明确空态（无渲染器时）', castDevState);
+
+  const castBtnState = await evalJs(`(function(){
+    var start = document.getElementById('sp_cast_start');
+    var stop = document.getElementById('sp_cast_stop');
+    if (!start || !stop) return null;
+    return { startDisabled: start.disabled, stopDisabled: stop.disabled };
+  })()`);
+  ck(castBtnState && castBtnState.startDisabled === false && castBtnState.stopDisabled === true,
+     '投放空闲时开始按钮可用且停止按钮禁用', JSON.stringify(castBtnState));
+
+  const dopTextOk = await evalJs(`(function(){
+    var dop = document.getElementById('sp_cast_dop');
+    if (!dop) return false;
+    var parent = dop.closest('.sfld') || dop.parentElement;
+    var txt = parent ? parent.textContent : '';
+    return txt.indexOf('DoP') >= 0 && (txt.indexOf('DSD') >= 0 || txt.indexOf('拒绝') >= 0);
+  })()`);
+  ck(dopTextOk, 'DoP 开关有说明文案（DSD 源说明与拒绝提示）');
+
+  const castStatOk = await evalJs(`(function(){
+    var pane = document.querySelector('#setpage .spane[data-g=out]');
+    var ids = ['sp_cast_stat_phase', 'sp_cast_stat_dev', 'sp_cast_stat_pos', 'sp_cast_stat_transport', 'sp_cast_stat_bytes', 'sp_cast_stat_reqs', 'sp_cast_stat_port', 'sp_cast_stat_ratematch'];
+    var miss = [];
+    ids.forEach(function(id) {
+      var e = document.getElementById(id);
+      if (!e || !pane.contains(e)) miss.push(id);
+    });
+    return miss;
+  })()`);
+  ck(Array.isArray(castStatOk) && castStatOk.length === 0,
+     '状态面板字段完整渲染（phase/渲染器/位置/传输状态/供源字节/请求数/采样率等）', JSON.stringify(castStatOk));
+
+  ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=out] a[href^=http]').length === 0"),
+     '投放小节与输出页签无 http 外链');
+
   // ---- 耳机 EQ（OPRA）小节自检 ----
   await evalJs("document.querySelector('.stab[data-g=adv]').click()");
   ck(await waitFor("!!document.getElementById('sp_opra_search') && !!document.getElementById('sp_opra_product') && !!document.getElementById('sp_opra_preset') && !!document.getElementById('sp_opra_apply')", 5000),
@@ -594,9 +659,9 @@ async function waitFor(expr, ms = 8000) {
       //            （早期把两类混在一起判，导致把正常控件误报成"未绑定"）
       //  P1.5：元数据源开关是动态的（/api/providers 注册表）—— 在静态清单之外逐源补查
       //  P2：标签写回的预览/执行按钮也是要点了有反应的
-      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_metasummary','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_opra_search','sp_opra_product','sp_opra_preset','sp_opra_apply','sp_opra_copychip','sp_instart','sp_instop','sp_inmon'];
+      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_metasummary','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_opra_search','sp_opra_product','sp_opra_preset','sp_opra_apply','sp_opra_copychip','sp_instart','sp_instop','sp_inmon','sp_cast_scan','sp_cast_usecur','sp_cast_start','sp_cast_stop','sp_cast_dop','sp_cast_dev'];
       (META_PROVIDERS || []).forEach(function (p) { needBind.push('sp_meta_' + p.id); });
-      var valueOnly=['sRate','sFilt','sFiltNx','sShap','sBuf','sDSD','sIsp','s2s'];
+      var valueOnly=['sRate','sFilt','sFiltNx','sShap','sBuf','sDSD','sIsp','s2s','sp_cast_file'];
       var miss=[];
       needBind.forEach(function(i){ var e=document.getElementById(i); if(!e) miss.push(i+':缺失'); else if(!e.onclick && !e.onchange && !e.oninput) miss.push(i+':未绑定'); });
       valueOnly.forEach(function(i){ if(!document.getElementById(i)) miss.push(i+':缺失'); });

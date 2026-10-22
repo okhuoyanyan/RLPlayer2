@@ -462,3 +462,9 @@ target_include_directories(test_wv2_version PRIVATE
 target_link_libraries(test_wv2_version PRIVATE version user32 ole32 advapi32)
 add_test(NAME wv2_version COMMAND test_wv2_version)
 
+# ---------------- UPnP 投放后台服务与编排测试（ROADMAP P5b） ----------------
+add_executable(test_cast_service tests/test_cast_service.cpp)
+target_include_directories(test_cast_service PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_cast_service PRIVATE rtadsp winhttp ws2_32)
+add_test(NAME cast_service COMMAND test_cast_service)
+

@@ -17,6 +17,7 @@
 #include "net/source_mgr.h"
 #include "net/library.h"
 #include "net/upnp.h"
+#include "net/cast_service.h"
 #include "net/app_icon.h"
 #include "net/zipstore.h"          // 最小 ZIP(STORE)打包：导出诊断 = 一个压缩包(2026-10-22 功能3)
 using rta::net::Library;
@@ -3908,6 +3909,93 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         ps.playing.store(true);
         ps.th = std::thread(queue_thread, p, target);
         return "{\"ok\":true,\"index\":" + std::to_string(target) + "}";
+    }
+
+    // ---------------- UPnP/DLNA 媒体投放（ROADMAP P5b）----------------
+    if (rq.path.rfind("/api/cast", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        if (rq.path.rfind("/api/cast/devices", 0) == 0) {
+            bool forceRescan = (rq.path.find("scan=1") != std::string::npos || rq.path.find("rescan=1") != std::string::npos);
+            auto devs = rta::net::CastManager::instance().get_devices(forceRescan);
+            std::ostringstream j;
+            j << "{\"ok\":true,\"n\":" << devs.size() << ",\"devices\":[";
+            for (size_t i = 0; i < devs.size(); ++i) {
+                if (i) j << ",";
+                j << "{\"name\":\"" << jesc(devs[i].name) << "\""
+                  << ",\"friendlyName\":\"" << jesc(devs[i].name) << "\""
+                  << ",\"model\":\"" << jesc(devs[i].model) << "\""
+                  << ",\"host\":\"" << jesc(devs[i].host) << "\""
+                  << ",\"port\":" << devs[i].port
+                  << ",\"location\":\"" << jesc(devs[i].location) << "\""
+                  << ",\"controlUrl\":\"" << jesc(devs[i].av_transport_url()) << "\""
+                  << ",\"avTransportUrl\":\"" << jesc(devs[i].av_transport_url()) << "\""
+                  << ",\"connectionManagerUrl\":\"" << jesc(devs[i].connection_manager_url()) << "\""
+                  << ",\"hasAVTransport\":" << (!devs[i].control.empty() ? "true" : "false")
+                  << "}";
+            }
+            j << "]}";
+            return j.str();
+        }
+        if (rq.path.rfind("/api/cast/state", 0) == 0) {
+            auto st = rta::net::CastManager::instance().get_state();
+            std::ostringstream j;
+            j << "{\"ok\":true"
+              << ",\"running\":" << (st.running ? "true" : "false")
+              << ",\"device\":\"" << jesc(st.device) << "\""
+              << ",\"sourceFile\":\"" << jesc(st.sourceFile) << "\""
+              << ",\"servePort\":" << st.servePort
+              << ",\"phase\":\"" << jesc(st.phase) << "\""
+              << ",\"positionSec\":" << st.positionSec
+              << ",\"transportState\":\"" << jesc(st.transportState) << "\""
+              << ",\"servedBytes\":" << st.servedBytes
+              << ",\"requestCount\":" << st.requestCount
+              << ",\"rateMatch\":\"" << jesc(st.rateMatch) << "\""
+              << ",\"warning\":\"" << jesc(st.warning) << "\""
+              << ",\"error\":\"" << jesc(st.error) << "\""
+              << "}";
+            return j.str();
+        }
+        if (rq.path.rfind("/api/cast/start", 0) == 0) {
+            if (rq.method != "POST") return "{\"ok\":false,\"error\":\"Method Not Allowed\"}";
+            rta::net::CastStartParams p;
+            if (!rq.body.empty() && rq.body.front() == '{') {
+                auto j = rta::net::json_parse(rq.body);
+                if (j.has("dev")) p.dev = j["dev"].s();
+                if (j.has("file")) p.file = j["file"].s();
+                if (j.has("port")) p.port = (uint16_t)j["port"].n();
+                if (j.has("rate")) p.rate = (uint32_t)j["rate"].n();
+                if (j.has("bits")) p.bits = (int)j["bits"].n();
+                if (j.has("seconds")) p.seconds = j["seconds"].n();
+                if (j.has("dop")) p.dop = (j["dop"].type == rta::net::Json::Bool) ? j["dop"].b : (j["dop"].n() != 0.0);
+            } else {
+                std::istringstream is(rq.body);
+                std::string tok;
+                while (std::getline(is, tok, '&')) {
+                    size_t eq = tok.find('=');
+                    if (eq == std::string::npos) continue;
+                    std::string k = urlDecode(tok.substr(0, eq));
+                    std::string v = urlDecode(tok.substr(eq + 1));
+                    if (k == "dev") p.dev = v;
+                    else if (k == "file") p.file = v;
+                    else if (k == "port") p.port = (uint16_t)std::atoi(v.c_str());
+                    else if (k == "rate") p.rate = (uint32_t)std::strtoul(v.c_str(), nullptr, 10);
+                    else if (k == "bits") p.bits = std::atoi(v.c_str());
+                    else if (k == "seconds") p.seconds = std::atof(v.c_str());
+                    else if (k == "dop") p.dop = (v == "1" || v == "true");
+                }
+            }
+            if (p.port == 0) p.port = 8912;
+            auto res = rta::net::CastManager::instance().start(p);
+            if (!res.ok) {
+                return "{\"ok\":false,\"error\":\"" + jesc(res.error) + "\"}";
+            }
+            return "{\"ok\":true,\"started\":true,\"phase\":\"discovering\"}";
+        }
+        if (rq.path.rfind("/api/cast/stop", 0) == 0) {
+            rta::net::CastManager::instance().stop();
+            return "{\"ok\":true,\"stopped\":true}";
+        }
+        return "{\"ok\":false,\"error\":\"未知的投放 API 路径\"}";
     }
 
     if (rq.path.rfind("/api/upnp", 0) == 0) {
