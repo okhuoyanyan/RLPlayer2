@@ -120,13 +120,20 @@ int main() {
         printf("  EC 5阶 (优化零点分布): 20kHz=%.1f dB\n", dbEc20k);
         check(dbEc20k < -20.0, "EC 5阶 20kHz 抑制达标");
 
-        // 1.3 7 阶降阶保护（1-bit 在低采样率下退回 5 阶）
+        // 1.3 7 阶降阶保护（1-bit 在低采样率或 Chebyshev 下退回 5 阶保护）
         SdmConfig cfgCheb64;
         cfgCheb64.fs = 2822400.0; cfgCheb64.order = 7; cfgCheb64.family = ModulatorFamily::Chebyshev;
         SdmModulator mCheb64(cfgCheb64);
-        check(mCheb64.steppedDown(), "DSD64 下 7 阶 1-bit 触发降阶保护");
+        check(mCheb64.steppedDown(), "DSD64 下 7 阶 1-bit Chebyshev 触发降阶保护");
         check(mCheb64.effectiveOrder() == 5, "降阶后实际运行于 5 阶");
         printf("  降阶报告原因: %s\n", mCheb64.stepDownReason().c_str());
+
+        SdmConfig cfgCheb256;
+        cfgCheb256.fs = 11289600.0; cfgCheb256.order = 7; cfgCheb256.family = ModulatorFamily::Chebyshev;
+        SdmModulator mCheb256(cfgCheb256);
+        check(mCheb256.steppedDown(), "DSD256 下 7 阶 1-bit Chebyshev 触发降阶保护（防止小信号极限环）");
+        check(mCheb256.effectiveOrder() == 5, "DSD256 降阶后安全运行于 5 阶");
+        printf("  降阶报告原因: %s\n", mCheb256.stepDownReason().c_str());
 
         // 1.4 AHM 多电平即使 7 阶在 DSD64 亦无需降阶
         SdmConfig cfgAhm64;
@@ -190,6 +197,8 @@ int main() {
                     double v = m6.process(x);
                     if (n >= warm) y6.push_back(v);
                 }
+
+
                 Spec s6 = analyse_spectrum(y6, r.fs, fin, 20000.0);
 
                 // 2.2 小信号 -60 dBFS 输入（遵从铁律 1 & 铁律 3）
@@ -219,6 +228,9 @@ int main() {
                 row.family   = modulator_family_name(f.family);
                 row.rate     = r.name;
                 row.config   = f.label;
+                if (m6.steppedDown()) {
+                    row.config += " (降阶5)";
+                }
                 row.snr_m6   = s6.snrDb;
                 row.snr_m60  = s60.snrDb;
                 row.oobNoise = s6.outBandDb;
@@ -230,7 +242,7 @@ int main() {
                 check(m6.clamped() == 0, item + " 环路无误差发散");
                 check(m6.overload() == 0, item + " -6 dBFS 稳态无限幅误触发");
                 check(std::isfinite(s6.snrDb) && s6.snrDb > 40.0, item + " -6 dBFS 带内 SNR 正常 (> 40 dB)");
-                check(std::isfinite(s60.snrDb), item + " -60 dBFS 小信号输出有效");
+                check(std::isfinite(s60.snrDb) && s60.snrDb >= 20.0, item + " -60 dBFS 小信号 SNR 达标 (>= 20 dB)");
 
                 if (f.levels > 2) {
                     check(s6.outBandDb < -30.0, item + " AHM 多电平带外噪声积分深度抑制 (< -30 dB)");

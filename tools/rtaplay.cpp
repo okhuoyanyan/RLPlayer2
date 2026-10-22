@@ -527,15 +527,15 @@ int main(int argc, char** argv) {
         // 管线已把输入升频到 dsdRate；取回 double 样本送入调制器
         rta::dsp::SdmConfig mcfg;
         mcfg.fs = (double)dsdRate;
-        // 阶数：默认 5 阶；用 --mod-order 7 时若采样率不够会自动退回 5 阶并提示
+        // 阶数：默认 5 阶；用 --mod-order 7 时若采样率不够或 Chebyshev 1-bit 会自动退回 5 阶并提示
         const int wantOrder = (modOrder > 0) ? modOrder : 5;
-        const int useOrder  = rta::dsp::stable_sdm_order(wantOrder, mcfg.fs);
-        if (useOrder != wantOrder)
-            printf("!! %d 阶调制器在 DSD%d 上不稳定（实测会饱和），已自动改用 %d 阶\n",
-                   wantOrder, dsdMultiple, useOrder);
         mcfg.family = rta::dsp::parse_modulator_family(modFamily);
-        mcfg.order = useOrder;
         mcfg.levels = (mcfg.family == rta::dsp::ModulatorFamily::Ahm ? (1 << ahmBits) : 2);
+        const int useOrder  = rta::dsp::stable_sdm_order(wantOrder, mcfg.fs, mcfg.levels, mcfg.family);
+        if (useOrder != wantOrder)
+            printf("!! %d 阶调制器在 %s / DSD%d 上不稳定（实测会饱和或失稳），已自动改用 %d 阶\n",
+                   wantOrder, rta::dsp::modulator_family_name(mcfg.family), dsdMultiple, useOrder);
+        mcfg.order = useOrder;
         mcfg.oobGainDb = oobGain;
         mcfg.ahmBits = ahmBits;
         mcfg.cutoffHz = 100000.0;
