@@ -100,6 +100,39 @@ New-Item -ItemType Directory -Force -Path $wvOut | Out-Null
 Write-Host ("bundling WebView2 " + $wvVer.Name + " ...")
 Copy-Item (Join-Path $wvVer.FullName '*') $wvOut -Recurse -Force
 
+# P2（2026-10-23）裁剪 WebView2 Locales 语言包：
+# 原始运行时内置 168 个 .pak 语言包，总计 ~128.9 MB（未压缩），占包内死重显著。
+# 为什么只留这两个：
+#   1. en-US.pak: Chromium 底层强制的根语言与终极回退（缺少可能引发 Chromium 资源定位异常）。
+#   2. zh-CN.pak: 中文简体界面语言包。
+# 其余 166 个语言包缺失只影响 WebView2 自身右键/菜单的本地化显示，绝不影响我们自己的 HTML/JS/CSS 播放器界面。
+# 裁剪后保留 Locales 目录和目录下的非 pak 文件（如有）。
+$localesDir = Join-Path $wvOut 'Locales'
+if (-not (Test-Path $localesDir)) { Fail "WebView2 Locales directory not found: $localesDir" }
+
+$prePaks = @(Get-ChildItem -LiteralPath $localesDir -Filter '*.pak')
+$prePakCount = $prePaks.Count
+$prePakBytes = ($prePaks | Measure-Object -Property Length -Sum).Sum
+Write-Host ("WebView2 Locales 裁剪前: {0} 个 .pak, {1} 字节 ({2} MB)" -f $prePakCount, $prePakBytes, [math]::Round($prePakBytes / 1MB, 2))
+
+# 删除除 en-US.pak 和 zh-CN.pak 之外的所有 *.pak
+$toDelete = $prePaks | Where-Object { $_.Name -ne 'en-US.pak' -and $_.Name -ne 'zh-CN.pak' }
+foreach ($p in $toDelete) {
+    Remove-Item -LiteralPath $p.FullName -Force
+}
+
+$postPaks = @(Get-ChildItem -LiteralPath $localesDir -Filter '*.pak')
+$postPakCount = $postPaks.Count
+$postPakBytes = ($postPaks | Measure-Object -Property Length -Sum).Sum
+Write-Host ("WebView2 Locales 裁剪后: {0} 个 .pak, {1} 字节 ({2} MB)（节省 {3} MB）" -f $postPakCount, $postPakBytes, [math]::Round($postPakBytes / 1MB, 2), [math]::Round(($prePakBytes - $postPakBytes) / 1MB, 2))
+
+# 出包守卫：en-US.pak 必须存在，且 .pak 数量必须恰为 2
+$enPak = Join-Path $localesDir 'en-US.pak'
+$zhPak = Join-Path $localesDir 'zh-CN.pak'
+if (-not (Test-Path -LiteralPath $enPak)) { Fail "Locales 守卫失败: en-US.pak 必须存在" }
+if (-not (Test-Path -LiteralPath $zhPak)) { Fail "Locales 守卫失败: zh-CN.pak 必须存在" }
+if ($postPakCount -ne 2) { Fail "Locales 守卫失败: .pak 数量必须恰为 2，当前为 $postPakCount" }
+
 $tools = @('rtaplay.exe', 'dsdconv.exe', 'make_dsd.exe', 'rtanet_rx.exe', 'dopinfo.exe',
            'wavcmp.exe', 'wasapi_probe.exe', 'naa_scan.exe', 'naa_probe.exe', 'upnp_scan.exe',
            'aidecode.exe', 'rtatag.exe')
