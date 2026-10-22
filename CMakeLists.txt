@@ -453,3 +453,12 @@ target_include_directories(test_upnp_control PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_upnp_control PRIVATE rtadsp winhttp ws2_32)
 add_test(NAME upnp_control COMMAND test_upnp_control)
 
+# WebView2 双轨版本护栏纯逻辑门禁（P3 双轨运行库护栏）
+add_executable(test_wv2_version tests/test_wv2_version.cpp)
+target_include_directories(test_wv2_version PRIVATE
+    ${CMAKE_SOURCE_DIR}/tools
+    ${CMAKE_SOURCE_DIR}/third_party/webview2/include
+)
+target_link_libraries(test_wv2_version PRIVATE version user32 ole32 advapi32)
+add_test(NAME wv2_version COMMAND test_wv2_version)
+
