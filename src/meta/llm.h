@@ -15,12 +15,8 @@
 //     重试 / 限频 / 熔断归上层（调研文档 §3「网络纪律」）
 //   * 可测试性：body 构造与响应解析全部拆成纯函数，离线喂写死报文即可测（铁律 3）
 #pragma once
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
+// （原 WIN32_LEAN_AND_MEAN / NOMINMAX 前导已删：http_client.h -> platform/http.h 会在
+//   windows.h 之前自己定义，行为不变。）
 #include "net/http_client.h"
 #include "net/json.h"
 #include <string>

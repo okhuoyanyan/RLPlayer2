@@ -9,13 +9,7 @@
 #include "gpu_pref.h"
 #include "filter_design.h"
 #include "filter_families.h"
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>   // 仅用于按需加载 rtagpu.dll（GPU 升频）
+#include "platform/dynlib.h"   // GPU 升频按需加载 rtagpu.dll —— 本目录不再直接碰平台 API
 #include <vector>
 #include <cmath>
 #include <cstdint>
@@ -331,15 +325,17 @@ private:
         // 逐个候选尝试：HIP → D3D12 → CUDA。某个 DLL 存在但 kernel 不可执行时
         // 必须继续试下一个（NVIDIA 机器上可能残留 HIP 版 rtagpu.dll）。
         for (const char* nm : gpu_dll_candidates()) {
-            HMODULE h = LoadLibraryA(nm);
-            if (!h) continue;
-            auto avail = (int (*)())GetProcAddress(h, "rta_gpu_available");
-            if (avail && avail() != 1) { FreeLibrary(h); continue; }
-            auto res = (GpuResampleFn)GetProcAddress(h, "rta_gpu_resample");
-            auto inv = (GpuVoidFn)GetProcAddress(h, "rta_gpu_resample_invalidate");
-            if (!res) { FreeLibrary(h); continue; }
+            rta::platform::SharedLib lib;
+            if (!lib.open(nm)) continue;
+            auto avail = (int (*)())lib.symbol("rta_gpu_available");
+            if (avail && avail() != 1) { lib.close(); continue; }
+            auto res = (GpuResampleFn)lib.symbol("rta_gpu_resample");
+            auto inv = (GpuVoidFn)lib.symbol("rta_gpu_resample_invalidate");
+            if (!res) { lib.close(); continue; }
             gpu_resample_ = res; gpu_invalidate_ = inv;
-            static HMODULE keep; keep = h;   // 保持模块存活
+            // 与迁移前一致：模块永久保持加载。多个重采样器实例各自持有取到的函数指针，
+            // 一旦卸载（FreeLibrary）就会变成野指针 —— 所以这里放弃所有权而不是留着析构。
+            lib.detach();
             return;
         }
     }
