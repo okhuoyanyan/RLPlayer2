@@ -329,6 +329,13 @@ inline std::string rta_ui_page() {
     h += ".trimgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}";
     h += ".setfoot{display:flex;gap:10px;align-items:center;padding:4px 2px 0}";
     h += ".setfoot .sp{flex:1}";
+    h += ".meter-bar{height:6px;border-radius:3px;background:var(--track);overflow:hidden;position:relative;margin:4px 0 2px}";
+    h += ".meter-val{height:100%;width:0%;background:linear-gradient(90deg,var(--acc),#22c55e);transition:width .12s ease;border-radius:3px}";
+    h += ".meter-val.clip{background:var(--err)}";
+    h += ".in-stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px 12px;font-size:11.5px;color:var(--txt2)}";
+    h += ".in-stat-item{background:var(--field);padding:7px 10px;border-radius:8px;border:1px solid var(--line)}";
+    h += ".in-stat-item .lbl{display:block;font-size:10px;color:var(--mut2);margin-bottom:2px}";
+    h += ".in-stat-item .val{font-weight:600;font-variant-numeric:tabular-nums}";
     // 滚动条
     h += "::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:var(--track);border-radius:5px}";
     h += "::-webkit-scrollbar-track{background:transparent}";

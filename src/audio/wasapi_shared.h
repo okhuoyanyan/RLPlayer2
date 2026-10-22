@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <cstring>
 #include "wasapi_out.h"   // 复用 COM 初始化模式 / hr_name / 端点定位
 
 namespace rta::audio {
@@ -222,6 +223,24 @@ public:
         return true;
     }
 
+    // 写入交错 float32 样本（用于采集直通监听等浮点通路）
+    size_t write_available_f32(const float* src, size_t availFrames) {
+        if (!running_ || !ac_ || !rc_ || availFrames == 0) return 0;
+        UINT32 pad = 0;
+        if (FAILED(ac_->GetCurrentPadding(&pad))) return 0;
+        lastPad_ = (long long)pad;
+        const size_t toWrite = shared_writable(bufferFrames_, pad, availFrames);
+        if (toWrite == 0) return 0;
+        BYTE* data = nullptr;
+        const HRESULT gb = rc_->GetBuffer((UINT32)toWrite, &data);
+        lastGbHr_ = (long long)gb;
+        if (FAILED(gb) || !data) return 0;
+        pack_f32(data, src, toWrite);
+        if (FAILED(rc_->ReleaseBuffer((UINT32)toWrite, 0))) return 0;
+        written_ += toWrite;
+        return toWrite;
+    }
+
     // 写入交错 int32 样本（按 mix 格式换算 float32）。返回实际写入帧数，调用方循环补满。
     size_t write_available(const int32_t* src, size_t availFrames) {
         if (!running_ || !ac_ || !rc_ || availFrames == 0) return 0;
@@ -310,6 +329,17 @@ private:
             return false;   // 混音引擎理论上恒为 float32；遇到整数格式如实拒绝
         }
         return false;
+    }
+
+    // float32 直通写出（含实时增益；gain=1 时直接 memcpy）
+    void pack_f32(BYTE* dst, const float* src, size_t frames) {
+        const size_t n = frames * (size_t)mixCh_;
+        float* p = (float*)dst;
+        if (gain_ != 1.0) {
+            for (size_t i = 0; i < n; ++i) p[i] = (float)(src[i] * gain_);
+        } else {
+            std::memcpy(p, src, n * sizeof(float));
+        }
     }
 
     // int32 → float32（含实时增益；gain=1 时走纯换算）
