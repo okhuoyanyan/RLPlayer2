@@ -28,6 +28,7 @@
 #include "meta/llm.h"
 #include "meta/enrich.h"
 #include "meta/writeback.h"
+#include "meta/knowledge.h"
 #include "audio/media_info.h"
 #include <chrono>
 #include <cstdio>
@@ -50,7 +51,9 @@ static void usage() {
            "                                        MetaStore 字段写回文件标签（默认 dry-run;--apply 真写;\n"
            "                                        PCM 逐位门禁,不一致绝不动原文件;原文件进 <store>/backups）\n"
            "  rtatag write --library [--apply]      整库写回（打印 written/skipped/failed 与失败队列路径）\n"
-           "  rtatag llm-smoke                      DeepSeek chat/search/fetch 连通性自检（需要 api_key）\n");
+           "  rtatag llm-smoke                      DeepSeek chat/search/fetch 连通性自检（需要 api_key）\n"
+           "  rtatag knowledge --kind <kind> --name <name> [--lang zh] [--refresh] [--json] [--metabase <dir>]\n"
+           "                                        查询实体权威文本材料（维基/萌娘百科 + 本地缓存/离线回退）\n");
 }
 
 // ---------------- 小工具 ----------------
@@ -456,6 +459,127 @@ static int cmd_llm_smoke() {
     return rc;
 }
 
+// ---------------- knowledge ----------------
+
+static int cmd_knowledge(const int argc, char** argv) {
+    std::string kindStr = "person";
+    std::string name;
+    std::string lang = "zh";
+    bool refresh = false;
+    bool json_output = false;
+    std::string metabase;
+    KnowledgeOpts opts;
+
+    for (int i = 2; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--kind" && i + 1 < argc) {
+            kindStr = argv[++i];
+        } else if (a == "--name" && i + 1 < argc) {
+            name = argv[++i];
+        } else if (a == "--lang" && i + 1 < argc) {
+            lang = argv[++i];
+        } else if (a == "--refresh") {
+            refresh = true;
+        } else if (a == "--json") {
+            json_output = true;
+        } else if (a == "--metabase" && i + 1 < argc) {
+            metabase = argv[++i];
+        } else if (a == "--wiki-base" && i + 1 < argc) {
+            opts.wiki_api_base = argv[++i];
+        } else if (a == "--moegirl-base" && i + 1 < argc) {
+            opts.moegirl_api_base = argv[++i];
+        } else if (a == "--offline") {
+            // 构造离线场景：将端点指向不可达地址并强制 refresh，以验证缓存离线回退
+            opts.wiki_api_base = "http://127.0.0.1:8919/unreachable_wiki";
+            opts.moegirl_api_base = "http://127.0.0.1:8919/unreachable_moe";
+            refresh = true;
+            opts.timeout_ms = 1500;
+        } else if (name.empty() && a.rfind("--", 0) != 0) {
+            name = a; // 容许直接传名：rtatag knowledge ZARD
+        }
+    }
+
+    if (name.empty()) {
+        printf("用法:\n  rtatag knowledge --kind <kind> --name <name> [--lang zh] [--refresh] [--json] [--metabase <dir>]\n");
+        return 2;
+    }
+
+    EntityKind k = EntityKind::Person;
+    if (!kindStr.empty()) {
+        if (!entity_kind_from_tag(kindStr, k)) {
+            printf("[错误] 未知实体种类: %s（支持 person / group / label / series / work / recording / release / track）\n",
+                   kindStr.c_str());
+            return 2;
+        }
+    }
+
+    opts.lang = lang;
+    opts.refresh = refresh;
+    opts.metabase = metabase;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const KnowledgeResult res = knowledge_get(k, name, opts);
+    const double elapsed_s = ms_since(t0) / 1000.0;
+
+    if (json_output) {
+        printf("{\n  \"ok\": %s,\n  \"from_cache\": %s,\n  \"offline\": %s,\n  \"materials\": [\n",
+               res.materials.empty() ? "false" : "true",
+               res.from_cache ? "true" : "false",
+               res.offline ? "true" : "false");
+        for (size_t i = 0; i < res.materials.size(); ++i) {
+            const auto& m = res.materials[i];
+            printf("    {\n"
+                   "      \"source\": \"%s\",\n"
+                   "      \"kind\": \"%s\",\n"
+                   "      \"subject\": \"%s\",\n"
+                   "      \"title\": \"%s\",\n"
+                   "      \"url\": \"%s\",\n"
+                   "      \"lang\": \"%s\",\n"
+                   "      \"fetched_at\": %lld,\n"
+                   "      \"expires_at\": %lld,\n"
+                   "      \"authority\": %d,\n"
+                   "      \"text\": \"%s\"\n"
+                   "    }%s\n",
+                   meta_jesc(m.source).c_str(),
+                   meta_jesc(m.kind).c_str(),
+                   meta_jesc(m.subject).c_str(),
+                   meta_jesc(m.title).c_str(),
+                   meta_jesc(m.url).c_str(),
+                   meta_jesc(m.lang).c_str(),
+                   m.fetched_at,
+                   m.expires_at,
+                   m.authority,
+                   meta_jesc(m.text).c_str(),
+                   (i + 1 < res.materials.size() ? "," : ""));
+        }
+        printf("  ],\n  \"error\": \"%s\"\n}\n", meta_jesc(res.error).c_str());
+        return res.materials.empty() ? 1 : 0;
+    }
+
+    const std::string eid = entity_id(k, name);
+    printf("== knowledge: kind=%s name=\"%s\" id=%s  (耗时 %.2f s)\n",
+           entity_kind_tag(k), name.c_str(), eid.c_str(), elapsed_s);
+    printf("  [状态] from_cache=%s  offline=%s  材料数=%zu\n",
+           res.from_cache ? "是" : "否",
+           res.offline ? "是" : "否",
+           res.materials.size());
+    if (!res.error.empty()) {
+        printf("  [说明] %s\n", res.error.c_str());
+    }
+    for (size_t i = 0; i < res.materials.size(); ++i) {
+        const auto& m = res.materials[i];
+        printf("  [%zu] source=%-14s kind=%-14s authority=%d lang=%s\n",
+               i + 1, m.source.c_str(), m.kind.c_str(), m.authority, m.lang.c_str());
+        printf("      title: %s\n", m.title.c_str());
+        printf("      url:   %s\n", m.url.c_str());
+        printf("      time:  %lld (%s)  expires: %lld (%s)\n",
+               m.fetched_at, fmt_ts(m.fetched_at).c_str(),
+               m.expires_at, fmt_ts(m.expires_at).c_str());
+        printf("      text:  %s\n", first_n(m.text, 200).c_str());
+    }
+    return res.materials.empty() ? 1 : 0;
+}
+
 // ---------------- main ----------------
 
 int wmain(int argc, wchar_t** argv) {
@@ -477,6 +601,7 @@ int wmain(int argc, wchar_t** argv) {
     if (cmd == "enrich")    return cmd_enrich(argc, u8argv);
     if (cmd == "write")     return cmd_write(argc, u8argv);
     if (cmd == "llm-smoke") return cmd_llm_smoke();
+    if (cmd == "knowledge") return cmd_knowledge(argc, u8argv);
     if (cmd == "store") {
         if (argc >= 3 && std::string(u8argv[2]) == "show") {
             if (argc < 4) { usage(); return 2; }

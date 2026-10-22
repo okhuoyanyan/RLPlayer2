@@ -387,6 +387,12 @@ add_executable(test_decode_retry tests/test_decode_retry.cpp)
 target_include_directories(test_decode_retry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME decode_retry COMMAND test_decode_retry)
 
+# P3 资料层② 直连层：实体 -> 权威文本材料（维基/萌娘百科 + 缓存/离线回退 + 令牌桶限频/熔断）
+add_executable(test_knowledge tests/test_knowledge.cpp)
+target_include_directories(test_knowledge PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_knowledge PRIVATE winhttp)
+add_test(NAME knowledge COMMAND test_knowledge)
+
 # 测试素材生成器：调制器 -> DSF/DFF（本机原本一个 DSD 文件都没有）
 add_executable(make_dsd tools/make_dsd.cpp)
 target_link_libraries(make_dsd PRIVATE rtadsp)
