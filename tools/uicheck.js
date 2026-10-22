@@ -96,7 +96,12 @@ async function waitFor(expr, ms = 8000) {
   await send('Log.enable');
 
   const results = [];
-  const ck = (ok, what, detail) => { results.push((ok ? '  [PASS] ' : '  [FAIL] ') + what + (detail ? '  ' + detail : '')); return ok; };
+  const ck = (ok, what, detail) => {
+    const line = (ok ? '  [PASS] ' : '  [FAIL] ') + what + (detail ? '  ' + detail : '');
+    results.push(line);
+    console.log(line);
+    return ok;
+  };
 
   await send('Page.navigate', { url: URL_ });
   await sleep(400);
@@ -128,6 +133,52 @@ async function waitFor(expr, ms = 8000) {
   await sleep(700);
   const arts = await evalJs("document.querySelectorAll('.card').length");
   ck(arts > 0, '艺术家视图有内容', arts + ' 位');
+
+  // ---- P3④a：艺术家资料页（L2 权威文本 + 来源芯片 + 空态/离线）----
+  await evalJs("document.querySelector('.card').click()");
+  await sleep(800);
+  ck(await waitFor("(function(){ return S.view === 'artist' && !!document.querySelector('.artist-head'); })()", 8000), '艺术家资料页可进入');
+  ck(await evalJs("!!document.querySelector('.artist-head') && !!document.querySelector('.artist-head h1')"), '艺术家资料页头部区块存在');
+  // 区块检查：有数据时生平与来源芯片存在，无数据时空态卡与重试按钮存在（避免强依赖外网连接成功）
+  const profileState = await evalJs(`(function(){
+    var hasSources = document.querySelectorAll('.chip-copy').length > 0;
+    var hasBio = !!document.querySelector('.bio-sec');
+    var hasEmpty = !!document.querySelector('.empty-card');
+    var hasRetry = !!document.getElementById('bRetryKnowledge');
+    if (hasSources && hasBio) return 'data-branch';
+    if (hasEmpty && hasRetry) return 'empty-branch';
+    return 'sources=' + hasSources + ' bio=' + hasBio + ' empty=' + hasEmpty + ' retry=' + hasRetry;
+  })()`);
+  ck(profileState === 'data-branch' || profileState === 'empty-branch',
+     '艺术家资料页状态正常（有数据时有简介与来源芯片，无数据时有空态卡与重试按钮）', profileState);
+  ck(await evalJs("document.querySelectorAll('a[href^=http]').length === 0"),
+     '艺术家资料页无 http 外链（来源一律使用复制链接芯片）');
+  if (profileState === 'data-branch') {
+    await evalJs("document.querySelector('.chip-copy').click()");
+    ck(await waitFor("(function(){ var t=document.getElementById('toast'); return t && t.classList.contains('on') && t.textContent.indexOf('已复制来源链接') >= 0; })()", 4000),
+       '点击来源芯片弹出「已复制来源链接」toast');
+  }
+  const pArtist = await shot('20-artist-profile');
+  await evalJs("document.getElementById('bBackArtists').click()");
+  await sleep(500);
+  ck(await waitFor("S.view === 'artists' && document.querySelectorAll('.card').length > 0"), '可从资料页返回艺术家列表');
+
+  // 兼测有资料与缓存的艺术家（ZARD：测试 L2 权威文本、来源芯片与复制交互）
+  await evalJs("openArtistProfile('ZARD')");
+  await sleep(600);
+  ck(await waitFor("(function(){ return S.view === 'artist' && document.querySelectorAll('.chip-copy').length > 0; })()", 8000),
+     '打开有权威资料的艺术家（ZARD）渲染出生平与来源芯片');
+  ck(await evalJs("document.querySelectorAll('.chip-copy').length >= 1"), '来源芯片存在（≥1 个）');
+  ck(await evalJs("!!document.querySelector('.artist-head .sub') && document.querySelector('.artist-head .sub').textContent.indexOf('缓存') >= 0"),
+     '离线/缓存标注显示正确（含「缓存 · YYYY-MM-DD 取回」）');
+  await evalJs("document.querySelector('.chip-copy').click()");
+  ck(await waitFor("(function(){ var t=document.getElementById('toast'); return t && t.classList.contains('on') && t.textContent.indexOf('已复制来源链接') >= 0; })()", 4000),
+     '点击来源芯片弹出「已复制来源链接」toast');
+  ck(await evalJs("document.querySelectorAll('a[href^=http]').length === 0"),
+     '带资料页面无 http 外链（永不跳转外部浏览器）');
+  const pZard = await shot('21-artist-profile-zard');
+  await evalJs("document.getElementById('bBackArtists').click()");
+  await sleep(500);
 
   // 文件夹
   await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='files').click()");
@@ -446,7 +497,7 @@ async function waitFor(expr, ms = 8000) {
   console.log(results.join(String.fromCharCode(10)));
   console.log('');
   console.log('截图目录: ' + OUT);
-  ['01-albums', '02-album', '03-tracks', '04-files', '05-settings', '06-search'].forEach(n => {
+  ['01-albums', '02-album', '03-tracks', '04-files', '05-settings', '06-search', '20-artist-profile', '21-artist-profile-zard'].forEach(n => {
     const p = path.join(OUT, n + '.png');
     if (fs.existsSync(p)) console.log('  ' + n + ': ' + fs.statSync(p).size + ' 字节');
   });
