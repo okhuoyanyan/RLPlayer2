@@ -61,6 +61,11 @@ target_link_libraries(rtacapture PRIVATE rtadsp ole32 uuid mmdevapi ws2_32)
 add_executable(upnp_scan tools/upnp_scan.cpp)
 target_link_libraries(upnp_scan PRIVATE ws2_32)
 
+# ---------------- UPnP/DLNA 投放 CLI（ROADMAP P5a） ----------------
+add_executable(rtacast tools/rtacast.cpp)
+target_include_directories(rtacast PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(rtacast PRIVATE rtadsp winhttp ws2_32)
+
 # ---------------- GPU 升频核验证 ----------------
 add_executable(gpu_resample_test tools/gpu_resample_test.cpp)
 target_link_libraries(gpu_resample_test PRIVATE ws2_32)
@@ -433,4 +438,10 @@ target_include_directories(test_capture PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_capture PRIVATE rtadsp ole32 uuid mmdevapi ws2_32)
 target_compile_definitions(test_capture PRIVATE RTA_CAPTURE_EXE="$<TARGET_FILE:rtacapture>")
 add_test(NAME capture COMMAND test_capture)
+
+# ---------------- UPnP 投放控制面与 HTTP 供源测试（ROADMAP P5a） ----------------
+add_executable(test_upnp_control tests/test_upnp_control.cpp)
+target_include_directories(test_upnp_control PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_upnp_control PRIVATE rtadsp winhttp ws2_32)
+add_test(NAME upnp_control COMMAND test_upnp_control)
 
