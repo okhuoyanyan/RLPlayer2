@@ -159,7 +159,7 @@ public:
             // 旧行为：直接按此时的最小序号定起始点 ⟹ 之后才到的 0/1 被当迟到整段丢弃，
             // 输出只剩 10/12 包、序号从 2 开始，而 stats.lost 仍为 0（丢包计数根本看不出来）。
             // 一旦已经交付过数据，更早的序号才是真迟到，必须丢弃（不能回头重排已播出的时间轴）。
-            if (!delivered_) nextSeq_ = h.seq;      // 回退起始点，把流头接回来
+            if (delivered_ == 0) nextSeq_ = h.seq;  // 回退起始点，把流头接回来
             else { stats_.late++; return false; }
         }
         if (map_.count(h.seq)) {
@@ -196,7 +196,7 @@ public:
         outPayload = std::move(it->second.payload);
         map_.erase(it);
         nextSeq_++;
-        delivered_ = true;      // 时间轴已经开始推进：此后 < nextSeq_ 才是真迟到
+        ++delivered_;           // 时间轴已推进；unpop 会撤销（那说明这一包其实没交付）
         return true;
     }
 
@@ -214,6 +214,9 @@ public:
         Slot s; s.header = h; s.payload = std::move(payload);
         map_[h.seq] = std::move(s);
         if (nextSeq_ > 0) nextSeq_--;      // 退回序号
+        // 这一包并没有真的交付（时钟未放行）：若它是"唯一已推进"的那次，则回到"尚未交付"状态，
+        // 这样启动阶段（0.2 s 预充期间反复 pop/unpop）仍然允许把起始点回退到真正的流头。
+        if (delivered_ > 0) --delivered_;
     }
 
     // 由调用方在判定"期望的包已超期"后调用：补一包静音并前进，保证时间轴连续。
@@ -232,7 +235,7 @@ public:
         nextSeq_++;
         stats_.lost++;
         outPayload.assign(packed_bytes(lastBits_, lastFrames_, lastChannels_), 0);
-        delivered_ = true;      // 补静音同样推进了时间轴
+        ++delivered_;           // 补静音同样推进了时间轴
         return true;
     }
 
@@ -245,10 +248,10 @@ public:
 
     size_t pending() const { return map_.size(); }
     bool started() const { return started_; }
-    bool delivered() const { return delivered_; }
+    bool delivered() const { return delivered_ > 0; }
     const JitterStats& stats() const { return stats_; }
     void reset() {
-        map_.clear(); started_ = false; delivered_ = false; firstSeq_ = -1; nextSeq_ = 0;
+        map_.clear(); started_ = false; delivered_ = 0; firstSeq_ = -1; nextSeq_ = 0;
         maxSeq_ = 0; sealedEnd_ = 0; sealed_ = false;
         stats_ = JitterStats{};
     }
@@ -258,7 +261,7 @@ private:
     std::map<uint32_t, Slot> map_;
     size_t preroll_ = 8;
     bool started_ = false;
-    bool delivered_ = false;      // 是否已经交付过数据（区分"流头乱序到达"与"真迟到"）
+    int  delivered_ = 0;          // 已推进但未撤销的交付次数（>0 才区分"流头乱序到达"与"真迟到"）
     int64_t firstSeq_ = -1;
     uint32_t nextSeq_ = 0;
     uint32_t maxSeq_ = 0;

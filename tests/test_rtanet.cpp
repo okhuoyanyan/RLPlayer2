@@ -103,16 +103,15 @@ int main() {
     {
         const int bits = 24, ch = 2; const size_t F = 128; const size_t NP = 12;
 
-        // 一个乱序用例：按给定顺序把 12 包全部投入（中途不 pop），再按顺序全部取出核对。
-        auto reorder_case = [&](const std::vector<size_t>& order, const std::string& what) {
-            printf("  投入顺序:");
-            for (size_t p : order) printf(" %zu", p);
-            printf("\n");
-            JitterBuffer jb(4);
+        auto push_all = [&](JitterBuffer& jb, const std::vector<size_t>& order) {
             for (size_t p : order) {
                 auto s = make_samples(F, ch, bits, 2000u + (uint32_t)p);
                 jb.push(build_packet((uint32_t)p, (uint64_t)p * F, 48000, ch, bits, s.data(), F, 5));
             }
+        };
+
+        // 把缓冲里的包全部取出并核对：序号必须是 0..NP-1、内容逐位一致、包数 = NP
+        auto drain_check = [&](JitterBuffer& jb, const std::string& what) {
             RtaHeader h{}; std::vector<uint8_t> pay; size_t cnt = 0; bool ordered = true;
             std::vector<uint32_t> seqs;
             while (jb.pop(h, pay)) {
@@ -133,6 +132,16 @@ int main() {
             check(ordered && seqOk && cnt == NP, what, buf);
         };
 
+        // 一个乱序用例：按给定顺序把 12 包全部投入（中途不 pop），再按顺序全部取出核对。
+        auto reorder_case = [&](const std::vector<size_t>& order, const std::string& what) {
+            printf("  投入顺序:");
+            for (size_t p : order) printf(" %zu", p);
+            printf("\n");
+            JitterBuffer jb(4);
+            push_all(jb, order);
+            drain_check(jb, what);
+        };
+
         // 3a：完全打乱。注意 std::shuffle 的排列是【实现定义】的（本机 MSVC STL 14.44 与
         //     CI runner 上的版本不同，同一个 seed 给的顺序不同），所以把实际顺序打印出来，
         //     失败时能直接照这个顺序复现。
@@ -146,6 +155,20 @@ int main() {
         //     之后才到的 0/1 被当"迟到"丢弃 ⟹ 输出 10 包、序号从 2 开始、lost 仍为 0。
         reorder_case({2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 1},
                      "流头最后到达也能还原出完整 0..11");
+
+        // 3c：模拟真实接收端的启动路径（rtanet_rx）：预滚满 4 包 ⟹ 播放线程先 pop，
+        //     但 0.2 s 预充期间时钟未放行，于是 unpop 放回 ⟹ 之后流头 0/1 才到。
+        //     unpop 的包并没有真的交付，必须把"已交付"状态一并撤销，否则起始点被锁死在 2，
+        //     这里仍然只会输出 10 包 —— 那正是"改了一半"的假修复。
+        {
+            JitterBuffer jb(4);
+            push_all(jb, {2, 3, 4, 5});
+            RtaHeader h{}; std::vector<uint8_t> pay;
+            const bool got = jb.pop(h, pay);          // 播放线程每个节拍都会尝试取一包
+            if (got) jb.unpop(h, pay);                // 时钟未放行 -> 放回（不算交付）
+            push_all(jb, {0, 1, 6, 7, 8, 9, 10, 11});
+            drain_check(jb, "pop/unpop 后流头补到，仍然完整 0..11");
+        }
     }
 
     printf("\n=== 4. 抖动缓冲：丢包必须补静音且时间轴连续 ===\n");
