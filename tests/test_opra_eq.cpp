@@ -314,6 +314,14 @@ int main() {
         check(!OpraPreset::parse_json("{}", dummy, nullptr), "缺少必要字段的空对象拒绝");
         std::vector<OpraPreset> dummies;
         check(!OpraPreset::parse_presets_json("{broken", dummies, nullptr), "畸变 JSON 传入 parse_presets_json 拒绝");
+
+        // OpraService 初始化与 baseDir/cwd 索引解析
+        bool initOk = OpraService::instance().init();
+        if (!initOk) {
+            initOk = OpraService::instance().init("", "..");
+        }
+        check(initOk, "OpraService 初始化并定位索引成功");
+        check(OpraService::instance().index().size() > 5000, "OpraService 载入轻量索引条目数 > 5000");
     }
 
     // -----------------------------------------------------------------------

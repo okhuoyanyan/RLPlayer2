@@ -1582,6 +1582,9 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         bool eqLoaded = false;
         if (!p.eqFile.empty()) {
             std::ifstream ef(p.eqFile);
+            if (!ef) {
+                ef.open(path_in_exe_dir(p.eqFile.c_str()));
+            }
             if (ef) {
                 std::string text((std::istreambuf_iterator<char>(ef)), std::istreambuf_iterator<char>());
                 // 去掉 UTF-8 BOM
@@ -1992,7 +1995,7 @@ static std::string path_in_exe_dir(const char* name) {
     std::wstring d(buf);
     const size_t s = d.find_last_of(L"\\/");
     if (s != std::wstring::npos) d = d.substr(0, s);
-    std::wstring w = d + L"\\" + std::wstring(name, name + std::strlen(name));
+    std::wstring w = (name && *name) ? (d + L"\\" + std::wstring(name, name + std::strlen(name))) : d;
     const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
     std::string o((size_t)n, 0);
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, o.data(), n, nullptr, nullptr);
@@ -3686,7 +3689,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
     // ---------------- 耳机 EQ（OPRA 预设管理）----------------
     if (rq.path.rfind("/api/opra/index", 0) == 0) {
         ct = "application/json; charset=utf-8";
-        rta::dsp::OpraService::instance().init();
+        rta::dsp::OpraService::instance().init(path_in_exe_dir("data\\opra_index.json"), path_in_exe_dir(""));
         const auto& index = rta::dsp::OpraService::instance().index();
         std::string q;
         const size_t qpos = rq.path.find("?q=");
@@ -3716,7 +3719,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
     }
     if (rq.path.rfind("/api/opra/presets", 0) == 0) {
         ct = "application/json; charset=utf-8";
-        rta::dsp::OpraService::instance().init();
+        rta::dsp::OpraService::instance().init(path_in_exe_dir("data\\opra_index.json"), path_in_exe_dir(""));
         std::string productId;
         bool forceRefresh = false;
         const size_t qpos = rq.path.find('?');
@@ -3764,7 +3767,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
     }
     if (rq.path.rfind("/api/opra/apply", 0) == 0) {
         ct = "application/json; charset=utf-8";
-        rta::dsp::OpraService::instance().init();
+        rta::dsp::OpraService::instance().init(path_in_exe_dir("data\\opra_index.json"), path_in_exe_dir(""));
         std::string productId, presetId;
         std::istringstream is(rq.body);
         std::string tok;
@@ -3780,7 +3783,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             return "{\"ok\":false,\"error\":\"缺少 productId 或 presetId 参数\"}";
         }
         std::string outRelPath, err;
-        bool ok = rta::dsp::OpraService::instance().apply_preset(productId, presetId, "", outRelPath, err);
+        bool ok = rta::dsp::OpraService::instance().apply_preset(productId, presetId, path_in_exe_dir(""), outRelPath, err);
         if (!ok) {
             std::ostringstream j;
             j << "{\"ok\":false,\"error\":\"" << jesc(err) << "\"}";
@@ -4553,6 +4556,7 @@ int main(int argc, char** argv) {
     // 播放触发补全与 /api/enrich、/api/meta、/api/cover、/api/lyrics 都走这个单例
     rta::meta::MetaStore::instance().setBaseDir(path_in_exe_dir("rlplayer-meta"));
     rta::meta::EntityStore::instance().setBaseDir(path_in_exe_dir("rlplayer-meta"));
+    rta::dsp::OpraService::instance().init(path_in_exe_dir("data\\opra_index.json"), path_in_exe_dir(""));
     if (Library::instance().trackCount() == 0) {
         printf("音乐库为空，开始首次扫描（根目录见 rlplayer-library.conf）…\n");
         Library::instance().startScan();

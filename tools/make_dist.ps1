@@ -15,7 +15,7 @@
 #
 # Usage: powershell -File tools/make_dist.ps1 [-Version 1.0.2] [-SkipGpuBuild]
 param(
-    [string]$Version = "1.0.4",
+    [string]$Version = "1.0.10",
     [switch]$SkipGpuBuild
 )
 
@@ -146,6 +146,17 @@ $readme = Get-Content (Join-Path $dist 'README-template.txt') -Raw -Encoding UTF
 $readme = $readme -replace '@VERSION@', $Version
 Set-Content -Path (Join-Path $out 'README.txt') -Value $readme -Encoding UTF8
 
+# OPRA 索引与协议声明 (CC BY-SA 4.0)
+$opraIndexSrc = Join-Path $root 'data\opra_index.json'
+if (-not (Test-Path $opraIndexSrc)) { Fail "OPRA 索引源文件缺失: $opraIndexSrc" }
+$dataOut = Join-Path $out 'data'
+New-Item -ItemType Directory -Force -Path $dataOut | Out-Null
+Copy-Item $opraIndexSrc (Join-Path $dataOut 'opra_index.json') -Force
+
+$opraNoticeSrc = Join-Path $root 'OPRA-NOTICE.txt'
+if (-not (Test-Path $opraNoticeSrc)) { Fail "OPRA 归属文件缺失: $opraNoticeSrc" }
+Copy-Item $opraNoticeSrc (Join-Path $out 'OPRA-NOTICE.txt') -Force
+
 Write-Host "=== GPU staging smoke (PATH = System32 only) ==="
 $stage = Join-Path $B '_gpustage_dist'
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
@@ -181,3 +192,12 @@ $h = Get-FileHash $zip -Algorithm SHA256
 Write-Host ("zip:    " + $zip)
 Write-Host ("size:   " + [math]::Round((Get-Item $zip).Length / 1MB, 1) + " MB")
 Write-Host ("sha256: " + $h.Hash)
+
+# 打印 OPRA 索引大小与 NOTICE 存在性
+$distIndex = Join-Path $out 'data\opra_index.json'
+$distNotice = Join-Path $out 'OPRA-NOTICE.txt'
+if (-not (Test-Path $distIndex)) { Fail "包内缺失 data\opra_index.json" }
+if (-not (Test-Path $distNotice)) { Fail "包内缺失 OPRA-NOTICE.txt" }
+$distIndexSize = (Get-Item $distIndex).Length
+Write-Host ("OPRA 索引: $distIndex ($distIndexSize 字节, " + [math]::Round($distIndexSize / 1KB, 1) + " KB)")
+Write-Host ("OPRA 归属: $distNotice (已包含)")

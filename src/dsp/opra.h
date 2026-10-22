@@ -414,15 +414,41 @@ public:
         return s;
     }
 
-    bool init(const std::string& indexFilePath = "") {
+    void set_base_dir(const std::string& baseDir) {
         std::lock_guard<std::mutex> lk(mu_);
-        namespace fs = std::filesystem;
-        std::string path = indexFilePath;
-        if (path.empty()) {
-            if (fs::exists("data/opra_index.json")) path = "data/opra_index.json";
-            else if (fs::exists("../data/opra_index.json")) path = "../data/opra_index.json";
+        baseDir_ = baseDir;
+    }
+
+    std::string base_dir() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return baseDir_;
+    }
+
+    bool init(const std::string& indexFilePath = "", const std::string& baseDir = "") {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!baseDir.empty()) {
+            baseDir_ = baseDir;
         }
-        if (!path.empty() && fs::exists(path)) {
+        if (index_.size() > 0 && indexFilePath.empty()) {
+            return true;
+        }
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        std::string path = indexFilePath;
+        if (!path.empty() && !fs::exists(path, ec)) {
+            path.clear();
+        }
+        if (path.empty()) {
+            if (!baseDir_.empty()) {
+                fs::path p = fs::path(baseDir_) / "data" / "opra_index.json";
+                if (fs::exists(p, ec)) path = p.string();
+            }
+            if (path.empty()) {
+                if (fs::exists("data/opra_index.json", ec)) path = "data/opra_index.json";
+                else if (fs::exists("../data/opra_index.json", ec)) path = "../data/opra_index.json";
+            }
+        }
+        if (!path.empty() && fs::exists(path, ec)) {
             indexPath_ = path;
             return index_.load_from_file(path);
         }
@@ -448,7 +474,15 @@ public:
         outPresets.clear();
 
         namespace fs = std::filesystem;
-        const std::string metaCachePath = "profiles/opra/metadata/" + sanitize_filename_part(productId) + ".json";
+        std::error_code ec;
+        const std::string metaRel = "profiles/opra/metadata/" + sanitize_filename_part(productId) + ".json";
+        std::string metaCachePath = metaRel;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (!baseDir_.empty()) {
+                metaCachePath = (fs::path(baseDir_) / metaRel).string();
+            }
+        }
 
         // 1. 内存缓存检查
         {
@@ -461,10 +495,18 @@ public:
             }
         }
 
-        // 2. 本地元数据缓存文件检查
-        if (!forceRefresh && fs::exists(metaCachePath)) {
+        // 2. 本地元数据缓存文件检查（优先 exe/baseDir 目录，后备当前目录）
+        std::string resolvedMetaPath;
+        if (!forceRefresh) {
+            if (fs::exists(metaCachePath, ec)) {
+                resolvedMetaPath = metaCachePath;
+            } else if (fs::exists(metaRel, ec)) {
+                resolvedMetaPath = metaRel;
+            }
+        }
+        if (!resolvedMetaPath.empty()) {
             std::string jsonStr;
-            if (load_cached_profile(metaCachePath, jsonStr)) {
+            if (load_cached_profile(resolvedMetaPath, jsonStr)) {
                 if (OpraPreset::parse_presets_json(jsonStr, outPresets, nullptr)) {
                     std::lock_guard<std::mutex> lk(mu_);
                     memCache_[productId] = outPresets;
@@ -478,9 +520,10 @@ public:
         if (!tokenBucket_.try_consume(1.0)) {
             err = "OPRA 请求频次达到上限（100次/60秒），已触发本地限频保护";
             // 若有本地元数据缓存，回退使用
-            if (fs::exists(metaCachePath)) {
+            std::string fb = fs::exists(metaCachePath, ec) ? metaCachePath : (fs::exists(metaRel, ec) ? metaRel : "");
+            if (!fb.empty()) {
                 std::string jsonStr;
-                if (load_cached_profile(metaCachePath, jsonStr) &&
+                if (load_cached_profile(fb, jsonStr) &&
                     OpraPreset::parse_presets_json(jsonStr, outPresets, nullptr)) {
                     fromCache = true;
                     return true;
@@ -491,13 +534,14 @@ public:
 
         // 4. 发起网络请求
         const std::string url = opra_url_eqs(productId, customBaseUrl);
-        auto resp = rta::net::http_get(url, { "User-Agent: RLPlayer/1.0.9 (OPRA-EQ)" }, 15000);
+        auto resp = rta::net::http_get(url, { "User-Agent: RLPlayer/1.0.10 (OPRA-EQ)" }, 15000);
         if (!resp.ok || resp.status != 200) {
             std::string netErr = resp.error.empty() ? ("HTTP " + std::to_string(resp.status)) : resp.error;
             // 网络失败尝试离线回退
-            if (fs::exists(metaCachePath)) {
+            std::string fb = fs::exists(metaCachePath, ec) ? metaCachePath : (fs::exists(metaRel, ec) ? metaRel : "");
+            if (!fb.empty()) {
                 std::string jsonStr;
-                if (load_cached_profile(metaCachePath, jsonStr) &&
+                if (load_cached_profile(fb, jsonStr) &&
                     OpraPreset::parse_presets_json(jsonStr, outPresets, nullptr)) {
                     fromCache = true;
                     err = "网络离线: 使用已缓存预设 (" + netErr + ")";
@@ -533,11 +577,20 @@ public:
                       const std::string& customBaseUrl = "https://opra.roon.app/opra") {
         err.clear();
         outRelPath = opra_profile_relpath(productId, presetId);
-        std::string fullPath = baseDir.empty() ? outRelPath : (baseDir + "/" + outRelPath);
-
+        std::string effectiveBase = baseDir;
+        if (effectiveBase.empty()) {
+            std::lock_guard<std::mutex> lk(mu_);
+            effectiveBase = baseDir_;
+        }
         namespace fs = std::filesystem;
+        std::error_code ec;
+        std::string fullPath = effectiveBase.empty() ? outRelPath : (fs::path(effectiveBase) / outRelPath).string();
+
         // 如果文件已存在，直接返回成功（已永久缓存）
-        if (fs::exists(fullPath)) {
+        if (fs::exists(fullPath, ec)) {
+            return true;
+        }
+        if (fs::exists(outRelPath, ec)) {
             return true;
         }
 
@@ -551,7 +604,7 @@ public:
                 return false;
             }
             const std::string url = opra_url_eq(presetId, customBaseUrl);
-            auto resp = rta::net::http_get(url, { "User-Agent: RLPlayer/1.0.9 (OPRA-EQ)" }, 15000);
+            auto resp = rta::net::http_get(url, { "User-Agent: RLPlayer/1.0.10 (OPRA-EQ)" }, 15000);
             if (!resp.ok || resp.status != 200) {
                 err = "预设不存在或网络离线";
                 return false;
@@ -586,6 +639,7 @@ private:
     mutable std::mutex mu_;
     OpraIndex index_;
     std::string indexPath_;
+    std::string baseDir_;
     TokenBucket tokenBucket_;
     std::map<std::string, std::vector<OpraPreset>> memCache_;
 };

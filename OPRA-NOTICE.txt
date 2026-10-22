@@ -1,0 +1,24 @@
+================================================================================
+OPRA (Open Profiles for Revealing Audio) Data Attribution Notice
+================================================================================
+
+RLPlayer 内置及按需获取的耳机 EQ 索引与预设数据来自 OPRA 开源项目：
+  - OPRA 官方服务：https://opra.roon.app/
+  - OPRA 项目仓库：https://github.com/opra-project/OPRA
+
+数据授权协议：
+  Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)
+  https://creativecommons.org/licenses/by-sa/4.0/
+
+数据获取日期：
+  2026-10-23
+
+许可与传染性说明：
+  1. data/opra_index.json 及 profiles/opra/ 下缓存的耳机 EQ 参数与元数据遵循
+     CC BY-SA 4.0 协议共享。
+  2. 耳机测量数据及目标补偿曲线的原始知识产权归各测量作者（如 oratory1990、
+     Crinacle、Innerfidelity 等）及 OPRA 贡献者所有。
+  3. CC BY-SA 4.0 仅适用于 OPRA 数据库与预设数据本身。RLPlayer 播放器自身的
+     DSP 内核、音频管线、Web 控制台及 Launcher 等全部软件源代码与二进制产物
+     不受 CC BY-SA 传染。
+================================================================================
