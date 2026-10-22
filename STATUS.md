@@ -66,6 +66,18 @@
 
 **uicheck 假红修复(同轮)**:AI 综合区断言改为「有摘要/无摘要」双状态分支(有摘要断言徽章+上标+芯片;无摘要断言空态卡+提示+禁用按钮,不许跳过),并把设置页/OPRA/保存验证的固定 sleep 全部收敛为 `waitFor` 轮询——本轮两次「UI 自检 3~5 项失败」都是这类假红,已消除。
 
+## 8. 1.0.10 正式包(本版交付物,2026-10-23)
+
+- 版本号真相源 `src/version.h` bump 到 `1.0.10`;`tools/make_dist.ps1` 默认版本同步;
+- **修掉一个打包级缺口**:OPRA 索引与缓存原来按**进程 cwd** 找 `data/opra_index.json`,包内又没有 data/ -> 正式包 OPRA 会空。
+  修复:OpraService 增加 baseDir(由 rtaweb 用 `path_in_exe_dir` 传 exe 根),索引/缓存以 exe 目录为准、cwd 仅作后备;
+  `make_dist` 复制 `data/opra_index.json`(312.4KB)与 `OPRA-NOTICE.txt`(CC BY-SA 4.0 归属)进包,**缺件拒绝出包**;
+- 产物:`dist\RLPlayer-1.0.10-win64.zip` = **387,644,214 字节(369.69 MB)**,sha256 `F87BC60D6903634268F1C110A53BF51620138B3E26CA29BF2113951984FD7D53`;
+- 验证:ctest **50/50**;**cwd 无关性实测**(cwd=包目录 与 cwd=%TEMP% 两次 `GET /api/opra/index` 均返回 6230 条);
+  bundled 模式启动 `STARTUP v1.0.10` + `已选用 包内固定版`;8899 全程无监听;包内 Locales 仅 2 pak、ffmpeg/ffprobe 12.18/11.97MB、
+  zip 内 data 索引与 NOTICE 存在、无 conf/log/profile/sk- 泄漏;
+- GitHub Release **v1.0.10** 已建(附件 digest 与本地 sha256 一致);CI(acc0bc9)两个 workflow success。
+
 ## 7. 本轮已知未解决项(铁律 4)
 
 1. ~~uicheck 固定 sleep 在重负载下会 flake~~ **已修(ea1de81)**:AI 综合区改为双状态分支断言;sleep 全部收敛为 waitFor;连续 3 次全过。
