@@ -2,6 +2,58 @@
 
 > **接手请先读**：[HANDOVER.md](HANDOVER.md)（架构/构建/已知坑）→ [ROADMAP.md](ROADMAP.md)（待开发与判据）。
 > 本文件按回合记录“做过什么、实测多少”，越往下越旧。
+# 第二十五轮:P6a 库扫描并行化 / P5b 投放 UI / L4 演绎去重 / 已知问题清理(2026-10-23)
+
+> 用户指令:无人值守连续开发。Lead 只核验/派单,编码全派 Gemini 3.8 Flash(high)子代理,并行独立 worktree。
+> 本轮结果:库扫描 **3.18× 加速**且结果逐字节一致;UPnP 投放有了设置页;L4 版本推荐补上「演绎身份」并去重;
+> 三处**已知未解决项**收口(WebView2 护栏入 ctest / rateAuto 策略纯函数测试 / PLAY_ABORT 归因);ctest 54 → **56 套**。
+
+## 1. P6a:库扫描并行化 + 信号链耗时统计(bde48f3 → 8e16c2b)
+
+- 新 `src/net/scan_pool.h`:固定大小工作线程池(默认 `min(hardware_concurrency,8)`,`scanThreads` 可配);**有界队列背压**;结果按预分配槽位聚合(**乱序完成不影响输出顺序**);取消时清空队列并安全唤醒退出;保留增量缓存逻辑;
+- **实测(真实库 653 首,只读,8911 沙箱)**:串行 30.16 s → 8 线程 **9.47 s(内核计时 3.18×,端到端 3.00×)**;两次扫描的 `rlplayer-index.tsv` **SHA256 完全一致**(A373EDCB…88A24),probe 次数 653 一致;
+- **耗时统计**:`decodeMs/ffmpegMs/wavReadMs/dspChunkUs/dspBlockMs/dspTotalMs/scanMs` 接入 `/api/status`、`/api/signal`、`/api/lib/stats`;UI 信号链弹层新增「耗时统计」节点(有值才显示,无值显示 –);设置页加「扫描线程数」;
+- 门禁:ctest **54/54**、平台边界 PASS。
+
+## 2. P5b:UPnP 投放设置页 + /api/cast(6525095 → 51f3de7)
+
+- `src/net/cast_service.h`(CastManager):设备匹配、本地 HTTP 供源(8912)、WAV/FLAC 解码打包、DSD 无 DoP 拒绝、SOAP 控制、采样率三态取证;
+- 端点:`GET /api/cast/devices`、`GET /api/cast/state`、`POST /api/cast/start`(dev/file/port/rate/bits/seconds/dop)、`POST /api/cast/stop`;
+- 设置页「投放（UPnP）」小节:渲染器下拉+重新扫描、源文件输入+「用当前播放文件」、DoP 开关(带规则说明)、开始/停止、1s 状态面板(阶段/进度/传输状态/供源字节/请求数/采样率三态+告警);
+- `tests/test_cast_service.cpp`(初始状态/空路径/文件不存在/DSD 无 DoP 拒绝/stop 回位);uicheck 全过;
+- ⚠️ 未解决:本机局域网无真实 UPnP 渲染器,发现与起播链路仅协议层+单测/回环验证,**端到端未实测**。
+
+## 3. L4:版本推荐补「演绎身份」+ 按演绎去重(971599a → db17a73)
+
+- Discogs `/releases/{id}` 详情抓取(仅前 12 条,令牌桶 25 req/min + 429 熔断,详情缓存 7 天):解析 conductor / ensemble / soloists / composer / year / label / country;
+- `dedupKey = normalize(conductor)|normalize(ensemble)|normalize_sort(soloists)`(大小写/拉丁重音/消歧义序号归一);非空按演绎去重,保留最早 year 为主、其余折叠 `otherEditions`;**空则不猜**,标 `dedupUnknown`;`complete = 去重后 distinct>=5 且每条有 url`;
+- **真网 3 部作品(各抓 12 条)**:Boléro 12 发行 → **11 个不同演绎**;Beethoven Sym5 12 → **10**;Mahler Sym5 12 → **10**,全部 `complete=true`;
+- UI 版本页新增 **指挥/乐团/独奏** 列、`+N 版` 折叠、`未明演绎` 徽标、顶部「不同演绎 X / 发行版本 Y」;
+- ⚠️ 未解决:Discogs 匿名限频;少数廉价合辑 credits 缺失(如实标未明)。
+
+## 4. 已知问题清理(565505a / ea8da58 / 18fe316)
+
+1. **WebView2 双轨版本护栏固化为 ctest**:`tests/test_wv2_version.cpp` 覆盖 10 用例(同版本/系统旧/系统新/版本读不出/只有系统/只有包内/都没有/补零/强制两轨)+ parse/compare/环境变量;**红→绿演示**:把 compare_version 反转 → 8 项失败退出码 1 → 复原 → 全绿;
+2. **rateAuto 能力失败策略抽纯函数**:`decide_capability_failure(rateAuto,want,supported,outRate,sourceRate)` 进 `src/audio/rate_pick.h`,rtaweb 接线改调它(**行为不变**),test_ratepick 增 6 组专项;
+3. **`END pos=0 error=""` 显式归因**:新起播打断上一首时打 `PLAY_ABORT prev=... reason=superseded_by_new_play`。8911 实测日志:
+   `END pos=0 played=0 total=0 clip=0 error="" file=...Pixel Library.flac` →
+   `PLAY_ABORT prev=...Pixel Library.flac reason=superseded_by_new_play` → 新 `START`/`DECODE`/`PLAY`。
+
+## 5. 门禁与交付
+
+- main 合并后:build 0 error、ctest **56/56**、平台边界 PASS、本机 verify **11/11(Fail 0)**;
+- **重要教训(铁律 4/3)**:verify.ps1 的 UI 自检与 ctest 在**并行重型构建(出包/全量编译)同时运行**时会出假红
+  (本轮出现「1 个 ctest + 3 项 UI 失败」,机器空闲串行重跑 11/11 全绿)。**以后 verify 必须在机器空闲时串行跑**。
+- **修掉一个合入即红的平台越界**:P5b 的 `src/net/cast_service.h` 直接 include windows.h/GetTempPathA/MAX_PATH(8 处),
+  边界门禁实际是 FAIL(我上轮误读输出);出包代理发现并在工作区改为 `std::filesystem::temp_directory_path` + 原子序号命名,
+  Lead 已单独提交 `c6909f0`,边界门禁恢复 PASS。**教训:门禁输出要看 exit code,不要只看尾行文案。**
+- CI 两个 workflow 对 db17a73 全绿;1.1.1 正式包(本轮交付物)见下节;
+
+## 6. 1.1.1 正式包
+
+- 版本 1.1.1;产物 `dist\RLPlayer-1.1.1-win64.zip` = **388,465,510 字节 (370.47 MB)**,sha256 `3B72561242E4958DC7C0D52A9FB464048E14A2DC33DEF3358E5DEF46FA97BE3C`(打包门禁:ffmpeg 守卫 + Locales 守卫 + 兼容门禁 + GPU 裸 PATH smoke)。
+- 包内验证:新 CLI(rtacapture/rtacast/filter_report)+ data/opra_index.json + OPRA-NOTICE.txt 齐全;bundled 启动 v1.1.1;`/api/cast/state`、`/api/input/devices`、`/api/opra/index` 全 200;8899 全程无监听。
+
 # 第二十四轮:ROADMAP 剩余阶段开跑——P4 输入采集 / P5 UPnP 投放 / P1 调制器族 / P2 滤波器变体(2026-10-23)
 
 > 用户指令:无人值守连续开发(「直到开发结束」)。Lead 只核验/派单,编码全派 Gemini 3.8 Flash(high)子代理,并行用独立 worktree。
