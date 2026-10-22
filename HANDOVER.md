@@ -1,15 +1,26 @@
 # RLPlayer 交接说明
 
-> **当前状态(2026-10-23 第二十二轮后)**:元数据智能补全方向 P0~P2 完成、P3 里程碑① 完成,**下一步 = 里程碑② 直连层**;
-> 基建三项(WebView2 双轨 / 自建精简 ffmpeg / 裁 WebView2 Locales)全部合入 main;
-> 源码树版本 **1.0.9**(验收:ctest **46/46**、ffmpeg 精简版守卫绿、平台边界 PASS、包内启动实测通过)。
-> **1.0.9 已出包**(`dist\RLPlayer-1.0.9-win64.zip`,**369.4 MB**(1.0.8 的 555.7 MB 上 **−33.5%**),
-> sha256 `831FE3462B0137FF0247C4BDDEE936FA4D169338A2BD1CE3C54FDEC61A308569`;1.0.8 旧包仍在 `dist\` 可回退)。
+> **当前状态(2026-10-23 第二十三轮后)**:**ROON/元数据 P3 资料层 ②③④ 全部完成并验收**(5 艺术家资料页带可复制来源 / 3 部古典作品各 10 条可溯源版本 / 幻觉抽检零硬伤 / 断网缓存);
+> **二轮开发目标「耳机 EQ 适配(OPRA)」完成**;基建三项(WebView2 双轨 / 自建精简 ffmpeg / 裁 Locales)全部在 main;
+> 源码树 ctest **50/50**、平台边界 PASS、uicheck 连续 3 次全过、verify 见 STATUS 第二十三轮。
+> 1.0.9 仍是当前已发布版(`dist\RLPlayer-1.0.9-win64.zip`,369.4 MB,
+> sha256 `831FE3462B0137FF0247C4BDDEE936FA4D169338A2BD1CE3C54FDEC61A308569`);**资料层+OPRA 是 1.0.9 之后的改动,下一步出 1.0.10**。
+> **资料层总恢复点**:`docs/元数据补全调研与规划.md` §1.6 + `docs/P3-资料层接口契约.md`(数据形状/UI 契约的唯一依据)+ `docs/耳机EQ-OPRA调研与设计.md`(含已拍板决策)。
 > 该方向的**总恢复点在 docs/元数据补全调研与规划.md §1.6**
 > (全景状态/代码地图/未解决项/工作方法/队列——新会话先读它),历史回合见 STATUS.md 第十三~**二十二**轮。
 > 以下为第十二轮及更早的通用交接内容,架构与坑清单仍然有效。
 >
-> **最近四轮的关键状态变化(接手必读)**:
+> **最近五轮的关键状态变化(接手必读)**:
+> - **第二十三轮(ROON P3 资料层 + 耳机 EQ/OPRA)**:② 直连层 `src/meta/knowledge.h`(维基 zh/en + 萌娘
+>   `zh.moegirl.org.cn/api.php`、OpenSearch「不猜」消歧义、令牌桶+熔断、缓存 `entities/<id>/knowledge.json` TTL30d 离线回退);
+>   ③ 检索层 `src/meta/retrieval.h`(rerank≥1.5/authority≥2/白名单 + **五道引用硬门**:每段≥1引用、id 不悬空、
+>   url 必须∈L2∪过滤后检索,任一段违规整份拒绝 + 缓存 TTL7d);④a 艺术家资料页(`/api/entity/knowledge`);
+>   ④b AI 综合区 + `src/meta/discogs.h` 版本推荐(`/api/entity/summary`、`/api/entity/versions`;`metasummary` 默认 0,
+>   界面显式生成)。**MusicBrainz 本机不可达 → L4 用 Discogs 匿名 API(免 token,25 req/min)**。
+>   另:**耳机 EQ(OPRA)** — `src/dsp/opra.h` + `data/opra_index.json`(312KB,6230 款)+ `biquad lowShelfQ/highShelfQ`
+>   + 设置页「耳机 EQ（OPRA）」(本地搜索→预设→应用到 `eq`);preamp 统一进 `ChannelProcess::gainDb`;数据 CC BY-SA 4.0 需署名。
+>   排障速记:`/api/entity/knowledge` 与 `/api/entity/summary` 都是**同步网络抓取**(走缓存时 <10ms;冷启动 1~10s);
+>   资料缓存都在 metabase(`rlplayer-meta/entities/<id>/`),删掉即回到空态;**uicheck 的 AI 区断言是双状态分支**。
 > - **第二十二轮(基建收口 + 1.0.9)**:P3 双轨 WebView2 合并(`RLPLAYER_WEBVIEW2_MODE=auto|system|bundled`,默认 auto:
 >   系统版≥包内版→系统版,否则包内版;选轨写 launcher.log);**P1 自建精简 ffmpeg**(12.18+11.97 MB,219 音频解码器,
 >   出包前 `tools\verify_ffmpeg_lite.ps1` 三层守卫,重建脚本 `tools\build_ffmpeg_lite.ps1`);

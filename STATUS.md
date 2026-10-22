@@ -2,6 +2,79 @@
 
 > **接手请先读**：[HANDOVER.md](HANDOVER.md)（架构/构建/已知坑）→ [ROADMAP.md](ROADMAP.md)（待开发与判据）。
 > 本文件按回合记录“做过什么、实测多少”，越往下越旧。
+# 第二十三轮:ROON/元数据 P3 资料层（②直连层 ③检索层 ④富页）+ 耳机 EQ(OPRA)(2026-10-23)
+
+> 用户指令:无人值守连续开发,Lead 只核验/派单,编码全派 Gemini 3.8 Flash(high)子代理;并行用独立 worktree。
+> 本轮结果:P3 资料层三个里程碑落地(②直连层/③检索层/④a 艺术家资料页/④b AI 综合+版本推荐),
+> **二轮开发目标「耳机 EQ 适配 OPRA」同步完成**;ctest 46 → **50 套**;所有网络抓取必带来源 URL + 取回时间,
+> 引用只做复制芯片(无外链),缺资料=内置空态卡,断网=缓存回退。
+
+## 1. P3② 直连层:实体 → 权威文本材料(0180f58)
+
+- 新模块 `src/meta/knowledge.h`(902 行,header-only,零 windows.h):`KnowledgeMaterial{source,kind,subject,title,text,url,lang,fetched_at,expires_at,authority}` / `KnowledgeResult{materials,errors,from_cache,offline}`;
+- 源:维基百科 zh/en(MediaWiki `opensearch` 消歧 + `extracts` 正文)、萌娘百科(`zh.moegirl.org.cn/api.php`;`mobile.moegirl` 实测被 Cloudflare 拦 404,已切换)、Discogs/Last.fm 描述符(**缺 key 快速失败、零伪造**);
+- **「不猜」消歧义**:候选里没有精确/归一化匹配时产出 `kind=disambiguation` 候选清单或报错,绝不硬取第一个;
+- 礼貌:令牌桶 1 req/s + 连续 3 次失败熔断 30s;显式 User-Agent;
+- 缓存:`<metabase>/entities/<entity_id>/knowledge.json`,原子写(tmp+rename),TTL 30 天;**过期/断网仍可离线回退**;`--offline` 可强制走缓存;
+- CLI:`rtatag knowledge --kind person --name ZARD [--refresh|--offline|--json]`;
+- 验收(真网 5 位艺术家,每条 url+fetched_at 齐全):ZARD(维基+萌娘 2 条)、初音未来(2 条)、澤田なつ(繁简重定向 2 条)、塞壬唱片(萌娘独占 1 条)、Toe(band)(英文维基 1 条);二次查询 `from_cache=是` 0.00s;断网 `--offline` 回退 `offline=是` 材料完整;
+- 门禁:build 0 error、ctest **47/47**、平台边界 PASS。
+
+## 2. P3③ 检索层:DeepSeek search/fetch + 引用纪律(f679d7b)
+
+- 新模块 `src/meta/retrieval.h`:search 结果过滤(**rerank≥1.5、authority≥2、域名白名单含子域精确匹配、URL 去重、上限 8**)、综合 prompt(只依据材料、强制 JSON、每段≥1 引用)、**五道引用硬门**(①JSON 可解析 ②每段 citations≥1 ③citation id 无悬空 ④url 必须 ∈ [L2 材料 ∪ 通过过滤的检索] ⑤url 非空;任一段违规整份拒绝,不许部分接受);
+- 编排:L2 knowledge → 1 次 ds_search → 过滤 → 2~3 次 ds_fetch → 1 次 flash 综合;缓存 `summary-<lang>.json` TTL 7 天;每实体 ≤ 1 search+3 fetch+1 chat;5 QPS 限速;
+- CLI:`rtatag summary --kind person --name ZARD [--refresh|--json]`;
+- 验收(真网 ZARD):9.55s 生成 3 节 6 段、**6/6 段落均有引用**、2 条引用 url 齐全、引用校验通过;二次 0.00s 命中缓存;
+- **幻觉抽检 5/5 无硬伤**:5 条 AI 段落逐条对照引用原文(ZARD 组合性质/经纪公司/百万单曲/9 张连续百万专辑/3800 万销量),字句与数据全部可在材料中找到;
+- 门禁:build 0 error、ctest **48/48**、平台边界 PASS。
+
+## 3. P3④a 艺术家资料页(5eb2d14 → merge 444fefa)
+
+- 端点 `GET /api/entity/knowledge?kind&name&refresh`(只读,契约 §2 JSON;空/失败 HTTP 200 + errors);
+- UI:点艺术家卡 → 资料页(头像/名称 → 简介 L2 原文长文折叠 → 风格与相似 → 资料来源);来源徽章(维基/萌娘)+ 取回日期 + **「复制链接」芯片**(clipboard + toast,无外链);空态卡(原因 + 重试);缓存标注「缓存 · YYYY-MM-DD 取回」;
+- uicheck:资料页可进入/头部/双分支(数据 vs 空态)/来源芯片/复制交互/**全页 `a[href^=http]`=0**/无 JS 异常;
+- 截图两张(空态 + ZARD 数据页,1570x905),Lead 视觉复核通过。
+
+## 4. 二轮开发目标:耳机 EQ 适配 OPRA(49ffc36 → merge 195dab9)
+
+**调研(实测)**:OPRA = Roon 发起开源项目,714 厂商 / 6,230 款耳机 / 12,594 条预设;免 key(限流 100/60s);全库 dump `opra.roonlabs.net/database_v1.jsonl`(12.6MB);数据为 biquad(preamp + peak_dip/low_shelf/high_shelf 带 Q);代码 MIT、**数据 CC BY-SA 4.0(允许随包缓存/分发,需署名)**。调研文档 `docs/耳机EQ-OPRA调研与设计.md`。
+**决策(无人值守授权拍板)**:①轻量索引(~312KB,不打包 12.6MB 全库)+ 按需抓取缓存 `profiles/opra/`;②preamp 进 `ChannelProcess::gainDb`(不扣主音量);③设置页 CC BY-SA 归属文字 + 复制链接芯片。
+**实现**:`src/dsp/opra.h`(索引过滤/100 per 60s 令牌桶/按需抓取/AutoEq 文本转换/永久缓存/离线回退)、`biquad_design::lowShelfQ/highShelfQ`(RBJ α=sinω0/2Q,旧 S=0.7 保留兼容)、`eq_text.h` LS/HS 带 Q 解析 + 奈奎斯特钳位、`/api/opra/{index,presets,apply}`、设置页「耳机 EQ（OPRA）」小节(6,230 款本地实时搜索/预设/应用)、`rtaplay` 与 `rtaweb` preamp 行为统一。
+**门禁**:ctest **48/48**(新增 opra_eq);3 款真实样本(HD600/AirPods Pro 2/WH-1000XM5)AutoEq 往返频响 **maxErr=0.000000 dB**(门槛 0.15);架式 Q 语义生效(80Hz 处 Q=1.5 vs S=0.7 差 3.205dB);**满幅 0dBFS 经 HD600 链 +5.5dB 提升 → 无 preamp 峰值 1.32(+2.38dBFS)会削波,有 preamp(-9.3dB)峰值 0.4508(-6.92dBFS)**,断言成立;uicheck 通过(8911)。
+
+## 5. P3④b AI 综合区 + Discogs 版本推荐(d945e89 → merge 08c8174)
+
+- 端点:`GET /api/entity/summary`(接 `retrieval_fetch`;`metasummary` 默认 0——**不自动调用 DeepSeek**,有缓存直读,界面按钮显式生成)与 `GET /api/entity/versions`(接 `discogs_versions`);
+- `src/meta/discogs.h`(877 行,零 windows.h):匿名 Discogs `/database/search` + `/masters/{id}/versions`(**实测免 token 可用**);令牌桶 25 req/min + 429 熔断;标题解析(清消歧义后缀、拆作曲家/乐团/指挥);缓存 `entities/<id>/versions.json` TTL 7 天原子写 + 离线回退;`complete = 条数>=5 且每条 url 非空`;
+- UI:艺术家页「AI 综合」小节(有缓存:常显**「AI 生成」徽章** + 上标引用序号 + 来源复制芯片 + disclaimer;无缓存:空态卡 + 生成按钮(未开启时禁用并提示));左导航新增「作品」→ 作品检索 + **版本表格**(年份/演奏/厂牌/格式/国家/复制链接芯片,不足 5 条如实提示);设置页元数据组新增「允许 AI 资料综合(DeepSeek,按次计费)」开关;
+- 真网验收:`/api/entity/summary` ZARD → 3 节 6 段**全部带引用**、2 条 citations(维基+萌娘,url+fetched_at 齐全);**3 部古典作品各 10 条可溯源 Discogs 版本,complete=true**:
+  - Boléro(Ravel):release/8858093、14226050、35612848、10708531…
+  - Beethoven Symphony No.5:release/14236188、19542469、21135013、5665552…
+  - Mahler Symphony No.5:release/9929933、4643954、19634065、22975103…
+- 门禁:build 0 error、ctest **50/50**(新增 discogs)、uicheck 全过。
+
+## 6. P3 整体验收(2026-10-23,用户口径见 docs/元数据补全调研与规划.md §4 P3 行)
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| 5 位艺术家资料页全带可复制来源 | ✅ | ② 真网 5 位(ZARD/初音未来/澤田なつ/塞壬唱片/Toe)每条 url+fetched_at;④a 页面来源徽章 + 复制链接芯片;二次查询 0.00s 命中缓存 |
+| 3 部古典作品版本页 ≥5 个可溯源演绎 | ✅(附注) | Boléro / Beethoven Sym5 / Mahler Sym5 各 **10 条** Discogs release URL,complete=true;**附注:单位是「Discogs 发行版本」,同录音的多版复刻可能重复计入,未按「演绎」去重**(见 §7-4) |
+| 幻觉抽检零硬伤 | ✅ | ③ 对 ZARD 摘要 5 段逐条对照引用原文,5/5 属实;④b 同源摘要 6 段引用校验通过 |
+| 断网显示缓存 | ✅ | ② `--offline` 实测 from_cache=是 offline=是 材料完整;④a 页面显示「缓存 · 日期」;summary TTL 7 天离线回退 |
+| 门禁 | ✅ | ctest **50/50**、平台边界 PASS、uicheck **连续 3 次全过**、**本机 verify 11/11(Fail 0)** |
+
+**uicheck 假红修复(同轮)**:AI 综合区断言改为「有摘要/无摘要」双状态分支(有摘要断言徽章+上标+芯片;无摘要断言空态卡+提示+禁用按钮,不许跳过),并把设置页/OPRA/保存验证的固定 sleep 全部收敛为 `waitFor` 轮询——本轮两次「UI 自检 3~5 项失败」都是这类假红,已消除。
+
+## 7. 本轮已知未解决项(铁律 4)
+
+1. ~~uicheck 固定 sleep 在重负载下会 flake~~ **已修(ea1de81)**:AI 综合区改为双状态分支断言;sleep 全部收敛为 waitFor;连续 3 次全过。
+2. 维基消歧义:跨领域同名实体(非(消歧义)页)可能直接命中第一个词条;③ 层用材料内容兜底但未做语义裁决。
+3. **MusicBrainz 本机当前不可达**(直连与 7897 代理均超时),L4 版本推荐改用 **Discogs 匿名 API**(实测 200);Last.fm 无 key 未接入。
+4. Discogs 匿名限频约 25 req/min;版本枚举在冷门作品上可能不足 5 条(如实 `complete=false`)。
+5. 「风格与相似」字段:维基/萌娘直连主要产出生平,genre/similar 待 L3 或扩展源补。
+6. OPRA 预设目前按双声道共用铺开;若官方提供分声道曲线需扩展。
+
 # 第二十二轮:基建收口(P3 双轨 WebView2 合并 / P1 裁 ffmpeg / P2 裁 Locales / 1.0.9 出包)(2026-10-23)
 
 > 用户指令:本轮只做核验与派单,编码全部派 Gemini 3.8 Flash(思考强度 high)子代理;按 P3 合并 → P1 收口 → P2 实施 → 出 1.0.9 → 更新文档。
