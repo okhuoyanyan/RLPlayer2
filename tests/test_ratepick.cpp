@@ -22,6 +22,9 @@ extern "C" __declspec(dllimport) int __stdcall SetConsoleOutputCP(unsigned int);
 using rta::audio::RatePick;
 using rta::audio::pick_output_rate;
 using rta::audio::pick_supported_rate;
+using rta::audio::CapAction;
+using rta::audio::CapDecision;
+using rta::audio::decide_capability_failure;
 
 static int g_fail = 0;
 static void ck(bool cond, const char* what, const std::string& detail = "") {
@@ -197,6 +200,95 @@ int main() {
         // max 的旧行为不能被 follow 改动（回归保护）
         ck_rate(pick_output_rate("max", 44100, {48000, 192000}, 48000).rate, 192000,
                 "max 仍取设备最高 192000（follow 不影响旧档）");
+    }
+
+    // ---------------- 8. decide_capability_failure：能力检查失败策略纯函数 ----------------
+    {
+        std::printf("[8] decide_capability_failure 能力失败策略（明确选择硬失败 / 自动换率 / 探测重试）\n");
+
+        // 8.1 明确选择不支持 → 报错文案 / 不换率
+        {
+            uint32_t outRate = 96000;
+            const CapDecision d = decide_capability_failure(false, 96000, {44100, 48000}, outRate);
+            ck(d.action == CapAction::HardFail, "明确选择不支持 → HardFail");
+            ck_rate(outRate, 96000, "明确选择不支持 → 绝不换率（outRate 保持 96000）");
+            ck(!d.changed, "明确选择不支持 → changed=false");
+            ck(d.logTag == "EXPLICIT_REJECT", "明确选择不支持 → logTag=EXPLICIT_REJECT");
+            ck(d.userMessage.find("明确指定了 96000 Hz") != std::string::npos,
+               "明确选择不支持 → userMessage 包含指定采样率 96000 Hz", d.userMessage);
+            ck(d.userMessage.find("不会自动改成别的率") != std::string::npos,
+               "明确选择不支持 → userMessage 包含 '不会自动改成别的率'", d.userMessage);
+        }
+
+        // 8.2 自动且 supported 非空 → 换到最近支持率
+        {
+            uint32_t outRate = 44100;
+            const CapDecision d = decide_capability_failure(true, 44100, {48000, 96000}, outRate, 44100);
+            ck(d.action == CapAction::FallbackRate, "自动且 supported 非空 → FallbackRate");
+            ck_rate(outRate, 48000, "44.1k 源在 48k 族端点 → 换到 48000 Hz");
+            ck(d.changed, "自动换率 → changed=true");
+            ck(d.logTag == "RATEFALLBACK", "自动换率 → logTag=RATEFALLBACK");
+            ck(d.userMessage.find("独占不支持，已用 48000 Hz") != std::string::npos,
+               "换率文案写明已用 48000 Hz", d.userMessage);
+
+            // 混族优先同族
+            uint32_t outFam = 44100;
+            const CapDecision dFam = decide_capability_failure(true, 44100, {48000, 88200}, outFam, 44100);
+            ck_rate(outFam, 88200, "混族 {48000, 88200} → 优先同族 88200 Hz");
+        }
+
+        // 8.3 自动且 supported 空 → 探测重试/保持
+        {
+            uint32_t outRate = 44100;
+            const CapDecision d = decide_capability_failure(true, 44100, {}, outRate);
+            ck(d.action == CapAction::RetryProbe, "自动且 supported 空 → RetryProbe");
+            ck_rate(outRate, 44100, "自动且 supported 空 → outRate 保持原率 44100");
+            ck(!d.changed, "自动且 supported 空 → changed=false");
+            ck(d.logTag == "RATEPROBE_EMPTY", "自动且 supported 空 → logTag=RATEPROBE_EMPTY");
+            ck(d.userMessage.find("探测为空") != std::string::npos,
+               "探测为空文案说明", d.userMessage);
+            ck(d.userMessage.find("重试或保持") != std::string::npos,
+               "探测为空文案建议重试或保持", d.userMessage);
+        }
+
+        // 8.4 边界测试：want 已在 supported 中
+        {
+            uint32_t outRate = 48000;
+            const CapDecision d = decide_capability_failure(true, 48000, {44100, 48000, 96000}, outRate);
+            ck(d.action == CapAction::Matched, "want 恰在 supported 中 → Matched");
+            ck_rate(outRate, 48000, "want 恰在 supported 中 → 保持 48000");
+            ck(!d.changed, "want 恰在 supported 中 → changed=false");
+        }
+
+        // 8.5 边界测试：supported 单元素
+        {
+            // 单元素命中
+            uint32_t outRate1 = 48000;
+            const CapDecision d1 = decide_capability_failure(false, 48000, {48000}, outRate1);
+            ck(d1.action == CapAction::Matched, "单元素 {48000} 命中 48000 → Matched");
+            ck_rate(outRate1, 48000, "单元素命中 → 48000");
+
+            // 单元素不命中 + 自动
+            uint32_t outRate2 = 44100;
+            const CapDecision d2 = decide_capability_failure(true, 44100, {48000}, outRate2);
+            ck(d2.action == CapAction::FallbackRate, "单元素 {48000} 未命中 44100 + 自动 → FallbackRate");
+            ck_rate(outRate2, 48000, "单元素未命中 + 自动 → 换到 48000");
+
+            // 单元素不命中 + 明确选择
+            uint32_t outRate3 = 44100;
+            const CapDecision d3 = decide_capability_failure(false, 44100, {48000}, outRate3);
+            ck(d3.action == CapAction::HardFail, "单元素 {48000} 未命中 44100 + 明确选择 → HardFail");
+            ck_rate(outRate3, 44100, "单元素未命中 + 明确选择 → 保持 44100 不换率");
+            ck(!d3.userMessage.empty(), "单元素未命中 + 明确选择 → 有报错文案");
+        }
+
+        // 8.6 乱序与重复支持列表
+        {
+            uint32_t outRate = 44100;
+            const CapDecision d = decide_capability_failure(true, 44100, {96000, 48000, 48000}, outRate);
+            ck_rate(outRate, 48000, "乱序重复列表 {96000, 48000, 48000} → 仍换到 48000");
+            ck(d.action == CapAction::FallbackRate, "乱序重复列表 → FallbackRate");
+        }
     }
 
     if (g_fail == 0) std::printf("== 全部通过 ==\n");

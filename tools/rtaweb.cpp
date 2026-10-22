@@ -595,6 +595,15 @@ static std::string path_in_exe_dir(const char* name);   // 定义在后面
 static void play_log(const std::string& s);              // 定义在后面
 static void play_log_rotate();
 
+// E-11: 记录上一次播放以 END pos=0 error="" 结束的状态，供下一次 START 显式归因 PLAY_ABORT
+struct LastPlayEnd {
+    bool isPosZeroNoErr = false;
+    std::string file;
+    std::chrono::steady_clock::time_point tp{};
+};
+static std::mutex g_lastEndMx;
+static LastPlayEnd g_lastEnd;
+
 // ---------------- 设备独占支持率探测（带重试 + 上次成功结果缓存）----------------
 // 为什么需要这一层（2026-10-22 现场事故，日志 playback (4).log 第 9~23 行）：
 //   第一首 44.1k FLAC 按 rate=max 探到 96000 并正常播完；紧接着播第二首，同一端点、
@@ -1170,6 +1179,17 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         ps.dspChunkUs.store(0);
         ps.dspTotalUs.store(0);
         ps.dspChunks.store(0);
+        {
+            std::lock_guard<std::mutex> lk(g_lastEndMx);
+            if (g_lastEnd.isPosZeroNoErr) {
+                const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - g_lastEnd.tp).count();
+                if (elapsedMs < 30000) {
+                    play_log("PLAY_ABORT prev=" + g_lastEnd.file + " reason=superseded_by_new_play");
+                }
+                g_lastEnd.isPosZeroNoErr = false;
+            }
+        }
         play_log("START file=" + file);
         const auto t_dec_0 = std::chrono::steady_clock::now();
         if (buf.raw.empty()) buf = read_any(file, &note);
@@ -1486,11 +1506,17 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                     // 而且若该列表恰好含源率，就等于完全不用重采样 —— 最优解）
                     int      effBitsFB = 0;
                     uint32_t pickedRate = 0;
+                    std::string pickedWhy;
                     for (int i = 0; i < nBits && effBitsFB == 0; ++i) {
                         const std::vector<uint32_t>& rates = (i < (int)ratesByBits.size())
                             ? ratesByBits[(size_t)i] : ratesByBits[0];
-                        const uint32_t r = rta::audio::pick_supported_rate(wantDevRate, in.rate, rates);
-                        if (r > 0) { effBitsFB = bitsCand[i]; pickedRate = r; }
+                        uint32_t outR = wantDevRate;
+                        const auto dec = rta::audio::decide_capability_failure(rateAuto, wantDevRate, rates, outR, in.rate);
+                        if (dec.action == rta::audio::CapAction::FallbackRate && outR > 0) {
+                            effBitsFB = bitsCand[i];
+                            pickedRate = outR;
+                            pickedWhy = dec.userMessage;
+                        }
                     }
                     if (effBitsFB != 0 && pickedRate != 0) {
                         // 设备真正打开的是 pickedRate：cfg.outRate 与 deviceRate 必须同时改。
@@ -1500,9 +1526,11 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                         cfg.outRate = pickedRate;
                         deviceRate  = pickedRate;   // 本分支只在 !dop 时进入（DoP 走上面的硬失败）
                         // 不能悄悄换率：note / ps.info / 信号链 JSON 都要写明（HF-01 同理）
-                        std::string why = "目标 " + std::to_string(wantDevRate) + " Hz 独占不支持，已用 " +
-                                          std::to_string(pickedRate) + " Hz（源 " +
-                                          std::to_string(in.rate) + " Hz 重采样，非 bit-perfect）";
+                        std::string why = pickedWhy.empty()
+                                          ? ("目标 " + std::to_string(wantDevRate) + " Hz 独占不支持，已用 " +
+                                             std::to_string(pickedRate) + " Hz（源 " +
+                                             std::to_string(in.rate) + " Hz 重采样，非 bit-perfect）")
+                                          : pickedWhy;
                         appendNote(why);
                         bitNote = bitNote.empty() ? why : (bitNote + "；" + why);
                         play_log("RATEFALLBACK " + why + " bits=" + std::to_string(effBitsFB) +
@@ -1535,10 +1563,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                        << srcDesc;    // 源采样率 + 后端：日志要能自证是哪首源、哪个后端
                     if (!rateAuto) {
                         // 明确选择档：绝不自动改率，但必须让用户清楚「做不到的是你选的那个率」
-                        es << "。你在设置里明确指定了 " << wantDevRate
-                           << " Hz，设备独占模式做不了这个采样率；"
-                              "已按你的选择报错（不会自动改成别的率，请在设置里改选设备支持的率，"
-                              "或把采样率改成\"最大\"让它自动挑）";
+                        const auto dec = rta::audio::decide_capability_failure(false, wantDevRate, {});
+                        es << "。" << dec.userMessage;
                     }
                     std::lock_guard<std::mutex> lk(ps.mtx);
                     ps.error = es.str();
@@ -2624,15 +2650,25 @@ static void queue_thread(PlayParams p, size_t start) {
 
         AudioBuffer buf = prefetch_take(cur);
         const bool done = play_one(cur, p, buf);
+        const double endPos = (ps.outRate > 0 ? (double)ps.played.load() / (double)ps.outRate : 0.0);
+        const size_t endPlayed = ps.played.load();
+        const std::string endErr = ps.error;
+        const std::string endCur = cur;
         {
             std::ostringstream es;
-            es << "END pos=" << (ps.outRate > 0 ? (double)ps.played.load() / (double)ps.outRate : 0.0)
-               << " played=" << ps.played.load() << " total=" << ps.total.load()
+            es << "END pos=" << endPos
+               << " played=" << endPlayed << " total=" << ps.total.load()
                << " clip=" << g_dbgClip.load()
-               << " error=\"" << ps.error << "\""
-               << " file=" << cur
+               << " error=\"" << endErr << "\""
+               << " file=" << endCur
                << " v" << RLPLAYER_VERSION;
             play_log(es.str());
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_lastEndMx);
+            g_lastEnd.isPosZeroNoErr = (endPos == 0.0 && endPlayed == 0 && endErr.empty());
+            g_lastEnd.file = endCur;
+            g_lastEnd.tp = std::chrono::steady_clock::now();
         }
         if (ps.stop.load() || !done) break;
 
@@ -3819,6 +3855,10 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         ps.joinIfDone();
         ps.stop.store(false);
         ps.playing.store(false);
+        {
+            std::lock_guard<std::mutex> lk(g_lastEndMx);
+            g_lastEnd.isPosZeroNoErr = false;
+        }
         { std::lock_guard<std::mutex> lk(g_q.mtx); g_q.items.clear(); g_q.index = 0; }
         queue_save();
         return "{\"ok\":true}";
@@ -4968,6 +5008,10 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         ps.stop.store(false);
         ps.paused.store(false);
         ps.playing.store(false);
+        {
+            std::lock_guard<std::mutex> lk(g_lastEndMx);
+            g_lastEnd.isPosZeroNoErr = false;
+        }
         return "{\"ok\":true}";
     }
 
@@ -5123,7 +5167,8 @@ int main(int argc, char** argv) {
     printf("  （只监听本机；播放会以独占模式接管音频设备）\n");
     printf("  按 Ctrl+C 退出\n");
     while (!g_exitReq.load()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    g_ps.stop.store(true);
+    g_ps.joinIfDone();
     ui.stop();
-    return 0;
     return 0;
 }
