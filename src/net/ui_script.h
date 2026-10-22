@@ -2051,13 +2051,13 @@ function renderSettingsPage() {
              '两者数值等价，差别只在传输方式')
        + sel('sp_modfamily', '调制器族',
               opt('dsd', 'DSD 标准（Butterworth NTF，1-bit）', ADV.modfamily || 'dsd') +
-              opt('chebyshev', '7 阶 Chebyshev（可配带外增益与截止）', ADV.modfamily || 'dsd') +
+              opt('chebyshev', 'Chebyshev（可配带外增益与截止，1-bit 保护运行于 5 阶）', ADV.modfamily || 'dsd') +
               opt('ec', 'EC 误差反馈（频带零点扩展消除）', ADV.modfamily || 'dsd') +
               opt('ahm', 'AHM 多电平（6~8 bit 风格）', ADV.modfamily || 'dsd'),
               '提供多种 NTF 滤波与量化架构；非专有黑盒曲线')
         + sel('sp_modorder', '调制器阶数',
              opt(5, '5 阶（DSD64 起）', ADV.modorder || 5) + opt(7, '7 阶（需 DSD128 以上）', ADV.modorder || 5),
-             '实测 7 阶在 DSD64 会饱和，程序会自动降为 5 阶')
+             '实测 7 阶在低采样率或 Chebyshev 1-bit 下会饱和失稳，程序会自动降为 5 阶')
        + num({ id: 'sp_modcut', label: '噪声整形拐点（kHz，0 = 100）' }, ADV.modcut, 0, 200, 5)
        + num({ id: 'sp_moddith', label: '调制器抖动（LSB，-1 = 默认）' }, ADV.moddith, -1, 1, 0.001, '抑制空闲音'))
      + sgroup('SDM 源（DSD 文件）', '原生读取 + DirectSDM',

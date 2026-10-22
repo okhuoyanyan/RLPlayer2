@@ -235,9 +235,15 @@ inline NtfPoly design_ec_ntf_poly(int order, double fcHz, double fs, double fBan
 }
 
 // 该采样率下【实际可用】的调制器阶数（含降阶保护）
-inline int stable_sdm_order(int requested, double fs, int levels = 2) {
+inline int stable_sdm_order(int requested, double fs, int levels = 2, ModulatorFamily family = ModulatorFamily::Dsd) {
     if (requested <= 5) return requested < 1 ? 1 : requested;
-    if (requested >= 7 && levels == 2 && fs < 5.6e6) return 5;
+    // 1-bit 模式保护：
+    // 1. 7 阶 Chebyshev NTF 因极点阻尼比过低（Q≈130），小信号下闭环极点易移出单位圆触发极限环失稳（底噪暴增至负 SNR）；
+    // 2. 标准 Butterworth 7 阶在 DSD64 (< 5.6 MHz) 下因量化步长大易过载饱和；
+    // 均自动降为 5 阶保护
+    if (requested >= 7 && levels == 2) {
+        if (family == ModulatorFamily::Chebyshev || fs < 5.6e6) return 5;
+    }
     return requested > 7 ? 7 : requested;
 }
 
@@ -274,11 +280,17 @@ public:
         }
 
         effectiveOrder_ = cfg_.order;
-        if (effectiveOrder_ >= 7 && levels_ == 2 && cfg_.fs < 5.6e6) {
-            effectiveOrder_ = 5;
-            steppedDown_ = true;
-            stepDownReason_ = "采样率 (" + std::to_string((int)(cfg_.fs / 1000.0)) +
-                              " kHz) 不足 5.6 MHz，7 阶 1-bit 环路易饱和，自动降为 5 阶保护";
+        if (effectiveOrder_ >= 7 && levels_ == 2) {
+            if (cfg_.family == ModulatorFamily::Chebyshev) {
+                effectiveOrder_ = 5;
+                steppedDown_ = true;
+                stepDownReason_ = "1-bit 模式下 7 阶 Chebyshev NTF 极点阻尼比过低（Q≈130），小信号下闭环极点易移出单位圆形成极限环，自动降为 5 阶保护";
+            } else if (cfg_.fs < 5.6e6) {
+                effectiveOrder_ = 5;
+                steppedDown_ = true;
+                stepDownReason_ = "采样率 (" + std::to_string((int)(cfg_.fs / 1000.0)) +
+                                  " kHz) 不足 5.6 MHz，7 阶 1-bit 环路易饱和，自动降为 5 阶保护";
+            }
         }
 
         if (cfg_.family == ModulatorFamily::Chebyshev) {

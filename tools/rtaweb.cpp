@@ -1756,8 +1756,9 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             if (dop) {
                 rta::dsp::SdmConfig mcfg;
                 mcfg.fs = (double)dsdRate;
-                mcfg.order = rta::dsp::stable_sdm_order(p.modOrder > 0 ? p.modOrder : 5, mcfg.fs);
-                mcfg.levels = 2;                 // 1-bit
+                mcfg.family = rta::dsp::parse_modulator_family(p.modFamily);
+                mcfg.levels = 2;                 // 1-bit (DoP)
+                mcfg.order = rta::dsp::stable_sdm_order(p.modOrder > 0 ? p.modOrder : 5, mcfg.fs, mcfg.levels, mcfg.family);
                 mcfg.cutoffHz = (p.modCutoff > 0.0) ? (p.modCutoff * 1000.0) : 100000.0;
                 // 默认 0.0005：1-bit 的量化步长是 2.0，旧默认 0.01 等于注入 -34 dBFS 白噪，
                 // 实测把 DSD64 的带内 SNR 从 89 dB 砍到 54 dB（听感：持续嘶声）。
