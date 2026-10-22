@@ -34,6 +34,7 @@ extern "C" __declspec(dllimport) unsigned int __stdcall timeEndPeriod(unsigned i
 #include "audio/media_info.h"
 #include "audio/wasapi_out.h"
 #include "audio/wasapi_shared.h"   // WASAPI 共享后端(VM/独占不可用兜底,2026-10-22 事故热修)
+#include "audio/wasapi_capture.h"  // WASAPI 采集核心 (ROADMAP P4b)
 #include "audio/render_loop.h"     // 渲染主循环(含 RENDERFAIL 遥测;测试与 rtaweb 共用同一份)
 #include "audio/rate_pick.h"       // 输出采样率选择的纯逻辑(可离线单测;2026-10-22 第二首按 44100 开流事故)
 #include "audio/asio_out.h"
@@ -2011,6 +2012,201 @@ static std::string path_in_exe_dir(const char* name) {
     return o;
 }
 
+// ---------------- 采集 / 直通监听状态与后台线程 (ROADMAP P4b) ----------------
+struct InputSessionState {
+    std::mutex mtx;
+    std::mutex joinMtx;
+    std::thread th;
+    std::atomic<bool> running{false};
+    std::atomic<bool> stopFlag{false};
+
+    std::string mode = "null"; // "record" | "monitor" | "null"
+    std::string device;
+    uint32_t rate = 0;
+    int channels = 0;
+    double seconds = 0.0;
+    uint64_t frames = 0;
+    double water = 0.0;
+    uint64_t overflow = 0;
+    uint64_t underflow = 0;
+    long long posClips = 0;
+    long long negClips = 0;
+    std::string outFile;
+    double rmsDb = -999.0;
+    double peakDb = -999.0;
+    std::string error;
+
+    void reap() {
+        std::lock_guard<std::mutex> lk(joinMtx);
+        if (!running.load() && th.joinable()) {
+            th.join();
+        }
+    }
+
+    void stop() {
+        stopFlag.store(true);
+        std::lock_guard<std::mutex> lk(joinMtx);
+        if (th.joinable()) {
+            th.join();
+        }
+        running.store(false);
+    }
+};
+static InputSessionState g_inputSession;
+
+static std::string default_recording_path() {
+    std::string recDir = path_in_exe_dir("recordings");
+    std::error_code ec;
+    fs::create_directories(fs::u8path(recDir), ec);
+    auto t = std::time(nullptr);
+    auto tm = *std::localtime(&t);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "cap-%Y%m%d-%H%M%S.wav", &tm);
+    return recDir + "/" + buf;
+}
+
+static void input_worker_func(std::shared_ptr<rta::audio::WasapiCapture> cap,
+                              std::shared_ptr<rta::audio::WasapiSharedOutput> sharedOut,
+                              std::string mode,
+                              std::string outFile,
+                              double maxSeconds) {
+    HRESULT ci = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool ownCom = SUCCEEDED(ci);
+
+    const uint32_t rate = cap->rate();
+    const int channels = cap->channels();
+    const size_t totalTargetFrames = (maxSeconds > 0.0) ? (size_t)(maxSeconds * (double)rate) : 0;
+
+    std::vector<float> recorded;
+    if (mode == "record" && totalTargetFrames > 0) {
+        recorded.reserve(totalTargetFrames * (size_t)channels);
+    }
+
+    std::vector<float> chunk(2048 * (size_t)channels);
+    size_t recordedFrames = 0;
+    auto tStart = std::chrono::steady_clock::now();
+
+    while (!g_inputSession.stopFlag.load()) {
+        if (totalTargetFrames > 0 && recordedFrames >= totalTargetFrames) {
+            break;
+        }
+        size_t want = 2048;
+        if (totalTargetFrames > 0 && recordedFrames + want > totalTargetFrames) {
+            want = totalTargetFrames - recordedFrames;
+        }
+
+        size_t n = cap->read_available(chunk.data(), want);
+        if (n > 0) {
+            if (mode == "record") {
+                recorded.insert(recorded.end(), chunk.begin(), chunk.begin() + n * (size_t)channels);
+            }
+            recordedFrames += n;
+
+            // RMS 与峰值计算
+            double sumSq = 0.0;
+            double maxPeak = 0.0;
+            const size_t totalSamples = n * (size_t)channels;
+            for (size_t i = 0; i < totalSamples; ++i) {
+                double absVal = std::fabs((double)chunk[i]);
+                if (absVal > maxPeak) maxPeak = absVal;
+                sumSq += (double)chunk[i] * (double)chunk[i];
+            }
+            double rms = (totalSamples > 0) ? std::sqrt(sumSq / (double)totalSamples) : 0.0;
+            double rmsDb = (rms > 1e-12) ? 20.0 * std::log10(rms) : -999.0;
+            double peakDb = (maxPeak > 1e-12) ? 20.0 * std::log10(maxPeak) : -999.0;
+
+            // 直通监听（如果配置了共享输出）
+            if (sharedOut && sharedOut->is_float()) {
+                if (cap->rate() == sharedOut->mix_rate() && cap->channels() == sharedOut->mix_channels()) {
+                    sharedOut->write_available_f32(chunk.data(), n);
+                } else if (cap->rate() == sharedOut->mix_rate() && cap->channels() == 1 && sharedOut->mix_channels() == 2) {
+                    std::vector<float> stereo(n * 2);
+                    for (size_t i = 0; i < n; ++i) {
+                        stereo[i * 2 + 0] = chunk[i];
+                        stereo[i * 2 + 1] = chunk[i];
+                    }
+                    sharedOut->write_available_f32(stereo.data(), n);
+                } else {
+                    double ratio = (double)cap->rate() / (double)sharedOut->mix_rate();
+                    size_t outFrames = (size_t)((double)n / ratio);
+                    int outCh = sharedOut->mix_channels();
+                    if (outFrames > 0 && outCh > 0) {
+                        std::vector<float> resampled(outFrames * (size_t)outCh);
+                        for (size_t i = 0; i < outFrames; ++i) {
+                            double srcIdx = (double)i * ratio;
+                            size_t idx0 = (size_t)srcIdx;
+                            size_t idx1 = (idx0 + 1 < n) ? idx0 + 1 : idx0;
+                            double frac = srcIdx - (double)idx0;
+                            for (int ch = 0; ch < outCh; ++ch) {
+                                int srcCh = (ch < channels) ? ch : (channels - 1);
+                                float s0 = chunk[idx0 * (size_t)channels + srcCh];
+                                float s1 = chunk[idx1 * (size_t)channels + srcCh];
+                                resampled[i * (size_t)outCh + ch] = (float)((1.0 - frac) * s0 + frac * s1);
+                            }
+                        }
+                        sharedOut->write_available_f32(resampled.data(), outFrames);
+                    }
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(g_inputSession.mtx);
+                g_inputSession.frames = recordedFrames;
+                g_inputSession.seconds = (double)recordedFrames / (double)rate;
+                g_inputSession.water = cap->water_level();
+                g_inputSession.overflow = cap->overflow_count();
+                g_inputSession.underflow = cap->underflow_count();
+                g_inputSession.posClips = cap->positive_clips();
+                g_inputSession.negClips = cap->negative_clips();
+                g_inputSession.rmsDb = rmsDb;
+                g_inputSession.peakDb = peakDb;
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+
+        if (maxSeconds > 0.0) {
+            auto now = std::chrono::steady_clock::now();
+            double el = std::chrono::duration<double>(now - tStart).count();
+            if (el > maxSeconds + 3.0) {
+                break;
+            }
+        }
+    }
+
+    cap->stop();
+    if (sharedOut) sharedOut->close();
+
+    // 录制落盘
+    if (mode == "record" && recordedFrames > 0 && !outFile.empty()) {
+        try {
+            std::error_code ec;
+            auto p = fs::u8path(outFile);
+            if (p.has_parent_path()) {
+                fs::create_directories(p.parent_path(), ec);
+            }
+            rta::audio::write_capture_wav(outFile, recorded.data(), recordedFrames, channels, rate, 24);
+        } catch (const std::exception& e) {
+            std::lock_guard<std::mutex> lk(g_inputSession.mtx);
+            g_inputSession.error = "WAV写入失败: " + std::string(e.what());
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_inputSession.mtx);
+        g_inputSession.running.store(false);
+        g_inputSession.frames = recordedFrames;
+        g_inputSession.seconds = (rate > 0) ? (double)recordedFrames / (double)rate : 0.0;
+        g_inputSession.water = cap->water_level();
+        g_inputSession.overflow = cap->overflow_count();
+        g_inputSession.underflow = cap->underflow_count();
+        g_inputSession.posClips = cap->positive_clips();
+        g_inputSession.negClips = cap->negative_clips();
+    }
+
+    if (ownCom) CoUninitialize();
+}
+
 // rlplayer-llm.conf 的可选 proxy= 行(P1.5 后备代理)。llm.h 的 LlmConfig 不带该字段
 // (llm.h 不在本轮可改清单),rtaweb 侧自行解析同一文件:键名 proxy,值形如
 // http://127.0.0.1:7897;# 注释/空行/trim 规则与 llm_config_load 一致。没有该行 → 空。
@@ -3829,6 +4025,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                                            "gpuvendor", "dsdnative", "directsdm", "dsdkind", "dsdconv",
                                            "backend", "naahost", "channels", "trim",
                                            "inbackend", "indev", "inoffset", "inbuf", "inmon",
+                                           "inseconds", "inout",
                                            "sdmfilt", "sdmfiltnx",
                                            // 耳机 EQ (OPRA)
                                            "opraproduct", "oprapreset", "opravendor",
@@ -4019,21 +4216,245 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         return j.str();
     }
 
-    // 输入端点（线路输入 / 麦克风）
-    if (rq.path.rfind("/api/indevices", 0) == 0) {
+    // ---------------- ROADMAP P4b：输入采集与直通监听 API ----------------
+    // 设备列表：含 loopback 端点标记、默认、混音率/声道/位深
+    if (rq.path.rfind("/api/input/devices", 0) == 0 || rq.path.rfind("/api/indevices", 0) == 0) {
         ct = "application/json; charset=utf-8";
         std::ostringstream j;
-        j << "{\"ok\":true,\"devices\":[";
+        j << R"({"ok":true,"devices":[)";
         bool first = true;
-        for (const auto& d : WasapiOutput::enumerate_capture()) {
+        for (const auto& d : rta::audio::WasapiCapture::enumerate_capture(true)) {
             if (d.state != DEVICE_STATE_ACTIVE) continue;
             if (!first) j << ",";
             first = false;
-            j << "{\"id\":\"" << jesc(d.id) << "\",\"name\":\"" << jesc(d.name) << "\""
-              << ",\"default\":" << (d.isDefault ? "true" : "false") << "}";
+            j << R"({"id":")" << jesc(d.id) << R"(",)"
+              << R"("name":")" << jesc(d.name) << R"(",)"
+              << R"("state":)" << (unsigned long)d.state << ","
+              << R"("isDefault":)" << (d.isDefault ? "true" : "false") << ","
+              << R"("isLoopback":)" << (d.isLoopback ? "true" : "false") << ","
+              << R"("mixRate":)" << d.mixRate << ","
+              << R"("mixChannels":)" << d.mixChannels << ","
+              << R"("mixBits":)" << d.mixBits
+              << "}";
         }
         j << "]}";
         return j.str();
+    }
+
+    // 实时状态：{running, mode(record|monitor|null), device, rate, channels, seconds, frames, water, overflow, underflow, posClips, negClips, outFile, rmsDb, peakDb, error}
+    if (rq.path.rfind("/api/input/state", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        std::lock_guard<std::mutex> lk(g_inputSession.mtx);
+        std::ostringstream j;
+        j << R"({"ok":true)";
+        j << R"(,"running":)" << (g_inputSession.running.load() ? "true" : "false");
+        j << R"(,"mode":")" << jesc(g_inputSession.mode) << R"(")";
+        j << R"(,"device":")" << jesc(g_inputSession.device) << R"(")";
+        j << R"(,"rate":)" << g_inputSession.rate;
+        j << R"(,"channels":)" << g_inputSession.channels;
+        j << R"(,"seconds":)" << g_inputSession.seconds;
+        j << R"(,"frames":)" << g_inputSession.frames;
+        j << R"(,"water":)" << g_inputSession.water;
+        j << R"(,"overflow":)" << g_inputSession.overflow;
+        j << R"(,"underflow":)" << g_inputSession.underflow;
+        j << R"(,"posClips":)" << g_inputSession.posClips;
+        j << R"(,"negClips":)" << g_inputSession.negClips;
+        j << R"(,"outFile":")" << jesc(g_inputSession.outFile) << R"(")";
+        j << R"(,"rmsDb":)" << g_inputSession.rmsDb;
+        j << R"(,"peakDb":)" << g_inputSession.peakDb;
+        j << R"(,"error":")" << jesc(g_inputSession.error) << R"(")";
+        j << "}";
+        return j.str();
+    }
+
+    // 启动采集：POST /api/input/start
+    // 参数：mode=record|monitor、dev=<子串或 id>、loopback=1、out=<wav>、seconds=<上限>；
+    // 测试用：src=null&inject=1000:0.001 走模拟源（不开设备、不发声），用于自动化门禁
+    if (rq.path.rfind("/api/input/start", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        auto parseParams = [](const rta::net::HttpRequest& req) {
+            std::map<std::string, std::string> m;
+            auto trim = [](std::string s) {
+                while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
+                size_t p = 0;
+                while (p < s.size() && (s[p] == '\r' || s[p] == '\n' || s[p] == ' ' || s[p] == '\t')) p++;
+                return s.substr(p);
+            };
+            auto parseStr = [&](const std::string& str) {
+                std::istringstream is(str);
+                std::string tok;
+                while (std::getline(is, tok, '&')) {
+                    tok = trim(tok);
+                    if (tok.empty()) continue;
+                    const size_t e = tok.find('=');
+                    if (e == std::string::npos) {
+                        m[trim(urlDecode(tok))] = "1";
+                    } else {
+                        m[trim(urlDecode(tok.substr(0, e)))] = trim(urlDecode(tok.substr(e + 1)));
+                    }
+                }
+            };
+            const size_t q = req.path.find('?');
+            if (q != std::string::npos) parseStr(req.path.substr(q + 1));
+            if (!req.body.empty()) parseStr(req.body);
+            return m;
+        };
+
+        auto params = parseParams(rq);
+        if (g_inputSession.running.load()) {
+            return R"({"ok":false,"error":"设备忙：采集已在运行中"})";
+        }
+        g_inputSession.reap();
+
+        std::string mode = "record";
+        if (params.count("mode")) mode = params["mode"];
+        std::string src = params.count("src") ? params["src"] : "";
+        if (src == "null" && (!params.count("mode") || params["mode"] == "null")) {
+            mode = "null";
+        }
+        if (mode != "record" && mode != "monitor" && mode != "null") {
+            return R"({"ok":false,"error":"不支持的采集模式: )" + jesc(mode) + R"EOF( (仅支持 record/monitor/null)"})EOF";
+        }
+
+        std::string dev = params.count("dev") ? params["dev"] : "";
+        bool loopback = (params.count("loopback") && (params["loopback"] == "1" || params["loopback"] == "true"));
+        double seconds = params.count("seconds") ? std::strtod(params["seconds"].c_str(), nullptr) : 0.0;
+        if (seconds < 0.0 || std::isnan(seconds)) seconds = 0.0;
+        if (seconds > 86400.0) seconds = 86400.0;
+        std::string outFile = params.count("out") ? params["out"] : "";
+        if (!outFile.empty() && !valid_utf8(outFile)) {
+            return utf8_path_reject(outFile);
+        }
+
+        double injectFreq = 1000.0;
+        double injectAmp = 0.001;
+        if (params.count("inject")) {
+            std::string inj = params["inject"];
+            size_t colon = inj.find(':');
+            if (colon != std::string::npos) {
+                injectFreq = std::strtod(inj.substr(0, colon).c_str(), nullptr);
+                injectAmp = std::strtod(inj.substr(colon + 1).c_str(), nullptr);
+            } else {
+                injectFreq = std::strtod(inj.c_str(), nullptr);
+            }
+        }
+
+        // 若选择回环设备且未显式指定 loopback 标志，自动识别
+        if (!loopback && !dev.empty()) {
+            auto allDevs = rta::audio::WasapiCapture::enumerate_capture(true);
+            for (const auto& d : allDevs) {
+                if (d.id == dev || d.name == dev || d.name.find(dev) != std::string::npos) {
+                    if (d.isLoopback) loopback = true;
+                    break;
+                }
+            }
+        }
+
+        if (src != "null" && mode != "null" && !dev.empty() && dev[0] != '{') {
+            auto allDevs = rta::audio::WasapiCapture::enumerate_capture(loopback);
+            bool found = false;
+            for (const auto& d : allDevs) {
+                if (d.id == dev || d.name == dev || d.name.find(dev) != std::string::npos) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return R"({"ok":false,"error":"打开采集端点失败: 未找到指定的设备 [)" + jesc(dev) + R"(]"})";
+            }
+        }
+
+        rta::audio::CaptureConfig cfg;
+        cfg.deviceId = dev;
+        cfg.loopback = loopback;
+        cfg.bufferMs = 100.0;
+        cfg.eventDriven = true;
+        cfg.srcNull = (src == "null" || mode == "null");
+        cfg.injectFreq = injectFreq;
+        cfg.injectAmp = injectAmp;
+        cfg.paced = true;
+        if (cfg.srcNull && seconds > 0.0) {
+            cfg.targetFrames = (size_t)(seconds * 48000.0);
+        }
+
+        auto cap = std::make_shared<rta::audio::WasapiCapture>();
+        if (!cap->open(cfg)) {
+            std::string err = cap->last_error();
+            if (err.empty()) err = "打开采集端点失败: 无法打开目标采集设备或端点不存在";
+            return R"({"ok":false,"error":")" + jesc(err) + R"("})";
+        }
+
+        std::shared_ptr<rta::audio::WasapiSharedOutput> sharedOut;
+        if (mode == "monitor" && !cfg.srcNull) {
+            // 直通监听（非 bit-perfect）：送往默认共享输出端点
+            sharedOut = std::make_shared<rta::audio::WasapiSharedOutput>();
+            if (!sharedOut->open("", cap->rate(), cap->channels(), 32)) {
+                cap->close();
+                return R"({"ok":false,"error":"直通监听打开输出端点失败: )" + jesc(sharedOut->last_error()) + R"("})";
+            }
+            if (!sharedOut->start()) {
+                cap->close();
+                return R"({"ok":false,"error":"直通监听启动输出失败: )" + jesc(sharedOut->last_error()) + R"("})";
+            }
+        }
+
+        if (!cap->start()) {
+            if (sharedOut) sharedOut->close();
+            cap->close();
+            std::string err = cap->last_error();
+            if (err.empty()) err = "启动采集流失败";
+            return R"({"ok":false,"error":"启动采集流失败: )" + jesc(err) + R"("})";
+        }
+
+        if (mode == "record" && outFile.empty()) {
+            outFile = default_recording_path();
+        }
+
+        std::string devName = dev.empty() ? "(默认端点)" : dev;
+        if (cfg.srcNull) {
+            devName = "模拟源 (48k/2ch)";
+        } else {
+            for (const auto& d : rta::audio::WasapiCapture::enumerate_capture(loopback)) {
+                if (d.id == dev || d.name.find(dev) != std::string::npos) {
+                    devName = d.name;
+                    break;
+                }
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(g_inputSession.mtx);
+            g_inputSession.mode = mode;
+            g_inputSession.device = devName;
+            g_inputSession.rate = cap->rate();
+            g_inputSession.channels = cap->channels();
+            g_inputSession.seconds = 0.0;
+            g_inputSession.frames = 0;
+            g_inputSession.water = 0.0;
+            g_inputSession.overflow = 0;
+            g_inputSession.underflow = 0;
+            g_inputSession.posClips = 0;
+            g_inputSession.negClips = 0;
+            g_inputSession.outFile = (mode == "record") ? outFile : "";
+            g_inputSession.rmsDb = -999.0;
+            g_inputSession.peakDb = -999.0;
+            g_inputSession.error.clear();
+            g_inputSession.stopFlag.store(false);
+            g_inputSession.running.store(true);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(g_inputSession.joinMtx);
+            g_inputSession.th = std::thread(input_worker_func, cap, sharedOut, mode, outFile, seconds);
+        }
+        return R"({"ok":true})";
+    }
+
+    // 停止采集：POST /api/input/stop
+    if (rq.path.rfind("/api/input/stop", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        g_inputSession.stop();
+        return R"({"ok":true})";
     }
 
     // ---------------- 导出诊断：一个压缩包（2026-10-22 功能3）----------------

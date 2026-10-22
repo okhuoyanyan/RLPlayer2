@@ -166,7 +166,7 @@ async function waitFor(expr, ms = 8000) {
   // 兼测有资料与缓存的艺术家（ZARD：测试 L2 权威文本、来源芯片与复制交互）
   await evalJs("openArtistProfile('ZARD')");
   await sleep(600);
-  ck(await waitFor("(function(){ return S.view === 'artist' && document.querySelectorAll('.chip-copy').length > 0; })()", 8000),
+  ck(await waitFor("(function(){ return S.view === 'artist' && document.querySelectorAll('.chip-copy').length > 0 && !!document.querySelector('.artist-head .sub') && document.querySelector('.artist-head .sub').textContent.indexOf('缓存') >= 0; })()", 8000),
      '打开有权威资料的艺术家（ZARD）渲染出生平与来源芯片');
   ck(await evalJs("document.querySelectorAll('.chip-copy').length >= 1"), '来源芯片存在（≥1 个）');
   ck(await evalJs("!!document.querySelector('.artist-head .sub') && document.querySelector('.artist-head .sub').textContent.indexOf('缓存') >= 0"),
@@ -298,6 +298,73 @@ async function waitFor(expr, ms = 8000) {
   // 2026-10-22 功能3：「诊断」独立成页，排在元数据之后
   ck(tabOrder === '输入/输出/PCM/SDM/高级/元数据/诊断',
      '设置页签顺序为 输入/输出/PCM/SDM/高级/元数据/诊断', tabOrder);
+
+  // ---- P4b：设置页输入面板自检（控件绑定/设备下拉/起停状态/状态渲染/无外链）----
+  await evalJs("document.querySelector('.stab[data-g=in]').click()");
+  await sleep(400);
+  ck(await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=in]');return !!p && p.classList.contains('on');})()"),
+     '输入页签可切换且当前处于激活状态');
+
+  const inControlsOk = await evalJs(`(function(){
+    var ids = ['sp_inbackend', 'sp_indev', 'sp_inbuf', 'sp_inch', 'sp_inmon', 'sp_inseconds', 'sp_inout', 'sp_instart', 'sp_instop'];
+    var pane = document.querySelector('#setpage .spane[data-g=in]');
+    var miss = [];
+    ids.forEach(function(id) {
+      var e = document.getElementById(id);
+      if (!e || !pane.contains(e)) miss.push(id + ':缺失');
+      else if (!e.onclick && !e.onchange && !e.oninput) miss.push(id + ':未绑定事件');
+    });
+    return miss;
+  })()`);
+  ck(Array.isArray(inControlsOk) && inControlsOk.length === 0, '输入页签控件全部存在且已绑定事件', JSON.stringify(inControlsOk));
+
+  const devState = await evalJs(`(function(){
+    var s = document.getElementById('sp_indev');
+    if (!s) return 'no-select';
+    var opts = s.querySelectorAll('option');
+    var msg = (document.getElementById('sp_inmsg') || {}).textContent || '';
+    if (opts.length > 1) return 'has-options:' + opts.length;
+    if (opts.length === 1 && (opts[0].value === '' || msg.indexOf('未检测到') >= 0 || msg.indexOf('没有') >= 0)) return 'empty-state';
+    return 'opts=' + opts.length + ' msg=' + msg;
+  })()`);
+  ck(devState.indexOf('has-options') === 0 || devState === 'empty-state',
+     '输入设备下拉有选项或明确空态', devState);
+
+  const inBtnState = await evalJs(`(function(){
+    var start = document.getElementById('sp_instart');
+    var stop = document.getElementById('sp_instop');
+    if (!start || !stop) return null;
+    return { startDisabled: start.disabled, stopDisabled: stop.disabled };
+  })()`);
+  ck(inBtnState && inBtnState.startDisabled === false && inBtnState.stopDisabled === true,
+     '空闲时开始按钮可用且停止按钮禁用', JSON.stringify(inBtnState));
+
+  const monTextOk = await evalJs(`(function(){
+    var mon = document.getElementById('sp_inmon');
+    if (!mon) return false;
+    var parent = mon.closest('.sfld');
+    var txt = parent ? parent.textContent : '';
+    return txt.indexOf('直通监听（非 bit-perfect）') >= 0;
+  })()`);
+  ck(monTextOk, '监听开关包含「直通监听（非 bit-perfect）」文案');
+
+  const statRenderOk = await evalJs(`(function(){
+    var pane = document.querySelector('#setpage .spane[data-g=in]');
+    var ids = ['sp_stat_running', 'sp_stat_frames', 'sp_stat_spec', 'sp_stat_water', 'sp_stat_xrun', 'sp_stat_clips', 'sp_stat_rms', 'sp_stat_peak', 'sp_stat_out', 'sp_meter_water', 'sp_meter_rms', 'sp_meter_peak'];
+    var miss = [];
+    ids.forEach(function(id) {
+      var e = document.getElementById(id);
+      if (!e || !pane.contains(e)) miss.push(id);
+    });
+    return miss;
+  })()`);
+  ck(Array.isArray(statRenderOk) && statRenderOk.length === 0,
+     '输入状态面板指标与电平条完整渲染', JSON.stringify(statRenderOk));
+
+  ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=in] a[href^=http]').length === 0"),
+     '输入页签无 http 外链');
+  const pInput = await shot('24-input-panel');
+
   await evalJs("document.querySelector('.stab[data-g=pcm]').click()");
   await sleep(200);
   ck(await evalJs("!document.getElementById('sp_trim0') || !document.getElementById('sp_trim0').offsetParent"), '声道微调只出现在输出页');
@@ -527,7 +594,7 @@ async function waitFor(expr, ms = 8000) {
       //            （早期把两类混在一起判，导致把正常控件误报成"未绑定"）
       //  P1.5：元数据源开关是动态的（/api/providers 注册表）—— 在静态清单之外逐源补查
       //  P2：标签写回的预览/执行按钮也是要点了有反应的
-      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_metasummary','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_opra_search','sp_opra_product','sp_opra_preset','sp_opra_apply','sp_opra_copychip'];
+      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_metasummary','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_opra_search','sp_opra_product','sp_opra_preset','sp_opra_apply','sp_opra_copychip','sp_instart','sp_instop','sp_inmon'];
       (META_PROVIDERS || []).forEach(function (p) { needBind.push('sp_meta_' + p.id); });
       var valueOnly=['sRate','sFilt','sFiltNx','sShap','sBuf','sDSD','sIsp','s2s'];
       var miss=[];
@@ -577,7 +644,7 @@ async function waitFor(expr, ms = 8000) {
   console.log(results.join(String.fromCharCode(10)));
   console.log('');
   console.log('截图目录: ' + OUT);
-  ['01-albums', '02-album', '03-tracks', '04-files', '05-settings', '06-search', '20-artist-profile', '21-artist-profile-zard'].forEach(n => {
+  ['01-albums', '02-album', '03-tracks', '04-files', '05-settings', '06-search', '20-artist-profile', '21-artist-profile-zard', '24-input-panel'].forEach(n => {
     const p = path.join(OUT, n + '.png');
     if (fs.existsSync(p)) console.log('  ' + n + ': ' + fs.statSync(p).size + ' 字节');
   });

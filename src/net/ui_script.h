@@ -27,7 +27,7 @@ var ADV = {
   backend: 'wasapi', channels: 0, naaHost: '127.0.0.1:43210',
   trim0: 0, trim1: 0, trim2: 0, trim3: 0, trim4: 0, trim5: 0, trim6: 0, trim7: 0,
   // 输入
-  inBackend: 'none', inDev: '', inOffset: 0, inBuf: 100, inMonitor: 0,
+  inBackend: 'none', inDev: '', inOffset: 0, inBuf: 100, inMonitor: 0, inSeconds: 0, inOut: '',
   // SDM（DSD 输出）专用滤波器：空 = 沿用 PCM 页那一组
   sdmFilt: '', sdmFiltNx: ''
 };
@@ -1047,6 +1047,8 @@ function saveSettings(immediate) {
         + '&inoffset=' + (ADV.inOffset || 0)
         + '&inbuf=' + (ADV.inBuf || 100)
         + '&inmon=' + (ADV.inMonitor || 0)
+        + '&inseconds=' + (ADV.inSeconds || 0)
+        + '&inout=' + encodeURIComponent(ADV.inOut || '')
         + '&sdmfilt=' + encodeURIComponent(ADV.sdmFilt || '')
         + '&sdmfiltnx=' + encodeURIComponent(ADV.sdmFiltNx || '')
         + '&directsdm=' + (ADV.directsdm ? 1 : 0)
@@ -1114,6 +1116,8 @@ function loadSettings() {
     if (kv.inoffset !== undefined) ADV.inOffset = parseInt(kv.inoffset, 10) || 0;
     if (kv.inbuf !== undefined) ADV.inBuf = parseInt(kv.inbuf, 10) || 100;
     if (kv.inmon !== undefined) ADV.inMonitor = (kv.inmon === '1') ? 1 : 0;
+    if (kv.inseconds !== undefined) ADV.inSeconds = parseFloat(kv.inseconds) || 0;
+    if (kv.inout !== undefined) ADV.inOut = kv.inout || '';
     if (kv.sdmfilt !== undefined) ADV.sdmFilt = kv.sdmfilt || '';
     if (kv.sdmfiltnx !== undefined) ADV.sdmFiltNx = kv.sdmfiltnx || '';
     if (kv.directsdm !== undefined) ADV.directsdm = (kv.directsdm === '1') ? 1 : 0;
@@ -1775,19 +1779,197 @@ function backendHint() {
   }
 }
 
+/* ---------------- 输入采集与直通监听（P4b） ---------------- */
+var _inPollTimer = null;
+
 function loadInputDevices() {
-  api('/api/indevices').then(function (j) {
+  return api('/api/input/devices').then(function (j) {
     var s = D('sp_indev'); if (!s) return;
-    var hh = '<option value="">（未选择）</option>';
-    (j.devices || []).forEach(function (d) { hh += '<option value="' + esc(d.id) + '">' + esc(d.name) + '</option>'; });
+    var list = (j && j.devices) || [];
+    var hh = '<option value="">（未选择 / 默认设备）</option>';
+    list.forEach(function (d) {
+      var name = d.name || '';
+      if (d.isLoopback && name.indexOf('[Loopback]') !== 0 && name.indexOf('[回环]') !== 0) {
+        name = '[回环] ' + name;
+      }
+      if (d.isDefault) {
+        name += '（默认）';
+      }
+      hh += '<option value="' + esc(d.id) + '">' + esc(name) + '</option>';
+    });
     s.innerHTML = hh;
-    s.value = ADV.inDev || '';
+    if (ADV.inDev) s.value = ADV.inDev;
     s.onchange = function () { ADV.inDev = this.value; saveSettings(); };
     if (D('sp_inmsg')) {
-      D('sp_inmsg').textContent = (j.devices || []).length ? '' : '本机没有可用的采集设备';
+      D('sp_inmsg').textContent = list.length ? '' : '本机未检测到可用输入设备';
     }
   }).catch(function () {
     if (D('sp_inmsg')) D('sp_inmsg').textContent = '输入设备列表读取失败';
+  });
+}
+
+function updateInputStateUi(st) {
+  if (!st) return;
+  var running = !!st.running;
+  var btnStart = D('sp_instart');
+  var btnStop = D('sp_instop');
+  if (btnStart) btnStart.disabled = running;
+  if (btnStop) btnStop.disabled = !running;
+
+  var rEl = D('sp_stat_running');
+  if (rEl) {
+    if (running) {
+      rEl.textContent = st.mode === 'monitor' ? '直通监听中' : (st.mode === 'null' ? '模拟源运行中' : '录制中');
+      rEl.style.color = 'var(--acc)';
+    } else {
+      rEl.textContent = '空闲';
+      rEl.style.color = '';
+    }
+  }
+
+  var fEl = D('sp_stat_frames');
+  if (fEl) {
+    var sec = (typeof st.seconds === 'number') ? st.seconds.toFixed(1) : '0.0';
+    fEl.textContent = (st.frames || 0) + ' 帧 (' + sec + 's)';
+  }
+
+  var sEl = D('sp_stat_spec');
+  if (sEl) {
+    if (st.rate && st.channels) {
+      sEl.textContent = st.rate + ' Hz / ' + st.channels + ' 声道' + (st.device ? (' · ' + st.device) : '');
+    } else {
+      sEl.textContent = st.device ? st.device : '-';
+    }
+  }
+
+  var wEl = D('sp_stat_water');
+  var wBar = D('sp_meter_water');
+  var waterVal = typeof st.water === 'number' ? Math.max(0, Math.min(1, st.water)) : 0;
+  var waterPct = (waterVal * 100).toFixed(1) + '%';
+  if (wEl) wEl.textContent = waterPct;
+  if (wBar) wBar.style.width = waterPct;
+
+  var xEl = D('sp_stat_xrun');
+  if (xEl) {
+    xEl.textContent = '溢出 ' + (st.overflow || 0) + ' / 欠载 ' + (st.underflow || 0);
+    xEl.style.color = ((st.overflow || 0) > 0 || (st.underflow || 0) > 0) ? 'var(--err)' : '';
+  }
+
+  var cEl = D('sp_stat_clips');
+  if (cEl) {
+    var pos = st.posClips || 0;
+    var neg = st.negClips || 0;
+    cEl.textContent = '+' + pos + ' / -' + neg;
+    cEl.style.color = (pos > 0 || neg > 0) ? 'var(--err)' : '';
+  }
+
+  var rmsEl = D('sp_stat_rms');
+  var rmsBar = D('sp_meter_rms');
+  var rms = typeof st.rmsDb === 'number' ? st.rmsDb : -999;
+  if (rmsEl) rmsEl.textContent = (rms > -900) ? (rms.toFixed(1) + ' dBFS') : '-∞ dBFS';
+  if (rmsBar) {
+    var rPct = Math.max(0, Math.min(100, ((rms + 60) / 60) * 100));
+    rmsBar.style.width = (rms > -900 ? rPct : 0).toFixed(0) + '%';
+  }
+
+  var pkEl = D('sp_stat_peak');
+  var pkBar = D('sp_meter_peak');
+  var pk = typeof st.peakDb === 'number' ? st.peakDb : -999;
+  if (pkEl) pkEl.textContent = (pk > -900) ? (pk.toFixed(1) + ' dBFS') : '-∞ dBFS';
+  if (pkBar) {
+    var pPct = Math.max(0, Math.min(100, ((pk + 60) / 60) * 100));
+    pkBar.style.width = (pk > -900 ? pPct : 0).toFixed(0) + '%';
+    pkBar.classList.toggle('clip', pk >= -0.1);
+  }
+
+  var oEl = D('sp_stat_out');
+  if (oEl) {
+    oEl.textContent = st.outFile || (st.mode === 'monitor' ? '（直通监听无输出文件）' : '-');
+  }
+
+  var errBox = D('sp_stat_err_box');
+  var errEl = D('sp_stat_err');
+  if (st.error) {
+    if (errEl) errEl.textContent = st.error;
+    if (errBox) errBox.style.display = 'block';
+    if (D('sp_inmsg')) D('sp_inmsg').textContent = st.error;
+  } else {
+    if (errBox) errBox.style.display = 'none';
+  }
+}
+
+function pollInputState() {
+  clearTimeout(_inPollTimer);
+  var inPane = document.querySelector('#setpage .spane[data-g=in]');
+  var isTabOn = inPane && inPane.classList.contains('on');
+  var isSetOpen = D('setpage') && D('setpage').classList.contains('on');
+
+  api('/api/input/state').then(function (st) {
+    updateInputStateUi(st);
+    if ((isSetOpen && isTabOn) || (st && st.running)) {
+      _inPollTimer = setTimeout(pollInputState, 1000);
+    }
+  }).catch(function () {
+    if (isSetOpen && isTabOn) {
+      _inPollTimer = setTimeout(pollInputState, 1500);
+    }
+  });
+}
+
+function startInputCapture() {
+  var btnStart = D('sp_instart');
+  var btnStop = D('sp_instop');
+  if (btnStart) btnStart.disabled = true;
+  if (btnStop) btnStop.disabled = true;
+
+  var isMon = D('sp_inmon') && D('sp_inmon').checked;
+  var mode = isMon ? 'monitor' : 'record';
+  var dev = (D('sp_indev') && D('sp_indev').value) || '';
+  var sec = D('sp_inseconds') ? parseFloat(D('sp_inseconds').value) || 0 : 0;
+  var out = D('sp_inout') ? D('sp_inout').value.trim() : '';
+
+  var body = 'mode=' + encodeURIComponent(mode);
+  if (dev) body += '&dev=' + encodeURIComponent(dev);
+  if (sec > 0) body += '&seconds=' + sec;
+  if (out) body += '&out=' + encodeURIComponent(out);
+
+  api('/api/input/start', body).then(function (j) {
+    if (j && j.ok) {
+      toast(isMon ? '直通监听已启动' : '录制采集已启动');
+      if (D('sp_inmsg')) D('sp_inmsg').textContent = '';
+      pollInputState();
+    } else {
+      var err = (j && j.error) || '启动失败';
+      if (D('sp_inmsg')) D('sp_inmsg').textContent = err;
+      toast('启动失败: ' + err);
+      pollInputState();
+    }
+  }).catch(function (e) {
+    var err = (e && e.message) || '网络或接口错误';
+    if (D('sp_inmsg')) D('sp_inmsg').textContent = err;
+    toast('启动失败: ' + err);
+    pollInputState();
+  });
+}
+
+function stopInputCapture() {
+  var btnStart = D('sp_instart');
+  var btnStop = D('sp_instop');
+  if (btnStart) btnStart.disabled = true;
+  if (btnStop) btnStop.disabled = true;
+
+  api('/api/input/stop', '').then(function (j) {
+    if (j && j.ok) {
+      toast('采集已停止');
+      pollInputState();
+    } else {
+      var err = (j && j.error) || '停止失败';
+      toast('停止失败: ' + err);
+      pollInputState();
+    }
+  }).catch(function (e) {
+    toast('停止失败');
+    pollInputState();
   });
 }
 
@@ -2081,16 +2263,43 @@ function renderSettingsPage() {
 
   // ---------- 输入 ----------
   h += '<div class="spane on" data-g=in>'
-     + sgroup('输入设备', 'WASAPI 采集',
+     + sgroup('输入设备与采集', 'WASAPI 共享模式采集 / 录制与直通监听',
          sel('sp_inbackend', '输入后端', opt('none', '[none]', ADV.inBackend || 'none') + opt('wasapi', 'WASAPI', ADV.inBackend || 'none'),
              '选 WASAPI 后可以采集线路输入 / 麦克风 / 系统回环')
-       + sel('sp_indev', '输入设备', '<option value="">（未选择）</option>', '')
+       + sel('sp_indev', '输入设备', '<option value="">（未选择 / 默认设备）</option>', '包含物理采集设备与 [Loopback] 系统混音回环端点')
        + sel('sp_inch', '声道偏移', opt('0', '0', ADV.inOffset || 0) + opt('1', '1', ADV.inOffset || 0) +
              opt('2', '2', ADV.inOffset || 0) + opt('4', '4', ADV.inOffset || 0),
              '多声道接口只取其中几路时用')
-       + num({ id: 'sp_inbuf', label: '输入缓冲（毫秒）' }, ADV.inBuf || 100, 10, 500, 10, '')
-       + chk('sp_inmon', '采集后送 DSP 输出（监听）', ADV.inMonitor == 1, '')
-       + '<div class="sfld wide"><div id=sp_inmsg class=hint></div></div>')
+       + num({ id: 'sp_inbuf', label: '输入缓冲（毫秒）' }, ADV.inBuf || 100, 10, 500, 10, '环形缓冲时间深度')
+       + chk('sp_inmon', '直通监听（非 bit-perfect）', ADV.inMonitor == 1,
+             '勾选后启动采集将直接经系统默认共享端点监听输出；不勾选为录制保存至 WAV 文件')
+       + num({ id: 'sp_inseconds', label: '录制时长（秒，0 为不限）' }, ADV.inSeconds || 0, 0, 86400, 1,
+             '达到指定时长自动停止；0 表示持续采集直到手动停止')
+       + '<div class="sfld wide"><label>输出文件路径（WAV）</label><input type=text id=sp_inout value="' +
+             esc(ADV.inOut || '') + '" placeholder="留空由系统自动存至 recordings' + SEP + 'cap-时间戳.wav">' +
+             '<div class=hint>仅录制模式生效；留空时自动保存在程序目录 recordings 文件夹下</div></div>'
+       + '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;margin-top:6px">'
+       + '<button class="btn pri" id=sp_instart>开始采集</button>'
+       + '<button class=btn id=sp_instop disabled>停止采集</button>'
+       + '<span id=sp_inmsg class=hint style="margin:0"></span>'
+       + '</div>')
+     + sgroup('采集实时状态', '1 秒自动轮询',
+         '<div class=in-stat-grid>'
+       + '<div class=in-stat-item><span class=lbl>运行状态</span><span class=val id=sp_stat_running>空闲</span></div>'
+       + '<div class=in-stat-item><span class=lbl>采集帧数 / 时长</span><span class=val id=sp_stat_frames>0 帧 (0.0s)</span></div>'
+       + '<div class=in-stat-item><span class=lbl>采样规格</span><span class=val id=sp_stat_spec>-</span></div>'
+       + '<div class=in-stat-item><span class=lbl>缓冲水位</span><span class=val id=sp_stat_water>0.0%</span>'
+       + '<div class=meter-bar><div id=sp_meter_water class=meter-val style="width:0%"></div></div></div>'
+       + '<div class=in-stat-item><span class=lbl>溢出 / 欠载</span><span class=val id=sp_stat_xrun>溢出 0 / 欠载 0</span></div>'
+       + '<div class=in-stat-item><span class=lbl>削波计数 (正 / 负)</span><span class=val id=sp_stat_clips>+0 / -0</span></div>'
+       + '<div class=in-stat-item><span class=lbl>RMS 电平</span><span class=val id=sp_stat_rms>-∞ dBFS</span>'
+       + '<div class=meter-bar><div id=sp_meter_rms class=meter-val style="width:0%"></div></div></div>'
+       + '<div class=in-stat-item><span class=lbl>峰值电平</span><span class=val id=sp_stat_peak>-∞ dBFS</span>'
+       + '<div class=meter-bar><div id=sp_meter_peak class=meter-val style="width:0%"></div></div></div>'
+       + '<div class=in-stat-item style="grid-column:1/-1"><span class=lbl>输出文件</span><span class=val id=sp_stat_out style="word-break:break-all">-</span></div>'
+       + '<div class=in-stat-item id=sp_stat_err_box style="grid-column:1/-1;display:none;color:var(--err)">'
+       + '<span class=lbl style="color:var(--err)">错误信息</span><span class=val id=sp_stat_err></span></div>'
+       + '</div>')
      + '</div>';
 
   // ---------- 高级 ----------
@@ -2248,6 +2457,10 @@ function renderSettingsPage() {
       Array.prototype.forEach.call(document.querySelectorAll('#setpage .spane'), function (p) {
         p.classList.toggle('on', p.dataset.g === b.dataset.g);
       });
+      if (b.dataset.g === 'in') {
+        loadInputDevices();
+        pollInputState();
+      }
     };
   });
 
@@ -2325,6 +2538,16 @@ function renderSettingsPage() {
     ADV.inBackend = this.value; saveSettings();
     if (this.value === 'wasapi') loadInputDevices(); else if (D('sp_inmsg')) D('sp_inmsg').textContent = '';
   };
+  if (D('sp_indev')) D('sp_indev').onchange = function () { ADV.inDev = this.value; saveSettings(); };
+  if (D('sp_inch')) D('sp_inch').onchange = function () { ADV.inOffset = parseInt(this.value, 10) || 0; saveSettings(); };
+  if (D('sp_inbuf')) D('sp_inbuf').onchange = function () { ADV.inBuf = parseInt(this.value, 10) || 100; saveSettings(); };
+  if (D('sp_inmon')) D('sp_inmon').onchange = function () { ADV.inMonitor = this.checked ? 1 : 0; saveSettings(); };
+  if (D('sp_inseconds')) D('sp_inseconds').onchange = function () { ADV.inSeconds = parseFloat(this.value) || 0; saveSettings(); };
+  if (D('sp_inout')) D('sp_inout').onchange = function () { ADV.inOut = (this.value || '').trim(); saveSettings(); };
+  if (D('sp_instart')) D('sp_instart').onclick = startInputCapture;
+  if (D('sp_instop')) D('sp_instop').onclick = stopInputCapture;
+  loadInputDevices();
+  pollInputState();
   backendHint();
 
   // 事件
@@ -2356,7 +2579,9 @@ function renderSettingsPage() {
   D('sp_save').onclick = applySettings;
   D('sp_reset').onclick = function () {
     if (!confirm('把所有参数恢复成默认值？')) return;
-    ADV = { device: '', bits: 0, taps: 0, atten: 0, transition: 0, phase: '', modcut: 0, moddith: -1, ir: '', irgpu: 0, ramp: 0, theme: S.theme, modorder: 5, modfamily: 'dsd', directsdm: 0, dsdKind: 'fir', dsdConv: 'narrow' };
+    ADV = { device: '', bits: 0, taps: 0, atten: 0, transition: 0, phase: '', modcut: 0, moddith: -1, ir: '', irgpu: 0, ramp: 0, theme: S.theme, modorder: 5, modfamily: 'dsd', directsdm: 0, dsdKind: 'fir', dsdConv: 'narrow',
+            backend: 'wasapi', channels: 0, naaHost: '127.0.0.1:43210',
+            inBackend: 'none', inDev: '', inOffset: 0, inBuf: 100, inMonitor: 0, inSeconds: 0, inOut: '' };
     META = { on: 1, llm: 1 };   // 元数据固定两键的默认；源开关随注册表一并全开
     (META_PROVIDERS || []).forEach(function (p) { META_SRC[p.id] = 1; });
     D('sRate').value = 'max'; D('sFiltNx').value = ''; D('sShap').value = 'auto';
@@ -2714,6 +2939,8 @@ function collectSettings() {
   if (D('sp_inch')) ADV.inOffset = parseInt(D('sp_inch').value, 10) || 0;
   if (D('sp_inbuf')) ADV.inBuf = parseInt(D('sp_inbuf').value, 10) || 100;
   if (D('sp_inmon')) ADV.inMonitor = D('sp_inmon').checked ? 1 : 0;
+  if (D('sp_inseconds')) ADV.inSeconds = parseFloat(D('sp_inseconds').value) || 0;
+  if (D('sp_inout')) ADV.inOut = (D('sp_inout').value || '').trim();
   if (D('sp_opra_product')) ADV.opraproduct = (D('sp_opra_product').value || '').trim();
   if (D('sp_opra_preset')) ADV.oprapreset = (D('sp_opra_preset').value || '').trim();
   // 同步回快捷面板

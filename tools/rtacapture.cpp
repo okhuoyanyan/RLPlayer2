@@ -35,8 +35,10 @@ static void print_usage() {
     std::printf("  rtacapture --list\n");
     std::printf("  rtacapture [--dev <子串>] [--loopback] [--seconds N] [--out <wav>] [--analyze]\n");
     std::printf("  rtacapture --src null [--inject <freq>:<amp>] [--seconds N] [--out <wav>] [--analyze] [--fast]\n");
+    std::printf("  rtacapture --in <wav> [--analyze]   分析已有 WAV 文件\n");
     std::printf("\n选项说明:\n");
     std::printf("  --list               列出所有可用的输入设备及回环端点并退出\n");
+    std::printf("  --in, --file <wav>   分析已有 WAV 文件的格式与指标\n");
     std::printf("  --dev <子串>         指定目标采集设备的友好名或 ID 子串\n");
     std::printf("  --loopback           启用系统混音回环采集 (AUDCLNT_STREAMFLAGS_LOOPBACK)\n");
     std::printf("  --seconds N          采集时长 (秒, 默认 5.0)\n");
@@ -62,6 +64,7 @@ int main(int argc, char** argv) {
     bool loopback = false;
     double seconds = 5.0;
     std::string outWav;
+    std::string inWav;
     bool analyze = false;
     bool srcNull = false;
     double injectFreq = 1000.0;
@@ -98,6 +101,12 @@ int main(int argc, char** argv) {
                 return 2;
             }
             outWav = argv[++i];
+        } else if (arg == "--in" || arg == "--file") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "错误: %s 缺少文件路径\n", arg.c_str());
+                return 2;
+            }
+            inWav = argv[++i];
         } else if (arg == "--analyze") {
             analyze = true;
         } else if (arg == "--src") {
@@ -146,6 +155,47 @@ int main(int argc, char** argv) {
         } else {
             std::fprintf(stderr, "错误: 未知参数 '%s'\n", arg.c_str());
             return 2;
+        }
+    }
+
+    if (!inWav.empty()) {
+        try {
+            AudioBuffer ab = read_wav(inWav);
+            std::vector<float> interleaved(ab.raw.size());
+            if (ab.isFloat) {
+                for (size_t i = 0; i < ab.raw.size(); ++i) {
+                    uint32_t u = (uint32_t)ab.raw[i];
+                    float f; std::memcpy(&f, &u, 4);
+                    interleaved[i] = f;
+                }
+            } else {
+                double scale = (double)(1u << (ab.bits - 1));
+                for (size_t i = 0; i < ab.raw.size(); ++i) {
+                    interleaved[i] = (float)((double)ab.raw[i] / scale);
+                }
+            }
+            size_t frames = ab.raw.size() / (size_t)ab.channels;
+            std::printf("[rtacapture] WAV 文件信息: %s\n", inWav.c_str());
+            std::printf("  总帧数  : %zu 帧 (%.3f 秒 @ %u Hz, %d ch, %d-bit%s)\n",
+                        frames, (double)frames / (double)ab.rate, ab.rate, ab.channels,
+                        ab.bits, ab.isFloat ? " float" : " PCM");
+            if (analyze) {
+                AnalysisResult ar = analyze_audio(interleaved.data(), frames, ab.channels, ab.rate, injectFreq);
+                std::printf("  RMS电平 : %.2f dBFS (总) ", ar.overallRmsDb);
+                if (ab.channels == 2) {
+                    std::printf("[L: %.2f dBFS, R: %.2f dBFS]\n", ar.rmsDb[0], ar.rmsDb[1]);
+                } else {
+                    std::printf("\n");
+                }
+                std::printf("  峰值电平: %.6f (%.2f dBFS)\n", ar.overallPeak, ar.overallPeakDb);
+                if (ar.thdnDb > -900.0) {
+                    std::printf("  THD+N   : %.2f dB\n", ar.thdnDb);
+                }
+            }
+            return 0;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "错误: 读取或分析 WAV 失败: %s\n", e.what());
+            return 4;
         }
     }
 
