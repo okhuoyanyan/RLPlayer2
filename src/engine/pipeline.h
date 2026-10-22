@@ -50,6 +50,7 @@ struct PipelineConfig {
     int      taps       = 262144;
     bool     gpuResample = true;    // 用 GPU 做多相升频（rtagpu.dll 缺失时自动退回 CPU，输出逐位相同）
     bool     twoStage    = true;    // 大比率升频拆两级（同参数下 CPU 运算量约 1/4，可听带内一致）
+    int      stage2Taps  = 64;      // 两段式第二级抽头数
     double   attenDb    = 180.0;
     double   transition = 0.04;
     dsp::WindowKind filterWindow = dsp::WindowKind::Kaiser;   // 命名滤波器（--filter）
@@ -379,7 +380,7 @@ private:
             rc.inRate = in.rate; rc.outRate = outRate; rc.channels = outCh;
             rc.totalTaps = cfg_.taps; rc.attenDb = cfg_.attenDb; rc.transition = cfg_.transition;
             rc.window = cfg_.filterWindow; rc.phase = cfg_.filterPhase;
-            rc.twoStage = cfg_.twoStage;
+            rc.twoStage = cfg_.twoStage; rc.stage2Taps = cfg_.stage2Taps;
             ss_.rs = std::make_unique<dsp::PolyphaseResampler>(rc);
             ss_.rs->set_use_gpu(cfg_.gpuResample);
         }

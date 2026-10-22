@@ -185,49 +185,88 @@ inline std::vector<double> to_intermediate_phase(const std::vector<double>& h, d
     return out;
 }
 
-// ---------------- 预设表（对齐手册家族命名）----------------
+// ---------------- 预设表（对齐手册家族命名与变体）----------------
 struct FilterPreset {
     const char* name;
-    int         taps;        // 抽头数（对应 -short/-medium/-long/-xl/sinc-M）
+    int         taps;        // 抽头数（对应 -short/-medium/-long/-xl/sinc-M 等）
     double      transition;  // 过渡带占比（相对理想截止）
     double      attenDb;
     WindowKind  window;
     PhaseKind   phase;
-    bool        forNx;       // true = 用于 Nx（高码率）路径
+    bool        forNx       = false; // true = 用于 Nx（高码率）路径
+    bool        twoStage    = false; // true = 两段式升频（*-2s）
+    int         stage2Taps  = 64;    // 第二级每相位抽头数
 };
 
-// 抽头数量级参考手册：short≈4k, medium≈32k, long≈256k, xl≈1M, sinc-M≈1M
+// 抽头数量级参考手册：short≈4k, medium≈32k, long≈256k, xl≈1M, sinc-M≈1M, 16M≈16M
 inline const std::vector<FilterPreset>& filter_presets() {
     static const std::vector<FilterPreset> p = {
-        { "poly-sinc-short-lp",   4095,    0.10, 120, WindowKind::Kaiser,         PhaseKind::Linear,  false },
-        { "poly-sinc-short-mp",   4095,    0.10, 120, WindowKind::Kaiser,         PhaseKind::Minimum, false },
-        { "poly-sinc-lp",        32767,    0.04, 180, WindowKind::Kaiser,         PhaseKind::Linear,  false },
-        { "poly-sinc-mp",        32767,    0.04, 180, WindowKind::Kaiser,         PhaseKind::Minimum, false },
-        { "poly-sinc-long-lp",  262143,    0.015,200, WindowKind::Kaiser,         PhaseKind::Linear,  true  },
-        { "poly-sinc-long-mp",  262143,    0.015,200, WindowKind::Kaiser,         PhaseKind::Minimum, true  },
-        { "poly-sinc-gauss-short",4095,    0.12, 120, WindowKind::Gaussian,       PhaseKind::Linear,  false },
-        { "poly-sinc-gauss-long",32767,    0.05, 180, WindowKind::Gaussian,       PhaseKind::Linear,  false },
-        { "poly-sinc-gauss-mp",  32767,    0.05, 180, WindowKind::Gaussian,       PhaseKind::Minimum, false },
-        { "poly-sinc-ext2",      65535,    0.03, 200, WindowKind::BlackmanHarris, PhaseKind::Linear,  false },
-        { "closed-form",         16383,    0.06, 150, WindowKind::BlackmanHarris, PhaseKind::Linear,  false },
-        { "sinc-M",             524287,    0.01, 220, WindowKind::Kaiser,         PhaseKind::Linear,  true  },
+        // ---- 1. 经典 poly-sinc 家族（Kaiser 窗）----
+        { "poly-sinc-short-lp",        4095,    0.10,  120, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64 },
+        { "poly-sinc-short-mp",        4095,    0.10,  120, WindowKind::Kaiser,         PhaseKind::Minimum,      false, false, 64 },
+        { "poly-sinc-short-2s",        4095,    0.10,  120, WindowKind::Kaiser,         PhaseKind::Linear,       true,  true,  64 },
+        { "poly-sinc-lp",             32767,    0.04,  180, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64 },
+        { "poly-sinc-mp",             32767,    0.04,  180, WindowKind::Kaiser,         PhaseKind::Minimum,      false, false, 64 },
+        { "poly-sinc-2s",             32767,    0.04,  180, WindowKind::Kaiser,         PhaseKind::Linear,       true,  true,  64 },
+        { "poly-sinc-mp-2s",          32767,    0.04,  180, WindowKind::Kaiser,         PhaseKind::Minimum,      true,  true,  64 },
+        { "poly-sinc-long-lp",       262143,    0.015, 200, WindowKind::Kaiser,         PhaseKind::Linear,       true,  false, 64 },
+        { "poly-sinc-long-mp",       262143,    0.015, 200, WindowKind::Kaiser,         PhaseKind::Minimum,      true,  false, 64 },
+        { "poly-sinc-long-ip",       262143,    0.015, 200, WindowKind::Kaiser,         PhaseKind::Intermediate, true,  false, 64 },
+        { "poly-sinc-long-2s",       262143,    0.015, 200, WindowKind::Kaiser,         PhaseKind::Linear,       true,  true,  64 },
+        { "poly-sinc-xl",           1048575,    0.008, 230, WindowKind::Kaiser,         PhaseKind::Linear,       true,  false, 64 },
+        { "poly-sinc-xla",          1048575,    0.010, 220, WindowKind::Kaiser,         PhaseKind::Linear,       true,  false, 64 },
+        { "poly-sinc-xtr",          1048575,    0.008, 230, WindowKind::Kaiser,         PhaseKind::Linear,       true,  false, 64 },
 
-        // ---- Round 54 补齐：手册里出现但此前缺失的四类 ----
-        // "hb" = half-band 家族：过渡带很宽（-6 dB 点在 fs/4 附近）、抽头很短、延迟低。
-        //        代价是过渡带内的镜像抑制不如 poly-sinc 系列 —— 这是设计取舍，不是缺陷。
-        { "poly-sinc-hb",         1023,    0.20, 100, WindowKind::Kaiser,         PhaseKind::Linear,  false },
-        { "poly-sinc-hb-2s",      2047,    0.16, 110, WindowKind::Kaiser,         PhaseKind::Linear,  true  },
-        // minringFIR = 最小振铃 FIR：抽头极短 ⟹ 前后振铃都最短，代价是过渡带最宽。
-        //   与 Minimum 相位不同：它仍是线性相位，只是整体很短。
-        { "minringFIR",            511,    0.28,  90, WindowKind::BlackmanHarris, PhaseKind::Linear,  false },
-        // xtr = 极端陡峭：抽头拉到 1M 级、过渡带压到 0.008，代价是延迟与算力。
-        { "poly-sinc-xtr",     1048575,    0.008,230, WindowKind::Kaiser,         PhaseKind::Linear,  true  },
+        // ---- 2. 高斯高分辨率与变体（poly-sinc-gauss 家族，高斯窗）----
+        { "poly-sinc-gauss-short",     4095,    0.12,  120, WindowKind::Gaussian,       PhaseKind::Linear,       false, false, 64 },
+        { "poly-sinc-gauss-long",     32767,    0.05,  180, WindowKind::Gaussian,       PhaseKind::Linear,       false, false, 64 },
+        { "poly-sinc-gauss-mp",       32767,    0.05,  180, WindowKind::Gaussian,       PhaseKind::Minimum,      false, false, 64 },
+        { "poly-sinc-gauss-2s",       32767,    0.05,  180, WindowKind::Gaussian,       PhaseKind::Linear,       true,  true,  64 },
+        { "poly-sinc-gauss-long-2s",  65535,    0.035, 200, WindowKind::Gaussian,       PhaseKind::Linear,       true,  true,  64 },
+        { "poly-sinc-gauss-hires-lp", 65535,    0.035, 200, WindowKind::Gaussian,       PhaseKind::Linear,       true,  false, 64 },
+        { "poly-sinc-gauss-hires-mp", 65535,    0.035, 200, WindowKind::Gaussian,       PhaseKind::Minimum,      true,  false, 64 },
+        { "poly-sinc-gauss-hires-ip", 65535,    0.035, 200, WindowKind::Gaussian,       PhaseKind::Intermediate, true,  false, 64 },
+        { "poly-sinc-gauss-xl",      524287,    0.025, 210, WindowKind::Gaussian,       PhaseKind::Linear,       true,  false, 64 },
+        { "poly-sinc-gauss-xla",     524287,    0.030, 200, WindowKind::Gaussian,       PhaseKind::Linear,       true,  false, 64 },
+
+        // ---- 3. ext2 扩展频响变体（Blackman-Harris 窗）----
+        { "poly-sinc-ext2",           65535,    0.03,  200, WindowKind::BlackmanHarris, PhaseKind::Linear,       false, false, 64 },
+        { "poly-sinc-ext2-2s",        65535,    0.03,  200, WindowKind::BlackmanHarris, PhaseKind::Linear,       true,  true,  64 },
+        { "poly-sinc-ext2-xl",       524287,    0.015, 230, WindowKind::BlackmanHarris, PhaseKind::Linear,       true,  false, 64 },
+        { "poly-sinc-ext2-xla",      524287,    0.018, 220, WindowKind::BlackmanHarris, PhaseKind::Linear,       true,  false, 64 },
+
+        // ---- 4. 半带（half-band）家族及 hb-*-2s 两段式 ----
+        { "poly-sinc-hb",              1023,    0.20,  100, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64 },
+        { "poly-sinc-hb-s",             511,    0.25,   95, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64 },
+        { "poly-sinc-hb-m",            2047,    0.15,  115, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64 },
+        { "poly-sinc-hb-l",            4095,    0.10,  130, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64 },
+        { "poly-sinc-hb-2s",           2047,    0.16,  110, WindowKind::Kaiser,         PhaseKind::Linear,       true,  true,  64 },
+        { "poly-sinc-hb-s-2s",         1023,    0.22,  100, WindowKind::Kaiser,         PhaseKind::Linear,       true,  true,  64 },
+        { "poly-sinc-hb-m-2s",         4095,    0.14,  120, WindowKind::Kaiser,         PhaseKind::Linear,       true,  true,  64 },
+        { "poly-sinc-hb-l-2s",         8191,    0.08,  135, WindowKind::Kaiser,         PhaseKind::Linear,       true,  true,  64 },
+
+        // ---- 5. sinc 恒定时间与超长系列（sinc-{S,M,MG,L,LL}）----
+        { "sinc-S",                   65535,    0.025, 200, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64 },
+        { "sinc-M",                  524287,    0.010, 220, WindowKind::Kaiser,         PhaseKind::Linear,       true,  false, 64 },
+        { "sinc-MG",                 524287,    0.020, 210, WindowKind::Gaussian,       PhaseKind::Linear,       true,  false, 64 },
+        { "sinc-L",                 1048575,    0.006, 160, WindowKind::Kaiser,         PhaseKind::Linear,       true,  false, 64 },
+        { "sinc-LL",                2097151,    0.004, 190, WindowKind::Kaiser,         PhaseKind::Linear,       true,  false, 64 },
+
+        // ---- 6. 闭式插值家族（closed-form-{fast,base,M,16M}）----
+        { "closed-form-fast",          4095,    0.10,  144, WindowKind::BlackmanHarris, PhaseKind::Linear,       false, false, 64 },
+        { "closed-form",              16383,    0.06,  150, WindowKind::BlackmanHarris, PhaseKind::Linear,       false, false, 64 },
+        { "closed-form-M",          1048575,    0.008, 200, WindowKind::BlackmanHarris, PhaseKind::Linear,       true,  false, 64 },
+        { "closed-form-16M",       16777215,    0.003, 240, WindowKind::BlackmanHarris, PhaseKind::Linear,       true,  false, 64 },
+
+        // ---- 7. 最小振铃特殊类型 ----
+        { "minringFIR",                 511,    0.28,   90, WindowKind::BlackmanHarris, PhaseKind::Linear,       false, false, 64 },
+        { "minringFIR-mp",              511,    0.28,   90, WindowKind::BlackmanHarris, PhaseKind::Minimum,      false, false, 64 },
     };
     return p;
 }
 
-// 按名字查找并生成系数
-inline std::vector<double> make_filter(const std::string& name, bool nxPath, int* tapsOut = nullptr) {
+// 按名字查找预设（优先匹配当前路径 Nx/1x）
+inline const FilterPreset* find_preset(const std::string& name, bool nxPath = false) {
     const auto& all = filter_presets();
     const FilterPreset* best = nullptr;
     int bestScore = -1;
@@ -236,6 +275,12 @@ inline std::vector<double> make_filter(const std::string& name, bool nxPath, int
         const int score = (p.forNx == nxPath) ? 2 : 1;
         if (score > bestScore) { bestScore = score; best = &p; }
     }
+    return best;
+}
+
+// 按名字查找并生成系数
+inline std::vector<double> make_filter(const std::string& name, bool nxPath, int* tapsOut = nullptr) {
+    const FilterPreset* best = find_preset(name, nxPath);
     if (!best) return {};
     // 截止取半带型（约为 Nyquist 的一半），这才是升频原型的真实形态。
     // 若把 cutoff 取得接近 1.0，滤波器会退化成一个近似冲激（中心抽头占 96% 能量），

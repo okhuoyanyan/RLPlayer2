@@ -158,6 +158,10 @@ target_link_libraries(dopinfo PRIVATE rtadsp)
 add_executable(wavcmp tools/wavcmp.cpp)
 target_link_libraries(wavcmp PRIVATE rtadsp)
 
+# ---------------- 滤波器变体对比报告生成器（ROADMAP P2） ----------------
+add_executable(filter_report tools/filter_report.cpp)
+target_link_libraries(filter_report PRIVATE rtadsp)
+
 # ---------------- RTANet 端点（跑在接 DAC 的机器上） ----------------
 add_executable(rtanet_rx tools/rtanet_rx.cpp)
 target_link_libraries(rtanet_rx PRIVATE rtadsp ole32 uuid mmdevapi ws2_32)

@@ -52,6 +52,17 @@ struct ResamplerConfig {
     int  stage2Taps = 64;      // 第二级每相位抽头数（过渡带很宽，不需要长）
 };
 
+// 把 FilterPreset 的全部参数应用到 ResamplerConfig
+inline void apply_preset(ResamplerConfig& cfg, const FilterPreset& fp) {
+    cfg.totalTaps  = fp.taps;
+    cfg.transition = fp.transition;
+    cfg.attenDb    = fp.attenDb;
+    cfg.window     = fp.window;
+    cfg.phase      = fp.phase;
+    cfg.twoStage   = fp.twoStage;
+    if (fp.twoStage && fp.stage2Taps > 0) cfg.stage2Taps = fp.stage2Taps;
+}
+
 class PolyphaseResampler {
 public:
     explicit PolyphaseResampler(const ResamplerConfig& cfg) : cfg_(cfg) {
