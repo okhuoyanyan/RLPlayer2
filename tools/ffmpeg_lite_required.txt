@@ -1,0 +1,65 @@
+# tools/ffmpeg_lite_required.txt — 精简版 ffmpeg 必须包含的音频解码器（出包守卫 & ctest 共用）
+#
+# 为什么是这一份而不是全部：这里列的是【产品承诺的格式覆盖】。守卫与本文件同源，
+# 缺任何一项都必须拒绝出包（铁律 6：缺件就是没做完）。
+# 全量音频解码器集合（约 220 个）由 tools/build_ffmpeg_lite.ps1 从 ffmpeg 源码
+# 的 --list-decoders + 一次探针构建实测得出，不在本文件里维护。
+#
+# ⚠️ 名字口径：本文件用的是 `ffmpeg -decoders` 输出的【运行时名】(.p.name)，
+#    不是 configure 的组件名 —— 两者在少数格式上不同（例：组件 atrac3p 的运行时名是
+#    atrac3plus，组件 adpcm_g722 的运行时名是 g722）。写错名字会让守卫"看起来缺解码器"。
+#
+# 封面用的 mjpeg/png 属于【视频】解码器，不在本表（本表只比对音频解码器）；
+# 封面链路由 ctest ffmpeg_matrix 的 get_cover 断言覆盖。
+#
+# 分组：无损 / 有损 / 容器内 PCM / WMA 家族 / DSD / 冷门格式
+flac
+alac
+ape
+wavpack
+tta
+tak
+shorten
+mpc7
+mpc8
+als
+dst
+mp3
+mp3float
+aac
+aac_latm
+vorbis
+opus
+speex
+ac3
+eac3
+dca
+truehd
+mlp
+atrac1
+atrac3
+atrac3plus
+atrac9
+cook
+wmav1
+wmav2
+wmapro
+wmalossless
+wmavoice
+pcm_s16le
+pcm_s24le
+pcm_s32le
+pcm_s32le_planar
+pcm_f32le
+pcm_f64le
+pcm_u8
+pcm_s8
+pcm_mulaw
+pcm_alaw
+pcm_s16be
+pcm_s24be
+pcm_s32be
+dsd_lsbf
+dsd_msbf
+dsd_lsbf_planar
+dsd_msbf_planar

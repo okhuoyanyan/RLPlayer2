@@ -1,9 +1,11 @@
-# make_dist.ps1 - build the ONE official release package (Full / self-contained).
+﻿# make_dist.ps1 - build the ONE official release package (Full / self-contained).
 #
 # Policy since 1.0.2:
 #   * There is no "Lite" package any more. Every release is the official
 #     release (zheng shi fa bu ban) and must be complete out of the box:
-#       - ffmpeg + ffprobe (all decoder formats)
+#       - ffmpeg + ffprobe: 自建【精简版】（12.2+12.0 MB，全部音频解码器；见
+#         tools/build_ffmpeg_lite.ps1）。出包前由 tools/verify_ffmpeg_lite.ps1 守卫，
+#         缺任一必需解码器/格式矩阵不过就拒绝出包。
 #       - rtagpu.dll (multi-arch HIP kernels) + amdhip64_7.dll (HIP runtime)
 #       - WebView2Loader.dll (built-in UI)
 #       - CLI tools under tools\ (DSD, network, probes)
@@ -56,12 +58,18 @@ Write-Host "=== compatibility gate ==="
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'check_compat.ps1') -Dir $B
 if ($LASTEXITCODE -ne 0) { Fail "compatibility gate failed - refusing to package" }
 
-# Resolve ffmpeg/ffprobe (prefer the real target of the WinGet shim).
-$ff = Get-Command ffmpeg -ErrorAction SilentlyContinue
-$fp = Get-Command ffprobe -ErrorAction SilentlyContinue
-if (-not $ff -or -not $fp) { Fail "ffmpeg/ffprobe not found on PATH" }
-$ffPath = @((Get-Item $ff.Source).Target)[0]; if (-not $ffPath) { $ffPath = $ff.Source }
-$fpPath = @((Get-Item $fp.Source).Target)[0]; if (-not $fpPath) { $fpPath = $fp.Source }
+# P1（2026-10-22）内置 ffmpeg/ffprobe 一律取【自建精简版】build\ffmpeg-lite：
+# 相比 gyan full（212+211.8 MB）体积 −94%，音频解码器一个不少（全部音频解码器 +
+# 全部 demuxer/muxer + 临时 WAV 需要的 pcm_s16/24/32le 编码器）。
+# 这里先跑守卫：它用精简版自身做裸环境执行 + 解码器白名单 + 格式矩阵（read_any）检查，
+# 缺任何一项就 exit 1 —— 缺件绝不静默出一个"看起来完整"的包（铁律 6）。
+$liteDir = Join-Path $B 'ffmpeg-lite'
+Write-Host "=== ffmpeg 精简版守卫（缺必需解码器即拒绝出包）==="
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'verify_ffmpeg_lite.ps1') -Dir $liteDir
+if ($LASTEXITCODE -ne 0) { Fail "ffmpeg 精简版守卫未通过 - 拒绝出包（原因见上面的守卫输出）" }
+$ffPath = Join-Path $liteDir 'ffmpeg.exe'
+$fpPath = Join-Path $liteDir 'ffprobe.exe'
+if (-not (Test-Path $ffPath) -or -not (Test-Path $fpPath)) { Fail "精简版产物缺失：$liteDir" }
 
 $name = "RLPlayer-$Version-win64"
 $out = Join-Path $dist $name
