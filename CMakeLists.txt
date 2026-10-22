@@ -399,6 +399,12 @@ target_include_directories(test_retrieval PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_retrieval PRIVATE winhttp)
 add_test(NAME retrieval COMMAND test_retrieval)
 
+# OPRA 耳机 EQ 适配门禁（离线纯函数 + RTA_NET_TESTS=1 真网 opt-in）
+add_executable(test_opra_eq tests/test_opra_eq.cpp)
+target_include_directories(test_opra_eq PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_opra_eq PRIVATE rtadsp winhttp ws2_32)
+add_test(NAME opra_eq COMMAND test_opra_eq)
+
 # 测试素材生成器：调制器 -> DSF/DFF（本机原本一个 DSD 文件都没有）
 add_executable(make_dsd tools/make_dsd.cpp)
 target_link_libraries(make_dsd PRIVATE rtadsp)

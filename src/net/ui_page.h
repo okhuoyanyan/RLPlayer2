@@ -269,6 +269,8 @@ inline std::string rta_ui_page() {
     h += ".vol{display:flex;align-items:center;gap:8px;justify-content:flex-end}.vol input[type=range]{width:88px;accent-color:var(--acc)}";
     h += ".badge{font-size:9.5px;padding:2px 7px;border-radius:5px;background:var(--acc-weak);color:var(--acc-text);border:1px solid var(--acc-weak);font-weight:600;letter-spacing:.3px;white-space:nowrap}";
     h += ".badge.g{background:var(--ok-bg);color:var(--ok-text);border-color:var(--ok-line)}";
+    h += ".chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 9px;border-radius:12px;background:var(--bg3);color:var(--txt2);border:1px solid var(--line);cursor:pointer;transition:.15s;user-select:none}";
+    h += ".chip:hover{background:var(--hov);color:var(--txt);border-color:var(--acc)}";
     h += ".toast{position:fixed;left:50%;transform:translateX(-50%);bottom:104px;z-index:21;background:var(--toast);border:1px solid var(--line);border-radius:9px;padding:9px 17px;font-size:12px;opacity:0;transition:.25s;pointer-events:none;box-shadow:0 8px 26px var(--shadow)}";
     h += ".toast.on{opacity:1;bottom:114px}";
     h += ".scanbar{height:3px;background:var(--acc-weak);border-radius:2px;overflow:hidden;margin:8px 18px 0}";

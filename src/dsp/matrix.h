@@ -100,6 +100,44 @@ inline void highShelf(Biquad& q, double fs, double f0, double S, double gainDb) 
           2 * ((A - 1) - (A + 1) * cw),
           (A + 1) - (A - 1) * cw - tsa);
 }
+// 标准 RBJ 架式滤波器设计（指定品质因数 Q，alpha = sin(w0)/(2Q)）
+inline void lowShelfQ(Biquad& q, double fs, double f0, double Q, double gainDb) {
+    const double A = std::pow(10.0, gainDb / 40.0);
+    const double w0 = 2.0 * kPi * f0 / fs;
+    const double cw = std::cos(w0), sw = std::sin(w0);
+    const double alpha = sw / (2.0 * (Q > 1e-6 ? Q : 0.7071));
+    const double tsa = 2.0 * std::sqrt(A) * alpha;
+    q.set(A * ((A + 1) - (A - 1) * cw + tsa),
+          2 * A * ((A - 1) - (A + 1) * cw),
+          A * ((A + 1) - (A - 1) * cw - tsa),
+          (A + 1) + (A - 1) * cw + tsa,
+          -2 * ((A - 1) + (A + 1) * cw),
+          (A + 1) + (A - 1) * cw - tsa);
+}
+inline void highShelfQ(Biquad& q, double fs, double f0, double Q, double gainDb) {
+    const double A = std::pow(10.0, gainDb / 40.0);
+    const double w0 = 2.0 * kPi * f0 / fs;
+    const double cw = std::cos(w0), sw = std::sin(w0);
+    const double alpha = sw / (2.0 * (Q > 1e-6 ? Q : 0.7071));
+    const double tsa = 2.0 * std::sqrt(A) * alpha;
+    q.set(A * ((A + 1) + (A - 1) * cw + tsa),
+          -2 * A * ((A - 1) + (A + 1) * cw),
+          A * ((A + 1) + (A - 1) * cw - tsa),
+          (A + 1) - (A - 1) * cw + tsa,
+          2 * ((A - 1) - (A + 1) * cw),
+          (A + 1) - (A - 1) * cw - tsa);
+}
+// 便捷重载：lowShelfQ(f, gain, q, sr) 直接返回 Biquad
+inline Biquad lowShelfQ(double f0, double gainDb, double Q, double fs) {
+    Biquad q;
+    lowShelfQ(q, fs, f0, Q, gainDb);
+    return q;
+}
+inline Biquad highShelfQ(double f0, double gainDb, double Q, double fs) {
+    Biquad q;
+    highShelfQ(q, fs, f0, Q, gainDb);
+    return q;
+}
 inline void lowpass(Biquad& q, double fs, double f0, double Q) {
     const double w0 = 2.0 * kPi * f0 / fs, cw = std::cos(w0);
     const double alpha = std::sin(w0) / (2.0 * Q);
