@@ -4205,7 +4205,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                                            "backend", "naahost", "channels", "trim",
                                            "inbackend", "indev", "inoffset", "inbuf", "inmon",
                                            "inseconds", "inout",
-                                           "sdmfilt", "sdmfiltnx",
+                                           "sdmfilt", "sdmfiltnx", "streamdecode",
                                            // 耳机 EQ (OPRA)
                                            "opraproduct", "oprapreset", "opravendor",
                                            // 元数据补全(P1.5):总开关与 LLM 固定两键;
@@ -4224,6 +4224,9 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                 if (k == "scanThreads" || k == "scanthreads") {
                     const int st = atoi(clean.c_str());
                     if (st > 0) Library::instance().setScanThreads((size_t)st);
+                }
+                if (k == "streamdecode") {
+                    rta::audio::set_stream_decode_enabled(clean != "0" && clean != "false");
                 }
                 f << k << "=" << clean << (char)10;
             }
@@ -4258,6 +4261,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         injectKv("metaon", "1");
         injectKv("metallm", "1");
         injectKv("metasummary", "0");
+        injectKv("streamdecode", "1");
         for (const rta::meta::ProviderDesc& pd : rta::meta::provider_registry()) {
             const std::string nk = std::string("metasrc_") + pd.id;
             if (seen.count(nk) != 0) continue;
@@ -5220,6 +5224,9 @@ int main(int argc, char** argv) {
             if (k == "scanThreads" || k == "scanthreads") {
                 const int st = atoi(v.c_str());
                 if (st > 0) Library::instance().setScanThreads((size_t)st);
+            }
+            if (k == "streamdecode") {
+                rta::audio::set_stream_decode_enabled(v != "0" && v != "false");
             }
         }
     }

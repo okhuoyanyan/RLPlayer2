@@ -44,6 +44,137 @@ struct AudioBuffer {
 namespace detail {
 inline uint32_t rd32(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
 inline uint16_t rd16(const uint8_t* p) { return (uint16_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8)); }
+}
+
+// 样本解码辅助：把原始字节转成 int32_t（保持与 read_wav 逐位对称）
+inline int32_t decode_sample(const uint8_t* p, int bps, bool isFloat) {
+    if (isFloat) {
+        uint32_t u = detail::rd32(p);
+        int32_t v = 0;
+        std::memcpy(&v, &u, 4);
+        return v;
+    }
+    if (bps == 8) {
+        return (int32_t)p[0] - 128; // WAV 8-bit PCM 无符号，中心 128
+    }
+    if (bps == 16) {
+        return (int32_t)(int16_t)detail::rd16(p);
+    }
+    if (bps == 24) {
+        int32_t t = (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16));
+        if (t & 0x800000) t |= (int32_t)0xFF000000;
+        return t;
+    }
+    if (bps == 32) {
+        return (int32_t)detail::rd32(p);
+    }
+    return 0;
+}
+
+struct WavHeaderInfo {
+    uint16_t fmtTag = 0;             // 1 = PCM, 3 = IEEE float
+    uint16_t channels = 0;           // 1..32
+    uint32_t rate = 0;               // 采样率
+    uint32_t byteRate = 0;
+    uint16_t blockAlign = 0;
+    uint16_t bits = 0;               // 8 / 16 / 24 / 32
+    bool     isFloat = false;        // true = IEEE float32
+    uint32_t dataDeclaredBytes = 0;  // data 块声明字节数（管道流式输出通常为 0xFFFFFFFF）
+    size_t   headerBytes = 0;        // data 块体在缓冲区中的起始偏移（即跳过整个头部后的位置）
+};
+
+// 解析内存中的 WAV (RIFF/WAVE) 头。
+// 必须健壮支持：
+//   - 任意 chunk 顺序（如 JUNK / LIST 出现在 fmt 之前或之后）
+//   - 奇数 chunk 大小紧跟的 1 字节补齐 padding (sz & 1)
+//   - WAVE_FORMAT_EXTENSIBLE (0xFFFE) 解析
+//   - 管道流式输出（dataDeclaredBytes == 0xFFFFFFFF）
+// 返回值：
+//   > 0: 成功解析并定位到 data 块起始，返回值即 headerBytes
+//     0: 数据不足，需要更多字节
+//   < 0: 格式非法（非 RIFF、缺少 fmt/data、不支持的编码或位深等）
+inline int parse_wav_header(const uint8_t* data, size_t size, WavHeaderInfo& out, std::string* errorMsg = nullptr) {
+    if (size < 12) return 0;
+    if (std::memcmp(data, "RIFF", 4) != 0 || std::memcmp(data + 8, "WAVE", 4) != 0) {
+        if (errorMsg) *errorMsg = "不是合法的 WAV 头部(需 RIFF/WAVE 标识)";
+        return -1;
+    }
+
+    bool haveFmt = false;
+    uint16_t fmtTag = 0, ch = 0, bps = 0;
+    uint32_t rate = 0, byteRate = 0;
+    uint16_t blockAlign = 0;
+
+    size_t off = 12;
+    while (off + 8 <= size) {
+        const uint8_t* id = data + off;
+        const uint32_t sz = detail::rd32(data + off + 4);
+        // 单个 chunk 过大防溢出/坏数据（超过 64MB 且非 data 块视作非法损坏）
+        if (sz > (1u << 26) && std::memcmp(id, "data", 4) != 0) {
+            if (errorMsg) *errorMsg = "WAV chunk 声明大小异常(>64MB)";
+            return -1;
+        }
+
+        if (std::memcmp(id, "fmt ", 4) == 0) {
+            if (off + 8 + sz > size) return 0; // fmt 块体尚未完全读入
+            if (sz < 16) {
+                if (errorMsg) *errorMsg = "WAV fmt 块过短(需>=16 字节)";
+                return -1;
+            }
+            const uint8_t* body = data + off + 8;
+            fmtTag     = detail::rd16(body);
+            ch         = detail::rd16(body + 2);
+            rate       = detail::rd32(body + 4);
+            byteRate   = detail::rd32(body + 8);
+            blockAlign = detail::rd16(body + 12);
+            bps        = detail::rd16(body + 14);
+            if (fmtTag == 0xFFFE && sz >= 40) { // WAVE_FORMAT_EXTENSIBLE
+                fmtTag = detail::rd16(body + 24);
+            }
+            if (fmtTag != 1 && fmtTag != 3) {
+                if (errorMsg) *errorMsg = "WAV 编码不是线性 PCM 或 IEEE float (fmtTag=" + std::to_string(fmtTag) + ")";
+                return -1;
+            }
+            if (bps != 8 && bps != 16 && bps != 24 && bps != 32) {
+                if (errorMsg) *errorMsg = "WAV 位深非法 (允许 8/16/24/32, 当前=" + std::to_string(bps) + ")";
+                return -1;
+            }
+            if (ch < 1 || ch > 32) {
+                if (errorMsg) *errorMsg = "WAV 声道数非法 (允许 1..32, 当前=" + std::to_string(ch) + ")";
+                return -1;
+            }
+            haveFmt = true;
+            off += 8 + sz + (sz & 1);
+        } else if (std::memcmp(id, "data", 4) == 0) {
+            if (!haveFmt) {
+                if (errorMsg) *errorMsg = "WAV 格式非法: data 块出现在 fmt 块之前或缺少 fmt 块";
+                return -1;
+            }
+            out.fmtTag = fmtTag;
+            out.channels = ch;
+            out.rate = rate;
+            out.byteRate = byteRate;
+            out.blockAlign = blockAlign;
+            out.bits = bps;
+            out.isFloat = (fmtTag == 3);
+            out.dataDeclaredBytes = sz;
+            out.headerBytes = off + 8;
+            return (int)out.headerBytes;
+        } else {
+            // 其他 chunk (LIST / JUNK / fact / PEAK 等)
+            if (off + 8 + sz + (sz & 1) > size) return 0; // chunk 尚未完全读入
+            off += 8 + sz + (sz & 1);
+        }
+    }
+
+    if (size > (1u << 20)) { // 超过 1MB 仍未找到 data 块
+        if (errorMsg) *errorMsg = "WAV 头部过大(>1MB)仍未找到 data 块";
+        return -1;
+    }
+    return 0; // 需要更多数据
+}
+
+namespace detail {
 
 // F5（2026-10-22）：Windows 窄 fopen 按 ANSI 代码页（ACP，本机 936/GBK）解释路径，
 // UTF-8 中文路径打不开（实证）。wav.h 不含 windows.h，用不了 MultiByteToWideChar，
@@ -233,21 +364,7 @@ inline AudioBuffer read_wav(const std::string& path) {
 
     for (size_t i = 0; i < nSamples; ++i) {
         const uint8_t* p = dataPtr + i * (size_t)bytesPer;
-        int32_t v = 0;
-        if (ab.isFloat) {
-            uint32_t u = detail::rd32(p); std::memcpy(&v, &u, 4);
-        } else if (bps == 8) {
-            v = (int32_t)p[0] - 128;                  // WAV 的 8-bit PCM 是无符号，中心 128
-        } else if (bps == 16) {
-            v = (int32_t)(int16_t)detail::rd16(p);
-        } else if (bps == 24) {
-            int32_t t = (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16));
-            if (t & 0x800000) t |= (int32_t)0xFF000000;      // 符号扩展
-            v = t;
-        } else if (bps == 32) {
-            v = (int32_t)detail::rd32(p);
-        }
-        ab.raw[i] = v;
+        ab.raw[i] = decode_sample(p, bps, ab.isFloat);
     }
     return ab;
 }

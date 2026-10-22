@@ -30,6 +30,8 @@
 #include <stdexcept>
 #include <new>
 #include <chrono>
+#include <thread>
+#include <cstring>
 
 namespace rta::audio {
 
@@ -199,6 +201,169 @@ struct DsdPcmSettings {
 };
 inline DsdPcmSettings& dsd_pcm_settings() { static DsdPcmSettings s; return s; }
 
+// 流式解码开关（ROADMAP P6b：免临时 WAV，默认 1 开启）
+// 可通过设置键 streamdecode（/api/settings）、环境变量 RLPLAYER_STREAM_DECODE、
+// 或 C++ set_stream_decode_enabled(bool) 进行控制，保持随时可回退。
+struct StreamDecodeSettings {
+    bool enabled = true;
+};
+inline StreamDecodeSettings& stream_decode_settings() { static StreamDecodeSettings s; return s; }
+inline bool is_stream_decode_enabled() {
+    const char* env = std::getenv("RLPLAYER_STREAM_DECODE");
+    if (env && env[0] != '\0') {
+        if (std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0 || std::strcmp(env, "off") == 0)
+            return false;
+        if (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 || std::strcmp(env, "on") == 0)
+            return true;
+    }
+    return stream_decode_settings().enabled;
+}
+inline void set_stream_decode_enabled(bool en) {
+    stream_decode_settings().enabled = en;
+}
+
+// 从匿名管道句柄读取 WAV 音频流并填充到 AudioBuffer（非阻塞读、分块拼装、逐位精确）
+inline bool read_wav_stream_pipe(HANDLE hPipe, HANDLE hProcess, AudioBuffer& ab, std::string* errOut = nullptr) {
+    std::vector<uint8_t> hbuf;
+    WavHeaderInfo hdr{};
+    bool hdrOk = false;
+    constexpr size_t kMaxHeaderBytes = 1 << 20; // 1 MB 上限防异常
+    const auto t_start = std::chrono::steady_clock::now();
+
+    while (!hdrOk) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(hPipe, nullptr, 0, nullptr, &avail, nullptr)) {
+            break;
+        }
+        if (avail > 0) {
+            char chunk[4096];
+            DWORD toRead = std::min<DWORD>(avail, (DWORD)sizeof(chunk));
+            DWORD got = 0;
+            if (ReadFile(hPipe, chunk, toRead, &got, nullptr) && got > 0) {
+                hbuf.insert(hbuf.end(), (const uint8_t*)chunk, (const uint8_t*)chunk + got);
+                std::string err;
+                int r = parse_wav_header(hbuf.data(), hbuf.size(), hdr, &err);
+                if (r > 0) {
+                    hdrOk = true;
+                    break;
+                } else if (r < 0) {
+                    if (errOut) *errOut = err;
+                    return false;
+                }
+                if (hbuf.size() > kMaxHeaderBytes) {
+                    if (errOut) *errOut = "WAV 头超过 1MB 防御上限";
+                    return false;
+                }
+            }
+        } else {
+            if (WaitForSingleObject(hProcess, 0) == WAIT_OBJECT_0) {
+                DWORD finalAvail = 0;
+                if (PeekNamedPipe(hPipe, nullptr, 0, nullptr, &finalAvail, nullptr) && finalAvail > 0) {
+                    continue;
+                }
+                break;
+            }
+            if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - t_start).count() > 30) {
+                if (errOut) *errOut = "读取 WAV 头超时";
+                return false;
+            }
+            Sleep(0);
+        }
+    }
+
+    if (!hdrOk) {
+        std::string err;
+        int r = parse_wav_header(hbuf.data(), hbuf.size(), hdr, &err);
+        if (r <= 0) {
+            if (errOut && errOut->empty()) *errOut = err.empty() ? "WAV 头不完整或进程提前退出" : err;
+            return false;
+        }
+    }
+
+    ab.rate = hdr.rate;
+    ab.channels = (int)hdr.channels;
+    ab.bits = (int)hdr.bits;
+    ab.isFloat = hdr.isFloat;
+    const int bytesPer = (int)hdr.bits / 8;
+    if (bytesPer <= 0 || ab.channels <= 0) {
+        if (errOut) *errOut = "非法的 bits 或 channels";
+        return false;
+    }
+
+    const size_t pcmStart = hdr.headerBytes;
+    const size_t initPcmBytes = hbuf.size() > pcmStart ? (hbuf.size() - pcmStart) : 0;
+    uint8_t leftover[4] = {0};
+    size_t leftoverCount = 0;
+
+    if (initPcmBytes > 0) {
+        const size_t completeSamples = initPcmBytes / (size_t)bytesPer;
+        ab.raw.resize(completeSamples);
+        const uint8_t* p = hbuf.data() + pcmStart;
+        for (size_t i = 0; i < completeSamples; ++i) {
+            ab.raw[i] = decode_sample(p + i * (size_t)bytesPer, ab.bits, ab.isFloat);
+        }
+        leftoverCount = initPcmBytes % (size_t)bytesPer;
+        if (leftoverCount > 0) {
+            std::memcpy(leftover, p + completeSamples * (size_t)bytesPer, leftoverCount);
+        }
+    }
+    hbuf.clear();
+    hbuf.shrink_to_fit();
+
+    std::vector<uint8_t> readChunk(65536);
+    while (true) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(hPipe, nullptr, 0, nullptr, &avail, nullptr)) {
+            break;
+        }
+        if (avail > 0) {
+            DWORD toRead = std::min<DWORD>(avail, (DWORD)readChunk.size());
+            DWORD got = 0;
+            if (!ReadFile(hPipe, readChunk.data(), toRead, &got, nullptr) || got == 0) {
+                break;
+            }
+            size_t chunkOff = 0;
+            if (leftoverCount > 0) {
+                const size_t needed = (size_t)bytesPer - leftoverCount;
+                if ((size_t)got >= needed) {
+                    std::memcpy(leftover + leftoverCount, readChunk.data(), needed);
+                    ab.raw.push_back(decode_sample(leftover, ab.bits, ab.isFloat));
+                    leftoverCount = 0;
+                    chunkOff = needed;
+                } else {
+                    std::memcpy(leftover + leftoverCount, readChunk.data(), got);
+                    leftoverCount += (size_t)got;
+                    continue;
+                }
+            }
+            const size_t rem = (size_t)got - chunkOff;
+            const size_t numSamples = rem / (size_t)bytesPer;
+            if (numSamples > 0) {
+                const size_t oldSz = ab.raw.size();
+                ab.raw.resize(oldSz + numSamples);
+                const uint8_t* p = readChunk.data() + chunkOff;
+                for (size_t i = 0; i < numSamples; ++i) {
+                    ab.raw[oldSz + i] = decode_sample(p + i * (size_t)bytesPer, ab.bits, ab.isFloat);
+                }
+            }
+            leftoverCount = rem % (size_t)bytesPer;
+            if (leftoverCount > 0) {
+                std::memcpy(leftover, readChunk.data() + chunkOff + numSamples * (size_t)bytesPer, leftoverCount);
+            }
+        } else {
+            if (WaitForSingleObject(hProcess, 0) == WAIT_OBJECT_0) {
+                DWORD finalAvail = 0;
+                if (PeekNamedPipe(hPipe, nullptr, 0, nullptr, &finalAvail, nullptr) && finalAvail > 0) {
+                    continue;
+                }
+                break;
+            }
+            Sleep(0);
+        }
+    }
+    return true;
+}
+
 // DSD 源：原生读取 + 我们的抽取器（ROADMAP P0-1/P0-4/P0-5）
 //
 // 以前 .dsf/.dff 走 ffmpeg 解成 PCM：多一层量化、拿不到 1-bit 流、DirectSDM 无从谈起。
@@ -239,8 +404,8 @@ inline AudioBuffer read_dsd_native(const std::string& path, LoadNote* note) {
     return out;
 }
 
-// ffmpeg 解码（非 WAV / 非 DSD，或 DSD 原生读取失败时的回退路径）
-inline AudioBuffer read_via_ffmpeg(const std::string& path, LoadNote* note) {
+// ffmpeg 解码：写临时 WAV 文件再原生读取（旧路径，作为流式不支持或关闭时的完整回退路径）
+inline AudioBuffer read_via_ffmpeg_file(const std::string& path, LoadNote* note = nullptr) {
     const std::string ext = lowerExt(path);
     const std::string ffmpeg  = find_tool("ffmpeg");
     const std::string ffprobe = find_tool("ffprobe");
@@ -380,6 +545,197 @@ inline AudioBuffer read_via_ffmpeg(const std::string& path, LoadNote* note) {
         note->totalMs = std::chrono::duration<double, std::milli>(t_total_1 - t_total_0).count();
     }
     return buf;
+}
+
+// ffmpeg 流式解码路径（ROADMAP P6b：直接读管道输出，不落临时 WAV 文件）
+inline AudioBuffer read_via_ffmpeg_stream(const std::string& path, LoadNote* note = nullptr) {
+    const std::string ext = lowerExt(path);
+    const std::string ffmpeg  = find_tool("ffmpeg");
+    const std::string ffprobe = find_tool("ffprobe");
+    if (ffmpeg.empty()) {
+        throw std::runtime_error(
+            "需要 ffmpeg 才能解码 " + ext + " 文件：把 ffmpeg.exe（以及 ffprobe.exe）放到播放器"
+            "同目录，或加进 PATH。WAV / DSF / DFF 不需要 ffmpeg。");
+    }
+
+    const int bits = probe_bit_depth(ffprobe, path);
+    const char* codec = (bits <= 16) ? "pcm_s16le" : (bits <= 24 ? "pcm_s24le" : "pcm_s32le");
+    const std::wstring cmd = L"\"" + widen(ffmpeg) + L"\" -v error -i \"" + widen(path) +
+                             L"\" -vn -c:a " + widen(codec) + L" -f wav pipe:1";
+    const auto t_total_0 = std::chrono::steady_clock::now();
+    constexpr int kDecodeTries = 3;
+    int rc = -1;
+    int attempts = 0;
+    std::string fflog;
+    std::string unreadable;
+    double ffmpeg_ms = 0.0;
+    AudioBuffer buf;
+    bool success = false;
+    std::string streamError;
+
+    for (int i = 0; i < kDecodeTries; ++i) {
+        ++attempts;
+        fflog.clear();
+        streamError.clear();
+        buf = AudioBuffer{};
+
+        if (i > 0) {
+            Sleep(120u * (DWORD)i); // 退避 120ms / 240ms，等占用方松手
+        }
+
+        SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
+        HANDLE outRd = nullptr, outWr = nullptr;
+        HANDLE errRd = nullptr, errWr = nullptr;
+        if (!CreatePipe(&outRd, &outWr, &sa, 0)) {
+            rc = -1;
+            streamError = "CreatePipe(stdout) 失败";
+            unreadable = source_read_probe(path);
+            if (i >= 1 && unreadable.empty()) break;
+            continue;
+        }
+        if (!CreatePipe(&errRd, &errWr, &sa, 0)) {
+            CloseHandle(outRd); CloseHandle(outWr);
+            rc = -1;
+            streamError = "CreatePipe(stderr) 失败";
+            unreadable = source_read_probe(path);
+            if (i >= 1 && unreadable.empty()) break;
+            continue;
+        }
+        SetHandleInformation(outRd, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(errRd, HANDLE_FLAG_INHERIT, 0);
+
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+        si.wShowWindow = SW_HIDE;
+        si.hStdOutput = outWr;
+        si.hStdError  = errWr;
+        si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+
+        PROCESS_INFORMATION pi{};
+        std::wstring tmpCmd = cmd;
+        const auto t_ff_0 = std::chrono::steady_clock::now();
+        BOOL cp = CreateProcessW(nullptr, tmpCmd.data(), nullptr, nullptr, TRUE,
+                                 CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+        if (!cp) {
+            CloseHandle(outRd); CloseHandle(outWr);
+            CloseHandle(errRd); CloseHandle(errWr);
+            rc = -1;
+            streamError = "CreateProcessW 启动 ffmpeg 失败";
+            unreadable = source_read_probe(path);
+            if (i >= 1 && unreadable.empty()) break;
+            continue;
+        }
+
+        // 立即关闭写端句柄，使得子进程写完后读端能正常收到 EOF
+        CloseHandle(outWr);
+        CloseHandle(errWr);
+
+        // 启动后台线程读取 stderr，避免 stderr 管道被填满导致子进程阻塞挂起
+        std::thread errThread([errRd, &fflog] {
+            char ebuf[4096];
+            DWORD eg = 0;
+            while (ReadFile(errRd, ebuf, sizeof(ebuf), &eg, nullptr) && eg > 0) {
+                fflog.append(ebuf, eg);
+            }
+            CloseHandle(errRd);
+        });
+
+        // 主线程读取 stdout 管道流并解析填充 AudioBuffer
+        bool readOk = false;
+        try {
+            readOk = read_wav_stream_pipe(outRd, pi.hProcess, buf, &streamError);
+        } catch (const std::exception& ex) {
+            streamError = ex.what();
+            readOk = false;
+        }
+        CloseHandle(outRd);
+
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD exitCode = 1;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        errThread.join();
+
+        const auto t_ff_1 = std::chrono::steady_clock::now();
+        ffmpeg_ms += std::chrono::duration<double, std::milli>(t_ff_1 - t_ff_0).count();
+        rc = (int)exitCode;
+
+        if (rc == 0 && readOk && buf.frames() > 0) {
+            success = true;
+            break;
+        }
+
+        unreadable = source_read_probe(path);
+        // 关键判据修正（2026-10-23 回归）：首轮失败（i == 0）必须至少再试一次
+        if (i >= 1 && unreadable.empty()) break;
+    }
+
+    std::string ffTail;
+    for (char c : fflog) {
+        if (c == '\r' || c == '\n') { if (!ffTail.empty() && ffTail.back() != ' ') ffTail.push_back(' '); }
+        else ffTail.push_back(c);
+    }
+    if (!ffTail.empty() && ffTail.back() == ' ') ffTail.pop_back();
+    if (ffTail.size() > 300) ffTail = ffTail.substr(0, 300) + "...";
+
+    if (!success) {
+        std::string why;
+        if (rc == -42) {
+            why = "ffmpeg 报非法字节序列(-42/EILSEQ)。该退出码只说明 ffmpeg 在非 ASCII 路径上"
+                  "回退到 ANSI 代码页后失败，不代表文件真有编码问题";
+            why += unreadable.empty()
+                ? "（重试期间源文件已可读：更像是 ffmpeg 打开瞬间的偶发失败）"
+                : "；真实原因：" + unreadable;
+        } else if (rc != 0) {
+            why = "ffmpeg 解码失败";
+            if (!unreadable.empty()) why += "（源文件此刻读不了：" + unreadable + "）";
+        } else {
+            why = "ffmpeg 解码产物异常: 流式解析失败(" + (streamError.empty() ? "帧数为空" : streamError) + ")";
+        }
+        throw std::runtime_error(why + "（退出码 " + std::to_string(rc) +
+                                 "，尝试 " + std::to_string(attempts) + " 次，源文件=" + path +
+                                 (ffTail.empty() ? "" : "，ffmpeg输出=" + ffTail) + "）");
+    }
+
+    const auto t_total_1 = std::chrono::steady_clock::now();
+    if (note) {
+        note->text = std::string("已用 ffmpeg 流式解码 ") + ext + " -> " + codec;
+        note->ffmpegMs = ffmpeg_ms;
+        note->wavReadMs = 0.0;
+        note->totalMs = std::chrono::duration<double, std::milli>(t_total_1 - t_total_0).count();
+    }
+    return buf;
+}
+
+// ffmpeg 解码统一入口（非 WAV / 非 DSD，或 DSD 原生读取失败时的回退路径）
+// 优先走流式管道读取（免落临时 WAV 文件）；对需要 seek 的特殊容器或设置关闭时自动回退临时文件。
+inline AudioBuffer read_via_ffmpeg(const std::string& path, LoadNote* note = nullptr) {
+    if (!is_stream_decode_enabled()) {
+        return read_via_ffmpeg_file(path, note);
+    }
+    try {
+        return read_via_ffmpeg_stream(path, note);
+    } catch (const std::exception& e) {
+        // 源文件探针归因：如果源文件此刻确实读不了（独占占用、文件不存在、无权限），
+        // 回退临时文件同样无法解决，必须直接重抛保留权威的 Win32 归因与原始退出码。
+        const std::string unreadable = source_read_probe(path);
+        if (!unreadable.empty()) {
+            throw;
+        }
+        // 源文件此刻可读，说明流式解码失败是由于流式管道/容器特性（如需 seek 的特殊容器或管道解析失败），
+        // 自动回退到既有临时 WAV 文件路径，并在 note 里详细说明回退原因。
+        LoadNote fileNote;
+        AudioBuffer b = read_via_ffmpeg_file(path, &fileNote);
+        if (note) {
+            note->text = "流式解码不适用(" + std::string(e.what()) + ")，已回退临时文件解码：" + fileNote.text;
+            note->ffmpegMs = fileNote.ffmpegMs;
+            note->wavReadMs = fileNote.wavReadMs;
+            note->totalMs = fileNote.totalMs;
+        }
+        return b;
+    }
 }
 
 // 统一读取：WAV 原生，DSD 原生（失败回退 ffmpeg），其他格式经 ffmpeg
