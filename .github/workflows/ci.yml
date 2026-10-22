@@ -1,0 +1,84 @@
+name: CI
+
+# 自动门禁：每次 push / PR 都跑「构建 0 error + ctest 全绿」。
+# 目的（用户 2026-10-22 明确要求）：让协作者改坏东西时立刻红灯，不靠人肉记得跑测试。
+#
+# 设计取舍（有理有据，不是随便挑的）：
+# 1. 用 GitHub 自带的 windows-latest，不自己造镜像 —— 私有仓库免费额度够本项目（单次约 5-10 分钟）。
+# 2. 编译器用 **LLVM clang++**（与开发机同为 clang），不用 MSVC：
+#    本项目在 clang 下开发，用 MSVC 编会引入「本地能过 CI 不能过」的假问题，反而失真。
+# 3. **不编 GPU**（rtagpu.dll 要 ROCm + hipcc，云机没有也没有 AMD 卡）：
+#    代码里 GPU 是可选后端，缺 rtagpu.dll 时自动纯 CPU，不影响 ctest 覆盖 DSP 正确性。
+# 4. **排除 wasapi_shared**：云机没有音频端点，该用例必然失败，且它验证的是设备交互而非算法。
+#    这不是「放水」——本地 verify.ps1 仍然是 11/11 的硬门禁。
+# 5. 失败时上传完整日志，方便协作者自己看是哪条挂了。
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # 同一分支连续 push 时取消旧的，省额度
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Windows / clang / build + ctest
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 定位 clang++（找不到就用 choco 装）
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "C:\Program Files\LLVM\bin\clang++.exe",
+            "C:\Program Files\LLVM\bin\clang-cl.exe"
+          )
+          $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $found) {
+            Write-Host "::group::LLVM 未预装，安装中"
+            choco install llvm -y --no-progress
+            Write-Host "::endgroup::"
+            $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $found) { Write-Error "clang++ 未找到，无法构建"; exit 1 }
+          Write-Host "使用编译器: $found"
+          & $found --version
+          "CXX=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 配置（CMake + Ninja）
+        shell: pwsh
+        run: |
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="$env:CXX"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: 构建（必须 0 error）
+        shell: pwsh
+        run: |
+          cmake --build build 2>&1 | Tee-Object -FilePath build-log.txt
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: 测试（ctest）
+        shell: pwsh
+        run: |
+          ctest --test-dir build --output-on-failure -E "wasapi_shared" 2>&1 | Tee-Object -FilePath ctest-log.txt
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: 上传失败日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failure-logs
+          path: |
+            build-log.txt
+            ctest-log.txt
+            build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+          retention-days: 14
