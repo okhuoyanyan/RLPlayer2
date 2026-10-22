@@ -22,7 +22,7 @@ var S = {
 var ADV = {
   device: '', bits: 0, taps: 0, atten: 0, transition: 0, phase: '',
   modcut: 0, moddith: -1, ir: '', irgpu: 0, ramp: 0, theme: 'dark',
-  eq: '', modorder: 5, gpuvendor: 'auto', directsdm: 0, dsdKind: 'fir', dsdConv: 'narrow',
+  eq: '', modorder: 5, modfamily: 'dsd', gpuvendor: 'auto', directsdm: 0, dsdKind: 'fir', dsdConv: 'narrow',
   // 输出后端与多声道
   backend: 'wasapi', channels: 0, naaHost: '127.0.0.1:43210',
   trim0: 0, trim1: 0, trim2: 0, trim3: 0, trim4: 0, trim5: 0, trim6: 0, trim7: 0,
@@ -99,6 +99,7 @@ function params() {
          '&twostage=' + (D('s2s').checked ? 1 : 0) +
          '&buffer=' + D('sBuf').value +
          '&modorder=' + (ADV.modorder || 5) +
+          '&modfamily=' + encodeURIComponent(ADV.modfamily || 'dsd') +
          '&device=' + encodeURIComponent(ADV.device || '') +
          '&bits=' + (ADV.bits || 0) +
          '&taps=' + (ADV.taps || 0) +
@@ -1032,7 +1033,7 @@ function saveSettings(immediate) {
   body += '&device=' + encodeURIComponent(ADV.device || '') + '&bits=' + (ADV.bits || 0)
         + '&taps=' + (ADV.taps || 0) + '&atten=' + (ADV.atten || 0)
         + '&transition=' + (ADV.transition || 0) + '&phase=' + encodeURIComponent(ADV.phase || '')
-        + '&modorder=' + (ADV.modorder || 5) + '&modcut=' + (ADV.modcut || 0)
+        + '&modorder=' + (ADV.modorder || 5) + '&modfamily=' + encodeURIComponent(ADV.modfamily || 'dsd') + '&modcut=' + (ADV.modcut || 0)
         + '&moddith=' + (ADV.moddith === undefined ? -1 : ADV.moddith)
         + '&eq=' + encodeURIComponent(ADV.eq || '')
         + '&ir=' + encodeURIComponent(ADV.ir || '') + '&irgpu=' + (ADV.irgpu || 0)
@@ -1093,6 +1094,7 @@ function loadSettings() {
     if (kv.transition !== undefined) ADV.transition = parseFloat(kv.transition) || 0;
     if (kv.phase !== undefined) ADV.phase = kv.phase;
     if (kv.modorder !== undefined) ADV.modorder = parseInt(kv.modorder, 10) || 5;
+    if (kv.modfamily !== undefined) ADV.modfamily = kv.modfamily || 'dsd';
     if (kv.modcut !== undefined) ADV.modcut = parseFloat(kv.modcut) || 0;
     if (kv.moddith !== undefined) ADV.moddith = parseFloat(kv.moddith);
     if (kv.eq !== undefined) ADV.eq = kv.eq;
@@ -2047,7 +2049,13 @@ function renderSettingsPage() {
              opt('dop', 'DoP（封在 24-bit PCM 容器里，WASAPI / ASIO 都行）', dsdPackOf()) +
              opt('nat', 'Native（直接用 DSD 采样率，只能走 ASIO）', dsdPackOf()),
              '两者数值等价，差别只在传输方式')
-       + sel('sp_modorder', '调制器阶数',
+       + sel('sp_modfamily', '调制器族',
+              opt('dsd', 'DSD 标准（Butterworth NTF，1-bit）', ADV.modfamily || 'dsd') +
+              opt('chebyshev', '7 阶 Chebyshev（可配带外增益与截止）', ADV.modfamily || 'dsd') +
+              opt('ec', 'EC 误差反馈（频带零点扩展消除）', ADV.modfamily || 'dsd') +
+              opt('ahm', 'AHM 多电平（6~8 bit 风格）', ADV.modfamily || 'dsd'),
+              '提供多种 NTF 滤波与量化架构；非专有黑盒曲线')
+        + sel('sp_modorder', '调制器阶数',
              opt(5, '5 阶（DSD64 起）', ADV.modorder || 5) + opt(7, '7 阶（需 DSD128 以上）', ADV.modorder || 5),
              '实测 7 阶在 DSD64 会饱和，程序会自动降为 5 阶')
        + num({ id: 'sp_modcut', label: '噪声整形拐点（kHz，0 = 100）' }, ADV.modcut, 0, 200, 5)
@@ -2348,7 +2356,7 @@ function renderSettingsPage() {
   D('sp_save').onclick = applySettings;
   D('sp_reset').onclick = function () {
     if (!confirm('把所有参数恢复成默认值？')) return;
-    ADV = { device: '', bits: 0, taps: 0, atten: 0, transition: 0, phase: '', modcut: 0, moddith: -1, ir: '', irgpu: 0, ramp: 0, theme: S.theme, modorder: 5, directsdm: 0, dsdKind: 'fir', dsdConv: 'narrow' };
+    ADV = { device: '', bits: 0, taps: 0, atten: 0, transition: 0, phase: '', modcut: 0, moddith: -1, ir: '', irgpu: 0, ramp: 0, theme: S.theme, modorder: 5, modfamily: 'dsd', directsdm: 0, dsdKind: 'fir', dsdConv: 'narrow' };
     META = { on: 1, llm: 1 };   // 元数据固定两键的默认；源开关随注册表一并全开
     (META_PROVIDERS || []).forEach(function (p) { META_SRC[p.id] = 1; });
     D('sRate').value = 'max'; D('sFiltNx').value = ''; D('sShap').value = 'auto';

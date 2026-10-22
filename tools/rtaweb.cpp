@@ -116,6 +116,9 @@ struct PlayParams {
     bool   twoStage = true;    // 两段式升频
     int    dsd = 0;            // 0 = PCM；64/128/256 = DoP 封装的 DSD
     int    modOrder = 5;       // SDM 调制器阶数
+    std::string modFamily = "dsd";     // SDM 调制器族：dsd | chebyshev | ec | ahm
+    double oobGain = 5.0;              // Chebyshev 带外增益 dB
+    int    ahmBits = 8;                // AHM 多电平位深 (6~8 bit)
     std::string gpuVendor = "auto";   // auto | amd | nvidia | off
     bool   dsdNative = false;         // true = 走 ASIO 原生 DSD（当前后端未实现，会明确报错）
     bool   directSdm = false;         // true = DirectSDM：源 DSD 与目标同速率时逐位直通（要求 0 dB、无 PCM 处理）
@@ -335,6 +338,9 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "twostage") p.twoStage = (v == "1");
         else if (k == "dsd")      p.dsd = atoi(v.c_str());
         else if (k == "modorder") p.modOrder = atoi(v.c_str());
+        else if (k == "modfamily") p.modFamily = v;
+        else if (k == "oobgain")   p.oobGain = atof(v.c_str());
+        else if (k == "ahmbits")   p.ahmBits = atoi(v.c_str());
         else if (k == "gpuvendor") p.gpuVendor = v;
         else if (k == "dsdnative") p.dsdNative = (v == "1");
         else if (k == "directsdm") p.directSdm = (v == "1");
@@ -1704,7 +1710,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 << ",\"dsdPassband\":" << dsdPassbandHz
                 << ",\"dsd\":" << (dop ? p.dsd : 0)
                 << ",\"dsdRate\":" << (dop ? dsdRate : 0)
-                << ",\"modOrder\":" << (dop ? (p.modOrder > 0 ? p.modOrder : 5) : 0)
+                << ",\"modFamily\":\"" << jesc(p.modFamily.empty() ? std::string("dsd") : p.modFamily) << "\""
+                 << ",\"modOrder\":" << (dop ? (p.modOrder > 0 ? p.modOrder : 5) : 0)
                 << ",\"ispPeak\":" << ispPeak
                 << ",\"ispOver\":" << ispOver
                 << ",\"srcPeak\":" << srcPeak
@@ -3817,7 +3824,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                 for (const char* allow : { "rate", "filter", "filterNx", "shaper", "dsd", "modorder",
                                            "buffer", "volume", "loudness", "isp", "twostage",
                                            "device", "bits", "taps", "atten", "transition", "phase",
-                                           "modcut", "moddith", "ir", "irgpu", "ramp", "theme", "eq",
+                                           "modfamily", "oobgain", "ahmbits", "modcut", "moddith", "ir", "irgpu", "ramp", "theme", "eq",
                                            "gpuvendor", "dsdnative", "directsdm", "dsdkind", "dsdconv",
                                            "backend", "naahost", "channels", "trim",
                                            "inbackend", "indev", "inoffset", "inbuf", "inmon",
@@ -4160,7 +4167,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             std::ifstream f(fs::u8path(path_in_exe_dir("rlplayer-settings.conf")));
             std::string line;
             static const char* kAllow[] = {"rate", "filter", "filterNx", "shaper", "dsd", "modorder",
-                                           "buffer", "isp", "twostage", "backend", "bits", "device",
+                                           "modfamily", "buffer", "isp", "twostage", "backend", "bits", "device",
                                            "theme", "taps", "atten", "transition", "phase", "directsdm",
                                            "dsdkind", "dsdconv", "channels", "metaon", "metallm"};
             while (std::getline(f, line)) {

@@ -175,6 +175,10 @@ add_executable(test_modulator tests/test_modulator.cpp)
 target_link_libraries(test_modulator PRIVATE rtadsp)
 add_test(NAME modulator COMMAND test_modulator)
 
+add_executable(test_modulator_families tests/test_modulator_families.cpp)
+target_link_libraries(test_modulator_families PRIVATE rtadsp)
+add_test(NAME modulator_families COMMAND test_modulator_families)
+
 add_executable(test_filters tests/test_filters.cpp)
 target_link_libraries(test_filters PRIVATE rtadsp)
 add_test(NAME filters COMMAND test_filters)
