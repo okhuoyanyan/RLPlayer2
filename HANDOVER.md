@@ -1,17 +1,24 @@
 # RLPlayer 交接说明
 
-> **当前状态(2026-10-23 第二十三轮后)**:**ROON/元数据 P3 资料层 ②③④ 全部完成并验收**(5 艺术家资料页带可复制来源 / 3 部古典作品各 10 条可溯源版本 / 幻觉抽检零硬伤 / 断网缓存);
-> **二轮开发目标「耳机 EQ 适配(OPRA)」完成**;基建三项(WebView2 双轨 / 自建精简 ffmpeg / 裁 Locales)全部在 main;
-> 源码树 ctest **50/50**、平台边界 PASS、uicheck 连续 3 次全过、verify 见 STATUS 第二十三轮。
-> **1.0.10 已发布**(资料层 + OPRA 耳机 EQ 已打进包):`dist\RLPlayer-1.0.10-win64.zip`,**369.69 MB**,
-> sha256 `F87BC60D6903634268F1C110A53BF51620138B3E26CA29BF2113951984FD7D53`(GitHub Release v1.0.10);
-> 1.0.9 旧包仍在 `dist\` 可回退。**下一步 = ROADMAP 剩余阶段(P4 WASAPI 采集 / P1 调制器族 / P5 UPnP 投放 / P6 性能)与未解决项清理**。
+> **当前状态(2026-10-23 第二十四轮后)**:ROADMAP **P1(调制器族)/P2(滤波器变体)/P4(输入采集)/P5(UPnP 投放)** 全部落地并合入 main;
+> 之前完成的 ROON/元数据 P3 资料层 ②③④、耳机 EQ(OPRA)、基建三项(WebView2 双轨/精简 ffmpeg/裁 Locales)都在 main;
+> 源码树 ctest **53/53**、本机 verify **11/11(Fail 0)**、平台边界 PASS、uicheck 全过。**下一轮 = P6 性能 + P5b 投放 UI + 未解决项清理**。
+> **1.1.0 已发布**(ROADMAP P1/P2/P4/P5 全部打进包):`dist\RLPlayer-1.1.0-win64.zip`,**370.35 MB**,
+> sha256 `BCE7B79E19F0FA275253B75D5F2D96E43D1DE32D39143ABD4BD2257FF699EEB9`(GitHub Release v1.1.0);
+> 1.0.10 / 1.0.9 旧包仍在 `dist\` 可回退。**下一步 = P6 性能 + P5b 投放 UI + 资料层 L4 演绎去重 + 未解决项清理**。
 > **资料层总恢复点**:`docs/元数据补全调研与规划.md` §1.6 + `docs/P3-资料层接口契约.md`(数据形状/UI 契约的唯一依据)+ `docs/耳机EQ-OPRA调研与设计.md`(含已拍板决策)。
 > 该方向的**总恢复点在 docs/元数据补全调研与规划.md §1.6**
 > (全景状态/代码地图/未解决项/工作方法/队列——新会话先读它),历史回合见 STATUS.md 第十三~**二十二**轮。
 > 以下为第十二轮及更早的通用交接内容,架构与坑清单仍然有效。
 >
-> **最近五轮的关键状态变化(接手必读)**:
+> **最近六轮的关键状态变化(接手必读)**:
+> - **第二十四轮(ROADMAP 剩余四阶段)**:**P4 输入采集**(`src/audio/wasapi_capture.h` 无锁 SPSC/格式转换/THD+N + `tools/rtacapture.exe` + `/api/input/*` +
+>   设置页输入面板;监听=共享输出直通,非 bit-perfect);**P5 UPnP 投放**(`src/net/upnp_control.h` SOAP 9 动作/UPnPError/DIDL/Range + `UpnpHttpServer` 8912 +
+>   `tools/rtacast.exe`;本机局域网无渲染器,端到端重采样未实测);**P1 调制器族**(dsd/chebyshev/ec/ahm,键 `modfamily`;
+>   Chebyshev-7 低电平失稳已强制降阶到 5 阶修复);**P2 滤波器变体**(16→47 预设,真实抽头/过渡带/阻带/相位;
+>   `tools/filter_report.exe` + `docs/滤波器变体对比表.md`;避开「三个坑」的判据)。
+>   ⚠️ 用法:新 CLI 在包内 `tools\` 下;`/api/input/start` 支持 `src=null&inject=1000:0.001` 在**不开设备不发声**下自检;
+>   `/api/input/devices` 的 Loopback 端点需要系统有音频流才有包(平台规范,静音录制需补零)。
 > - **第二十三轮(ROON P3 资料层 + 耳机 EQ/OPRA)**:② 直连层 `src/meta/knowledge.h`(维基 zh/en + 萌娘
 >   `zh.moegirl.org.cn/api.php`、OpenSearch「不猜」消歧义、令牌桶+熔断、缓存 `entities/<id>/knowledge.json` TTL30d 离线回退);
 >   ③ 检索层 `src/meta/retrieval.h`(rerank≥1.5/authority≥2/白名单 + **五道引用硬门**:每段≥1引用、id 不悬空、

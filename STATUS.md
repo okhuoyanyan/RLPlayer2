@@ -2,6 +2,64 @@
 
 > **接手请先读**：[HANDOVER.md](HANDOVER.md)（架构/构建/已知坑）→ [ROADMAP.md](ROADMAP.md)（待开发与判据）。
 > 本文件按回合记录“做过什么、实测多少”，越往下越旧。
+# 第二十四轮:ROADMAP 剩余阶段开跑——P4 输入采集 / P5 UPnP 投放 / P1 调制器族 / P2 滤波器变体(2026-10-23)
+
+> 用户指令:无人值守连续开发(「直到开发结束」)。Lead 只核验/派单,编码全派 Gemini 3.8 Flash(high)子代理,并行用独立 worktree。
+> 本轮结果:ROADMAP 的 **P4 / P5 / P1 / P2** 四阶段一次性落地;ctest 53 → **53 套全绿**(新增 capture / upnp_control / modulator_families);
+> 修掉 **两个真实质量缺陷**(Chebyshev-7 低电平失稳、P4 采集 HTTP 线程 join 死锁)与一个 uicheck 假红体系。
+
+## 1. P4 输入采集(WASAPI)——核心 + API + UI
+
+**P4a 核心**(6637232):
+- `src/audio/wasapi_capture.h`:设备枚举(含 `[Loopback]` 回环端点)、共享模式采集、**无锁 SPSC 环形缓冲**(cacheline 对齐/溢出/下溢/水位/削波正负计数)、mix 格式→float32(16/24/32-bit PCM + float,**24-bit 3 字节符号扩展**有专门断言)、`analyze_audio`(RMS/Peak/THD+N,加 Hann 窗残差 FFT)、`write_capture_wav`;
+- `tools/rtacapture.cpp`:--list/--dev/--loopback/--seconds/--out/--analyze/**--src null/--inject**(不开设备、不发声的确定性源)/--fast;退出码 0/2/3/4;
+- 测试证据:环形缓冲环绕/溢出/下溢;**模拟 10 分钟 48k 数据 28,800,000 帧 → 0 溢出/0 下溢/序列号逐点正确**(快进 0.016s);16/24/32/float 转换与削波计数全项;**--src null 注入 1kHz −60dBFS → 48000 帧、RMS 误差 0.0000%、THD+N 154.10 dB**;麦克风真机采集 1 秒 48,000 帧/0 溢出。
+
+**P4b API + UI**(8fdf242 / 4cd197b):
+- 端点:`GET /api/input/devices`(真机返回麦克风 + 2 个 Loopback 端点)、`GET /api/input/state`、`POST /api/input/start`(mode=record|monitor,dev,loopback,out,seconds;**src=null&inject=… 测试路径**)、`POST /api/input/stop`;
+- 修掉的真 bug:start 时无条件 `join()` 会**卡死 HTTP 线程**(改为先判 running + joinMtx 串行化);stop 返回前保证 WAV 已刷盘闭合;POST body 尾随 \r\n 污染 outFile;不存在设备要明确报错;录制线程 maxSeconds 保底超时;
+- 设置页「输入」面板:设备下拉(回环/默认标记)、录制时长、输出路径、开始/停止、1s 状态轮询(帧/水位/溢出/欠载/削波/RMS/Peak/错误)、**直通监听(明确标注「非 bit-perfect」)**;uicheck 新增 9 控件 + 状态面板 + 无外链断言;
+- 门禁实证:API 录制 `src=null` → `frames=48000, overflow=0`,WAV 头 24-bit/48k/2ch/288000 字节 data(48000 帧),分析 RMS −63.01 dBFS / THD+N **90.06 dB**;uicheck 全过;8899 全程无监听。
+- ⚠️ 未解决:Windows 回环在系统静音时不产生数据包(平台规范)——静音录制需读取侧补零;监听=共享输出直通,**采集→DSP 管线尚未接**。
+
+## 2. P5 UPnP/DLNA 投放(3a37039 → ae773b9)
+
+- `src/net/upnp_control.h`(零 windows.h):9 个 SOAP 动作(SetAVTransportURI/Play/Pause/Stop/Seek/GetTransportInfo/GetPositionInfo/GetMediaInfo/GetProtocolInfo)、**UPnPError 错误码/描述解析**(不静默)、DIDL-Lite 生成/解析(含 sampleFrequency/bitsPerSample/nrAudioChannels)、**渲染器采样率三态取证**(Match/Mismatch/Unknown)、HTTP Range 纯函数、stream token 防目录遍历;
+- `src/net/upnp.h`:`UpnpHttpServer`(默认 0.0.0.0:8912,/stream/<token>.wav,Range 200/206/416,访问日志);
+- `tools/rtacast.cpp`:--list/--dev/--file/--port/--rate/--bits/--seconds/--dop/--analyze;**DSD 源无 --dop 时明确拒绝偷偷转 PCM**(退出码 1);--analyze 打印供源格式/渲染器声明/是否可能重采样/position 推进;
+- 测试:`tests/test_upnp_control.cpp` 全离线(SOAP/DIDL/Range/token/三态);
+- ⚠️ 未解决:本机局域网 SSDP 发现 0 台渲染器(如实记录,未伪造);**端到端重采样未物理实测**(已在报告/代码标注;需要真渲染器 + 本机 loopback 采集联动)。
+
+## 3. P1 调制器族(299c5c0 + 修复 6846bb8)
+
+- 四族可切:`dsd`(Butterworth,默认向后兼容)/ `chebyshev`(7 阶 NTF)/ `ec`(误差反馈)/ `ahm`(多电平 6~8 bit);键 `modfamily`/`oobgain`/`ahmbits`,CLI `--mod-family/--list-modulators`,UI 下拉;
+- **发现并修复**:Chebyshev-7 在 **DSD256 −60dBFS SNR = −2.3 dB**(低电平崩塌)。根因:Chebyshev 极点极低阻尼(Q≈130)→ 开环误差多项式 P(z) 最高频极点出单位圆(DSD64/128/256 的 max|root| = 1.0141/1.0035/1.0008),小信号下 1-bit 量化器等效增益 kq 从 ~1 飙到 >4 → 闭环极点越界 → 高频极限环折叠进通带。**修法:1-bit + Chebyshev 且阶数≥7 时强制降阶到已验证稳定的 5 阶**(CLI/Web/UI 全链路一致),修复后 −60dBFS SNR **32.3 dB**、空闲音 −87→−115.9 dBFS;
+- AHM 位数口径校正(原表 6-bit 与 8-bit 的阶数/抖动口径不同):8-bit 在 DSD256 SNR **128.3 dB**、−60dBFS 74.7 dB、带外 −51.9 dB,全面领先 6-bit;
+- 铁律 7:各族 50ms 满幅 0dBFS 与单样本 +5 越界后**稳态过载增量 0、clamped=0、RMS/同号率恢复**;10 分钟 26.46M 样点 0 NaN/0 稳态限幅。
+
+## 4. P2 滤波器变体与命名体系(7dcdc2f → 117a55e)
+
+- 预设 16 → **47 个**,覆盖 poly-sinc(short/long/xl/xla/xtr/…)、gauss(hires-lp/mp/ip/xl/xla/…)、ext2、hb 半带及 `hb-*-2s`、`sinc-{S,M,MG,L,LL}`、`closed-form-{fast,,M,16M}`、minringFIR;每个都是**真实参数**(抽头/过渡带/阻带/窗/相位/单段或两段),不是改标签;
+- 新工具 `tools/filter_report.cpp`(--markdown/--csv/--out)+ `docs/滤波器变体对比表.md`(47 变体参数与实测指标);
+- 判据避开 docs/滤波器家族纪要.md 的「三个坑」:① 归一化截止统一 `0.5*(1-transition)` 并断言在 [0.35,0.499](防冲激退化);② 相位用**前/后振铃能量比**(线性=1.0000、最小<1、混合居中),不用「峰值前能量/总能量」;③ 倒谱法用**相对峰值对数地板**(peakMag*1e-15)避免高斯深阻带被压平;
+- 两段式(-2s)与单段对应变体:100Hz~19kHz 幅度差 ≤0.004 dB、分块逐位一致;47 变体已接入 CLI/Web(/api/filters);
+- ⚠️ 未解决:短抽头(≤1024)最小相位受因果截断,阻带交界 ~0.26 dB 纹波(门禁基线 0.30 dB);262k 抽头以上单段滤波器群延迟 ≥8192 样点,离线测量需 ≥16384 样点前导。
+
+## 5. 门禁与文档
+
+- 每阶段都经:build 0 error + `ctest --test-dir build` 全绿 + `check_platform_boundary.ps1` PASS;合并到 main 后统一重跑。
+- 本机 verify 11/11(见下)、CI 两个 workflow 对每次 push 全绿(1d34b7a→b5cca73→117a55e 逐步验证)。
+- 新增文档:`docs/滤波器变体对比表.md`;更新:`docs/耳机EQ-OPRA调研与设计.md`(决策)、`HANDOVER.md`。
+
+## 6. 1.1.0 正式包(本轮交付物,2026-10-23)
+
+- 版本号 `src/version.h` + `make_dist.ps1` 默认版本 → **1.1.0**;新 CLI 入包:`rtacapture.exe`(采集)、`rtacast.exe`(UPnP 投放)、`filter_report.exe`(滤波器对比);
+- 产物:`dist\RLPlayer-1.1.0-win64.zip` = **388,337,496 字节(370.35 MB)**,sha256 `BCE7B79E19F0FA275253B75D5F2D96E43D1DE32D39143ABD4BD2257FF699EEB9`;
+- 包内验证:三个新 CLI 可执行(`rtacapture --list` 枚举 46 个端点);`data/opra_index.json` + `OPRA-NOTICE.txt` 在包内;
+  bundled 启动 `STARTUP v1.1.0` + `已选用 包内固定版`;`GET /api/input/devices`、`GET /api/opra/index` 均 200;
+- 审计:Locales 仅 2 pak、ffmpeg/ffprobe 12.18/11.97 LB、无 conf/log/webview2/profile/真实 sk-;8899 全程无监听;
+- CI 两个 workflow 对 117a55e / 02e93bd 全绿;GitHub Release **v1.1.0** 已建(附件 digest 与本地一致)。
+
 # 第二十三轮:ROON/元数据 P3 资料层（②直连层 ③检索层 ④富页）+ 耳机 EQ(OPRA)(2026-10-23)
 
 > 用户指令:无人值守连续开发,Lead 只核验/派单,编码全派 Gemini 3.8 Flash(high)子代理;并行用独立 worktree。
