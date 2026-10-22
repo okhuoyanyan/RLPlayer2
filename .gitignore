@@ -28,6 +28,11 @@ rta-*.conf
 *.exe
 *.dll
 *.log
+# ⚠️ 例外：third_party 里的【分发性】构建依赖必须进仓库
+#   WebView2Loader.dll 是 Microsoft WebView2 SDK 自带的可再分发组件，链接期必需。
+#   （2026-10-22 教训：最初 *.dll 把它一起挡了，CI 在云机上构建失败
+#     "Error copying file ... WebView2Loader.dll: No such file or directory"）
+!/third_party/**/*.dll
 *.log.*
 CMakeCache.txt
 CMakeFiles/
