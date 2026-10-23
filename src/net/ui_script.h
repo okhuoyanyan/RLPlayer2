@@ -2995,7 +2995,11 @@ function renderSettingsPage() {
   // 里按注册表逐源绑定（metasrc_<id>，改完即落盘）
   [['sp_metaon', 'on'], ['sp_metallm', 'llm'], ['sp_metasummary', 'summary']].forEach(function (p) {
     var e = D(p[0]); if (!e) return;
-    e.onchange = function () { META[p[1]] = this.checked ? 1 : 0; saveSettings(); };
+    e.onchange = function () {
+      META[p[1]] = this.checked ? 1 : 0;
+      saveSettings();
+      if (p[1] === 'summary' && S.lastCur) loadMeta(S.lastCur);
+    };
   });
   // 功能4：DeepSeek API Key（保存 / 测试连接 / 清除）。输入框重建后必须为空 ——
   // 这是「永不回显明文」的最后一道：哪怕浏览器缓存了 value，重建也会清掉。
@@ -3554,7 +3558,10 @@ function openNowPlaying() {
   pg.classList.add('on');
   // 每次都刷新：上一首的 LY 可能还在；而且内嵌歌词是异步加载的，
   // 只更新 #lyricbox 不会刷新整页的 #npLyric（用户反馈"整页没有歌词"）。
-  if (S.lastCur) loadLyrics(S.lastCur);
+  if (S.lastCur) {
+    loadLyrics(S.lastCur);
+    if (!S.curMeta) loadMeta(S.lastCur);
+  }
   renderNp();
   // 整页控件是底栏/设置页的镜像：进来时刷一次，绝不显示与底栏不同的值
   applyRep(D('sRep') ? D('sRep').value : 0);
@@ -3566,9 +3573,10 @@ function updateNpSummary(m) {
   var el = D('npSummary');
   if (!el) return;
   function hide() { el.style.display = 'none'; el.innerHTML = ''; }
-  // 开关关 / 无元数据 / 后端判定「无缓存且无 key」或「缓存已过期且无 key」→ 不显示、不请求。
+  // 开关关 / 无元数据 / 没配 key 且无本地缓存 → 不显示、不留空白区块（用户 261023-03 #2/#4）。
   // 单曲播放页显示的是【所属专辑】的简介（kind=release + artist），不是每首歌各调一次（用户 261023-03 #3）。
-  if (!META.summary || !m || !m.summaryAvailable) { el.dataset.targetKey = ''; el.dataset.loaded = '0'; hide(); return; }
+  var canSumm = m && (m.summaryAvailable || m.summaryCached || m.summaryCacheOk || m.hasLlmKey === true || META.hasLlmKey === true);
+  if (!META.summary || !m || !canSumm) { el.dataset.targetKey = ''; el.dataset.loaded = '0'; hide(); return; }
   var targetKind = m.summaryKind || 'release';
   var targetName = m.summaryTarget || '';
   var targetArtist = '';

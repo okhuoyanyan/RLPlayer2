@@ -1786,11 +1786,19 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
 
         // 实际端点名称/id：信号链 JSON 与 RENDERFAIL 遥测共用同一来源（HF-02 + 本轮事故归因）
         std::string dev, devId;
-        for (const auto& d : WasapiOutput::enumerate()) {
-            const bool hit = pEff.device.empty() ? d.isDefault : (d.id == pEff.device);
-            if (hit) { dev = d.name; devId = d.id; break; }
+        if (p.backend == "null") {
+            dev = "Null 输出（不出声）";
+            devId = "null";
+        } else if (p.backend == "naa") {
+            dev = p.naaHost.empty() ? "NAA 127.0.0.1:43210" : p.naaHost;
+            devId = "naa";
+        } else {
+            for (const auto& d : WasapiOutput::enumerate()) {
+                const bool hit = pEff.device.empty() ? d.isDefault : (d.id == pEff.device);
+                if (hit) { dev = d.name; devId = d.id; break; }
+            }
+            if (dev.empty()) dev = pEff.device.empty() ? "默认音频设备" : pEff.device;
         }
-        if (dev.empty()) dev = pEff.device.empty() ? "默认音频设备" : pEff.device;
 
         // 信号链快照：源文件 -> 解码 -> 重采样 -> 抖动 -> 音量 -> 设备
         {

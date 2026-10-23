@@ -106,7 +106,7 @@ async function waitFor(expr, ms = 8000) {
   await send('Page.navigate', { url: URL_ });
   await sleep(400);
   ck(await waitFor("document.querySelector('#list') && document.querySelector('#list').children.length"), '首屏渲染出内容');
-  await sleep(900);
+  ck(await waitFor("document.querySelectorAll('.card').length > 0", 8000), '首屏专辑卡片已就绪');
   const cards = await evalJs("document.querySelectorAll('.card').length");
   ck(cards > 0, '专辑卡片渲染', cards + ' 张');
   // 注意：判据要限定在 #list 内 —— 队列为空时右侧也会有一个 .empty，
@@ -599,9 +599,20 @@ async function waitFor(expr, ms = 8000) {
   await sleep(200);
   ck(await evalJs("!document.getElementById('modal').classList.contains('on')"), '信号链弹层可关闭');
 
-  // 搜索
-  await evalJs("var q=document.getElementById('q'); q.value='Isobel'; q.dispatchEvent(new Event('input'));");
-  await waitFor("document.querySelectorAll('#list .trow').length > 0", 6000);
+  // 搜索：自适应已有曲库（用户库有 Isobel 则搜 Isobel，测试库自选已有曲目）
+  await evalJs(`(function(){
+    var q = document.getElementById('q');
+    fetch('/api/lib/search?q=').then(r=>r.json()).then(j=>{
+      var kw = 'Isobel';
+      if (j.tracks && j.tracks.length) {
+        var hasIso = j.tracks.some(t => (t.title||'').indexOf('Isobel') >= 0);
+        if (!hasIso) kw = j.tracks[0].title || 'test';
+      }
+      q.value = kw;
+      q.dispatchEvent(new Event('input'));
+    });
+  })()`);
+  await waitFor("document.querySelectorAll('#list .trow').length > 0", 8000);
   const hits = await evalJs("document.querySelectorAll('#list .trow').length");
   ck(hits > 0, '全局搜索有结果', hits + ' 条');
   const p6 = await shot('06-search');
