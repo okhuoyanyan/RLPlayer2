@@ -16,6 +16,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <commctrl.h>   // SetWindowSubclass（WebView2 子窗口的边缘命中放行，见下）
 #include <string>
 #include <vector>
 #include <cstdarg>
@@ -29,6 +30,7 @@
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "comctl32.lib")   // SetWindowSubclass
 
 #define WM_TRAYICON  (WM_APP + 1)
 #define ID_TRAY_OPEN  1001
@@ -165,6 +167,7 @@ static void theme_flags(bool& dark, bool& blue) {
     blue = (s.substr(p + 6, e - (p + 6)) == "blue");
 }
 
+static void install_wv_edge_hittest(HWND top);   // 定义在窗口过程之前（WS 边缘命中，见下）
 static void open_browser(int port) {
     wchar_t url[64];
     swprintf_s(url, L"http://127.0.0.1:%d/", port);
@@ -416,7 +419,12 @@ static bool spawn_server(int port) {
 // WebView2 不铺满窗口、四周留的像素数：留给原生缩放命中的热区（WM_NCHITTEST 要有机会拿到鼠标）。
 // 这段边带由宿主自己上色 —— 上色失败就是用户看到的"白边框"，所以三个地方
 //（resize / WM_ERASEBKGND / WM_NCPAINT）必须用同一个值，不许各写一个 5。
-static const int kBandInset = 5;
+// 2026-10-24（用户实机：单曲页"黑边过渡，非常难忍"）：
+// 旧方案给 WebView 内缩 5px 并把这条带子填成主题底色。问题是单曲页背景是**封面衍生渐变**，
+// 任何"实色边带"都必然露出边框 —— 之前给页面加同色外圈/暗角只是把硬边变成渐变边，用户照样一眼看出来。
+// 现在改成真正的满幅：WebView 铺满客户区（inset=0），边缘缩放改由"子窗口放行 + 父窗口 hit-test"实现
+// （见 wv_child_hit_test_proc）。这样页面内容直接顶到窗口边，物理上不存在那条带子。
+static const int kBandInset = 0;
 
 // ---------------- 高 DPI 支持（2026-10-23） ----------------
 // 之前进程是 DPI-UNAWARE：Windows 把整个窗口按 96 DPI 位图拉伸，WebView2 的内容
@@ -559,6 +567,7 @@ static bool trace_paint() {
 //     而"填充"只挂在 WM_PAINT/WM_ERASEBKGND 上，那两条消息压根不来。
 //   所以把填充抽成 repaint_band()，在"表面可能被重建"的每条消息里都补一次。
 static void repaint_band(HWND hwnd) {
+    if (dp(hwnd, kBandInset) <= 0) return;   // 满幅模式：没有边带可画
     if (!g_bandBrush) update_band(theme_bg(g_captionDark, g_captionBlue));
     HDC dc = GetWindowDC(hwnd);   // 用窗口 DC：边带是客户区，窗口 DC 原点与客户区一致
     if (!dc) return;
@@ -585,6 +594,7 @@ static void repaint_band(HWND hwnd) {
 //   我们。既然无法穷举所有提交时机，就用最低成本的办法收口：定时抽查像素，
 //   不对就补一刀。四条 FillRect 的代价可以忽略，且只有真的不对时才画（无闪烁）。
 static void verify_band(HWND hwnd) {
+    if (dp(hwnd, kBandInset) <= 0) return;   // 满幅模式：边缘就是页面内容，不该按主题色校验
     if (!g_bandBrush) update_band(theme_bg(g_captionDark, g_captionBlue));
     const COLORREF want = theme_bg(g_captionDark, g_captionBlue);
     HDC dc = GetWindowDC(hwnd);
@@ -727,6 +737,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         case WM_SIZE:
             if (g_wvCtl) rta::wv2::resize(g_wvCtl, hwnd, dp(hwnd, kBandInset));
+            install_wv_edge_hittest(hwnd);   // 子窗口可能被 WebView2 重建，尺寸变化时重挂一次
             // 尺寸一变，WebView2 子窗口按新几何重排，边带跟着变宽/变高；WM_SIZE 之后
             // 不保证有 WM_PAINT（实测最大化/还原就可能没有），所以这里主动补一次。
             // 与 WM_NCPAINT/WM_PAINT/WM_ERASEBKGND 共用同一个 repaint_band + kBandInset。
@@ -844,6 +855,7 @@ static bool open_webview_window(int port) {
         g_mainWnd = nullptr;
         return false;
     }
+    install_wv_edge_hittest(hwnd);   // 满幅模式：让 WebView2 子窗口把边缘命中交还父窗口
     theme_flags(g_captionDark, g_captionBlue);
     apply_caption(hwnd, g_captionDark, g_captionBlue);
     SetTimer(hwnd, 1, 1500, nullptr);   // 主题跟随（conf 兜底）
@@ -855,6 +867,32 @@ static bool open_webview_window(int port) {
     UpdateWindow(hwnd);
     logf(L"已用内置 WebView2 打开界面（无浏览器外壳）");
     return true;
+}
+
+// 2026-10-24（满幅后的配套）：WebView2 铺满客户区后，鼠标打在边缘命中的是它的子窗口，
+// 子窗口默认把 WM_NCHITTEST 吃掉 → 父窗口拿不到 HTLEFT/HTTOP，窗口就拖不动大小了。
+// 给每个 WebView2 子窗口挂 subclass：接近窗口边框时返回 HTTRANSPARENT，把命中测试交还父窗口；
+// 父窗口原有的 6 逻辑像素边缘判定（WM_NCHITTEST）照旧生效。
+static LRESULT CALLBACK wv_child_hit_proc(HWND child, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (msg == WM_NCHITTEST) {
+        HWND top = GetAncestor(child, GA_ROOT);
+        if (top && !IsZoomed(top)) {
+            POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            RECT rc{};
+            GetWindowRect(top, &rc);
+            const int b = dp(top, 6);
+            if (pt.x < rc.left + b || pt.x >= rc.right - b || pt.y < rc.top + b || pt.y >= rc.bottom - b)
+                return HTTRANSPARENT;
+        }
+    }
+    return DefSubclassProc(child, msg, wp, lp);
+}
+static BOOL CALLBACK subclass_wv_child(HWND child, LPARAM) {
+    SetWindowSubclass(child, wv_child_hit_proc, 0x5254, 0);   // 同 id 重复设置=替换，不会叠加
+    return TRUE;
+}
+static void install_wv_edge_hittest(HWND top) {
+    if (top) EnumChildWindows(top, subclass_wv_child, 0);
 }
 
 // ---------------- 窗口过程 ----------------

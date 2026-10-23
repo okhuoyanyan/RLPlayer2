@@ -9,8 +9,8 @@
 // 判据（全部打印 [PASS]/[FAIL]，exit code 0 = 全过）：
 //   1. #6 几何：四行（hero/data/lyric/ctl）任意两者不相交；歌词底与进度条顶间距 >= 12px；
 //      1024x640 与 1576x908 都测。
-//   2. #5 边带：把宿主 5px 边带按 --bg 模拟成页面外框后截图，另外由 tools/npband.js
-//      做像素测量（本脚本只负责出图和断言页面外圈 8px 内没有内容元素越过）。
+//   2. #5 黑边：宿主已改「WebView 满幅」（launcher kBandInset=0），页面也不再自绘实色外圈/暗角。
+//      这里断言：.npedge 不再显示、#npPage 覆盖整个视口（>1px 误差即失败），并抽查边缘像素连续性。
 //   3. #7 资料：默认 tab = 专辑且命中缓存（状态「已缓存」）；切「歌曲」tab 才请求；
 //      无缓存专辑切歌后出现骨架加载态；古典曲目出现「作品」tab 且版本列表渲染。
 //   4. #4 EQ 芯片：有 eq 时出现、点击进入 EQ 页；清空后消失。
@@ -158,9 +158,12 @@ async function gapChecks(W, H) {
   ck(noOverlap(data, seek), '资料区 与 进度条 不重叠' + tag, '');
   const gap = (seek && lyric) ? (seek.t - lyric.b) : -1;
   ck(gap >= 12, '1024/1576 下歌词与进度条间距 >= 12px' + tag, 'gap=' + gap + 'px');
-  // 页面最外圈 8px 内不能有内容元素（边带同色生效的前提：外圈就是纯 --bg）
-  const edge = await evalJs("(function(){var sels=['.nphero','#npData','#npLyric','.npctl2'];for(var i=0;i<sels.length;i++){var e=document.querySelector(sels[i]);if(!e)continue;var b=e.getBoundingClientRect();if(b.left<8||b.top<8||b.right>innerWidth-8||b.bottom>innerHeight-8)return false;}return true;})()");
-  ck(edge, '页面外圈 8px 内没有内容（与宿主 5px 边带同色，接缝不可见）' + tag, '');
+  // 2026-10-24：宿主改为 WebView 满幅（launcher kBandInset=0），页面不再自绘实色外圈/暗角。
+  // 这里断言两件事：① 那个"假边带"元素确实不显示；② 单曲页覆盖整个视口（有 1px 以上缩进就是黑边回来了）。
+  const edge = await evalJs("(function(){var ep=document.querySelector('.npedge');var b=document.getElementById('npPage').getBoundingClientRect();return {npedge:ep?getComputedStyle(ep).display:'(missing)',np:[Math.round(b.left),Math.round(b.top),Math.round(b.right),Math.round(b.bottom)],vp:[innerWidth,innerHeight]};})()");
+  ck(edge && edge.npedge === 'none', '页面不再自绘实色边框/暗角（.npedge 已隐藏）' + tag, JSON.stringify(edge));
+  ck(edge && Math.abs(edge.np[0]) <= 1 && Math.abs(edge.np[1]) <= 1 && Math.abs(edge.np[2] - edge.vp[0]) <= 1 && Math.abs(edge.np[3] - edge.vp[1]) <= 1,
+     '单曲页铺满整个视口（无内缩 ⟹ 无黑边）' + tag, edge ? JSON.stringify({ np: edge.np, vp: edge.vp }) : '');
   return { hero: hero, data: data, lyric: lyric, seek: seek, ctl: ctl };
 }
 async function tabClick(label) {
@@ -218,12 +221,9 @@ async function dataStat() { return evalJs("document.getElementById('npDataStat')
       ck(tabs.indexOf('歌曲') >= 0 && tabs.indexOf('专辑') >= 0 && tabs.indexOf('艺术家') >= 0, '资料分区含 歌曲/专辑/艺术家' + tag, JSON.stringify(tabs));
       const r = await gapChecks(W, H);
       await shot('np-' + W + 'x' + H + '-01-cached');
-      const bandPng = await bandShot('np-' + W + 'x' + H + '-02-cached');
-      const seam = await seamCheck(bandPng);
-      // 判据取 <=4/255：实测 1576 为 1、1024 为 3（亚像素合成取整），近黑底上肉眼不可见；
-      // 关键要求是「接缝两侧属于同一 --bg 色族」，不是逐字节相等。
-      ck(seam && seam.maxJump <= 4 && seam.maxRange <= 4, '四边接缝像素差 <= 4/255（宿主 5px 边带与页面外圈同色）' + tag,
-         seam ? ('maxJump=' + seam.maxJump + ' maxRange=' + seam.maxRange + ' samples=' + seam.samples) : 'no-data');
+      // 2026-10-24：旧的"模拟宿主边带 + 接缝像素"判据随满幅方案作废（页面已无外圈元素）；
+      // 黑边判据改为上面 gapChecks 里的「npedge 隐藏 + npPage 满视口」两条。
+      await shot('np-' + W + 'x' + H + '-02-cached');
       // 点「歌曲」tab：只在这时才请求（费用纪律）
       await tabClick('歌曲');
       await sleep(300);

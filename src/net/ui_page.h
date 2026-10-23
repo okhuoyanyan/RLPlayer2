@@ -257,7 +257,9 @@ inline std::string rta_ui_page() {
     // 边带同色暗角：最外 8px 纯 --bg（覆盖宿主 5~8 物理像素的边带），再向内 64px 柔和过渡。
     // 用「8px 实心边框 + 内阴影」而不是两层 box-shadow：边框像素是纯 --bg（逐像素实测 08090C），
     // 保证宿主 5px 边带与页面外圈逐字节同色；内阴影从边框内侧开始做暗角渐隐。
-    h += "#npPage .npedge{position:absolute;inset:0;z-index:1;pointer-events:none;border:8px solid var(--bg);box-sizing:border-box;box-shadow:inset 0 0 64px 22px var(--bg)}";
+    // 2026-10-24（用户实机：这条"同色外圈 + 暗角"反而变成明显的黑边过渡）：
+// 宿主已改为 WebView 满幅（launcher kBandInset=0），页面不需要再遮任何边带 → 整块删除。
+h += "#npPage .npedge{display:none}";
     // 拖拽条：贴顶 34px，透明，不挡下方内容（z-index 高于背景、低于关闭按钮）
     h += "#npPage .npgrip{position:absolute;top:0;left:0;right:0;height:34px;z-index:5;cursor:grab;background:transparent}";
     h += "#npPage .npgrip:active{cursor:grabbing}";
