@@ -460,6 +460,13 @@ private:
                     state_.rateMatch = "unknown";
                 }
                 state_.warning = analysis.warning;
+                // 2026-10-24（261023-01 #9 实测）：设备回 PLAYING 但 8 秒内一次都没来取流，
+                // 最常见原因是 Windows 防火墙挡住入站 8912/TCP（本机被 sandbox 的 Block 规则挡住时，
+                // 现象就是 servedBytes=0 / requestCount=0）。给用户可执行的提示，而不是静默"在播"。
+                if (elapsed > 8.0 && state_.requestCount == 0 && state_.warning.empty()) {
+                    state_.warning = "渲染器没有来取流：请检查 Windows 防火墙是否允许 rtaweb.exe 入站 TCP " +
+                                     std::to_string(server.port()) + "，或设备是否支持该格式";
+                }
             }
 
             if (transport.ok && (transport.state == "STOPPED" || transport.state == "NO_MEDIA_PRESENT") && elapsed > 2.0) {
