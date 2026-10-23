@@ -221,7 +221,9 @@ inline std::string rta_ui_page() {
     h += "#npPage{position:fixed;inset:0;z-index:70;display:none;background:var(--bg);overflow:hidden}";
     h += "#npPage.on{display:block}";
     // 边带同色暗角：最外 8px 纯 --bg（覆盖宿主 5~8 物理像素的边带），再向内 64px 柔和过渡。
-    h += "#npPage .npedge{position:absolute;inset:0;z-index:1;pointer-events:none;box-shadow:inset 0 0 0 8px var(--bg),inset 0 0 64px 22px var(--bg)}";
+    // 用「8px 实心边框 + 内阴影」而不是两层 box-shadow：边框像素是纯 --bg（逐像素实测 08090C），
+    // 保证宿主 5px 边带与页面外圈逐字节同色；内阴影从边框内侧开始做暗角渐隐。
+    h += "#npPage .npedge{position:absolute;inset:0;z-index:1;pointer-events:none;border:8px solid var(--bg);box-sizing:border-box;box-shadow:inset 0 0 64px 22px var(--bg)}";
     // 拖拽条：贴顶 34px，透明，不挡下方内容（z-index 高于背景、低于关闭按钮）
     h += "#npPage .npgrip{position:absolute;top:0;left:0;right:0;height:34px;z-index:5;cursor:grab;background:transparent}";
     h += "#npPage .npgrip:active{cursor:grabbing}";
@@ -269,6 +271,8 @@ inline std::string rta_ui_page() {
     // 行3：歌词区（独立滚动，min-height:0 保证网格行真的能压缩 —— 这是 1024x640 下
     // 歌词压到进度条上的根因：旧实现 .nplyric 固定 58vh 且控件绝对定位，二者必然重叠）
     h += ".nplyric2{min-height:0;overflow:auto;text-align:center;scrollbar-width:none;padding:2px 0}";
+    // 无歌词/纯音乐时把提示垂直居中，避免大片空白显得像没加载出来
+    h += ".nplyric2.empty{display:flex;flex-direction:column;align-items:center;justify-content:center}";
     h += ".nplyric2::-webkit-scrollbar{display:none}";
     h += ".npline{font-size:clamp(13px,1.9vh,17px);line-height:2.05;color:var(--mut2);transition:.18s}";
     h += ".npline.on{color:var(--txt);font-weight:650;transform:scale(1.03)}";

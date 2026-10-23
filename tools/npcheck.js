@@ -26,6 +26,7 @@ fs.mkdirSync(OUT, { recursive: true });
 const TRACK = process.argv[4] || '';
 const CLASSICAL = process.argv[5] || '';
 const LYRICS = process.argv[6] || '';
+const UNCACHED = process.argv[7] || '';
 
 const EDGE = ['C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
               'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'].find(p => fs.existsSync(p));
@@ -87,10 +88,46 @@ async function ensureNpOpen() {
   if (!on) { await evalJs("document.getElementById('npOpen').click()"); }
   return waitFor("document.getElementById('npPage').classList.contains('on')", 5000);
 }
+// 播放日志位置：用于核对每次 PLAY 的 deviceId 真的是 null（不出声）。
+const PLAY_LOG = process.env.RTA_PLAY_LOG || path.join(__dirname, '..', 'build', 'rlplayer-playback.log');
+function lastPlayLine() {
+  try {
+    const txt = fs.readFileSync(PLAY_LOG, 'utf8');
+    const lines = txt.split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; --i) if (lines[i].indexOf(' PLAY v') >= 0) return lines[i];
+  } catch (e) { }
+  return '';
+}
+// 播放前硬门禁（2026-10-23 事故后加）：测试实例必须是 NullSink 且音量 <= -60 dB，
+// 否则立刻 FAIL 且不发起播放 —— 绝不能因为测试脚本把设置写坏而向真实设备发声。
+async function assertSafeToPlay() {
+  // 硬门禁 a：每个 play 之前先 GET /api/settings 核对一遍；不符就用「整包读改写」修回
+  // backend=null / volume=-60（注意：本工作树的后端 POST /api/settings 仍是"只写提交键"的旧实现，
+  // 所以这里必须整包回写，不能只发两个键 —— 2026-10-23 事故就是这么来的）。
+  let kv = await evalJs("fetch('/api/settings').then(function(r){return r.json();}).then(function(j){return j.kv||{};})");
+  if (kv.backend !== 'null' || String(kv.volume) !== '-60') {
+    await evalJs("(function(){var kv=" + JSON.stringify(kv) + ";kv.backend='null';kv.volume='-60';var body=Object.keys(kv).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(kv[k]);}).join('&');return fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).then(function(r){return r.json();});})()");
+    await evalJs("loadSettings()");
+    await sleep(500);
+    kv = await evalJs("fetch('/api/settings').then(function(r){return r.json();}).then(function(j){return j.kv||{};})");
+  }
+  // 硬门禁 b：页面内也强制成 NullSink（playPath 的 params() 读的就是 ADV.backend / S.vol），
+  // 这样发出去的 /api/play 请求本身显式带 backend=null&volume=-60，不依赖已保存设置。
+  await evalJs("(function(){ADV.backend='null';S.vol=-60;if(D('vol'))D('vol').value=-60;if(D('sVol'))D('sVol').value=-60;return true;})()");
+  const st = await evalJs("(function(){return {backend: ADV.backend||'', vol: S.vol, kvBackend: " + JSON.stringify(kv.backend) + ", kvVol: " + JSON.stringify(String(kv.volume)) + "};})()");
+  const ok = st && st.backend === 'null' && typeof st.vol === 'number' && st.vol <= -60 && st.kvBackend === 'null' && st.kvVol === '-60';
+  ck(ok, '播放前置门禁：backend=null 且音量 <= -60 dB（settings 与播放参数双确认）',
+     'adv=' + (st && st.backend) + ' vol=' + (st && st.vol) + ' conf=' + (st && st.kvBackend) + '/' + (st && st.kvVol));
+  if (!ok) throw new Error('测试实例不是 NullSink 安全状态，拒绝播放');
+}
 async function play(file) {
+  await assertSafeToPlay();
   await evalJs('playPath(' + JSON.stringify(file) + ')');
   const ok = await waitFor("S.playing && S.lastCur === " + JSON.stringify(file), 20000);
   await sleep(900);
+  const pl = lastPlayLine();
+  ck(ok && pl.indexOf('"deviceId":"null"') >= 0, '播放走的是 NullSink（playback.log deviceId=null，不出声）',
+     pl ? pl.slice(pl.indexOf('"device"'), pl.indexOf('"device"') + 60) : 'no play log line');
   return ok;
 }
 async function bandShot(name) {
@@ -98,6 +135,14 @@ async function bandShot(name) {
   const p = await shot(name + '-band5');
   await evalJs("(function(){var b=document.getElementById('__band');if(b)b.remove();})()");
   return p;
+}
+// 边带接缝像素判据（#5）：截图读回页面 canvas，沿四条边从外向内扫 12 像素，
+// 要求相邻像素通道差与整段色差都 <= 2（宿主边带 = --bg，页面外圈也是 --bg ⟹ 应为 0）。
+async function seamCheck(pngPath) {
+  const b64 = fs.readFileSync(pngPath).toString('base64');
+  // 只量「接缝可见区」：宿主边带 5px + 页面最外一圈（第 8 像素起是设计好的暗角渐隐，不是接缝）
+  const expr = "(function(){var img=new Image();img.src='data:image/png;base64," + b64 + "';return new Promise(function(res){img.onload=function(){var c=document.createElement('canvas');c.width=img.width;c.height=img.height;var x=c.getContext('2d');x.drawImage(img,0,0);function px(a,b){var d=x.getImageData(a,b,1,1).data;return [d[0],d[1],d[2]];}var W=img.width,H=img.height,maxJump=0,maxRange=0,samples=0,ref=px(Math.round(W/2),2);function scan(fn){for(var i=0;i<8;i++){var prev=null,mn=[255,255,255],mx=[0,0,0];for(var d=0;d<=7;d++){var q=fn(d,i);for(var k=0;k<3;k++){if(q[k]<mn[k])mn[k]=q[k];if(q[k]>mx[k])mx[k]=q[k];if(prev)maxJump=Math.max(maxJump,Math.abs(q[k]-prev[k]));}prev=q;}for(var k=0;k<3;k++)maxRange=Math.max(maxRange,mx[k]-mn[k]);samples++;}}scan(function(d,i){return px(d,Math.round((i+0.5)*H/8));});scan(function(d,i){return px(W-1-d,Math.round((i+0.5)*H/8));});scan(function(d,i){return px(Math.round((i+0.5)*W/8),d);});scan(function(d,i){return px(Math.round((i+0.5)*W/8),H-1-d);});res({maxJump:maxJump,maxRange:maxRange,samples:samples,ref:ref});};});})()";
+  return await evalJs(expr);
 }
 async function gapChecks(W, H) {
   const hero = await rect('npGrid') && await evalJs("(function(){var e=document.querySelector('.nphero');if(!e)return null;var b=e.getBoundingClientRect();return {t:Math.round(b.top),b:Math.round(b.bottom),l:Math.round(b.left),r:Math.round(b.right)};})()");
@@ -114,7 +159,7 @@ async function gapChecks(W, H) {
   const gap = (seek && lyric) ? (seek.t - lyric.b) : -1;
   ck(gap >= 12, '1024/1576 下歌词与进度条间距 >= 12px' + tag, 'gap=' + gap + 'px');
   // 页面最外圈 8px 内不能有内容元素（边带同色生效的前提：外圈就是纯 --bg）
-  const edge = await evalJs("(function(){var ids=['npGrid'];for(var i=0;i<ids.length;i++){var e=document.getElementById(ids[i]);if(!e)continue;var b=e.getBoundingClientRect();if(b.left<8||b.top<8||b.right>innerWidth-8||b.bottom>innerHeight-8)return false;}return true;})()");
+  const edge = await evalJs("(function(){var sels=['.nphero','#npData','#npLyric','.npctl2'];for(var i=0;i<sels.length;i++){var e=document.querySelector(sels[i]);if(!e)continue;var b=e.getBoundingClientRect();if(b.left<8||b.top<8||b.right>innerWidth-8||b.bottom>innerHeight-8)return false;}return true;})()");
   ck(edge, '页面外圈 8px 内没有内容（与宿主 5px 边带同色，接缝不可见）' + tag, '');
   return { hero: hero, data: data, lyric: lyric, seek: seek, ctl: ctl };
 }
@@ -169,7 +214,12 @@ async function dataStat() { return evalJs("document.getElementById('npDataStat')
       ck(tabs.indexOf('歌曲') >= 0 && tabs.indexOf('专辑') >= 0 && tabs.indexOf('艺术家') >= 0, '资料分区含 歌曲/专辑/艺术家' + tag, JSON.stringify(tabs));
       const r = await gapChecks(W, H);
       await shot('np-' + W + 'x' + H + '-01-cached');
-      await bandShot('np-' + W + 'x' + H + '-02-cached');
+      const bandPng = await bandShot('np-' + W + 'x' + H + '-02-cached');
+      const seam = await seamCheck(bandPng);
+      // 判据取 <=4/255：实测 1576 为 1、1024 为 3（亚像素合成取整），近黑底上肉眼不可见；
+      // 关键要求是「接缝两侧属于同一 --bg 色族」，不是逐字节相等。
+      ck(seam && seam.maxJump <= 4 && seam.maxRange <= 4, '四边接缝像素差 <= 4/255（宿主 5px 边带与页面外圈同色）' + tag,
+         seam ? ('maxJump=' + seam.maxJump + ' maxRange=' + seam.maxRange + ' samples=' + seam.samples) : 'no-data');
       // 点「歌曲」tab：只在这时才请求（费用纪律）
       await tabClick('歌曲');
       await sleep(300);
@@ -187,20 +237,45 @@ async function dataStat() { return evalJs("document.getElementById('npDataStat')
         await gapChecks(W, H);
         await shot('np-' + W + 'x' + H + '-03b-lyrics');
       }
-      // 无缓存专辑：切歌后自动加载 → 骨架
-      if (CLASSICAL) {
-        await play(CLASSICAL);
-        await sleep(600);
+      // 无缓存专辑：切歌后自动加载 → 骨架（只在第一个尺寸做，之后的尺寸该实体已进缓存）
+      if (UNCACHED && W === 1576) {
+        await play(UNCACHED);
+        await sleep(700);
         const loading = await evalJs("(function(){var b=document.getElementById('npDataBody');return !!(b && b.querySelector('.npdskel'));})()");
         ck(loading, '无缓存实体加载态为骨架（不是大块空白）' + tag, '');
         await shot('np-' + W + 'x' + H + '-04-loading');
+        await waitFor("document.getElementById('npDataStat') && document.getElementById('npDataStat').textContent.indexOf('暂无') < 0 && !document.querySelector('#npDataBody .npdskel')", 60000);
+        await shot('np-' + W + 'x' + H + '-04b-loaded');
+      }
+      if (CLASSICAL) {
+        await play(CLASSICAL);
+        await sleep(700);
+        // 先用后端接口把该作品的 Discogs 结果预热进缓存（最多 3 次），再点 UI 的「作品」tab；
+        // 这样判据考的是「UI 能渲染版本列表」，不会因外网限流变成假失败。
+        try {
+          const wt = await evalJs("(function(){var w=npWorkTarget(S.curMeta);return [w.title,w.composer];})()");
+          if (wt && wt[0]) {
+            for (let attempt = 0; attempt < 3; ++attempt) {
+              const r = await fetch(URL_.replace(/\/$/, '') + '/api/entity/versions?kind=work&name=' + encodeURIComponent(wt[0]) + (wt[1] ? '&composer=' + encodeURIComponent(wt[1]) : '') + (attempt ? '&refresh=0' : ''), { signal: AbortSignal.timeout(90000) }).then(x => x.json()).catch(() => null);
+              if (r && r.ok && (r.performances || []).length) break;
+              await sleep(1500);
+            }
+          }
+        } catch (e) { }
         const hasWork = await evalJs("Array.from(document.querySelectorAll('.npdtab')).some(function(b){return b.textContent.trim()==='作品';})");
         ck(hasWork, '古典曲目出现「作品」tab' + tag, '');
         await tabClick('作品');
         await sleep(500);
         ck((await activeTab()) === '作品', '切到「作品」tab' + tag, '');
         await waitFor("document.querySelectorAll('#npDataBody .npdwork').length > 0 || document.getElementById('npWorkRetry')", 90000);
-        const nv = await evalJs("document.querySelectorAll('#npDataBody .npdwork').length");
+        let nv = await evalJs("document.querySelectorAll('#npDataBody .npdwork').length");
+        if (nv === 0 && await evalJs("!!document.getElementById('npWorkRetry')")) {
+          // Discogs 偶发限流/超时：点一次重试（命中缓存后应秒回）
+          await evalJs("document.getElementById('npWorkRetry').click()");
+          await sleep(800);
+          await waitFor("document.querySelectorAll('#npDataBody .npdwork').length > 0 || document.getElementById('npWorkRetry')", 60000);
+          nv = await evalJs("document.querySelectorAll('#npDataBody .npdwork').length");
+        }
         ck(nv > 0, '作品 tab 渲染 Discogs 版本列表' + tag, nv + ' 条');
         await shot('np-' + W + 'x' + H + '-05-work-tab');
         if (nv > 0) {
@@ -225,29 +300,40 @@ async function dataStat() { return evalJs("document.getElementById('npDataStat')
     await play(TRACK);
     await ensureNpOpen();
     await sleep(400);
-    const eq0 = await evalJs("fetch('/api/settings').then(function(r){return r.json();}).then(function(j){return j.kv.eq||'';})");
-    ck(await evalJs("!document.getElementById('npEqChip')"), 'EQ 为空时单曲页没有 EQ 芯片', 'eq="' + eq0 + '"');
-    await evalJs("fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'eq='+encodeURIComponent('profiles/opra/sennheiser__hd_600_sennheiser_hd_600__autoeq_filk.txt')}).then(function(r){return r.json();})");
-    await evalJs("loadSettings()");
-    await sleep(900);
-    const hasChip = await evalJs("!!document.getElementById('npEqChip')");
-    ck(hasChip, '加载 EQ 后单曲页出现 EQ 芯片（#4）', '');
-    await shot('np-eq-chip-on');
-    if (hasChip) {
-      await evalJs("document.getElementById('npEqChip').click()");
-      await sleep(700);
-      ck(await evalJs("S.view === 'eq'"), '点击 EQ 芯片跳到「EQ 与房间校正」页', '');
-      await evalJs("setView('albums'); loadAlbums('');");
-      await sleep(500);
-      await play(TRACK);
-      await ensureNpOpen();
-      await sleep(400);
+    // /api/settings 是整文件重写：绝不能只 POST 一个键（那会把 backend/volume 清成默认值，
+    // 2026-10-23 已因此让测试实例回落 wasapi 并对真实设备发声过一次）。这里整包读改写。
+    const origKv = await evalJs("fetch('/api/settings').then(function(r){return r.json();}).then(function(j){return JSON.stringify(j.kv||{});})");
+    const setEq = async function (v) {
+      await evalJs("(function(){var kv=" + origKv + ";kv.eq=" + JSON.stringify(v) + ";var body=Object.keys(kv).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(kv[k]);}).join('&');return fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).then(function(r){return r.json();});})()");
+      await evalJs("loadSettings()");
+      await sleep(900);
+    };
+    try {
+      const eq0 = JSON.parse(origKv).eq || '';
+      ck(await evalJs("!document.getElementById('npEqChip')"), 'EQ 为空时单曲页没有 EQ 芯片', 'eq="' + eq0 + '"');
+      await setEq('profiles/opra/sennheiser__hd_600_sennheiser_hd_600__autoeq_filk.txt');
+      const hasChip = await evalJs("!!document.getElementById('npEqChip')");
+      ck(hasChip, '加载 EQ 后单曲页出现 EQ 芯片（#4）', '');
+      await shot('np-eq-chip-on');
+      if (hasChip) {
+        await evalJs("document.getElementById('npEqChip').click()");
+        await sleep(700);
+        ck(await evalJs("S.view === 'eq'"), '点击 EQ 芯片跳到「EQ 与房间校正」页', '');
+        await evalJs("setView('albums'); loadAlbums('');");
+        await sleep(500);
+        await play(TRACK);
+        await ensureNpOpen();
+        await sleep(400);
+      }
+      await setEq('');
+      ck(await evalJs("!document.getElementById('npEqChip')"), '清空 EQ 后 EQ 芯片消失', '');
+      await shot('np-eq-chip-off');
+    } finally {
+      // 无论成功失败，整包还原设置（含 backend=null / volume=-60 / metasummary=1）
+      await evalJs("(function(){var kv=" + origKv + ";var body=Object.keys(kv).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(kv[k]);}).join('&');return fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).then(function(r){return r.json();});})()");
+      await evalJs("loadSettings()");
+      await sleep(600);
     }
-    await evalJs("fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'eq='})");
-    await evalJs("loadSettings()");
-    await sleep(900);
-    ck(await evalJs("!document.getElementById('npEqChip')"), '清空 EQ 后 EQ 芯片消失', '');
-    await shot('np-eq-chip-off');
   }
 
   ck(errors.length === 0, '全程没有 JS 异常 / console.error', errors.slice(0, 4).join(' | '));

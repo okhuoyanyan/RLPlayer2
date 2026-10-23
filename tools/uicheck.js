@@ -136,8 +136,9 @@ async function waitFor(expr, ms = 8000) {
   await sleep(500);
   const tr = await evalJs("document.querySelectorAll('.trow').length");
   ck(tr > 0, '曲目列表非空', tr + ' 首');
-  ck(await evalJs("!document.querySelector('.summary-sec')"),
-     '开关关闭时专辑页不出现简介板块（不请求、不留空白块）');
+  // 自检不能假设用户的「在线资料整理」开关状态：关 → 不能有板块；开 → 允许出现（加载行或内容）
+  ck(await evalJs("(META.summary === 0) ? !document.querySelector('.summary-sec') : true"),
+     '开关关闭时专辑页不出现简介板块（开关开启时允许出现，由用户设置决定）');
   const p2 = await shot('02-album');
 
   // 曲目视图
@@ -243,8 +244,8 @@ async function waitFor(expr, ms = 8000) {
      '带资料页面无 http 外链（永不跳转外部浏览器）');
   // 2026-10-23 261023-03 #2/#3：不再有「AI 综合 / AI 生成 / 生成 AI 简介」字样与按钮。
   // 设置开关默认关闭 → 艺术家页不应出现任何简介板块（不请求、不留空板块、不闪加载行）。
-  ck(await evalJs("!document.querySelector('.ai-sec') && !document.querySelector('.summary-sec')"),
-     '艺术家资料页默认不出现简介板块（开关关闭 → 不请求、不留空板块）');
+  ck(await evalJs("!document.querySelector('.ai-sec') && ((META.summary === 0) ? !document.querySelector('.summary-sec') : true)"),
+     '艺术家资料页不出现旧「AI 简介」板块（开关关闭时也不留空板块）');
   ck(await evalJs("(function(){var t=document.body.textContent||'';return t.indexOf('AI 综合')<0 && t.indexOf('AI 生成')<0 && t.indexOf('生成 AI 简介')<0;})()"),
      '艺术家资料页无「AI 综合 / AI 生成 / 生成 AI 简介」字样');
   const pZard = await shot('21-artist-profile-zard');

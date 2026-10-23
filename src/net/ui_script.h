@@ -4133,7 +4133,12 @@ function npGuessComposer(m) {
 }
 function npWorkTarget(m) {
   if (!m) return { title: '', composer: '' };
-  return { title: String(m.title || ''), composer: npGuessComposer(m) };
+  var t = String(m.title || '');
+  // 在线补全有时把曲名改写成「原文 (中文译名)」。Discogs 检索要用**原文**：
+  // 去掉末尾带 CJK 的括号译名（否则 composer 猜对也搜不到版本，实测 1024 那次就 0 条）。
+  var mm = t.match(/^(.*?)\s*[（(]([^()（）]*)[）)]\s*$/);
+  if (mm && mm[1] && /[\u4e00-\u9fff]/.test(mm[2])) t = mm[1].trim();
+  return { title: t, composer: npGuessComposer(m) };
 }
 // 当前 EQ / IR 芯片（用户 261023-04 #4）：读 /api/settings 的 eq/ir（loadSettings 填进 ADV），
 // 有值才出现；点击跳「EQ 与房间校正」页；tooltip 显示当前文件。
@@ -4236,6 +4241,9 @@ function npDataSummaryBody(d) {
     });
     h += '</div>';
   }
+  // Lead 约定：无权威材料时后端回 unverified=true（AI 整理），这里必须明确标注，
+  // 不能让用户把 AI 组织的内容当成权威资料。
+  if (d.unverified) h += '<div class=npdhint style="margin-bottom:4px">AI 整理（未找到权威来源，仅供参考）</div>';
   h += '<div class=npdhint>' + (d.unverified ? '未核对 · ' : '') +
        (d.summaryCached ? '缓存结果 · ' : '实时整理 · ') + '依据来源整理，可能不完整，请以来源为准</div>';
   return h;
@@ -4400,6 +4408,7 @@ function renderNp() {
 }
 function renderNpLyric() {
   var box = D('npLyric'); if (!box) return;
+  if (box.classList) box.classList.toggle('empty', !LY.lines.length);
   if (!LY.lines.length) {
     box.innerHTML = '<div class=npline>没有歌词<br><span style="font-size:12px;color:var(--mut2)">同名 .lrc 文件、内嵌歌词，或播放时自动在线补全（可在设置-元数据补全关闭）</span></div>';
     return;
