@@ -750,6 +750,9 @@ inline fsx::path summary_cache_path(const std::string& baseDir,
 inline std::string summary_to_json(const SummaryResult& sr) {
     std::ostringstream o;
     o << "{\n"
+      // 2026-10-24（261024-01 #4）：缓存格式版本。v2 起才有结构化 fields；旧缓存（无 v 或 v<2）
+      // 在读取时直接判过期，让下次请求重新生成 —— 否则升级后老用户永远看不到标签网格。
+      << "  \"v\": 2,\n"
       << "  \"ok\": " << (sr.ok ? "true" : "false") << ",\n"
       << "  \"ai\": " << (sr.ai ? "true" : "false") << ",\n"
       << "  \"model\": \"" << meta_jesc(sr.model) << "\",\n"
@@ -831,6 +834,9 @@ inline bool summary_from_json(const std::string& text,
     if (sr_out.expires_at <= 0 && sr_out.generated_at > 0) {
         sr_out.expires_at = sr_out.generated_at + 7 * 86400; // 默认 TTL 7 天
     }
+    // 2026-10-24（261024-01 #4）：v2 之前的缓存没有结构化标签 → 视为已过期，重新生成一次
+    //（否则升级后老用户永远看不到标签网格）。
+    if ((int)j["v"].n() < 2) sr_out.expires_at = 0;
     sr_out.disclaimer = j["disclaimer"].s();
     if (j.has("from_cache")) sr_out.from_cache = j["from_cache"].b;
     if (j.has("offline")) sr_out.offline = j["offline"].b;

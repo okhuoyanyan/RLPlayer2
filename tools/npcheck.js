@@ -41,6 +41,11 @@ const CLASSICAL = arg(5);
 const LYRICS = arg(6);
 const UNCACHED = arg(7);
 const NO_MOCK = process.argv.indexOf('--no-mock') >= 0;
+// 2026-10-24（真实后端联调）：--no-mock 时走真实 /api/entity/summary。此时：
+//  · 断言文案改成真实字段名（不再依赖 MOCK-* 标记）；
+//  · 点标签前清空页面内 NP_DATA 缓存，确保真的发请求（否则预取/缓存会让"请求次数=0"假失败）；
+//  · 数据生成要等，rows 判据先 waitFor 再断言。
+const REAL = NO_MOCK;
 
 // 契约为 Lead 约定的 {ok, kind, fields:{标签:值}}。三个 kind 内容形状不同 ⟹ 顺带验证
 // "歌曲标签渲染的是歌曲级字段、专辑标签是专辑级字段"，不会串台。
@@ -147,7 +152,9 @@ function lastPlayLine() {
   try {
     const txt = fs.readFileSync(PLAY_LOG, 'utf8');
     const lines = txt.split(/\r?\n/);
-    for (let i = lines.length - 1; i >= 0; --i) if (lines[i].indexOf(' PLAY v') >= 0) return lines[i];
+    for (let i = lines.length - 1; i >= 0; --i) {
+      if (lines[i].indexOf(' PLAY v') >= 0 && lines[i].indexOf('"deviceId":"null"') >= 0) return lines[i];
+    }
   } catch (e) { }
   return '';
 }
@@ -308,7 +315,9 @@ async function installMock() {
       const r = await gapChecks(W, H);
       await shot('np-' + W + 'x' + H + '-01-default');
       // ---- 点「专辑」标签：才请求 kind=release，抽屉滑出且不遮住控制区 ----
+      if (REAL) await evalJs("(function(){try{NP_DATA.cache={};NP_DATA.inflight={};}catch(e){}return 1;})()");
       ck(await tabClick('专辑'), '点「专辑」标签' + tag, '');
+      if (REAL) await waitFor("document.querySelectorAll('#npDataBody .efrow').length >= 1", 150000);
       await sleep(600);
       const dAlb = await drawerState();
       ck(dAlb.on && dAlb.kind === '专辑', '抽屉滑出且头部显示「专辑」' + tag, JSON.stringify({ on: dAlb.on, kind: dAlb.kind }));
@@ -316,7 +325,9 @@ async function installMock() {
       ck(dAlb.rows >= 3, '专辑标签渲染字段网格（.efrow >= 3 行）' + tag, 'rows=' + dAlb.rows);
       const relReq = await evalJs("(window.__reqs||[]).filter(function(s){return /[?&]kind=release/.test(s);}).length");
       ck(relReq >= 1, '专辑标签请求的是 kind=release' + tag, 'release 请求 ' + relReq + ' 次');
-      ck(await evalJs("(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-艺术家')>=0||t.indexOf('MOCK-类型')>=0;})()"),
+      ck(await evalJs(REAL
+           ? "(function(){var t=document.getElementById('npDataBody').textContent;return /发行时间|专辑类型|语种|出版方|曲目列表|专辑编号/.test(t);})()"
+           : "(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-艺术家')>=0||t.indexOf('MOCK-类型')>=0;})()"),
          '专辑标签内容来自 release 级字段（不串台）' + tag, '');
       await shot('np-' + W + 'x' + H + '-02-album-tab');
       // 关闭（#npDataClose）
@@ -324,24 +335,34 @@ async function installMock() {
       await sleep(350);
       ck(!(await drawerOpen()), '点右上关闭按钮收起抽屉' + tag, '');
       // ---- 点「歌曲」标签：请求 kind=track，内容必须是曲目级 ----
+      if (REAL) await evalJs("(function(){try{NP_DATA.cache={};NP_DATA.inflight={};}catch(e){}return 1;})()");
       ck(await tabClick('歌曲'), '点「歌曲」标签' + tag, '');
+      if (REAL) await waitFor("document.querySelectorAll('#npDataBody .efrow').length >= 1", 150000);
       await sleep(600);
       const dTrk = await drawerState();
       ck(dTrk.on && dTrk.kind === '歌曲', '抽屉头部显示「歌曲」' + tag, JSON.stringify({ kind: dTrk.kind }));
-      ck(await evalJs("(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-演唱')>=0||t.indexOf('MOCK-作词')>=0;})()"),
+      ck(await evalJs(REAL
+           ? "(function(){var t=document.getElementById('npDataBody').textContent;return /演唱|作词|作曲|编曲|所属专辑|歌曲风格/.test(t);})()"
+           : "(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-演唱')>=0||t.indexOf('MOCK-作词')>=0;})()"),
          '歌曲标签渲染曲目级字段（演唱/作词…，不是歌手简介）' + tag, '');
       // 实体串台硬判据：歌曲 tab 里不得出现艺术家级字段
-      ck(await evalJs("(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-国籍')<0&&t.indexOf('MOCK-厂牌')<0;})()"),
+      ck(await evalJs(REAL
+           ? "(function(){var t=document.getElementById('npDataBody').textContent;return !/国籍|厂牌|活跃年代/.test(t);})()"
+           : "(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-国籍')<0&&t.indexOf('MOCK-厂牌')<0;})()"),
          '歌曲标签里没有艺术家级字段（国籍/厂牌）—— 不串台' + tag, '');
       const trkReq = await evalJs("(window.__reqs||[]).filter(function(s){return /[?&]kind=track/.test(s);}).length");
       ck(trkReq >= 1, '歌曲标签请求的是 kind=track' + tag, 'track 请求 ' + trkReq + ' 次');
       await shot('np-' + W + 'x' + H + '-03-song-tab');
       // ---- 点「艺术家」标签：kind=person ----
+      if (REAL) await evalJs("(function(){try{NP_DATA.cache={};NP_DATA.inflight={};}catch(e){}return 1;})()");
       ck(await tabClick('艺术家'), '点「艺术家」标签' + tag, '');
+      if (REAL) await waitFor("document.querySelectorAll('#npDataBody .efrow').length >= 1", 150000);
       await sleep(600);
       const dPer = await drawerState();
       ck(dPer.on && dPer.kind === '艺术家', '抽屉头部显示「艺术家」' + tag, JSON.stringify({ kind: dPer.kind }));
-      ck(await evalJs("(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-国籍')>=0||t.indexOf('MOCK-代表作')>=0;})()"),
+      ck(await evalJs(REAL
+           ? "(function(){var t=document.getElementById('npDataBody').textContent;return /国籍|风格|代表作品|简介|活跃年代/.test(t);})()"
+           : "(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-国籍')>=0||t.indexOf('MOCK-代表作')>=0;})()"),
          '艺术家标签渲染表演者级字段（国籍/代表作品…）' + tag, '');
       const perReq = await evalJs("(window.__reqs||[]).filter(function(s){return /[?&]kind=person/.test(s);}).length");
       ck(perReq >= 1, '艺术家标签请求的是 kind=person' + tag, 'person 请求 ' + perReq + ' 次');
@@ -357,7 +378,13 @@ async function installMock() {
       const txt = await evalJs("document.getElementById('npDataBody').textContent");
       ck(txt.indexOf('未找到权威来源') < 0 && txt.indexOf('仅供参考') < 0 && txt.indexOf('未核对') < 0,
          '资料里没有「未找到权威来源/仅供参考/未核对」' + tag, '');
-      ck(txt.indexOf('AI 整理') >= 0, '资料里有「AI 整理」标注（诚实标注保留）' + tag, '');
+      if (REAL) {
+        // 真实后端：有权威来源时显示引用/来源，无来源时显示「AI 整理」——两者都算诚实标注。
+        ck(txt.indexOf('AI 整理') >= 0 || txt.indexOf('依据') >= 0 || txt.indexOf('引用') >= 0 || txt.indexOf('来源') >= 0,
+           '资料有诚实标注（AI 整理 / 来源引用）' + tag, '');
+      } else {
+        ck(txt.indexOf('AI 整理') >= 0, '资料里有「AI 整理」标注（诚实标注保留）' + tag, '');
+      }
       await evalJs("document.getElementById('npDataClose').click()");
       await sleep(300);
       // 有歌词的曲目：用真实多行歌词验 1024x640 的「歌词压进度条」回归
