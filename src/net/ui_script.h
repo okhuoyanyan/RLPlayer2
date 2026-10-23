@@ -1077,6 +1077,9 @@ function renderTracksView() {
 function loadFiles(d) {
   S.view = 'files';
   api('/api/files?dir=' + encodeURIComponent(d || '')).then(function (j) {
+    // 与 loadTracks 同一类问题（261023-01 #4）：请求在路上时用户可能已经切走，
+    // 迟到的响应不许覆写当前页面 —— 否则「文件夹」偶发空白/闪回别的页（本轮自检就踩到）。
+    if (S.view !== 'files') return;
     if (!j.ok) { D('list').innerHTML = '<div class=empty>' + esc(j.error) + '</div>'; return; }
     S.dir = j.dir;
     head('文件夹', '', '');
@@ -3990,6 +3993,7 @@ document.addEventListener('keydown', function (e) {
 function renderQueuePage() {
   S.view = 'queue';
   api('/api/queue').then(function (j) {
+    if (S.view !== 'queue') return;   // 已切走 → 丢弃，别覆写当前页面
     S.q = { items: j.items || [], index: j.index || 0 };
     var n = S.q.items.length;
     head('播放队列', n ? (n + ' 首') : '', n ? '<button class=btn id=qClrAll>清空队列</button>' : '');
