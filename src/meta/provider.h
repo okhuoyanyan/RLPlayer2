@@ -53,6 +53,7 @@
 #include "net/http_client.h"
 #include "net/json.h"
 #include "meta/match.h"          // Candidate 的唯一定义(评分与 provider 共用,2026-10-21 统一)
+#include "meta/year.h"           // E-14：年份清洗统一由此头提供
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -147,31 +148,7 @@ inline std::string percent_enc_utf8(const std::string& s) {
     return o;
 }
 
-// 取年份:找第一段「连续数字且长度 ≥4」的数字串,取其前 4 位;找不到返回 ""。
-//   "2003-07-31" → "2003";"2003-07-31T07:00:00Z" → "2003";""/"abc" → ""。
-// 数字串本身 ≥5 位时取前 4(CompactDate "20030731" 也能取到 2003)。
-// 合理窗口 [1000,2100]:取到的 4 位年份落在窗口内才返回,否则返回 ""。
-//   ⚠️ 2026-10-22 实测事故:QQ 源对该曲返回 time_public="0000-00-00",旧版取出 "0000"
-//   被采纳写回,文件 DATE 从 2022-12-24 变 "0000"。垃圾年份必须在源头丢弃;
-//   本函数同时服务 QQ/netease/iTunes 三家解析,一处修三家受益
-//   (写回侧另有第二道守卫,见 meta/writeback.h 的 writeback_year_ok)。
-inline std::string pv_year4(const std::string& s) {
-    const size_t n = s.size();
-    size_t i = 0;
-    while (i < n) {
-        if (s[i] < '0' || s[i] > '9') { ++i; continue; }
-        size_t j = i;
-        while (j < n && s[j] >= '0' && s[j] <= '9') ++j;
-        if (j - i >= 4) {
-            const std::string y = s.substr(i, 4);
-            const int v = (y[0] - '0') * 1000 + (y[1] - '0') * 100 +
-                          (y[2] - '0') * 10 + (y[3] - '0');
-            return (v >= 1000 && v <= 2100) ? y : std::string();
-        }
-        i = j;
-    }
-    return "";
-}
+// E-14：pv_year4 统一定义并实现在 meta/year.h（由上文 include 引入）
 
 // base64 解码(256 项查表,启动时构建一次):
 //   * '='(表值 -2)结束数据段 —— 标准 padding;

@@ -26,6 +26,7 @@
 // 头文件库：全部 inline，namespace rta::meta，不用异常（同 store.h / parse.h）。
 #pragma once
 #include "meta/store.h"          // MetaStore::hashOf / MetaValue / meta_path_of / meta_jesc
+#include "meta/year.h"           // E-14：年份清洗复用统一纯函数 pv_year4
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -867,49 +868,11 @@ inline EntityKind entity_artist_kind(const std::string& raw) {
 // 年份清洗（Release 判等键专用；纯函数）
 // ---------------------------------------------------------------------------
 
-// 从任意标签串里取【4 位年份】。取不到（或无合理年份）返回 ""。
-//   "2022-08-16" → "2022"；"20030731" → "2003"（紧凑日期形态）；"1996" → "1996"（不误伤）；
-//   "0000" / "" / "abc" / "999" / "99999" / "-1" → ""（垃圾一律不猜，宁缺毋滥）。
-// 为什么需要它：Release 的判等键是「专辑 × 年份」，而 s.year 来自 year/date 标签的**原样串**
-// （真实库里就是 "2022-08-16"）。整段进键会把同一张碟按发行日期的月/日差异拆成两个 Release
-// 实体 —— 静默数据分裂，不报错，最难发现（实测见 tests/test_entities.cpp [11]）。
-// 判据与 src/meta/provider.h 的 pv_year4 是**同一个合理窗口 [1000,2100]**：
-// P2 曾发生 QQ 返回 "0000-00-00"、取出 "0000" 被采纳写回、把 DATE 2022-12-24 改成 0000 的事故，
-// 窗口外年份必须在源头丢弃（写回侧另有第二道守卫 writeback_year_ok）。
-//
-// ⚠️ 刻意重复一份而不 include provider.h（方案 (a)，理由）：
-//   ① entities.h 是纯 schema / 存储头，provider.h 会拖进 net/http_client.h（winsock2）+ match.h，
-//      schema 层依赖网络栈是倒退，也会让这个头在无网络组件的地方编不动；
-//   ② 用例不同：pv_year4 产出的是【候选年份】（宽进），本函数产出的是【判等键的一段】（严出）——
-//      见下面"唯一差异"。共用一个函数就得塞开关，判据反而不再单一。
-//   ⇒ 代价是两处窗口数字可能漂移。改动任一处窗口/形态时，请同时看 provider.h 的 pv_year4
-//     与 tests/test_metaproviders.cpp 的窗口断言（那边 1000/2100/0000/0999/2101 都钉住了）。
-//
-// 与 pv_year4 的**唯一**差异（2026-10-22 实测对照 25 个输入，只有 1 个不同）：
-//   数字串长度既不是 4 也不是 8 时，本函数整段跳过；pv_year4 对任何 ≥4 位的数字串一律截前 4 位。
-//   实测差异样本："20221" → pv_year4="2022"，entity_year4=""（其余 24 个输入两者一致，
-//   含 "99999"：那边截出 9999 但**窗口外**，同样回 ""；"0000" 两边都回 ""）。
-// 这里更保守的原因：5/6/7/9+ 位的纯数字串在标签里是垃圾或曲目序号，截前 4 位得到的"年份"
-// 是伪造的 —— 它进了 Release 判等键就会把一张真专辑与另一堆垃圾年份的曲目并到一起
-// （错误合并比漏合并更难挽回）。宁可回 ""（退化为"无日期版"，见下面的刻意取舍）。
-// 8 位（YYYYMMDD）是真实存在的紧凑日期形态，仍然接受。
+// E-14：实体 year 统一复用 pv_year4（提取至 meta/year.h 公共头），
+// 统一清洗规则与 [1000, 2100] 合理窗口，彻底消除两份实现漂移风险。
+// 本函数作为薄包装保持与已有调用点向后兼容。
 inline std::string entity_year4(const std::string& raw) {
-    const size_t n = raw.size();
-    for (size_t i = 0; i < n;) {
-        if (raw[i] < '0' || raw[i] > '9') { ++i; continue; }
-        size_t j = i;
-        while (j < n && raw[j] >= '0' && raw[j] <= '9') ++j;
-        const size_t len = j - i;
-        if (len == 4 || len == 8) {
-            const std::string y = raw.substr(i, 4);
-            const int v = (y[0] - '0') * 1000 + (y[1] - '0') * 100 +
-                          (y[2] - '0') * 10 + (y[3] - '0');
-            // 首个候选决定结果：不在其后继续找第二个数字段，否则曲目序号/时长会被当成年代
-            return (v >= 1000 && v <= 2100) ? y : std::string();
-        }
-        i = j;                                          // 长度不合形态 → 跳过整段继续扫
-    }
-    return "";
+    return pv_year4(raw);
 }
 
 // ---------------------------------------------------------------------------

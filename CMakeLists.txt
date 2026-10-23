@@ -396,6 +396,11 @@ add_executable(test_entities tests/test_entities.cpp)
 target_include_directories(test_entities PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME entities COMMAND test_entities)
 
+# E-14 年份清洗纯函数（统一窗口 [1000, 2100] 与清洗规则）：全离线
+add_executable(test_year tests/test_year.cpp)
+target_include_directories(test_year PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME year COMMAND test_year)
+
 # probe_media 的 duration 字段（2026-10-22 跨模块缺陷）：ffprobe 原参数只有 format_tags，
 # MediaInfo::duration 恒 0 → enrich 的 fileSec 恒 0 → match 的「时长差 ±3s」强信号从未生效。
 # 本测试需要环境里的 ffprobe（工具缺失即失败，不跳过，与 writeback 同类门禁）；
