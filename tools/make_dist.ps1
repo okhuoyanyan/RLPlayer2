@@ -1,4 +1,4 @@
-﻿# make_dist.ps1 - build the ONE official release package (Full / self-contained).
+﻿﻿# make_dist.ps1 - build the ONE official release package (Full / self-contained).
 #
 # Policy since 1.0.2:
 #   * There is no "Lite" package any more. Every release is the official
@@ -83,6 +83,16 @@ foreach ($f in $main) {
     if (-not (Test-Path $p)) { Fail "missing build artifact: $f" }
     Copy-Item $p $out -Force
 }
+# 2026-10-23：CUDA 后端（rtagpu_cuda.dll）是可选组件 —— 由协作者在 NVIDIA 机器上构建后放到 build\。
+# 有就一起打进包（铁律 6：正式版自包含，NVIDIA 用户不需要自己编）；没有就跳过（兼容门禁标 OPTIONAL）。
+$cudaDll = Join-Path $B 'rtagpu_cuda.dll'
+if (Test-Path $cudaDll) {
+    Copy-Item $cudaDll $out -Force
+    Write-Host 'bundled rtagpu_cuda.dll (NVIDIA CUDA backend)'
+} else {
+    Write-Host 'rtagpu_cuda.dll not in build\ — CUDA backend stays optional (fallback: dx12/AMD/CPU)'
+}
+
 Copy-Item $hipDll $out -Force
 Copy-Item $ffPath (Join-Path $out 'ffmpeg.exe') -Force
 Copy-Item $fpPath (Join-Path $out 'ffprobe.exe') -Force

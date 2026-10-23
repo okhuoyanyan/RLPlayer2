@@ -37,6 +37,10 @@ rta-*.conf
 #   （2026-10-22 教训：最初 *.dll 把它一起挡了，CI 在云机上构建失败
 #     "Error copying file ... WebView2Loader.dll: No such file or directory"）
 !/third_party/**/*.dll
+
+# CUDA 后端二进制（由协作者在 NVIDIA 机器上构建后交回；铁律 6：正式版自包含需要它）
+!/cuda-artifacts/
+!/cuda-artifacts/*.dll
 *.log.*
 CMakeCache.txt
 CMakeFiles/
