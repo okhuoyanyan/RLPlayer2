@@ -5263,6 +5263,12 @@ int main(int argc, char** argv) {
     }
     g_uiPort = port;
     g_lanOn  = lan;
+    // 2026-10-23：把端口写进环境，供 Library 选择实例私有的库配置/索引文件名
+    //（非 8899 实例用 .p<port> 后缀，避免自检沙箱与用户实例互相覆盖库根）。
+    {
+        char pb[16]; std::snprintf(pb, sizeof(pb), "%u", (unsigned)port);
+        _putenv_s("RLPLAYER_PORT", pb);
+    }
     // 系统级调优：提高进程优先级 + 把系统定时器精度提到 1ms。
     // 默认 15.6ms 的定时器粒度会让喂数节奏变粗（Round 6 实测过这个问题）。
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);

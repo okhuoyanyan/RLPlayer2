@@ -2737,13 +2737,23 @@ function renderSettingsPage() {
   // ---------- 元数据补全（排在「高级」之后）----------
   // P1.5：源开关不再硬编码 —— #sp_metasrc 占位容器由 fillMetaProviders 按
   // /api/providers 动态填充（注册表驱动，后端新增数据源前端零改动）。
+  // 2026-10-23 用户反馈「元数据一栏 UI 很难看、很繁杂」：
+  // 原来一屏平铺 6 个数据源开关 + Key 输入 + 4 个按钮 + 写回说明，扫一眼全是字。
+  // 改成：常用 3 项直接可见，其余（逐源开关 / Key / 写回）收进「高级选项」折叠区，
+  // 默认收起。功能一个没少，只是不再把所有细节同时摊在人脸上。
   h += '<div class=spane data-g=meta>'
      + sgroup('元数据补全', '播放时后台补全标签 / 封面 / 歌词，结果落在本地库',
-         chk('sp_metaon', '自动补全（总开关）', META.on == 1,
+         chk('sp_metaon', '自动补全', META.on == 1,
              '关闭后播放不再触发在线补全；已补全的结果仍在本地库，随时可以再打开')
-       + '<div id=sp_metasrc>' + metaSrcHtml() + '</div>'
-       + chk('sp_metallm', 'DeepSeek 增强', META.llm == 1, '无标签文件用 LLM 解析与裁决；不影响已有标签的优先级')
-       + chk('sp_metasummary', '允许 AI 资料综合（DeepSeek，按次计费）', META.summary == 1, '启用后可在艺术家/作品页点击生成 AI 深度简介；按次产生 DeepSeek API 调用，默认关闭')
+       + chk('sp_metallm', 'DeepSeek 增强（无标签文件）', META.llm == 1, '用 LLM 解析无标签文件并与数据源结果互相校验；不影响已有标签的优先级')
+       + chk('sp_metasummary', '允许 AI 资料综合（按次计费）', META.summary == 1, '启用后可在艺术家/作品页手动生成 AI 简介；按次产生 DeepSeek 调用，默认关闭')
+       + '<div class=sfld wide style="margin-top:14px">'
+       + '<button class=btn id=sp_metamore style="font-size:12px" aria-expanded="false">高级选项 ▾</button>'
+       + '<span style="font-size:11.5px;color:var(--mut2);margin-left:10px">数据源开关 / API Key / 标签写回</span>'
+       + '</div>'
+       + '<div id=sp_metaadv style="display:none">'
+       + '<div class=sfld wide><div style="font-size:12px;color:var(--mut);margin:10px 0 6px">数据源（越靠上优先级越高）</div>'
+       + '<div id=sp_metasrc>' + metaSrcHtml() + '</div></div>'
        // ---- 功能4（用户 2026-10-22）：「元数据没有提供 ds 的 api 输入接口」----
        // 红线：界面【只显示掩码】，输入框永不回填，保存后立刻清空；
        // key 只写 exe 同目录 rlplayer-llm.conf（路径由后端决定，前端不碰文件）。
@@ -2762,7 +2772,8 @@ function renderSettingsPage() {
        + '把补全结果写回音频文件标签。写回前自动校验音频数据逐位不变，原文件备份到 rlplayer-meta' + SEP + 'backups</div></div>'
        + '<div class="sfld wide"><button class=btn id=sp_wbdry>预览写回</button> '
        + '<button class=btn id=sp_wbapply>执行写回</button>'
-       + '<span id=sp_wbmsg style="font-size:11.5px;color:var(--mut2);margin-left:10px"></span></div>')
+       + '<span id=sp_wbmsg style="font-size:11.5px;color:var(--mut2);margin-left:10px"></span></div>'
+       + '</div>')   // ← 关闭 #sp_metaadv（高级选项折叠区）
      + '</div>';
 
   // 底部按钮（不随页签切换）
@@ -2876,6 +2887,14 @@ function renderSettingsPage() {
   // P2 标签写回：预览 / 执行按钮绑定，并同步一次在跑状态（中途刷新页面也能恢复禁用）
   if (D('sp_wbdry')) D('sp_wbdry').onclick = wbPreview;
   if (D('sp_wbapply')) D('sp_wbapply').onclick = wbApply;
+  // 元数据「高级选项」折叠（2026-10-23 用户反馈「元数据栏繁杂」）：默认收起，点开才显示逐源开关/Key/写回
+  if (D('sp_metamore')) D('sp_metamore').onclick = function () {
+    var box = D('sp_metaadv'); if (!box) return;
+    var open = (box.style.display === 'none');
+    box.style.display = open ? '' : 'none';
+    this.setAttribute('aria-expanded', open ? 'true' : 'false');
+    this.textContent = open ? '高级选项 ▴' : '高级选项 ▾';
+  };
   wbSyncBusy();
   if (D('sp_directsdm')) D('sp_directsdm').onchange = function () {
     ADV.directsdm = this.checked ? 1 : 0;

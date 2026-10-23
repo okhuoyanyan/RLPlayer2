@@ -173,6 +173,7 @@ private:
     static void writeFile(const std::string& p, const std::string& s);
     static std::string exeDirOrEmpty();   // 2026-10-23：库配置/索引固定落 exe 目录（见 confPath 注释）
     static std::string libDataDir();      // 同样可被 RLPLAYER_LIBRARY_DIR 覆盖（测试/多实例）
+    static std::string confLeaf(const char* base);   // 非默认端口加 .p<port> 后缀，避免实例互相踩库
     static std::string confPath();
     static std::string indexPath();
 
@@ -312,13 +313,23 @@ inline std::string Library::libDataDir() {
     }
     return exeDirOrEmpty();
 }
+// 文件名区分实例：默认实例（8899）用原名；--port 指定的其它实例加 ".p<端口>" 后缀。
+// 为什么不再共用一份：自检沙箱（8907/8908/8911）会写自己的库根与索引，共用会把用户库覆盖成空
+// （1.3.x「升级后曲库变空」的另一半原因）。端口从 RLPLAYER_PORT 取（rtaweb 启动时设置）。
+inline std::string Library::confLeaf(const char* base) {
+    const char* p = std::getenv("RLPLAYER_PORT");
+    const std::string port = (p && *p) ? std::string(p) : std::string();
+    std::string name(base);
+    if (!port.empty() && port != "8899") name += ".p" + port;
+    return name;
+}
 inline std::string Library::confPath() {
-    const std::string d = libDataDir();
-    return d.empty() ? std::string("rlplayer-library.conf") : d + "\\rlplayer-library.conf";
+    const std::string d = libDataDir(), leaf = confLeaf("rlplayer-library.conf");
+    return d.empty() ? leaf : d + "\\" + leaf;
 }
 inline std::string Library::indexPath() {
-    const std::string d = libDataDir();
-    return d.empty() ? std::string("rlplayer-index.tsv") : d + "\\rlplayer-index.tsv";
+    const std::string d = libDataDir(), leaf = confLeaf("rlplayer-index.tsv");
+    return d.empty() ? leaf : d + "\\" + leaf;
 }
 inline std::string Library::readFile(const std::string& p) {
     std::ifstream f(p, std::ios::binary);
