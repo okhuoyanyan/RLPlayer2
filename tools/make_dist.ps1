@@ -15,7 +15,7 @@
 #
 # Usage: powershell -File tools/make_dist.ps1 [-Version 1.0.2] [-SkipGpuBuild]
 param(
-    [string]$Version = "1.2.0",
+    [string]$Version = "1.3.0",
     [switch]$SkipGpuBuild
 )
 
@@ -133,9 +133,25 @@ if (-not (Test-Path -LiteralPath $enPak)) { Fail "Locales 守卫失败: en-US.pa
 if (-not (Test-Path -LiteralPath $zhPak)) { Fail "Locales 守卫失败: zh-CN.pak 必须存在" }
 if ($postPakCount -ne 2) { Fail "Locales 守卫失败: .pak 数量必须恰为 2，当前为 $postPakCount" }
 
+# 诊断与性能工具（1.3.0 PR #1 新增）
+$probeExe = Join-Path $B 'wasapi_ex_probe.exe'
+$probeSrc = Join-Path $here 'wasapi_ex_probe.cpp'
+$benchExe = Join-Path $B 'gpubench_conv.exe'
+$benchSrc = Join-Path $here 'gpubench_conv.cpp'
+$clang = 'C:\Program Files\AMD\ROCm\7.2\bin\clang++.exe'
+if (Test-Path $clang) {
+    if ((-not (Test-Path $probeExe)) -or ((Get-Item $probeSrc).LastWriteTime -gt (Get-Item $probeExe).LastWriteTime)) {
+        & $clang -std=c++20 -O2 $probeSrc -o $probeExe -lole32
+    }
+    if ((-not (Test-Path $benchExe)) -or ((Get-Item $benchSrc).LastWriteTime -gt (Get-Item $benchExe).LastWriteTime)) {
+        & $clang -std=c++20 -O2 -I(Join-Path $root 'src') $benchSrc -o $benchExe
+    }
+}
+
 $tools = @('rtaplay.exe', 'dsdconv.exe', 'make_dsd.exe', 'rtanet_rx.exe', 'dopinfo.exe',
            'wavcmp.exe', 'wasapi_probe.exe', 'naa_scan.exe', 'naa_probe.exe', 'upnp_scan.exe',
-           'aidecode.exe', 'rtatag.exe', 'rtacapture.exe', 'rtacast.exe', 'filter_report.exe')
+           'aidecode.exe', 'rtatag.exe', 'rtacapture.exe', 'rtacast.exe', 'filter_report.exe',
+           'wasapi_ex_probe.exe', 'gpubench_conv.exe')
 foreach ($f in $tools) {
     $p = Join-Path $B $f
     if (Test-Path $p) { Copy-Item $p (Join-Path $out 'tools') -Force }
