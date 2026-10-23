@@ -28,6 +28,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -104,6 +105,8 @@ struct DiscogsReleaseDetail {
     std::string format;
     std::string country;
     std::string url;
+    std::vector<std::string> genres; // E-5: 大类流派
+    std::vector<std::string> styles; // E-5: 细分风格
     long long fetched_at = 0;
 };
 
@@ -583,6 +586,8 @@ struct SearchResultItem {
     std::string format;
     std::string country;
     std::string uri;
+    std::vector<std::string> genres; // E-5: 大类流派
+    std::vector<std::string> styles; // E-5: 细分风格
 };
 
 inline bool parse_discogs_search_json(const std::string& text,
@@ -632,6 +637,25 @@ inline bool parse_discogs_search_json(const std::string& text,
         }
         sri.country = it["country"].s();
         sri.uri = it["uri"].s();
+        // E-5: 解析 genre 与 style（支持数组与单串）
+        if (it["genre"].type == rta::net::Json::Arr) {
+            for (size_t k = 0; k < it["genre"].size(); ++k) {
+                const std::string g = it["genre"].at(k).s();
+                if (!g.empty()) sri.genres.push_back(g);
+            }
+        } else if (it["genre"].type == rta::net::Json::Str) {
+            const std::string g = it["genre"].s();
+            if (!g.empty()) sri.genres.push_back(g);
+        }
+        if (it["style"].type == rta::net::Json::Arr) {
+            for (size_t k = 0; k < it["style"].size(); ++k) {
+                const std::string s = it["style"].at(k).s();
+                if (!s.empty()) sri.styles.push_back(s);
+            }
+        } else if (it["style"].type == rta::net::Json::Str) {
+            const std::string s = it["style"].s();
+            if (!s.empty()) sri.styles.push_back(s);
+        }
         items_out.push_back(std::move(sri));
     }
     return true;
@@ -763,6 +787,22 @@ inline bool parse_discogs_release_json(const std::string& text,
     if (det_out.url.empty() && det_out.id > 0) {
         det_out.url = "https://www.discogs.com/release/" + std::to_string(det_out.id);
     }
+
+    // E-5: genres / styles 提取（支持 genres/genre, styles/style 数组或单串）
+    auto extract_str_list = [&](const rta::net::Json& obj, const char* k1, const char* k2, std::vector<std::string>& out) {
+        const rta::net::Json& f = obj.has(k1) ? obj[k1] : (obj.has(k2) ? obj[k2] : rta::net::Json());
+        if (f.type == rta::net::Json::Arr) {
+            for (size_t i = 0; i < f.size(); ++i) {
+                const std::string s = f.at(i).s();
+                if (!s.empty()) out.push_back(s);
+            }
+        } else if (f.type == rta::net::Json::Str) {
+            const std::string s = f.s();
+            if (!s.empty()) out.push_back(s);
+        }
+    };
+    extract_str_list(j, "genres", "genre", det_out.genres);
+    extract_str_list(j, "styles", "style", det_out.styles);
 
     // 直接键提取（支持 fixture 与简化 mock）
     if (j.has("conductor")) det_out.conductor = clean_discogs_artist(j["conductor"].s());
@@ -1502,6 +1542,92 @@ inline WorkVersionsResult discogs_versions(const std::string& workTitle,
     }
 
     return res;
+}
+
+// ---------------------------------------------------------------------------
+// E-5: Discogs 流派与风格（styles / genres）提取与检索纯函数/服务
+// ---------------------------------------------------------------------------
+
+// 纯函数：将 Discogs styles 与 genres 格式化为规范的流派字符串
+// 优先使用具体的 styles（如 "Modern, Impressionist"）；若 styles 为空则回退到大类 genres（如 "Classical"）
+inline std::string format_discogs_genre(const std::vector<std::string>& genres,
+                                        const std::vector<std::string>& styles) {
+    std::ostringstream oss;
+    if (!styles.empty()) {
+        for (size_t i = 0; i < styles.size(); ++i) {
+            if (i) oss << ", ";
+            oss << styles[i];
+        }
+    } else if (!genres.empty()) {
+        for (size_t i = 0; i < genres.size(); ++i) {
+            if (i) oss << ", ";
+            oss << genres[i];
+        }
+    }
+    return oss.str();
+}
+
+using DiscogsTransportHook = std::function<rta::net::HttpResponse(
+    const std::string& url, const std::vector<std::string>& headers, int timeout_ms)>;
+
+inline DiscogsTransportHook& discogs_transport_hook() {
+    static DiscogsTransportHook h = nullptr;
+    return h;
+}
+
+inline void set_discogs_transport_for_test(DiscogsTransportHook hook) {
+    discogs_transport_hook() = std::move(hook);
+}
+
+// 根据 artist / title / album 从 Discogs 检索 styles/genres 事实（L1 结构化事实源）
+inline std::string discogs_lookup_genre(const std::string& artist,
+                                        const std::string& title,
+                                        const std::string& album,
+                                        std::string& err) {
+    err.clear();
+    std::string q;
+    if (!artist.empty() && !title.empty()) q = artist + " " + title;
+    else if (!title.empty()) q = title;
+    else if (!album.empty()) q = album;
+    if (q.empty()) return "";
+
+    if (!discogs_transport_hook() && !DiscogsRateLimiter::instance().acquire(2500)) {
+        err = "discogs: rate limited or circuit open";
+        return "";
+    }
+
+    const std::string url = "https://api.discogs.com/database/search?q=" +
+                            discogs_url_encode(q) + "&type=release";
+    const std::vector<std::string> headers = {
+        "User-Agent: RLPlayer/1.0.10 (metadata; contact: local)"
+    };
+
+    rta::net::HttpResponse resp;
+    if (discogs_transport_hook()) {
+        resp = discogs_transport_hook()(url, headers, 5000);
+    } else {
+        resp = rta::net::http_get(url, headers, 10000);
+    }
+
+    if (resp.status != 200 || resp.body.empty()) {
+        if (resp.status == 429) DiscogsRateLimiter::instance().trip_circuit(60);
+        err = "discogs HTTP " + std::to_string(resp.status);
+        return "";
+    }
+
+    std::vector<SearchResultItem> items;
+    std::string perr;
+    const std::string bodyStr(resp.body.begin(), resp.body.end());
+    if (!parse_discogs_search_json(bodyStr, items, &perr) || items.empty()) {
+        err = perr;
+        return "";
+    }
+
+    for (const auto& it : items) {
+        const std::string g = format_discogs_genre(it.genres, it.styles);
+        if (!g.empty()) return g;
+    }
+    return "";
 }
 
 } // namespace rta::meta

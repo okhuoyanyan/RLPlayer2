@@ -86,7 +86,8 @@ inline int meta_source_rank(const std::string& source) {
     if (source == "user") return 100;
     if (source == "tag")  return 90;
     if (source == "itunes" || source == "qq" || source == "netease" ||
-        source == "lrclib" || source == "musicbrainz" || source == "wiki") return 50;
+        source == "lrclib" || source == "musicbrainz" || source == "wiki" ||
+        source == "discogs" || source == "dizzylab") return 50;
     if (source == "llm") return 10;
     return 0;
 }

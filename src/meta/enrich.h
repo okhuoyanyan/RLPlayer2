@@ -35,6 +35,7 @@
 #include "meta/llm.h"
 #include "meta/provider.h"
 #include "meta/match.h"
+#include "meta/discogs.h"
 #include "audio/media_info.h"
 #include <algorithm>
 #include <chrono>
@@ -410,6 +411,23 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
         fv.ts         = now;
         fv.confidence = (float)scoreJ;
         mergeTracked(f, fv);
+    }
+
+    // ---- 6.5) E-5: genre 多源（Discogs styles 接入作为 backfill 来源）----
+    // 保持采纳门槛语义不变（在此之前采纳门槛已裁决并过门），保留 iTunes 优先（仅当 genre 仍为空时尝试 Discogs）
+    if (fieldStillEmpty("genre") && opts.enabled("discogs")) {
+        std::string dErr;
+        const std::string alb = !best.album.empty() ? best.album : mi.album;
+        const std::string dg = discogs_lookup_genre(p.artist, p.title, alb, dErr);
+        if (!dg.empty()) {
+            MetaValue gv;
+            gv.value = dg;
+            gv.source = "discogs";
+            gv.ts = now;
+            gv.confidence = (float)st.bestScore; // 按事实源规则，随采纳置信度
+            mergeTracked("genre", gv);
+            notes.push_back("genre=discogs(" + dg + ")");
+        }
     }
 
     // ---- 7) 封面:记录缺封面且首选候选有 URL → 下载(>2KB 才收) ----
