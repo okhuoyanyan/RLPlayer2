@@ -698,9 +698,18 @@ function openWorkVersions(workTitle, composer, refresh) {
           (composer ? ('&composer=' + encodeURIComponent(composer)) : '') +
           (refresh ? '&refresh=1' : '');
 
+  // 2026-10-23（用户 261023-01 #4「切到作品栏后无法切回其它栏位」）真凶：
+  // 这里没有「当前是否还在作品页」的判断。用户点了作品栏、Discogs 还没返回时切到专辑/曲目，
+  // 回调仍把 #worksResult 的内容写回 → 看起来就是「卡在作品页/切不过去」。
+  // 修法：回调先校验 S.view 与容器是否仍属于作品页，不满足就整段丢弃（不写 DOM、不报错）。
+  var stillWorks = function () {
+    return S.view === 'works' && !!D('worksResult');
+  };
   api(u).then(function (j) {
+    if (!stillWorks()) return;                 // 已切走：丢弃这次结果
     renderWorkVersions(workTitle, composer, j);
   }).catch(function (err) {
+    if (!stillWorks()) return;
     renderWorkVersions(workTitle, composer, { ok: false, errors: [String(err)], performances: [] });
   });
 }
@@ -708,6 +717,8 @@ function openWorkVersions(workTitle, composer, refresh) {
 function renderWorkVersions(workTitle, composer, j) {
   var box = D('worksResult');
   if (!box) return;
+  // 同 openWorkVersions 的守卫：视图已经切走就别再动 DOM（防「切不回去」的残留内容）
+  if (S.view !== 'works') return;
 
   var perfs = (j && j.performances) || [];
   var isOk = j && j.ok && perfs.length > 0;
