@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -107,8 +108,19 @@ inline void wrTag(std::vector<uint8_t>& o, const char* t) {
     for (int i = 0; i < 4; ++i) o.push_back((uint8_t)t[i]);
 }
 
+inline FILE* dsd_fopen(const std::string& path, const wchar_t* wmode, const char* nmode) {
+#if defined(_WIN32)
+    (void)nmode;
+    const std::filesystem::path p(std::u8string(reinterpret_cast<const char8_t*>(path.data()), path.size()));
+    return ::_wfopen(p.c_str(), wmode);
+#else
+    (void)wmode;
+    return std::fopen(path.c_str(), nmode);
+#endif
+}
+
 inline std::vector<uint8_t> read_file_bytes(const std::string& path) {
-    FILE* f = std::fopen(path.c_str(), "rb");
+    FILE* f = dsd_fopen(path, L"rb", "rb");
     if (!f) throw std::runtime_error("无法打开文件: " + path);
     std::fseek(f, 0, SEEK_END);
     const long n = std::ftell(f);
@@ -122,7 +134,7 @@ inline std::vector<uint8_t> read_file_bytes(const std::string& path) {
 }
 
 inline void write_file_bytes(const std::string& path, const std::vector<uint8_t>& b) {
-    FILE* f = std::fopen(path.c_str(), "wb");
+    FILE* f = dsd_fopen(path, L"wb", "wb");
     if (!f) throw std::runtime_error("无法写入: " + path);
     const size_t w = std::fwrite(b.data(), 1, b.size(), f);
     std::fclose(f);
@@ -369,16 +381,18 @@ struct DsdInfo {
     uint64_t bits = 0;          // 每声道位数；DFF 没读到 DSD 块头时为 0（未知时长）
     std::string container;      // "dsf" / "dff"
     DsdBitOrder fileOrder = DsdBitOrder::MsbFirst;
+
+    double seconds() const { return rate ? (double)bits / (double)rate : 0.0; }
 };
 
 inline DsdInfo probe_dsd(const std::string& path) {
     using namespace dsd_detail;
-    FILE* fp = std::fopen(path.c_str(), "rb");
+    FILE* fp = dsd_fopen(path, L"rb", "rb");
     if (!fp) throw std::runtime_error("无法打开文件: " + path);
     std::fseek(fp, 0, SEEK_END);
     const long total = std::ftell(fp);
     std::fseek(fp, 0, SEEK_SET);
-    const size_t want = (size_t)std::min<long>(total, 65536);
+    const size_t want = (size_t)std::min<long>(total > 0 ? total : 0, 65536);
     std::vector<uint8_t> b(want);
     const size_t got = std::fread(b.data(), 1, want, fp);
     std::fclose(fp);

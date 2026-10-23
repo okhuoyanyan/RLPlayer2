@@ -507,6 +507,145 @@ int main() {
            "熔断阈值/冷却窗合理(≥2 次失败、≥30s)");
     }
 
+    // ---------------- 10b) E-18：连续失败熔断与恢复（可注入自动化测试） ----------------
+    std::printf("-- dl_gate 连续失败熔断与恢复（可注入,E-18）--\n");
+    {
+        // 1. 设置模拟时钟与计数器
+        auto mockNow = std::chrono::steady_clock::now();
+        set_dizzylab_clock_for_test([&]() { return mockNow; });
+
+        int transportCalls = 0;
+        int statusToReturn = 500;
+        std::string bodyToReturn = "";
+        std::string lastRequestedUrl = "";
+
+        set_dizzylab_transport_for_test([&](const std::string& url,
+                                            const std::vector<std::string>&,
+                                            int) -> rta::net::HttpResponse {
+            ++transportCalls;
+            lastRequestedUrl = url;
+            rta::net::HttpResponse r;
+            r.status = statusToReturn;
+            if (statusToReturn == 0) {
+                r.error = "Connection refused";
+            } else if (statusToReturn == 200) {
+                r.body.assign(bodyToReturn.begin(), bodyToReturn.end());
+            }
+            return r;
+        });
+
+        dl_gate_reset_for_test();
+        ck(dl_gate().fails == 0, "初始失败计数为 0");
+        ck(dl_gate().coolUntil.time_since_epoch().count() == 0, "初始不在冷却期");
+
+        // 2. 连续第 1 次失败：不进入冷却
+        {
+            statusToReturn = 500;
+            std::string err;
+            const std::string res = dl_http_get("https://www.dizzylab.net/test1", err);
+            ck(res.empty() && err == "HTTP 500", "第 1 次失败: dl_http_get 返回 HTTP 500");
+            ck(transportCalls == 1, "第 1 次失败: 向 transport 发出了请求");
+            ck(dl_gate().fails == 1, "第 1 次失败: fails 增加为 1");
+            ck(dl_gate().coolUntil.time_since_epoch().count() == 0, "第 1 次失败: 未开冷却");
+        }
+
+        // 3. 连续第 2 次失败：仍不进入冷却
+        {
+            mockNow += std::chrono::milliseconds(1100);
+            statusToReturn = 0; // 网络层报错
+            std::string err;
+            const std::string res = dl_http_get("https://www.dizzylab.net/test2", err);
+            ck(res.empty() && err.find("请求失败") != std::string::npos, "第 2 次失败: dl_http_get 返回网络错误");
+            ck(transportCalls == 2, "第 2 次失败: 向 transport 发出了请求");
+            ck(dl_gate().fails == 2, "第 2 次失败: fails 增加为 2");
+            ck(dl_gate().coolUntil.time_since_epoch().count() == 0, "第 2 次失败: 仍未开冷却");
+            std::string acqErr;
+            ck(dl_gate_acquire(acqErr), "连续 2 次失败后: dl_gate_acquire 仍可获得许可（不冷却）");
+        }
+
+        // 4. 连续第 3 次失败：立刻进入冷却，开启 120s 冷却窗
+        {
+            mockNow += std::chrono::milliseconds(1100);
+            statusToReturn = 502; // 网关错误
+            std::string err;
+            const std::string res = dl_http_get("https://www.dizzylab.net/test3", err);
+            ck(res.empty() && err == "HTTP 502", "第 3 次失败: dl_http_get 返回 HTTP 502");
+            ck(transportCalls == 3, "第 3 次失败: 向 transport 发出了请求");
+            ck(dl_gate().fails == 0, "第 3 次失败开冷却: fails 计数清零");
+            const auto expectedCool = mockNow + std::chrono::seconds(kDizzylabCooldownSec);
+            ck(dl_gate().coolUntil == expectedCool, "第 3 次失败开冷却: 冷却截止时间正确设定 (+120s)");
+        }
+
+        // 5. 冷却期间：严禁发起任何请求，直接返回熔断错误
+        {
+            const int callsBefore = transportCalls;
+            mockNow += std::chrono::seconds(10); // 冷却才过去 10 秒，还剩 110 秒
+            std::string err;
+            const std::string res = dl_http_get("https://www.dizzylab.net/test4", err);
+            ck(res.empty(), "冷却期内: dl_http_get 返回空");
+            ck(err.find("连续失败熔断中") != std::string::npos && err.find("不发起请求") != std::string::npos,
+               "冷却期内: err 明确提示熔断并给出剩余秒数", err);
+            ck(transportCalls == callsBefore, "冷却期内: 严禁向 transport 发起请求（调用次数未增加）");
+
+            // search_dizzylab 端到端同样被拦截
+            std::string searchErr;
+            const auto cands = search_dizzylab("Pixel Library", searchErr);
+            ck(cands.empty(), "冷却期内: search_dizzylab 优雅返回空候选");
+            ck(searchErr.find("连续失败熔断中") != std::string::npos, "冷却期内: search_dizzylab 给出熔断错误", searchErr);
+            ck(transportCalls == callsBefore, "search_dizzylab 在冷却期内同样 0 请求");
+        }
+
+        // 6. 冷却时间到达（120s 过去）：自动恢复发请求
+        {
+            mockNow += std::chrono::seconds(115); // 总共过去 125s > 120s
+            statusToReturn = 200;
+            bodyToReturn = "<html><head><title>ok</title></head><body><h1>ok</h1></body></html>";
+            const int callsBefore = transportCalls;
+            std::string err;
+            const std::string res = dl_http_get("https://www.dizzylab.net/test5", err);
+            ck(!res.empty() && err.empty(), "冷却结束后: 请求恢复成功");
+            ck(transportCalls == callsBefore + 1, "冷却结束后: 实际向 transport 发出了新请求");
+            ck(dl_gate().fails == 0, "恢复请求成功后: fails 为 0");
+        }
+
+        // 7. 成功会重置失败计数：即使此前有 1 次或 2 次失败
+        {
+            mockNow += std::chrono::milliseconds(1100);
+            statusToReturn = 500;
+            std::string err;
+            dl_http_get("https://www.dizzylab.net/test_fail1", err);
+            ck(dl_gate().fails == 1, "失败记账: 1 次失败 → fails = 1");
+
+            mockNow += std::chrono::milliseconds(1100);
+            dl_http_get("https://www.dizzylab.net/test_fail2", err);
+            ck(dl_gate().fails == 2, "连续第 2 次失败 → fails = 2");
+
+            // 中途来一次成功
+            mockNow += std::chrono::milliseconds(1100);
+            statusToReturn = 200;
+            bodyToReturn = "<html>ok</html>";
+            const std::string okRes = dl_http_get("https://www.dizzylab.net/test_ok", err);
+            ck(!okRes.empty(), "中途发生一次成功请求");
+            ck(dl_gate().fails == 0, "成功重置失败计数: fails 重新归零");
+
+            // 再次失败：从 1 开始记，而不是从 3 触发熔断
+            mockNow += std::chrono::milliseconds(1100);
+            statusToReturn = 500;
+            dl_http_get("https://www.dizzylab.net/test_fail3", err);
+            ck(dl_gate().fails == 1, "重置后再次失败: fails = 1（需要再连续 2 次才会熔断）");
+            ck(dl_gate().coolUntil.time_since_epoch().count() == 0 || dl_gate().coolUntil <= mockNow,
+               "重置后 1 次失败绝不触发熔断");
+        }
+
+        // 8. 清理钩子与重置状态，保证不影响后续测试与生产行为
+        set_dizzylab_transport_for_test(nullptr);
+        set_dizzylab_clock_for_test(nullptr);
+        dl_gate_reset_for_test();
+        ck(dl_transport_hook() == nullptr, "transport 钩子已还原为 nullptr（默认行为不变）");
+        ck(dl_clock_hook() == nullptr, "clock 钩子已还原为 nullptr");
+        ck(dl_gate().fails == 0, "gate 状态已完全重置");
+    }
+
     // ---------------- 11) 真网 opt-in(RTA_NET_TESTS=1) ----------------
     // 默认不联网:ctest 必须在断网机器上全绿。联网时也只打 3 个请求(搜索 1 + 专辑 2),
     // 间隔由 dl_gate 保证 ≥1s —— 不并发、不轰炸。
