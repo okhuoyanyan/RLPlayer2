@@ -1640,8 +1640,10 @@ function renderLibStats(j) {
   function it(lbl, val) {
     return '<div class=it><span class=lbl>' + lbl + '</span><span class=val>' + val + '</span></div>';
   }
+  // 输入框里的 0 = 自动；统计卡显示的是后端【实际生效】的线程数（例如 8），
+  // 标签写成「生效」避免用户以为「输入 0 / 统计 8」是两套不一致的值。
   var h = it('曲目', (j.tracks || 0)) + it('专辑', (j.albums || 0)) +
-          it('扫描线程', th ? th : '自动') + it('上次扫描', ms > 0 ? (ms / 1000).toFixed(1) + ' s' : '—');
+          it('扫描线程（生效）', th ? th : '自动') + it('上次扫描', ms > 0 ? (ms / 1000).toFixed(1) + ' s' : '—');
   if (j.scanning) h += it('进度', (j.scanned || 0) + ' / ' + (j.total || 0));
   box.innerHTML = h;
 }
@@ -1736,6 +1738,8 @@ function srcShowForm(open, s) {
   box.style.display = open ? '' : 'none';
   if (!open) { SRC.editing = ''; return; }
   SRC.editing = s ? String(s.id) : '';
+  var ft = D('sp_src_ftitle');
+  if (ft) ft.textContent = s ? ('编辑服务器 · ' + (s.name || s.base || '')) : '添加服务器';
   D('sp_src_name').value = s ? (s.name || '') : '';
   D('sp_src_kind').value = s ? (s.kind || 'subsonic') : 'subsonic';
   D('sp_src_base').value = s ? (s.base || '') : '';
@@ -3236,11 +3240,11 @@ function renderSettingsPage() {
   h += '<div class=spane data-g=stream>'
      + sgroup('流媒体服务器', '可保存多台，同一时刻启用一台；只取原始文件，不转码',
          '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
-       + '<button class="btn pri" id=sp_src_add>添加服务器</button>'
-       + '<span class=hint style="margin:0">Navidrome / Subsonic / Emby</span></div>'
+       + '<button class="btn pri" id=sp_src_add>添加服务器</button></div>'
        + '<div class="sfld wide"><div id=sp_src_list class=srvlist></div></div>'
        + '<div class="sfld wide" id=sp_src_form style="display:none">'
        + '<div class=srvform>'
+       + '<div class=mh id=sp_src_ftitle>添加服务器</div>'
        + '<div class=sfld><label>名称</label><input type=text id=sp_src_name placeholder="例如 客厅 NAS"></div>'
        + '<div class=sfld><label>类型</label><select id=sp_src_kind>'
        + '<option value=subsonic>Navidrome / Subsonic</option><option value=emby>Emby</option></select></div>'
@@ -3274,7 +3278,8 @@ function renderSettingsPage() {
        + '<button class=btn id=sp_diagjson>只要 JSON</button>'
        + tip('包内：rlplayer-diag.json（版本 / 系统 / CPU / GPU / 端口）、rlplayer-playback.log（含 .1/.2 轮转）、launcher.log、dumps-manifest.txt、settings-summary.txt；' +
              'api_key / token / password 一律脱敏为 ***，rlplayer-llm.conf 本体不会被打进包。')
-       + '<span style="font-size:11.5px;color:var(--mut2);margin-left:2px" id=sp_diagmsg></span></div>')
+       + '<span style="font-size:11.5px;color:var(--mut2);margin-left:2px" id=sp_diagmsg></span></div>'
+       + '<div class=hint>一个 zip 打包全部日志 / 系统信息 / 设置摘要（已脱敏），不用再到处找日志文件</div>')
      + '</div>';
 
   // ---------- 元数据补全（排在「高级」之后）----------

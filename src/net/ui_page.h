@@ -424,6 +424,8 @@ h += "#npPage .npedge{display:none}";
     h += ".tip:hover,.tip:focus{border-color:var(--acc);color:var(--acc);outline:0}";
     h += ".tip::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 8px);transform:translateX(-50%);width:max-content;max-width:290px;background:var(--bg3);color:var(--txt2);border:1px solid var(--line);border-radius:9px;padding:8px 10px;font-size:11px;line-height:1.6;font-weight:400;white-space:normal;text-align:left;box-shadow:0 10px 28px var(--shadow);opacity:0;visibility:hidden;transition:opacity .12s,transform .12s;z-index:40;pointer-events:none}";
     h += ".tip:hover::after,.tip:focus::after{opacity:1;visibility:visible}";
+    // 分组标题的 (?) 改成向下展开：向上会被吸顶的页签条盖住（实测第一个分组就是这样）。
+    h += ".sghead .tip::after{bottom:auto;top:calc(100% + 8px)}";
     h += "@media (max-width:1200px){.tip::after{max-width:min(240px,42vw)}}";
     h += ".sfld.wide{grid-column:1/-1}";
     h += ".sfld .chk{margin:0}";
@@ -451,6 +453,8 @@ h += "#npPage .npedge{display:none}";
     h += ".srvlist{display:flex;flex-direction:column;gap:8px}";
     h += ".srvrow{display:grid;grid-template-columns:9px minmax(0,1fr) auto;align-items:center;gap:9px 12px;padding:10px 13px;border:1px solid var(--line);border-radius:10px;background:var(--field);transition:.13s}";
     h += ".srvrow.on{border-color:var(--acc);background:var(--hov);box-shadow:0 0 0 1px var(--acc-weak)}";
+    h += ".srvrow:hover{background:var(--hov)}";
+    h += ".srvrow.on:hover{background:var(--hov2,var(--hov))}";
     h += ".srvdots{width:9px;height:9px;border-radius:50%;background:var(--track);flex:none}";
     h += ".srvrow.on .srvdots{background:var(--ok);box-shadow:0 0 9px var(--ok-line)}";
     h += ".srvmain{min-width:0}";
@@ -469,6 +473,7 @@ h += "#npPage .npedge{display:none}";
     h += ".srvempty{padding:16px;text-align:center;color:var(--mut2);font-size:12px;border:1px dashed var(--line);border-radius:10px;background:var(--hov)}";
     h += ".srvform{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px 18px;margin-top:12px;padding:14px 15px;border:1px solid var(--acc);border-radius:10px;background:var(--hov)}";
     h += ".srvform .sfld.wide{grid-column:1/-1}";
+    h += ".srvform .mh{grid-column:1/-1;display:flex;align-items:center;gap:8px;font-size:12px;font-weight:650;color:var(--txt);margin-bottom:2px}";
     h += "@media (max-width:820px){.srvrow{grid-template-columns:9px minmax(0,1fr)}.srvacts{grid-column:2/-1;justify-content:flex-start}}";
     // 本地音乐库统计条（信息密度：一眼看到规模与上次扫描结果，不再靠一段说明）
     h += ".libstats{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px 14px;font-size:11.5px;color:var(--txt2)}";
