@@ -34,7 +34,10 @@ var ADV = {
 // 元数据补全开关（P1.5 注册表化）：总开关 metaon 与 DeepSeek metallm 固定两键；
 // 数据源开关按 /api/providers（后端注册表）动态渲染，写 metasrc_<id> ——
 // 后端新增数据源 = 注册一个描述符，前端零改动。缺省全开，与后端缺省一致。
-var META = { on: 1, llm: 1, summary: 0 };
+// summary = 设置开关（/api/settings 的 metasummary，改动即时生效）；
+// hasLlmKey / summaryEnabled = /api/status 回报的权威状态（是否配了 key、后端是否开着开关）。
+// 简介板块的显示门控用这两个：没 key 又没缓存时连加载行都不显示（用户 261023-03 #5）。
+var META = { on: 1, llm: 1, summary: 0, hasLlmKey: null, summaryEnabled: null };
 var META_PROVIDERS = null;   // /api/providers 的 items（启动时拉取；null = 还没到）
 var META_SRC = {};           // id → 0/1（源开关状态，随 /api/providers 到达而填充）
 var SEP = String.fromCharCode(92);
@@ -322,6 +325,65 @@ function updateFavUi() {
   }
 }
 
+function renderSummaryContent(summary, title) {
+  if (!summary || !summary.ok || !summary.sections || !summary.sections.length) return '';
+  var h = '';
+  h += '<div style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:8px">' + esc(title || '简介') + '</div>';
+  var citMap = {};
+  (summary.citations || []).forEach(function (c, idx) {
+    citMap[c.id] = { idx: idx + 1, c: c };
+  });
+  summary.sections.forEach(function (sec) {
+    h += '<div style="margin-bottom:10px">';
+    if (sec.heading && sec.heading !== '概述' && sec.heading !== '简介') {
+      h += '<div style="font-size:12.5px;font-weight:600;color:var(--txt);margin:6px 0 4px">' + esc(sec.heading) + '</div>';
+    }
+    (sec.paragraphs || []).forEach(function (p) {
+      var sups = '';
+      (p.citations || []).forEach(function (cid) {
+        var found = citMap[cid];
+        if (found) sups += '<sup style="color:var(--mut);font-size:10px;margin-left:2px">[' + found.idx + ']</sup>';
+      });
+      h += '<div style="font-size:12.5px;line-height:1.7;color:var(--txt);margin-bottom:6px">' + esc(p.text) + sups + '</div>';
+    });
+    h += '</div>';
+  });
+  if (summary.citations && summary.citations.length > 0) {
+    h += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">';
+    summary.citations.forEach(function (c, idx) {
+      var label = '[' + (idx + 1) + '] ' + (c.title || c.source || '来源');
+      h += '<button class="btn chip-copy" data-url="' + esc(c.url) + '" title="复制来源链接" style="font-size:11px;padding:2px 8px">' +
+           '<svg width=11 height=11 viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:3px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
+           esc(label) +
+           '</button>';
+    });
+    h += '</div>';
+  }
+  // 说明行：不写「AI 生成」这类字眼（用户 261023-03 #2），也不回显旧缓存里的旧措辞
+  h += '<div style="font-size:11px;color:var(--mut2);margin-top:8px">依据上面的来源整理，可能不完整，请以来源为准</div>';
+  return h;
+}
+
+function bindCopyChips(container) {
+  if (!container) return;
+  Array.prototype.forEach.call(container.querySelectorAll('.chip-copy'), function (btn) {
+    btn.onclick = function (ev) {
+      ev.stopPropagation();
+      var u = btn.dataset.url;
+      if (!u) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(u).then(function () {
+          toast('已复制来源链接');
+        }).catch(function () {
+          toast('已复制来源链接');
+        });
+      } else {
+        toast('已复制来源链接');
+      }
+    };
+  });
+}
+
 function openAlbum(k) {
   S.view = 'album';
   api('/api/lib/album?k=' + encodeURIComponent(k)).then(function (j) {
@@ -340,6 +402,17 @@ function openAlbum(k) {
             '<button class=btn id=aAdd>加入队列</button> ' +
             '<button class=btn id=aShuf>随机播放</button>' +
             '</div></div>';
+
+    // 2026-10-23（用户 261023-03 #2/#3）：勾选「在线整理音乐资料简介」后，进专辑页即自动整理并缓存。
+    // 加载态只有一行低调灰字；没配 key 又没缓存时先不显示（不留空白板块、也不闪加载行）。
+    var albumSummLoading = (META.summary == 1 && META.hasLlmKey === true);
+    if (META.summary == 1) {
+      h += '<div class="sec-card summary-sec" id="albumSummary" data-k="' + esc(j.k) + '"' +
+           ' style="margin:16px 0 20px' + (albumSummLoading ? '' : ';display:none') + '">' +
+           (albumSummLoading ? '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>' : '') +
+           '</div>';
+    }
+
     h += '<div style="padding:4px 0 24px">';
     j.tracks.forEach(function (t, i) {
       var isFav = FAV_SET.has(t.path);
@@ -354,6 +427,28 @@ function openAlbum(k) {
     h += '</div>';
     D('list').innerHTML = h;
     head(j.name, j.tracks.length + ' 首', '');
+
+    if (META.summary == 1) {
+      var albK = String(j.k);
+      api('/api/entity/summary?kind=release&name=' + encodeURIComponent(j.name) +
+          '&artist=' + encodeURIComponent(j.artist || '') + '&lang=zh')
+        .then(function (s) {
+          var el = D('albumSummary');
+          if (!el || el.dataset.k !== albK) return;   // 异步回来时已切到别的专辑 → 丢弃
+          if (s && s.ok && s.sections && s.sections.length > 0) {
+            el.style.display = '';
+            el.innerHTML = renderSummaryContent(s, '简介');
+            bindCopyChips(el);
+          } else {
+            el.remove();   // 无资料/无 key 又无缓存 → 干脆不显示
+          }
+        })
+        .catch(function () {
+          var el = D('albumSummary');
+          if (el && el.dataset.k === albK) el.remove();
+        });
+    }
+
     D('aPlay').onclick = function () { playAlbum(j.k, 0); };
     D('aAdd').onclick = function () { enqueueAlbum(j.k); };
     D('aShuf').onclick = function () { playAlbum(j.k, Math.floor(Math.random() * j.tracks.length)); };
@@ -440,19 +535,45 @@ function openArtistProfile(who, refresh) {
   S.view = 'artist';
   setView('artists');
   S.view = 'artist';
+  S.artistWho = who;
   head(who, '正在获取权威资料…', '<button class=btn id=bBackArtistsTop>返回艺术家列表</button>');
   if (D('bBackArtistsTop')) D('bBackArtistsTop').onclick = function () { loadArtists(); };
   D('list').innerHTML = '<div class=empty style="padding:60px 0">正在获取权威资料…</div>';
 
   var uKnow = '/api/entity/knowledge?kind=person&name=' + encodeURIComponent(who) + (refresh ? '&refresh=1' : '');
-  var uSumm = '/api/entity/summary?kind=person&name=' + encodeURIComponent(who) + '&lang=zh&refresh=0';
+  var uSumm = '/api/entity/summary?kind=person&name=' + encodeURIComponent(who) + '&lang=zh' + (refresh ? '&refresh=1' : '');
 
-  Promise.all([
-    api(uKnow).catch(function (err) { return { ok: false, error: String(err), materials: [] }; }),
-    api(uSumm).catch(function () { return { ok: false }; })
-  ]).then(function (res) {
-    renderArtistProfile(who, res[0], res[1]);
+  // 2026-10-23（用户 261023-03 #2/#3）：权威资料与简介并行请求，谁先到都不丢；
+  // 简介板块在 renderArtistProfile 里先渲染「正在整理资料…」（仅配了 key 时），回来再填。
+  var wantSumm = (META.summary == 1);
+  var summState = { done: false, res: null, enabled: wantSumm };
+  function applyArtistSummary() {
+    if (!wantSumm) return;
+    if (S.view !== 'artist' || S.artistWho !== who) return;    // 已切走 → 丢弃
+    var el = D('artistSummary');
+    if (!el) return;
+    if (!summState.done) return;
+    var ss = summState.res;
+    if (ss && ss.ok && ss.sections && ss.sections.length > 0) {
+      el.style.display = '';
+      el.innerHTML = renderSummaryContent(ss, '延伸简介');
+      bindCopyChips(el);
+    } else {
+      el.remove();   // 无资料/失败/无 key 又无缓存 → 不留空白板块
+    }
+  }
+
+  api(uKnow).catch(function (err) { return { ok: false, error: String(err), materials: [] }; }).then(function (res) {
+    renderArtistProfile(who, res, summState);
+    applyArtistSummary();
   });
+  if (wantSumm) {
+    api(uSumm).then(function (s) {
+      summState.done = true; summState.res = s; applyArtistSummary();
+    }).catch(function () {
+      summState.done = true; summState.res = null; applyArtistSummary();
+    });
+  }
 }
 
 function renderArtistProfile(who, j, summary) {
@@ -548,66 +669,20 @@ function renderArtistProfile(who, j, summary) {
       h += '</div></div>';
     }
 
-    // 3) AI 综合小节（P3④b 新增）：有缓存展示 sections/citations/徽章；无缓存展示空态卡+生成按钮
-    var hasSummary = summary && summary.ok && summary.sections && summary.sections.length > 0;
-    h += '<div class="sec-card ai-sec" style="margin-bottom:24px">';
-    h += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">';
-    h += '<span style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2)">AI 综合</span>';
-    if (hasSummary) {
-      h += '<span class="badge ai-badge" style="background:var(--hov);color:var(--txt);font-size:11px;font-weight:600">AI 生成</span>';
-      var sumDate = summary.generated_at ? fmtDate(summary.generated_at) : '';
-      h += '<span class=hint style="font-size:11.5px;color:var(--mut2)">' + esc(summary.disclaimer || '仅依据来源材料综合') + (sumDate ? (' · ' + sumDate + ' 取回') : '') + '</span>';
-      h += '<button class="btn" id=bReGenSummary style="margin-left:auto;font-size:12px;padding:3px 10px">重新生成</button>';
-    }
-    h += '</div>';
-
-    if (hasSummary) {
-      var citMap = {};
-      (summary.citations || []).forEach(function (c, idx) {
-        citMap[c.id] = { idx: idx + 1, c: c };
-      });
-
-      summary.sections.forEach(function (sec) {
-        h += '<div style="margin-bottom:14px">';
-        if (sec.heading) {
-          h += '<div style="font-size:13px;font-weight:600;color:var(--txt);margin:10px 0 6px">' + esc(sec.heading) + '</div>';
-        }
-        (sec.paragraphs || []).forEach(function (p) {
-          var sups = '';
-          (p.citations || []).forEach(function (cid) {
-            var found = citMap[cid];
-            if (found) sups += '<sup style="color:var(--mut);font-size:10px;margin-left:2px">[' + found.idx + ']</sup>';
-          });
-          h += '<div style="font-size:13px;line-height:1.75;color:var(--txt);margin-bottom:8px">' + esc(p.text) + sups + '</div>';
-        });
-        h += '</div>';
-      });
-
-      if (summary.citations && summary.citations.length > 0) {
-        h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">';
-        summary.citations.forEach(function (c, idx) {
-          var label = '[' + (idx + 1) + '] ' + (c.title || c.source || '来源');
-          h += '<button class="btn chip-copy" data-url="' + esc(c.url) + '" title="复制引用来源链接">' +
-               '<svg width=12 height=12 viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:4px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
-               esc(label) +
-               '</button>';
-        });
-        h += '</div>';
-      }
-    } else {
-      var isAllowed = (META.summary == 1);
-      var summErrMsg = (summary && summary.error) ? summary.error : '';
-      h += '<div class="card empty-card" style="padding:22px 18px;text-align:center;background:var(--phbg);border:1px solid var(--line);border-radius:10px">';
-      h += '<div style="font-size:13px;color:var(--txt);margin-bottom:10px">' + (summErrMsg ? esc(summErrMsg) : '暂无 AI 综合简介（默认不自动调用以节省成本）') + '</div>';
-      if (isAllowed) {
-        h += '<button class="btn pri" id=bGenSummary>生成 AI 简介</button>';
-      } else {
-        h += '<button class="btn" id=bGenSummary disabled style="opacity:0.6;cursor:not-allowed" title="请先在设置页开启允许 AI 资料综合">生成 AI 简介</button>';
-        h += '<div class=hint style="margin-top:6px;font-size:11.5px;color:var(--mut2)">未开启 AI 资料综合（可在 设置 → 元数据 中开启「允许 AI 资料综合」）</div>';
+    // 3) 延伸简介：设置开启时自动整理并展示（低调加载行；无 key 且无缓存时先隐藏，
+    //    等接口回来再决定显示内容还是整块丢弃 —— 绝不先闪一个空白板块）
+    if (META.summary == 1) {
+      var sumObj = (summary && summary.enabled && summary.done) ? summary.res : null;
+      var hasSummary = sumObj && sumObj.ok && sumObj.sections && sumObj.sections.length > 0;
+      var sumLoading = (META.hasLlmKey === true && !hasSummary);
+      h += '<div class="sec-card summary-sec" id="artistSummary" style="margin-bottom:24px' + (sumLoading ? '' : ';display:none') + '">';
+      if (hasSummary) {
+        h += renderSummaryContent(sumObj, '延伸简介');
+      } else if (sumLoading) {
+        h += '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>';
       }
       h += '</div>';
     }
-    h += '</div>';
 
     // 4) 来源：来源徽章、标题、取回日期、「复制链接」芯片（绝不 window.open / <a target=_blank>）
     h += '<div class="sec-card sources-sec" style="margin-bottom:24px">' +
@@ -666,45 +741,8 @@ function renderArtistProfile(who, j, summary) {
     };
   }
 
-  function triggerSummaryGen() {
-    var btn = D('bGenSummary') || D('bReGenSummary');
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = '正在由 DeepSeek 检索与综合…';
-    }
-    api('/api/entity/summary?kind=person&name=' + encodeURIComponent(who) + '&lang=zh&refresh=1')
-      .then(function (newSumm) {
-        if (newSumm && newSumm.ok) {
-          renderArtistProfile(who, j, newSumm);
-        } else {
-          renderArtistProfile(who, j, { ok: false, error: (newSumm && newSumm.error) || '生成失败，请稍后重试' });
-        }
-      })
-      .catch(function (err) {
-        renderArtistProfile(who, j, { ok: false, error: '请求失败: ' + String(err) });
-      });
-  }
-
-  if (D('bGenSummary')) D('bGenSummary').onclick = triggerSummaryGen;
-  if (D('bReGenSummary')) D('bReGenSummary').onclick = triggerSummaryGen;
-
   // 复制链接芯片：navigator.clipboard.writeText(url) + toast「已复制来源链接」
-  Array.prototype.forEach.call(D('list').querySelectorAll('.chip-copy'), function (btn) {
-    btn.onclick = function (ev) {
-      ev.stopPropagation();
-      var u = btn.dataset.url;
-      if (!u) return;
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(u).then(function () {
-          toast('已复制来源链接');
-        }).catch(function () {
-          toast('已复制来源链接');
-        });
-      } else {
-        toast('已复制来源链接');
-      }
-    };
-  });
+  bindCopyChips(D('list'));
 }
 
 /* ---------------- 古典作品与版本推荐（P3④b Discogs L4 / 261023-03 第4条） ---------------- */
@@ -1181,6 +1219,7 @@ function buildNpMetaHtml(m) {
 function loadMeta(f) {
   if (!f) return;
   api('/api/meta?file=' + encodeURIComponent(f)).then(function (m) {
+    S.curMeta = m;
     if (m.title) D('npt').textContent = m.title;
     else D('npt').textContent = nam(f);
     var sub = [];
@@ -1190,7 +1229,10 @@ function loadMeta(f) {
     D('cv').style.backgroundImage = m.hasCover ? "url('/api/cover?file=" + encodeURIComponent(f) + "')" : '';
     // 补全芯片：存全局，renderNp 统一填进 #npMeta；整页开着就立刻刷一次（meta 是异步回来的）
     S.npMetaHtml = buildNpMetaHtml(m);
-    if (D('npPage') && D('npPage').classList.contains('on')) renderNp();
+    if (D('npPage') && D('npPage').classList.contains('on')) {
+      renderNp();
+      updateNpSummary(m);
+    }
   }).catch(function () { D('npt').textContent = nam(f); });
 }
 
@@ -1200,6 +1242,9 @@ function tick() {
     S.playing = !!j.playing; S.paused = !!j.paused; S.dur = j.dur; S.pos = j.pos;
     // 2026-10-23 #1：底栏 bit-perfect 徽标的数据源（后端权威判定，见 /api/status 的 bitPerfect 字段）
     S.bpState = j.bitPerfect || ""; S.bpWhy = j.bitPerfectWhy || "";
+    // 2026-10-23 261023-03 #2/#5：资料简介的显示门控只用后端权威状态（400ms 轮询顺带更新）
+    if (typeof j.hasLlmKey === 'boolean') META.hasLlmKey = j.hasLlmKey;
+    if (typeof j.summaryEnabled === 'boolean') META.summaryEnabled = j.summaryEnabled;
     // 正在播放整页：进度条 / 时间 / 播放图标
     if (D('npPage') && D('npPage').classList.contains('on')) {
       if (D('npBar') && S.dur > 0) D('npBar').style.width = Math.min(100, S.pos / S.dur * 100) + '%';
@@ -2977,13 +3022,13 @@ function renderSettingsPage() {
          chk('sp_metaon', '自动补全', META.on == 1,
              '关闭后播放不再触发在线补全；已补全的结果仍在本地库，随时可以再打开')
        + chk('sp_metallm', 'DeepSeek 增强（无标签文件）', META.llm == 1, '用 LLM 解析无标签文件并与数据源结果互相校验；不影响已有标签的优先级')
-       // 2026-10-23（用户 261023-02 #5）：「勾了允许 AI 资料综合，却没看到任何地方生成曲目介绍」——
-       // 入口在**艺术家页的「AI 综合」小节**（点艺术家名进入），设置页这里只有开关。直接把路径写出来。
-       + chk('sp_metasummary', '允许 AI 资料综合（按次计费）', META.summary == 1,
-             '开启后到「艺术家」页 → 点某个艺术家 → 页内「AI 综合」小节点「生成 AI 简介」。按次产生 DeepSeek 调用，默认关闭')
+       // 2026-10-23（用户 261023-03 #2/#3）：不再有「生成 AI 简介」按钮，也不出现「AI 综合 / AI 生成」字样。
+       // 勾选即自动：进艺术家 / 专辑 / 单曲播放页就整理对应简介并保存为缓存，重复进入读缓存。
+       + chk('sp_metasummary', '在线整理音乐资料简介（按次计费）', META.summary == 1,
+             '开启后进入艺术家、专辑、单曲播放页会自动联网整理简介并缓存：同一个艺术家或专辑只整理一次，之后直接读缓存（7 天有效）。关闭则不请求、也不显示简介板块。每次整理产生少量在线调用，默认关闭')
        + '<div class=sfld wide><div class=hint style="color:var(--mut2)">'
-       + 'AI 简介的入口：左侧「艺术家」→ 点进任一艺术家 → 页面下方「AI 综合」→「生成 AI 简介」。'
-       + '（作品页另有「Discogs 版本推荐」，不需要 AI。）</div></div>'
+       + '简介会自动出现在艺术家页、专辑页和单曲播放整页，无需点任何按钮；整理过的内容缓存在本地，重复进入不重复计费。'
+       + '（作品页另有「Discogs 版本推荐」，不产生费用。）</div></div>'
        + '<div class=sfld wide style="margin-top:14px">'
        + '<button class=btn id=sp_metamore style="font-size:12px" aria-expanded="false">高级选项 ▾</button>'
        + '<span style="font-size:11.5px;color:var(--mut2);margin-left:10px">数据源 · DeepSeek Key · 标签写回</span>'
@@ -2998,7 +3043,7 @@ function renderSettingsPage() {
        // 红线不变：界面【只显示掩码】，输入框永不回填，保存后立刻清空；key 只写 exe 同目录 rlplayer-llm.conf。
        + '<div class=sfld wide><div style="margin:18px 0 2px;padding-top:14px;border-top:1px solid var(--line)">'
        + '<div style="font-size:12.5px;font-weight:600;color:var(--txt)">DeepSeek 接入</div>'
-       + '<div class=hint style="margin-top:4px">只用于「DeepSeek 增强」与「AI 资料综合」；不填也能用全部本地与公开数据源</div></div></div>'
+       + '<div class=hint style="margin-top:4px">只用于「DeepSeek 增强」与「在线资料整理」；不填也能用全部本地与公开数据源</div></div></div>'
        + '<div class=sfld><label>DeepSeek API Key</label>'
        + '<input type=password id=sp_llmkey autocomplete=off spellcheck=false placeholder="sk-…（粘贴后点保存，只显示掩码）">'
        + '<div class=hint>只存本机 build' + SEP + 'rlplayer-llm.conf；不进安装包，界面永不回显明文</div></div>'
@@ -3113,7 +3158,11 @@ function renderSettingsPage() {
   // 里按注册表逐源绑定（metasrc_<id>，改完即落盘）
   [['sp_metaon', 'on'], ['sp_metallm', 'llm'], ['sp_metasummary', 'summary']].forEach(function (p) {
     var e = D(p[0]); if (!e) return;
-    e.onchange = function () { META[p[1]] = this.checked ? 1 : 0; saveSettings(); };
+    e.onchange = function () {
+      META[p[1]] = this.checked ? 1 : 0;
+      saveSettings();
+      if (p[1] === 'summary' && S.lastCur) loadMeta(S.lastCur);
+    };
   });
   // 功能4：DeepSeek API Key（保存 / 测试连接 / 清除）。输入框重建后必须为空 ——
   // 这是「永不回显明文」的最后一道：哪怕浏览器缓存了 value，重建也会清掉。
@@ -3998,13 +4047,70 @@ function openNowPlaying() {
   pg.classList.add('on');
   // 每次都刷新：上一首的 LY 可能还在；而且内嵌歌词是异步加载的，
   // 只更新 #lyricbox 不会刷新整页的 #npLyric（用户反馈"整页没有歌词"）。
-  if (S.lastCur) loadLyrics(S.lastCur);
+  if (S.lastCur) {
+    loadLyrics(S.lastCur);
+    if (!S.curMeta) loadMeta(S.lastCur);
+  }
   renderNp();
   // 整页控件是底栏/设置页的镜像：进来时刷一次，绝不显示与底栏不同的值
   applyRep(D('sRep') ? D('sRep').value : 0);
   syncVolUi();
 }
 function closeNowPlaying() { var pg = D('npPage'); if (pg) pg.classList.remove('on'); }
+
+function updateNpSummary(m) {
+  var el = D('npSummary');
+  if (!el) return;
+  function hide() { el.style.display = 'none'; el.innerHTML = ''; }
+  // 开关关 / 无元数据 / 没配 key 且无本地缓存 → 不显示、不留空白区块（用户 261023-03 #2/#4）。
+  // 单曲播放页显示的是【所属专辑】的简介（kind=release + artist），不是每首歌各调一次（用户 261023-03 #3）。
+  var canSumm = m && (m.summaryAvailable || m.summaryCached || m.summaryCacheOk || m.hasLlmKey === true || META.hasLlmKey === true);
+  if (!META.summary || !m || !canSumm) { el.dataset.targetKey = ''; el.dataset.loaded = '0'; hide(); return; }
+  var targetKind = m.summaryKind || 'release';
+  var targetName = m.summaryTarget || '';
+  var targetArtist = '';
+  if (targetKind === 'release') {
+    if (!targetName) targetName = m.album || '';
+    targetArtist = m.albumArtist || m.artist || '';
+  } else if (!targetName) {
+    targetName = m.artist || '';
+  }
+  if (!targetName) { el.dataset.targetKey = ''; el.dataset.loaded = '0'; hide(); return; }
+
+  var curKey = targetKind + ':' + targetName + ':' + targetArtist;
+  if (el.dataset.targetKey === curKey && el.dataset.loaded === '1') { el.style.display = ''; return; }
+  if (el.dataset.targetKey !== curKey) {
+    el.dataset.targetKey = curKey;
+    el.dataset.loaded = '0';
+    el.innerHTML = '';
+  }
+
+  // 只有真要现场整理（有 key 且无缓存）才显示那一行灰字；命中缓存时等本地接口直接出内容，
+  // 避免「一闪而过的加载文案」。没 key 时后端只会回缓存或失败，也不需要加载行。
+  if (!m.summaryCached && m.hasLlmKey === true) {
+    el.style.display = '';
+    el.innerHTML = '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>';
+  } else {
+    hide();
+  }
+
+  var u = '/api/entity/summary?kind=' + targetKind + '&name=' + encodeURIComponent(targetName) +
+          (targetArtist ? ('&artist=' + encodeURIComponent(targetArtist)) : '') + '&lang=zh';
+  api(u).then(function (s) {
+    if (!D('npSummary') || el.dataset.targetKey !== curKey) return;
+    if (s && s.ok && s.sections && s.sections.length > 0) {
+      el.dataset.loaded = '1';
+      el.style.display = '';
+      el.innerHTML = renderSummaryContent(s, '简介');
+      bindCopyChips(el);
+    } else {
+      hide();
+    }
+  }).catch(function () {
+    if (el.dataset.targetKey === curKey) hide();
+  });
+}
+
 function renderNp() {
   var pg = D('npPage'); if (!pg || !pg.classList.contains('on')) return;
   D('npTitle').textContent = (D('npt') && D('npt').textContent) || '未播放';
@@ -4014,6 +4120,7 @@ function renderNp() {
   // 元数据补全芯片（loadMeta 异步回来时也会走到这里刷一次）
   if (D('npMeta')) D('npMeta').innerHTML = S.npMetaHtml || '';
   updateFavUi();
+  updateNpSummary(S.curMeta);
   var bg = (D('cv') && D('cv').style.backgroundImage) || '';
   if (bg && bg.indexOf('url(') === 0) {
     D('npbg').style.backgroundImage = bg;

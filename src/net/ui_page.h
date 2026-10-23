@@ -489,7 +489,10 @@ inline std::string rta_ui_page() {
     h += "<div class=nptit id=npTitle style='margin:0'>未播放</div>";
     h += "<button class=fav-btn id=npFavBtn title='收藏' style='padding:4px;display:none'><svg width=20 height=20 viewBox='0 0 24 24' fill=none stroke='currentColor' stroke-width=2><path d='M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z'/></svg></button>";
     h += "</div><div class=npsub id=npSub></div>";
-    h += "<div id=npMeta style='display:flex;flex-wrap:wrap;gap:6px;margin-top:8px'></div></div>";
+    h += "<div id=npMeta style='display:flex;flex-wrap:wrap;gap:6px;margin-top:8px'></div>";
+    // 整页简介：低调滚动区（不是大按钮/大动画）。高度给到 38vh，让 ROON 式介绍能读到几段；
+    // 内容多时页内滚动，不挤压右侧歌词列。
+    h += "<div id=npSummary style='display:none;margin-top:14px;max-height:38vh;overflow-y:auto;font-size:12px;line-height:1.6;color:var(--txt)'></div></div>";
     h += "<div class=nplyric id=npLyric><div class=npline>还没有在播放</div></div>";
     h += "</div>";
     // 播放控件：整页也要能操作，否则进来就必须退出

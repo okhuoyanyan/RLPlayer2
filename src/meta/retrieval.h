@@ -20,6 +20,7 @@
 //   * 实体 id 复用 entities.h / store.h 的 FNV-1a 64 位哈希
 #pragma once
 
+#include "meta/discogs.h"
 #include "meta/entities.h"
 #include "meta/knowledge.h"
 #include "meta/llm.h"
@@ -346,10 +347,10 @@ inline std::vector<LlmMessage> build_synthesis_prompt(
         "   - 每段至少 1 条引用：每个段落的 citations 数组至少包含 1 条引用 ID（如 [\"M1\"]），无引用支撑的陈述一律禁止输出！\n"
         "   - citations 数组列出所有引用的条目，每个条目包含 \"id\"、\"title\"、\"url\"、\"source\"、\"fetched_at\"。\n"
         "   - 引用 URL 必须原样复制自输入材料中对应的 url，严禁修改或编造 URL！\n"
-        "4. 免责声明：disclaimer 固定为：\"AI 生成，仅依据下方来源材料综合；可能不完整，请以来源为准\"。\n\n"
+        "4. 免责声明：disclaimer 固定为：\"仅依据下方来源材料综合整理；可能不完整，请以来源为准\"。\n\n"
         "JSON 格式模板：\n"
         "{\n"
-        "  \"disclaimer\": \"AI 生成，仅依据下方来源材料综合；可能不完整，请以来源为准\",\n"
+        "  \"disclaimer\": \"仅依据下方来源材料综合整理；可能不完整，请以来源为准\",\n"
         "  \"sections\": [\n"
         "    {\n"
         "      \"heading\": \"创作背景\",\n"
@@ -460,7 +461,7 @@ inline SummaryResult parse_synthesis_reply(const std::string& text,
     // 免责声明
     r.disclaimer = j["disclaimer"].s();
     if (r.disclaimer.empty()) {
-        r.disclaimer = "AI 生成，仅依据下方来源材料综合；可能不完整，请以来源为准";
+        r.disclaimer = "仅依据下方来源材料综合整理；可能不完整，请以来源为准";
     }
 
     // 解析 citations 表
@@ -854,6 +855,110 @@ inline RetrievalRateLimiter& retrieval_rate_limiter() {
 // 编排检索：retrieval_fetch
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Discogs Release 材料提取（供专辑简介结合 Wikipedia 使用）
+// ---------------------------------------------------------------------------
+
+inline KnowledgeMaterial retrieval_fetch_discogs_release(const std::string& name,
+                                                         const std::string& artist = "",
+                                                         int timeout_ms = 10000) {
+    KnowledgeMaterial m;
+    if (name.empty()) return m;
+
+    std::string q = !artist.empty() ? (artist + " " + name) : name;
+    if (!discogs_transport_hook() && !DiscogsRateLimiter::instance().acquire(2500)) {
+        return m;
+    }
+
+    const std::string searchUrl = "https://api.discogs.com/database/search?q=" +
+                                  discogs_url_encode(q) + "&type=release";
+    const std::vector<std::string> headers = {
+        "User-Agent: RLPlayer/1.0.10 (metadata; contact: local)"
+    };
+
+    rta::net::HttpResponse resp;
+    if (discogs_transport_hook()) {
+        resp = discogs_transport_hook()(searchUrl, headers, timeout_ms);
+    } else {
+        resp = rta::net::http_get(searchUrl, headers, timeout_ms);
+    }
+
+    if (resp.status != 200 || resp.body.empty()) {
+        if (resp.status == 429) DiscogsRateLimiter::instance().trip_circuit(60);
+        return m;
+    }
+
+    std::vector<SearchResultItem> items;
+    std::string perr;
+    const std::string bodyStr(resp.body.begin(), resp.body.end());
+    if (!parse_discogs_search_json(bodyStr, items, &perr) || items.empty()) {
+        return m;
+    }
+
+    const SearchResultItem& top = items[0];
+    DiscogsReleaseDetail det;
+    bool detailOk = false;
+    if (top.id > 0) {
+        if (discogs_transport_hook() || DiscogsRateLimiter::instance().acquire(2500)) {
+            std::string relUrl = "https://api.discogs.com/releases/" + std::to_string(top.id);
+            rta::net::HttpResponse detResp;
+            if (discogs_transport_hook()) {
+                detResp = discogs_transport_hook()(relUrl, headers, timeout_ms);
+            } else {
+                detResp = rta::net::http_get(relUrl, headers, timeout_ms);
+            }
+            if (detResp.status == 200 && !detResp.body.empty()) {
+                std::string detBody(detResp.body.begin(), detResp.body.end());
+                std::string detErr;
+                if (parse_discogs_release_json(detBody, det, &detErr)) {
+                    detailOk = true;
+                }
+            } else if (detResp.status == 429) {
+                DiscogsRateLimiter::instance().trip_circuit(60);
+            }
+        }
+    }
+
+    const int64_t relId = (detailOk && det.id > 0) ? det.id : top.id;
+    m.source = "discogs";
+    m.kind = "release";
+    m.subject = name;
+    m.title = detailOk && !det.title.empty() ? det.title : (!top.title.empty() ? top.title : name);
+    if (detailOk && !det.url.empty()) {
+        m.url = det.url;
+    } else if (!top.uri.empty()) {
+        m.url = top.uri.rfind("http", 0) == 0 ? top.uri : ("https://www.discogs.com" + top.uri);
+    } else if (relId > 0) {
+        m.url = "https://www.discogs.com/release/" + std::to_string(relId);
+    }
+    m.fetched_at = (long long)std::time(nullptr);
+
+    std::ostringstream ss;
+    ss << "专辑: " << m.title << "\n";
+    if (!artist.empty()) ss << "艺术家: " << artist << "\n";
+    int yr = detailOk && det.year > 0 ? det.year : top.year;
+    if (yr > 0) ss << "发行年份: " << yr << "\n";
+    std::string lab = detailOk && !det.label.empty() ? det.label : top.label;
+    if (!lab.empty()) ss << "厂牌: " << lab << "\n";
+    std::string fmt = detailOk && !det.format.empty() ? det.format : top.format;
+    if (!fmt.empty()) ss << "格式: " << fmt << "\n";
+    std::string cntry = detailOk && !det.country.empty() ? det.country : top.country;
+    if (!cntry.empty()) ss << "发行地区: " << cntry << "\n";
+    const auto& gnrs = detailOk && !det.genres.empty() ? det.genres : top.genres;
+    const auto& styls = detailOk && !det.styles.empty() ? det.styles : top.styles;
+    if (!gnrs.empty() || !styls.empty()) {
+        ss << "流派与风格: " << format_discogs_genre(gnrs, styls) << "\n";
+    }
+    if (detailOk) {
+        if (!det.conductor.empty()) ss << "指挥: " << det.conductor << "\n";
+        if (!det.ensemble.empty()) ss << "乐团/组合: " << det.ensemble << "\n";
+        if (!det.composer.empty()) ss << "作曲: " << det.composer << "\n";
+        if (!det.notes.empty()) ss << "专辑说明与发行背景:\n" << det.notes << "\n";
+    }
+    m.text = ss.str();
+    return m;
+}
+
 struct RetrievalOptions {
     std::string metabase;
     bool refresh = false;
@@ -864,13 +969,19 @@ struct RetrievalOptions {
     int timeout_ms = 15000;
     LlmConfig llm_cfg;
     FilterOptions filter_opts;
+    std::string artist;           // 针对 Release 的艺术家辅助（用于 Wikipedia 与 Discogs 检索消歧）
+    std::string entity_id;        // 显式指定实体 ID（为空则自动计算）
 };
 
 inline SummaryResult retrieval_fetch(EntityKind kind,
                                      const std::string& name,
                                      const std::string& lang = "zh",
                                      const RetrievalOptions& opts = {}) {
-    const std::string eid = entity_id(kind, name);
+    const std::string eid = !opts.entity_id.empty()
+        ? opts.entity_id
+        : ((!opts.artist.empty() && kind == EntityKind::Release)
+            ? entity_make_id("release", entity_norm(opts.artist) + "\x1f" + entity_norm(name))
+            : entity_id(kind, name));
     const std::string baseDir = !opts.metabase.empty() ? opts.metabase : EntityStore::instance().baseDir();
 
     // 1. 检查既有本地缓存
@@ -921,13 +1032,33 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         return err_res;
     }
 
-    // 3. Step 1: 拉取 L2 权威材料（knowledge_fetch）
+    // 3. Step 1: 拉取 L2 权威材料（Release 整合 Wikipedia 与 Discogs）
     KnowledgeOpts kopts;
     kopts.lang = lang;
     kopts.metabase = opts.metabase;
     kopts.refresh = opts.refresh;
     kopts.timeout_ms = opts.timeout_ms;
-    const KnowledgeResult kr = knowledge_fetch(kind, name, kopts);
+    KnowledgeResult kr;
+    if (kind == EntityKind::Release) {
+        kr = knowledge_wikipedia(name, lang, kopts);
+        if (kr.materials.empty() && !opts.artist.empty()) {
+            KnowledgeResult kr2 = knowledge_wikipedia(opts.artist + " " + name, lang, kopts);
+            if (!kr2.materials.empty()) {
+                kr.materials.insert(kr.materials.end(), kr2.materials.begin(), kr2.materials.end());
+            } else {
+                KnowledgeResult kr3 = knowledge_wikipedia(name + " (" + opts.artist + ")", lang, kopts);
+                if (!kr3.materials.empty()) {
+                    kr.materials.insert(kr.materials.end(), kr3.materials.begin(), kr3.materials.end());
+                }
+            }
+        }
+        KnowledgeMaterial dm = retrieval_fetch_discogs_release(name, opts.artist, opts.timeout_ms);
+        if (!dm.url.empty()) {
+            kr.materials.push_back(std::move(dm));
+        }
+    } else {
+        kr = knowledge_fetch(kind, name, kopts);
+    }
 
     // 4. Step 2: (可选) ds_search「创作背景/评价/版本点评」检索（每实体最多 1 次）
     std::vector<SearchHit> valid_hits;
@@ -939,12 +1070,23 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
 
     if (opts.enable_search) {
         std::string query;
-        if (lang == "zh" || lang.empty()) {
-            query = name + " 创作背景 评价 音乐";
-        } else if (lang == "ja") {
-            query = name + " 音楽 背景 評価";
+        if (kind == EntityKind::Release) {
+            std::string qTarget = !opts.artist.empty() ? (opts.artist + " " + name) : name;
+            if (lang == "zh" || lang.empty()) {
+                query = qTarget + " 专辑 背景 评价";
+            } else if (lang == "ja") {
+                query = qTarget + " アルバム 背景 評価";
+            } else {
+                query = qTarget + " album background reviews";
+            }
         } else {
-            query = name + " music background reception reviews";
+            if (lang == "zh" || lang.empty()) {
+                query = name + " 创作背景 评价 音乐";
+            } else if (lang == "ja") {
+                query = name + " 音楽 背景 評価";
+            } else {
+                query = name + " music background reception reviews";
+            }
         }
 
         retrieval_rate_limiter().acquire();
@@ -1007,9 +1149,14 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     }
 
     // 5. Step 4: llm_chat 综合（单次调用，不重试）
-    const std::vector<LlmMessage> msgs = build_synthesis_prompt(name, kr.materials, fetched_hits, lang);
+    const std::string promptEntityName = (!opts.artist.empty() && kind == EntityKind::Release)
+        ? (opts.artist + " - " + name)
+        : name;
+    const std::vector<LlmMessage> msgs = build_synthesis_prompt(promptEntityName, kr.materials, fetched_hits, lang);
     retrieval_rate_limiter().acquire();
-    const LlmReply chat_rep = llm_chat(cfg, msgs, 2000, 0.2f, true);
+    // 2026-10-23（261023-03 实测）：2000 tokens 对「专辑」类资料（维基正文 + Discogs 发行说明）
+    // 会截断成半截 JSON，导致校验失败、页面什么都看不到。提到 4000 后揺れる想い/海阔天空均通过。
+    const LlmReply chat_rep = llm_chat(cfg, msgs, 4000, 0.2f, true);
 
     if (!chat_rep.ok) {
         // 网络综合失败时若有旧缓存则离线回退
