@@ -34,7 +34,7 @@ inline std::string rta_ui_page() {
          "--cvbg:#151a24;--phbg:linear-gradient(135deg,#1a2233,#12161f);--ph-txt:rgba(255,255,255,.14);"
          "--shadow:rgba(0,0,0,.45);--track:rgba(255,255,255,.09);--toast:rgba(22,28,38,.97);"
          "--ok:#34d399;--ok-bg:rgba(52,211,153,.14);--ok-line:rgba(52,211,153,.3);--ok-text:#6ee7b7;"
-         "--warn:#fbbf24;--danger:#e8654b;"
+         "--warn:#fbbf24;--danger:#e8654b;--bp-direct:#a78bfa;"
          "}";
     // 白色主题
     h += "html[data-theme=light]{color-scheme:light;"
@@ -50,7 +50,7 @@ inline std::string rta_ui_page() {
          "--cvbg:#e6ecf5;--phbg:linear-gradient(135deg,#e6ecf6,#dae2ee);--ph-txt:rgba(15,23,42,.20);"
          "--shadow:rgba(15,23,42,.13);--track:rgba(15,23,42,.10);--toast:rgba(255,255,255,.98);"
          "--ok:#059669;--ok-bg:rgba(5,150,105,.10);--ok-line:rgba(5,150,105,.25);--ok-text:#047857;"
-         "--warn:#b45309;--danger:#dc2626;"
+         "--warn:#b45309;--danger:#dc2626;--bp-direct:#6d28d9;"
          "}";
     // 浅蓝主题
     h += "html[data-theme=blue]{color-scheme:light;"
@@ -66,12 +66,23 @@ inline std::string rta_ui_page() {
          "--cvbg:#d9e9ff;--phbg:linear-gradient(135deg,#dbeafe,#cde2ff);--ph-txt:rgba(11,37,69,.20);"
          "--shadow:rgba(11,37,69,.15);--track:rgba(11,37,69,.10);--toast:rgba(255,255,255,.98);"
          "--ok:#0f766e;--ok-bg:rgba(15,118,110,.10);--ok-line:rgba(15,118,110,.25);--ok-text:#0b5f59;"
-         "--warn:#b45309;--danger:#c2410c;"
+         "--warn:#b45309;--danger:#c2410c;--bp-direct:#4338ca;"
          "}";
     h += "*{box-sizing:border-box;margin:0;padding:0}html,body{height:100%}";
     h += "body{font:13px/1.5 Inter,'Segoe UI Variable','Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--txt);overflow:hidden;-webkit-font-smoothing:antialiased}";
     h += "button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}input,select{font:inherit;color:inherit}";
     h += "a{color:inherit;text-decoration:none}";
+    // 2026-10-23 用户 261023-04 #8：深色主题下曲目页「默认排序」下拉的**菜单列表**看不清。
+    // 原因：<select> 本体有 color:var(--txt)（浅色字），但 <option> 没有显式 background —— 弹层
+    // 在某些宿主（WebView2 / 高对比主题）按系统浅底渲染，于是浅字压浅底。
+    // 修法：全局给 select / option 都定死 color+background（三套主题都走 CSS 变量），
+    //       不依赖浏览器对 <option> 的默认配色。:checked 项再给强调色，键盘/鼠标都看得清。
+    h += "select{color:var(--txt);background-color:var(--field)}";
+    h += "select option{background-color:var(--bg2);color:var(--txt)}";
+    // 选中项不写死「白字 + 强调蓝」（#3b82f6 底上白字对比度只有 3.68:1）；交给系统高亮，
+    // 其余选项统一 bg2/txt，深色 16:1 / 浅色 14:1，菜单怎么弹都读得清。
+    h += "select option:checked{background-color:var(--acc-weak);color:var(--acc-text)}";
+    h += "select option:disabled{color:var(--mut2)}";
     h += "#app{display:grid;grid-template-columns:212px 1fr 378px;grid-template-rows:52px 1fr 88px;height:100vh}";
     h += "#app.noq{grid-template-columns:212px 1fr 0}#app.noq #right{display:none}";
     // 顶栏
@@ -201,13 +212,28 @@ inline std::string rta_ui_page() {
     h += ".rootline button{color:var(--mut2);font-size:15px;line-height:1;padding:0 6px}";
     h += ".rootline button:hover{color:var(--danger)}";
     // 播放条
-    h += ".bar{grid-column:1/-1;display:grid;grid-template-columns:minmax(200px,300px) 1fr minmax(170px,232px);align-items:center;gap:18px;padding:0 18px;background:var(--barbg);border-top:1px solid var(--line)}";
-    h += ".np{display:flex;align-items:center;gap:11px;min-width:0;cursor:pointer;border-radius:10px;padding:4px 6px;margin-left:-6px;transition:.14s}";
+    // 2026-10-23 用户 261023-04 #1（底栏严重错误）：现场是「控制键被推到最右、中间只有一行黄色非 bit-perfect、
+    // 信号链/歌词/音量整组不见了」。根因：底栏是 3 列 grid，但 #bpBadge 作为第 4 个子项插在 .np 与 .ctr 之间，
+    // grid 自动排布把 .ctr 放到第 3 列、把 .vol 挤到第 2 行（88px 行高之外 = 看不见）。
+    // 修法（判据：控制组中心与底栏中心偏差 < 8px；bLyric/bChain/音量任何宽度都可见）：
+    //   ① 三列改为 minmax(0,1fr) | auto | minmax(0,1fr)：左右两列严格等宽 ⟹ 中间控制组水平居中；
+    //   ② bit-perfect 状态改为紧凑 chip（#bpBadge），收进右侧状态簇，不再占中间列；
+    //   ③ 窄屏压缩音量条/隐藏格式徽标，但歌词、信号链、音量三件套始终保留。
+    h += ".bar{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:14px;padding:0 16px;background:var(--barbg);border-top:1px solid var(--line)}";
+    h += ".np{display:flex;align-items:center;gap:11px;min-width:0;max-width:340px;justify-self:start;cursor:pointer;border-radius:10px;padding:4px 6px;margin-left:-6px;transition:.14s}";
     h += ".np:hover{background:var(--hov)}";
     h += ".cv2{width:56px;height:56px;border-radius:9px;flex:none;background:var(--cvbg) center/cover no-repeat;border:1px solid var(--line);box-shadow:0 3px 14px var(--shadow)}";
     h += ".np .tx{min-width:0}.np .t1{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
     h += ".np .t2{font-size:10.5px;color:var(--mut2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}";
-    h += ".ctr{display:flex;flex-direction:column;align-items:center;gap:7px}.keys{display:flex;align-items:center;gap:6px}";
+    h += ".ctr{display:flex;flex-direction:column;align-items:center;gap:7px;width:clamp(300px,34vw,540px);flex:none}.keys{display:flex;align-items:center;gap:6px}";
+    // bit-perfect 状态 chip（#bpBadge）：紧凑小标签，颜色区分三态；空态不占位。
+    // 颜色全部走主题变量：--ok-text / --warn / --bp-direct（三套主题各一份，浅色底也够对比度）。
+    h += "#bpBadge{display:none;align-items:center;font-size:9.5px;font-weight:700;letter-spacing:.4px;padding:2px 7px;border-radius:5px;border:1px solid var(--line);background:var(--hov);white-space:nowrap;line-height:1.5}";
+    h += "#bpBadge.bp-yes{display:inline-flex;color:var(--ok-text);border-color:var(--ok-line);background:var(--ok-bg)}";
+    h += "#bpBadge.bp-no{display:inline-flex;color:var(--warn);border-color:currentColor;background:var(--hov)}";
+    h += "#bpBadge.bp-direct{display:inline-flex;color:var(--bp-direct);border-color:currentColor;background:var(--hov)}";
+    // 窄屏（1024 级）：中间控制组收窄、右侧只压缩音量条与格式徽标 —— 歌词/信号链/音量必须还在。
+    h += "@media (max-width:1180px){.bar{gap:10px;padding:0 12px}.ctr{width:300px}.np{max-width:260px}.np .cv2{width:48px;height:48px}.vol{gap:6px}.vol input[type=range]{width:64px}#fmt{display:none}}";
     h += "#bRep{position:relative}";
     // 正在播放整页
     // 2026-10-23 用户反馈「单曲播放页面四周有黑框」：
@@ -275,7 +301,7 @@ inline std::string rta_ui_page() {
     h += ".prog{width:100%;display:flex;align-items:center;gap:9px;font-size:10.5px;color:var(--mut2);font-variant-numeric:tabular-nums;max-width:560px}";
     h += ".track{flex:1;height:5px;border-radius:3px;background:var(--track);overflow:hidden;cursor:pointer;position:relative}";
     h += ".track i{display:block;height:100%;border-radius:3px;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .18s linear;width:0}";
-    h += ".vol{display:flex;align-items:center;gap:8px;justify-content:flex-end}.vol input[type=range]{width:88px;accent-color:var(--acc)}";
+    h += ".vol{display:flex;align-items:center;gap:8px;justify-content:flex-end;justify-self:end;min-width:0}.vol input[type=range]{width:88px;accent-color:var(--acc)}";
     h += ".badge{font-size:9.5px;padding:2px 7px;border-radius:5px;background:var(--acc-weak);color:var(--acc-text);border:1px solid var(--acc-weak);font-weight:600;letter-spacing:.3px;white-space:nowrap}";
     h += ".badge.g{background:var(--ok-bg);color:var(--ok-text);border-color:var(--ok-line)}";
     h += ".chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 9px;border-radius:12px;background:var(--bg3);color:var(--txt2);border:1px solid var(--line);cursor:pointer;transition:.15s;user-select:none}";
@@ -329,6 +355,15 @@ inline std::string rta_ui_page() {
     h += ".sfld select:focus,.sfld input:focus{outline:0;border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-weak)}";
     h += ".sfld.wide{grid-column:1/-1}";
     h += ".sfld .chk{margin:0}";
+    // 元数据「高级选项」：左右两列卡片（左=数据源，右=DeepSeek 接入 + 标签写回）。
+    // 2026-10-23 用户 261023-04 #3：原来左边只有一行按钮、右边一整竖排，左右失衡又挤。
+    h += ".meta-adv-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;align-items:start}";
+    h += ".meta-card{border:1px solid var(--line);border-radius:10px;background:var(--bg2);padding:14px 16px;min-width:0}";
+    h += ".meta-card .mh{display:flex;align-items:baseline;gap:8px;font-size:12.5px;font-weight:650;color:var(--txt);margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--line)}";
+    h += ".meta-card .mh.sub{margin-top:16px}";
+    h += ".meta-src-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px 14px}";
+    h += ".meta-card .chk{margin-bottom:0}";
+    h += "@media (max-width:1100px){.meta-adv-grid{grid-template-columns:1fr}}";
     // 设置页分页（对齐 HQPlayer 的 Inputs / Outputs / PCM / SDM / Advanced）
     h += ".stabs{display:flex;gap:4px;padding:10px 0 12px;margin:-20px 0 14px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:6}";
     h += ".stab{padding:7px 15px;border-radius:8px;font-size:12px;color:var(--mut);border:1px solid transparent;transition:.13s}";
@@ -341,10 +376,16 @@ inline std::string rta_ui_page() {
     h += ".meter-bar{height:6px;border-radius:3px;background:var(--track);overflow:hidden;position:relative;margin:4px 0 2px}";
     h += ".meter-val{height:100%;width:0%;background:linear-gradient(90deg,var(--acc),#22c55e);transition:width .12s ease;border-radius:3px}";
     h += ".meter-val.clip{background:var(--err)}";
-    h += ".in-stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px 12px;font-size:11.5px;color:var(--txt2)}";
-    h += ".in-stat-item{background:var(--field);padding:7px 10px;border-radius:8px;border:1px solid var(--line)}";
-    h += ".in-stat-item .lbl{display:block;font-size:10px;color:var(--mut2);margin-bottom:2px}";
-    h += ".in-stat-item .val{font-weight:600;font-variant-numeric:tabular-nums}";
+    // 2026-10-23 用户 261023-04 #10/#12：「采集/投放实时状态」原来是一个 260px 宽的窄列里再套
+    // auto-fill 网格 —— 外层 .sgbody 把整块塞进单个网格单元，内层只剩 1 列，于是所有指标竖排成长条。
+    // 修法：① 标记里给状态网格加 .sfld.wide（跨满 .sgbody 所有列）；② 卡片横向 auto-fill（宽屏 4~6 个/行、
+    // 窄屏自动换行）；③ 每卡「小标题 + 大数值」两级字号，数值用 tabular-nums 对齐。
+    h += ".in-stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px 14px;font-size:11.5px;color:var(--txt2)}";
+    h += ".in-stat-item{background:var(--field);padding:10px 13px;border-radius:9px;border:1px solid var(--line);min-width:0}";
+    h += ".in-stat-item .lbl{display:block;font-size:10px;color:var(--mut2);margin-bottom:4px;letter-spacing:.2px}";
+    h += ".in-stat-item .val{font-weight:650;font-variant-numeric:tabular-nums;font-size:15px;line-height:1.3;color:var(--txt)}";
+    h += ".in-stat-item .val.sm{font-size:12px;font-weight:600;word-break:break-all}";
+    h += "@media (max-width:1200px){.in-stat-grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}}";
     // 收藏 / EQ 卡片 / 调音卡片 / 芯片 / 排序
     h += ".fav-btn{background:none;border:none;cursor:pointer;padding:2px 4px;display:inline-flex;align-items:center;justify-content:center;color:var(--mut2);border-radius:4px;transition:color .15s,transform .1s}";
     h += ".fav-btn:hover{color:#e05666;transform:scale(1.15)}";
@@ -390,7 +431,8 @@ inline std::string rta_ui_page() {
     h += "<div class=nav data-v=tracks><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M14.5 4.5v11.2'/><circle cx='12' cy='17.5' r='2.8'/><path d='M14.5 4.5c2.6.6 4 2 4.5 4.2'/></svg>曲目</div>";
     h += "<div class=nav data-v=files><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M3 7.5a2 2 0 012-2h4l1.8 2H19a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z'/></svg>文件夹</div>";
     h += "<div class=nav data-v=remote><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M7 18a4.5 4.5 0 010-9 6 6 0 0111.6 1.6A3.7 3.7 0 0118 18z'/></svg>流媒体</div>";
-    h += "<div class=nav data-v=eq><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6'/></svg>EQ 与房间校正</div>";
+    // 2026-10-23 用户 261023-04 #2：EQ 与房间校正**不再留在左导航**，改为设置页的一个页签（data-g=eq）。
+    // （261023-03 曾把它做成独立主导航页；本轮用户明确要求「放到设置里面单开一页，不是放到主页里面」。）
     h += "<div class=sec>播放</div>";
     h += "<div class=nav data-v=queue><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M4 6h10M4 12h10M4 18h7'/><path d='M17 15.5V7l4-1v8.5'/><circle cx='16' cy='16.5' r='1.6' fill='currentColor' stroke='none'/><circle cx='20' cy='15' r='1.6' fill='currentColor' stroke='none'/></svg>播放队列</div>";
     h += "<div class=nav data-v=recent><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><circle cx='12' cy='12' r='8.5'/><path d='M12 7.2V12l3.2 2'/></svg>最近播放</div>";
@@ -455,8 +497,8 @@ inline std::string rta_ui_page() {
     h += "<div class=cv2 id=cv></div><div class=tx><div class=t1 id=npt>未播放</div><div class=t2 id=npart></div>";
     h += "<div class=t2 id=nps>选择一个专辑开始</div></div></div>";
     // 2026-10-23（用户 261023-02 #1）：底栏常驻 bit-perfect 徽标。
-    // 不点开信号链也能一眼看到「本次是否逐位」；颜色由 ui_script 按 direct/yes/no 三态设置。
-    h += "<div id=bpBadge style=\"font-size:10.5px;font-weight:700;letter-spacing:.4px;margin-left:12px;white-space:nowrap\" title=\"\"></div>";
+    // 2026-10-23（用户 261023-04 #1）：它**不能**再作为底栏 grid 的第 4 个子项（那会把控制组挤到最右、
+    // 把右侧状态簇挤到第二行）。现在作为紧凑 chip 收进 .vol 状态簇，由 CSS 控制显隐与配色。
     h += "<div class=ctr><div class=keys>";
     // 循环方式（关 / 列表 / 单曲）：放在播放键左边，凑齐五个键
     h += "<button class=k id=bRep title='循环方式'><svg width=17 height=17 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2>";
@@ -469,6 +511,7 @@ inline std::string rta_ui_page() {
     h += "</div><div class=prog><span id=tpos title='当前时间'>0:00</span><div class=track id=seek title='点击跳转'><i id=bar></i></div><span id=tdur title='总时长'>0:00</span></div></div>";
     h += "<div class=vol><button class=ibtn id=bLyric title='歌词'><svg width=16 height=16 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=1.8><path d='M4 5h16M4 10h16M4 15h10'/><circle cx='18' cy='17' r='2.5'/></svg></button>";
     h += "<button class=ibtn id=bChain title='信号链'><svg width=16 height=16 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=1.8><path d='M9 12a3 3 0 016 0'/><path d='M6 12H3M21 12h-3'/><circle cx=12 cy=12 r=3'/></svg></button>";
+    h += "<span id=bpBadge title=''></span>";
     h += "<span class=badge id=fmt>--</span><span class='badge g' id=gpub style='display:none'>GPU</span>";
     h += "<svg width=14 height=14 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2 opacity=.55><path d='M3 10v4h4l5 4V6L7 10H3z'/><path d='M16.5 8.5a5 5 0 010 7'/></svg>";
     h += "<input id=vol type=range min=-60 max=0 step=0.5 value=0></div></div>";
