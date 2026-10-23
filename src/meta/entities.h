@@ -841,21 +841,24 @@ inline EntityKind entity_artist_kind(const std::string& raw) {
         }
     }
 
-    // 2. 强团体特征英文词表
-    static const char* kWord[] = { "orchestra", "ensemble", "choir", "chorus", "band",
-                                   "quartet", "trio", "singers", "philharmonic", "symphony",
-                                   "group", "project" };
+    // 2. 强团体特征英文/德文/西文乐团词表
+    static const char* kWord[] = {
+        "orchestra", "ensemble", "choir", "chorus", "band",
+        "quartet", "trio", "singers", "philharmonic", "philharmoniker",
+        "philharmonia", "sinfonieorchester", "symphonieorchester", "kammerorchester",
+        "symphony", "staatskapelle", "group", "project"
+    };
     for (const char* w : kWord)
         if (n.find(w) != std::string::npos) return EntityKind::Group;
 
     // 3. 强团体特征多字 CJK 词表（即使含负例词根，有强团体词也算团体，如“团结交响乐团”）
-    static const char* kCjkMulti[] = { "乐团", "樂團", "乐队", "樂隊", "合唱", "组合", "組合",
-                                       "社团", "社團", "剧团", "劇團" };
+    static const char* kCjkMulti[] = {
+        "交響楽団", "管弦乐团", "管弦樂團", "交响乐团", "交響樂團", "室内乐团", "室內樂團",
+        "合唱团", "合唱團", "爱乐乐团", "愛樂樂團", "乐团", "樂團", "乐队", "樂隊",
+        "合唱", "组合", "組合", "社团", "社團", "剧团", "劇團"
+    };
     for (const char* w : kCjkMulti)
         if (raw.find(w) != std::string::npos) return EntityKind::Group;
-
-    if (isNegative) return EntityKind::Person;
-
     // 4. 单字「社」「団」「团」：加上下文/后缀门槛（必须为后缀或后接修饰符，且长度>单字）
     if (entity_detail_has_cjk_suffix(n, "社")) return EntityKind::Group;
     if (entity_detail_has_cjk_suffix(n, "団")) return EntityKind::Group;
@@ -1010,9 +1013,61 @@ inline bool entity_is_disc_subdir_name(const std::string& name, int* discOut = n
     if (discOut) *discOut = num;
     return num > 0;
 }
+// 盒装中间层目录名判定（Season / Vol / Volume / Part / Act / 季 / 卷 / 部 等）
+inline bool entity_is_intermediate_box_subdir_name(const std::string& name) {
+    const std::string s = entity_detail::ent_ascii_lower(entity_detail::ent_trim_ascii_ws(name));
+    if (s.empty()) return false;
+
+    // 1. 常见英文前缀：season / volume / vol / part / pt / act / series
+    auto match_prefix_num = [&](const std::string& pfx) -> bool {
+        if (s.rfind(pfx, 0) != 0) return false;
+        size_t pos = pfx.size();
+        while (pos < s.size() && (s[pos] == ' ' || s[pos] == '-' || s[pos] == '_' || s[pos] == '.')) {
+            ++pos;
+        }
+        // 若恰好以该词为完整目录名（如单独一个目录叫 "Season" 或 "Vol" 或 "Volume"）
+        if (pos == s.size()) return true;
+        // 或者后接数字/罗马数字/修饰字符（如 Season 1, Vol.02, Part-A）
+        if (s[pos] >= '0' && s[pos] <= '9') return true;
+        if (s[pos] == 'i' || s[pos] == 'v' || s[pos] == 'x' || s[pos] == 'a' || s[pos] == 'b') return true;
+        return false;
+    };
+
+    if (match_prefix_num("season")) return true;
+    if (match_prefix_num("volume")) return true;
+    if (match_prefix_num("vol")) return true;
+    if (match_prefix_num("part")) return true;
+    if (match_prefix_num("pt")) return true;
+    if (match_prefix_num("act")) return true;
+    if (match_prefix_num("series")) return true;
+
+    // 缩写 s1, s2, s01 等（s + 纯数字）
+    if (s.size() >= 2 && s[0] == 's') {
+        size_t p = 1;
+        while (p < s.size() && (s[p] == ' ' || s[p] == '-' || s[p] == '_' || s[p] == '.')) ++p;
+        if (p < s.size() && s[p] >= '0' && s[p] <= '9') {
+            bool allDig = true;
+            for (size_t k = p; k < s.size(); ++k) {
+                if (s[k] < '0' || s[k] > '9') { allDig = false; break; }
+            }
+            if (allDig) return true;
+        }
+    }
+
+    // 2. CJK 字符：第X季、第X卷、第X部、第X篇、第X册
+    static const char* kCjkUnits[] = { "季", "卷", "部", "篇", "册", "冊" };
+    for (const char* u : kCjkUnits) {
+        if (name.find(u) != std::string::npos) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 // 判定一个目录是否是多碟盒装专辑目录：
-// 自身不要求有直接音频，但其直接子目录中【所有含音频的子目录】全部呈现 CD1..CDn / Disc1..n 碟片形态（至少 1 个碟片子目录）。
+// 自身不要求有直接音频，但其直接子目录中【所有含音频的子目录】全部呈现 CD1..CDn / Disc1..n 碟片形态，
+// 或呈现 Season/Vol 中间层形态（其下全为碟片子目录），至少包含 1 个碟片子目录。
 inline bool entity_dir_is_boxset(const fsx::path& dir, std::vector<int>* discsOut = nullptr) {
     std::error_code ec;
     if (!fsx::is_directory(dir, ec) || ec) return false;
@@ -1033,9 +1088,17 @@ inline bool entity_dir_is_boxset(const fsx::path& dir, std::vector<int>* discsOu
                 ++discSubdirs;
                 if (dNo > 0) discs.push_back(dNo);
             }
+        } else if (entity_is_intermediate_box_subdir_name(subName)) {
+            // 三层盒装支持：子目录是 Season / Vol 等中间层
+            std::vector<int> subDiscs;
+            if (entity_dir_is_boxset(subPath, &subDiscs) && !subDiscs.empty()) {
+                ++audioSubdirs;
+                ++discSubdirs;
+                discs.insert(discs.end(), subDiscs.begin(), subDiscs.end());
+            }
         }
     }
-    if (audioSubdirs > 0 && discSubdirs == audioSubdirs) {
+    if (audioSubdirs > 0 && discSubdirs == audioSubdirs && !discs.empty()) {
         if (discsOut) {
             std::sort(discs.begin(), discs.end());
             discs.erase(std::unique(discs.begin(), discs.end()), discs.end());
@@ -1046,7 +1109,7 @@ inline bool entity_dir_is_boxset(const fsx::path& dir, std::vector<int>* discsOu
     return false;
 }
 
-// 判定某个目录是否是多碟盒装的碟片子目录（例如 MyBoxSet/CD1）
+// 判定某个目录是否是多碟盒装的碟片子目录（例如 MyBoxSet/CD1 或 MyBoxSet/Season1/CD1）
 inline bool entity_dir_is_disc_subdir(const fsx::path& dir, int* discOut = nullptr) {
     const std::string name = meta_string_of(dir.filename());
     if (!entity_is_disc_subdir_name(name, discOut)) return false;
@@ -1071,20 +1134,43 @@ inline bool entity_dir_is_category(const fsx::path& dir) {
     return s.readable && s.audioFiles == 0 && s.subdirs > 0;
 }
 
-// 给定曲目路径，查找其所属的真实专辑目录路径（处理单碟与多碟盒装），并可导出推断的碟号
+// 给定曲目路径，查找其所属的真实专辑目录路径（处理单碟与多碟盒装，支持三层 Season/Vol/CD 结构），并可导出推断的碟号
 inline fsx::path entity_find_album_dir_for_track(const fsx::path& trackPath, int* discOut = nullptr) {
     std::error_code ec;
     fsx::path p = trackPath.parent_path();
     if (p.empty()) return fsx::path();
-    // 1. 若父目录是盒装的碟片子目录（MyBoxSet/CD1），其真正的专辑目录是其上层盒装目录
+
+    // 1. 若最终父目录是碟片子目录（例如 CD1 / Disc 1 / Disk 2 等）
+    int dNo = 0;
+    if (entity_is_disc_subdir_name(meta_string_of(p.filename()), &dNo)) {
+        if (discOut) *discOut = dNo;
+        fsx::path albumDir = p.parent_path();
+        // 向上钻取：若父目录是中间层（Season / Vol / Volume / Part 等），继续向上找到盒装根
+        while (!albumDir.empty()) {
+            const std::string name = meta_string_of(albumDir.filename());
+            if (entity_is_intermediate_box_subdir_name(name)) {
+                const fsx::path grand = albumDir.parent_path();
+                if (!grand.empty()) {
+                    albumDir = grand;
+                    continue;
+                }
+            }
+            break;
+        }
+        return albumDir;
+    }
+
+    // 2. 既有两层盒装兼容（以防某些目录名未完全命中 entity_is_disc_subdir_name 但 entity_dir_is_disc_subdir 返回真）
     if (entity_dir_is_disc_subdir(p, discOut)) {
         return p.parent_path();
     }
-    // 2. 若父目录本身就是专辑目录（普通单碟）
+
+    // 3. 若父目录本身就是专辑目录（普通单碟）
     if (entity_dir_is_album(p)) {
         if (discOut) *discOut = 1;
         return p;
     }
+
     return fsx::path();
 }
 
@@ -1398,7 +1484,8 @@ inline EntityGraph entity_graph_from_seed(const MetaSeed& s, long long ts) {
             b.link(recordingId, entity_rel::kCredit, pid, "conductor", "tag");
         }
         if (!performer.empty()) {
-            const std::string pid = b.add(EntityKind::Person, performer, "tag");
+            const EntityKind pk = entity_artist_kind(performer);
+            const std::string pid = b.add(pk, performer, "tag");
             b.attr(pid, "role", "performer", "tag");
             b.link(recordingId, entity_rel::kCredit, pid, "performer", "tag");
         }

@@ -492,10 +492,213 @@ int main() {
            "total=" + std::to_string(br2.total) + " failed=" + std::to_string(br2.failed));
     }
 
-    fs::current_path(oldCwd, ec);
-    // 沙箱保留给失败时排查:只有全过才删
-    if (g_fail == 0) fs::remove_all(tmp, ec);
+    // ---------------- 11) 纯解析内嵌封面保护门 (FLAC / MP3 字节夹具 + 预览/真批计数一致性) ----------------
+    std::printf("-- 纯解析内嵌封面保护门 (字节夹具 + 预览/真批一致性) --\n");
+    {
+        // 1. FLAC 字节夹具测试 (合法 / 空 MIME / 长度越界)
+        auto make_flac = [](int mimeLenOverride, uint32_t dataLenOverride) {
+            std::vector<unsigned char> b = { 'f', 'L', 'a', 'C' };
+            // STREAMINFO (type 0, last=0, len=34)
+            b.push_back(0x00); b.push_back(0x00); b.push_back(0x00); b.push_back(34);
+            b.insert(b.end(), 34, 0);
 
-    std::printf("\n%s\n", g_fail == 0 ? "全部通过" : (std::to_string(g_fail) + " 项失败").c_str());
+            // PICTURE block (type 6, last=1)
+            std::vector<unsigned char> pic;
+            // pic type = 3
+            pic.push_back(0); pic.push_back(0); pic.push_back(0); pic.push_back(3);
+            if (mimeLenOverride == 0) {
+                // 空 MIME: mime_len = 0
+                pic.push_back(0); pic.push_back(0); pic.push_back(0); pic.push_back(0);
+            } else if (mimeLenOverride < 0) {
+                // 越界: mime_len = 0xFFFFFFFF
+                pic.push_back(0xFF); pic.push_back(0xFF); pic.push_back(0xFF); pic.push_back(0xFF);
+            } else {
+                // 正常: "image/jpeg" (10 字节)
+                const std::string m = "image/jpeg";
+                pic.push_back(0); pic.push_back(0); pic.push_back(0); pic.push_back((unsigned char)m.size());
+                pic.insert(pic.end(), m.begin(), m.end());
+            }
+            // desc len = 0
+            pic.push_back(0); pic.push_back(0); pic.push_back(0); pic.push_back(0);
+            // width(4), height(4), depth(4), colors(4)
+            for (int i = 0; i < 16; ++i) pic.push_back(0);
+            // data len
+            pic.push_back((unsigned char)((dataLenOverride >> 24) & 0xFF));
+            pic.push_back((unsigned char)((dataLenOverride >> 16) & 0xFF));
+            pic.push_back((unsigned char)((dataLenOverride >> 8) & 0xFF));
+            pic.push_back((unsigned char)(dataLenOverride & 0xFF));
+            // 4 字节图片数据
+            pic.push_back(0xFF); pic.push_back(0xD8); pic.push_back(0xFF); pic.push_back(0xE0);
+
+            const uint32_t picLen = (uint32_t)pic.size();
+            b.push_back(0x86); // last=1, type=6
+            b.push_back((unsigned char)((picLen >> 16) & 0xFF));
+            b.push_back((unsigned char)((picLen >> 8) & 0xFF));
+            b.push_back((unsigned char)(picLen & 0xFF));
+            b.insert(b.end(), pic.begin(), pic.end());
+            return b;
+        };
+
+        std::string reason;
+        // FLAC 正常
+        const auto fGood = make_flac(10, 4);
+        ck(!writeback_detect_picture_malformed_bytes(fGood.data(), fGood.size(), ".flac", &reason),
+           "FLAC 夹具: 正常 PICTURE 块判定为合法 (false)");
+
+        // FLAC 空 MIME
+        const auto fEmptyMime = make_flac(0, 4);
+        ck(writeback_detect_picture_malformed_bytes(fEmptyMime.data(), fEmptyMime.size(), ".flac", &reason),
+           "FLAC 夹具: 空 MIME 判定为畸形 (true)");
+        ck(reason.find("PICTURE") != std::string::npos && reason.find("空") != std::string::npos,
+           "FLAC 夹具说明写明 MIME 为空", reason);
+
+        // FLAC 长度越界
+        const auto fBadLen = make_flac(-1, 4);
+        ck(writeback_detect_picture_malformed_bytes(fBadLen.data(), fBadLen.size(), ".flac", &reason),
+           "FLAC 夹具: MIME 长度越界判定为畸形 (true)");
+        ck(reason.find("PICTURE") != std::string::npos && reason.find("越界") != std::string::npos,
+           "FLAC 夹具说明写明长度越界", reason);
+
+        // 2. MP3 字节夹具测试 (合法 / 空 MIME / 长度越界)
+        auto make_mp3 = [](int mimeMode, uint32_t frameSizeOverride) {
+            std::vector<unsigned char> fData;
+            fData.push_back(0); // enc = ISO-8859-1
+            if (mimeMode == 0) {
+                // 空 MIME: 单个 \0
+                fData.push_back(0);
+            } else {
+                const std::string m = "image/jpeg";
+                fData.insert(fData.end(), m.begin(), m.end());
+                fData.push_back(0); // null terminator
+            }
+            fData.push_back(3); // pic type = front cover
+            fData.push_back(0); // desc = \0
+            fData.push_back(0xFF); fData.push_back(0xD8); fData.push_back(0xFF); fData.push_back(0xE0); // 4 字节数据
+
+            const uint32_t fsize = (frameSizeOverride > 0) ? frameSizeOverride : (uint32_t)fData.size();
+            std::vector<unsigned char> frame = { 'A', 'P', 'I', 'C' };
+            frame.push_back((unsigned char)((fsize >> 24) & 0xFF));
+            frame.push_back((unsigned char)((fsize >> 16) & 0xFF));
+            frame.push_back((unsigned char)((fsize >> 8) & 0xFF));
+            frame.push_back((unsigned char)(fsize & 0xFF));
+            frame.push_back(0); frame.push_back(0); // flags
+            frame.insert(frame.end(), fData.begin(), fData.end());
+
+            const uint32_t tagSize = (uint32_t)frame.size();
+            std::vector<unsigned char> full = { 'I', 'D', '3', 3, 0, 0 };
+            full.push_back((unsigned char)((tagSize >> 21) & 0x7F));
+            full.push_back((unsigned char)((tagSize >> 14) & 0x7F));
+            full.push_back((unsigned char)((tagSize >> 7) & 0x7F));
+            full.push_back((unsigned char)(tagSize & 0x7F));
+            full.insert(full.end(), frame.begin(), frame.end());
+            return full;
+        };
+
+        // MP3 正常
+        const auto mGood = make_mp3(1, 0);
+        ck(!writeback_detect_picture_malformed_bytes(mGood.data(), mGood.size(), ".mp3", &reason),
+           "MP3 夹具: 正常 APIC 帧判定为合法 (false)");
+
+        // MP3 空 MIME
+        const auto mEmptyMime = make_mp3(0, 0);
+        ck(writeback_detect_picture_malformed_bytes(mEmptyMime.data(), mEmptyMime.size(), ".mp3", &reason),
+           "MP3 夹具: 空 MIME 判定为畸形 (true)");
+        ck(reason.find("PICTURE") != std::string::npos && reason.find("空") != std::string::npos,
+           "MP3 夹具说明写明 MIME 为空", reason);
+
+        // MP3 帧长越界
+        const auto mBadLen = make_mp3(1, 65536);
+        ck(writeback_detect_picture_malformed_bytes(mBadLen.data(), mBadLen.size(), ".mp3", &reason),
+           "MP3 夹具: 帧长越界判定为畸形 (true)");
+        ck(reason.find("PICTURE") != std::string::npos && reason.find("越界") != std::string::npos,
+           "MP3 夹具说明写明帧长越界", reason);
+
+        // 3. 在 %TEMP% 造 1 正常 + 1 畸形封面文件，断言【预览计数 == 真批计数】
+        const fs::path p2Box = tmp / "parity_test";
+        fs::create_directories(p2Box, ec);
+        const std::string normFile = meta_string_of(p2Box / "parity_normal.flac");
+        const std::string badPicFile = meta_string_of(p2Box / "parity_badpic.flac");
+
+        // 写出正常音频 FLAC（来自本测试生成的真实音频素材）
+        std::vector<unsigned char> baseFlac = read_bytes(flac);
+        {
+            std::ofstream f(meta_path_of(normFile), std::ios::binary | std::ios::trunc);
+            f.write((const char*)baseFlac.data(), (std::streamsize)baseFlac.size());
+        }
+        // 写出畸形封面 FLAC（在有效音频素材 STREAMINFO 之后插入畸形 PICTURE 块）
+        {
+            std::vector<unsigned char> badFlac = baseFlac;
+            std::vector<unsigned char> pic = {
+                0x00,0x00,0x00,0x03,             // picture type = front cover
+                0xFF,0xFF,0xFF,0xFF              // mime 长度字段爆掉 → 畸形
+            };
+            for (int i = 0; i < 32; ++i) pic.push_back(0x41);
+            std::vector<unsigned char> ins;
+            ins.push_back(0x06);                 // last=0, type=6(PICTURE)
+            ins.push_back((unsigned char)((pic.size() >> 16) & 0xFF));
+            ins.push_back((unsigned char)((pic.size() >> 8) & 0xFF));
+            ins.push_back((unsigned char)(pic.size() & 0xFF));
+            ins.insert(ins.end(), pic.begin(), pic.end());
+            badFlac.insert(badFlac.begin() + 4, ins.begin(), ins.end());
+
+            std::ofstream f(meta_path_of(badPicFile), std::ios::binary | std::ios::trunc);
+            f.write((const char*)badFlac.data(), (std::streamsize)badFlac.size());
+        }
+
+        // 隔离专属 MetaStore
+        MetaStore& pms = MetaStore::instance();
+        const std::string oldBase = pms.baseDir();
+        pms.setBaseDir(meta_string_of(p2Box / "meta"));
+
+        TrackMeta tmNorm;
+        tmNorm.path = normFile;
+        tmNorm.fields["title"] = { "Normal Track", "user", 1792000000, 1.0f };
+        pms.save(tmNorm);
+
+        TrackMeta tmBad;
+        tmBad.path = badPicFile;
+        tmBad.fields["title"] = { "Bad Picture Track", "user", 1792000000, 1.0f };
+        pms.save(tmBad);
+
+        // 预览扫描模拟（复刻 writeback_preview_scan 逻辑，使用纯容器头解析写回门）
+        int prevTotal = 0, prevWritable = 0, prevSkipped = 0;
+        const fs::path pTracks = meta_path_of(pms.baseDir()) / "tracks";
+        for (fs::directory_iterator it(pTracks, ec), end; !ec && it != end; it.increment(ec)) {
+            TrackMeta tm;
+            if (!writeback_load_store_record(it->path(), tm)) continue;
+            ++prevTotal;
+            const std::string ext = rta::platform::lower_extension(tm.path);
+            std::string why;
+            if (ext == ".dsf" || ext == ".dff") why = "DSD 跳过";
+            else if (!writeback_muxer(ext)) why = "不支持格式";
+            else if (writeback_collect(tm, writeback_vorbis_family(ext)).empty()) why = "无可写字段";
+            else if (writeback_detect_picture_malformed(tm.path, &why)) {
+                // 封面畸形门拦截！
+            }
+            if (why.empty()) ++prevWritable;
+            else ++prevSkipped;
+        }
+
+        ck(prevTotal == 2, "预览扫描总数 = 2", std::to_string(prevTotal));
+        ck(prevWritable == 1, "预览可写数 = 1", std::to_string(prevWritable));
+        ck(prevSkipped == 1, "预览跳过数 = 1 (畸形封面)", std::to_string(prevSkipped));
+
+        // 真批执行（dry-run 批）
+        WritebackOpts opts;
+        opts.dryRun = true;
+        std::string bErr;
+        const BatchResult br = writeback_library(opts, &bErr);
+        ck(bErr.empty(), "真批执行无硬错误", bErr);
+        ck(br.total == 2, "真批总数 = 2", std::to_string(br.total));
+        ck(br.written == 1, "真批写入数 = 1", std::to_string(br.written));
+        ck(br.skipped == 1, "真批跳过数 = 1", std::to_string(br.skipped));
+        ck(br.failed == 0, "真批失败数 = 0", std::to_string(br.failed));
+
+        // ★ 核心断言：预览可写数 == 真批计数，跳过数对齐
+        ck(prevWritable == br.written, "★ 预览可写数 == 真批计数 (1 == 1)");
+        ck(prevSkipped == br.skipped, "★ 预览跳过数 == 真批跳过数 (1 == 1)");
+
+        pms.setBaseDir(oldBase);
+    }
     return g_fail == 0 ? 0 : 1;
 }
