@@ -105,6 +105,9 @@ struct SummaryResult {
     // 2026-10-23（用户 261023-04 #14/#15）：AI 自有知识整理（没有任何权威材料可引用）。
     // UI 必须据此标注「AI 整理，未找到权威来源，仅供参考」，不能冒充有来源的综合。
     bool unverified = false;
+    // 2026-10-24（用户 261024-01 #4）：结构化标签。AI 只填"确实知道"的字段，找不到的不出现。
+    // 顺序保留（label,value），序列化成 JSON 对象供前端按 标签: 值 渲染。
+    std::vector<std::pair<std::string, std::string>> fields;
 };
 
 // ---------------------------------------------------------------------------
@@ -114,17 +117,67 @@ struct SummaryResult {
 // 契约 §3.2 初版域名白名单常量数组
 inline const std::vector<std::string>& default_domain_whitelist() {
     static const std::vector<std::string> kWhitelist = {
-        "wikipedia.org",
-        "moegirl.org.cn",
-        "musicbrainz.org",
-        "discogs.com",
-        "allmusic.com",
-        "last.fm",
-        "pitchfork.com",
-        "gramophone.co.uk",
-        "bach-cantatas.com"
+        // 百科 / 数据库
+        "wikipedia.org", "moegirl.org.cn", "musicbrainz.org", "discogs.com", "allmusic.com",
+        "rateyourmusic.com", "last.fm", "genius.com", "songfacts.com", "bangumi.tv", "bgm.tv",
+        // 乐评 / 电台
+        "pitchfork.com", "gramophone.co.uk", "bach-cantatas.com",
+        // 2026-10-24（261024-01 #1）：官方 search 返回的高质量条目大量来自流媒体平台与官方站点，
+        // 旧白名单只认百科/数据库 → 这些 hit 全被丢掉（Winged Step 就是这样变成"无材料"的）。
+        "tidal.com", "spotify.com", "music.apple.com", "deezer.com", "bandcamp.com", "soundcloud.com",
+        "y.qq.com", "qq.com", "music.163.com", "163.com", "music.amazon.com", "amazon.com",
+        // 明日方舟 / 塞壬唱片官方
+        "monster-siren.hypergryph.com", "hypergryph.com", "arknights.jp",
+        // 通用（中文媒体常见）
+        "zhihu.com", "bilibili.com", "weibo.com",
+        "kuwo.cn", "douban.com", "prts.wiki", "yopu.co", "monster-siren.hypergryph.com"
     };
     return kWhitelist;
+}
+
+// ---------------------------------------------------------------------------
+// 结构化标签 schema（2026-10-24，用户 261024-01 #4）
+// 用户要求先把「每类实体该出现的标签」定下来，再让 AI 只填它确实知道的；找不到就不显示。
+// 这里集中定义，prompt 与解析都用它排序（避免 map 按字母序把"发行时间"排到后面）。
+// ---------------------------------------------------------------------------
+inline const std::vector<std::string>& canonical_field_order() {
+    static const std::vector<std::string> k = {
+        // 歌曲
+        "发行时间", "所属专辑", "歌曲风格", "歌词赏析", "演唱", "作词", "作曲", "编曲",
+        "衍生作品", "时长", "版本",
+        // 艺术家
+        "简介", "国籍", "风格", "代表作品", "活跃年代", "厂牌", "合作",
+        // 专辑
+        "专辑编号", "艺术家", "专辑类型", "语种", "出版方", "专辑介绍", "曲目列表",
+        "制作人员", "关联"
+    };
+    return k;
+}
+
+inline int canonical_field_rank(const std::string& label) {
+    const auto& k = canonical_field_order();
+    for (size_t i = 0; i < k.size(); ++i) if (k[i] == label) return (int)i;
+    return 1000;
+}
+
+inline void sort_canonical_fields(std::vector<std::pair<std::string, std::string>>& f) {
+    std::stable_sort(f.begin(), f.end(), [](const auto& a, const auto& b) {
+        return canonical_field_rank(a.first) < canonical_field_rank(b.first);
+    });
+}
+
+// 给 prompt 用的候选字段清单（按实体类型）
+inline std::string field_schema_for_kind(const std::string& kindLabel) {
+    if (kindLabel.find("专辑") != std::string::npos) {
+        return "发行时间, 专辑编号, 艺术家, 专辑类型, 语种, 出版方, 专辑介绍, 曲目列表, 制作人员, 关联, 时长";
+    }
+    if (kindLabel.find("艺术家") != std::string::npos || kindLabel.find("歌手") != std::string::npos) {
+        return "简介, 国籍, 风格, 代表作品, 活跃年代, 厂牌, 合作";
+    }
+    if (kindLabel.find("歌曲") != std::string::npos) {
+        return "发行时间, 所属专辑, 歌曲风格, 歌词赏析, 演唱, 作词, 作曲, 编曲, 衍生作品, 时长, 版本";
+    }
+    return "简介, 发行时间, 艺术家, 专辑类型, 语种, 出版方, 风格, 代表作品";
 }
 
 // 提取 URL 中的 host（小写，去除协议、路径、端口）
@@ -239,7 +292,10 @@ inline bool parse_search_response(const std::string& text,
 // ---------------------------------------------------------------------------
 
 struct FilterOptions {
-    double min_rerank_score = 1.5;
+    // 2026-10-24（261024-01 #1）：实测官方 /v1/tools/search 对音乐实体的 rerank 分布是 0.87~1.66，
+// 旧值 1.5 会把整批高质量结果（Tidal/豆瓣/酷我/PRTS）全过滤掉 → 永远退到 AI 记忆。
+// 降到 0.8，质量闸改由 authority>=2 + 域名白名单承担。
+    double min_rerank_score = 0.8;
     int min_authority = 2;
     std::vector<std::string> whitelist; // 空则使用 default_domain_whitelist()
     size_t max_hits = 8;
@@ -337,8 +393,10 @@ inline std::vector<LlmMessage> build_synthesis_prompt(
     const std::string& entity,
     const std::vector<KnowledgeMaterial>& materials,
     const std::vector<SearchHit>& hits,
-    const std::string& lang = "zh") {
+    const std::string& lang = "zh",
+    const std::string& kindLabel = "") {
     (void)lang;
+    const std::string schema = field_schema_for_kind(kindLabel);
     std::string sys =
         "你是一个严谨的音乐资料整理与综合专家。你的任务是根据给定的权威材料与检索网页，为音乐实体编写结构化的背景介绍与艺术评价。\n\n"
         "【硬约束规则】（核心纪律，违反任何一条均判失败）：\n"
@@ -353,10 +411,15 @@ inline std::vector<LlmMessage> build_synthesis_prompt(
         "   - 引用 URL 必须原样复制自输入材料中对应的 url，严禁修改或编造 URL！\n"
         "4. 免责声明：disclaimer 固定为：\"仅依据下方来源材料综合整理；可能不完整，请以来源为准\"。\n"
         "5. 行文纪律：**不要提及「材料」「来源」「资料」「条目」「文中」等元话语**，也不要复述检索过程；"
-        "直接以陈述句写事实（例：不要写「材料列出的代表歌曲包括…」，直接写「代表歌曲包括…」）。\n\n"
+        "直接以陈述句写事实（例：不要写「材料列出的代表歌曲包括…」，直接写「代表歌曲包括…」）。\n"
+        "6. 结构化标签：JSON 还必须包含 \"fields\" 对象（键值都是字符串），用于界面上的「标签: 值」展示。"
+        "**只填材料明确支撑的字段；材料没说的键直接不要出现**（禁止写「未知」「暂无」「—」占位）。\n"
+        "   本实体可用字段（键名必须原样使用）：" + schema + "\n"
+        "   若同一信息既有标签又值得展开叙述，可以在 sections 里写叙述、fields 里放一句结论，但不要整段复制。\n\n"
         "JSON 格式模板：\n"
         "{\n"
         "  \"disclaimer\": \"仅依据下方来源材料综合整理；可能不完整，请以来源为准\",\n"
+        "  \"fields\": { \"发行时间\": \"2024-01-09\", \"专辑类型\": \"EP（数字）\" },\n"
         "  \"sections\": [\n"
         "    {\n"
         "      \"heading\": \"创作背景\",\n"
@@ -414,8 +477,8 @@ inline std::vector<LlmMessage> build_synthesis_prompt(
     const std::vector<KnowledgeMaterial>& materials,
     const std::vector<SearchHit>& hits,
     const std::string& lang = "zh") {
-    (void)kind;
-    return build_synthesis_prompt(name, materials, hits, lang);
+    const std::string kindLabel = (kind == EntityKind::Release) ? "专辑" : "艺术家";
+    return build_synthesis_prompt(name, materials, hits, lang, kindLabel);
 }
 
 // ---------------------------------------------------------------------------
@@ -636,6 +699,22 @@ inline SummaryResult parse_synthesis_reply(const std::string& text,
     }
 
     r.materials_used.assign(used_urls.begin(), used_urls.end());
+    // 2026-10-24（261024-01 #4）：结构化标签（键值都是字符串；空值/占位一律丢弃）
+    {
+        const rta::net::Json& fj = j["fields"];
+        if (fj.type == rta::net::Json::Obj) {
+            for (const auto& kv : fj.obj) {
+                const std::string k = kv.first;
+                std::string v = kv.second.s();
+                v = llm_trim(v);
+                if (k.empty() || v.empty()) continue;
+                if (v == "未知" || v == "暂无" || v == "—" || v == "-" || v == "无" || v == "N/A") continue;
+                if (v.size() > 600) continue;
+                r.fields.emplace_back(k, v);
+            }
+            sort_canonical_fields(r.fields);
+        }
+    }
     r.ok = true;
     r.validation_ok = true;
     return r;
@@ -677,7 +756,17 @@ inline std::string summary_to_json(const SummaryResult& sr) {
       << "  \"generated_at\": " << sr.generated_at << ",\n"
       << "  \"expires_at\": " << sr.expires_at << ",\n"
       << "  \"disclaimer\": \"" << meta_jesc(sr.disclaimer) << "\",\n"
+      << "  \"fields\": {";
+{
+    bool first_f = true;
+    for (const auto& kv : sr.fields) {
+        if (!first_f) o << ", ";
+        first_f = false;
+        o << "\"" << meta_jesc(kv.first) << "\": \"" << meta_jesc(kv.second) << "\"";
+    }
+    o << "},\n"
       << "  \"sections\": [\n";
+}
     for (size_t i = 0; i < sr.sections.size(); ++i) {
         const auto& sec = sr.sections[i];
         o << "    {\n"
@@ -746,6 +835,18 @@ inline bool summary_from_json(const std::string& text,
     if (j.has("from_cache")) sr_out.from_cache = j["from_cache"].b;
     if (j.has("offline")) sr_out.offline = j["offline"].b;
     if (j.has("unverified")) sr_out.unverified = j["unverified"].b;
+    // 结构化标签（旧缓存没有这个字段 → 空数组，兼容）
+    {
+        const rta::net::Json& fj = j["fields"];
+        if (fj.type == rta::net::Json::Obj) {
+            for (const auto& kv : fj.obj) {
+                const std::string v = llm_trim(kv.second.s());
+                if (kv.first.empty() || v.empty()) continue;
+                sr_out.fields.emplace_back(kv.first, v);
+            }
+            sort_canonical_fields(sr_out.fields);
+        }
+    }
 
     // citations
     const rta::net::Json& carr = j["citations"];
@@ -1023,8 +1124,10 @@ inline std::vector<LlmMessage> build_ai_only_prompt(const std::string& entityLab
         "如果没有十足把握就不要写；\n"
         "3. 不确定就写「资料有限」，不要用模糊话术凑字数；\n"
         "4. 只输出严格合法的 JSON 对象，不要 Markdown 代码块、不要任何解释文字。\n"
+        "5. 结构化标签：输出 \"fields\" 对象（键值都是字符串），只填你有把握的字段，没把握的键直接不要出现"
+        "（禁止写「未知」「暂无」「—」）。本实体可用字段（键名原样使用）：" + field_schema_for_kind(kindLabel) + "\n"
         "JSON 模板：\n"
-        "{\"sections\":[{\"heading\":\"简介\",\"paragraphs\":[{\"text\":\"……\"}]}]}\n";
+        "{\"sections\":[{\"heading\":\"简介\",\"paragraphs\":[{\"text\":\"……\"}]}],\"fields\":{\"发行时间\":\"……\"}}\n";
     std::string user = "请为" + kindLabel + "【" + entityLabel + "】写 2~3 段简介，"
                        "可用小标题（如 风格与定位 / 代表作品 / 影响与评价）。直接输出 JSON。";
     return { LlmMessage{ "system", sys }, LlmMessage{ "user", user } };
@@ -1064,6 +1167,20 @@ inline SummaryResult parse_ai_only_reply(const std::string& text) {
         if (!sec.paragraphs.empty()) r.sections.push_back(std::move(sec));
     }
     if (r.sections.empty()) { r.error = "AI 输出没有可用段落"; return r; }
+    // 结构化标签（AI 自有知识路径同样输出；空值/占位丢弃）
+    {
+        const rta::net::Json& fj = j["fields"];
+        if (fj.type == rta::net::Json::Obj) {
+            for (const auto& kv : fj.obj) {
+                const std::string v = llm_trim(kv.second.s());
+                if (kv.first.empty() || v.empty()) continue;
+                if (v == "未知" || v == "暂无" || v == "—" || v == "-" || v == "无" || v == "N/A") continue;
+                if (v.size() > 600) continue;
+                r.fields.emplace_back(kv.first, v);
+            }
+            sort_canonical_fields(r.fields);
+        }
+    }
     r.ok = true;
     r.unverified = true;
     r.validation_ok = true;
@@ -1105,6 +1222,38 @@ inline SummaryResult summary_ai_only_generate(const std::string& entityName,
 // 歌曲级简介（用户 261023-04 #7：单曲页要能单独看「歌曲」这一层）。
 // 没有专门的权威源（维基/唱片条目通常到专辑层），所以走 AI 自有知识 + 明确标注 unverified；
 // 按 artist+title 归键缓存，同一首歌只整理一次。
+// 歌曲级 prompt：允许使用 search 命中正文（歌词/制作信息），只输出 fields + 短叙述。
+// 语言要求：不引用编号（不需要 citations），但严禁编造材料外的年份/榜单/销量。
+inline std::vector<LlmMessage> build_track_prompt(const std::string& title,
+                                                  const std::string& artist,
+                                                  const std::vector<SearchHit>& hits,
+                                                  const std::string& lang) {
+    (void)lang;
+    const std::string schema = field_schema_for_kind("歌曲");
+    std::string sys =
+        "你是严谨的音乐资料编辑。请依据下方提供的检索材料，为这首歌曲整理结构化资料。\n"
+        "【纪律】\n"
+        "1. 只写材料能支撑的事实；材料没说的不要猜，也不要写「未知/暂无」。\n"
+        "2. 严禁编造可核查的精确数据（发行日期、榜单名次、销量、作者名单），除非材料明确给出。\n"
+        "3. 只输出严格 JSON 对象，不要 Markdown、不要解释。\n"
+        "4. 结构：{\"fields\":{...},\"sections\":[{\"heading\":\"简介\",\"paragraphs\":[{\"text\":\"…\"}]}]}\n"
+        "   fields 只填有把握的键，键名必须从下面清单里选：\n   " + schema + "\n"
+        "5. 叙述（sections）最多两段，简短；不要把字段内容整段复制。\n";
+    std::ostringstream u;
+    u << "歌曲：【" << title << "】";
+    if (!artist.empty()) u << "，演唱/艺术家：" << artist;
+    u << "\n\n【检索材料】\n";
+    int idx = 1;
+    for (const auto& h : hits) {
+        u << "\n[" << idx << "] " << h.title << " | " << h.url;
+        if (!h.date.empty()) u << " | " << h.date;
+        u << "\n" << (h.snippet.empty() ? h.summary : h.snippet) << "\n";
+        idx++;
+    }
+    u << "\n直接输出 JSON。";
+    return { LlmMessage{ "system", sys }, LlmMessage{ "user", u.str() } };
+}
+
 inline SummaryResult retrieval_fetch_track(const std::string& title,
                                            const std::string& artist,
                                            const std::string& lang,
@@ -1125,11 +1274,75 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
         err.error = "未配置 LLM API key（rlplayer-llm.conf）";
         return err;
     }
-    const std::string label = artist.empty() ? title : (artist + " - " + title);
-    SummaryResult sr = summary_ai_only_generate(label, "歌曲", lang, cfg);
-    if (sr.ok) summary_save_cache(baseDir, eid, lang, sr);
+
+    // 2026-10-24（261024-01 #1）：歌曲级资料也走**官方 search + fetch**，
+    // 而不是只凭模型记忆（用户对"AI 只会瞎编"的批评就来自这里）。
+    std::vector<SearchHit> hits;
+    if (opts.enable_search) {
+        std::string query;
+        if (lang == "zh" || lang.empty()) {
+            query = (artist.empty() ? title : (artist + " " + title)) + " 歌曲 作词 作曲 编曲 发行";
+        } else if (lang == "ja") {
+            query = (artist.empty() ? title : (artist + " " + title)) + " 楽曲 作詞 作曲 編曲";
+        } else {
+            query = (artist.empty() ? title : (artist + " " + title)) + " song credits release lyrics";
+        }
+        retrieval_rate_limiter().acquire();
+        const DsSearchReply s_rep = ds_search(cfg, query, opts.max_search_hits > 0 ? opts.max_search_hits : 8);
+        if (s_rep.ok) {
+            std::vector<SearchHit> raw;
+            for (const auto& dh : s_rep.hits) {
+                SearchHit sh;
+                sh.title = dh.title; sh.url = dh.url; sh.snippet = dh.snippet; sh.summary = dh.summary;
+                sh.date = dh.date; sh.rerankScore = dh.rerankScore; sh.authority = dh.authority;
+                raw.push_back(std::move(sh));
+            }
+            FilterResult fr = filter_hits(raw, opts.filter_opts);
+            hits = std::move(fr.hits);
+            const size_t fetch_count = std::min(hits.size(), (size_t)2);
+            for (size_t i = 0; i < fetch_count; ++i) {
+                retrieval_rate_limiter().acquire();
+                const DsFetchReply f_rep = ds_fetch(cfg, hits[i].url);
+                if (f_rep.ok && !f_rep.content.empty()) {
+                    hits[i].snippet = f_rep.content.substr(0, 1200);
+                    if (!f_rep.title.empty()) hits[i].title = f_rep.title;
+                }
+            }
+        }
+    }
+
+    SummaryResult sr;
+    if (!hits.empty()) {
+        std::string last_err;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            std::vector<LlmMessage> msgs = build_track_prompt(title, artist, hits, lang);
+            if (attempt > 0) {
+                msgs.push_back(LlmMessage{ "user", "上一次输出不合规（" + last_err +
+                    "）。请只输出严格 JSON：{\"fields\":{...},\"sections\":[{\"heading\":\"简介\",\"paragraphs\":[{\"text\":\"…\"}]}]}" });
+            }
+            retrieval_rate_limiter().acquire();
+            const LlmReply rep = llm_chat(cfg, msgs, 2200, 0.3f, true);
+            if (!rep.ok) { last_err = rep.error; continue; }
+            sr = parse_ai_only_reply(rep.content);
+            if (sr.ok) break;
+            last_err = sr.error;
+        }
+    }
+    if (!sr.ok) {
+        // 检索不到材料 → 退回 AI 自有知识（仍标 unverified，UI 只显示「AI 整理」）
+        sr = summary_ai_only_generate(artist.empty() ? title : (artist + " - " + title), "歌曲", lang, cfg);
+    } else {
+        sr.unverified = true;   // 检索正文未做逐段引用校验 → 仍按"AI 整理"标注
+        sr.disclaimer = "AI 整理";
+    }
+    if (sr.ok) {
+        sr.generated_at = (long long)std::time(nullptr);
+        sr.expires_at = sr.generated_at + 7 * 86400;
+        summary_save_cache(baseDir, eid, lang, sr);
+    }
     return sr;
 }
+
 
 inline SummaryResult retrieval_fetch(EntityKind kind,
                                      const std::string& name,
@@ -1246,22 +1459,28 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
 
     if (opts.enable_search) {
         std::string query;
+        // 2026-10-24（261024-01 #1）：官方 /v1/tools/search 的召回质量与 query 强相关。
+        // 实测「专辑名 + 艺术家 + EP 发行 曲目 制作」比「背景 评价」命中多得多（评价类词会把结果带偏到乐评站）。
         if (kind == EntityKind::Release) {
             std::string qTarget = !opts.artist.empty() ? (opts.artist + " " + name) : name;
+            // 艺术家串里的分隔符（"塞壬唱片-MSR / Ivoris"）会稀释 query，换成空格
+            for (char& ch : qTarget) if (ch == '/' || ch == '&' || ch == '|' || ch == '+') ch = ' ';
             if (lang == "zh" || lang.empty()) {
-                query = qTarget + " 专辑 背景 评价";
+                query = qTarget + " EP 专辑 发行时间 曲目 制作 语种 出版方";
             } else if (lang == "ja") {
-                query = qTarget + " アルバム 背景 評価";
+                query = qTarget + " EP アルバム 発売日 収録曲 制作";
             } else {
-                query = qTarget + " album background reviews";
+                query = qTarget + " EP album release date tracklist credits";
             }
         } else {
+            std::string qn = name;
+            for (char& ch : qn) if (ch == '/' || ch == '&' || ch == '|' || ch == '+') ch = ' ';
             if (lang == "zh" || lang.empty()) {
-                query = name + " 创作背景 评价 音乐";
+                query = qn + " 歌手 音乐人 简介 国籍 风格 代表作品";
             } else if (lang == "ja") {
-                query = name + " 音楽 背景 評価";
+                query = name + " アーティスト プロフィール 出身 ジャンル 代表曲";
             } else {
-                query = name + " music background reception reviews";
+                query = name + " artist musician biography genre discography";
             }
         }
 
@@ -1286,9 +1505,10 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             FilterResult fr = filter_hits(raw_hits, opts.filter_opts);
             valid_hits = std::move(fr.hits);
 
-            // Step 3: ds_fetch 取前 2~3 页正文（每实体最多 3 次 fetch）
+            // Step 3: ds_fetch 取前几页正文（每实体最多 4 次 fetch；官方 fetch 返回正文质量好，
+            // 262024-01 #1 用户要求对齐官方 search 结果质量）
             const size_t fetch_count = std::min(valid_hits.size(),
-                (size_t)std::max(1, std::min(opts.max_fetch_pages, 3)));
+                (size_t)std::max(1, std::min(opts.max_fetch_pages, 4)));
             for (size_t i = 0; i < fetch_count; ++i) {
                 SearchHit fh = valid_hits[i];
                 retrieval_rate_limiter().acquire();
@@ -1346,7 +1566,9 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     const std::string promptEntityName = (!opts.artist.empty() && kind == EntityKind::Release)
         ? (opts.artist + " - " + name)
         : name;
-    const std::vector<LlmMessage> msgs = build_synthesis_prompt(promptEntityName, kr.materials, fetched_hits, lang);
+    const std::vector<LlmMessage> msgs = build_synthesis_prompt(
+        promptEntityName, kr.materials, fetched_hits, lang,
+        (kind == EntityKind::Release) ? "专辑" : "艺术家");
     SummaryResult parsed;
     std::string last_err;
     for (int attempt = 0; attempt < 2; ++attempt) {

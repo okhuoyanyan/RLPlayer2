@@ -405,6 +405,11 @@ inline std::string llm_build_chat_body(const std::string& model,
           << "\",\"content\":\"" << llm_esc(msgs[i].content) << "\"}";
     }
     o << "],\"max_tokens\":" << maxTokens;
+    // 2026-10-24（用户 261024-01 #1）：思考强度设 LOW 以提升速度。
+    // DeepSeek 侧接受 reasoning_effort 参数（实测 200；不支持的兼容端点可能 400，
+    // 所以只在模型名含 deepseek 时追加，避免影响其它 OpenAI 兼容后端）。
+    const std::string lm = model;
+    if (lm.find("deepseek") != std::string::npos) o << ",\"reasoning_effort\":\"low\"";
     char tb[32];
     std::snprintf(tb, sizeof(tb), "%.2f", (double)temperature);   // 保留 2 位小数
     o << ",\"temperature\":" << tb;
