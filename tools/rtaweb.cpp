@@ -157,6 +157,7 @@ struct PlayParams {
 
     std::string dsdKind = "fir";     // DSD 源抽取器：fir | iir | cic
     std::string dsdConv = "narrow";  // DSD 源 Conversion 预设：narrow | wide | xfi
+    bool        dsd2Stage = true;    // DSD 源两级抽取（CIC 4x + 短 FIR），默认开启
 
     std::string remoteId;        // 远程曲目 id（Subsonic）
     std::string remoteSuffix;    // 远程文件后缀，决定缓存文件名
@@ -225,6 +226,7 @@ static void apply_dsd_src_settings(const PlayParams& p) {
             : (p.dsdKind == "cic") ? rta::dsp::IntegratorKind::Cic
                                    : rta::dsp::IntegratorKind::Fir;
     st.conversion = rta::dsp::parse_conversion(p.dsdConv);
+    st.twoStage = p.dsd2Stage;
 }
 
 // ---------------- 工具 ----------------
@@ -357,6 +359,7 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "directsdm") p.directSdm = (v == "1");
         else if (k == "dsdkind")  p.dsdKind = v;
         else if (k == "dsdconv")  p.dsdConv = v;
+        else if (k == "dsd2stage") p.dsd2Stage = (v == "1" || v == "true");
         else if (k == "loudness") p.loudness = (v == "1");
         else if (k == "buffer")   p.bufferMs = std::max(10, atoi(v.c_str()));
         else if (k == "device")   p.device = v;
@@ -4201,7 +4204,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                                            "buffer", "volume", "loudness", "isp", "twostage",
                                            "device", "bits", "taps", "atten", "transition", "phase",
                                            "modfamily", "oobgain", "ahmbits", "modcut", "moddith", "ir", "irgpu", "ramp", "theme", "eq",
-                                           "gpuvendor", "dsdnative", "directsdm", "dsdkind", "dsdconv",
+                                           "gpuvendor", "dsdnative", "directsdm", "dsdkind", "dsdconv", "dsd2stage",
                                            "backend", "naahost", "channels", "trim",
                                            "inbackend", "indev", "inoffset", "inbuf", "inmon",
                                            "inseconds", "inout",
@@ -4780,7 +4783,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             static const char* kAllow[] = {"rate", "filter", "filterNx", "shaper", "dsd", "modorder",
                                            "modfamily", "buffer", "isp", "twostage", "backend", "bits", "device",
                                            "theme", "taps", "atten", "transition", "phase", "directsdm",
-                                           "dsdkind", "dsdconv", "channels", "metaon", "metallm"};
+                                           "dsdkind", "dsdconv", "dsd2stage", "channels", "metaon", "metallm"};
             while (std::getline(f, line)) {
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 const size_t e2 = line.find('=');

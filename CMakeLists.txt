@@ -474,3 +474,9 @@ target_include_directories(test_stream_decode PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_stream_decode PRIVATE rtadsp)
 add_test(NAME stream_decode COMMAND test_stream_decode)
 
+# ---------------- DSD 两级抽取测试（ROADMAP P6c） ----------------
+add_executable(test_dsd_two_stage tests/test_dsd_two_stage.cpp)
+target_include_directories(test_dsd_two_stage PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_dsd_two_stage PRIVATE rtadsp psapi)
+add_test(NAME dsd_two_stage COMMAND test_dsd_two_stage)
+

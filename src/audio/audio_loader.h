@@ -198,6 +198,7 @@ struct LoadNote {
 struct DsdPcmSettings {
     dsp::IntegratorKind kind = dsp::IntegratorKind::Fir;
     dsp::DsdConversion  conversion = dsp::DsdConversion::Narrow;
+    bool                twoStage = true;
 };
 inline DsdPcmSettings& dsd_pcm_settings() { static DsdPcmSettings s; return s; }
 
@@ -375,7 +376,7 @@ inline AudioBuffer read_dsd_native(const std::string& path, LoadNote* note) {
     const uint32_t outRate = std::min<uint32_t>(s.rate / 16u, 705600u);
     const DsdPcmSettings st = dsd_pcm_settings();
     const dsp::IntegratorConfig cfg =
-        dsp::conversion_integrator(st.kind, st.conversion, s.rate, outRate, 120.0);
+        dsp::conversion_integrator(st.kind, st.conversion, s.rate, outRate, 120.0, st.twoStage);
     dsp::DsdDecimator dec(cfg);
     auto planes = dec.process(s);
 
@@ -394,8 +395,9 @@ inline AudioBuffer read_dsd_native(const std::string& path, LoadNote* note) {
     if (note) {
         char buf[320];
         std::snprintf(buf, sizeof(buf),
-                      "DSD 原生解码：%s %u Hz → PCM %u Hz（%s / %s 通带 %.1f kHz / 阻带 %.1f kHz）",
+                      "DSD 原生解码：%s %u Hz → PCM %u Hz（%s%s / %s 通带 %.1f kHz / 阻带 %.1f kHz）",
                       s.container.c_str(), s.rate, outRate,
+                      dec.isTwoStage() ? "两级 " : "",
                       dsp::integrator_name(cfg.kind), dsp::conversion_name(st.conversion),
                       cfg.passbandHz / 1000.0, dec.stopbandStartHz() / 1000.0);
         note->text = buf;
