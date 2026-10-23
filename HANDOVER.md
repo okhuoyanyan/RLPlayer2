@@ -1,11 +1,12 @@
 # RLPlayer 交接说明
 
-> **当前状态(2026-10-23 第二十六轮后)**:ROADMAP **P1/P2/P4/P5/P6(性能) 全部落地并合入 main**;**协作者 PR #1(CUDA 后端 + 输出链路/DPI)已选择性集成**;
-> 之前完成的 ROON/元数据 P3 资料层 ②③④、耳机 EQ(OPRA)、基建三项(WebView2 双轨/精简 ffmpeg/裁 Locales)都在 main;
-> 源码树 ctest **58/58**、本机 verify **11/11(Fail 0)**、平台边界/兼容门禁 PASS、uicheck 全过。
-> **CUDA 说明**:源码/构建脚本/UI/加载路径已就绪,`rtagpu_cuda.dll` 需 NVIDIA 机器 + CUDA 12.x 跑 `tools/build_gpu_cuda.ps1` 构建;
-> 本机(AMD)无 CUDA 工具链,包内不含该 DLL(兼容门禁标 OPTIONAL),缺失时安静回退 AMD/CPU。
-> **剩余都是外部/真机条件**:P3(NAA) 受 EULA 授权阻塞;UPnP 投放需真实渲染器;输入/资料层/CUDA 上机需真机复测。
+> **当前状态(2026-10-23 第二十七轮后)**:ROADMAP **P1/P2/P4/P5/P6 全部落地**;**协作者 PR #1(CUDA 后端 + 输出链路/DPI)已选择性集成**;
+> ROON/元数据 P3 资料层 ②③④、耳机 EQ(OPRA)、基建三项(WebView2 双轨/精简 ffmpeg/裁 Locales)都在 main;
+> 元数据 **§1.6.E 的非外部阻塞遗留项已全部收口**(E-5/E-12/E-13/E-14/E-15/E-16/E-17/E-18);
+> 源码树 ctest **60/60**、本机 verify **11/11(Fail 0)**、平台边界/兼容门禁 PASS、uicheck 全过。
+> **CUDA 说明**:源码/构建脚本/UI/加载回退就绪,`rtagpu_cuda.dll` 需 NVIDIA 机器 + CUDA 12.x 构建;本机(AMD)包内不含(OPTIONAL)。
+> **剩余都是外部/真机条件**:P3(NAA) 受 EULA 阻塞;投放需真渲染器;输入/资料层/CUDA/独占输出需真机复测。
+> **verify 必须机器空闲串行跑**——并行重型构建会让 UI 自检与个别 ctest 出假红。
 > **verify 必须在机器空闲时串行跑**——并行重型构建(出包/全量编译)会让 UI 自检与个别 ctest 出假红(已二次踩到)。
 > **1.1.1 已发布**(P6a 扫描并行 3.18× / P5b 投放 UI / L4 演绎去重 / 已知问题修复):`dist\RLPlayer-1.1.1-win64.zip`,**370.47 MB**,
 > sha256 `3B72561242E4958DC7C0D52A9FB464048E14A2DC33DEF3358E5DEF46FA97BE3C`(GitHub Release v1.1.1);

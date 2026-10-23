@@ -2,6 +2,48 @@
 
 > **接手请先读**：[HANDOVER.md](HANDOVER.md)（架构/构建/已知坑）→ [ROADMAP.md](ROADMAP.md)（待开发与判据）。
 > 本文件按回合记录“做过什么、实测多少”，越往下越旧。
+# 第二十七轮:元数据方向未解决项批量收口（E-5/E-12/E-13/E-14/E-15/E-16/E-17/E-18）(2026-10-23)
+
+> 无人值守续跑：把 docs/元数据补全调研与规划.md §1.6.E 里**所有非外部阻塞**的遗留项一次收完。
+> 结果：8 个遗留项全部关闭；ctest 58 → **60 套**；多碟盒装聚合第一次真正进了入库路径（用户可见）。
+
+## 1. 实体模型三项（E-13/E-12/E-14，1598197/23f237c/b3d6d22 → 49707cf）
+
+- **E-13 目录结构判据接进真实批量入口**：新增 `entity_is_disc_subdir_name`（CD1..CDn/Disc/Disk，大小写与连字符容错）、`entity_dir_is_boxset`、`entity_find_album_dir_for_track`、
+  `entity_batch_from_paths/from_tracks`、`EntityBuilder::merge`；`Library::albumVecLocked()` 与 `entity_graph_from_library` 接入。
+  **测试**：%TEMP% 造 5 张专辑（含 1 个 CD1/CD2/Scans 盒装、9 首音频）走真实批量入口 → 严格 **5 个 Release 实体**、盒装 `entity_release_disc_count == 2`、自动挂社团边、落盘后 store 仍 5 条；MUSIC 653 首只读核对 100% 定位到有效专辑目录。
+- **E-12 启发式误判校准**：`entity_artist_kind` 单字「社/団/团」改为**必须作后缀**（且长度>单字）才判 Group，加负例词表（社会/社交/社区/团结/团子…）；
+  `entity_looks_label` 排除「唱片机/唱片店」；强特征多字词表前置（保证「团结交响乐团」仍判 Group）。**测试**：20 条正反例全过；既有用户缓存 5 条实体判定前后一致（**无需迁移、未改用户数据**）。
+- **E-14 year 统一**：抽 `src/meta/year.h`（零依赖），`entity_year4` 与 `pv_year4` 同源；provider.h 删重复实现，新增 test_year 覆盖 1000/2100 边界与脏值。
+
+## 2. 数据口径与熔断（E-16/E-18，4ddc85f/5552a60 → d8c8acb）
+
+- **E-16 DSD 时长改用 header 口径**：`probe_media` 对 .dsf/.dff 优先用 `probe_dsd` 解析 header（DSF: sampleCount÷FS；DFF: dataSize÷ch×8÷FS），失败再回退 ffprobe；`dsd_reader.h` 增 `seconds()` 与宽字符打开。
+  **篡改对照**：DSF 样本数 2822400→7056000（数据体不变）→ probe_media 2.500 s，ffprobe 恒 1.0101 s；DFF 同理 2.000 vs 1.000；DSD64/128/256 各 1 秒误差 0.000 ms；坏头优雅降级 duration=0。
+- **E-18 dizzylab 熔断可注入测试**：provider.h 加**测试专用** transport/时钟钩子（默认为 nullptr，生产行为不变）。**用例**：1/2 次失败不冷却；第 3 次失败进入 120 s 冷却且期间 0 次请求；冷却满恢复；成功重置计数；钩子还原。
+
+## 3. 检索质量三项（E-17/E-5/E-15，256ad71/d2ff890/01ba858 → 8174c0d）
+
+- **E-17 dizzylab 关键词扩展**：`ProviderDesc.searchQuery`/`ProviderQuery` 支持 album/circle/dirName，enrich 从目录名「专辑 @ 社团」提取；阶梯 = 目录名 → 专辑+社团 → artist+title → 后缀放宽(末2/末1)，命中即短路。
+  **真网 opt-in**：§1.5 的 6 首拒采曲命中 **4/6**（#10/#17 站内确无条目），与调研结论吻合。
+- **E-5 genre 增加 Discogs styles 来源**：`format_discogs_genre`（styles 优先、genres 兜底）+ `discogs_lookup_genre`；`meta_source_rank` 加 discogs(50)；enrich 保持 iTunes 优先，仅当 genre 仍空时 backfill；**user(100)/tag(90) 不被覆盖**。
+- **E-15 古典 COMPOSER→Work 四层端到端**：%TEMP% 用 ffmpeg 合成贝多芬第五（两乐章，带 COMPOSER/WORK/CONDUCTOR/PERFORMER）与《晴天》（无 COMPOSER），走 Enrich→Store→`entity_batch_from_paths`；
+  32 项断言：Composer=Person(role=composer)、Work--credit--Person、Work--has_recording--Recording（两乐章聚合）、Recording 关联指挥/演奏者、Recording--released_as--Release、Release--has_track--Track、Track--track_of--Recording；
+  流行走 Artist--release_artist--Release 跳过 Work；全图 **1 Work / 2 Release / 3 Track**，无空壳 Work。
+
+## 4. 门禁与交付
+
+- main 合并后：build 0 error、ctest **60/60**、平台边界 PASS(exit 0)、本机 verify **11/11(Fail 0)**（串行、机器空闲）；
+- **1.3.1 正式包**：`dist\\RLPlayer-1.3.1-win64.zip` = **388,801,447 字节(370.79 MB)**，sha256 `2D4612195605576D251D04CFBC623CE51E65BF52E1322A3663C1956BC0ECBEA9`；
+  包内 `/api/ping` = `1.3.1`、`/api/gpu` = `amd:true,cuda:false,available:true`；17 个 CLI 与 OPRA 资产齐全；审计无非预期文件。
+
+## 5. ⚠️ 本轮保留的未解决项（铁律 4）
+
+1. 多碟盒装只支持**两层**识别（`BoxSet/CD1`）；三层以上（`BoxSet/Season1/Disc1`）需扩展下钻；
+2. 「单个大 WAV + 独立 CUE」的整轨碟片依赖后续 CUE 拆轨；
+3. 古典乐团若写在 `PERFORMER` 而非 `ENSEMBLE/ORCHESTRA`，当前按 Person 角色化（未按 Philharmonic/Orchestra 词表提升为 Group）；
+4. dizzylab 6 首中 #10/#17 站内确无条目（数据源缺失，非解析漏失）；Discogs 匿名限频 25 req/min 触发 429 时熔断 60 s。
+
 # 第二十六轮:合并协作者 PR #1——NVIDIA CUDA 后端 + 输出链路三坑/DPI 修复(2026-10-23)
 
 > 用户指令:协作者(garaxc)凌晨在 GitHub 提交了 NVIDIA CUDA 兼容,**合并进主项目,完成后发包**。
@@ -51,7 +93,8 @@
 - 包内 **17 个 tools** 齐全,新增 `wasapi_ex_probe.exe` / `gpubench_conv.exe`;data/opra_index.json + OPRA-NOTICE.txt 在包内;
 - **`rtagpu_cuda.dll` 未入包(预期)**:本机无 NVIDIA 显卡/CUDA 12.x 工具链;兼容门禁标 OPTIONAL;需在 NVIDIA 机器跑 `tools/build_gpu_cuda.ps1` 后另行验证/分发;
 - 审计:Locales 2 pak、ffmpeg/ffprobe 12.18/11.97MB、无 conf/log/profile/sk-、测试残留已清;
-- CI 两个 workflow 对 4cb471b(集成提交)全绿;GitHub Release **v1.3.0** 已建(附件 digest 与本地一致);PR #1 已按「选择性集成」关闭并注明集成 commit。
+- CI 两个 workflow 对 4cb471b(集成提交)与 78f5716(文档)全绿;GitHub Release **v1.3.0** 已建(附件 digest 与本地一致);
+- PR #1 被 GitHub 自动标记 **MERGED**(我们的集成 merge commit 含原提交 c3de461),已评论致谢并说明「选择性集成 + 采纳/拒绝清单 + CUDA DLL 需 NVIDIA 机器构建」。
 
 
 # 第二十五轮:P6a 库扫描并行化 / P5b 投放 UI / L4 演绎去重 / 已知问题清理(2026-10-23)
