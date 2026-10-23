@@ -26,6 +26,7 @@
 #include <vector>
 #include <map>
 #include <thread>
+#include <chrono>
 #include <atomic>
 #include <mutex>
 #include <memory>
@@ -134,15 +135,53 @@ inline bool http_get(const std::string& host, int port, const std::string& path,
 } // namespace upnp_detail
 
 // 发一次 SSDP M-SEARCH，收集 MediaRenderer。timeoutMs 建议 1500~2500。
-inline std::vector<UpnpDevice> upnp_discover(int timeoutMs = 1800) {
+//
+// 2026-10-23（用户 261023-04 #11「UPnP 搜不到我的设备，现在应该还开着」）：
+//   旧实现只在"默认路由"上发一次组播。本机装了 Clash Verge TUN（198.18.0.0/15 fake-IP）后，
+//   默认路由指向 TUN 虚拟网卡，组播包进了隧道 → 局域网设备永远收不到 M-SEARCH（这正是我们复现到的
+//   /api/upnp → n=0）。修法：枚举所有本机 IPv4，逐个网卡设置 IP_MULTICAST_IF 并发送 2 次，
+//   再一起收响应；同时给出诊断信息（找到几个网卡、哪些被跳过），供 UI 如实显示。
+struct UpnpDiscoverDiag {
+    int ifaces_tried = 0;
+    int msgs_sent = 0;
+    std::string note;
+};
+
+inline std::vector<std::string> upnp_local_ipv4(std::vector<std::string>* skipped = nullptr) {
+    std::vector<std::string> out;
+    char host[256] = {0};
+    if (::gethostname(host, sizeof(host)) != 0) return out;
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    if (::getaddrinfo(host, nullptr, &hints, &res) != 0) return out;
+    for (addrinfo* p = res; p; p = p->ai_next) {
+        if (!p->ai_addr) continue;
+        char ip[64] = {0};
+        sockaddr_in* sa = (sockaddr_in*)p->ai_addr;
+        if (::inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip)) == nullptr) continue;
+        const std::string s(ip);
+        if (s.rfind("127.", 0) == 0 || s.rfind("169.254.", 0) == 0) continue;
+        // Clash/Mihomo TUN 的 fake-IP 段与常见虚拟网卡段：组播从这里出去没有意义，跳过但记录下来
+        const bool virtual_like = (s.rfind("198.18.", 0) == 0 || s.rfind("198.19.", 0) == 0);
+        if (virtual_like) { if (skipped) skipped->push_back(s + "(代理 TUN)"); continue; }
+        if (std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
+    }
+    ::freeaddrinfo(res);
+    return out;
+}
+
+inline std::vector<UpnpDevice> upnp_discover(int timeoutMs = 1800, UpnpDiscoverDiag* diag = nullptr) {
     using namespace upnp_detail;
     std::vector<UpnpDevice> out;
 
     WSADATA w;
     if (WSAStartup(MAKEWORD(2, 2), &w) != 0) return out;
 
-    SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s == INVALID_SOCKET) { WSACleanup(); return out; }
+    std::vector<std::string> skipped;
+    std::vector<std::string> ips = upnp_local_ipv4(&skipped);
+    if (ips.empty()) ips.push_back("0.0.0.0");   // 拿不到网卡时退回系统默认路由（老行为）
 
     const char* msg =
         "M-SEARCH * HTTP/1.1\r\n"
@@ -150,64 +189,97 @@ inline std::vector<UpnpDevice> upnp_discover(int timeoutMs = 1800) {
         "MAN: \"ssdp:discover\"\r\n"
         "MX: 2\r\n"
         "ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n";
+
     sockaddr_in to{};
     to.sin_family = AF_INET;
     to.sin_port = htons(1900);
     to.sin_addr.s_addr = ::inet_addr("239.255.255.250");
-    ::sendto(s, msg, (int)std::strlen(msg), 0, (sockaddr*)&to, sizeof(to));
+
+    std::vector<SOCKET> socks;
+    for (const auto& ip : ips) {
+        SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s == INVALID_SOCKET) continue;
+        in_addr ifaddr{};
+        ifaddr.s_addr = ::inet_addr(ip.c_str());
+        if (ip != "0.0.0.0") {
+            sockaddr_in local{};
+            local.sin_family = AF_INET;
+            local.sin_port = htons(0);
+            local.sin_addr = ifaddr;
+            // bind 失败也继续（退回任意地址绑定），但组播出口仍按该网卡设置
+            (void)::bind(s, (sockaddr*)&local, sizeof(local));
+            ::setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, (const char*)&ifaddr, sizeof(ifaddr));
+        }
+        for (int rep = 0; rep < 2; ++rep) {
+            ::sendto(s, msg, (int)std::strlen(msg), 0, (sockaddr*)&to, sizeof(to));
+            if (diag) diag->msgs_sent++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        }
+        socks.push_back(s);
+        if (diag) diag->ifaces_tried++;
+    }
+    if (diag && !skipped.empty()) {
+        std::string sk;
+        for (size_t i = 0; i < skipped.size(); ++i) { if (i) sk += ", "; sk += skipped[i]; }
+        diag->note = "已跳过虚拟/代理网卡: " + sk;
+    }
 
     const ULONGLONG t0 = GetTickCount64();
-    while (GetTickCount64() - t0 < (ULONGLONG)timeoutMs) {
+    std::vector<std::string> seen_locations;
+    while (GetTickCount64() - t0 < (ULONGLONG)timeoutMs && !socks.empty()) {
         fd_set rf;
         FD_ZERO(&rf);
-        FD_SET(s, &rf);
+        for (SOCKET s : socks) FD_SET(s, &rf);
         timeval tv{0, 150000};
         const int rc = ::select(0, &rf, nullptr, nullptr, &tv);
         if (rc <= 0) continue;
-        char buf[4096];
-        sockaddr_in from{};
-        int fl = sizeof(from);
-        const int n = ::recvfrom(s, buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
-        if (n <= 0) continue;
-        const std::string resp(buf, (size_t)n);
-        std::string loc = header_of(resp, "LOCATION");
-        if (loc.empty()) continue;
+        for (size_t si = 0; si < socks.size(); ++si) {
+            if (!FD_ISSET(socks[si], &rf)) continue;
+            char buf[4096];
+            sockaddr_in from{};
+            int fl = sizeof(from);
+            const int n = ::recvfrom(socks[si], buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
+            if (n <= 0) continue;
+            const std::string resp(buf, (size_t)n);
+            std::string loc = header_of(resp, "LOCATION");
+            if (loc.empty()) continue;
 
-        const std::string lowerLoc = lower(loc);
-        if (lowerLoc.rfind("http://", 0) != 0) continue;
-        const size_t hs = 7;
-        const size_t slash = loc.find('/', hs);
-        const std::string hostport = loc.substr(hs, (slash == std::string::npos ? loc.size() : slash) - hs);
-        const std::string path = (slash == std::string::npos) ? "/" : loc.substr(slash);
-        std::string host = hostport;
-        int port = 80;
-        const size_t colon = hostport.find(':');
-        if (colon != std::string::npos) {
-            host = hostport.substr(0, colon);
-            port = atoi(hostport.c_str() + colon + 1);
+            const std::string lowerLoc = lower(loc);
+            if (lowerLoc.rfind("http://", 0) != 0) continue;
+            const size_t hs = 7;
+            const size_t slash = loc.find('/', hs);
+            const std::string hostport = loc.substr(hs, (slash == std::string::npos ? loc.size() : slash) - hs);
+            const std::string path = (slash == std::string::npos) ? "/" : loc.substr(slash);
+            std::string host = hostport;
+            int port = 80;
+            const size_t colon = hostport.find(':');
+            if (colon != std::string::npos) {
+                host = hostport.substr(0, colon);
+                port = atoi(hostport.c_str() + colon + 1);
+            }
+
+            bool dup = false;
+            for (auto& d : out) if (d.location == loc) { dup = true; break; }
+            if (dup) continue;
+
+            UpnpDevice dev;
+            dev.location = loc;
+            dev.host = host;
+            dev.port = port;
+            std::string xml;
+            if (http_get(host, port, path, xml)) {
+                dev.name    = xml_tag(xml, "friendlyName");
+                dev.model   = xml_tag(xml, "modelName");
+                dev.udn     = xml_tag(xml, "UDN");
+                dev.control = extract_service_control_url(xml, "AVTransport");
+                if (dev.control.empty()) dev.control = xml_tag(xml, "controlURL");
+                dev.controlConnection = extract_service_control_url(xml, "ConnectionManager");
+            }
+            if (dev.name.empty()) dev.name = host;
+            out.push_back(dev);
         }
-
-        bool dup = false;
-        for (auto& d : out) if (d.location == loc) { dup = true; break; }
-        if (dup) continue;
-
-        UpnpDevice dev;
-        dev.location = loc;
-        dev.host = host;
-        dev.port = port;
-        std::string xml;
-        if (http_get(host, port, path, xml)) {
-            dev.name    = xml_tag(xml, "friendlyName");
-            dev.model   = xml_tag(xml, "modelName");
-            dev.udn     = xml_tag(xml, "UDN");
-            dev.control = extract_service_control_url(xml, "AVTransport");
-            if (dev.control.empty()) dev.control = xml_tag(xml, "controlURL");
-            dev.controlConnection = extract_service_control_url(xml, "ConnectionManager");
-        }
-        if (dev.name.empty()) dev.name = host;
-        out.push_back(dev);
     }
-    ::closesocket(s);
+    for (SOCKET s : socks) ::closesocket(s);
     WSACleanup();
     return out;
 }

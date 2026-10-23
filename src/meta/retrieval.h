@@ -102,6 +102,9 @@ struct SummaryResult {
     bool from_cache = false;
     bool offline = false;
     bool validation_ok = false;
+    // 2026-10-23（用户 261023-04 #14/#15）：AI 自有知识整理（没有任何权威材料可引用）。
+    // UI 必须据此标注「AI 整理，未找到权威来源，仅供参考」，不能冒充有来源的综合。
+    bool unverified = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -715,7 +718,8 @@ inline std::string summary_to_json(const SummaryResult& sr) {
     }
     o << "],\n"
       << "  \"from_cache\": " << (sr.from_cache ? "true" : "false") << ",\n"
-      << "  \"offline\": " << (sr.offline ? "true" : "false") << "\n"
+      << "  \"offline\": " << (sr.offline ? "true" : "false") << ",\n"
+      << "  \"unverified\": " << (sr.unverified ? "true" : "false") << "\n"
       << "}\n";
     return o.str();
 }
@@ -741,6 +745,7 @@ inline bool summary_from_json(const std::string& text,
     sr_out.disclaimer = j["disclaimer"].s();
     if (j.has("from_cache")) sr_out.from_cache = j["from_cache"].b;
     if (j.has("offline")) sr_out.offline = j["offline"].b;
+    if (j.has("unverified")) sr_out.unverified = j["unverified"].b;
 
     // citations
     const rta::net::Json& carr = j["citations"];
@@ -992,6 +997,140 @@ struct RetrievalOptions {
     std::string entity_id;        // 显式指定实体 ID（为空则自动计算）
 };
 
+// ---------------------------------------------------------------------------
+// AI 自有知识整理（无权威材料时的兜底；2026-10-23 用户 261023-04 #14/#15）
+//
+// 背景：用户实测「塞壬唱片」等实体维基没有条目 → 旧逻辑直接回「未找到权威材料，拒绝综合」，
+// 页面上什么都不显示。用户原话「AI 呢？不会自己搜么？一定要维基百科？那要 AI 干嘛？」
+//
+// 折中方案（不放弃防幻觉纪律）：
+//   * 只在 L2 权威材料与 L3 检索正文都为 0 时才启用；
+//   * 结果标记 unverified=true，disclaimer 明确写「AI 整理（未找到权威来源，仅供参考）」，
+//     UI 必须把这条标注显示出来，不许冒充带来源的综合；
+//   * prompt 里禁止编造可核查的精确数据（日期/销量/榜单名次/成员名单），不确定就写「资料有限」；
+//   * 结果同样写 summary 缓存（7 天），所以第二次打开不再调用 LLM。
+// ---------------------------------------------------------------------------
+
+inline std::vector<LlmMessage> build_ai_only_prompt(const std::string& entityLabel,
+                                                    const std::string& kindLabel,
+                                                    const std::string& lang) {
+    (void)lang;
+    std::string sys =
+        "你是严谨的音乐资料编辑。当前没有任何可引用的权威材料，请仅凭你已有的知识为实体写一段简短介绍。\n"
+        "【纪律】\n"
+        "1. 只写你有把握的共性信息（风格类型、大致活动年代、代表作品方向、行业位置）；\n"
+        "2. 严禁编造可核查的精确数据：具体发行日期、销量数字、榜单名次、成员真实姓名、获奖年份等，"
+        "如果没有十足把握就不要写；\n"
+        "3. 不确定就写「资料有限」，不要用模糊话术凑字数；\n"
+        "4. 只输出严格合法的 JSON 对象，不要 Markdown 代码块、不要任何解释文字。\n"
+        "JSON 模板：\n"
+        "{\"sections\":[{\"heading\":\"简介\",\"paragraphs\":[{\"text\":\"……\"}]}]}\n";
+    std::string user = "请为" + kindLabel + "【" + entityLabel + "】写 2~3 段简介，"
+                       "可用小标题（如 风格与定位 / 代表作品 / 影响与评价）。直接输出 JSON。";
+    return { LlmMessage{ "system", sys }, LlmMessage{ "user", user } };
+}
+
+// 宽松解析：只要求 sections/paragraphs 结构，不要求 citations（因为没有材料可引）。
+inline SummaryResult parse_ai_only_reply(const std::string& text) {
+    SummaryResult r;
+    std::string t = text;
+    // 容忍围栏式代码块包裹
+    const size_t fence = t.find("\x60\x60\x60");
+    if (fence != std::string::npos) {
+        const size_t s = t.find('\n', fence);
+        const size_t e = t.rfind("\x60\x60\x60");
+        if (s != std::string::npos && e != std::string::npos && e > s) t = t.substr(s + 1, e - s - 1);
+    }
+    const rta::net::Json j = rta::net::json_parse(t);
+    if (j.type != rta::net::Json::Obj) { r.error = "AI 输出不是 JSON 对象"; return r; }
+    const rta::net::Json& sarr = j["sections"];
+    if (sarr.type != rta::net::Json::Arr || sarr.size() == 0) { r.error = "AI 输出缺少 sections"; return r; }
+    for (size_t i = 0; i < sarr.size(); ++i) {
+        const auto& sitem = sarr.at(i);
+        if (sitem.type != rta::net::Json::Obj) continue;
+        SummarySection sec;
+        sec.heading = sitem["heading"].s();
+        if (sec.heading.empty()) sec.heading = "简介";
+        const rta::net::Json& parr = sitem["paragraphs"];
+        if (parr.type == rta::net::Json::Arr) {
+            for (size_t k = 0; k < parr.size(); ++k) {
+                const auto& p = parr.at(k);
+                if (p.type != rta::net::Json::Obj) continue;
+                SummaryParagraph para;
+                para.text = p["text"].s();
+                if (!para.text.empty()) sec.paragraphs.push_back(std::move(para));
+            }
+        }
+        if (!sec.paragraphs.empty()) r.sections.push_back(std::move(sec));
+    }
+    if (r.sections.empty()) { r.error = "AI 输出没有可用段落"; return r; }
+    r.ok = true;
+    r.unverified = true;
+    r.validation_ok = true;
+    r.disclaimer = "AI 整理（未找到权威来源，仅供参考）";
+    return r;
+}
+
+inline SummaryResult summary_ai_only_generate(const std::string& entityName,
+                                              const std::string& kindLabel,
+                                              const std::string& lang,
+                                              const LlmConfig& cfg) {
+    const std::vector<LlmMessage> base_msgs = build_ai_only_prompt(entityName, kindLabel, lang);
+    SummaryResult parsed;
+    std::string last_err;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        std::vector<LlmMessage> msgs = base_msgs;
+        if (attempt > 0) {
+            msgs.push_back(LlmMessage{ "user",
+                "上一次输出不合规（" + last_err + "）。请只输出严格 JSON：" +
+                "{\"sections\":[{\"heading\":\"简介\",\"paragraphs\":[{\"text\":\"……\"}]}]}，不要任何其它文字。" });
+        }
+        retrieval_rate_limiter().acquire();
+        const LlmReply rep = llm_chat(cfg, msgs, 2000, 0.3f, true);
+        if (!rep.ok) { last_err = rep.error; continue; }
+        parsed = parse_ai_only_reply(rep.content);
+        if (parsed.ok) break;
+        last_err = parsed.error;
+    }
+    if (parsed.ok) {
+        parsed.model = cfg.model;
+        parsed.generated_at = (long long)std::time(nullptr);
+        parsed.expires_at = parsed.generated_at + 7 * 86400;
+        parsed.from_cache = false;
+        parsed.offline = false;
+    }
+    return parsed;
+}
+
+// 歌曲级简介（用户 261023-04 #7：单曲页要能单独看「歌曲」这一层）。
+// 没有专门的权威源（维基/唱片条目通常到专辑层），所以走 AI 自有知识 + 明确标注 unverified；
+// 按 artist+title 归键缓存，同一首歌只整理一次。
+inline SummaryResult retrieval_fetch_track(const std::string& title,
+                                           const std::string& artist,
+                                           const std::string& lang,
+                                           const RetrievalOptions& opts) {
+    const std::string baseDir = !opts.metabase.empty() ? opts.metabase : EntityStore::instance().baseDir();
+    const std::string eid = entity_make_id("track", entity_norm(artist) + "\x1f" + entity_norm(title));
+    SummaryResult cached;
+    if (summary_load_cache(baseDir, eid, lang, cached) && cached.ok && !opts.refresh &&
+        !summary_is_expired(cached)) {
+        cached.from_cache = true;
+        return cached;
+    }
+    LlmConfig cfg = opts.llm_cfg;
+    if (cfg.apiKey.empty()) cfg = llm_config_load();
+    if (cfg.apiKey.empty()) {
+        if (cached.ok) { cached.from_cache = true; cached.offline = true; return cached; }
+        SummaryResult err;
+        err.error = "未配置 LLM API key（rlplayer-llm.conf）";
+        return err;
+    }
+    const std::string label = artist.empty() ? title : (artist + " - " + title);
+    SummaryResult sr = summary_ai_only_generate(label, "歌曲", lang, cfg);
+    if (sr.ok) summary_save_cache(baseDir, eid, lang, sr);
+    return sr;
+}
+
 inline SummaryResult retrieval_fetch(EntityKind kind,
                                      const std::string& name,
                                      const std::string& lang = "zh",
@@ -1171,7 +1310,11 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         if (!h.url.empty()) allowed_urls.push_back(h.url);
     }
 
-    // 若 L2 和 L3 均无材料，拒绝综合（铁律：防无依据幻觉）
+    // 若 L2 和 L3 均无材料：
+    //   旧逻辑直接拒绝综合 → 用户实测「塞壬唱片」这类没有维基条目的实体，页面永远空白
+    //   （261023-04 #14/#15：「一定要维基百科？那要 AI 干嘛？」）。
+    //   现改为：有旧缓存先用缓存；否则若配了 key，退到 AI 自有知识整理（unverified=true，UI 必须标注），
+    //   结果写缓存 7 天，第二次打开不再调用。有材料时仍走严格引用路径，不受影响。
     if (kr.materials.empty() && fetched_hits.empty()) {
         if (have_cache && cached.ok) {
             cached.from_cache = true;
@@ -1179,9 +1322,18 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             cached.error = "未检索到任何权威材料，已回退至本地缓存";
             return cached;
         }
+        if (!cfg.apiKey.empty()) {
+            const std::string label = !opts.artist.empty() ? (opts.artist + " - " + name) : name;
+            const std::string kind_label = (kind == EntityKind::Release) ? "专辑" : "艺术家";
+            SummaryResult ai_res = summary_ai_only_generate(label, kind_label, lang, cfg);
+            if (ai_res.ok) {
+                summary_save_cache(baseDir, eid, lang, ai_res);
+                return ai_res;
+            }
+        }
         SummaryResult err_res;
         err_res.ok = false;
-        err_res.error = "未找到任何相关权威材料，拒绝综合以防幻觉";
+        err_res.error = "未找到任何相关权威材料，AI 整理也未成功（防幻觉兜底）";
         return err_res;
     }
 

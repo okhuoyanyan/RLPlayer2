@@ -360,7 +360,12 @@ function renderSummaryContent(summary, title) {
     h += '</div>';
   }
   // 说明行：不写「AI 生成」这类字眼（用户 261023-03 #2），也不回显旧缓存里的旧措辞
-  h += '<div style="font-size:11px;color:var(--mut2);margin-top:8px">依据上面的来源整理，可能不完整，请以来源为准</div>';
+  // 261023-04 #14/#15：没有任何权威材料时走 AI 自有知识整理，必须如实标注（不许冒充带来源的综合）
+  if (summary.unverified) {
+    h += '<div style="font-size:11px;color:#d8a24a;margin-top:8px">AI 整理（未找到权威来源，仅供参考）</div>';
+  } else {
+    h += '<div style="font-size:11px;color:var(--mut2);margin-top:8px">依据上面的来源整理，可能不完整，请以来源为准</div>';
+  }
   return h;
 }
 
@@ -634,15 +639,40 @@ function renderArtistProfile(who, j, summary) {
 
   h += '<div class=artist-body style="padding:0 22px 30px">';
 
+  // 延伸简介（AI 资料）HTML 先算好：有权威词条时排在「风格」之后、无条目时紧跟提示卡（261023-04 #14）
+  var summHtml = '';
+  if (META.summary == 1) {
+    var sumObj = (summary && summary.enabled && summary.done) ? summary.res : null;
+    var hasSummary = sumObj && sumObj.ok && sumObj.sections && sumObj.sections.length > 0;
+    var sumLoading = (META.hasLlmKey === true && !hasSummary);
+    summHtml = '<div class="sec-card summary-sec" id="artistSummary" style="margin-bottom:24px' + (sumLoading ? '' : ';display:none') + '">';
+    if (hasSummary) {
+      summHtml += renderSummaryContent(sumObj, '延伸简介');
+    } else if (sumLoading) {
+      summHtml += '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>';
+    }
+    summHtml += '</div>';
+  }
+
   if (!isOk) {
-    // 空态卡：没资料/网络失败 → 内置空态（.card + 说明 + 「重试」按钮，--phbg 风格）
-    var errMsg = (j && j.errors && j.errors[0] && j.errors[0].error) || (j && j.error) || '未在维基百科或萌娘百科匹配到权威词条，或当前网络不可达。';
-    h += '<div class="card empty-card" style="padding:36px 20px;text-align:center;background:var(--phbg);border:1px solid var(--line);border-radius:12px;margin-top:14px">' +
-         '<div style="font-size:15px;font-weight:600;margin-bottom:8px;color:var(--txt)">暂无权威资料或网络连接失败</div>' +
-         '<div style="color:var(--mut);font-size:12.5px;margin-bottom:18px;max-width:520px;margin-left:auto;margin-right:auto;line-height:1.6">' +
-         esc(errMsg) + '</div>' +
-         '<button class="btn pri" id=bRetryKnowledge>重试获取</button>' +
-         '</div>';
+    // 2026-10-23（用户 261023-04 #14）：夏壬唱片这类维基没有条目的实体，旧版在这里拍一张大空态卡，
+    // 而下面其实还有 AI 整理简介 → 用户看到"暂无权威资料"就以为功能坏了。
+    // 现在：开了「在线整理」时只留一行低调说明（AI 简介会在下面自动出现）；没开才保留空态卡+重试。
+    if (META.summary == 1) {
+      h += '<div class="card" style="padding:14px 18px;background:var(--phbg);border:1px solid var(--line);border-radius:10px;margin-top:14px">' +
+           '<div style="font-size:13px;font-weight:600;margin-bottom:4px;color:var(--txt)">权威词条暂缺</div>' +
+           '<div style="color:var(--mut);font-size:12px;line-height:1.6">维基百科 / 萌娘百科没有匹配条目。下方会用 AI 依据通识整理一段简介（标注「AI 整理」，仅供参考）；也可点上方「刷新资料」重试权威来源。</div>' +
+           '</div>';
+      h += summHtml;
+    } else {
+      var errMsg = (j && j.errors && j.errors[0] && j.errors[0].error) || (j && j.error) || '未在维基百科或萌娘百科匹配到权威词条，或当前网络不可达。';
+      h += '<div class="card empty-card" style="padding:36px 20px;text-align:center;background:var(--phbg);border:1px solid var(--line);border-radius:12px;margin-top:14px">' +
+           '<div style="font-size:15px;font-weight:600;margin-bottom:8px;color:var(--txt)">暂无权威资料或网络连接失败</div>' +
+           '<div style="color:var(--mut);font-size:12.5px;margin-bottom:18px;max-width:520px;margin-left:auto;margin-right:auto;line-height:1.6">' +
+           esc(errMsg) + '</div>' +
+           '<button class="btn pri" id=bRetryKnowledge>重试获取</button>' +
+           '</div>';
+    }
   } else {
     // 1) 简介（L2 原文，长文折叠「展开」）
     var bioMat = null;
@@ -678,20 +708,8 @@ function renderArtistProfile(who, j, summary) {
       h += '</div></div>';
     }
 
-    // 3) 延伸简介：设置开启时自动整理并展示（低调加载行；无 key 且无缓存时先隐藏，
-    //    等接口回来再决定显示内容还是整块丢弃 —— 绝不先闪一个空白板块）
-    if (META.summary == 1) {
-      var sumObj = (summary && summary.enabled && summary.done) ? summary.res : null;
-      var hasSummary = sumObj && sumObj.ok && sumObj.sections && sumObj.sections.length > 0;
-      var sumLoading = (META.hasLlmKey === true && !hasSummary);
-      h += '<div class="sec-card summary-sec" id="artistSummary" style="margin-bottom:24px' + (sumLoading ? '' : ';display:none') + '">';
-      if (hasSummary) {
-        h += renderSummaryContent(sumObj, '延伸简介');
-      } else if (sumLoading) {
-        h += '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>';
-      }
-      h += '</div>';
-    }
+    // 3) 延伸简介（AI 资料）
+    h += summHtml;
 
     // 4) 来源：来源徽章、标题、取回日期、「复制链接」芯片（绝不 window.open / <a target=_blank>）
     h += '<div class="sec-card sources-sec" style="margin-bottom:24px">' +

@@ -394,6 +394,47 @@ inline bool knowledge_load_cache(const std::string& baseDir,
 }
 
 // ---------------------------------------------------------------------------
+// 失败负缓存（2026-10-23，用户 261023-04 #14）
+//
+// 用户实测：打开艺术家「塞壬唱片」每次都提示「暂无权威资料或网络连接失败 wikipedia: 未找到匹配候选条目」，
+// 而且每次打开都要等一次网络往返 —— 因为旧实现只缓存**成功**，失败不缓存，于是每次都重打 2~3 次维基。
+// 这里落一个 knowledge.miss.json 标记，默认 6 小时内直接返回"近期未找到"，不再联网；成功后清除。
+// ---------------------------------------------------------------------------
+
+inline fsx::path knowledge_miss_path(const std::string& baseDir, const std::string& entity_id) {
+    const std::string b = baseDir.empty() ? EntityStore::instance().baseDir() : baseDir;
+    return meta_path_of(b) / "entities" / entity_id / "knowledge.miss.json";
+}
+
+inline bool knowledge_recent_miss(const std::string& baseDir, const std::string& entity_id,
+                                  long long ttl_sec, long long* at_out = nullptr) {
+    if (entity_id.empty() || ttl_sec <= 0) return false;
+    std::string text;
+    if (!entity_read_file(knowledge_miss_path(baseDir, entity_id), text)) return false;
+    const rta::net::Json j = rta::net::json_parse(text);
+    if (j.type != rta::net::Json::Obj) return false;
+    const long long at = (long long)j["at"].n();
+    if (at <= 0) return false;
+    if (at_out) *at_out = at;
+    return ((long long)std::time(nullptr) - at) < ttl_sec;
+}
+
+inline void knowledge_mark_miss(const std::string& baseDir, const std::string& entity_id,
+                                const std::string& subject, const std::string& error) {
+    if (entity_id.empty()) return;
+    std::ostringstream o;
+    o << "{\"entity_id\":\"" << meta_jesc(entity_id) << "\",\"subject\":\"" << meta_jesc(subject)
+      << "\",\"at\":" << (long long)std::time(nullptr) << ",\"error\":\"" << meta_jesc(error) << "\"}\n";
+    entity_write_atomic(knowledge_miss_path(baseDir, entity_id), o.str());
+}
+
+inline void knowledge_clear_miss(const std::string& baseDir, const std::string& entity_id) {
+    if (entity_id.empty()) return;
+    std::error_code ec;
+    fsx::remove(knowledge_miss_path(baseDir, entity_id), ec);
+}
+
+// ---------------------------------------------------------------------------
 // 限频（令牌桶/最小间隔）与熔断控制器
 // ---------------------------------------------------------------------------
 
@@ -788,8 +829,19 @@ inline KnowledgeResult knowledge_get(const std::string& entity_id,
     const long long now_sec = (long long)std::time(nullptr);
     const bool has_unexpired = cache_valid && knowledge_has_unexpired(cached_materials, now_sec);
 
+    // 0) 失败负缓存（6 小时）：上一次已经确认「没有权威材料」→ 直接返回，不再联网
+    //    （用户 261023-04 #14：每次打开艺术家页都重打维基，既慢又什么都出不来）
+    long long miss_at = 0;
+    if (!opts.refresh && knowledge_recent_miss(baseDir, entity_id, 6 * 3600, &miss_at)) {
+        res.from_cache = true;
+        res.offline = false;
+        res.error = "近期未找到权威材料（6 小时内不再重试；可在资料页点「刷新资料」强制重试）";
+        return res;
+    }
+
     // 1) 命中未过期缓存且未要求 refresh -> 直接返回缓存
     if (!opts.refresh && has_unexpired) {
+        knowledge_clear_miss(baseDir, entity_id);
         res.materials = cached_materials;
         res.from_cache = true;
         res.offline = false;
@@ -823,6 +875,7 @@ inline KnowledgeResult knowledge_get(const std::string& entity_id,
 
     // 3) 处理网络拉取成功结果
     if (!fresh_materials.empty()) {
+        knowledge_clear_miss(baseDir, entity_id);
         std::vector<KnowledgeMaterial> merged = cached_materials;
         knowledge_merge_materials(merged, fresh_materials);
         knowledge_save_cache(baseDir, entity_id, subject, merged);
@@ -859,6 +912,8 @@ inline KnowledgeResult knowledge_get(const std::string& entity_id,
     } else {
         res.error = "未找到任何相关权威材料";
     }
+    // 落失败标记：下一次（6 小时内）不再联网重试
+    if (!opts.refresh) knowledge_mark_miss(baseDir, entity_id, subject, res.error);
     return res;
 }
 

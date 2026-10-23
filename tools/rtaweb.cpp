@@ -11,6 +11,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <functional>              // 简介后台任务用 std::function 包装（2026-10-23 261023-04）
 #include "net/webui.h"
 #include "net/ui_page.h"
 #include "net/ui_script.h"
@@ -2991,19 +2992,21 @@ struct SummaryJob {
 static std::mutex g_summ_mu;
 static std::map<std::string, SummaryJob> g_summ_jobs;
 
-static void summary_job_start(const std::string& key, rta::meta::EntityKind ek, const std::string& name,
-                              const std::string& lang, const std::string& kindStr,
-                              const rta::meta::RetrievalOptions& ropts) {
-    std::thread([key, ek, name, lang, kindStr, ropts]() {
-        const rta::meta::SummaryResult sr = rta::meta::retrieval_fetch(ek, name, lang, ropts);
+// 通用后台任务：work 里跑检索/综合，完成后把 JSON 放进 job 表，由前端轮询取走。
+static void summary_job_start_fn(const std::string& key, const std::string& kindStr,
+                                 const std::string& label,
+                                 std::function<rta::meta::SummaryResult()> work) {
+    std::thread([key, kindStr, label, work]() {
+        const rta::meta::SummaryResult sr = work();
         std::string body;
         if (!sr.ok) {
-            play_log("SUMMARY failed kind=" + kindStr + " name=" + name + " err=" + sr.error);
+            play_log("SUMMARY failed kind=" + kindStr + " name=" + label + " err=" + sr.error);
             body = "{\"ok\":false,\"error\":\"" + jesc(sr.error.empty() ? "资料整理失败" : sr.error) +
                    "\",\"summaryKind\":\"" + jesc(kindStr) + "\",\"summaryCached\":false}";
         } else {
-            play_log("SUMMARY generated kind=" + kindStr + " name=" + name + " eid=" + key +
-                     " fromCache=" + std::string(sr.from_cache ? "1" : "0"));
+            play_log("SUMMARY generated kind=" + kindStr + " name=" + label + " eid=" + key +
+                     " fromCache=" + std::string(sr.from_cache ? "1" : "0") +
+                     " unverified=" + std::string(sr.unverified ? "1" : "0"));
             body = summary_json_with_flags(sr, kindStr, sr.from_cache);
         }
         std::lock_guard<std::mutex> lk(g_summ_mu);
@@ -3014,6 +3017,14 @@ static void summary_job_start(const std::string& key, rta::meta::EntityKind ek, 
         job.body = body;
         job.finished_at = (long long)std::time(nullptr);
     }).detach();
+}
+
+static void summary_job_start(const std::string& key, rta::meta::EntityKind ek, const std::string& name,
+                              const std::string& lang, const std::string& kindStr,
+                              const rta::meta::RetrievalOptions& ropts) {
+    summary_job_start_fn(key, kindStr, name, [ek, name, lang, ropts]() {
+        return rta::meta::retrieval_fetch(ek, name, lang, ropts);
+    });
 }
 
 static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
@@ -4076,6 +4087,58 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         if (name.empty()) {
             return "{\"ok\":false,\"error\":\"未指定实体名称\"}";
         }
+        // ---- 歌曲级简介（261023-04 #7）：没有任何权威源可引，走 AI 自有知识 + unverified 标注，
+        //      按 artist+title 归键缓存；同样把这个耗时操作放后台线程，前端轮询。 ----
+        if (kindStr == "track" || kindStr == "song") {
+            const std::string eidTrack = rta::meta::entity_make_id(
+                "track", rta::meta::entity_norm(artist) + "\x1f" + rta::meta::entity_norm(name));
+            const MetaSettings msT = meta_settings_load();
+            if (!msT.summary) {
+                return "{\"ok\":false,\"error\":\"未开启在线资料整理\",\"summaryEnabled\":false,"
+                       "\"summaryKind\":\"track\",\"summaryCached\":false}";
+            }
+            const std::string metabaseT = path_in_exe_dir("rlplayer-meta");
+            if (!refresh) {
+                rta::meta::SummaryResult cached;
+                std::string cErr;
+                if (rta::meta::summary_load_cache(metabaseT, eidTrack, lang, cached, &cErr) && cached.ok &&
+                    !rta::meta::summary_is_expired(cached)) {
+                    cached.from_cache = true;
+                    return summary_json_with_flags(cached, "track", true);
+                }
+            }
+            rta::meta::RetrievalOptions ropts;
+            ropts.metabase = metabaseT;
+            ropts.refresh = refresh;
+            ropts.llm_cfg = rta::meta::llm_config_load(llm_conf_path());
+            const std::string jobKey = eidTrack + "|" + lang;
+            {
+                std::lock_guard<std::mutex> lk(g_summ_mu);
+                const long long now = (long long)std::time(nullptr);
+                for (auto it = g_summ_jobs.begin(); it != g_summ_jobs.end();) {
+                    if (it->second.done && it->second.finished_at > 0 && now - it->second.finished_at > 600)
+                        it = g_summ_jobs.erase(it);
+                    else ++it;
+                }
+                auto it = g_summ_jobs.find(jobKey);
+                if (it != g_summ_jobs.end() && it->second.done) {
+                    std::string body = it->second.body;
+                    g_summ_jobs.erase(it);
+                    return body;
+                }
+                if (it == g_summ_jobs.end() || !it->second.running) {
+                    SummaryJob job;
+                    job.running = true;
+                    job.started_at = now;
+                    g_summ_jobs[jobKey] = job;
+                    play_log("SUMMARY generate(async) kind=track name=" + name);
+                    summary_job_start_fn(jobKey, "track", name, [name, artist, lang, ropts]() {
+                        return rta::meta::retrieval_fetch_track(name, artist, lang, ropts);
+                    });
+                }
+            }
+            return "{\"ok\":false,\"pending\":true,\"error\":\"正在整理资料\",\"summaryKind\":\"track\",\"summaryCached\":false}";
+        }
         if (kindStr == "album") kindStr = "release";
         rta::meta::EntityKind ek = rta::meta::EntityKind::Person;
         if (!rta::meta::entity_kind_from_tag(kindStr, ek)) {
@@ -4401,17 +4464,28 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
 
     if (rq.path.rfind("/api/upnp", 0) == 0) {
         ct = "application/json; charset=utf-8";
-        const auto devs = rta::net::upnp_discover(1800);
+        // 2026-10-23（用户 261023-04 #11）：多网卡逐卡发 M-SEARCH + 诊断信息，
+        // 并且在 JSON 里把"为什么没搜到"如实说出来（组播被代理/防火墙/AP 隔离拦截是最常见原因）。
+        rta::net::UpnpDiscoverDiag diag;
+        const auto devs = rta::net::upnp_discover(2200, &diag);
         std::ostringstream j;
         j << "{\"ok\":true,\"n\":" << devs.size() << ",\"devices\":[";
         for (size_t i = 0; i < devs.size(); ++i) {
             if (i) j << ",";
             j << "{\"name\":\"" << jesc(devs[i].name) << "\""
               << ",\"model\":\"" << jesc(devs[i].model) << "\""
-              << ",\"host\":\"" << jesc(devs[i].host) << "\":\"" << devs[i].port << "\""
+              << ",\"host\":\"" << jesc(devs[i].host) << "\""
+              << ",\"port\":" << devs[i].port
               << ",\"loc\":\"" << jesc(devs[i].location) << "\"}";
         }
-        j << "]}";
+        j << "],\"diag\":{\"ifaces\":" << diag.ifaces_tried
+          << ",\"sent\":" << diag.msgs_sent
+          << ",\"note\":\"" << jesc(diag.note) << "\"}";
+        if (devs.empty()) {
+            j << ",\"hint\":\"未发现 UPnP 渲染器：SSDP 组播可能被代理(VPN/TUN)/防火墙/路由器 AP 隔离拦截。"
+                 "可关闭代理后重试，或直接填设备地址（http://IP:端口/）直连。\"";
+        }
+        j << "}";
         return j.str();
     }
 
