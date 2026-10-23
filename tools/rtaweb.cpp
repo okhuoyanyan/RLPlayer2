@@ -2772,6 +2772,8 @@ static std::string llm_status_json() {
       << ",\"baseUrl\":\"" << jesc(c.baseUrl) << "\""
       << ",\"path\":\"" << jesc(llm_conf_path()) << "\""
       << ",\"proxy\":" << (llm_conf_proxy_line().empty() ? "false" : "true")
+      << ",\"monthlyCap\":" << c.monthlyCap
+      << ",\"currentUsage\":" << rta::meta::llm_get_monthly_count(rta::meta::llm_current_month(), c.usagePath)
       << "}";
     return j.str();
 }
@@ -4091,7 +4093,8 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         const bool hasKey   = (f.count("key") != 0) && !f["key"].empty();
         const bool hasModel = (f.count("model") != 0) && !f["model"].empty();
         const bool hasBase  = (f.count("base_url") != 0) && !f["base_url"].empty();
-        if (!clear && !hasKey && !hasModel && !hasBase)
+        const bool hasCap   = (f.count("llmmonthlycap") != 0) || (f.count("monthly_cap") != 0);
+        if (!clear && !hasKey && !hasModel && !hasBase && !hasCap)
             return "{\"ok\":false,\"error\":\"没有可保存的字段\"}";
         if (hasKey && !llm_value_ok(f["key"], 512))
             return "{\"ok\":false,\"error\":\"API Key 格式不对（不允许空格/控制字符，最长 512）\"}";
@@ -4107,6 +4110,11 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         else if (hasKey)   { c.apiKey = f["key"]; note("key"); }
         if (hasModel)      { c.model = f["model"]; note("model"); }
         if (hasBase)       { c.baseUrl = rta::meta::llm_base_url(f["base_url"]); note("baseUrl"); }
+        if (hasCap) {
+            std::string capStr = f.count("llmmonthlycap") ? f["llmmonthlycap"] : f["monthly_cap"];
+            c.monthlyCap = atoi(capStr.c_str());
+            note("monthlyCap");
+        }
         if (!rta::meta::llm_config_save_merge(c, llm_conf_path()))
             return "{\"ok\":false,\"error\":\"写入 rlplayer-llm.conf 失败（文件被占用？）\"}";
         // 日志只记「改了哪些字段 + 掩码」，绝不记值：launcher/playback 日志会进诊断包。
@@ -4263,7 +4271,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                                            // 元数据补全(P1.5):总开关与 LLM 固定两键;
                                            // 源开关 metasrc_<id> 按注册表动态放行(见下);
                                            // P3④b AI 综合开关 metasummary (默认0)
-                                           "metaon", "metallm", "metasummary", "scanthreads", "scanThreads" })
+                                           "metaon", "metallm", "metasummary", "llmmonthlycap", "scanthreads", "scanThreads" })
                     if (k == allow) okKey = true;
                 if (!okKey && k.rfind("metasrc_", 0) == 0) {
                     const std::string id = k.substr(8);
@@ -4313,6 +4321,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         injectKv("metaon", "1");
         injectKv("metallm", "1");
         injectKv("metasummary", "0");
+        injectKv("llmmonthlycap", "0");
         injectKv("streamdecode", "1");
         for (const rta::meta::ProviderDesc& pd : rta::meta::provider_registry()) {
             const std::string nk = std::string("metasrc_") + pd.id;

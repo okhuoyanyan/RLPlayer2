@@ -313,6 +313,138 @@ int main() {
         ck(guarded.find("sk-demo-42") == std::string::npos, "错误文本经 redact 后不含 key", guarded);
     }
 
+    // ---------------- 6) E-8: DeepSeek 月度调用上限与超限降级（离线 mock transport） ----------------
+    std::printf("-- E-8: 月度调用上限与超限降级（mock transport 离线测试）--\n");
+    {
+        int httpCalls = 0;
+        std::string lastReqUrl;
+        std::string lastReqBody;
+        int nextStatus = 200;
+        std::string nextResponseBody;
+
+        auto mockTransport = [&](const std::string& url, const std::string& body, const std::vector<std::string>& headers) -> rta::net::HttpResponse {
+            httpCalls++;
+            lastReqUrl = url;
+            lastReqBody = body;
+            rta::net::HttpResponse resp;
+            resp.status = nextStatus;
+            if (nextStatus != 200) {
+                resp.error = "Mock HTTP Error";
+            }
+            resp.body.assign(nextResponseBody.begin(), nextResponseBody.end());
+            return resp;
+        };
+
+        const std::string testUsagePath = (tmp / "test-usage.json").string();
+
+        LlmConfig cfg;
+        cfg.apiKey = "sk-mock-key-secret-123456789";
+        cfg.baseUrl = "https://api.deepseek.mock";
+        cfg.model = "deepseek-flash";
+        cfg.monthlyCap = 2; // 上限 2 次
+        cfg.usagePath = testUsagePath;
+        cfg.monthOverride = "202610";
+        cfg.transport = mockTransport;
+
+        // 6.1 cap=2 时调用 1 与调用 2 成功，调用 3 不发请求直接拦截
+        nextStatus = 200;
+        nextResponseBody = "{\"choices\":[{\"message\":{\"content\":\"OK 1\"}}]}";
+        const LlmReply r1 = llm_chat(cfg, {{"user", "q1"}});
+        ck(r1.ok && r1.content == "OK 1", "第 1 次 chat 成功");
+        ck(httpCalls == 1, "第 1 次 chat 真实发起 HTTP (httpCalls=1)");
+        ck(llm_get_monthly_count("202610", testUsagePath) == 1, "202610 计数为 1");
+
+        nextResponseBody = "{\"results\":[{\"title\":\"res1\",\"url\":\"https://example.com/1\"}]}";
+        const DsSearchReply r2 = ds_search(cfg, "query2");
+        ck(r2.ok && r2.hits.size() == 1, "第 2 次 search 成功");
+        ck(httpCalls == 2, "第 2 次 search 真实发起 HTTP (httpCalls=2)");
+        ck(llm_get_monthly_count("202610", testUsagePath) == 2, "202610 计数为 2");
+
+        // 第 3 次调用 (fetch)：已达 cap=2，必须不发请求且返回明确错误
+        nextResponseBody = "{\"title\":\"t\",\"content\":\"c\"}";
+        const DsFetchReply r3 = ds_fetch(cfg, "https://example.com/3");
+        ck(!r3.ok, "第 3 次 fetch 超限被拦截（ok=false）");
+        ck(r3.error.find("本月 AI 调用已达上限") != std::string::npos,
+           "超限返回明确错误「本月 AI 调用已达上限」", r3.error);
+        ck(httpCalls == 2, "★ 关键断言：超限调用不发起 HTTP 请求 (httpCalls 仍为 2)",
+           std::to_string(httpCalls));
+        ck(llm_get_monthly_count("202610", testUsagePath) == 2, "计数未被超限调用污染 (仍为 2)");
+
+        // chat 同样被超限拦截
+        const LlmReply r3_chat = llm_chat(cfg, {{"user", "q3"}});
+        ck(!r3_chat.ok && r3_chat.error.find("本月 AI 调用已达上限") != std::string::npos,
+           "超限后 chat 同样被拦截", r3_chat.error);
+        ck(httpCalls == 2, "chat 被拦截不发 HTTP (httpCalls 仍为 2)");
+
+        // 6.2 换月后恢复（202611 分桶从 0 开始，自动清零恢复）
+        cfg.monthOverride = "202611";
+        nextResponseBody = "{\"title\":\"Doc Nov\",\"content\":\"Nov Content\"}";
+        const DsFetchReply r4 = ds_fetch(cfg, "https://example.com/nov");
+        ck(r4.ok && r4.title == "Doc Nov", "换月到 202611 后自动恢复可用");
+        ck(httpCalls == 3, "换月后调用发起 HTTP 请求 (httpCalls 增加到 3)");
+        ck(llm_get_monthly_count("202611", testUsagePath) == 1, "202611 计数为 1");
+        ck(llm_get_monthly_count("202610", testUsagePath) == 2, "旧月份 202610 计数保持 2 不变（分桶独立）");
+
+        // 6.3 cap=0 不受限（默认行为）
+        cfg.monthlyCap = 0; // 不限
+        cfg.monthOverride = "202610"; // 哪怕在已经有 2 次调用的 202610 月份
+        nextResponseBody = "{\"choices\":[{\"message\":{\"content\":\"Unlimited 1\"}}]}";
+        const LlmReply r5 = llm_chat(cfg, {{"user", "q5"}});
+        ck(r5.ok && r5.content == "Unlimited 1", "cap=0 不受限，在旧月份依然可调用");
+        ck(httpCalls == 4, "cap=0 正常发起 HTTP (httpCalls=4)");
+        ck(llm_get_monthly_count("202610", testUsagePath) == 3, "cap=0 依然正确累加用量统计 (3)");
+
+        // 6.4 计费口径：失败/空响应不计（按实际成功计）
+        cfg.monthlyCap = 5;
+        const int countBeforeFail = llm_get_monthly_count("202610", testUsagePath);
+        // a) HTTP 500 服务端报错
+        nextStatus = 500;
+        nextResponseBody = "{\"error\":{\"message\":\"Internal Server Error\"}}";
+        const LlmReply rFail1 = llm_chat(cfg, {{"user", "fail1"}});
+        ck(!rFail1.ok, "HTTP 500 返回失败");
+        ck(llm_get_monthly_count("202610", testUsagePath) == countBeforeFail,
+           "口径验证：HTTP 500 失败调用不计入月度配额",
+           std::to_string(llm_get_monthly_count("202610", testUsagePath)));
+
+        // b) 网络断开 (status=0)
+        nextStatus = 0;
+        nextResponseBody = "";
+        const DsSearchReply rFail2 = ds_search(cfg, "netfail");
+        ck(!rFail2.ok, "网络错误 status=0 返回失败");
+        ck(llm_get_monthly_count("202610", testUsagePath) == countBeforeFail,
+           "口径验证：网络失败调用不计入月度配额");
+
+        // c) 非法/空响应
+        nextStatus = 200;
+        nextResponseBody = "invalid json";
+        const DsFetchReply rFail3 = ds_fetch(cfg, "https://example.com/badjson");
+        ck(!rFail3.ok, "非法响应解析失败");
+        ck(llm_get_monthly_count("202610", testUsagePath) == countBeforeFail,
+           "口径验证：非法/空响应不计入月度配额");
+
+        // 6.5 持久化与安全性：检查用量 JSON 文件结构，断言无 key 泄露
+        ck(fs::exists(testUsagePath), "用量文件 test-usage.json 存在");
+        std::string usageContent;
+        {
+            std::ifstream uf(testUsagePath, std::ios::binary);
+            usageContent.assign((std::istreambuf_iterator<char>(uf)), std::istreambuf_iterator<char>());
+        }
+        ck(usageContent.find("202610") != std::string::npos && usageContent.find("202611") != std::string::npos,
+           "用量文件包含 202610 与 202611 分桶");
+        ck(usageContent.find("total") != std::string::npos && usageContent.find("chat") != std::string::npos,
+           "用量文件包含 total, chat, search, fetch 字段");
+        ck(usageContent.find("sk-mock-key") == std::string::npos,
+           "★ 红线断言：用量持久化文件中绝无 API Key 泄露");
+
+        // 6.6 配置项往返：llmmonthlycap
+        LlmConfig capCfg;
+        capCfg.monthlyCap = 500;
+        capCfg.apiKey = "sk-cap-save-test";
+        ck(llm_config_save_merge(capCfg, "cap_test.conf"), "save_merge 带 llmmonthlycap");
+        LlmConfig loadedCap = llm_config_load("cap_test.conf");
+        ck(loadedCap.monthlyCap == 500, "load 读回 llmmonthlycap=500", std::to_string(loadedCap.monthlyCap));
+    }
+
     fs::current_path(oldCwd, ec);
     fs::remove_all(tmp, ec);
 
