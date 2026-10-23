@@ -487,6 +487,10 @@ int main() {
             ck(reg[0].search != nullptr && reg[1].search != nullptr &&
                reg[2].search != nullptr && reg[3].search != nullptr,
                "canSearch 源 search 指针非空");
+            ck(reg[0].searchQuery != nullptr, "dizzylab searchQuery 非空(E-17 支持扩展上下文)");
+            ck(reg[1].searchQuery == nullptr && reg[2].searchQuery == nullptr &&
+               reg[3].searchQuery == nullptr && reg[4].searchQuery == nullptr,
+               "其它源 searchQuery 为空(默认忽略新参数)");
             ck(reg[4].search == nullptr, "lrclib 无 search(canSearch=false → 空)");
             ck(reg[0].lyric == nullptr, "dizzylab 无 lyric(canLyric=false → 空)");
             ck(reg[1].lyric != nullptr && reg[2].lyric != nullptr && reg[4].lyric != nullptr,

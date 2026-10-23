@@ -235,8 +235,13 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
     // 行为（本机实测 1e10 → -4），负秒会让 match 静默退回中性分而缺陷无声。
     const int fileSec = rta::audio::media_duration_sec(mi.duration);
     const std::string parentName = meta_string_of(meta_path_of(file).parent_path().filename());
-    if (parentName.find(" @ ") != std::string::npos)
-        notes.push_back("父目录「" + parentName + "」(同人盘形态,未参与查询)");
+    std::string dirAlbum, dirCircle;
+    if (parentName.find(" @ ") != std::string::npos) {
+        const size_t at = parentName.find(" @ ");
+        dirAlbum = parentName.substr(0, at);
+        dirCircle = parentName.substr(at + 3);
+        notes.push_back("父目录「" + parentName + "」(同人盘形态,参与扩展查询)");
+    }
 
     // ---- 3) 查询侧 ParsedName:标签优先 → 文件名规则 → LLM 兜底 ----
     const std::string stem = meta_string_of(meta_path_of(file).stem());
@@ -270,17 +275,32 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
     }
 
     // ---- 4) 搜索(遍历注册表,canSearch 且启用的源逐个调;调用间 ≥300ms;错误记 note 继续) ----
-    // 注册表顺序 = 搜索优先级(qq → netease → itunes),与 P1 固定顺序一致。
+    // 注册表顺序 = 搜索优先级(dizzylab → qq → netease → itunes)。
+    // E-17 扩展：构造 ProviderQuery 传递 album/circle/dirName 供 dizzylab 优先命中，
+    // 其它源无 searchQuery 指针，继续沿用 query（默认忽略新参数）。
+    ProviderQuery pq;
+    pq.query   = query;
+    pq.title   = p.title;
+    pq.artist  = p.artist;
+    pq.album   = !mi.album.empty() ? mi.album : dirAlbum;
+    pq.circle  = dirCircle;
+    pq.dirName = parentName;
+
     std::vector<Candidate> cands;
     std::vector<std::string> srcErrs;
     bool firstCall = true;
     for (const ProviderDesc& pd : provider_registry()) {
-        if (!pd.canSearch || !pd.search) continue;
+        if (!pd.canSearch) continue;
         if (!opts.enabled(pd.id)) continue;
         if (!firstCall) std::this_thread::sleep_for(std::chrono::milliseconds(300));
         firstCall = false;
         std::string err;
-        std::vector<Candidate> got = pd.search(query, err);
+        std::vector<Candidate> got;
+        if (pd.searchQuery) {
+            got = pd.searchQuery(pq, err);
+        } else if (pd.search) {
+            got = pd.search(pq.query, err);
+        }
         if (!err.empty()) srcErrs.push_back(std::string(pd.id) + ": " + err);
         for (Candidate& c : got) cands.push_back(std::move(c));
     }
