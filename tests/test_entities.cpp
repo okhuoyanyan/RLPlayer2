@@ -697,6 +697,38 @@ int main() {
     }
 
     // =====================================================================
+    // [9b] entity_artist_kind 与 entity_looks_label 启发式校准（E-12：单字社/団/团门槛与负例保护）
+    // =====================================================================
+    std::printf("[9b] 启发式校准（E-12：正例保留 + 负例「社会科学」「团结」等不误判）\n");
+    {
+        // 1. 现有正例保持正确
+        ck(entity_looks_label("塞壬唱片") == true, "正例：塞壬唱片 是 Label");
+        ck(entity_looks_label("塞壬唱片-MSR") == true, "正例：塞壬唱片-MSR 是 Label");
+        ck(entity_looks_label("Sony Records") == true, "正例：Sony Records 是 Label");
+        ck(entity_artist_kind("月華社") == EntityKind::Group, "正例：月華社 是 Group（后缀社）");
+        ck(entity_artist_kind("月華社 (Circle)") == EntityKind::Group, "正例：月華社 (Circle) 是 Group");
+        ck(entity_artist_kind("上海アリス幻樂団") == EntityKind::Group, "正例：上海アリス幻樂団 是 Group（樂団）");
+        ck(entity_artist_kind("Czech National Symphony Orchestra") == EntityKind::Group, "正例：Symphony Orchestra 是 Group");
+        ck(entity_artist_kind("早见沙织应援团") == EntityKind::Group, "正例：应援团 是 Group");
+        ck(entity_artist_kind("团结交响乐团") == EntityKind::Group, "正例：团结交响乐团 是 Group（强特征词覆盖负例前缀）");
+
+        // 2. 负例保护（不误判为 Group，退化为 Person，保证宁可拆开也不错并）
+        ck(entity_artist_kind("社会科学") == EntityKind::Person, "负例：社会科学 不误判为 Group（Person）");
+        ck(entity_artist_kind("团结") == EntityKind::Person, "负例：团结 不误判为 Group（Person）");
+        ck(entity_artist_kind("团子") == EntityKind::Person, "负例：团子 不误判为 Group（Person）");
+        ck(entity_artist_kind("社长") == EntityKind::Person, "负例：社长 不误判为 Group（Person）");
+        ck(entity_artist_kind("社交达人") == EntityKind::Person, "负例：社交达人 不误判为 Group（Person）");
+        ck(entity_artist_kind("社区工作者") == EntityKind::Person, "负例：社区工作者 不误判为 Group（Person）");
+        ck(entity_artist_kind("团") == EntityKind::Person, "单字「团」不误判为 Group（需>=2字）");
+        ck(entity_artist_kind("社") == EntityKind::Person, "单字「社」不误判为 Group（需>=2字）");
+
+        // 3. entity_looks_label 负例保护
+        ck(entity_looks_label("唱片机") == false, "负例：唱片机 不是 Label");
+        ck(entity_looks_label("唱片店") == false, "负例：唱片店 不是 Label");
+        ck(entity_looks_label("黑胶唱片机") == false, "负例：黑胶唱片机 不是 Label");
+    }
+
+    // =====================================================================
     // [10] entity_year4：4 位年份清洗（纯函数；Release 判等键的正解）
     // =====================================================================
     // 判据凭什么成立：这一组不只看"改对了的几个"，还专门钉住

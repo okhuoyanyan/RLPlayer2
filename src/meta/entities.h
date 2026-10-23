@@ -778,11 +778,14 @@ inline std::string entity_parse_movement(const std::string& text) {
 
 // 厂牌判定：名含「唱片」或以 Records / Record 结尾（大小写不敏感）。
 // 依据：本库真实样本「塞壬唱片-MSR」（MUSIC\专辑-感动我的&RainLain\2021，ffprobe ARTIST）。
-// ⚠️ 已知风险（铁律 4）：这是启发式 —— 把「合辑/发行品牌」都当厂牌可能误判（例如
-// 「某某社」不是厂牌）。误判只影响 facet 视图，用户手改可覆盖；不当作已验证事实。
+// E-12 校准：加入负例保护（器具、配件、店铺等非厂牌名词不判为 Label）。
 inline bool entity_looks_label(const std::string& raw) {
     const std::string n = entity_norm(raw);
     if (n.empty()) return false;
+    static const char* kLabelNeg[] = { "唱片机", "唱片店", "唱片套", "唱片架", "唱片盒", "唱片垫", "黑胶唱片机" };
+    for (const char* neg : kLabelNeg) {
+        if (n.find(neg) != std::string::npos) return false;
+    }
     if (n.find("唱片") != std::string::npos) return true;
     if (n.size() >= 7 && n.compare(n.size() - 7, 7, "records") == 0) return true;
     if (n.size() >= 6 && n.compare(n.size() - 6, 6, "record") == 0) return true;
@@ -796,24 +799,67 @@ inline bool entity_label_also_series(const std::string& raw) {
     return entity_looks_label(raw);
 }
 
+// 辅助：检查 n 中是否以 suffix 作为后缀或带有修饰符后缀（如 "月華社" / "月華社 (Circle)"）
+inline bool entity_detail_has_cjk_suffix(const std::string& n, const char* suffix) {
+    const size_t slen = std::strlen(suffix);
+    if (n.size() <= slen) return false; // 单字本身不当团体（人名/单字handle，如单字“团”“社”）
+    if (n.compare(n.size() - slen, slen, suffix) == 0) return true;
+    const size_t pos = n.rfind(suffix);
+    if (pos != std::string::npos && pos > 0) {
+        const size_t after = pos + slen;
+        if (after == n.size()) return true;
+        char c = n[after];
+        if (c == ' ' || c == '(' || c == '[' || c == '-' || c == '_' || c == '/' || c == ':') {
+            return true;
+        }
+    }
+    return false;
+}
+
 // 艺人名的实体种类启发：乐团/合唱/乐队/组合/社/団 或 Orchestra/Ensemble/Choir/Band/
 // Quartet/Trio/Singers/Philharmonic/Symphony → Group；否则 Person（个人/同人作者）。
 // 依据：真实样本「Czech National Symphony Orchestra」(ffprobe ARTIST, TEST 站交响诗)
-// 是乐团；「澤田なつ」是个人/同人（§3 原文）。⚠️ 同样是启发式：像「团子」这类昵称会被
-// 误判成 Group；单字「社」「团」「団」更宽（「社会科学」这类名字也会中）。误判只影响
-// 分类展示，但**kind 进 id，所以种类判错会得到另一个 id** —— 这是已知取舍：宁可把同一
-// 实体拆成两条（人能看见、能手工合并），也不要错并（错并会悄悄丢掉一条的来源写法）。
+// 是乐团；「澤田なつ」是个人/同人（§3 原文）。
+// E-12 校准：单字「社」「团」「団」加后缀/上下文门槛与负例保护（如「社会科学」「团结」「团子」
+// 不会误判成 Group；现有正例「月華社」「上海アリス幻樂団」仍正确判定）。
 inline EntityKind entity_artist_kind(const std::string& raw) {
     const std::string n = entity_norm(raw);
+    if (n.empty()) return EntityKind::Person;
+
+    // 1. 纯词表负例保护：包含单字「社」「团」「団」的普通词汇或人名
+    static const char* kCjkNeg[] = {
+        "社会", "社交", "社区", "社论", "社评", "社稷", "社保", "社工", "社长",
+        "团结", "团圆", "团聚", "团拜", "团购", "团团", "团子", "饭团", "纸团", "线团", "蒲公英团",
+        "団結", "団欒", "団子"
+    };
+    bool isNegative = false;
+    for (const char* neg : kCjkNeg) {
+        if (n.find(neg) != std::string::npos) {
+            isNegative = true;
+            break;
+        }
+    }
+
+    // 2. 强团体特征英文词表
     static const char* kWord[] = { "orchestra", "ensemble", "choir", "chorus", "band",
                                    "quartet", "trio", "singers", "philharmonic", "symphony",
                                    "group", "project" };
     for (const char* w : kWord)
         if (n.find(w) != std::string::npos) return EntityKind::Group;
-    static const char* kCjk[] = { "乐团", "樂團", "乐队", "樂隊", "合唱", "组合", "組合",
-                                  "社团", "社團", "社", "団", "团" };
-    for (const char* w : kCjk)
+
+    // 3. 强团体特征多字 CJK 词表（即使含负例词根，有强团体词也算团体，如“团结交响乐团”）
+    static const char* kCjkMulti[] = { "乐团", "樂團", "乐队", "樂隊", "合唱", "组合", "組合",
+                                       "社团", "社團", "剧团", "劇團" };
+    for (const char* w : kCjkMulti)
         if (raw.find(w) != std::string::npos) return EntityKind::Group;
+
+    if (isNegative) return EntityKind::Person;
+
+    // 4. 单字「社」「団」「团」：加上下文/后缀门槛（必须为后缀或后接修饰符，且长度>单字）
+    if (entity_detail_has_cjk_suffix(n, "社")) return EntityKind::Group;
+    if (entity_detail_has_cjk_suffix(n, "団")) return EntityKind::Group;
+    if (entity_detail_has_cjk_suffix(n, "团")) return EntityKind::Group;
+
     return EntityKind::Person;
 }
 
