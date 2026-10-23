@@ -74,6 +74,12 @@ function fmtDate(sec) {
   var day = ('0' + d.getDate()).slice(-2);
   return y + '-' + m + '-' + day;
 }
+// 从完整路径取「所在文件夹名」（队列列表用，比整条路径可读；评审 #8）
+function parentFolder(p) {
+  var s = String(p || '').replace(/\\\\/g, '/');
+  var segs = s.split('/').filter(function (x) { return !!x; });
+  return segs.length >= 2 ? segs[segs.length - 2] : '';
+}
 function nam(p) {
   var s = String(p || ''), i = Math.max(s.lastIndexOf('/'), s.lastIndexOf(SEP));
   return i >= 0 ? s.slice(i + 1) : s;
@@ -424,20 +430,12 @@ function openAlbum(k) {
             '<button class=btn id=aShuf>随机播放</button>' +
             '</div></div>';
 
-    // 2026-10-23（用户 261023-03 #2/#3）：勾选「在线整理音乐资料简介」后，进专辑页即自动整理并缓存。
-    // 加载态只有一行低调灰字；没配 key 又没缓存时先不显示（不留空白板块、也不闪加载行）。
-    var albumSummLoading = (META.summary == 1 && META.hasLlmKey === true);
-    if (META.summary == 1) {
-      h += '<div class="sec-card summary-sec" id="albumSummary" data-k="' + esc(j.k) + '"' +
-           ' style="margin:16px 0 20px' + (albumSummLoading ? '' : ';display:none') + '">' +
-           (albumSummLoading ? '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>' : '') +
-           '</div>';
-    }
-
+    // 2026-10-23（UI 评审 #2）：曲目列表必须在首屏可见 —— 以前简介（有时是很长的维基消歧义文）
+    // 排在曲目之前，1024 下用户一首歌都看不到。现在先曲目、后简介。
     h += '<div style="padding:4px 0 24px">';
     j.tracks.forEach(function (t, i) {
       var isFav = FAV_SET.has(t.path);
-      h += '<div class=trow data-i=' + i + ' style="grid-template-columns:28px 24px 1fr 140px 58px;gap:8px">' +
+      h += '<div class="trow trow-track" data-i=' + i + ' style="grid-template-columns:28px 24px minmax(120px,1fr) minmax(0,1fr) 58px;gap:8px">' +
            '<div class=n>' + (t.n || (i + 1)) + '</div>' +
            favIconHtml(t.path, isFav) +
            '<div class=tt title="' + esc(t.title) + '">' + esc(t.title) + '</div>' +
@@ -446,6 +444,14 @@ function openAlbum(k) {
            '</div>';
     });
     h += '</div>';
+    // 简介放在曲目之后（评审 #2）；加载态只一行灰字，无 key 又无缓存时先隐藏
+    if (META.summary == 1) {
+      var albumSummLoading = (META.hasLlmKey === true);
+      h += '<div class="sec-card summary-sec" id="albumSummary" data-k="' + esc(j.k) + '"' +
+           ' style="margin:8px 0 24px' + (albumSummLoading ? '' : ';display:none') + '">' +
+           (albumSummLoading ? '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>' : '') +
+           '</div>';
+    }
     D('list').innerHTML = h;
     head(j.name, j.tracks.length + ' 首', '');
 
@@ -514,9 +520,10 @@ function loadArtists() {
     var h = '<div class=grid style="grid-template-columns:repeat(auto-fill,minmax(180px,1fr))">';
     order.forEach(function (k) {
       var v = m[k];
-      var cv = v.cv ? "background-image:url('/api/lib/cover?k=" + v.key + "');border-radius:50%" : '';
+      // 头像统一圆形（评审 #4：有封面圆、没封面方，混排很突兀）
+      var cv = "border-radius:50%;overflow:hidden;" + (v.cv ? "background-image:url('/api/lib/cover?k=" + v.key + "')" : '');
       h += '<div class=card data-a="' + esc(k) + '"><div class=cv style="' + cv + '">' +
-           (v.cv ? '' : '<div class=ph>' + esc(k.slice(0, 1).toUpperCase()) + '</div>') + '</div>' +
+           (v.cv ? '' : '<div class=ph style="border-radius:50%">' + esc(k.slice(0, 1).toUpperCase()) + '</div>') + '</div>' +
            '<div class=nm>' + esc(k) + '</div><div class=ar>' + v.n + ' 张专辑</div></div>';
     });
     h += '</div>';
@@ -1059,7 +1066,7 @@ function renderTracksView() {
   h += '<div style="padding:4px 0 24px">';
   sorted.forEach(function (x, i) {
     var isFav = FAV_SET.has(x.path);
-    h += '<div class=trow data-i=' + i + ' style="grid-template-columns:28px 24px 1fr 150px 92px 58px;gap:8px">' +
+    h += '<div class="trow trow-track" data-i=' + i + ' style="grid-template-columns:28px 24px minmax(120px,1.6fr) minmax(0,1fr) 92px 58px;gap:8px">' +
          '<div class=n>' + (i + 1) + '</div>' +
          favIconHtml(x.path, isFav) +
          '<div class=tt title="' + esc(x.title) + '">' + esc(x.title) + '</div>' +
@@ -1654,7 +1661,19 @@ function loadLibStats() {
 function loadRemote(id) {
   S.view = 'remote';
   api('/api/src/browse?id=' + encodeURIComponent(id || '')).then(function (j) {
-    if (j.err && !(j.items || []).length) { D('list').innerHTML = '<div class=empty>' + esc(j.err) + '</div>'; head('流媒体', '', ''); return; }
+    if (j.err && !(j.items || []).length) {
+      // 评审 #7：以前错误态整屏只留一行裸文本，像"页面坏了"。改成带说明 + 去配置入口的空态卡。
+      head('流媒体', '', '');
+      D('list').innerHTML = '<div class="card" style="max-width:560px;margin:26px auto;padding:22px 24px;background:var(--phbg);border:1px solid var(--line);border-radius:12px">' +
+        '<div style="font-size:14px;font-weight:650;margin-bottom:6px">还没有可浏览的流媒体服务器</div>' +
+        '<div style="color:var(--mut);font-size:12.5px;line-height:1.7;margin-bottom:14px">' +
+        esc(j.err) + '<br>支持 Navidrome / Subsonic / Emby（只取原始文件，不转码）。先在「设置 → 高级 → 流媒体服务器」填地址与账号，保存后回到这里即可浏览。</div>' +
+        '<button class="btn pri" id=remoteGoSet>去设置里配置</button>' +
+        '<button class="btn" id=remoteRetry style="margin-left:8px">重试</button></div>';
+      if (D('remoteGoSet')) D('remoteGoSet').onclick = function () { openSettingsTab('adv'); };
+      if (D('remoteRetry')) D('remoteRetry').onclick = function () { loadRemote(id || ''); };
+      return;
+    }
     S.remote = j.items || []; S.rpath = id || '';
     head('流媒体', S.remote.length + ' 项', '');
     var h = '';
@@ -1720,7 +1739,8 @@ function setView(v) {
   var isSet = (v === 'settings');
   // 设置页占满整屏：右栏（队列/歌词）在这里没有意义，直接藏掉。
   // 走 #app.noq 这套已有的网格规则，否则网格会留一个空列。
-  D('app').classList.toggle('noq', isSet || S.queueHidden);
+  // 2026-10-23（UI 评审 #8）：播放队列页自己就是队列，右侧抽屉再显示一份同样的队列是重复信息
+  D('app').classList.toggle('noq', isSet || S.queueHidden || v === 'queue');
   D('app').classList.toggle('setmode', isSet);   // 设置页隐藏 crumb，页签自己吸顶
   applyRTab(isSet);
   if (D('setpage')) D('setpage').classList.toggle('on', isSet);
@@ -3173,6 +3193,9 @@ function renderSettingsPage() {
       Array.prototype.forEach.call(document.querySelectorAll('#setpage .spane'), function (p) {
         p.classList.toggle('on', p.dataset.g === b.dataset.g);
       });
+      // 评审 #12：诊断页是纯操作页（导出/写回），底部「保存设置/恢复默认」在这里没有意义 → 隐藏
+      var foot = document.querySelector('#setpage .setfoot');
+      if (foot) foot.style.display = (b.dataset.g === 'diag') ? 'none' : '';
       if (b.dataset.g === 'in') {
         loadInputDevices();
         pollInputState();
@@ -3593,7 +3616,9 @@ function eqSettingsHtml() {
     + '<div class=hint>留空 = 不做卷积；支持立体声 / 多声道 FIR 房间校正</div></div>'
     + chk('sp_irgpu', '卷积走 GPU 硬件加速（需要 rtagpu.dll 就位）', ADV.irgpu == 1,
           '房间 / 耳机 FIR 卷积交给 GPU；没有可用后端时自动退回 CPU')
-    + '<div class="sfld wide" style="margin-top:4px"><button class="btn pri" id=bSaveRoomEq>保存 EQ 与房间校正设置</button></div>');
+    // 评审 #11：这里原来还有一个「保存 EQ 与房间校正设置」按钮，与底部全局「保存设置」重复 → 移除；
+    // sp_eq / sp_ir / sp_irgpu 的值本来就会随 saveSettings 一起提交，不需要第二个主操作。
+    );
   return h;
 }
 function initEqViewLogic() {
@@ -4056,7 +4081,8 @@ function renderQueuePage() {
       h += '<div class="qrow' + (i === S.q.index ? ' on' : '') + '" data-i=' + i + ' draggable=true>' +
            '<span class=qn>' + (i + 1) + '</span>' +
            '<span class=qt title="' + esc(f) + '">' + esc(nam(f)) + '</span>' +
-           '<span class=qp>' + esc(base(f)) + '</span>' +
+           // 评审 #8：以前这里打完整物理路径，又长又不可读；只显示所在文件夹名，全路径放 tooltip
+           '<span class=qp title="' + esc(f) + '">' + esc(parentFolder(f)) + '</span>' +
            '<button class=qdel data-i=' + i + ' title="从队列移除">\u00d7</button></div>';
     });
     D('list').innerHTML = h + '</div>';
@@ -4435,6 +4461,10 @@ function renderNp() {
 function renderNpLyric() {
   var box = D('npLyric'); if (!box) return;
   if (box.classList) box.classList.toggle('empty', !LY.lines.length);
+  // 评审 #19：纯音乐没有歌词时，歌词行不该继续占 1fr 高度（中间会留一大片黑）；
+  // 让 .npgrid 收起歌词行，把空间让给资料面板。
+  var grid = D('npGrid');
+  if (grid) grid.classList.toggle('nolyric', !LY.lines.length);
   if (!LY.lines.length) {
     box.innerHTML = '<div class=npline>没有歌词<br><span style="font-size:12px;color:var(--mut2)">同名 .lrc 文件、内嵌歌词，或播放时自动在线补全（可在设置-元数据补全关闭）</span></div>';
     return;

@@ -85,6 +85,12 @@ inline std::string rta_ui_page() {
     h += "select option:disabled{color:var(--mut2)}";
     h += "#app{display:grid;grid-template-columns:212px 1fr 378px;grid-template-rows:52px 1fr 88px;height:100vh}";
     h += "#app.noq{grid-template-columns:212px 1fr 0}#app.noq #right{display:none}";
+    // 2026-10-23（UI 评审 #1/#3/#9/#18）：窄窗口（≤1240px）右侧队列/歌词抽屉会吃掉 378px，
+    // 把主区挤到 434px → 曲目名被压成 0 宽、专辑网格只剩 2 列。窄窗默认收起抽屉，主区优先。
+    h += "@media (max-width:1240px){#app{grid-template-columns:200px minmax(0,1fr) 0}#app #right{display:none}}";
+    // 窄窗口下曲目行按「歌名 > 艺术家 > 规格」优先级收列，绝不把歌名压成 0 宽（评审 #3/#18 的根因兜底）
+    h += "@media (max-width:1400px){.trow-track{grid-template-columns:28px 24px minmax(140px,1.6fr) minmax(0,1fr) 58px!important}.trow-track .bd{display:none}}";
+    h += "@media (max-width:1120px){.trow-track{grid-template-columns:28px 24px minmax(160px,1fr) 58px!important}.trow-track .ar{display:none}}";
     // 顶栏
     // 顶栏与内容同底色、无分隔线：整块界面连成一片（QQ 音乐式一体化）。
     h += ".top{grid-column:1/-1;display:flex;align-items:center;gap:10px;padding:0 10px 0 16px;background:var(--bg);border-bottom:0;position:relative;z-index:9;min-width:0}";
@@ -259,7 +265,10 @@ inline std::string rta_ui_page() {
     //   行1 封面+标题区 / 行2 资料区 / 行3 歌词区 / 行4 进度控制区。
     //   资料区隐藏时不占行（.withdata 由 JS 按是否有可用资料切换）⟹ 不会留空白块。
     h += ".npgrid{position:relative;z-index:2;height:100%;display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:16px;padding:44px 52px 16px;box-sizing:border-box}";
-    h += ".npgrid.withdata{grid-template-rows:auto minmax(0,.8fr) minmax(0,1fr) auto}";
+    h += ".npgrid.withdata{grid-template-rows:auto minmax(140px,1.6fr) minmax(0,.9fr) auto}";
+    h += ".npgrid.nolyric #npLyric{display:none}";
+    h += ".npgrid.nolyric{grid-template-rows:auto minmax(0,1fr) auto}";
+    h += ".npgrid.nolyric.withdata{grid-template-rows:auto minmax(0,1fr) auto}";
     h += ".nphero{display:grid;grid-template-columns:auto minmax(0,1fr);gap:26px;align-items:center;min-height:0}";
     h += ".npcover{height:clamp(132px,24vh,236px)}";
     h += ".npcover img{height:100%;width:auto;aspect-ratio:1/1;object-fit:cover;border-radius:14px;box-shadow:0 24px 70px rgba(0,0,0,.6);display:block}";
@@ -305,7 +314,7 @@ inline std::string rta_ui_page() {
     // 行4：进度控制区（正常流式排版，不再绝对定位 ⟹ 与歌词/资料区不会重叠）
     h += ".npctl2{min-height:0;display:grid;grid-template-rows:auto auto auto;gap:11px;justify-items:center}";
     // 行2：资料面板（用户 261023-04 #7：按实体分区的 AI 资料；优雅加载态 + 缓存/未核对标注）
-    h += ".npdata{min-height:0;display:none;flex-direction:column;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09);border-radius:12px;padding:10px 14px 8px;box-sizing:border-box;overflow:hidden}";
+    h += ".npdata{min-height:120px;display:none;flex-direction:column;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09);border-radius:12px;padding:10px 14px 8px;box-sizing:border-box;overflow:hidden}";
     h += ".npdata.on{display:flex}";
     h += ".npdhead{display:flex;align-items:center;gap:8px;flex:none;flex-wrap:wrap}";
     h += ".npdtabs{display:flex;align-items:center;gap:4px;flex-wrap:wrap}";
@@ -379,9 +388,9 @@ inline std::string rta_ui_page() {
     // 弹层
     h += "#modal{position:fixed;inset:0;z-index:40;background:rgba(0,0,0,.45);backdrop-filter:blur(3px);display:none;place-items:center}";
     h += "#modal.on{display:grid}";
-    h += ".mcard{width:min(600px,92vw);max-height:84vh;overflow:auto;background:var(--bg2);border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 70px var(--shadow)}";
-    h += ".mhead{display:flex;align-items:center;gap:9px;padding:14px 18px;border-bottom:1px solid var(--line);font-weight:650}";
-    h += ".mbody{padding:16px 18px 22px}";
+    h += ".mcard{width:min(600px,92vw);max-height:calc(100vh - 40px);display:flex;flex-direction:column;overflow:hidden;background:var(--bg2);border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 70px var(--shadow)}";
+    h += ".mhead{display:flex;align-items:center;gap:9px;padding:14px 18px;border-bottom:1px solid var(--line);font-weight:650;flex:none}";
+    h += ".mbody{padding:16px 18px 22px;flex:1;min-height:0;overflow:auto}";
     h += ".chain{display:flex;flex-direction:column;gap:0}";
     h += ".cnode{display:flex;gap:12px;align-items:flex-start;padding:9px 0}";
     h += ".cnode .dot{width:9px;height:9px;border-radius:50%;background:var(--acc);margin-top:6px;flex:none;box-shadow:0 0 12px var(--acc-weak)}";
@@ -420,7 +429,7 @@ inline std::string rta_ui_page() {
     h += ".stab.on{background:var(--acc-weak);color:var(--acc-text);border-color:rgba(59,130,246,.32);font-weight:600}";
     h += ".spane{display:none}.spane.on{display:block}";
     h += ".trimgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}";
-    h += ".setfoot{display:flex;gap:10px;align-items:center;padding:4px 2px 0}";
+    h += ".setfoot{display:flex;gap:10px;align-items:center;padding:12px 2px 10px;position:sticky;bottom:0;background:var(--bg);border-top:1px solid var(--line);z-index:6}";
     h += ".setfoot .sp{flex:1}";
     h += ".meter-bar{height:6px;border-radius:3px;background:var(--track);overflow:hidden;position:relative;margin:4px 0 2px}";
     h += ".meter-val{height:100%;width:0%;background:linear-gradient(90deg,var(--acc),#22c55e);transition:width .12s ease;border-radius:3px}";

@@ -582,8 +582,10 @@ async function gotoFiles() {
   // 2026-10-23 用户 261023-04 #2：EQ 与房间校正不再是主导航页，而是设置页的「EQ」页签。
   // 判据：抽头/衰减仍在「高级」页签；EQ 文件 / IR / GPU 卷积在「EQ」页签 —— 都在设置页内，
   // 且各自归属正确（不能互相串页签，否则又会出现重复 id / 读错控件）。
-  ck(await evalJs("(function(){var page=document.getElementById('setpage');var eq=document.querySelector('#setpage .spane[data-g=eq]');if(!eq)return false;var t=document.getElementById('sp_taps'),a=document.getElementById('sp_atten'),ir=document.getElementById('sp_ir'),e=document.getElementById('sp_eq'),g=document.getElementById('sp_irgpu'),b=document.getElementById('bSaveRoomEq');return !!(t&&a&&page.contains(t)&&page.contains(a)&&ir&&e&&g&&b&&eq.contains(ir)&&eq.contains(e)&&eq.contains(g)&&eq.contains(b));})()"),
-     '抽头/衰减仍在设置页（PCM 页签），EQ 文件/IR/GPU 卷积在「EQ」页签内');
+  // 2026-10-23（UI 评审 #11）：EQ 卡片里的「保存 EQ 与房间校正设置」按钮与底部全局保存重复，已删除；
+  // 这里同时断言它确实不在了，避免以后又被加回来。
+  ck(await evalJs("(function(){var page=document.getElementById('setpage');var eq=document.querySelector('#setpage .spane[data-g=eq]');if(!eq)return false;var t=document.getElementById('sp_taps'),a=document.getElementById('sp_atten'),ir=document.getElementById('sp_ir'),e=document.getElementById('sp_eq'),g=document.getElementById('sp_irgpu'),dup=document.getElementById('bSaveRoomEq');return !!(t&&a&&page.contains(t)&&page.contains(a)&&ir&&e&&g&&eq.contains(ir)&&eq.contains(e)&&eq.contains(g)&&!dup);})()"),
+     '抽头/衰减在设置页，EQ 文件/IR/GPU 卷积在「EQ」页签内，且无重复保存按钮');
   ck(await evalJs("document.querySelectorAll('#sp_device option').length > 1"), '输出设备下拉有内容', (await evalJs("document.querySelectorAll('#sp_device option').length")) + ' 项');
   // ---- 本轮新增：WASAPI 共享后端（选项存在 / 说明文案 / 能保存；!! 跑完必须还原，
   //      与 taps 同一原则 —— 自检不许改用户的输出后端）----
