@@ -1,3 +1,3 @@
-// version.h — 单一版本号真相源（rc / ping / 播放日志都从这里取）
+﻿// version.h 鈥?鍗曚竴鐗堟湰鍙风湡鐩告簮锛坮c / ping / 鎾斁鏃ュ織閮戒粠杩欓噷鍙栵級
 #pragma once
-#define RLPLAYER_VERSION "1.3.4"
+#define RLPLAYER_VERSION "1.3.5"

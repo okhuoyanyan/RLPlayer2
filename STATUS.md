@@ -2,6 +2,48 @@
 
 > **接手请先读**：[HANDOVER.md](HANDOVER.md)（架构/构建/已知坑）→ [ROADMAP.md](ROADMAP.md)（待开发与判据）。
 > 本文件按回合记录“做过什么、实测多少”，越往下越旧。
+# 第三十轮:真机联调——输入采集、P5 投放、资料层验收复核(2026-10-23)
+
+## 1. 输入采集(用户授权麦克风 Widget B)——✅ 端到端通过
+
+- `/api/input/devices` 正确枚举 4 端点,Widget B 标为默认;`POST /api/input/start mode=record&dev=Widget+B&seconds=3`:
+  **144,000 帧 = 48000×2ch×3s 精确**,`overflow=0 underflow=0 posClips=0 negClips=0`,RMS −85.4 dB / peak −73.9 dB(静室合理),WAV 正常落盘。
+- **踩到并修掉一个静默失败**:参数名是 `dev` 不是 `device`;传错会被**静默忽略、回落默认端点**(表现为"指定 Widget B 却打开 Realtek Center")。
+  已改为**对 `device/deviceId/devid` 直接报错**(030ae37):`{"ok":false,"error":"参数名应为 dev(不是 device);收到但未生效会静默回落默认设备,已拒绝以免误导"}`。
+
+## 2. P5 UPnP 投放(用户授权 192.168.50.109)——控制面 ✅ / 供源侧被网络隔离 ❌
+
+- 设备 = `N1000_UPNP`(upmpdcli 1.4.12 + MPD 0.22.0 + MiniDLNA 1.2.1);
+- **SSDP 组播在本机网络零响应**(手写 M-SEARCH 亦然)→ 但 `--dev http://IP:PORT/` **直连描述完全可用**;
+- **控制面全部通过**:SetAVTransportURI(完整 DIDL+protocolInfo)/Play/GetTransportInfo → 200 OK、PLAYING;
+- **供源失败,判定网络隔离**:MPD 报 `CURL failed: Connection timed out`;
+  排除法(本机自测 200 → 最简 python http.server 仍超时 → 按端口+按程序放行防火墙仍超时 →
+  `Get-NetTCPConnection -RemoteAddress` **从未出现设备入站连接**)= 典型 AP/客户端隔离(icmp 通、TCP 入站不通);
+- **代码侧未改**;顺手把 `rtacast --list` 空发现的提示改为直接给出直连用法;
+- 打通后复测:`rtacast --file <曲> --dev http://192.168.50.109:49152/ --seconds 15`,
+  判据 = MPD `status` 的 `time:` 推进 + 我们侧看到设备 TCP/Range 请求。
+
+## 3. 资料层验收复核——全部有持久磁盘证据
+
+| 验收项 | 证据 |
+|---|---|
+| 5 位艺术家资料页 | `rlplayer-meta\\entities\\<id>\\knowledge.json` × 5:初音未来/ZARD/Toe (band)/澤田なつ/塞壬唱片,各 1–2 条材料(维基/萌娘,带 expires_at 离线兜底) |
+| 3 部古典作品 ≥5 演绎 | `build\\rlplayer-meta\\entities\\<id>\\versions.json`:Boléro **11**/12、La Valse **10**/12、Mahler 5 **12**/12、Beethoven 5 **10**/12(complete=true) |
+| 幻觉抽检 | 第 23 轮 5/5 属实(见 STATUS 第 23 轮) |
+| 断网缓存 | knowledge.json + versions.json 均带 expires_at,离线回退路径已有测试 |
+
+## 4. 视图切换加固(用户反馈「作品栏切不回」)
+
+- 干净环境 3 种路径 CDP 复现均正常 → **未复现**;
+- 但发现一类真实残留风险:设置页会把 `#list` 置 `display:none`,离开时若不显式恢复就可能"看起来卡住";
+  已在 `setView()` 里按目标视图**强制**设定 `#list` 与 `scanbar` 的显示态(ff76c95)。
+
+## 5. 未解决(铁律 4)
+
+1. P5 端到端有声播放仍被网络隔离阻断(需用户侧关 AP 隔离);
+2. 「作品栏切不回」未复现,待用户补现象(点击表现/按钮高亮/F12 报错);
+3. CUDA DLL 需 NVIDIA 机器构建(交付说明见 `docs/CUDA交付说明-给协作者.md`)。
+
 # 第二十九轮:P5 UPnP 投放端到端实测 + 1.3.3 真机 BUG 修复(2026-10-23)
 
 ## 0. 1.3.3 三个致命 BUG 的根因(用户真机反馈 261023-01)
