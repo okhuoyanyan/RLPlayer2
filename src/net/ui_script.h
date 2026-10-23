@@ -1321,10 +1321,12 @@ function tick() {
       if (S.lastCur) { S.lastCur = ''; D('npt').textContent = '未播放'; D('npart').textContent = ''; D('nps').textContent = '选择一个专辑开始'; D('cv').style.backgroundImage = ''; S.npMetaHtml = ''; if (D('npMeta')) D('npMeta').innerHTML = ''; }
     }
     // 2026-10-23 #1：底栏常驻一个「b-p」徽标，不打开信号链也能知道当前是否 bit-perfect。
+    // 2026-10-23 用户 261023-04 #1：改成紧凑 chip（class=bp-yes/bp-no/bp-direct），
+    // 配色与显隐交给 CSS（三套主题各有一套颜色），这里不写死颜色、也不占中间列。
     if (D('bpBadge')) {
       var bpv = S.bpState || '';
       D('bpBadge').textContent = bpv === 'direct' ? 'BIT-PERFECT·1bit' : (bpv === 'yes' ? 'BIT-PERFECT' : (bpv === 'no' ? '非 bit-perfect' : ''));
-      D('bpBadge').style.color = bpv === 'direct' ? '#a78bfa' : (bpv === 'yes' ? '#34d399' : (bpv === 'no' ? '#fbbf24' : ''));
+      D('bpBadge').className = bpv ? ('bp-' + bpv) : '';
       D('bpBadge').title = S.bpWhy || '';
     }
     if (j.error) D('nps').textContent = j.error;
@@ -1686,7 +1688,7 @@ function saveSrc() {
 function setView(v) {
   S.view = v;
   Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
-    e.classList.toggle('on', e.dataset.v === v || (v === 'artist' && e.dataset.v === 'artists') || (v === 'work' && e.dataset.v === 'works') || (v === 'eq' && e.dataset.v === 'eq'));
+    e.classList.toggle('on', e.dataset.v === v || (v === 'artist' && e.dataset.v === 'artists') || (v === 'work' && e.dataset.v === 'works'));
   });
   var isSet = (v === 'settings');
   // 设置页占满整屏：右栏（队列/歌词）在这里没有意义，直接藏掉。
@@ -1717,7 +1719,6 @@ Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
     else if (v === 'tracks') loadTracks('');
     else if (v === 'files') loadFiles(S.dir || '');
     else if (v === 'remote') loadRemote('');
-    else if (v === 'eq') loadEqView();
     else if (v === 'queue') { renderQueuePage(); }
     else if (v === 'recent') loadRecent();
   };
@@ -2141,8 +2142,9 @@ function sel(id, label, optsHtml, hint) {
   return '<div class=sfld><label>' + label + '</label><select id=' + id + '>' + optsHtml + '</select>' +
          (hint ? '<div class=hint>' + hint + '</div>' : '') + '</div>';
 }
-function chk(id, label, checked, hint) {
-  return '<div class=sfld><label class=chk><input type=checkbox id=' + id + (checked ? ' checked' : '') + '>' +
+// wide=true 时整行显示（用于描述文字较长的开关，避免被 .sgbody 的多列网格压成窄条）
+function chk(id, label, checked, hint, wide) {
+  return '<div class="sfld' + (wide ? ' wide' : '') + '"><label class=chk><input type=checkbox id=' + id + (checked ? ' checked' : '') + '>' +
          label + '</label>' + (hint ? '<div class=hint>' + hint + '</div>' : '') + '</div>';
 }
 function txt(id, label, val, hint, ph) {
@@ -2784,6 +2786,8 @@ function renderSettingsPage() {
      + '<button class=stab data-g=pcm>PCM</button>'
      + '<button class=stab data-g=sdm>SDM</button>'
      + '<button class=stab data-g=adv>高级</button>'
+     // 2026-10-23 用户 261023-04 #2：EQ 与房间校正从左侧主导航移到这里，单开一个页签。
+     + '<button class=stab data-g=eq>EQ</button>'
      + '<button class=stab data-g=meta>元数据</button>'
      // 「诊断」独立成页：用户 2026-10-22 功能3 明确要求不要塞在元数据里。
      // 开发期它是必需品（报错时要拿现场），所以与输入/输出/PCM/SDM/高级 平级。
@@ -2820,7 +2824,11 @@ function renderSettingsPage() {
          '<div class="sfld wide"><div class=trimgrid>'+ trimFields(CH) + '</div>' +
          '<div class=hint>显示的是「输出声道数」对应的实际声道。2 = 左/右；5.1 = 左/右/中置/低音/左环绕/右环绕；7.1 再加左后/右后</div></div>')
      + sgroup('投放（UPnP）', '将本地音频流式推送到网络播放器/音箱（DLNA MediaRenderer）',
-         sel('sp_cast_dev', '目标渲染器', '<option value="">（未发现 UPnP 渲染器）</option>', '选择局域网内的 DLNA/UPnP MediaRenderer 设备')
+         // 2026-10-23 用户 261023-04 #12：渲染器名字常常很长（friendlyName + 型号），
+         // 放在 260px 的小格里会被截断得只剩几个字；改成整行、下拉铺满宽度。
+         '<div class="sfld wide"><label>目标渲染器</label>'
+       + '<select id=sp_cast_dev style="width:100%"><option value="">（未发现 UPnP 渲染器）</option></select>'
+       + '<div class=hint>选择局域网内的 DLNA/UPnP MediaRenderer 设备</div></div>'
        + '<div class="sfld" style="display:flex;align-items:flex-end">'
        + '<button class=btn id=sp_cast_scan>重新扫描</button>'
        + '<span id=sp_cast_devmsg class=hint style="margin-left:10px;line-height:30px"></span>'
@@ -2839,10 +2847,12 @@ function renderSettingsPage() {
        + '<button class=btn id=sp_cast_stop disabled>停止投放</button>'
        + '<span id=sp_cast_msg class=hint style="margin:0"></span>'
        + '</div>')
+     // 2026-10-23 用户 261023-04 #12：状态网格必须跨满整张卡片（.sfld.wide），
+     // 否则外层 .sgbody 的 auto-fill 网格把它压进单个 260px 单元 → 内层只剩 1 列，指标竖排成长条。
      + sgroup('投放实时状态', '1 秒自动轮询',
-         '<div class=in-stat-grid>'
+         '<div class="sfld wide in-stat-grid">'
        + '<div class=in-stat-item><span class=lbl>运行阶段</span><span class=val id=sp_cast_stat_phase>已停止</span></div>'
-       + '<div class=in-stat-item><span class=lbl>目标渲染器</span><span class=val id=sp_cast_stat_dev>-</span></div>'
+       + '<div class=in-stat-item><span class=lbl>目标渲染器</span><span class="val sm" id=sp_cast_stat_dev>-</span></div>'
        + '<div class=in-stat-item><span class=lbl>播放进度</span><span class=val id=sp_cast_stat_pos>0:00</span></div>'
        + '<div class=in-stat-item><span class=lbl>传输状态</span><span class=val id=sp_cast_stat_transport>STOPPED</span></div>'
        + '<div class=in-stat-item><span class=lbl>供源传输字节</span><span class=val id=sp_cast_stat_bytes>0 B</span></div>'
@@ -2954,8 +2964,9 @@ function renderSettingsPage() {
        + '<button class=btn id=sp_instop disabled>停止采集</button>'
        + '<span id=sp_inmsg class=hint style="margin:0"></span>'
        + '</div>')
+     // 2026-10-23 用户 261023-04 #10：采集状态同样改成跨满整行的横向卡片网格。
      + sgroup('采集实时状态', '1 秒自动轮询',
-         '<div class=in-stat-grid>'
+         '<div class="sfld wide in-stat-grid">'
        + '<div class=in-stat-item><span class=lbl>运行状态</span><span class=val id=sp_stat_running>空闲</span></div>'
        + '<div class=in-stat-item><span class=lbl>采集帧数 / 时长</span><span class=val id=sp_stat_frames>0 帧 (0.0s)</span></div>'
        + '<div class=in-stat-item><span class=lbl>采样规格</span><span class=val id=sp_stat_spec>-</span></div>'
@@ -2967,7 +2978,7 @@ function renderSettingsPage() {
        + '<div class=meter-bar><div id=sp_meter_rms class=meter-val style="width:0%"></div></div></div>'
        + '<div class=in-stat-item><span class=lbl>峰值电平</span><span class=val id=sp_stat_peak>-∞ dBFS</span>'
        + '<div class=meter-bar><div id=sp_meter_peak class=meter-val style="width:0%"></div></div></div>'
-       + '<div class=in-stat-item style="grid-column:1/-1"><span class=lbl>输出文件</span><span class=val id=sp_stat_out style="word-break:break-all">-</span></div>'
+       + '<div class=in-stat-item style="grid-column:1/-1"><span class=lbl>输出文件</span><span class="val sm" id=sp_stat_out>-</span></div>'
        + '<div class=in-stat-item id=sp_stat_err_box style="grid-column:1/-1;display:none;color:var(--err)">'
        + '<span class=lbl style="color:var(--err)">错误信息</span><span class=val id=sp_stat_err></span></div>'
        + '</div>')
@@ -2988,12 +2999,8 @@ function renderSettingsPage() {
              '选了具体厂商就只试该厂商的 DLL。后端缺失或 kernel 不可执行时自动退回 CPU 分块 FFT，并在信号链里写明实际用的哪个 DLL。')
        + '<div class="sfld wide"><div id=sp_gpumsg class=hint></div></div>'
        + '<div class="sfld wide"><div id=sp_asiomsg class=hint></div></div>')
-     + sgroup('EQ 与房间校正', '耳机校准预设 · 房间声学 IR 卷积 · 调音管理（已移至主导航）',
-         '<div class="sfld wide"><div class=hint style="margin-bottom:8px">耳机 EQ、调音预设与房间声学校正已独立为左侧主导航「EQ 与房间校正」页面。</div>'
-       + '<button class="btn pri" id=bGoEqNav type="button" style="font-size:12px;padding:6px 14px">前往「EQ 与房间校正」页面 →</button></div>'
-       // 261023-03 第6条：这里**不能**再放 sp_eq / sp_ir 旧控件 ——
-       // 独立 EQ 页各有一份，重复 id 会让 D() 取到设置页这份的陈旧值（隐藏控件陷阱）。
-       + '<div class="sfld wide"><div class=hint>EQ 文件路径、房间校正 IR 与 GPU 卷积开关都在该页面里填写；这里只保留入口。</div></div>')
+     // 2026-10-23 用户 261023-04 #2：EQ 与房间校正已移进设置页的「EQ」页签，
+     // 原来这里的「前往…页面」跳转按钮没有意义了，整组删掉（不再有重复 id / 失效入口）。
      + sgroup('流媒体服务器', 'Navidrome / Subsonic / Emby（只取原始文件，不用转码流）',
          '<div class="sfld wide"><div class=hint>DLNA/UPnP 是"发现网络上的播放器"，与这里的"登录音乐服务器"是两件事。' +
          '要连 Emby / Navidrome，在这一栏填地址与账号。</div></div>'
@@ -3014,6 +3021,9 @@ function renderSettingsPage() {
        + chk('sp_shuf', '随机播放', D('sShuf').checked, '关掉会恢复原顺序')
        + chk('sp_loud', '等响度补偿', D('sLoud').checked, '音量越低低频提升越多'))
      + '</div>';
+
+  // ---------- EQ 与房间校正（用户 261023-04 #2：从主导航移进设置页的独立页签）----------
+  h += '<div class=spane data-g=eq>' + eqSettingsHtml() + '</div>';
 
   // ---------- 诊断（用户 2026-10-22 功能3：独立页签）----------
   // 用户原话：「导出诊断信息其实就是一个 log，最好是直接导出一个压缩包或一个整体的
@@ -3041,62 +3051,57 @@ function renderSettingsPage() {
   // ---------- 元数据补全（排在「高级」之后）----------
   // P1.5：源开关不再硬编码 —— #sp_metasrc 占位容器由 fillMetaProviders 按
   // /api/providers 动态填充（注册表驱动，后端新增数据源前端零改动）。
-  // 2026-10-23 用户反馈「元数据一栏 UI 很难看、很繁杂」：
-  // 原来一屏平铺 6 个数据源开关 + Key 输入 + 4 个按钮 + 写回说明，扫一眼全是字。
-  // 改成：常用 3 项直接可见，其余（逐源开关 / Key / 写回）收进「高级选项」折叠区，
-  // 默认收起。功能一个没少，只是不再把所有细节同时摊在人脸上。
+  // 2026-10-23 用户 261023-04 #3：三个开关 → 两个。
+  //   ①「自动补全（不用 AI）」= metaon（只走公开数据源，不产生费用）；
+  //   ②「AI 增强（DeepSeek）」= 原「DeepSeek 增强（无标签文件）」+「在线整理音乐资料简介」合并，
+  //      保存时同时写 metallm 与 metasummary（开 = 1,1；关 = 0,0）。
+  // 高级选项：左右两列卡片（左 = 数据源，右 = DeepSeek 接入 + 标签写回），铺满宽度、留足间距。
+  var aiOn = (META.llm == 1 && META.summary == 1);
   h += '<div class=spane data-g=meta>'
      + sgroup('元数据补全', '播放时后台补全标签 / 封面 / 歌词，结果落在本地库',
-         chk('sp_metaon', '自动补全', META.on == 1,
-             '关闭后播放不再触发在线补全；已补全的结果仍在本地库，随时可以再打开')
-       + chk('sp_metallm', 'DeepSeek 增强（无标签文件）', META.llm == 1, '用 LLM 解析无标签文件并与数据源结果互相校验；不影响已有标签的优先级')
-       // 2026-10-23（用户 261023-03 #2/#3）：不再有「生成 AI 简介」按钮，也不出现「AI 综合 / AI 生成」字样。
-       // 勾选即自动：进艺术家 / 专辑 / 单曲播放页就整理对应简介并保存为缓存，重复进入读缓存。
-       + chk('sp_metasummary', '在线整理音乐资料简介（按次计费）', META.summary == 1,
-             '开启后进入艺术家、专辑、单曲播放页会自动联网整理简介并缓存：同一个艺术家或专辑只整理一次，之后直接读缓存（7 天有效）。关闭则不请求、也不显示简介板块。每次整理产生少量在线调用，默认关闭')
-       + '<div class=sfld wide><div class=hint style="color:var(--mut2)">'
-       + '简介会自动出现在艺术家页、专辑页和单曲播放整页，无需点任何按钮；整理过的内容缓存在本地，重复进入不重复计费。'
-       + '（作品页另有「Discogs 版本推荐」，不产生费用。）</div></div>'
-       + '<div class=sfld wide style="margin-top:14px">'
+         chk('sp_metaon', '自动补全（不用 AI）', META.on == 1,
+             '只用公开数据源（QQ音乐 / 网易云 / iTunes / dizzylab / lrclib）补全标签、封面、歌词；全程不调用 AI，不产生费用', true)
+       + chk('sp_metallm', 'AI 增强（DeepSeek）', aiOn,
+             '合并原「DeepSeek 解析无标签文件」与「在线整理音乐资料简介」：开启后会联网调用 DeepSeek（按次计费）；' +
+             '关闭则两项都停（不解析无标签文件、也不整理简介），本地与公开数据源照常工作', true)
+       + '<div class="sfld wide"><div class=hint style="color:var(--mut2)">'
+       + 'AI 增强用于两件事：① 解析没有标签的文件，并与数据源结果互相校验；② 进入艺术家 / 专辑 / 单曲播放页时自动整理简介并缓存（同一条目只整理一次，缓存 7 天有效）。'
+       + '不需要 AI 时可只开「自动补全（不用 AI）」。</div></div>'
+       + '<div class="sfld wide" style="margin-top:6px">'
        + '<button class=btn id=sp_metamore style="font-size:12px" aria-expanded="false">高级选项 ▾</button>'
        + '<span style="font-size:11.5px;color:var(--mut2);margin-left:10px">数据源 · DeepSeek Key · 标签写回</span>'
        + '</div>'
-       + '<div id=sp_metaadv style="display:none">'
-       // 数据源小节（2026-10-23 #4：与 API Key 分成两块，不再黏在一起）
-       + '<div class=sfld wide><div style="font-size:12.5px;font-weight:600;color:var(--txt);margin:4px 0 2px">数据源</div>'
-       + '<div class=hint>越靠上优先级越高；关掉的源完全不参与补全（不需要任何 Key）</div></div>'
-       + '<div id=sp_metasrc>' + metaSrcHtml() + '</div>'
-       // ---- 2026-10-23（用户 261023-02 #4）：API Key 不要跟数据源黏在一起 ----
-       // 现在拆成独立小节：先「数据源」、再「DeepSeek 接入」、最后「标签写回」，中间用分割标题隔开。
-       // 红线不变：界面【只显示掩码】，输入框永不回填，保存后立刻清空；key 只写 exe 同目录 rlplayer-llm.conf。
-       + '<div class=sfld wide><div style="margin:18px 0 2px;padding-top:14px;border-top:1px solid var(--line)">'
-       + '<div style="font-size:12.5px;font-weight:600;color:var(--txt)">DeepSeek 接入</div>'
-       + '<div class=hint style="margin-top:4px">只用于「DeepSeek 增强」与「在线资料整理」；不填也能用全部本地与公开数据源</div></div></div>'
-       + '<div class=sfld><label>DeepSeek API Key</label>'
-       + '<input type=password id=sp_llmkey autocomplete=off spellcheck=false placeholder="sk-…（粘贴后点保存，只显示掩码）">'
-       + '<div class=hint>只存本机 build' + SEP + 'rlplayer-llm.conf；不进安装包，界面永不回显明文</div></div>'
-       + '<div class="sfld wide"><div class=hint id=sp_llmmsg>读取配置中…</div></div>'
-       + '<div class="sfld wide"><button class="btn pri" id=sp_llmsave>保存 Key</button> '
-       + '<button class=btn id=sp_llmtest>测试连接</button> '
+       // #sp_metaadv 必须跨满 .sgbody 的整行（否则会被压进单个 260px 网格单元，两列各只剩 140px）
+       + '<div class="sfld wide" id=sp_metaadv style="display:none;margin-top:14px">'
+       + '<div class=meta-adv-grid>'
+       // 左列：数据源（逐源开关，注册表驱动渲染进 #sp_metasrc）
+       + '<div class=meta-card>'
+       + '<div class=mh>数据源<span class=hint style="font-weight:400">越靠上优先级越高；关掉的源完全不参与补全</span></div>'
+       + '<div id=sp_metasrc class=meta-src-grid>' + metaSrcHtml() + '</div>'
+       + '</div>'
+       // 右列：DeepSeek 接入 + 标签写回
+       + '<div class=meta-card>'
+       + '<div class=mh>DeepSeek 接入</div>'
+       + '<div class=hint style="margin-bottom:8px">只用于上面的「AI 增强」；不填也能用全部本地与公开数据源</div>'
+       + '<label style="display:block;font-size:11px;color:var(--mut);margin-bottom:5px">DeepSeek API Key</label>'
+       + '<input type=password id=sp_llmkey autocomplete=off spellcheck=false placeholder="sk-…（粘贴后点保存，只显示掩码）" style="width:100%">'
+       + '<div class=hint style="margin-top:4px">只存本机 build' + SEP + 'rlplayer-llm.conf；不进安装包，界面永不回显明文</div>'
+       + '<div class=hint id=sp_llmmsg style="margin-top:6px">读取配置中…</div>'
+       + '<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">'
+       + '<button class="btn pri" id=sp_llmsave>保存 Key</button>'
+       + '<button class=btn id=sp_llmtest>测试连接</button>'
        + '<button class=btn id=sp_llmclear>清除 Key</button></div>'
-       + '<div class="sfld wide"><div style="font-size:12px;color:var(--mut);line-height:1.7">'
-       + '播放时自动补全标签/封面/歌词；数据源清单来自 /api/providers；DeepSeek 用上面填的 key</div></div>'
-       // P2 标签写回：预览（只读扫描）/ 执行（后台批 + 轮询进度）。写回前服务端做
-       // PCM 逐位校验（不一致绝不动原文件），原文件备份到 rlplayer-meta\backups。
-       // 2026-10-23（用户 261023-02 #4）：「预览写回 / 执行写回是什么东西？」—— 加白话解释。
-       + '<div class=sfld wide><div style="margin:18px 0 2px;padding-top:14px;border-top:1px solid var(--line)">'
-       + '<div style="font-size:12.5px;font-weight:600;color:var(--txt)">标签写回（可选）</div>'
-       + '<div class=hint style="margin-top:4px;line-height:1.8">'
-       + '<b>作用</b>：把在线补到的标签/封面<b>写进音频文件本身</b>，换播放器也能看到。<br>'
-       + '<b>预览写回</b>：只扫描并列出「哪些文件会被改成什么」，<b>不改任何文件</b>（先看效果再决定）。<br>'
-       + '<b>执行写回</b>：真正写入。写入前会把音频数据逐位校验一遍，任何不一致就放弃该文件；'
-       + '原文件备份在 rlplayer-meta' + SEP + 'backups，可随时手动还原。</div></div></div>'
-       + '<div class="sfld wide"><div id=sp_wbdesc style="font-size:12px;color:var(--mut);line-height:1.7">'
-       + '把补全结果写回音频文件标签。写回前自动校验音频数据逐位不变，原文件备份到 rlplayer-meta' + SEP + 'backups</div></div>'
-       + '<div class="sfld wide"><button class=btn id=sp_wbdry>预览写回</button> '
+       + '<div class="mh sub">标签写回<span class=hint style="font-weight:400">可选</span></div>'
+       + '<div style="font-size:12px;color:var(--mut);line-height:1.75">'
+       + '把在线补到的标签/封面<b>写进音频文件本身</b>，换播放器也能看到。<b>预览写回</b>只扫描并列出「哪些文件会被改成什么」，<b>不改任何文件</b>；'
+       + '<b>执行写回</b>真正写入，写前逐位校验音频数据，任何不一致就放弃该文件，原文件备份在 rlplayer-meta' + SEP + 'backups。</div>'
+       + '<div class=hint id=sp_wbdesc style="margin-top:6px;line-height:1.7">写回前自动校验音频数据逐位不变，原文件备份到 rlplayer-meta' + SEP + 'backups</div>'
+       + '<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center">'
+       + '<button class=btn id=sp_wbdry>预览写回</button>'
        + '<button class=btn id=sp_wbapply>执行写回</button>'
-       + '<span id=sp_wbmsg style="font-size:11.5px;color:var(--mut2);margin-left:10px"></span></div>'
-       + '</div>')   // ← 关闭 #sp_metaadv（高级选项折叠区）
+       + '<span id=sp_wbmsg style="font-size:11.5px;color:var(--mut2)"></span></div>'
+       + '</div>'
+       + '</div></div>')
      + '</div>';
 
   // 底部按钮（不随页签切换）
@@ -3182,16 +3187,18 @@ function renderSettingsPage() {
       saveSettings();
     };
   });
-  // 元数据补全开关（P1.5）：总开关与 DeepSeek 固定绑定；源开关在 renderMetaSrcRows
-  // 里按注册表逐源绑定（metasrc_<id>，改完即落盘）
-  [['sp_metaon', 'on'], ['sp_metallm', 'llm'], ['sp_metasummary', 'summary']].forEach(function (p) {
-    var e = D(p[0]); if (!e) return;
-    e.onchange = function () {
-      META[p[1]] = this.checked ? 1 : 0;
-      saveSettings();
-      if (p[1] === 'summary' && S.lastCur) loadMeta(S.lastCur);
-    };
-  });
+  // 元数据补全开关（用户 261023-04 #3）：只剩两个。
+  //   ① 自动补全 = metaon（公开数据源，不调 AI）；
+  //   ② AI 增强 = metallm + metasummary 合并 —— 一开同开、一关同关（保存时写 1,1 / 0,0）。
+  // 源开关仍在 renderMetaSrcRows 里按注册表逐源绑定（metasrc_<id>，改完即落盘）。
+  var eMetaOn = D('sp_metaon');
+  if (eMetaOn) eMetaOn.onchange = function () { META.on = this.checked ? 1 : 0; saveSettings(); };
+  var eMetaAi = D('sp_metallm');
+  if (eMetaAi) eMetaAi.onchange = function () {
+    META.llm = META.summary = this.checked ? 1 : 0;
+    saveSettings();
+    if (S.lastCur) loadMeta(S.lastCur);   // 关掉后简介板块要立刻消失，不用刷新
+  };
   // 功能4：DeepSeek API Key（保存 / 测试连接 / 清除）。输入框重建后必须为空 ——
   // 这是「永不回显明文」的最后一道：哪怕浏览器缓存了 value，重建也会清掉。
   if (D('sp_llmsave')) D('sp_llmsave').onclick = llmSave;
@@ -3292,7 +3299,9 @@ function renderSettingsPage() {
     ADV = { device: '', bits: 0, taps: 0, atten: 0, transition: 0, phase: '', modcut: 0, moddith: -1, ir: '', irgpu: 0, ramp: 0, theme: S.theme, modorder: 5, modfamily: 'dsd', directsdm: 0, dsdKind: 'fir', dsdConv: 'narrow',
             backend: 'wasapi', channels: 0, naaHost: '127.0.0.1:43210',
             inBackend: 'none', inDev: '', inOffset: 0, inBuf: 100, inMonitor: 0, inSeconds: 0, inOut: '' };
-    META = { on: 1, llm: 1 };   // 元数据固定两键的默认；源开关随注册表一并全开
+    // 元数据两键的默认：自动补全开；AI 增强关（联网计费项默认关，避免「恢复默认」反而产生费用）。
+    // 源开关随注册表一并全开。
+    META = { on: 1, llm: 0, summary: 0 };
     (META_PROVIDERS || []).forEach(function (p) { META_SRC[p.id] = 1; });
     D('sRate').value = 'max'; D('sFiltNx').value = ''; D('sShap').value = 'auto';
     D('sBuf').value = 100; D('sDSD').value = 0; D('sIsp').checked = true; D('s2s').checked = true;
@@ -3323,7 +3332,8 @@ function renderSettingsPage() {
     });
   };
   drawRoots();
-  initOpraControls();
+  // EQ 页签的内容在 renderSettingsPage 里一并渲染；这里统一做一次事件绑定 + 初始 OPRA 状态。
+  initEqViewLogic();
   initCastControls();
   scanCastDevices(false);
   pollCastState();
@@ -3506,88 +3516,60 @@ function getTargetCurveDescInfo(details, author) {
   };
 }
 
-function loadEqView() {
-  S.view = 'eq';
-  setView('eq');
-  head('EQ 与房间校正', 'OPRA 耳机校准预设 · 房间声学校正 (IR 卷积) · 调音管理', '');
-
-  var h = '<div style="padding:16px 28px 48px;max-width:1200px;margin:0 auto">';
-
-  // 1. 耳机 EQ（OPRA）卡片
-  h += '<div class=card style="padding:22px 24px;margin-bottom:24px;background:var(--hov);border:1px solid var(--line);border-radius:12px">';
-  h += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">' +
-       '<div><h2 style="font-size:16px;margin:0 0 4px;font-weight:700">耳机校准与调音预设</h2>' +
-       '<div style="font-size:12px;color:var(--mut2)">收录 6,230 款耳机专业校准滤波，CC BY-SA 4.0 授权</div></div>' +
-       '<div style="display:flex;align-items:center;gap:10px">' +
-       '<span class="chip" id=sp_opra_copychip title="复制 OPRA 项目官网链接" style="cursor:pointer;display:inline-flex;align-items:center;font-size:11.5px">' +
-       '<svg width=12 height=12 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 style="margin-right:4px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>https://opra.roon.app/</span>' +
-       '</div></div>';
-
-  // 搜索框（合并为一个，同时匹配品牌与型号，261023-03 第6条）
-  h += '<div style="position:relative;margin-bottom:12px">' +
-       '<input id=sp_opra_search type=text placeholder="搜索耳机品牌或型号（如 Sennheiser / HD 600 / AirPods / Sony / XM5…）" autocomplete=off style="width:100%;height:38px;padding:0 14px;background:var(--card);border:1px solid var(--line);border-radius:8px;font-size:13px;color:var(--txt);box-sizing:border-box">' +
-       '</div>';
-
-  // 空输入引导 + 热门品牌芯片（空输入显示；有输入隐藏，261023-03 第6条）
-  h += '<div id=eqSearchGuide style="padding:10px 0 6px">' +
-       '<div style="font-size:12.5px;color:var(--mut2);margin-bottom:10px">输入品牌或型号检索耳机，或直接点击下方热门品牌快速筛选：</div>' +
-       '<div style="display:flex;flex-wrap:wrap;gap:8px" id=eqBrandChips>' +
-       '<button class="btn brand-chip" data-brand="Sennheiser">森海塞尔 Sennheiser</button>' +
-       '<button class="btn brand-chip" data-brand="Sony">索尼 Sony</button>' +
-       '<button class="btn brand-chip" data-brand="Apple">苹果 Apple</button>' +
-       '<button class="btn brand-chip" data-brand="Beyerdynamic">拜雅 Beyerdynamic</button>' +
-       '<button class="btn brand-chip" data-brand="Audio-Technica">铁三角 Audio-Technica</button>' +
-       '<button class="btn brand-chip" data-brand="AKG">爱科技 AKG</button>' +
-       '<button class="btn brand-chip" data-brand="Hifiman">海菲曼 Hifiman</button>' +
-       '<button class="btn brand-chip" data-brand="Focal">劲浪 Focal</button>' +
-       '</div></div>';
-
-  // 搜索提示
-  h += '<div id=sp_opra_searchhint style="font-size:12px;color:var(--mut2);margin-bottom:10px;display:none"></div>';
-
-  // 型号卡片容器（空输入时 0 个，有输入时 <= 30 个，261023-03 第6条判据）
-  h += '<div id=eqModelCards style="display:grid;grid-template-columns:repeat(auto-fill, minmax(220px, 1fr));gap:10px;margin-bottom:14px"></div>';
-
-  // 预设选择与目标曲线卡片展示区（选中某款耳机后渲染）
-  h += '<div id=eqPresetsArea style="display:none;margin-top:20px;padding-top:18px;border-top:1px dashed var(--line)">' +
-       '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">' +
-       '<h3 id=eqSelectedModelTitle style="font-size:14px;margin:0;font-weight:600">选择调音目标预设</h3>' +
-       '<span id=sp_opra_msg style="font-size:12px;color:var(--mut2)"></span>' +
-       '</div>' +
-       '<div id=eqPresetCards style="display:grid;grid-template-columns:repeat(auto-fill, minmax(280px, 1fr));gap:12px"></div>' +
-       '<div id=eqTargetCurveInfo style="margin-top:16px;padding:14px 16px;background:var(--card);border:1px solid var(--line);border-radius:8px;font-size:12.5px;color:var(--txt2);line-height:1.6;display:none"></div>' +
-       '</div>';
-
-  h += '</div>'; // 结束第一部分
-
-  // 2. EQ 文件（REW / AutoEq 文本）—— 261023-03 第6条 ②
-  h += '<div class=card style="padding:22px 24px;margin-bottom:24px;background:var(--hov);border:1px solid var(--line);border-radius:12px">' +
-       '<h2 style="font-size:16px;margin:0 0 4px;font-weight:700">EQ 文件（REW / AutoEq 文本）</h2>' +
-       '<div style="font-size:12px;color:var(--mut2);margin-bottom:14px">参量 EQ 支持 REW / AutoEq 的标准文本格式，按文件里的 Filter 行生成双二阶滤波器组。</div>' +
-       '<label style="display:block;font-size:12px;color:var(--mut2);margin-bottom:6px;font-weight:500">EQ 文件路径</label>' +
-       '<input type=text id=sp_eq value="' + esc(ADV.eq || '') + '" placeholder="D:\\Music\\headphone-eq.txt" style="width:100%;height:34px;padding:0 10px;background:var(--card);border:1px solid var(--line);border-radius:6px;color:var(--txt);box-sizing:border-box">' +
-       '<div style="font-size:11px;color:var(--mut2);margin-top:4px">每行如 Filter 1: ON PK Fc 1000 Hz Gain -3.0 dB Q 1.41</div>' +
-       '</div>';
-
-  // 3. 房间校正 IR（WAV 路径 + GPU 卷积开关）—— 261023-03 第6条 ③
-  h += '<div class=card style="padding:22px 24px;background:var(--hov);border:1px solid var(--line);border-radius:12px">' +
-       '<h2 style="font-size:16px;margin:0 0 4px;font-weight:700">房间校正 IR（WAV 脉冲响应）</h2>' +
-       '<div style="font-size:12px;color:var(--mut2);margin-bottom:14px">把测量到的房间 / 耳机脉冲响应用 FIR 卷积叠进播放链路，做声学校正。</div>' +
-       '<label style="display:block;font-size:12px;color:var(--mut2);margin-bottom:6px;font-weight:500">IR 脉冲响应卷积文件（WAV）</label>' +
-       '<input type=text id=sp_ir value="' + esc(ADV.ir || '') + '" placeholder="D:\\Music\\room.wav" style="width:100%;height:34px;padding:0 10px;background:var(--card);border:1px solid var(--line);border-radius:6px;color:var(--txt);box-sizing:border-box">' +
-       '<div style="font-size:11px;color:var(--mut2);margin-top:4px">留空 = 不做卷积；支持立体声 / 多声道 FIR 房间校正</div>' +
-       '<div style="display:flex;align-items:center;justify-content:space-between;margin-top:14px;flex-wrap:wrap;gap:10px">' +
-       '<label class=chk style="margin:0"><input type=checkbox id=sp_irgpu' + (ADV.irgpu == 1 ? ' checked' : '') + '> 卷积走 GPU 硬件加速（需要 rtagpu.dll 就位）</label>' +
-       '<button class="btn pri" id=bSaveRoomEq>保存 EQ 与房间校正设置</button>' +
-       '</div></div>';
-
-  h += '</div>';
-
-  D('list').innerHTML = h;
-
-  initEqViewLogic();
+// EQ 页签当前是否可见（设置页开着 + 选中 EQ 页签）。用于丢弃切走后的异步回调。
+function eqTabActive() {
+  var p = document.querySelector('#setpage .spane[data-g=eq]');
+  return !!(p && p.classList.contains('on'));
 }
-
+/* EQ 与房间校正（用户 261023-04 #2：从左侧主导航移进设置页的「EQ」页签）
+   内容沿用原来的三块：① 耳机 EQ（OPRA 校准预设）② EQ 文件（REW / AutoEq）③ 房间校正 IR（WAV + GPU 卷积）。
+   改用设置页统一的分组卡片（sgroup），不再用原来的独立大卡片，保证页签内视觉与其它页一致。 */
+function eqSettingsHtml() {
+  var h = '';
+  // 1. 耳机 EQ（OPRA）
+  h += sgroup('耳机 EQ（OPRA 校准预设）', '收录 6,230 款耳机专业校准滤波 · CC BY-SA 4.0',
+      '<div class="sfld wide" style="display:flex;align-items:center;gap:10px">'
+    + '<input id=sp_opra_search type=text placeholder="搜索耳机品牌或型号（如 Sennheiser / HD 600 / AirPods / Sony / XM5…）" autocomplete=off style="flex:1;min-width:0;width:auto;height:34px;padding:0 12px;background:var(--field);border:1px solid var(--line);border-radius:8px;font-size:12.5px;color:var(--txt);box-sizing:border-box">'
+    + '<span class="chip" id=sp_opra_copychip title="复制 OPRA 项目官网链接" style="cursor:pointer;display:inline-flex;align-items:center;font-size:11.5px;flex:none">'
+    + '<svg width=12 height=12 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 style="margin-right:4px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>https://opra.roon.app/</span>'
+    + '</div>'
+    + '<div class="sfld wide" id=eqSearchGuide style="padding:2px 0 0">'
+    + '<div style="font-size:12px;color:var(--mut2);margin-bottom:8px">输入品牌或型号检索耳机，或直接点击下方热门品牌快速筛选：</div>'
+    + '<div style="display:flex;flex-wrap:wrap;gap:8px" id=eqBrandChips>'
+    + '<button class="btn brand-chip" data-brand="Sennheiser">森海塞尔 Sennheiser</button>'
+    + '<button class="btn brand-chip" data-brand="Sony">索尼 Sony</button>'
+    + '<button class="btn brand-chip" data-brand="Apple">苹果 Apple</button>'
+    + '<button class="btn brand-chip" data-brand="Beyerdynamic">拜雅 Beyerdynamic</button>'
+    + '<button class="btn brand-chip" data-brand="Audio-Technica">铁三角 Audio-Technica</button>'
+    + '<button class="btn brand-chip" data-brand="AKG">爱科技 AKG</button>'
+    + '<button class="btn brand-chip" data-brand="Hifiman">海菲曼 Hifiman</button>'
+    + '<button class="btn brand-chip" data-brand="Focal">劲浪 Focal</button>'
+    + '</div></div>'
+    + '<div class="sfld wide" id=sp_opra_searchhint style="font-size:12px;color:var(--mut2);display:none"></div>'
+    + '<div class="sfld wide"><div id=eqModelCards style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px"></div></div>'
+    + '<div class="sfld wide" id=eqPresetsArea style="display:none;margin-top:16px;padding-top:14px;border-top:1px dashed var(--line)">'
+    + '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;gap:10px;flex-wrap:wrap">'
+    + '<h3 id=eqSelectedModelTitle style="font-size:14px;margin:0;font-weight:600">选择调音目标预设</h3>'
+    + '<span id=sp_opra_msg style="font-size:12px;color:var(--mut2)"></span>'
+    + '</div>'
+    + '<div id=eqPresetCards style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px"></div>'
+    + '<div id=eqTargetCurveInfo style="margin-top:16px;padding:14px 16px;background:var(--field);border:1px solid var(--line);border-radius:8px;font-size:12.5px;color:var(--txt2);line-height:1.6;display:none"></div>'
+    + '</div>');
+  // 2. EQ 文件（REW / AutoEq 文本）
+  h += sgroup('EQ 文件（REW / AutoEq 文本）', '参量 EQ 支持 REW / AutoEq 标准文本，按文件里的 Filter 行生成双二阶滤波器组',
+      '<div class="sfld wide"><label>EQ 文件路径</label>'
+    + '<input type=text id=sp_eq value="' + esc(ADV.eq || '') + '" placeholder="D:\\Music\\headphone-eq.txt">'
+    + '<div class=hint>每行如 Filter 1: ON PK Fc 1000 Hz Gain -3.0 dB Q 1.41</div></div>');
+  // 3. 房间校正 IR（WAV 路径 + GPU 卷积开关）
+  h += sgroup('房间校正 IR（WAV 脉冲响应）', '把测量到的房间 / 耳机脉冲响应用 FIR 卷积叠进播放链路，做声学校正',
+      '<div class="sfld wide"><label>IR 脉冲响应卷积文件（WAV）</label>'
+    + '<input type=text id=sp_ir value="' + esc(ADV.ir || '') + '" placeholder="D:\\Music\\room.wav">'
+    + '<div class=hint>留空 = 不做卷积；支持立体声 / 多声道 FIR 房间校正</div></div>'
+    + chk('sp_irgpu', '卷积走 GPU 硬件加速（需要 rtagpu.dll 就位）', ADV.irgpu == 1,
+          '房间 / 耳机 FIR 卷积交给 GPU；没有可用后端时自动退回 CPU')
+    + '<div class="sfld wide" style="margin-top:4px"><button class="btn pri" id=bSaveRoomEq>保存 EQ 与房间校正设置</button></div>');
+  return h;
+}
 function initEqViewLogic() {
   var sInput = D('sp_opra_search');
   var guide = D('eqSearchGuide');
@@ -3626,7 +3608,7 @@ function initEqViewLogic() {
 
     if (!OPRA_INDEX) {
       if (hint) { hint.textContent = '正在加载耳机数据库…'; hint.style.display = 'block'; }
-      loadOpraIndex(function () { if (S.view === 'eq') doSearch(q); });   // 切走后丢弃过期回调
+      loadOpraIndex(function () { if (eqTabActive()) doSearch(q); });   // 切走后丢弃过期回调
       return;
     }
 
@@ -3689,7 +3671,7 @@ function initEqViewLogic() {
 
     OPRA_CUR_PRODUCT = productId;   // 连点不同型号时，只认最后一次选择（防止慢请求把旧预设盖到新型号上）
     api('/api/opra/presets?productId=' + encodeURIComponent(productId)).then(function (j) {
-      if (S.view !== 'eq' || OPRA_CUR_PRODUCT !== productId) return;   // 切走 / 已换型号 → 丢弃
+      if (!eqTabActive() || OPRA_CUR_PRODUCT !== productId) return;   // 切走 / 已换型号 → 丢弃
       if (!j.ok || !j.items || !j.items.length) {
         if (msg) msg.textContent = '暂无可用预设';
         if (presetsBox) presetsBox.innerHTML = '<div class=empty style="padding:20px 0">该型号暂无可用调音预设</div>';
@@ -3832,7 +3814,7 @@ function initEqViewLogic() {
   // 空输入时这里**不发起任何 /api/opra/index 请求**（261023-03 第6条）。
   if (ADV.opraproduct) {
     loadOpraIndex(function () {
-      if (S.view !== 'eq') return;
+      if (!eqTabActive()) return;
       var it = null;
       for (var i = 0; i < (OPRA_INDEX || []).length; ++i) {
         if (OPRA_INDEX[i][0] === ADV.opraproduct) { it = OPRA_INDEX[i]; break; }
@@ -3848,14 +3830,7 @@ function initEqViewLogic() {
   }
 }
 
-function initOpraControls() {
-  if (D('bGoEqNav')) {
-    D('bGoEqNav').onclick = function () {
-      setView('eq');
-      loadEqView();
-    };
-  }
-}
+// 2026-10-23 用户 261023-04 #2：EQ 已并入设置页，不再需要「前往 EQ 页面」跳转按钮的绑定。
 // ============================================================================
 // 诊断导出（用户 2026-10-22 功能3）
 // ----------------------------------------------------------------------------

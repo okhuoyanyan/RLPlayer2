@@ -120,14 +120,15 @@ async function waitFor(expr, ms = 8000) {
   ck(await evalJs("!document.querySelector('#list .empty')"), '主内容区没有落到空状态');
   const p1 = await shot('01-albums');
 
-  // ---- 验收 1：导航里有「古典作品」「EQ 与房间校正」 ----
+  // ---- 验收 1：导航里有「古典作品」；EQ 与房间校正**不再**留在导航 ----
+  // 2026-10-23 用户 261023-04 #2：EQ 与房间校正已移进设置页的「EQ」页签，左导航不许再有这一项。
   const navOk = await evalJs(`(function(){
     var navs = Array.from(document.querySelectorAll('.nav')).map(e => e.textContent.trim());
     var hasClassical = navs.some(t => t.indexOf('古典作品') >= 0);
-    var hasEq = navs.some(t => t.indexOf('EQ 与房间校正') >= 0);
-    return { ok: hasClassical && hasEq, hasClassical: hasClassical, hasEq: hasEq, navs: navs };
+    var hasEq = navs.some(t => t.indexOf('EQ') >= 0);
+    return { ok: hasClassical && !hasEq, hasClassical: hasClassical, hasEq: hasEq, navs: navs };
   })()`);
-  ck(navOk.ok, '导航里有「古典作品」「EQ 与房间校正」', JSON.stringify(navOk));
+  ck(navOk.ok, '导航里有「古典作品」且没有「EQ 与房间校正」（已移入设置页）', JSON.stringify(navOk));
   await shot('01-nav-classical-eq', true);
 
   // 点第一张专辑
@@ -309,9 +310,10 @@ async function waitFor(expr, ms = 8000) {
   await sleep(600);
   ck(await evalJs("document.getElementById('setpage').classList.contains('on')"), '设置页可打开');
   const tabOrder = await evalJs("Array.from(document.querySelectorAll('.stab')).map(e=>e.textContent).join('/')");
-  // 2026-10-22 功能3：「诊断」独立成页，排在元数据之后
-  ck(tabOrder === '输入/输出/PCM/SDM/高级/元数据/诊断',
-     '设置页签顺序为 输入/输出/PCM/SDM/高级/元数据/诊断', tabOrder);
+  // 2026-10-22 功能3：「诊断」独立成页，排在元数据之后。
+  // 2026-10-23 用户 261023-04 #2：EQ 与房间校正从主导航移进设置页，「EQ」页签排在「高级」之后。
+  ck(tabOrder === '输入/输出/PCM/SDM/高级/EQ/元数据/诊断',
+     '设置页签顺序为 输入/输出/PCM/SDM/高级/EQ/元数据/诊断', tabOrder);
 
   // ---- P4b：设置页输入面板自检（控件绑定/设备下拉/起停状态/状态渲染/无外链）----
   await evalJs("document.querySelector('.stab[data-g=in]').click()");
@@ -374,6 +376,23 @@ async function waitFor(expr, ms = 8000) {
   })()`);
   ck(Array.isArray(statRenderOk) && statRenderOk.length === 0,
      '输入状态面板指标与电平条完整渲染', JSON.stringify(statRenderOk));
+  // 2026-10-23 用户 261023-04 #10：状态卡必须是横向网格（宽屏一行 4~6 个、窄屏自动换行），
+  // 不能像原来那样被 .sgbody 压进单列 → 竖排成长条。顺带断言数值是「大字」。
+  const inStatGeom = await evalJs(`(function(){
+    var grid = document.querySelector('#setpage .spane[data-g=in] .in-stat-grid');
+    if (!grid) return null;
+    var items = Array.prototype.slice.call(grid.querySelectorAll('.in-stat-item'));
+    var rows = {};
+    items.forEach(function(e){ var k = Math.round(e.getBoundingClientRect().top); rows[k] = (rows[k]||0)+1; });
+    var maxRow = 0; Object.keys(rows).forEach(function(k){ maxRow = Math.max(maxRow, rows[k]); });
+    var val = document.getElementById('sp_stat_running');
+    return { count: items.length, maxRow: maxRow,
+             valFontSize: val ? parseFloat(getComputedStyle(val).fontSize) : 0,
+             gridW: Math.round(grid.getBoundingClientRect().width) };
+  })()`);
+  ck(inStatGeom && inStatGeom.count >= 6 && inStatGeom.maxRow >= 4,
+     '「采集实时状态」是横向统计卡网格（宽屏一行 ≥4 个）', JSON.stringify(inStatGeom));
+  ck(inStatGeom && inStatGeom.valFontSize >= 14, '状态卡数值用大字号（≥14px）', JSON.stringify(inStatGeom));
 
   ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=in] a[href^=http]').length === 0"),
      '输入页签无 http 外链');
@@ -436,24 +455,41 @@ async function waitFor(expr, ms = 8000) {
     ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.metasrc_qq)==='" + origQq + "')", 6000),
        '「QQ音乐」源开关往返还原');
   }
-  // 总开关、DeepSeek 开关与在线资料整理开关保持固定
-  const metaFix = await evalJs("(function(){var ids=['sp_metaon','sp_metallm','sp_metasummary'];var p=document.querySelector('#setpage .spane[data-g=meta]');var miss=[];ids.forEach(function(i){var e=document.getElementById(i);if(!e||e.type!=='checkbox'||!p.contains(e)||!e.onchange)miss.push(i)});return miss;})()");
-  ck(Array.isArray(metaFix) && metaFix.length === 0, '总开关、DeepSeek 开关与在线资料整理开关存在且已绑定', JSON.stringify(metaFix));
+  // 2026-10-23 用户 261023-04 #3：三个开关 → 两个。
+  //   ①「自动补全（不用 AI）」= metaon；②「AI 增强（DeepSeek）」= metallm + metasummary 合并。
+  // 固定两键必须仍在且已绑定；旧的 sp_metasummary 必须**不存在**（已合并）。
+  const metaFix = await evalJs("(function(){var ids=['sp_metaon','sp_metallm'];var p=document.querySelector('#setpage .spane[data-g=meta]');var miss=[];ids.forEach(function(i){var e=document.getElementById(i);if(!e||e.type!=='checkbox'||!p.contains(e)||!e.onchange)miss.push(i)});if(document.getElementById('sp_metasummary'))miss.push('sp_metasummary:仍存在');return miss;})()");
+  ck(Array.isArray(metaFix) && metaFix.length === 0,
+     '两个开关（自动补全 / AI 增强）存在且已绑定；旧 sp_metasummary 已合并删除', JSON.stringify(metaFix));
 
-  // 2026-10-23 261023-03 #2：开关文案必须去掉「AI」字眼，并说明「自动整理 + 缓存」
-  const summLabel = await evalJs("(function(){var e=document.getElementById('sp_metasummary');return (e&&e.parentNode)?e.parentNode.textContent.trim():'';})()");
-  ck(summLabel.indexOf('在线整理音乐资料简介') >= 0 && summLabel.indexOf('AI') < 0,
-     '资料简介开关文案已去掉 AI 字眼', summLabel);
+  // 合并后的 AI 开关：文案必须讲清「DeepSeek + 联网 + 按次计费」
+  const aiLabel = await evalJs("(function(){var e=document.getElementById('sp_metallm');return (e&&e.parentNode)?e.parentNode.textContent.trim():'';})()");
+  ck(aiLabel.indexOf('AI 增强') >= 0 && aiLabel.indexOf('DeepSeek') >= 0 && aiLabel.indexOf('按次计费') >= 0,
+     '「AI 增强（DeepSeek）」文案包含联网 / 按次计费说明', aiLabel);
 
-  // metasummary 默认关(0)，可保存并往返还原
-  const origSummary = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasummary||'0')"));
-  ck(origSummary === '0', 'metasummary 默认关闭 (0)');
-  await evalJs("var e=document.getElementById('sp_metasummary'); e.checked=true; e.dispatchEvent(new Event('change'));");
-  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.metasummary)==='1')", 6000),
-     '打开「在线整理音乐资料简介」能保存到后端');
-  await evalJs("var e=document.getElementById('sp_metasummary'); e.checked=" + (origSummary === '1') + "; e.dispatchEvent(new Event('change'));");
-  ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.metasummary)==='" + origSummary + "')", 6000),
-     '「在线整理音乐资料简介」往返还原');
+  // 合并语义：一次勾选必须**同时**写 metallm 与 metasummary（开=1,1 / 关=0,0）。
+  // 自检纪律：原状态可能是 metallm=1,metasummary=0 的混合态，合并后无法用两次点击还原成混合态，
+  // 所以这里**不落盘** —— 临时劫持 api() 截获 saveSettings 生成的 body，检查完立刻还原
+  // 函数 / META / DOM，全程不发任何网络请求（不会改用户设置）。
+  const mergedPair = await evalJs(`(function(){
+    var e = document.getElementById('sp_metallm');
+    if (!e) return 'missing';
+    var origChecked = e.checked, origLlm = META.llm, origSum = META.summary;
+    var realApi = api, captured = '';
+    api = function(u, b){ if (u === '/api/settings') captured = b; return Promise.resolve({}); };
+    e.checked = true; e.dispatchEvent(new Event('change')); saveSettings(true);
+    var onBody = captured, onState = (META.llm === 1 && META.summary === 1);
+    captured = '';
+    e.checked = false; e.dispatchEvent(new Event('change')); saveSettings(true);
+    var offBody = captured, offState = (META.llm === 0 && META.summary === 0);
+    api = realApi;
+    META.llm = origLlm; META.summary = origSum; e.checked = origChecked;
+    return { onPair: /(?:^|&)metallm=1(?:&|$)/.test(onBody) && /(?:^|&)metasummary=1(?:&|$)/.test(onBody),
+             offPair: /(?:^|&)metallm=0(?:&|$)/.test(offBody) && /(?:^|&)metasummary=0(?:&|$)/.test(offBody),
+             onState: onState, offState: offState };
+  })()`);
+  ck(mergedPair && mergedPair.onPair && mergedPair.offPair && mergedPair.onState && mergedPair.offState,
+     '「AI 增强」一次勾选同时写 metallm+metasummary（开=1,1 / 关=0,0）', JSON.stringify(mergedPair));
   // metaon 关→开：走 UI 开关（onchange → saveSettings → POST /api/settings），往返一致。
   // 注意不能裸 POST 单键：/api/settings 的 POST 是整文件重写，只发一个键会把其余设置全抹掉。
   const origMetaon = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metaon||'1')"));
@@ -631,20 +667,38 @@ async function waitFor(expr, ms = 8000) {
   })()`);
   ck(Array.isArray(castStatOk) && castStatOk.length === 0,
      '状态面板字段完整渲染（phase/渲染器/位置/传输状态/供源字节/请求数/采样率等）', JSON.stringify(castStatOk));
+  // 2026-10-23 用户 261023-04 #12：投放状态同样是横向卡片网格；目标渲染器整行显示。
+  const castStatGeom = await evalJs(`(function(){
+    var grid = document.querySelector('#setpage .spane[data-g=out] .in-stat-grid');
+    if (!grid) return null;
+    var items = Array.prototype.slice.call(grid.querySelectorAll('.in-stat-item'));
+    var rows = {};
+    items.forEach(function(e){ var k = Math.round(e.getBoundingClientRect().top); rows[k] = (rows[k]||0)+1; });
+    var maxRow = 0; Object.keys(rows).forEach(function(k){ maxRow = Math.max(maxRow, rows[k]); });
+    var sel = document.getElementById('sp_cast_dev');
+    var fld = sel ? sel.closest('.sfld') : null;
+    return { count: items.length, maxRow: maxRow,
+             devWidth: fld ? Math.round(fld.getBoundingClientRect().width) : 0 };
+  })()`);
+  ck(castStatGeom && castStatGeom.count >= 6 && castStatGeom.maxRow >= 4,
+     '「投放实时状态」是横向统计卡网格（宽屏一行 ≥4 个）', JSON.stringify(castStatGeom));
+  ck(castStatGeom && castStatGeom.devWidth >= 400,
+     '目标渲染器整行显示（长设备名可读）', JSON.stringify(castStatGeom));
 
   ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=out] a[href^=http]').length === 0"),
      '投放小节与输出页签无 http 外链');
 
-  // ---- 高级设置页包含前往 EQ 页面跳转按钮 ----
+  // ---- 高级页：EQ 跳转按钮已删除（261023-04 #2：EQ 已在设置页内，不再需要跳转）----
   await evalJs("document.querySelector('.stab[data-g=adv]').click()");
-  ck(await evalJs("!!document.getElementById('bGoEqNav')"), '高级设置页包含前往 EQ 与房间校正页面的跳转按钮');
+  ck(await evalJs("!document.getElementById('bGoEqNav')"), '高级设置页不再有「前往 EQ 页面」跳转按钮（EQ 已在设置页内）');
   ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=adv] a[href^=http]').length === 0"),
      '高级页签无外链');
 
-  // ---- 验收 3 & 4：EQ 与房间校正独立页面自检（261023-03 第6/7条） ----
-  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='eq').click()");
+  // ---- 验收 3 & 4：EQ 与房间校正（261023-04 #2 起是设置页的一个页签，不再是主导航页） ----
+  await evalJs("document.querySelector('.stab[data-g=eq]').click()");
   await sleep(700);
-  ck(await evalJs("S.view === 'eq'"), '可进入独立「EQ 与房间校正」页面');
+  ck(await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=eq]');return !!p && p.classList.contains('on') && document.getElementById('setpage').classList.contains('on');})()"),
+     '设置页「EQ」页签可切换且内容在设置页内');
   ck(await evalJs("!!document.getElementById('sp_opra_search')"), '包含合并后的品牌/型号搜索框');
 
   // 判据 3a：EQ 页空输入时型号卡片数 == 0（最关键判据）
@@ -669,8 +723,12 @@ async function waitFor(expr, ms = 8000) {
   ck(await evalJs("!!document.getElementById('eqTargetCurveInfo') && document.getElementById('eqTargetCurveInfo').style.display !== 'none'"), '选中后显示目标曲线说明');
   await shot('05-eq-presets-cards', true);
 
-  ck(await evalJs("document.querySelectorAll('#list a[href^=http]').length === 0"), 'EQ 与房间校正页面无外链');
+  ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=eq] a[href^=http]').length === 0"), 'EQ 页签无外链');
   ck(await evalJs("!!document.getElementById('sp_opra_copychip') && document.getElementById('sp_opra_copychip').classList.contains('chip')"), '存在复制官网链接芯片');
+
+  // EQ 自检在设置页里做，后续「右栏标签页 / 歌词 / 信号链」需要回到普通浏览视图（右栏才可见）。
+  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='tracks').click()");
+  await sleep(600);
 
   // ---- 右栏标签页 / 歌词 / 播放列表 / 信号链 ----
   await evalJs("document.querySelector('.rtab[data-t=l]').click()");
