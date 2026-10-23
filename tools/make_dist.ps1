@@ -15,7 +15,7 @@
 #
 # Usage: powershell -File tools/make_dist.ps1 [-Version 1.0.2] [-SkipGpuBuild]
 param(
-    [string]$Version = "1.3.11",
+    [string]$Version = "1.3.12",
     [switch]$SkipGpuBuild
 )
 

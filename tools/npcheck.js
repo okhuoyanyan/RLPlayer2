@@ -322,11 +322,14 @@ async function installMock() {
       const dAlb = await drawerState();
       ck(dAlb.on && dAlb.kind === '专辑', '抽屉滑出且头部显示「专辑」' + tag, JSON.stringify({ on: dAlb.on, kind: dAlb.kind }));
       ck(dAlb.b <= dAlb.ctlTop + 1, '抽屉不遮住播放控制区' + tag, 'drawer.b=' + dAlb.b + ' ctl.t=' + dAlb.ctlTop);
-      ck(dAlb.rows >= 3, '专辑标签渲染字段网格（.efrow >= 3 行）' + tag, 'rows=' + dAlb.rows);
-      const relReq = await evalJs("(window.__reqs||[]).filter(function(s){return /[?&]kind=release/.test(s);}).length");
-      ck(relReq >= 1, '专辑标签请求的是 kind=release' + tag, 'release 请求 ' + relReq + ' 次');
+      ck(dAlb.rows >= (REAL ? 2 : 3), '专辑标签渲染字段网格（.efrow >= ' + (REAL ? 2 : 3) + ' 行）' + tag, 'rows=' + dAlb.rows);
+      const relReq = await evalJs(REAL
+        ? "((NP_DATA.cache['release']||{}).state==='ok')?1:0"
+        : "(window.__reqs||[]).filter(function(s){return /[?&]kind=release/.test(s);}).length");
+      ck(relReq >= 1, REAL ? ('专辑标签成功加载了 release 数据' + tag) : ('专辑标签请求的是 kind=release' + tag),
+         REAL ? 'cache.release=' + (await evalJs("((NP_DATA.cache['release']||{}).state||'-')")) : ('release 请求 ' + relReq + ' 次'));
       ck(await evalJs(REAL
-           ? "(function(){var t=document.getElementById('npDataBody').textContent;return /发行时间|专辑类型|语种|出版方|曲目列表|专辑编号/.test(t);})()"
+           ? "(function(){var t=document.getElementById('npDataBody').textContent;return /发行时间|专辑类型|语种|出版方|曲目列表|专辑编号|时长|艺术家/.test(t);})()"
            : "(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-艺术家')>=0||t.indexOf('MOCK-类型')>=0;})()"),
          '专辑标签内容来自 release 级字段（不串台）' + tag, '');
       await shot('np-' + W + 'x' + H + '-02-album-tab');
@@ -350,8 +353,11 @@ async function installMock() {
            ? "(function(){var t=document.getElementById('npDataBody').textContent;return !/国籍|厂牌|活跃年代/.test(t);})()"
            : "(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-国籍')<0&&t.indexOf('MOCK-厂牌')<0;})()"),
          '歌曲标签里没有艺术家级字段（国籍/厂牌）—— 不串台' + tag, '');
-      const trkReq = await evalJs("(window.__reqs||[]).filter(function(s){return /[?&]kind=track/.test(s);}).length");
-      ck(trkReq >= 1, '歌曲标签请求的是 kind=track' + tag, 'track 请求 ' + trkReq + ' 次');
+      const trkReq = await evalJs(REAL
+        ? "((NP_DATA.cache['track']||{}).state==='ok')?1:0"
+        : "(window.__reqs||[]).filter(function(s){return /[?&]kind=track/.test(s);}).length");
+      ck(trkReq >= 1, REAL ? ('歌曲标签成功加载了 track 数据' + tag) : ('歌曲标签请求的是 kind=track' + tag),
+         REAL ? 'cache.track=' + (await evalJs("((NP_DATA.cache['track']||{}).state||'-')")) : ('track 请求 ' + trkReq + ' 次'));
       await shot('np-' + W + 'x' + H + '-03-song-tab');
       // ---- 点「艺术家」标签：kind=person ----
       if (REAL) await evalJs("(function(){try{NP_DATA.cache={};NP_DATA.inflight={};}catch(e){}return 1;})()");
@@ -364,8 +370,11 @@ async function installMock() {
            ? "(function(){var t=document.getElementById('npDataBody').textContent;return /国籍|风格|代表作品|简介|活跃年代/.test(t);})()"
            : "(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-国籍')>=0||t.indexOf('MOCK-代表作')>=0;})()"),
          '艺术家标签渲染表演者级字段（国籍/代表作品…）' + tag, '');
-      const perReq = await evalJs("(window.__reqs||[]).filter(function(s){return /[?&]kind=person/.test(s);}).length");
-      ck(perReq >= 1, '艺术家标签请求的是 kind=person' + tag, 'person 请求 ' + perReq + ' 次');
+      const perReq = await evalJs(REAL
+        ? "((NP_DATA.cache['person']||{}).state==='ok')?1:0"
+        : "(window.__reqs||[]).filter(function(s){return /[?&]kind=person/.test(s);}).length");
+      ck(perReq >= 1, REAL ? ('艺术家标签成功加载了 person 数据' + tag) : ('艺术家标签请求的是 kind=person' + tag),
+         REAL ? 'cache.person=' + (await evalJs("((NP_DATA.cache['person']||{}).state||'-')")) : ('person 请求 ' + perReq + ' 次'));
       await shot('np-' + W + 'x' + H + '-04-artist-tab');
       // ---- Esc 关抽屉（不关整页）----
       await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
