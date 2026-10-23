@@ -517,13 +517,15 @@ function loadArtists() {
     order.sort(function (x, y) { return x.localeCompare(y, 'zh'); });
     head('艺术家', order.length + ' 位', '');
     if (!order.length) { D('list').innerHTML = '<div class=empty>库里还没有音乐</div>'; return; }
-    var h = '<div class=grid style="grid-template-columns:repeat(auto-fill,minmax(180px,1fr))">';
+    var h = '<div class=grid style="grid-template-columns:repeat(auto-fill,minmax(150px,1fr))">';
     order.forEach(function (k) {
       var v = m[k];
-      // 头像统一圆形（评审 #4：有封面圆、没封面方，混排很突兀）
-      var cv = "border-radius:50%;overflow:hidden;" + (v.cv ? "background-image:url('/api/lib/cover?k=" + v.key + "')" : '');
-      h += '<div class=card data-a="' + esc(k) + '"><div class=cv style="' + cv + '">' +
-           (v.cv ? '' : '<div class=ph style="border-radius:50%">' + esc(k.slice(0, 1).toUpperCase()) + '</div>') + '</div>' +
+      // 头像统一圆形（评审 #4）：占位字母**始终**渲染在底层，封面用 <img> 覆盖并 onerror 自隐。
+      // 以前用 background-image：封面文件缺失时整块纯黑、连首字母都没有（Irotas/RØSE 就是这样）。
+      var phChar = (String(k).trim().slice(0, 1) || '?').toUpperCase();
+      h += '<div class=card data-a="' + esc(k) + '"><div class=cv style="border-radius:50%;overflow:hidden">' +
+           '<div class=ph style="border-radius:50%">' + esc(phChar) + '</div>' +
+           (v.cv ? '<img src="/api/lib/cover?k=' + v.key + '" loading=lazy alt="" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:50%" onerror="this.style.display=\'none\'">' : '') + '</div>' +
            '<div class=nm>' + esc(k) + '</div><div class=ar>' + v.n + ' 张专辑</div></div>';
     });
     h += '</div>';
@@ -1664,7 +1666,7 @@ function loadRemote(id) {
     if (j.err && !(j.items || []).length) {
       // 评审 #7：以前错误态整屏只留一行裸文本，像"页面坏了"。改成带说明 + 去配置入口的空态卡。
       head('流媒体', '', '');
-      D('list').innerHTML = '<div class="card" style="max-width:560px;margin:26px auto;padding:22px 24px;background:var(--phbg);border:1px solid var(--line);border-radius:12px">' +
+      D('list').innerHTML = '<div class="card" style="max-width:560px;width:100%;margin:clamp(24px,10vh,90px) auto 0;padding:24px 26px;background:var(--phbg);border:1px solid var(--line);border-radius:12px">' +
         '<div style="font-size:14px;font-weight:650;margin-bottom:6px">还没有可浏览的流媒体服务器</div>' +
         '<div style="color:var(--mut);font-size:12.5px;line-height:1.7;margin-bottom:14px">' +
         esc(j.err) + '<br>支持 Navidrome / Subsonic / Emby（只取原始文件，不转码）。先在「设置 → 高级 → 流媒体服务器」填地址与账号，保存后回到这里即可浏览。</div>' +

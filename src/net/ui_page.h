@@ -89,8 +89,10 @@ inline std::string rta_ui_page() {
     // 把主区挤到 434px → 曲目名被压成 0 宽、专辑网格只剩 2 列。窄窗默认收起抽屉，主区优先。
     h += "@media (max-width:1240px){#app{grid-template-columns:200px minmax(0,1fr) 0}#app #right{display:none}}";
     // 窄窗口下曲目行按「歌名 > 艺术家 > 规格」优先级收列，绝不把歌名压成 0 宽（评审 #3/#18 的根因兜底）
-    h += "@media (max-width:1400px){.trow-track{grid-template-columns:28px 24px minmax(140px,1.6fr) minmax(0,1fr) 58px!important}.trow-track .bd{display:none}}";
-    h += "@media (max-width:1120px){.trow-track{grid-template-columns:28px 24px minmax(160px,1fr) 58px!important}.trow-track .ar{display:none}}";
+    h += ".trow-track .ar,.trow-track .bd{overflow:hidden}";
+    h += "@media (max-width:1400px){.trow-track{grid-template-columns:28px 24px minmax(120px,1.8fr) minmax(0,1fr) 0px 58px!important}}";
+    h += "@media (max-width:1120px){.trow-track{grid-template-columns:28px 24px minmax(0,1fr) minmax(0,.9fr) 0px 58px!important}}";
+    
     // 顶栏
     // 顶栏与内容同底色、无分隔线：整块界面连成一片（QQ 音乐式一体化）。
     h += ".top{grid-column:1/-1;display:flex;align-items:center;gap:10px;padding:0 10px 0 16px;background:var(--bg);border-bottom:0;position:relative;z-index:9;min-width:0}";
@@ -386,9 +388,9 @@ inline std::string rta_ui_page() {
     h += ".plrow button{color:var(--mut2);font-size:14px;padding:0 5px}";
     h += ".plrow button:hover{color:var(--danger)}";
     // 弹层
-    h += "#modal{position:fixed;inset:0;z-index:40;background:rgba(0,0,0,.45);backdrop-filter:blur(3px);display:none;place-items:center}";
+    h += "#modal{position:fixed;inset:0;z-index:40;background:rgba(0,0,0,.45);backdrop-filter:blur(3px);display:none;place-items:center;padding:16px;box-sizing:border-box;overflow:auto}";
     h += "#modal.on{display:grid}";
-    h += ".mcard{width:min(600px,92vw);max-height:calc(100vh - 40px);display:flex;flex-direction:column;overflow:hidden;background:var(--bg2);border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 70px var(--shadow)}";
+    h += ".mcard{width:min(600px,92vw);max-height:calc(100vh - 32px);display:flex;flex-direction:column;overflow:hidden;background:var(--bg2);border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 70px var(--shadow)}";
     h += ".mhead{display:flex;align-items:center;gap:9px;padding:14px 18px;border-bottom:1px solid var(--line);font-weight:650;flex:none}";
     h += ".mbody{padding:16px 18px 22px;flex:1;min-height:0;overflow:auto}";
     h += ".chain{display:flex;flex-direction:column;gap:0}";
@@ -400,7 +402,7 @@ inline std::string rta_ui_page() {
     h += ".cnode .v{font-size:12.5px;color:var(--txt);margin-top:1px}";
     h += ".cline{width:1px;height:14px;background:var(--line);margin-left:4px}";
     // 设置页
-    h += "#setpage{display:none;padding:20px 24px 60px}";
+    h += "#setpage{display:none;padding:20px 24px 104px}";   // 底部留出 sticky 保存栏的高度 + 呼吸位（UI 评审：窄窗底栏压字）
     h += "#setpage.on{display:block}";
     h += ".sgroup{margin-bottom:22px;border:1px solid var(--line);border-radius:12px;background:var(--bg2);overflow:hidden}";
     h += ".sghead{display:flex;align-items:center;gap:9px;padding:11px 16px;border-bottom:1px solid var(--line);font-weight:650;font-size:12.5px;background:var(--bg3)}";
