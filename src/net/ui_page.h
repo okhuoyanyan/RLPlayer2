@@ -155,6 +155,9 @@ inline std::string rta_ui_page() {
     h += ".ahead{display:flex;gap:20px;padding:22px 22px 16px;align-items:flex-end}";
     h += ".ahead .cv{width:168px;height:168px;border-radius:12px;background:var(--cvbg) center/cover no-repeat;border:1px solid var(--line);flex:none;box-shadow:0 10px 34px var(--shadow)}";
     h += ".ahead .info{min-width:0;padding-bottom:5px}";
+    // 无封面艺术家的首字母占位必须居中在圆形/方形头像内（261024-01 顺带修：以前字母跑到圆外左上角）
+    h += ".ahead .cv{position:relative;overflow:hidden}";
+    h += ".ahead .cv .ph{position:absolute;inset:0;display:grid;place-items:center;font-size:46px;font-weight:800;color:var(--ph-txt);background:var(--phbg)}";
     h += ".ahead .kind{font-size:10px;letter-spacing:1.4px;color:var(--mut2);font-weight:600}";
     h += ".ahead h1{font-size:26px;line-height:1.2;font-weight:750;letter-spacing:-.4px;margin:5px 0 7px;word-break:break-word}";
         h += ".ahead .sub{font-size:12.5px;color:var(--mut);margin-bottom:13px}";
@@ -265,14 +268,41 @@ h += "#npPage .npedge{display:none}";
     h += "#npPage .npgrip:active{cursor:grabbing}";
     h += ".npbg{position:absolute;inset:-60px;background-size:cover;background-position:center;filter:blur(64px) saturate(1.15) brightness(.38);transform:scale(1.08)}";
     h += ".npveil{position:absolute;inset:0;background:linear-gradient(180deg,rgba(8,9,12,.35),rgba(8,9,12,.82))}";
-    // 四行网格（用户 261023-04 #6：任何尺寸下互不重叠）：
-    //   行1 封面+标题区 / 行2 资料区 / 行3 歌词区 / 行4 进度控制区。
-    //   资料区隐藏时不占行（.withdata 由 JS 按是否有可用资料切换）⟹ 不会留空白块。
-    h += ".npgrid{position:relative;z-index:2;height:100%;display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:16px;padding:44px 52px 16px;box-sizing:border-box}";
-    h += ".npgrid.withdata{grid-template-rows:auto minmax(140px,1.6fr) minmax(0,.9fr) auto}";
+    // 三段式网格（261024-01 #3b，用户原话「丑的令人震惊」）：
+    //   行1 封面+标题 / 行2 歌词（左）+ 资料标签栏（右，默认只露标签）/ 行3 控制区。
+    //   资料内容改为右侧抽屉，默认完全不出现在版面上；歌词与资料永远**左右相邻**，绝不上下堆叠。
+    //   旧版四行（资料整行 + 歌词整行）已删除 —— 那正是用户说的"上下排列丑到不忍直视"。
+    // 内容列限宽并居中：hero / 歌词+标签栏 / 控制区 共用同一条左右边界（对齐判据靠这个，而不是靠肉眼）
+    h += ".npgrid{position:relative;z-index:2;height:100%;display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:18px;padding:44px 40px 18px;box-sizing:border-box;max-width:1240px;margin:0 auto}";
     h += ".npgrid.nolyric #npLyric{display:none}";
-    h += ".npgrid.nolyric{grid-template-rows:auto minmax(0,1fr) auto}";
-    h += ".npgrid.nolyric.withdata{grid-template-rows:auto minmax(0,1fr) auto}";
+    // 行2：左歌词 + 右标签栏（标签栏无可用资料时整列收起，歌词自动吃满）
+    h += ".npbody{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:22px;min-height:0;align-items:stretch}";
+    h += ".nprail{display:none;min-height:0;align-self:start}";
+    h += ".nprail.on{display:block}";
+    // 资料卡：右侧一张紧凑浮卡（caption + 三个标签），比"贯穿全高的分隔线 + 飘着的药丸"更像正式组件
+    h += ".nprailcard{display:flex;flex-direction:column;gap:5px;padding:9px;border-radius:14px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.08);backdrop-filter:blur(8px);min-width:104px}";
+    h += ".nprailcap{font-size:9.5px;letter-spacing:1.5px;color:var(--mut2);font-weight:700;padding:0 4px 3px}";
+    h += ".npchipwrap{display:flex;flex-direction:column;align-items:stretch;gap:4px;min-height:0}";
+    // 标签（歌曲/专辑/艺术家/作品）：默认只露这一列药丸，点开才从右侧滑出抽屉。
+    h += ".npchip{display:flex;align-items:center;gap:8px;justify-content:space-between;padding:7px 10px;border-radius:9px;font-size:12px;color:var(--mut);background:transparent;border:1px solid transparent;cursor:pointer;transition:.14s;white-space:nowrap;line-height:1.5;text-align:left}";
+    h += ".npchip:hover{color:var(--txt);background:rgba(255,255,255,.09)}";
+    h += ".npchip.on{color:var(--acc-text);background:var(--acc-weak);border-color:var(--acc-weak);font-weight:600}";
+    h += ".npchip .dot{width:5px;height:5px;border-radius:50%;background:currentColor;opacity:.4;flex:none;transition:.2s}";
+    h += ".npchip.ok .dot{background:var(--ok);opacity:1}";
+    h += ".npchip.busy .dot{animation:npdot 1.1s ease-in-out infinite}";
+    h += ".npchip.err .dot{opacity:.9;background:var(--warn)}";
+    h += "@keyframes npdot{0%,100%{opacity:.25}50%{opacity:1}}";
+    h += "@media (prefers-reduced-motion:reduce){.npchip.busy .dot{animation:none}}";
+    // 资料抽屉（默认隐藏，transform 滑入 / 滑出；不改变版面尺寸 ⟹ 歌词不会被挤压跳动）
+    h += ".npdrawerbg{position:absolute;inset:0;z-index:5;background:rgba(0,0,0,.34);opacity:0;pointer-events:none;transition:opacity .2s}";
+    h += ".npdrawerbg.on{opacity:1;pointer-events:auto}";
+    h += ".npdrawer{position:absolute;top:0;right:0;bottom:0;z-index:6;width:min(460px,46vw);display:flex;flex-direction:column;background:var(--bg2);border-left:1px solid var(--line);box-shadow:-28px 0 70px rgba(0,0,0,.5);transform:translateX(102%);visibility:hidden;transition:transform .22s cubic-bezier(.4,0,.2,1),visibility .22s}";
+    h += ".npdrawer.on{transform:none;visibility:visible}";
+    h += ".npdhead{display:flex;align-items:center;gap:9px;padding:16px 16px 12px;border-bottom:1px solid var(--line);flex:none;min-width:0}";
+    h += ".npdkicker{font-size:9.5px;letter-spacing:1.2px;font-weight:700;color:var(--acc-text);background:var(--acc-weak);border-radius:5px;padding:2px 6px;flex:none}";
+    h += ".npdname{font-size:13.5px;font-weight:650;color:var(--txt);min-width:0;flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
+    h += ".npdclose{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;color:var(--mut);flex:none;transition:.13s}";
+    h += ".npdclose:hover{background:var(--hov2);color:var(--txt)}";
     h += ".nphero{display:grid;grid-template-columns:auto minmax(0,1fr);gap:26px;align-items:center;min-height:0}";
     h += ".npcover{height:clamp(132px,24vh,236px)}";
     h += ".npcover img{height:100%;width:auto;aspect-ratio:1/1;object-fit:cover;border-radius:14px;box-shadow:0 24px 70px rgba(0,0,0,.6);display:block}";
@@ -291,47 +321,58 @@ h += "#npPage .npedge{display:none}";
     //   左右 1fr 由网格保证严格等宽 ⟹ 中间列的水平中心 == 容器水平中心；
     //   时长行的 "/" 放在中间列，播放键也放在中间列 ⟹ 两者中心必然重合。
     // 宽度必须两边一样（都取 --npctl-w），否则两个容器中心不同，对齐又跑了。
-    h += ":root{--npctl-w:min(720px,70vw)}";
+    // 整页控制组宽度：261024-01 起控制键与时间/音量同处一行 ⟹ 必须收窄（旧 70vw 在新布局里会溢出）
+    h += ":root{--npctl-w:min(460px,40vw)}";
     h += ".npkeys{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:14px;width:var(--npctl-w)}";
     h += ".npkeys .grp{display:flex;align-items:center;gap:14px}";
     h += ".npkeys .grp.l{justify-content:flex-end}.npkeys .grp.r{justify-content:flex-start}";
-    h += ".nptime{font-size:12px;color:var(--mut);display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:14px;font-variant-numeric:tabular-nums;width:var(--npctl-w)}";
-    h += ".nptime .tside{display:flex;align-items:center;gap:6px}";
-    h += ".nptime .tside.l{justify-content:flex-end}.nptime .tside.r{justify-content:flex-start}";
-    h += ".npseek{width:min(720px,70vw);height:4px;border-radius:2px;background:rgba(255,255,255,.18);position:relative;cursor:pointer}";
+    // 261024-01 #3b：时间不再是"当前 x:xx / 总时长 y:yy"两条对称列（那是上下堆叠时代的对齐补丁），
+    // 现在是控制行左侧的一个紧凑整体，与控制键/音量同高。
+    h += ".nptime{font-size:12px;color:var(--mut2);display:flex;align-items:center;gap:6px;font-variant-numeric:tabular-nums;white-space:nowrap}";
+    h += ".nptime .tval{font-weight:600;color:var(--txt2);min-width:0}";
+    h += ".nptime .tsep{opacity:.45}";
+    h += ".npseek{width:100%;height:5px;border-radius:3px;background:rgba(255,255,255,.16);position:relative;cursor:pointer;transition:height .15s}";
+    h += ".npseek:hover{height:7px}";
     h += ".npseek>i{position:absolute;left:0;top:0;bottom:0;border-radius:2px;background:var(--acc);width:0}";
     h += ".nptime .tlab{font-size:10px;color:var(--mut2);letter-spacing:.4px}";
     h += ".nptime .tval{min-width:42px;text-align:center;font-weight:600;color:var(--txt2)}";
     h += ".nptime .tsep{opacity:.45;margin:0 1px;text-align:center;min-width:10px}";
-    // 整页的音量条（用户 UI2：单曲播放页缺音量调节）
-    h += ".npvol{display:flex;align-items:center;gap:9px;color:var(--mut);width:min(380px,42vw)}";
-    h += ".npvol input[type=range]{flex:1;accent-color:var(--acc)}";
-    h += ".npvol .vlab{font-size:11px;min-width:44px;text-align:right;font-variant-numeric:tabular-nums;color:var(--txt2)}";
+    // 整页音量（用户 UI2：单曲播放页缺音量调节；261024-01 #3b ①：并入控制行，不再单独占底部一行）
+    h += ".npvol{display:flex;align-items:center;gap:8px;color:var(--mut);width:auto;min-width:150px}";
+    h += ".npvol input[type=range]{width:104px;accent-color:var(--acc)}";
+    h += ".npvol .vlab{font-size:11px;min-width:46px;text-align:right;font-variant-numeric:tabular-nums;color:var(--txt2)}";
     // 行3：歌词区（独立滚动，min-height:0 保证网格行真的能压缩 —— 这是 1024x640 下
     // 歌词压到进度条上的根因：旧实现 .nplyric 固定 58vh 且控件绝对定位，二者必然重叠）
-    h += ".nplyric2{min-height:0;overflow:auto;text-align:center;scrollbar-width:none;padding:2px 0}";
+    h += ".nplyric2{min-height:0;overflow:auto;text-align:center;scrollbar-width:none;padding:2px 0;-webkit-mask-image:linear-gradient(180deg,transparent 0,#000 26px,#000 calc(100% - 26px),transparent 100%);mask-image:linear-gradient(180deg,transparent 0,#000 26px,#000 calc(100% - 26px),transparent 100%)}";
     // 无歌词/纯音乐时把提示垂直居中，避免大片空白显得像没加载出来
     h += ".nplyric2.empty{display:flex;flex-direction:column;align-items:center;justify-content:center}";
     h += ".nplyric2::-webkit-scrollbar{display:none}";
-    h += ".npline{font-size:clamp(13px,1.9vh,17px);line-height:2.05;color:var(--mut2);transition:.18s}";
+    h += ".npline{font-size:clamp(13px,1.9vh,17px);line-height:2.05;color:var(--mut);transition:.18s}";
     h += ".npline.on{color:var(--txt);font-weight:650;transform:scale(1.03)}";
-    // 行4：进度控制区（正常流式排版，不再绝对定位 ⟹ 与歌词/资料区不会重叠）
-    h += ".npctl2{min-height:0;display:grid;grid-template-rows:auto auto auto;gap:11px;justify-items:center}";
-    // 行2：资料面板（用户 261023-04 #7：按实体分区的 AI 资料；优雅加载态 + 缓存/未核对标注）
-    h += ".npdata{min-height:120px;display:none;flex-direction:column;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09);border-radius:12px;padding:10px 14px 8px;box-sizing:border-box;overflow:hidden}";
-    h += ".npdata.on{display:flex}";
-    h += ".npdhead{display:flex;align-items:center;gap:8px;flex:none;flex-wrap:wrap}";
-    h += ".npdtabs{display:flex;align-items:center;gap:4px;flex-wrap:wrap}";
-    h += ".npdtab{padding:4px 12px;border-radius:999px;font-size:11.5px;color:var(--mut);border:1px solid transparent;transition:.13s;background:transparent}";
-    h += ".npdtab:hover{color:var(--txt);background:var(--hov)}";
-    h += ".npdtab.on{background:var(--acc-weak);border-color:var(--acc-weak);color:var(--acc-text);font-weight:600}";
-    h += ".npdstat{margin-left:auto;font-size:10.5px;color:var(--mut2);white-space:nowrap}";
-    h += ".npdbody{flex:1;min-height:0;overflow:auto;margin-top:8px;font-size:12.5px;line-height:1.7;color:var(--txt2);scrollbar-width:thin}";
+    // 行3：控制区（261024-01 #3b ①：音量不再是底部独立一行）——
+    //   进度条一行；下面**同一行**放「时间（左）/ 控制键（中）/ 音量（右）」，
+    //   三列都居中于同一条竖轴，整页底部只剩这一块控制区。
+    h += ".npctl2{min-height:0;display:grid;grid-template-rows:auto auto;gap:12px;justify-items:center}";
+    h += ".npctlrow{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:16px;width:100%}";
+    h += ".npctlrow .nptime{justify-self:start}";
+    h += ".npctlrow .npkeys{justify-self:center}";
+    h += ".npctlrow .npvol{justify-self:end}";
+    h += ".npdstat{font-size:10.5px;color:var(--mut2);white-space:nowrap;flex:none}";
+    h += ".npdbody{flex:1;min-height:0;overflow:auto;padding:14px 16px 22px;font-size:12.5px;line-height:1.7;color:var(--txt2);scrollbar-width:thin}";
     h += ".npdbody::-webkit-scrollbar{width:6px}";
     h += ".npdbody::-webkit-scrollbar-thumb{background:var(--line);border-radius:3px}";
     h += ".npdsec{margin-bottom:8px}";
     h += ".npdsec h4{font-size:12px;color:var(--txt);margin:0 0 4px;font-weight:650}";
     h += ".npdbody p{margin:0 0 5px}";
+    // 标签值网格（261024-01 #4）：label 小字灰、value 主色；长文本（简介/曲目列表/制作人员…）独占整行。
+    // 三处复用：单曲页抽屉 / 专辑页简介 / 艺术家页资料 —— 一致性靠同一份样式。
+    h += ".efields{display:grid;grid-template-columns:repeat(auto-fill,minmax(178px,1fr));gap:13px 22px}";
+    h += ".efrow{min-width:0}";
+    h += ".efrow.wide{grid-column:1/-1}";
+    h += ".efrow .lb{font-size:10px;letter-spacing:.8px;color:var(--mut2);font-weight:600;margin-bottom:3px}";
+    h += ".efrow .vl{font-size:12.5px;line-height:1.72;color:var(--txt);word-break:break-word}";
+    h += ".efrow.wide .vl{color:var(--txt2);white-space:pre-wrap}";
+    h += ".efrow .vl a{color:var(--acc-text)}";
     h += ".npdskel i{display:block;height:9px;border-radius:5px;margin-bottom:8px;background:linear-gradient(90deg,var(--hov),var(--hov2) 45%,var(--hov));background-size:220% 100%;animation:npskel 1.4s ease-in-out infinite}";
     h += "@keyframes npskel{0%{background-position:0 0}100%{background-position:-220% 0}}";
     h += "@media (prefers-reduced-motion:reduce){.npdskel i{animation:none}}";
@@ -354,7 +395,7 @@ h += "#npPage .npedge{display:none}";
     h += "html[data-theme=light] .npclose:hover,html[data-theme=blue] .npclose:hover{background:rgba(15,23,42,.15)}";
     h += "html[data-theme=light] .npseek,html[data-theme=blue] .npseek{background:rgba(15,23,42,.16)}";
     h += "html[data-theme=light] .npcover img,html[data-theme=blue] .npcover img{box-shadow:0 24px 70px rgba(15,23,42,.22)}";
-    h += "html[data-theme=light] .npdata,html[data-theme=blue] .npdata{background:rgba(15,23,42,.035);border-color:rgba(15,23,42,.09)}";
+    h += "html[data-theme=light] .nprailcard,html[data-theme=blue] .nprailcard{background:rgba(15,23,42,.04);border-color:rgba(15,23,42,.10)}";
     h += "html[data-theme=light] .npdwork,html[data-theme=blue] .npdwork{border-bottom-color:var(--line)}";
     h += ".k{width:32px;height:32px;border-radius:9px;display:grid;place-items:center;color:var(--mut);transition:.13s}";
     h += ".k:hover{background:var(--hov2);color:var(--txt)}";
@@ -652,23 +693,20 @@ h += "#npPage .npedge{display:none}";
     // npMeta：元数据补全芯片（year/genre/albumArtist/已补全）+ 当前 EQ/IR 芯片，由 renderNp 填充
     h += "<div class=npmline id=npMeta></div>";
     h += "</div></div>";
-    // 行2：资料区（多实体 AI 资料；无可用资料时整行收起，不留空白块）
-    h += "<section class=npdata id=npData><div class=npdhead>";
-    h += "<div class=npdtabs id=npTabs></div><div class=npdstat id=npDataStat></div>";
-    h += "</div><div class=npdbody id=npDataBody></div></section>";
-    // 行3：歌词区
+    // 行2（261024-01 #3b ②③）：**左歌词 / 右资料标签栏**，左右排列，绝不上下堆叠。
+    //   资料默认完全隐藏，右侧只露「歌曲 / 专辑 / 艺术家 / 作品」标签；
+    //   点标签 → 从右侧滑出抽屉看内容（.npdrawer，默认 translateX(102%) + visibility:hidden）。
+    h += "<div class=npbody id=npBody>";
     h += "<div class=nplyric2 id=npLyric><div class=npline>还没有在播放</div></div>";
-    // 行4：进度控制区（整页也要能操作，否则进来就必须退出）
+    h += "<aside class=nprail id=npRail><div class=nprailcard><div class=nprailcap>AI 整理</div>";
+    h += "<div class=npchipwrap id=npTabs></div></div></aside>";
+    h += "</div>";
+    // 行3：控制区（整页也要能操作，否则进来就必须退出）
     h += "<div class=npctl2>";
     h += "<div class=npseek id=npSeek title='点击跳转'><i id=npBar></i></div>";
-    // 时长行：3 列网格，中间列居中放「当前 x:xx / 总时长 y:yy」里的分隔符 "/"。
-    // 因为左右两列都是 1fr（等宽），中间列的中心 == 容器中心；下面 .npkeys 的播放键
-    // 也落在中间列中心 ⟹ 两者严格对齐（用户 UI3；详见 CSS 注）。
-    h += "<div class=nptime>";
-    h += "<div class='tside l'><span class=tlab>当前</span><span class=tval id=npPos>0:00</span></div>";
-    h += "<span class=tsep id=npSep>/</span>";
-    h += "<div class='tside r'><span class=tlab>总时长</span><span class=tval id=npDur>0:00</span></div>";
-    h += "</div>";
+    // 261024-01 #3b ①：音量不再单独一行 —— 「时间 / 控制键 / 音量」同处一行（三列网格，中列恒居中）。
+    h += "<div class=npctlrow>";
+    h += "<div class=nptime><span class=tval id=npPos>0:00</span><span class=tsep id=npSep>/</span><span class=tval id=npDur>0:00</span></div>";
     h += "<div class=npkeys>";
     // 左组：循环方式 + 上一首。循环按钮直接把 #sRep 的值改掉并下发（唯一真相源，
     // 见 ui_script 的 cycleRep()——整页与底栏/设置页共用同一个值，不各存一份）。
@@ -682,14 +720,25 @@ h += "#npPage .npedge{display:none}";
     h += "<div class='grp r'>";
     h += "<button class=k id=npNext title='下一首'><svg width='18' height='18' viewBox='0 0 24 24' fill='currentColor'><path d='M16 5h2v14h-2zM4 5v14l11-7z'/></svg></button>";
     h += "<button class=k id=npStop title='停止'><svg width='15' height='15' viewBox='0 0 24 24' fill='currentColor'><rect x='6' y='6' width='12' height='12' rx='2'/></svg></button>";
-    h += "</div></div>";
-    // 音量行：滑块本身是 #vol 的镜像（同一个 S.vol 真相源，见 setVol）
+    h += "</div>";   // .grp.r
+    h += "</div>";   // .npkeys —— 音量必须和 npkeys 同级，才是"同一行"
+    // 音量并入同一控制行（#3b ①）；滑块本身是 #vol 的镜像（同一个 S.vol 真相源，见 setVol）
     h += "<div class=npvol><svg width='14' height='14' viewBox='0 0 24 24' fill=none stroke='currentColor' stroke-width='2' opacity=.6><path d='M3 10v4h4l5 4V6L7 10H3z'/><path d='M16.5 8.5a5 5 0 010 7'/></svg>";
     h += "<input id=npVol type=range min=-60 max=0 step=0.5 value=0 title='音量（dB）'>";
-    h += "<span class=vlab id=npVolLab>0.0 dB</span></div></div>";
+    h += "<span class=vlab id=npVolLab>0.0 dB</span></div>";
+    h += "</div>";   // .npctlrow
+    h += "</div>";   // .npctl2
+    // 关：.npgrid → #npPage
     h += "</div>";
-    // 关：.npctl2 → .npgrid → #npPage
-    h += "</div></div>";
+    // 资料抽屉（#3b ③）：默认隐藏；点右侧标签才滑出。层级在 .npgrid 之上、#modal 之下。
+    h += "<div class=npdrawerbg id=npDrawerBg></div>";
+    h += "<aside class=npdrawer id=npDrawer>";
+    h += "<div class=npdhead><span class=npdkicker id=npDrawerKind>资料</span>";
+    h += "<div class=npdname id=npDrawerName></div>";
+    h += "<span class=npdstat id=npDataStat></span>";
+    h += "<button class=npdclose id=npDataClose title='关闭（Esc）'><svg width=14 height=14 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2><path d='M18 6L6 18M6 6l12 12'/></svg></button>";
+    h += "</div><div class=npdbody id=npDataBody></div></aside>";
+    h += "</div>";
 
     h += "<div id=modal><div class=mcard><div class=mhead><b id=mtitle>信号链</b><span class=sp></span><button class=ibtn id=mclose><svg width=15 height=15 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2><path d='M18 6L6 18M6 6l12 12'/></svg></button></div><div class=mbody id=mbody></div></div></div>";
     h += "<div class=toast id=toast></div></div>";
