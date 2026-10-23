@@ -56,6 +56,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <functional>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -978,6 +979,38 @@ inline constexpr int  kDizzylabFailLimit      = 3;
 inline constexpr int  kDizzylabCooldownSec    = 120;
 inline constexpr int  kDizzylabTimeoutMs      = 15000;   // 与四源同(15s)
 
+// E-18：测试专用可注入 transport 与时钟钩子（默认 nullptr，走真实网络与真实时钟）
+using DlHttpTransportHook = std::function<rta::net::HttpResponse(
+    const std::string& url,
+    const std::vector<std::string>& headers,
+    int timeoutMs)>;
+
+using DlClockHook = std::function<std::chrono::steady_clock::time_point()>;
+
+inline DlHttpTransportHook& dl_transport_hook() {
+    static DlHttpTransportHook hook = nullptr;
+    return hook;
+}
+
+inline DlClockHook& dl_clock_hook() {
+    static DlClockHook hook = nullptr;
+    return hook;
+}
+
+inline void set_dizzylab_transport_for_test(DlHttpTransportHook hook) {
+    dl_transport_hook() = std::move(hook);
+}
+
+inline void set_dizzylab_clock_for_test(DlClockHook hook) {
+    dl_clock_hook() = std::move(hook);
+}
+
+inline std::chrono::steady_clock::time_point dl_now() {
+    auto& h = dl_clock_hook();
+    if (h) return h();
+    return std::chrono::steady_clock::now();
+}
+
 struct DlGate {
     std::chrono::steady_clock::time_point lastCall{};   // 上次请求发出时刻
     int  fails = 0;                                      // 连续失败次数
@@ -986,13 +1019,18 @@ struct DlGate {
 inline DlGate& dl_gate() { static DlGate g; return g; }
 inline std::mutex& dl_gate_mtx() { static std::mutex m; return m; }
 
+inline void dl_gate_reset_for_test() {
+    std::lock_guard<std::mutex> lk(dl_gate_mtx());
+    dl_gate() = DlGate{};
+}
+
 // 取到「可以发请求」的许可:限频 sleep + 熔断判定都在锁内做(临界区最多 1s 的 sleep,
 // 但 dizzylab 只有这一条调用路径,且 enrich 侧本来就是串行,阻塞可接受)。
 // 返回 false = 熔断中,调用方直接返回空候选(不重试、不抛)。
 inline bool dl_gate_acquire(std::string& err) {
     std::lock_guard<std::mutex> lk(dl_gate_mtx());
     DlGate& g = dl_gate();
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = dl_now();
     if (now < g.coolUntil) {
         const long long left = (long long)std::chrono::duration_cast<std::chrono::seconds>(
                                    g.coolUntil - now).count() + 1;
@@ -1001,9 +1039,10 @@ inline bool dl_gate_acquire(std::string& err) {
     }
     if (g.lastCall.time_since_epoch().count() != 0) {
         const auto wait = std::chrono::milliseconds(kDizzylabMinIntervalMs) - (now - g.lastCall);
-        if (wait.count() > 0) std::this_thread::sleep_for(wait);
+        // 若注入了测试时钟，由时钟控制时间推进，不在此做真实线程 sleep
+        if (wait.count() > 0 && !dl_clock_hook()) std::this_thread::sleep_for(wait);
     }
-    g.lastCall = std::chrono::steady_clock::now();
+    g.lastCall = now;
     return true;
 }
 
@@ -1017,7 +1056,7 @@ inline void dl_gate_fail() {
     std::lock_guard<std::mutex> lk(dl_gate_mtx());
     DlGate& g = dl_gate();
     if (++g.fails >= kDizzylabFailLimit) {
-        g.coolUntil = std::chrono::steady_clock::now() +
+        g.coolUntil = dl_now() +
                       std::chrono::seconds(kDizzylabCooldownSec);
         g.fails = 0;
     }
@@ -1026,8 +1065,11 @@ inline void dl_gate_fail() {
 // 单次 GET(带 UA + 限频 + 熔断记账)。返回空 body 表示失败,err 已写明原因。
 inline std::string dl_http_get(const std::string& url, std::string& err) {
     if (!dl_gate_acquire(err)) return "";
-    const rta::net::HttpResponse resp = rta::net::http_get(
-        url, { std::string("User-Agent: ") + pv_user_agent() }, kDizzylabTimeoutMs);
+    const auto& hook = dl_transport_hook();
+    const rta::net::HttpResponse resp = hook
+        ? hook(url, { std::string("User-Agent: ") + pv_user_agent() }, kDizzylabTimeoutMs)
+        : rta::net::http_get(
+            url, { std::string("User-Agent: ") + pv_user_agent() }, kDizzylabTimeoutMs);
     if (resp.status == 0) {
         dl_gate_fail();
         err = "请求失败: " + resp.error;
