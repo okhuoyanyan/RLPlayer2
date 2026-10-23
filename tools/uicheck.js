@@ -13,6 +13,8 @@ const os = require('os');
 const URL_ = process.argv[2] || 'http://127.0.0.1:8902/';
 const OUT = process.argv[3] || path.join(os.tmpdir(), 'rta_uicheck');
 fs.mkdirSync(OUT, { recursive: true });
+const OUT_UI3 = path.join(__dirname, '..', 'build', 'ui3');
+fs.mkdirSync(OUT_UI3, { recursive: true });
 
 const EDGE = ['C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
               'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'].find(p => fs.existsSync(p));
@@ -61,10 +63,14 @@ async function evalJs(expr) {
   }
   return r.result && r.result.value;
 }
-async function shot(name) {
+async function shot(name, toUi3) {
   const r = await send('Page.captureScreenshot', { format: 'png' });
   const p = path.join(OUT, name + '.png');
   fs.writeFileSync(p, Buffer.from(r.data, 'base64'));
+  if (toUi3) {
+    const p3 = path.join(OUT_UI3, name + '.png');
+    fs.writeFileSync(p3, Buffer.from(r.data, 'base64'));
+  }
   return p;
 }
 async function waitFor(expr, ms = 8000) {
@@ -114,6 +120,16 @@ async function waitFor(expr, ms = 8000) {
   ck(await evalJs("!document.querySelector('#list .empty')"), '主内容区没有落到空状态');
   const p1 = await shot('01-albums');
 
+  // ---- 验收 1：导航里有「古典作品」「EQ 与房间校正」 ----
+  const navOk = await evalJs(`(function(){
+    var navs = Array.from(document.querySelectorAll('.nav')).map(e => e.textContent.trim());
+    var hasClassical = navs.some(t => t.indexOf('古典作品') >= 0);
+    var hasEq = navs.some(t => t.indexOf('EQ 与房间校正') >= 0);
+    return { ok: hasClassical && hasEq, hasClassical: hasClassical, hasEq: hasEq, navs: navs };
+  })()`);
+  ck(navOk.ok, '导航里有「古典作品」「EQ 与房间校正」', JSON.stringify(navOk));
+  await shot('01-nav-classical-eq', true);
+
   // 点第一张专辑
   await evalJs("document.querySelector('.card').click()");
   ck(await waitFor("document.querySelector('#list .ahead') || document.querySelector('#list .empty')", 8000), '专辑页打开');
@@ -127,6 +143,53 @@ async function waitFor(expr, ms = 8000) {
   await sleep(700);
   ck(await evalJs("document.querySelectorAll('.trow').length > 0"), '曲目视图有内容');
   const p3 = await shot('03-tracks');
+
+  // ---- 验收 2：曲目页有排序控件，点收藏优先后顺序变化；点心形后 /api/fav/list 出现该文件，取消后消失 ----
+  ck(await evalJs("!!document.getElementById('trackSort')"), '曲目页有排序控件');
+  const favCycleOk = await evalJs(`(async function(){
+    var rows = document.querySelectorAll('#list .trow');
+    if (!rows.length) return { ok: false, msg: '没有曲目行' };
+    var btn = rows[0].querySelector('.fav-btn');
+    if (!btn) return { ok: false, msg: '没有心形按钮' };
+    var f = btn.dataset.file;
+    await fetch('/api/fav?file=' + encodeURIComponent(f) + '&on=0');
+    var l0 = await fetch('/api/fav/list').then(r => r.json());
+    if (l0.files.indexOf(f) >= 0) return { ok: false, msg: '初始清理失败' };
+    btn.click();
+    await new Promise(r => setTimeout(r, 450));
+    var l1 = await fetch('/api/fav/list').then(r => r.json());
+    if (l1.files.indexOf(f) < 0) return { ok: false, msg: '点心形后未在 /api/fav/list 出现' };
+    btn.click();
+    await new Promise(r => setTimeout(r, 450));
+    var l2 = await fetch('/api/fav/list').then(r => r.json());
+    if (l2.files.indexOf(f) >= 0) return { ok: false, msg: '再次点击未在 /api/fav/list 消失' };
+    return { ok: true, file: f };
+  })()`);
+  ck(favCycleOk.ok, '点心形后 /api/fav/list 出现该文件，取消后消失', JSON.stringify(favCycleOk));
+
+  const favSortOk = await evalJs(`(async function(){
+    var rows = document.querySelectorAll('#list .trow');
+    if (rows.length < 2) return { ok: false, msg: '曲目不足2首' };
+    var titlesBefore = Array.from(document.querySelectorAll('#list .trow .tt')).map(e => e.textContent);
+    var lastRow = rows[rows.length - 1];
+    var lastBtn = lastRow.querySelector('.fav-btn');
+    lastBtn.click();
+    await new Promise(r => setTimeout(r, 400));
+    var sel = document.getElementById('trackSort');
+    sel.value = 'fav';
+    sel.dispatchEvent(new Event('change'));
+    await new Promise(r => setTimeout(r, 400));
+    var titlesAfter = Array.from(document.querySelectorAll('#list .trow .tt')).map(e => e.textContent);
+    var changed = (titlesBefore.join('||') !== titlesAfter.join('||'));
+    var firstIsFav = document.querySelectorAll('#list .trow')[0].querySelector('.fav-btn').classList.contains('on');
+    var activeFav = document.querySelector('#list .trow .fav-btn.on');
+    if (activeFav) activeFav.click();
+    sel.value = 'default';
+    sel.dispatchEvent(new Event('change'));
+    return { ok: changed && firstIsFav, changed: changed, firstIsFav: firstIsFav };
+  })()`);
+  ck(favSortOk.ok, '点收藏优先后顺序变化', JSON.stringify(favSortOk));
+  await shot('02-tracks-sort-fav', true);
 
   // 艺术家
   await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='artists').click()");
@@ -610,20 +673,42 @@ async function waitFor(expr, ms = 8000) {
   ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=out] a[href^=http]').length === 0"),
      '投放小节与输出页签无 http 外链');
 
-  // ---- 耳机 EQ（OPRA）小节自检 ----
+  // ---- 高级设置页包含前往 EQ 页面跳转按钮 ----
   await evalJs("document.querySelector('.stab[data-g=adv]').click()");
-  ck(await waitFor("!!document.getElementById('sp_opra_search') && !!document.getElementById('sp_opra_product') && !!document.getElementById('sp_opra_preset') && !!document.getElementById('sp_opra_apply')", 5000),
-     '设置页高级页签包含 OPRA 耳机 EQ 控件（搜索/产品/预设/应用）');
-  ck(await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=adv]');if(!p)return false;return p.textContent.indexOf('CC BY-SA 4.0')>=0&&p.textContent.indexOf('OPRA')>=0;})()"),
-     '耳机 EQ 小节包含 CC BY-SA 4.0 归属声明');
-  ck(await evalJs("!!document.getElementById('sp_opra_copychip') && document.getElementById('sp_opra_copychip').classList.contains('chip')"),
-     '存在复制官网链接芯片（.chip）');
+  ck(await evalJs("!!document.getElementById('bGoEqNav')"), '高级设置页包含前往 EQ 与房间校正页面的跳转按钮');
   ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=adv] a[href^=http]').length === 0"),
-     '耳机 EQ 与高级页签无外链');
-  // 实时搜索测试
+     '高级页签无外链');
+
+  // ---- 验收 3 & 4：EQ 与房间校正独立页面自检（261023-03 第6/7条） ----
+  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='eq').click()");
+  await sleep(700);
+  ck(await evalJs("S.view === 'eq'"), '可进入独立「EQ 与房间校正」页面');
+  ck(await evalJs("!!document.getElementById('sp_opra_search')"), '包含合并后的品牌/型号搜索框');
+
+  // 判据 3a：EQ 页空输入时型号卡片数 == 0（最关键判据）
+  const emptyCards = await evalJs("document.querySelectorAll('#eqModelCards .model-card').length");
+  ck(emptyCards === 0, 'EQ 页空输入时型号卡片数 == 0（最关键判据）', 'cards=' + emptyCards);
+  ck(await evalJs("document.querySelectorAll('#eqBrandChips .brand-chip').length >= 8"), '空输入显示引导与热门品牌芯片');
+  await shot('03-eq-empty-guide', true);
+
+  // 判据 3b：输入 HD 600 后有结果且 <=30 条
   await evalJs("var s=document.getElementById('sp_opra_search'); s.value='HD 600'; s.dispatchEvent(new Event('input'));");
-  ck(await waitFor("document.querySelectorAll('#sp_opra_product option').length > 1", 5000),
-     'OPRA 本地实时搜索 HD 600 成功过滤出产品型号');
+  await waitFor("document.querySelectorAll('#eqModelCards .model-card').length > 0", 6000);
+  const hdCards = await evalJs("document.querySelectorAll('#eqModelCards .model-card').length");
+  ck(hdCards > 0 && hdCards <= 30, '输入 HD 600 后有结果且 <=30 条', 'cards=' + hdCards);
+  await shot('04-eq-hd600-results', true);
+
+  // 判据 4：调音预设是卡片布局（至少 3 张卡）
+  await evalJs("Array.from(document.querySelectorAll('#eqModelCards .model-card')).find(c => c.dataset.name.indexOf('HD 600') >= 0 || c.dataset.id.indexOf('hd_600') >= 0).click()");
+  await waitFor("document.querySelectorAll('#eqPresetCards .preset-card').length >= 3", 8000);
+  const nPresets = await evalJs("document.querySelectorAll('#eqPresetCards .preset-card').length");
+  ck(nPresets >= 3, '调音预设是卡片布局（至少 3 张卡）', 'count=' + nPresets);
+  ck(await evalJs("document.querySelectorAll('#eqPresetCards .preset-card .opra-apply-btn').length === " + nPresets), '每张预设卡片均有应用按钮');
+  ck(await evalJs("!!document.getElementById('eqTargetCurveInfo') && document.getElementById('eqTargetCurveInfo').style.display !== 'none'"), '选中后显示目标曲线说明');
+  await shot('05-eq-presets-cards', true);
+
+  ck(await evalJs("document.querySelectorAll('#list a[href^=http]').length === 0"), 'EQ 与房间校正页面无外链');
+  ck(await evalJs("!!document.getElementById('sp_opra_copychip') && document.getElementById('sp_opra_copychip').classList.contains('chip')"), '存在复制官网链接芯片');
 
   // ---- 右栏标签页 / 歌词 / 播放列表 / 信号链 ----
   await evalJs("document.querySelector('.rtab[data-t=l]').click()");
@@ -659,7 +744,7 @@ async function waitFor(expr, ms = 8000) {
       //            （早期把两类混在一起判，导致把正常控件误报成"未绑定"）
       //  P1.5：元数据源开关是动态的（/api/providers 注册表）—— 在静态清单之外逐源补查
       //  P2：标签写回的预览/执行按钮也是要点了有反应的
-      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_metasummary','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_opra_search','sp_opra_product','sp_opra_preset','sp_opra_apply','sp_opra_copychip','sp_instart','sp_instop','sp_inmon','sp_cast_scan','sp_cast_usecur','sp_cast_start','sp_cast_stop','sp_cast_dop','sp_cast_dev'];
+      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_metasummary','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','bGoEqNav','sp_instart','sp_instop','sp_inmon','sp_cast_scan','sp_cast_usecur','sp_cast_start','sp_cast_stop','sp_cast_dop','sp_cast_dev'];
       (META_PROVIDERS || []).forEach(function (p) { needBind.push('sp_meta_' + p.id); });
       var valueOnly=['sRate','sFilt','sFiltNx','sShap','sBuf','sDSD','sIsp','s2s','sp_cast_file'];
       var miss=[];
