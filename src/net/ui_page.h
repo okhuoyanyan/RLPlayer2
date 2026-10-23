@@ -470,7 +470,9 @@ inline std::string rta_ui_page() {
     // 只进整页，底栏不加（避免拥挤）；样式只用布局属性，颜色交给 .badge 自身的 CSS 变量。
     h += "<div class=nptit id=npTitle>未播放</div><div class=npsub id=npSub></div>";
     h += "<div id=npMeta style='display:flex;flex-wrap:wrap;gap:6px;margin-top:8px'></div>";
-    h += "<div id=npSummary style='display:none;margin-top:14px;max-height:160px;overflow-y:auto;font-size:12px;line-height:1.6;color:var(--txt)'></div></div>";
+    // 整页简介：低调滚动区（不是大按钮/大动画）。高度给到 38vh，让 ROON 式介绍能读到几段；
+    // 内容多时页内滚动，不挤压右侧歌词列。
+    h += "<div id=npSummary style='display:none;margin-top:14px;max-height:38vh;overflow-y:auto;font-size:12px;line-height:1.6;color:var(--txt)'></div></div>";
     h += "<div class=nplyric id=npLyric><div class=npline>还没有在播放</div></div>";
     h += "</div>";
     // 播放控件：整页也要能操作，否则进来就必须退出
