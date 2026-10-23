@@ -3664,36 +3664,119 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
     if (rq.path.rfind("/api/src", 0) == 0) {
         ct = "application/json; charset=utf-8";
         auto& mgr = SourceManager::instance();
+        // 2026-10-24（用户 261024-01 #5）：单服务器 → 多服务器。
+        //   GET  /api/src/config             → 服务器列表 + 当前启用（密码只回 hasPass，永不回明文）
+        //   POST /api/src/config action=add|update|remove|active …
+        //        （无 action 且带 kind/base/user/pass = 旧协议：更新当前启用服务器，保持兼容）
         if (rq.path.rfind("/api/src/config", 0) == 0) {
             if (rq.method == "POST") {
-                SourceConfig c = mgr.config();
+                std::map<std::string, std::string> f;
                 std::istringstream is(rq.body);
                 std::string tok;
                 while (std::getline(is, tok, (char)38)) {
                     const size_t e = tok.find((char)61);
                     if (e == std::string::npos) continue;
-                    const std::string kk = urlDecode(tok.substr(0, e));
-                    const std::string vv = urlDecode(tok.substr(e + 1));
-                    if (kk == "kind") c.kind = vv;
-                    else if (kk == "base") c.base = vv;
-                    else if (kk == "user") c.user = vv;
-                    else if (kk == "pass") c.pass = vv;
+                    f[urlDecode(tok.substr(0, e))] = urlDecode(tok.substr(e + 1));
                 }
+                auto gv = [&](const char* k) {
+                    const auto it = f.find(k);
+                    return it == f.end() ? std::string() : it->second;
+                };
+                const std::string action = gv("action");
+                if (action == "add" || action == "update" ||
+                    (action.empty() && !gv("kind").empty() && gv("id").empty() && f.count("base"))) {
+                    SourceConfig c;
+                    c.kind = gv("kind").empty() ? "subsonic" : gv("kind");
+                    c.base = gv("base");
+                    c.user = gv("user");
+                    c.pass = gv("pass");
+                    c.name = gv("name");
+                    const std::string id = gv("id");
+                    if (action == "add" || (action.empty() && id.empty())) {
+                        const std::string nid = mgr.add_server(c);
+                        return std::string("{\"ok\":true,\"id\":\"") + jesc(nid) + "\"}";
+                    }
+                    if (!mgr.update_server(id, c, /*keepPass=*/true))
+                        return "{\"ok\":false,\"error\":\"服务器不存在（可能已被删除）\"}";
+                    return "{\"ok\":true,\"id\":\"" + jesc(id) + "\"}";
+                }
+                if (action == "remove") {
+                    const bool ok = mgr.remove_server(gv("id"));
+                    return std::string("{\"ok\":") + (ok ? "true" : "false") +
+                           ",\"error\":\"" + (ok ? "" : "服务器不存在（可能已被删除）") + "\"}";
+                }
+                if (action == "active") {
+                    const bool ok = mgr.set_active(gv("id"));
+                    return std::string("{\"ok\":") + (ok ? "true" : "false") +
+                           ",\"error\":\"" + (ok ? "" : "服务器不存在（可能已被删除）") + "\"}";
+                }
+                // 旧协议兜底：只带 kind/base/user/pass → 更新当前启用服务器（没有就新建）
+                SourceConfig c = mgr.config();
+                if (f.count("kind")) c.kind = gv("kind");
+                if (f.count("base")) c.base = gv("base");
+                if (f.count("user")) c.user = gv("user");
+                if (f.count("pass")) c.pass = gv("pass");
                 mgr.set_config(c);
                 return "{\"ok\":true}";
             }
-            const SourceConfig c = mgr.config();
+            const std::vector<SourceConfig> list = mgr.servers();
+            const std::string act = mgr.active_id();
+            const SourceConfig cur = mgr.config();
             std::ostringstream j;
-            j << "{\"ok\":true,\"configured\":" << (c.enabled() ? "true" : "false")
-              << ",\"kind\":\"" << jesc(c.kind) << "\""
-              << ",\"base\":\"" << jesc(c.base) << "\""
-              << ",\"user\":\"" << jesc(c.user) << "\""
-              << ",\"cache\":" << mgr.cache_count() << "}";
+            j << "{\"ok\":true,\"configured\":" << (cur.valid() ? "true" : "false")
+              << ",\"active\":\"" << jesc(act) << "\""
+              << ",\"kind\":\"" << jesc(cur.kind) << "\""
+              << ",\"base\":\"" << jesc(cur.base) << "\""
+              << ",\"user\":\"" << jesc(cur.user) << "\""
+              << ",\"cache\":" << mgr.cache_count()
+              << ",\"servers\":[";
+            for (size_t i = 0; i < list.size(); ++i) {
+                if (i) j << ",";
+                j << "{\"id\":\"" << jesc(list[i].id) << "\""
+                  << ",\"name\":\"" << jesc(list[i].display_name()) << "\""
+                  << ",\"kind\":\"" << jesc(list[i].kind) << "\""
+                  << ",\"base\":\"" << jesc(list[i].base) << "\""
+                  << ",\"user\":\"" << jesc(list[i].user) << "\""
+                  << ",\"hasPass\":" << (list[i].pass.empty() ? "false" : "true")
+                  << ",\"active\":" << (list[i].id == act ? "true" : "false") << "}";
+            }
+            j << "]}";
             return j.str();
         }
         if (rq.path.rfind("/api/src/ping", 0) == 0) {
             std::string err;
-            const bool ok = mgr.ping(err);
+            bool ok = false;
+            if (rq.method == "POST") {
+                // 表单里还没保存的服务器也能先测：kind/base/user/pass 直接带进来
+                std::map<std::string, std::string> f;
+                std::istringstream is(rq.body);
+                std::string tok;
+                while (std::getline(is, tok, (char)38)) {
+                    const size_t e = tok.find((char)61);
+                    if (e == std::string::npos) continue;
+                    f[urlDecode(tok.substr(0, e))] = urlDecode(tok.substr(e + 1));
+                }
+                auto gv = [&](const char* k) {
+                    const auto it = f.find(k);
+                    return it == f.end() ? std::string() : it->second;
+                };
+                const std::string id = gv("id");
+                if (!id.empty() && gv("base").empty()) {
+                    ok = mgr.ping_server(id, err);
+                } else {
+                    SourceConfig c;
+                    c.kind = gv("kind").empty() ? "subsonic" : gv("kind");
+                    c.base = gv("base");
+                    c.user = gv("user");
+                    c.pass = gv("pass");
+                    ok = mgr.ping_config(c, err);
+                }
+            } else {
+                std::string id;
+                const size_t q = rq.path.find("?id=");
+                if (q != std::string::npos) id = urlDecode(rq.path.substr(q + 4));
+                ok = id.empty() ? mgr.ping(err) : mgr.ping_server(id, err);
+            }
             return std::string("{\"ok\":") + (ok ? "true" : "false") + ",\"error\":\"" + jesc(err) + "\"}";
         }
         if (rq.path.rfind("/api/src/browse", 0) == 0 || rq.path.rfind("/api/src/search", 0) == 0) {
@@ -5776,6 +5859,9 @@ int main(int argc, char** argv) {
 
     queue_load();                             // 恢复上次的播放列表
     Library::instance().load();               // 载入音乐库索引
+    // 2026-10-24（用户 261024-01 #5）：流媒体服务器配置必须开机载入。
+    // 旧版从未调用过 SourceManager::load() —— 填过的服务器重启后就"消失"，只能重填。
+    SourceManager::instance().load(path_in_exe_dir("rlplayer-sources.conf"));
     // 可选后备代理(P1.5):rlplayer-llm.conf 里 proxy=http://127.0.0.1:7897(可省)。
     // 非空则本进程全部 http_get/http_post 走它(HTTPS 由 WinHTTP 走 CONNECT 隧道);
     // 没有该行 = 直连,现状行为不变(本机 MusicBrainz 已可直连,代理只是后备)。

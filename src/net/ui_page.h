@@ -406,15 +406,27 @@ h += "#npPage .npedge{display:none}";
     // 设置页
     h += "#setpage{display:none;padding:20px 24px 104px}";   // 底部留出 sticky 保存栏的高度 + 呼吸位（UI 评审：窄窗底栏压字）
     h += "#setpage.on{display:block}";
-    h += ".sgroup{margin-bottom:22px;border:1px solid var(--line);border-radius:12px;background:var(--bg2);overflow:hidden}";
-    h += ".sghead{display:flex;align-items:center;gap:9px;padding:11px 16px;border-bottom:1px solid var(--line);font-weight:650;font-size:12.5px;background:var(--bg3)}";
+    h += ".sgroup{margin-bottom:22px;border:1px solid var(--line);border-radius:12px;background:var(--bg2);overflow:visible}";
+    h += ".sghead{display:flex;align-items:center;gap:9px;padding:11px 16px;border-bottom:1px solid var(--line);font-weight:650;font-size:12.5px;background:var(--bg3);border-radius:11px 11px 0 0}";
     h += ".sghead .hint{font-weight:400;font-size:11px;color:var(--mut2)}";
     h += ".sgbody{padding:14px 16px;display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px 20px}";
     h += ".sfld{min-width:0}";
     h += ".sfld label{display:block;font-size:11px;color:var(--mut);margin-bottom:5px;font-weight:500}";
     h += ".sfld .hint{font-size:10.5px;color:var(--mut2);margin-top:4px;line-height:1.5}";
-    h += ".sfld select,.sfld input[type=text],.sfld input[type=number]{width:100%;padding:7px 10px;border-radius:8px;border:1px solid var(--line);background:var(--field);font-size:12px;transition:.15s}";
+    // 2026-10-24（用户 261024-01 #5）：「密码框跟其他框样式不一样」的根因 ——
+    // 旧选择器只列了 text/number，password 完全没命中任何一条规则 ⟹ 落到浏览器默认样式
+    // （无内边距、方角、原生边框、宽度不铺满）。这里把所有文本类 input 一起列全，逐项对齐。
+    h += ".sfld select,.sfld input[type=text],.sfld input[type=number],.sfld input[type=password],.sfld input[type=url],.sfld input[type=search]{width:100%;padding:7px 10px;border-radius:8px;border:1px solid var(--line);background:var(--field);font-size:12px;font-family:inherit;line-height:1.45;color:var(--txt);transition:.15s;min-height:31px}";
     h += ".sfld select:focus,.sfld input:focus{outline:0;border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-weak)}";
+    h += ".sfld input::placeholder{color:var(--mut2);opacity:1}";
+    // 2026-10-24（用户 261024-01 #7）：长说明不再铺在页面上 —— 收进 (?) 图标，hover/focus 才显示。
+    h += ".tip{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;margin-left:5px;border-radius:50%;border:1px solid var(--line2,var(--line));color:var(--mut2);font-size:9.5px;font-weight:700;line-height:1;cursor:help;vertical-align:1px;position:relative;user-select:none;flex:none}";
+    h += ".tip:hover,.tip:focus{border-color:var(--acc);color:var(--acc);outline:0}";
+    h += ".tip::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 8px);transform:translateX(-50%);width:max-content;max-width:290px;background:var(--bg3);color:var(--txt2);border:1px solid var(--line);border-radius:9px;padding:8px 10px;font-size:11px;line-height:1.6;font-weight:400;white-space:normal;text-align:left;box-shadow:0 10px 28px var(--shadow);opacity:0;visibility:hidden;transition:opacity .12s,transform .12s;z-index:40;pointer-events:none}";
+    h += ".tip:hover::after,.tip:focus::after{opacity:1;visibility:visible}";
+    // 分组标题的 (?) 改成向下展开：向上会被吸顶的页签条盖住（实测第一个分组就是这样）。
+    h += ".sghead .tip::after{bottom:auto;top:calc(100% + 8px)}";
+    h += "@media (max-width:1200px){.tip::after{max-width:min(240px,42vw)}}";
     h += ".sfld.wide{grid-column:1/-1}";
     h += ".sfld .chk{margin:0}";
     // 元数据「高级选项」：左右两列卡片（左=数据源，右=DeepSeek 接入 + 标签写回）。
@@ -425,6 +437,10 @@ h += "#npPage .npedge{display:none}";
     h += ".meta-card .mh.sub{margin-top:16px}";
     h += ".meta-src-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px 14px}";
     h += ".meta-card .chk{margin-bottom:0}";
+    // 2026-10-24 #5：DeepSeek API Key 也是 password，之前落在 .sfld 之外没有任何输入框样式
+    //（和内嵌表单里那个密码框同病）。同样逐项对齐到文本框。
+    h += ".meta-card input[type=text],.meta-card input[type=password]{width:100%;padding:7px 10px;border-radius:8px;border:1px solid var(--line);background:var(--field);font-size:12px;font-family:inherit;line-height:1.45;color:var(--txt);min-height:31px;transition:.15s}";
+    h += ".meta-card input:focus{outline:0;border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-weak)}";
     h += "@media (max-width:1100px){.meta-adv-grid{grid-template-columns:1fr}}";
     // 设置页分页（对齐 HQPlayer 的 Inputs / Outputs / PCM / SDM / Advanced）
     h += ".stabs{display:flex;gap:4px;padding:10px 0 12px;margin:-20px 0 14px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:6}";
@@ -433,6 +449,37 @@ h += "#npPage .npedge{display:none}";
     h += ".stab.on{background:var(--acc-weak);color:var(--acc-text);border-color:rgba(59,130,246,.32);font-weight:600}";
     h += ".spane{display:none}.spane.on{display:block}";
     h += ".trimgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}";
+    // 2026-10-24（用户 261024-01 #5）：流媒体多服务器列表 + 行内操作
+    h += ".srvlist{display:flex;flex-direction:column;gap:8px}";
+    h += ".srvrow{display:grid;grid-template-columns:9px minmax(0,1fr) auto;align-items:center;gap:9px 12px;padding:10px 13px;border:1px solid var(--line);border-radius:10px;background:var(--field);transition:.13s}";
+    h += ".srvrow.on{border-color:var(--acc);background:var(--hov);box-shadow:0 0 0 1px var(--acc-weak)}";
+    h += ".srvrow:hover{background:var(--hov)}";
+    h += ".srvrow.on:hover{background:var(--hov2,var(--hov))}";
+    h += ".srvdots{width:9px;height:9px;border-radius:50%;background:var(--track);flex:none}";
+    h += ".srvrow.on .srvdots{background:var(--ok);box-shadow:0 0 9px var(--ok-line)}";
+    h += ".srvmain{min-width:0}";
+    h += ".srvname{display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:650;color:var(--txt);min-width:0}";
+    h += ".srvname .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
+    h += ".srvurl{font-size:11px;color:var(--mut2);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
+    h += ".srvacts{display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end}";
+    h += ".srvtag{font-size:10px;font-weight:600;letter-spacing:.2px;padding:2px 8px;border-radius:9px;border:1px solid var(--line);background:var(--hov);color:var(--mut2);white-space:nowrap}";
+    h += ".srvtag.on{background:var(--ok-bg);border-color:var(--ok-line);color:var(--ok-text)}";
+    h += ".srvtag.kind{background:var(--acc-weak);border-color:rgba(59,130,246,.28);color:var(--acc-text)}";
+    h += ".srvbtn{font-size:11.5px;color:var(--mut);padding:4px 9px;border-radius:7px;border:1px solid transparent;transition:.13s;white-space:nowrap}";
+    h += ".srvbtn:hover{background:var(--hov);color:var(--txt);border-color:var(--line)}";
+    h += ".srvbtn.pri{color:var(--acc-text);border-color:rgba(59,130,246,.3);background:var(--acc-weak)}";
+    h += ".srvbtn.pri:hover{color:var(--acc-text);background:var(--acc-weak);border-color:var(--acc)}";
+    h += ".srvbtn.del:hover{color:var(--danger);border-color:var(--danger)}";
+    h += ".srvempty{padding:16px;text-align:center;color:var(--mut2);font-size:12px;border:1px dashed var(--line);border-radius:10px;background:var(--hov)}";
+    h += ".srvform{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px 18px;margin-top:12px;padding:14px 15px;border:1px solid var(--acc);border-radius:10px;background:var(--hov)}";
+    h += ".srvform .sfld.wide{grid-column:1/-1}";
+    h += ".srvform .mh{grid-column:1/-1;display:flex;align-items:center;gap:8px;font-size:12px;font-weight:650;color:var(--txt);margin-bottom:2px}";
+    h += "@media (max-width:820px){.srvrow{grid-template-columns:9px minmax(0,1fr)}.srvacts{grid-column:2/-1;justify-content:flex-start}}";
+    // 本地音乐库统计条（信息密度：一眼看到规模与上次扫描结果，不再靠一段说明）
+    h += ".libstats{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px 14px;font-size:11.5px;color:var(--txt2)}";
+    h += ".libstats .it{background:var(--field);border:1px solid var(--line);border-radius:9px;padding:9px 12px;min-width:0}";
+    h += ".libstats .lbl{display:block;font-size:10px;color:var(--mut2);margin-bottom:3px}";
+    h += ".libstats .val{font-weight:650;font-size:14px;color:var(--txt);font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
     h += "@media (max-width:1100px){#crumb,#sub{display:none}.search{max-width:320px}}";
     h += ".setfoot{display:flex;gap:10px;align-items:center;padding:12px 2px 10px;position:sticky;bottom:0;background:var(--bg);border-top:1px solid var(--line);z-index:6}";
     h += ".setfoot .sp{flex:1}";

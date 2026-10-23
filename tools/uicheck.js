@@ -320,8 +320,51 @@ async function gotoFiles() {
   const tabOrder = await evalJs("Array.from(document.querySelectorAll('.stab')).map(e=>e.textContent).join('/')");
   // 2026-10-22 功能3：「诊断」独立成页，排在元数据之后。
   // 2026-10-23 用户 261023-04 #2：EQ 与房间校正从主导航移进设置页，「EQ」页签排在「高级」之后。
-  ck(tabOrder === '输入/输出/PCM/SDM/高级/EQ/元数据/诊断',
-     '设置页签顺序为 输入/输出/PCM/SDM/高级/EQ/元数据/诊断', tabOrder);
+  // 2026-10-24 用户 261024-01 #5：「流媒体」从「高级」拆成独立页签，排在元数据之后、诊断之前。
+  ck(tabOrder === '输入/输出/PCM/SDM/高级/EQ/元数据/流媒体/诊断',
+     '设置页签顺序为 输入/输出/PCM/SDM/高级/EQ/元数据/流媒体/诊断', tabOrder);
+
+  // ---- 2026-10-24 用户 261024-01 #5/#6/#8/#12 的界面契约（全部只读，不改任何设置）----
+  // #5 密码框样式：旧 CSS 选择器只列了 text/number，password 落到浏览器默认样式（方角/无内边距/
+  //    不铺满），这就是「密码框怎么跟其他框样式不一样」的根因。判据：计算样式逐项相等。
+  const pwStyle = await evalJs(`(function(){
+    function cs(id){var e=document.getElementById(id);if(!e)return null;var s=getComputedStyle(e);
+      return [s.paddingTop,s.paddingRight,s.paddingBottom,s.paddingLeft,s.borderRadius,
+              s.backgroundColor,s.borderTopWidth,s.borderTopStyle,s.fontSize,s.fontFamily].join('|');}
+    return {u:cs('sp_src_user'),p:cs('sp_src_pass'),k:cs('sp_llmkey')};
+  })()`);
+  ck(pwStyle && pwStyle.u && pwStyle.p === pwStyle.u && pwStyle.k === pwStyle.u,
+     '密码框（流媒体服务器 / DeepSeek Key）与文本框计算样式逐项一致', JSON.stringify(pwStyle));
+
+  // #5/#6 流媒体页：控件齐全；高级页改名「本地音乐库」，不再有「流媒体服务器」组与 DLNA 按钮。
+  const streamSec = await evalJs(`(function(){
+    var s=document.querySelector('#setpage .spane[data-g=stream]');
+    var a=document.querySelector('#setpage .spane[data-g=adv]');
+    if(!s||!a) return 'missing-pane';
+    var need=['sp_src_add','sp_src_list','sp_src_form','sp_src_name','sp_src_kind','sp_src_base',
+              'sp_src_user','sp_src_pass','sp_src_save','sp_src_cancel','sp_src_testform','sp_upnp','sp_upnpmsg'];
+    var miss=[]; need.forEach(function(id){var e=document.getElementById(id);if(!e||!s.contains(e))miss.push(id)});
+    return {miss:miss,
+            oldStream:a.textContent.indexOf('流媒体服务器')>=0,
+            oldName:a.textContent.indexOf('音乐库与网络')>=0,
+            newName:a.textContent.indexOf('本地音乐库')>=0,
+            upnpInAdv:!!a.querySelector('#sp_upnp')};
+  })()`);
+  ck(streamSec && Array.isArray(streamSec.miss) && streamSec.miss.length===0 && !streamSec.oldStream &&
+     !streamSec.oldName && streamSec.newName && !streamSec.upnpInAdv,
+     '流媒体页控件齐全；高级页改名「本地音乐库」、无流媒体服务器组/DLNA 按钮', JSON.stringify(streamSec));
+
+  // #12 SDM 比特率 / 封装始终可选（根因：旧 applyDsdState 只在输出 DSD 时启用，默认 PCM ⟹ 全灰）
+  const sdmEnabled = await evalJs(`(function(){var r={};['sp_dsdrate','sp_dsdpk'].forEach(function(id){var e=document.getElementById(id);r[id]=e?e.disabled:null});r.note=!!document.getElementById('sp_dsdmodenote');return r;})()`);
+  ck(sdmEnabled && sdmEnabled.sp_dsdrate===false && sdmEnabled.sp_dsdpk===false && sdmEnabled.note,
+     'SDM 比特率 / 封装始终可选（不 disabled），并有 PCM 下的联动说明', JSON.stringify(sdmEnabled));
+
+  // #8 标签写回默认开启、不再出现「可选」开关字样
+  const wbDefault = await evalJs(`(function(){var p=document.querySelector('#setpage .spane[data-g=meta]');if(!p)return null;
+    var t=p.textContent;return {hasDefault:t.indexOf('默认开启')>=0, hasOptional:t.indexOf('可选')>=0,
+    desc:!!document.getElementById('sp_wbdesc')};})()`);
+  ck(wbDefault && wbDefault.hasDefault && !wbDefault.hasOptional && wbDefault.desc,
+     '标签写回默认开启：「默认开启」在、无「可选」字样，两按钮说明仍在', JSON.stringify(wbDefault));
 
   // ---- P4b：设置页输入面板自检（控件绑定/设备下拉/起停状态/状态渲染/无外链）----
   await evalJs("document.querySelector('.stab[data-g=in]').click()");
@@ -473,9 +516,11 @@ async function gotoFiles() {
   // 合并后的 AI 开关：文案必须讲清「DeepSeek + 联网 + 按次计费」
   // 2026-10-23 修判据：说明文案是独立描述行（不在 <label> 内），旧判据只看 label 文本会误报；
   // 这里取整行 .sfld 的可读文案（含说明），必须出现 AI 增强 / DeepSeek / 联网 / 按次计费。
-  const aiLabel = await evalJs("(function(){var e=document.getElementById('sp_metallm');var f=e?e.closest('.sfld'):null;return f?f.textContent.trim():'';})()");
+  // 2026-10-24 用户 261024-01 #7：说明文字收进 (?) 的 data-tip（hover 才显示）——
+  // 判据必须同时读可见文字与 data-tip，否则会把"移进提示"误判成"文案丢失"。
+  const aiLabel = await evalJs("(function(){var e=document.getElementById('sp_metallm');var f=e?e.closest('.sfld'):null;if(!f)return '';var t=f.textContent;var d=f.querySelectorAll('[data-tip]');for(var i=0;i<d.length;i++)t+=' '+d[i].getAttribute('data-tip');return t;})()");
   ck(aiLabel.indexOf('AI 增强') >= 0 && aiLabel.indexOf('DeepSeek') >= 0 && aiLabel.indexOf('联网') >= 0 && aiLabel.indexOf('按次计费') >= 0,
-     '「AI 增强（DeepSeek）」文案包含联网 / 按次计费说明', aiLabel);
+     '「AI 增强（DeepSeek）」文案包含联网 / 按次计费说明（可见文字或 (?) 提示）', aiLabel);
 
   // 合并语义：一次勾选必须**同时**写 metallm 与 metasummary（开=1,1 / 关=0,0）。
   // 自检纪律：原状态可能是 metallm=1,metasummary=0 的混合态，合并后无法用两次点击还原成混合态，
@@ -664,6 +709,9 @@ async function gotoFiles() {
     if (!dop) return false;
     var parent = dop.closest('.sfld') || dop.parentElement;
     var txt = parent ? parent.textContent : '';
+    // #7 之后说明在 (?) 的 data-tip 里：可见文字 + 提示一起看
+    var tips = parent ? parent.querySelectorAll('[data-tip]') : [];
+    for (var i = 0; i < tips.length; i++) txt += ' ' + tips[i].getAttribute('data-tip');
     return txt.indexOf('DoP') >= 0 && (txt.indexOf('DSD') >= 0 || txt.indexOf('拒绝') >= 0);
   })()`);
   ck(dopTextOk, 'DoP 开关有说明文案（DSD 源说明与拒绝提示）');
@@ -788,7 +836,8 @@ async function gotoFiles() {
       //            （早期把两类混在一起判，导致把正常控件误报成"未绑定"）
       //  P1.5：元数据源开关是动态的（/api/providers 注册表）—— 在静态清单之外逐源补查
       //  P2：标签写回的预览/执行按钮也是要点了有反应的
-      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_instart','sp_instop','sp_inmon','sp_cast_scan','sp_cast_usecur','sp_cast_start','sp_cast_stop','sp_cast_dop','sp_cast_dev'];
+      // 2026-10-24 #5：旧的单服务器表单 srcSave 已删除，改为流媒体页的多服务器控件。
+      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_instart','sp_instop','sp_inmon','sp_cast_scan','sp_cast_usecur','sp_cast_start','sp_cast_stop','sp_cast_dop','sp_cast_dev','sp_src_add','sp_src_save','sp_src_cancel','sp_src_testform','sp_upnp'];
       (META_PROVIDERS || []).forEach(function (p) { needBind.push('sp_meta_' + p.id); });
       var valueOnly=['sRate','sFilt','sFiltNx','sShap','sBuf','sDSD','sIsp','s2s','sp_cast_file'];
       var miss=[];
