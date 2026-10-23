@@ -145,7 +145,14 @@ int main(int argc, char** argv) {
         std::printf("UPnP/DLNA 媒体渲染器发现中（SSDP M-SEARCH，超时 2000 ms）...\n");
         auto devs = upnp_discover(2000);
         if (devs.empty()) {
-            std::printf("未发现 UPnP/DLNA 渲染器（可能原因：接收设备未开机、不在同一子网、或组播被防火墙拦截）。\n");
+            // 2026-10-23 真机实测：本机网络 SSDP 组播被彻底拦截（手写 M-SEARCH 也 0 回应），
+            // 但设备用「直连描述 URL」完全可用。所以这里必须把绕过办法直接印出来，
+            // 否则用户只会以为"没有设备"。
+            std::printf("未发现 UPnP/DLNA 渲染器。\n");
+            std::printf("可能原因：设备未开机 / 不在同一子网 / **SSDP 组播被路由器或防火墙拦截**。\n");
+            std::printf("   若你已知设备的描述地址，可绕过组播直接投放：\n");
+            std::printf("     rtacast --file <音频> --dev http://<设备IP>:<端口>/\n");
+            std::printf("   设备描述地址一般可用浏览器或 rtacast 的 \"--dev\" 探测常见端口（49152/49153/80）。\n");
             return 0;
         }
         std::printf("共发现 %zu 个 UPnP/DLNA 渲染器：\n", devs.size());
