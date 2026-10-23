@@ -591,7 +591,10 @@ async function waitFor(expr, ms = 8000) {
     if (!s) return 'no-select';
     var opts = s.querySelectorAll('option');
     var msg = (document.getElementById('sp_cast_devmsg') || {}).textContent || '';
+    // 2026-10-23 修判据：旧判据要求 opts.length > 1，隐含"发现设备至少两台" —— 实际只有 1 台时
+    // （用户环境就是 1 台 N1000_UPNP）会误判 FAIL。改为：只要下拉里有真实设备（非占位）+ 文案说共发现 N 个，就算通过。
     if (opts.length > 1) return 'has-options:' + opts.length;
+    if (opts.length === 1 && msg.indexOf('共发现') >= 0) return 'has-options:' + opts.length;
     if (opts.length === 1 && (opts[0].value === '' || msg.indexOf('未发现') >= 0 || opts[0].textContent.indexOf('未发现') >= 0)) return 'empty-state';
     return 'opts=' + opts.length + ' msg=' + msg;
   })()`);

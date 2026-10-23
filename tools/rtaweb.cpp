@@ -4686,8 +4686,26 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         ct = "application/json; charset=utf-8";
         const std::string sp = path_in_exe_dir("rlplayer-settings.conf");
         if (rq.method == "POST") {
-            std::ofstream f(sp, std::ios::trunc);
-            if (!f) return "{\"ok\":false,\"error\":\"写入失败\"}";
+            // 2026-10-23（真实事故后加固）：旧实现 std::ios::trunc + 只写本次提交的键 ——
+            // 任何「只提交部分键」的客户端都会把其余设置整份清空。
+            // 事故复现：测试脚本只 POST eq=… 一个键 → backend/volume 等被抹掉 → 重启后回落
+            // wasapi + 0 dB → 直接对用户听音设备出声（违反铁律 1）。
+            // 现在改为**合并写**：先读全量 kv，覆盖本次提交的白名单键，再整体写回；文件不可读时按空处理。
+            std::map<std::string, std::string> merged;
+            std::vector<std::string> order;
+            {
+                std::set<std::string> seen_keys;
+                std::ifstream in(sp);
+                std::string line;
+                while (std::getline(in, line)) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    const size_t eqp = line.find('=');
+                    if (eqp == std::string::npos) continue;
+                    const std::string kk = line.substr(0, eqp);
+                    if (seen_keys.insert(kk).second) order.push_back(kk);
+                    merged[kk] = line.substr(eqp + 1);
+                }
+            }
             std::istringstream is(rq.body);
             std::string tok;
             while (std::getline(is, tok, (char)38)) {
@@ -4728,9 +4746,19 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                 if (k == "streamdecode") {
                     rta::audio::set_stream_decode_enabled(clean != "0" && clean != "false");
                 }
-                f << k << "=" << clean << (char)10;
+                if (merged.find(k) == merged.end()) order.push_back(k);
+                merged[k] = clean;
             }
-            return "{\"ok\":true}";
+            // 整体写回（合并后的全量键；顺序保持首次出现次序，便于人工排查）
+            std::ofstream f(sp, std::ios::trunc);
+            if (!f) return "{\"ok\":false,\"error\":\"写入失败\"}";
+            for (const auto& kk : order) {
+                const auto itv = merged.find(kk);
+                if (itv == merged.end()) continue;
+                f << kk << "=" << itv->second << (char)10;
+            }
+            if (!f.good()) return "{\"ok\":false,\"error\":\"写入未完成\"}";
+            return "{\"ok\":true,\"merged\":true}";
         }
         std::ifstream f(sp);
         std::ostringstream j;
