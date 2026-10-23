@@ -353,7 +353,9 @@ inline std::string rta_ui_page() {
     h += ".model-card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px;cursor:pointer;transition:all .15s ease}";
     h += ".model-card:hover{border-color:var(--acc);background:var(--hov)}";
     h += ".model-card.active{border-color:var(--acc);box-shadow:0 0 0 1.5px var(--acc);background:var(--hov)}";
-    h += ".preset-card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;justify-content:space-between;transition:all .15s ease}";
+    h += ".preset-card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;justify-content:space-between;transition:all .15s ease;cursor:pointer}";
+    h += ".tc-curve{padding:2px 0}";
+    h += ".tc-curve svg{max-width:100%}";
     h += ".preset-card:hover{border-color:var(--line2);box-shadow:0 2px 10px rgba(0,0,0,.08)}";
     h += ".preset-card.active{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc);background:var(--hov)}";
     h += ".brand-chip{font-size:12px;padding:5px 12px;border-radius:16px;background:var(--hov);border:1px solid var(--line);color:var(--txt);cursor:pointer;transition:all .15s}";
