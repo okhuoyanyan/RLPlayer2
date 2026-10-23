@@ -345,6 +345,20 @@ inline std::string rta_ui_page() {
     h += ".in-stat-item{background:var(--field);padding:7px 10px;border-radius:8px;border:1px solid var(--line)}";
     h += ".in-stat-item .lbl{display:block;font-size:10px;color:var(--mut2);margin-bottom:2px}";
     h += ".in-stat-item .val{font-weight:600;font-variant-numeric:tabular-nums}";
+    // 收藏 / EQ 卡片 / 调音卡片 / 芯片 / 排序
+    h += ".fav-btn{background:none;border:none;cursor:pointer;padding:2px 4px;display:inline-flex;align-items:center;justify-content:center;color:var(--mut2);border-radius:4px;transition:color .15s,transform .1s}";
+    h += ".fav-btn:hover{color:#e05666;transform:scale(1.15)}";
+    h += ".fav-btn.on{color:#e05666}";
+    h += ".fav-btn.on svg{fill:#e05666;stroke:#e05666}";
+    h += ".model-card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px;cursor:pointer;transition:all .15s ease}";
+    h += ".model-card:hover{border-color:var(--acc);background:var(--hov)}";
+    h += ".model-card.active{border-color:var(--acc);box-shadow:0 0 0 1.5px var(--acc);background:var(--hov)}";
+    h += ".preset-card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;justify-content:space-between;transition:all .15s ease}";
+    h += ".preset-card:hover{border-color:var(--line2);box-shadow:0 2px 10px rgba(0,0,0,.08)}";
+    h += ".preset-card.active{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc);background:var(--hov)}";
+    h += ".brand-chip{font-size:12px;padding:5px 12px;border-radius:16px;background:var(--hov);border:1px solid var(--line);color:var(--txt);cursor:pointer;transition:all .15s}";
+    h += ".brand-chip:hover{border-color:var(--acc);color:var(--acc)}";
+    h += ".track-sort{font-size:12px;height:26px;background:var(--hov);border:1px solid var(--line);border-radius:5px;color:var(--txt);padding:0 8px;cursor:pointer}";
     // 滚动条
     h += "::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:var(--track);border-radius:5px}";
     h += "::-webkit-scrollbar-track{background:transparent}";
@@ -370,10 +384,11 @@ inline std::string rta_ui_page() {
     h += "<div class=side>";
     h += "<div class='nav on' data-v=albums><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><circle cx='12' cy='12' r='9'/><circle cx='12' cy='12' r='2.5'/></svg>专辑</div>";
     h += "<div class=nav data-v=artists><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><circle cx='12' cy='8' r='3.6'/><path d='M4.5 20.5c0-4.1 3.4-6.8 7.5-6.8s7.5 2.7 7.5 6.8'/></svg>艺术家</div>";
-    h += "<div class=nav data-v=works><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M9 18V5l12-2v13'/><circle cx='6' cy='18' r='3'/><circle cx='18' cy='16' r='3'/></svg>作品</div>";
+    h += "<div class=nav data-v=works><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M9 18V5l12-2v13'/><circle cx='6' cy='18' r='3'/><circle cx='18' cy='16' r='3'/></svg>古典作品</div>";
     h += "<div class=nav data-v=tracks><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M14.5 4.5v11.2'/><circle cx='12' cy='17.5' r='2.8'/><path d='M14.5 4.5c2.6.6 4 2 4.5 4.2'/></svg>曲目</div>";
     h += "<div class=nav data-v=files><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M3 7.5a2 2 0 012-2h4l1.8 2H19a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z'/></svg>文件夹</div>";
     h += "<div class=nav data-v=remote><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M7 18a4.5 4.5 0 010-9 6 6 0 0111.6 1.6A3.7 3.7 0 0118 18z'/></svg>流媒体</div>";
+    h += "<div class=nav data-v=eq><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6'/></svg>EQ 与房间校正</div>";
     h += "<div class=sec>播放</div>";
     h += "<div class=nav data-v=queue><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M4 6h10M4 12h10M4 18h7'/><path d='M17 15.5V7l4-1v8.5'/><circle cx='16' cy='16.5' r='1.6' fill='currentColor' stroke='none'/><circle cx='20' cy='15' r='1.6' fill='currentColor' stroke='none'/></svg>播放队列</div>";
     h += "<div class=nav data-v=recent><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><circle cx='12' cy='12' r='8.5'/><path d='M12 7.2V12l3.2 2'/></svg>最近播放</div>";
@@ -468,7 +483,10 @@ inline std::string rta_ui_page() {
     h += "<div><div class=npcover><img id=npCover alt=''></div>";
     // npMeta：元数据补全信息芯片容器（year/genre/albumArtist/已补全），由 ui_script 的 renderNp 填充。
     // 只进整页，底栏不加（避免拥挤）；样式只用布局属性，颜色交给 .badge 自身的 CSS 变量。
-    h += "<div class=nptit id=npTitle>未播放</div><div class=npsub id=npSub></div>";
+    h += "<div style='display:flex;align-items:center;gap:10px;margin-top:20px'>";
+    h += "<div class=nptit id=npTitle style='margin:0'>未播放</div>";
+    h += "<button class=fav-btn id=npFavBtn title='收藏' style='padding:4px;display:none'><svg width=20 height=20 viewBox='0 0 24 24' fill=none stroke='currentColor' stroke-width=2><path d='M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z'/></svg></button>";
+    h += "</div><div class=npsub id=npSub></div>";
     h += "<div id=npMeta style='display:flex;flex-wrap:wrap;gap:6px;margin-top:8px'></div></div>";
     h += "<div class=nplyric id=npLyric><div class=npline>还没有在播放</div></div>";
     h += "</div>";

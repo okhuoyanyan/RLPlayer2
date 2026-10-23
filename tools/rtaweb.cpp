@@ -2659,6 +2659,57 @@ static WbPreview writeback_preview_scan() {
     return w;
 }
 
+// ---------------- 收藏（曲目喜好标记，落盘到 exe 目录小 json）----------------
+static std::mutex g_favMu;
+static std::set<std::string> g_favFiles;
+static bool g_favLoaded = false;
+
+static std::string normalize_fav_path(std::string p) {
+    for (char& c : p) { if (c == '/') c = '\\'; }
+    return p;
+}
+
+static void fav_load_if_needed() {
+    std::lock_guard<std::mutex> lk(g_favMu);
+    if (g_favLoaded) return;
+    g_favLoaded = true;
+    const std::string path = path_in_exe_dir("rlplayer-favs.json");
+    std::error_code ec;
+    if (!fs::exists(fs::u8path(path), ec)) return;
+    std::ifstream f(fs::u8path(path), std::ios::binary);
+    if (!f) return;
+    std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    rta::net::Json j = rta::net::json_parse(s);
+    if (j.type == rta::net::Json::Arr) {
+        for (size_t i = 0; i < j.size(); ++i) {
+            if (j.at(i).type == rta::net::Json::Str) {
+                g_favFiles.insert(normalize_fav_path(j.at(i).s()));
+            }
+        }
+    } else if (j.type == rta::net::Json::Obj && j.has("files") && j["files"].type == rta::net::Json::Arr) {
+        const auto& arr = j["files"];
+        for (size_t i = 0; i < arr.size(); ++i) {
+            if (arr.at(i).type == rta::net::Json::Str) {
+                g_favFiles.insert(normalize_fav_path(arr.at(i).s()));
+            }
+        }
+    }
+}
+
+static void fav_save_locked() {
+    const std::string path = path_in_exe_dir("rlplayer-favs.json");
+    std::ofstream f(fs::u8path(path), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    f << "{\"files\":[";
+    bool first = true;
+    for (const auto& file : g_favFiles) {
+        if (!first) f << ",";
+        first = false;
+        f << "\"" << jesc(file) << "\"";
+    }
+    f << "]}\n";
+}
+
 static void recent_add(const std::string& file, const std::string& title,
                        const std::string& artist, const std::string& album) {
     const std::string p = path_in_exe_dir("rlplayer-recent.txt");
@@ -3065,6 +3116,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                 j << "{\"title\":\"" << jesc(t.title) << "\",\"artist\":\"" << jesc(t.artist)
                   << "\",\"album\":\"" << jesc(t.album) << "\",\"dur\":" << t.duration
                   << ",\"sr\":" << t.sampleRate << ",\"bits\":" << t.bits
+                  << ",\"year\":" << t.year
                   << ",\"path\":\"" << jesc(t.path) << "\"}";
             }
             j << "]}";
@@ -3463,6 +3515,61 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         }
         queue_save();
         return "{\"ok\":true,\"count\":" + std::to_string(cnt) + "}";
+    }
+
+    // ---------------- 收藏（新增 /api/fav?file=...&on=1 与 /api/fav/list）----------------
+    if (rq.path.rfind("/api/fav", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        fav_load_if_needed();
+        if (rq.path.rfind("/api/fav/list", 0) == 0) {
+            std::lock_guard<std::mutex> lk(g_favMu);
+            std::ostringstream j;
+            j << "{\"ok\":true,\"files\":[";
+            bool first = true;
+            for (const auto& f : g_favFiles) {
+                if (!first) j << ",";
+                first = false;
+                j << "\"" << jesc(f) << "\"";
+            }
+            j << "]}";
+            return j.str();
+        }
+
+        std::string file;
+        std::string onStr = "1";
+        auto parseKvs = [&](const std::string& query) {
+            std::istringstream qs(query);
+            std::string tok;
+            while (std::getline(qs, tok, '&')) {
+                const size_t eq = tok.find('=');
+                if (eq == std::string::npos) continue;
+                const std::string k = urlDecode(tok.substr(0, eq));
+                const std::string v = urlDecode(tok.substr(eq + 1));
+                if (k == "file") file = v;
+                else if (k == "on") onStr = v;
+            }
+        };
+        const size_t qpos = rq.path.find('?');
+        if (qpos != std::string::npos) parseKvs(rq.path.substr(qpos + 1));
+        if (!rq.body.empty()) parseKvs(rq.body);
+
+        if (file.empty()) {
+            return "{\"ok\":false,\"error\":\"缺少 file 参数\"}";
+        }
+        file = normalize_fav_path(file);
+        bool on = (onStr == "1" || onStr == "true" || onStr == "on");
+        {
+            std::lock_guard<std::mutex> lk(g_favMu);
+            if (on) {
+                g_favFiles.insert(file);
+            } else {
+                g_favFiles.erase(file);
+            }
+            fav_save_locked();
+        }
+        std::ostringstream j;
+        j << "{\"ok\":true,\"file\":\"" << jesc(file) << "\",\"on\":" << (on ? "true" : "false") << "}";
+        return j.str();
     }
 
     if (rq.path.rfind("/api/src", 0) == 0) {

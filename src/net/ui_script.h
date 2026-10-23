@@ -244,6 +244,84 @@ function loadAlbums(q, title) {
   }).catch(function (e) { D('list').innerHTML = '<div class=empty>' + esc(e) + '</div>'; });
 }
 
+/* ---------------- 收藏（心形喜好标记 / 261023-03 第5条） ---------------- */
+var FAV_SET = new Set();
+
+function initFavs() {
+  api('/api/fav/list').then(function (j) {
+    if (j && j.ok && Array.isArray(j.files)) {
+      FAV_SET = new Set(j.files);
+      updateFavUi();
+    }
+  }).catch(function () {});
+}
+
+function favIconHtml(filePath, isFav, extraClass) {
+  var onCls = isFav ? ' on' : '';
+  var extCls = extraClass ? (' ' + extraClass) : '';
+  return '<button class="fav-btn' + onCls + extCls + '" data-file="' + esc(filePath) + '" title="' + (isFav ? '取消收藏' : '收藏') + '">' +
+         '<svg width=14 height=14 viewBox="0 0 24 24" fill="' + (isFav ? '#e05666' : 'none') + '" stroke="' + (isFav ? '#e05666' : 'currentColor') + '" stroke-width="2">' +
+         '<path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z"/>' +
+         '</svg></button>';
+}
+
+function toggleFav(filePath, ev) {
+  if (ev) { ev.stopPropagation(); ev.preventDefault(); }
+  if (!filePath) return;
+  var isFav = FAV_SET.has(filePath);
+  var nextOn = isFav ? 0 : 1;
+  api('/api/fav?file=' + encodeURIComponent(filePath) + '&on=' + nextOn).then(function (j) {
+    if (j && j.ok) {
+      if (nextOn) {
+        FAV_SET.add(filePath);
+        toast('已添加到收藏');
+      } else {
+        FAV_SET.delete(filePath);
+        toast('已取消收藏');
+      }
+      updateFavUi();
+      if (S.view === 'tracks' && S.trackSort === 'fav') {
+        renderTracksView();
+      }
+    }
+  }).catch(function (e) {
+    toast('收藏操作失败: ' + e);
+  });
+}
+
+function updateFavUi() {
+  Array.prototype.forEach.call(document.querySelectorAll('.fav-btn'), function (btn) {
+    if (btn.id === 'npFavBtn') return;
+    var f = btn.dataset.file;
+    if (!f) return;
+    var on = FAV_SET.has(f);
+    btn.classList.toggle('on', on);
+    var svg = btn.querySelector('svg');
+    if (svg) {
+      svg.setAttribute('fill', on ? '#e05666' : 'none');
+      svg.setAttribute('stroke', on ? '#e05666' : 'currentColor');
+    }
+    btn.title = on ? '取消收藏' : '收藏';
+  });
+  // 同步单曲整页心形
+  var npb = D('npFavBtn');
+  if (npb) {
+    if (S.lastCur) {
+      npb.style.display = 'inline-flex';
+      var curOn = FAV_SET.has(S.lastCur);
+      npb.classList.toggle('on', curOn);
+      var npsvg = npb.querySelector('svg');
+      if (npsvg) {
+        npsvg.setAttribute('fill', curOn ? '#e05666' : 'none');
+        npsvg.setAttribute('stroke', curOn ? '#e05666' : 'currentColor');
+      }
+      npb.title = curOn ? '取消收藏' : '收藏';
+    } else {
+      npb.style.display = 'none';
+    }
+  }
+}
+
 function openAlbum(k) {
   S.view = 'album';
   api('/api/lib/album?k=' + encodeURIComponent(k)).then(function (j) {
@@ -264,8 +342,10 @@ function openAlbum(k) {
             '</div></div>';
     h += '<div style="padding:4px 0 24px">';
     j.tracks.forEach(function (t, i) {
-      h += '<div class=trow data-i=' + i + '>' +
+      var isFav = FAV_SET.has(t.path);
+      h += '<div class=trow data-i=' + i + ' style="grid-template-columns:28px 24px 1fr 140px 58px;gap:8px">' +
            '<div class=n>' + (t.n || (i + 1)) + '</div>' +
+           favIconHtml(t.path, isFav) +
            '<div class=tt title="' + esc(t.title) + '">' + esc(t.title) + '</div>' +
            '<div class=ar>' + esc(t.artist || j.artist) + '</div>' +
            '<div class=du>' + fmt(t.dur) + '</div>' +
@@ -277,8 +357,17 @@ function openAlbum(k) {
     D('aPlay').onclick = function () { playAlbum(j.k, 0); };
     D('aAdd').onclick = function () { enqueueAlbum(j.k); };
     D('aShuf').onclick = function () { playAlbum(j.k, Math.floor(Math.random() * j.tracks.length)); };
+    Array.prototype.forEach.call(D('list').querySelectorAll('.fav-btn'), function (btn) {
+      btn.onclick = function (ev) {
+        ev.stopPropagation();
+        toggleFav(btn.dataset.file, ev);
+      };
+    });
     Array.prototype.forEach.call(D('list').querySelectorAll('.trow'), function (e) {
-      e.onclick = function () { playAlbum(j.k, +e.dataset.i); };
+      e.onclick = function (ev) {
+        if (ev.target.closest && ev.target.closest('.fav-btn')) return;
+        playAlbum(j.k, +e.dataset.i);
+      };
     });
   });
 }
@@ -618,17 +707,21 @@ function renderArtistProfile(who, j, summary) {
   });
 }
 
-/* ---------------- 古典作品与版本推荐（P3④b Discogs L4） ---------------- */
+/* ---------------- 古典作品与版本推荐（P3④b Discogs L4 / 261023-03 第4条） ---------------- */
 function loadWorksView(initialTitle, initialComposer) {
   S.view = 'works';
   setView('works');
   S.view = 'works';
-  head('作品与版本推荐', 'Discogs 权威演绎版本推荐', '');
+  head('古典作品 · 演绎版本', '按作品名查不同指挥/乐团/年代的录音版本', '');
 
   var defaultTitle = initialTitle || 'Boléro';
   var defaultComposer = (initialComposer !== undefined) ? initialComposer : 'Maurice Ravel';
 
   var h = '<div style="padding:10px 22px 30px">';
+
+  // 首次进入顶部说明文案（261023-03 第4条）
+  h += '<div style="font-size:12.5px;color:var(--mut2);margin-bottom:12px;line-height:1.5">' +
+       '这个页面用来按作品名查不同指挥/乐团/年代的录音版本，点击下方示例可直接检索。</div>';
 
   // 搜索卡片
   h += '<div class=card style="padding:16px 20px;margin-bottom:20px;background:var(--hov);border:1px solid var(--line);border-radius:10px">';
@@ -832,25 +925,92 @@ function renderWorkVersions(workTitle, composer, j) {
 }
 function loadTracks(q) {
   S.view = 'tracks';
+  S.tracksQuery = q || '';
   head(q ? ('搜索：' + q) : '曲目', '搜索中…', '');
   api('/api/lib/search?q=' + encodeURIComponent(q || '')).then(function (j) {
     var t = j.tracks || [];
-    head(q ? ('搜索：' + q) : '曲目', t.length + ' 首', '');
-    if (!t.length) { D('list').innerHTML = '<div class=empty>没有匹配的曲目</div>'; return; }
-    var h = '<div style="padding:6px 0 24px">';
-    t.forEach(function (x, i) {
-      h += '<div class=trow data-i=' + i + ' style="grid-template-columns:34px 1fr 150px 92px 58px">' +
-           '<div class=n>' + (i + 1) + '</div>' +
-           '<div class=tt>' + esc(x.title) + '</div>' +
-           '<div class=ar>' + esc(x.artist) + ' \u2014 ' + esc(x.album) + '</div>' +
-           '<div class=bd>' + fmtTag(x.sr, x.bits) + '</div>' +
-           '<div class=du>' + fmt(x.dur) + '</div></div>';
+    S.currentTracks = t;
+    renderTracksView();
+  });
+}
+
+function renderTracksView() {
+  var t = S.currentTracks || [];
+  var q = S.tracksQuery || '';
+  head(q ? ('搜索：' + q) : '曲目', t.length + ' 首', '');
+  if (!t.length) { D('list').innerHTML = '<div class=empty>没有匹配的曲目</div>'; return; }
+
+  var sortMode = S.trackSort || 'default';
+  var sorted = t.slice();
+  if (sortMode === 'title') {
+    sorted.sort(function (a, b) { return (a.title || '').localeCompare(b.title || '', 'zh'); });
+  } else if (sortMode === 'artist') {
+    sorted.sort(function (a, b) { return (a.artist || '').localeCompare(b.artist || '', 'zh'); });
+  } else if (sortMode === 'album') {
+    sorted.sort(function (a, b) { return (a.album || '').localeCompare(b.album || '', 'zh'); });
+  } else if (sortMode === 'dur') {
+    sorted.sort(function (a, b) { return (a.dur || 0) - (b.dur || 0); });
+  } else if (sortMode === 'year') {
+    sorted.sort(function (a, b) { return (b.year || 0) - (a.year || 0); });
+  } else if (sortMode === 'fav') {
+    sorted.sort(function (a, b) {
+      var fa = FAV_SET.has(a.path) ? 1 : 0;
+      var fb = FAV_SET.has(b.path) ? 1 : 0;
+      if (fa !== fb) return fb - fa; // 收藏优先排前面
+      return (a.title || '').localeCompare(b.title || '', 'zh');
     });
-    D('list').innerHTML = h + '</div>';
-    Array.prototype.forEach.call(D('list').querySelectorAll('.trow'), function (e) {
-      e.onclick = function () { playPath(t[+e.dataset.i].path); };
-      e.oncontextmenu = function (ev) { ev.preventDefault(); addPath(t[+e.dataset.i].path); };
-    });
+  }
+
+  // 排序控件放列表右上，紧凑（261023-03 第5条）
+  var h = '<div style="display:flex;justify-content:flex-end;align-items:center;padding:10px 20px 4px;gap:8px">' +
+          '<span style="font-size:12px;color:var(--mut2)">排序：</span>' +
+          '<select id=trackSort class="track-sort sort-select">' +
+          '<option value=default' + (sortMode === 'default' ? ' selected' : '') + '>默认排序</option>' +
+          '<option value=title' + (sortMode === 'title' ? ' selected' : '') + '>标题</option>' +
+          '<option value=artist' + (sortMode === 'artist' ? ' selected' : '') + '>艺术家</option>' +
+          '<option value=album' + (sortMode === 'album' ? ' selected' : '') + '>专辑</option>' +
+          '<option value=dur' + (sortMode === 'dur' ? ' selected' : '') + '>时长</option>' +
+          '<option value=year' + (sortMode === 'year' ? ' selected' : '') + '>年份</option>' +
+          '<option value=fav' + (sortMode === 'fav' ? ' selected' : '') + '>收藏优先</option>' +
+          '</select></div>';
+
+  h += '<div style="padding:4px 0 24px">';
+  sorted.forEach(function (x, i) {
+    var isFav = FAV_SET.has(x.path);
+    h += '<div class=trow data-i=' + i + ' style="grid-template-columns:28px 24px 1fr 150px 92px 58px;gap:8px">' +
+         '<div class=n>' + (i + 1) + '</div>' +
+         favIconHtml(x.path, isFav) +
+         '<div class=tt title="' + esc(x.title) + '">' + esc(x.title) + '</div>' +
+         '<div class=ar title="' + esc(x.artist + ' \u2014 ' + x.album) + '">' + esc(x.artist) + ' \u2014 ' + esc(x.album) + '</div>' +
+         '<div class=bd>' + fmtTag(x.sr, x.bits) + '</div>' +
+         '<div class=du>' + fmt(x.dur) + '</div></div>';
+  });
+  h += '</div>';
+  D('list').innerHTML = h;
+
+  if (D('trackSort')) {
+    D('trackSort').onchange = function () {
+      S.trackSort = this.value;
+      renderTracksView();
+    };
+  }
+
+  Array.prototype.forEach.call(D('list').querySelectorAll('.fav-btn'), function (btn) {
+    btn.onclick = function (ev) {
+      ev.stopPropagation();
+      toggleFav(btn.dataset.file, ev);
+    };
+  });
+
+  Array.prototype.forEach.call(D('list').querySelectorAll('.trow'), function (e) {
+    e.onclick = function (ev) {
+      if (ev.target.closest && ev.target.closest('.fav-btn')) return;
+      playPath(sorted[+e.dataset.i].path);
+    };
+    e.oncontextmenu = function (ev) {
+      ev.preventDefault();
+      addPath(sorted[+e.dataset.i].path);
+    };
   });
 }
 
@@ -1443,7 +1603,7 @@ function saveSrc() {
 function setView(v) {
   S.view = v;
   Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
-    e.classList.toggle('on', e.dataset.v === v || (v === 'artist' && e.dataset.v === 'artists') || (v === 'work' && e.dataset.v === 'works'));
+    e.classList.toggle('on', e.dataset.v === v || (v === 'artist' && e.dataset.v === 'artists') || (v === 'work' && e.dataset.v === 'works') || (v === 'eq' && e.dataset.v === 'eq'));
   });
   var isSet = (v === 'settings');
   // 设置页占满整屏：右栏（队列/歌词）在这里没有意义，直接藏掉。
@@ -1474,6 +1634,7 @@ Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
     else if (v === 'tracks') loadTracks('');
     else if (v === 'files') loadFiles(S.dir || '');
     else if (v === 'remote') loadRemote('');
+    else if (v === 'eq') loadEqView();
     else if (v === 'queue') { renderQueuePage(); }
     else if (v === 'recent') loadRecent();
   };
@@ -2744,31 +2905,11 @@ function renderSettingsPage() {
              '选了具体厂商就只试该厂商的 DLL。后端缺失或 kernel 不可执行时自动退回 CPU 分块 FFT，并在信号链里写明实际用的哪个 DLL。')
        + '<div class="sfld wide"><div id=sp_gpumsg class=hint></div></div>'
        + '<div class="sfld wide"><div id=sp_asiomsg class=hint></div></div>')
-     + sgroup('耳机 EQ（OPRA）', '6,230 款耳机开箱即用校正预设（CC BY-SA 4.0）',
-         '<div class=sfld><label>搜索耳机品牌/型号</label>'
-       + '<input type=text id=sp_opra_search placeholder="输入品牌或型号（如 HD600 / AirPods / XM5）" autocomplete=off>'
-       + '<div class=hint id=sp_opra_searchhint>本地实时搜索 6,230 款耳机型号</div></div>'
-       + '<div class=sfld><label>产品型号</label>'
-       + '<select id=sp_opra_product><option value="">（请先输入关键词搜索）</option></select>'
-       + '<div class=hint id=sp_opra_prodhint>从搜索结果中选择耳机型号</div></div>'
-       + '<div class="sfld wide"><label>调音预设</label>'
-       + '<select id=sp_opra_preset><option value="">（未选择预设）</option></select>'
-       + '<div class=hint id=sp_opra_preshint>选择调音目标（如 Harman Target / AutoEQ）</div></div>'
-       + '<div class="sfld wide" id=sp_opra_card style="display:none;background:var(--bg3);border:1px solid var(--line);border-radius:8px;padding:9px 13px;margin:2px 0 6px"></div>'
-       + '<div class="sfld wide" style="display:flex;align-items:center;gap:12px;margin-top:2px">'
-       + '<button class="btn pri" id=sp_opra_apply>应用到 EQ</button>'
-       + '<span id=sp_opra_msg class=hint style="margin:0"></span>'
-       + '</div>'
-       + '<div class="sfld wide" style="display:flex;align-items:center;justify-content:space-between;padding-top:10px;border-top:1px dashed var(--line);margin-top:8px">'
-       + '<span style="font-size:11px;color:var(--mut2)">EQ 数据来自 OPRA 开源项目（CC BY-SA 4.0）</span>'
-       + '<span class=chip id=sp_opra_copychip title="复制 OPRA 项目官网链接"><svg width=12 height=12 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 style="margin-right:2px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>https://opra.roon.app/</span>'
-       + '</div>')
-     + sgroup('EQ 与房间校正', 'FIR 用 WAV，EQ 用 REW / AutoEq 文本',
-         txt('sp_eq', 'EQ 文件路径（REW / AutoEq 文本）', ADV.eq,
-             '每行形如「Filter 1: ON PK Fc 1000 Hz Gain -3.0 dB Q 1.41」，或用 AutoEq 的 Preamp / Low Shelf / Peaking 段落',
-             'D:\Music\headphone-eq.txt')
-       + txt('sp_ir', 'IR 文件路径（WAV）', ADV.ir, '留空 = 不做卷积。路径形如 D:\Music\room.wav', 'D:\Music\room.wav')
-       + chk('sp_irgpu', '卷积走 GPU', ADV.irgpu == 1, '需要 GPU 后端就位：rtagpu.dll（AMD/HIP）或 rtagpu_cuda.dll（NVIDIA/CUDA）'))
+     + sgroup('EQ 与房间校正', '耳机校准预设 · 房间声学 IR 卷积 · 调音管理（已移至主导航）',
+         '<div class="sfld wide"><div class=hint style="margin-bottom:8px">耳机 EQ、调音预设与房间声学校正已独立为左侧主导航「EQ 与房间校正」页面。</div>'
+       + '<button class="btn pri" id=bGoEqNav type="button" style="font-size:12px;padding:6px 14px">前往「EQ 与房间校正」页面 →</button></div>'
+       + '<input type=hidden id=sp_eq value="' + esc(ADV.eq || '') + '">'
+       + '<input type=hidden id=sp_ir value="' + esc(ADV.ir || '') + '">')
      + sgroup('流媒体服务器', 'Navidrome / Subsonic / Emby（只取原始文件，不用转码流）',
          '<div class="sfld wide"><div class=hint>DLNA/UPnP 是"发现网络上的播放器"，与这里的"登录音乐服务器"是两件事。' +
          '要连 Emby / Navidrome，在这一栏填地址与账号。</div></div>'
@@ -3093,35 +3234,237 @@ function renderSettingsPage() {
   scanCastDevices(false);
   pollCastState();
 }
-
+/* ---------------- EQ 与房间校正（261023-03 第6/7条） ---------------- */
 var OPRA_INDEX = null;
 var OPRA_PRESETS = [];
+var _opraLoading = false;
 
-function initOpraControls() {
+function loadOpraIndex(cb) {
+  if (OPRA_INDEX) { if (cb) cb(); return; }
+  if (_opraLoading) {
+    var checkTimer = setInterval(function () {
+      if (OPRA_INDEX) { clearInterval(checkTimer); if (cb) cb(); }
+    }, 100);
+    return;
+  }
+  _opraLoading = true;
+  api('/api/opra/index').then(function (j) {
+    _opraLoading = false;
+    if (j && j.ok && Array.isArray(j.items)) {
+      OPRA_INDEX = j.items;
+      if (cb) cb();
+    }
+  }).catch(function () { _opraLoading = false; if (cb) cb(); });
+}
+
+function getTargetCurveDesc(details, author) {
+  var d = (details || '').toLowerCase();
+  var a = (author || '').toLowerCase();
+  if (d.indexOf('harman') >= 0 && (d.indexOf('in-ear') >= 0 || d.indexOf('iem') >= 0)) {
+    return {
+      name: '哈曼入耳目标曲线 (Harman In-Ear)',
+      scene: '针对入耳式耳道封闭增强低频动态与人声清晰度，适合现代流行、人声与节奏感强的音乐。',
+      tech: 'Harman In-Ear Target 补偿了耳道封闭效应，适度提升 100Hz 以下低频与 3kHz 附近耳甲腔增益，提供接近高品质音箱的听感。'
+    };
+  }
+  if (d.indexOf('harman') >= 0) {
+    return {
+      name: '哈曼头戴目标曲线 (Harman Over-Ear)',
+      scene: '符合大众听音盲测偏好，低频温暖厚实、中高频平衡耐听，杂食百搭，适合绝大多数现代流行乐与影视原声。',
+      tech: 'Harman Target 基于 Harman 实验室长期双盲听音实验，低频有约 4~6dB 适度平滑提升，高频平顺无刺激刺耳感。'
+    };
+  }
+  if (d.indexOf('soundguys_studio') >= 0) {
+    return {
+      name: 'SoundGuys 录音室中性曲线',
+      scene: '严格平直的工作室参考曲线，适合录音棚监听、音频剪辑与追求原汁原味还原的听众。',
+      tech: 'SoundGuys Studio 目标注重全频段线性度，消除耳机本身声学谐振，为混音制作提供真实基准。'
+    };
+  }
+  if (d.indexOf('soundguys_consumer') >= 0) {
+    return {
+      name: 'SoundGuys 大众消费曲线',
+      scene: '兼顾清晰度与氛围感，微调低频弹性与高频空气感，适合日常通勤随身聆听与流媒体影视。',
+      tech: '面向普通消费者的均衡曲线，在平直基础上微抬极低频与极高频，听感更具感染力。'
+    };
+  }
+  if (d.indexOf('diffuse') >= 0 || d.indexOf('hrtf_5128') >= 0) {
+    return {
+      name: '扩散场目标曲线 (Diffuse Field / HRTF)',
+      scene: '模拟无指向多反射声学空间，空间定位感与高频解析力极强，特别适合大编制古典交响乐与现场录音。',
+      tech: 'Diffuse Field 曲线基于人工头在混响室中测量的自由声场平均响应，声场开阔通透，高频细节丰富。'
+    };
+  }
+  if (d.indexOf('free_field') >= 0) {
+    return {
+      name: '自由场目标曲线 (Free Field)',
+      scene: '模拟消音室正前方向直达声，干脆纯净，适合需要清晰方向判断的专业监听。',
+      tech: 'Free Field 曲线反映消音室内扬声器正前方的直达声听觉响应。'
+    };
+  }
+  if (d.indexOf('senselab') >= 0) {
+    return {
+      name: 'SenseLab 声学实验室目标',
+      scene: '注重高保真声学平直度与相位一致性，适合乐器真实音色鉴赏与原声发烧录音。',
+      tech: 'SenseLab 方案基于精细声学补偿，重点修正耳机单元在高频段的群延迟与频响峰谷。'
+    };
+  }
+  if (d.indexOf('rtings') >= 0) {
+    return {
+      name: 'Rtings 参考目标曲线',
+      scene: 'Rtings 实验室测量的平直均衡曲线，适合影视与游戏声效还原。',
+      tech: 'Rtings 综合目标结合声学生理模型，旨在使耳机频响趋近于平直扬声器室内频响。'
+    };
+  }
+  if (d.indexOf('optimum') >= 0 || d.indexOf('hifi') >= 0) {
+    return {
+      name: '最佳高保真目标曲线 (Optimum HiFi)',
+      scene: '低频平顺不轰鸣、中频通透无染色，适合古典乐、爵士乐与纯乐器发烧录音。',
+      tech: 'Optimum HiFi 强调极低失真与线性动态，不对低频做过多主观提升，保持纯正声底。'
+    };
+  }
+  if (d.indexOf('neutral') >= 0 || d.indexOf('ief') >= 0) {
+    return {
+      name: 'IEF 中性监听目标 (Neutral)',
+      scene: '监听级纯中性调音，无主观音染，适合专业音频工作者与追求纯粹原声的用户。',
+      tech: 'IEF Neutral 以平直无染为核心，低频不外加低音架，高频顺滑延伸。'
+    };
+  }
+  var authorName = author || 'AutoEQ';
+  return {
+    name: details || (authorName + ' 专业校准预设'),
+    scene: '由 ' + authorName + ' 依据测量数据生成的校准滤波，平直化固有频响缺陷。',
+    tech: '基于 AutoEq 优化算法与专业人工耳测量数据计算所得的双二阶 IIR 滤波器组。'
+  };
+}
+
+function loadEqView() {
+  S.view = 'eq';
+  setView('eq');
+  head('EQ 与房间校正', 'OPRA 耳机校准预设 · 房间声学校正 (IR 卷积) · 调音管理', '');
+
+  var h = '<div style="padding:16px 28px 48px;max-width:1200px;margin:0 auto">';
+
+  // 1. 耳机 EQ（OPRA）卡片
+  h += '<div class=card style="padding:22px 24px;margin-bottom:24px;background:var(--hov);border:1px solid var(--line);border-radius:12px">';
+  h += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">' +
+       '<div><h2 style="font-size:16px;margin:0 0 4px;font-weight:700">耳机校准与调音预设</h2>' +
+       '<div style="font-size:12px;color:var(--mut2)">收录 6,230 款耳机专业校准滤波，CC BY-SA 4.0 授权</div></div>' +
+       '<div style="display:flex;align-items:center;gap:10px">' +
+       '<span class="chip" id=sp_opra_copychip title="复制 OPRA 项目官网链接" style="cursor:pointer;display:inline-flex;align-items:center;font-size:11.5px">' +
+       '<svg width=12 height=12 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 style="margin-right:4px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>https://opra.roon.app/</span>' +
+       '</div></div>';
+
+  // 搜索框（合并为一个，同时匹配品牌与型号，261023-03 第6条）
+  h += '<div style="position:relative;margin-bottom:12px">' +
+       '<input id=sp_opra_search type=text placeholder="搜索耳机品牌或型号（如 Sennheiser / HD 600 / AirPods / Sony / XM5…）" autocomplete=off style="width:100%;height:38px;padding:0 14px;background:var(--card);border:1px solid var(--line);border-radius:8px;font-size:13px;color:var(--txt);box-sizing:border-box">' +
+       '</div>';
+
+  // 空输入引导 + 热门品牌芯片（空输入显示；有输入隐藏，261023-03 第6条）
+  h += '<div id=eqSearchGuide style="padding:10px 0 6px">' +
+       '<div style="font-size:12.5px;color:var(--mut2);margin-bottom:10px">输入品牌或型号检索耳机，或直接点击下方热门品牌快速筛选：</div>' +
+       '<div style="display:flex;flex-wrap:wrap;gap:8px" id=eqBrandChips>' +
+       '<button class="btn brand-chip" data-brand="Sennheiser">森海塞尔 Sennheiser</button>' +
+       '<button class="btn brand-chip" data-brand="Sony">索尼 Sony</button>' +
+       '<button class="btn brand-chip" data-brand="Apple">苹果 Apple</button>' +
+       '<button class="btn brand-chip" data-brand="Beyerdynamic">拜雅 Beyerdynamic</button>' +
+       '<button class="btn brand-chip" data-brand="Audio-Technica">铁三角 Audio-Technica</button>' +
+       '<button class="btn brand-chip" data-brand="AKG">爱科技 AKG</button>' +
+       '<button class="btn brand-chip" data-brand="Hifiman">海菲曼 Hifiman</button>' +
+       '<button class="btn brand-chip" data-brand="Focal">劲浪 Focal</button>' +
+       '</div></div>';
+
+  // 搜索提示
+  h += '<div id=sp_opra_searchhint style="font-size:12px;color:var(--mut2);margin-bottom:10px;display:none"></div>';
+
+  // 型号卡片容器（空输入时 0 个，有输入时 <= 30 个，261023-03 第6条判据）
+  h += '<div id=eqModelCards style="display:grid;grid-template-columns:repeat(auto-fill, minmax(220px, 1fr));gap:10px;margin-bottom:14px"></div>';
+
+  // 兼容老代码的隐藏控件
+  h += '<select id=sp_opra_product style="display:none"></select>' +
+       '<select id=sp_opra_preset style="display:none"></select>' +
+       '<button id=sp_opra_apply style="display:none">应用</button>' +
+       '<div id=sp_opra_card style="display:none"></div>';
+
+  // 预设选择与目标曲线卡片展示区（选中某款耳机后渲染）
+  h += '<div id=eqPresetsArea style="display:none;margin-top:20px;padding-top:18px;border-top:1px dashed var(--line)">' +
+       '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">' +
+       '<h3 id=eqSelectedModelTitle style="font-size:14px;margin:0;font-weight:600">选择调音目标预设</h3>' +
+       '<span id=sp_opra_msg style="font-size:12px;color:var(--mut2)"></span>' +
+       '</div>' +
+       '<div id=eqPresetCards style="display:grid;grid-template-columns:repeat(auto-fill, minmax(280px, 1fr));gap:12px"></div>' +
+       '<div id=eqTargetCurveInfo style="margin-top:16px;padding:14px 16px;background:var(--card);border:1px solid var(--line);border-radius:8px;font-size:12.5px;color:var(--txt2);line-height:1.6;display:none"></div>' +
+       '</div>';
+
+  h += '</div>'; // 结束第一部分
+
+  // 2. 房间校正与通用 EQ 卡片
+  h += '<div class=card style="padding:22px 24px;background:var(--hov);border:1px solid var(--line);border-radius:12px">' +
+       '<h2 style="font-size:16px;margin:0 0 4px;font-weight:700">EQ 与房间声学校正</h2>' +
+       '<div style="font-size:12px;color:var(--mut2);margin-bottom:16px">FIR 卷积用 WAV 脉冲响应，参量 EQ 支持 REW / AutoEq 标准文本格式</div>' +
+       '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:14px">' +
+       '<div><label style="display:block;font-size:12px;color:var(--mut2);margin-bottom:6px;font-weight:500">EQ 文件路径（REW / AutoEq 文本）</label>' +
+       '<input type=text id=sp_eq value="' + esc(ADV.eq || '') + '" placeholder="D:\\Music\\headphone-eq.txt" style="width:100%;height:34px;padding:0 10px;background:var(--card);border:1px solid var(--line);border-radius:6px;color:var(--txt);box-sizing:border-box">' +
+       '<div style="font-size:11px;color:var(--mut2);margin-top:4px">每行如 Filter 1: ON PK Fc 1000 Hz Gain -3.0 dB Q 1.41</div></div>' +
+       '<div><label style="display:block;font-size:12px;color:var(--mut2);margin-bottom:6px;font-weight:500">IR 脉冲响应卷积文件（WAV）</label>' +
+       '<input type=text id=sp_ir value="' + esc(ADV.ir || '') + '" placeholder="D:\\Music\\room.wav" style="width:100%;height:34px;padding:0 10px;background:var(--card);border:1px solid var(--line);border-radius:6px;color:var(--txt);box-sizing:border-box">' +
+       '<div style="font-size:11px;color:var(--mut2);margin-top:4px">留空 = 不做卷积；支持立体声/多声道 FIR 房间校正</div></div></div>' +
+       '<div style="display:flex;align-items:center;justify-content:space-between;margin-top:14px">' +
+       '<label class=chk style="margin:0"><input type=checkbox id=sp_irgpu' + (ADV.irgpu == 1 ? ' checked' : '') + '> 卷积走 GPU 硬件加速（需要 rtagpu.dll 就位）</label>' +
+       '<button class="btn pri" id=bSaveRoomEq>保存房间校正设置</button>' +
+       '</div></div>';
+
+  h += '</div>';
+
+  D('list').innerHTML = h;
+
+  initEqViewLogic();
+}
+
+function initEqViewLogic() {
   var sInput = D('sp_opra_search');
-  var prodSel = D('sp_opra_product');
-  var presSel = D('sp_opra_preset');
-  var applyBtn = D('sp_opra_apply');
+  var guide = D('eqSearchGuide');
+  var hint = D('sp_opra_searchhint');
+  var cardsBox = D('eqModelCards');
+  var presetsArea = D('eqPresetsArea');
+  var presetsBox = D('eqPresetCards');
+  var targetInfo = D('eqTargetCurveInfo');
   var copyChip = D('sp_opra_copychip');
-  var card = D('sp_opra_card');
+  var selectedTitle = D('eqSelectedModelTitle');
   var msg = D('sp_opra_msg');
-  if (!sInput || !prodSel || !presSel || !applyBtn) return;
 
-  function renderProductOptions(items, selectedId) {
-    var h = '<option value="">（请选择耳机型号' + (items.length ? ('，共 ' + items.length + ' 款') : '') + '）</option>';
-    items.forEach(function (it) {
-      var id = it[0], v = it[1], n = it[2];
-      var sel = (id === selectedId) ? ' selected' : '';
-      h += '<option value="' + esc(id) + '"' + sel + '>' + esc(v + ' - ' + n) + '</option>';
-    });
-    prodSel.innerHTML = h;
+  if (copyChip) {
+    copyChip.onclick = function () {
+      var text = 'https://opra.roon.app/';
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { toast('已复制来源链接: ' + text); });
+      } else {
+        toast('来源链接: ' + text);
+      }
+    };
   }
 
-  function filterIndex(q) {
-    if (!OPRA_INDEX) return [];
-    if (!q) return OPRA_INDEX.slice(0, 100);
+  function doSearch(q) {
+    q = (q || '').trim();
+    if (!q) {
+      // 空输入：型号卡片数 == 0，展示引导与热门芯片（261023-03 第6条）
+      cardsBox.innerHTML = '';
+      if (guide) guide.style.display = 'block';
+      if (hint) hint.style.display = 'none';
+      if (presetsArea) presetsArea.style.display = 'none';
+      return;
+    }
+
+    if (guide) guide.style.display = 'none';
+
+    if (!OPRA_INDEX) {
+      if (hint) { hint.textContent = '正在加载耳机数据库…'; hint.style.display = 'block'; }
+      loadOpraIndex(function () { doSearch(q); });
+      return;
+    }
+
     var tokens = q.toLowerCase().split(/\s+/).filter(Boolean);
-    var hits = [];
+    var allHits = [];
     for (var i = 0; i < OPRA_INDEX.length; ++i) {
       var item = OPRA_INDEX[i];
       var str = (item[1] + ' ' + item[2] + ' ' + item[0]).toLowerCase();
@@ -3129,167 +3472,217 @@ function initOpraControls() {
       for (var t = 0; t < tokens.length; ++t) {
         if (str.indexOf(tokens[t]) < 0) { match = false; break; }
       }
-      if (match) {
-        hits.push(item);
-        if (hits.length >= 100) break;
-      }
+      if (match) allHits.push(item);
     }
-    return hits;
-  }
 
-  function showPresetDetails(presetId) {
-    var p = OPRA_PRESETS.find(function (x) { return x.id === presetId; });
-    if (!p) { card.style.display = 'none'; return; }
-    var ch = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">'
-           + '<b>' + esc(p.author || 'OPRA') + (p.details ? (' · ' + esc(p.details)) : '') + '</b>'
-           + '<span class="badge" style="background:var(--bg2)">' + p.bandsCount + ' Bands</span>'
-           + '</div>'
-           + '<div style="font-size:11.5px;color:var(--txt2);line-height:1.6">'
-           + '前级增益（Preamp）：<b>' + p.gainDb + ' dB</b>（防数字削波衰减，独立于主音量）'
-           + (p.link ? ('<br><span style="color:var(--mut2)">测量/调音出处：' + esc(p.link) + '</span>') : '')
-           + '</div>';
-    card.innerHTML = ch;
-    card.style.display = 'block';
-  }
-
-  function loadPresetsForProduct(productId, autoSelectPresetId) {
-    if (!productId) {
-      presSel.innerHTML = '<option value="">（未选择预设）</option>';
-      card.style.display = 'none';
-      return;
+    // 最多 30 条，带继续输入提示（261023-03 第6条）
+    var hits = allHits.slice(0, 30);
+    if (hint) {
+      if (!allHits.length) {
+        hint.textContent = '未找到匹配的耳机型号，请尝试不同关键词';
+      } else if (allHits.length > 30) {
+        hint.textContent = '共匹配到 ' + allHits.length + ' 款耳机，已显示前 30 条。继续输入更具体关键词以精确筛选…';
+      } else {
+        hint.textContent = '匹配到 ' + hits.length + ' 款耳机型号';
+      }
+      hint.style.display = 'block';
     }
-    presSel.innerHTML = '<option value="">正在获取调音预设列表…</option>';
-    msg.textContent = '';
-    api('/api/opra/presets?productId=' + encodeURIComponent(productId)).then(function (j) {
-      if (!j.ok) {
-        presSel.innerHTML = '<option value="">（获取失败）</option>';
-        msg.innerHTML = '<span style="color:var(--err)">' + esc(j.error || '获取预设失败') + '</span>';
-        card.style.display = 'none';
-        return;
-      }
-      OPRA_PRESETS = j.items || [];
-      if (OPRA_PRESETS.length === 0) {
-        presSel.innerHTML = '<option value="">（该型号暂无可用预设）</option>';
-        msg.textContent = '暂无可用预设';
-        card.style.display = 'none';
-        return;
-      }
-      var ph = '<option value="">（请选择预设，共 ' + OPRA_PRESETS.length + ' 种调音）</option>';
-      OPRA_PRESETS.forEach(function (p) {
-        var sel = (p.id === autoSelectPresetId) ? ' selected' : '';
-        var lbl = (p.author || '预设') + (p.details ? (' (' + p.details + ')') : '') + ' [Preamp: ' + p.gainDb + ' dB, ' + p.bandsCount + '段]';
-        ph += '<option value="' + esc(p.id) + '"' + sel + '>' + esc(lbl) + '</option>';
+
+    // 渲染型号卡片（品牌 · 型号 · 预设）
+    var ch = '';
+    hits.forEach(function (it) {
+      var id = it[0], vendor = it[1], name = it[2];
+      var isCur = (id === ADV.opraproduct);
+      ch += '<div class="model-card card' + (isCur ? ' active' : '') + '" data-id="' + esc(id) + '" data-vendor="' + esc(vendor) + '" data-name="' + esc(name) + '">' +
+            '<div style="font-size:11px;color:var(--mut2);font-weight:600">' + esc(vendor) + '</div>' +
+            '<div style="font-size:13.5px;font-weight:600;margin:3px 0 6px;color:var(--txt)">' + esc(name) + '</div>' +
+            '<div style="font-size:11.5px;color:var(--mut2);display:flex;align-items:center;justify-content:space-between">' +
+            '<span>OPRA 预设</span><span class="badge" style="font-size:10px">查看预设</span>' +
+            '</div></div>';
+    });
+    cardsBox.innerHTML = ch;
+
+    // 兼容老 select
+    var pSel = D('sp_opra_product');
+    if (pSel) {
+      var oph = '<option value="">（选择耳机型号）</option>';
+      hits.forEach(function (it) {
+        oph += '<option value="' + esc(it[0]) + '">' + esc(it[1] + ' - ' + it[2]) + '</option>';
       });
-      presSel.innerHTML = ph;
-      if (j.fromCache) {
-        msg.innerHTML = '<span style="color:var(--mut2)">已加载本地缓存预设</span>';
-      }
-      if (autoSelectPresetId) {
-        showPresetDetails(autoSelectPresetId);
-      } else {
-        card.style.display = 'none';
-      }
-    }).catch(function (e) {
-      presSel.innerHTML = '<option value="">（网络离线/获取失败）</option>';
-      msg.innerHTML = '<span style="color:var(--err)">获取失败: ' + esc(String(e)) + '</span>';
-      card.style.display = 'none';
+      pSel.innerHTML = oph;
+    }
+
+    // 绑定点击型号卡片
+    Array.prototype.forEach.call(cardsBox.querySelectorAll('.model-card'), function (card) {
+      card.onclick = function () {
+        Array.prototype.forEach.call(cardsBox.querySelectorAll('.model-card'), function (c) { c.classList.remove('active'); });
+        card.classList.add('active');
+        var pid = card.dataset.id;
+        var pvendor = card.dataset.vendor;
+        var pname = card.dataset.name;
+        if (pSel) pSel.value = pid;
+        loadProductPresets(pid, pvendor, pname);
+      };
     });
   }
 
-  sInput.oninput = function () {
-    var q = sInput.value.trim();
-    var hits = filterIndex(q);
-    renderProductOptions(hits);
-    if (D('sp_opra_prodhint')) D('sp_opra_prodhint').textContent = hits.length ? ('匹配到 ' + hits.length + ' 款耳机') : '未找到匹配的耳机型号';
-  };
+  function loadProductPresets(productId, vendor, name) {
+    if (!presetsArea) return;
+    presetsArea.style.display = 'block';
+    if (selectedTitle) selectedTitle.textContent = vendor + ' ' + name + ' · 调音预设';
+    if (msg) msg.textContent = '正在获取预设…';
+    if (presetsBox) presetsBox.innerHTML = '<div class=empty style="padding:20px 0">正在加载调音目标曲线…</div>';
+    if (targetInfo) targetInfo.style.display = 'none';
 
-  prodSel.onchange = function () {
-    ADV.opraproduct = this.value;
-    loadPresetsForProduct(this.value);
-  };
-
-  presSel.onchange = function () {
-    ADV.oprapreset = this.value;
-    showPresetDetails(this.value);
-  };
-
-  applyBtn.onclick = function () {
-    var pid = prodSel.value;
-    var eqid = presSel.value;
-    if (!pid || !eqid) {
-      toast('请先选择耳机型号与调音预设');
-      return;
-    }
-    applyBtn.disabled = true;
-    msg.textContent = '正在应用并生成预设文件…';
-    api('/api/opra/apply', 'productId=' + encodeURIComponent(pid) + '&presetId=' + encodeURIComponent(eqid)).then(function (j) {
-      applyBtn.disabled = false;
-      if (!j.ok) {
-        msg.innerHTML = '<span style="color:var(--err)">应用失败: ' + esc(j.error || '') + '</span>';
-        toast('应用失败: ' + (j.error || ''));
+    api('/api/opra/presets?productId=' + encodeURIComponent(productId)).then(function (j) {
+      if (!j.ok || !j.items || !j.items.length) {
+        if (msg) msg.textContent = '暂无可用预设';
+        if (presetsBox) presetsBox.innerHTML = '<div class=empty style="padding:20px 0">该型号暂无可用调音预设</div>';
         return;
       }
-      ADV.eq = j.path;
-      if (D('sp_eq')) D('sp_eq').value = j.path;
-      ADV.opraproduct = pid;
-      ADV.oprapreset = eqid;
-      saveSettings();
-      msg.innerHTML = '<span style="color:var(--ok)">✓ 已生效: ' + esc(j.path) + '</span>';
-      toast('已成功应用耳机 EQ 并保存！');
-    }).catch(function (e) {
-      applyBtn.disabled = false;
-      msg.innerHTML = '<span style="color:var(--err)">网络或系统错误</span>';
-      toast('应用异常');
-    });
-  };
+      var presets = j.items;
+      OPRA_PRESETS = presets;
+      if (msg) msg.textContent = (j.fromCache ? '已加载本地缓存（' : '共 ') + presets.length + ' 种调音目标）';
 
-  if (copyChip) {
-    copyChip.onclick = function () {
-      var text = 'https://opra.roon.app/';
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text);
-      } else {
-        var ta = document.createElement('textarea');
-        ta.value = text;
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
+      // 兼容老 select
+      var presSel = D('sp_opra_preset');
+      if (presSel) {
+        var optsh = '<option value="">（请选择预设）</option>';
+        presets.forEach(function (p) {
+          optsh += '<option value="' + esc(p.id) + '">' + esc(p.author + ' ' + p.details) + '</option>';
+        });
+        presSel.innerHTML = optsh;
       }
-      toast('已复制链接: ' + text);
+
+      // 渲染卡片式调音预设（至少 3 张卡，261023-03 第7条）
+      var ph = '';
+      presets.forEach(function (p) {
+        var curve = getTargetCurveDesc(p.details, p.author);
+        var isActive = (ADV.opraproduct === productId && ADV.oprapreset === p.id);
+        ph += '<div class="preset-card card' + (isActive ? ' active' : '') + '" data-id="' + esc(p.id) + '">' +
+              '<div>' +
+              '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">' +
+              '<b style="font-size:13.5px;color:var(--txt)">' + esc(curve.name) + '</b>' +
+              '<span class="badge" style="background:var(--hov)">' + p.bandsCount + ' 段 EQ</span>' +
+              '</div>' +
+              '<div style="font-size:11px;color:var(--mut2);margin-bottom:6px">测量出处：' + esc(p.author || 'OPRA') + (p.details ? (' (' + esc(p.details) + ')') : '') + '</div>' +
+              '<div style="font-size:12px;color:var(--txt2);line-height:1.5;margin:8px 0;background:var(--card);padding:8px 10px;border-radius:6px;border:1px solid var(--line)">' +
+              esc(curve.scene) + '</div>' +
+              '<div style="font-size:11.5px;color:var(--mut2)">前级增益（Preamp）：<b>' + p.gainDb + ' dB</b>（独立衰减防削波）</div>' +
+              '</div>' +
+              '<div style="margin-top:12px;display:flex;align-items:center;justify-content:space-between">' +
+              '<button class="btn pri opra-apply-btn" data-pid="' + esc(productId) + '" data-eid="' + esc(p.id) + '" style="font-size:12px;padding:5px 14px">' +
+              (isActive ? '已应用当前预设' : '应用到 EQ') + '</button>' +
+              '</div></div>';
+      });
+      presetsBox.innerHTML = ph;
+
+      // 选中当前或第一个预设展示曲线说明
+      var curP = presets.find(function (x) { return x.id === ADV.oprapreset; }) || presets[0];
+      if (curP) {
+        showTargetCurveInfo(curP);
+      }
+
+      // 绑定应用按钮与卡片点击
+      Array.prototype.forEach.call(presetsBox.querySelectorAll('.preset-card'), function (pcard) {
+        pcard.onclick = function () {
+          var eid = pcard.dataset.id;
+          var p = presets.find(function (x) { return x.id === eid; });
+          if (p) showTargetCurveInfo(p);
+        };
+      });
+
+      Array.prototype.forEach.call(presetsBox.querySelectorAll('.opra-apply-btn'), function (btn) {
+        btn.onclick = function (ev) {
+          ev.stopPropagation();
+          var pid = btn.dataset.pid;
+          var eid = btn.dataset.eid;
+          applyOpraPreset(pid, eid, presets);
+        };
+      });
+    }).catch(function (err) {
+      if (msg) msg.textContent = '获取失败: ' + err;
+      if (presetsBox) presetsBox.innerHTML = '<div class=empty style="padding:20px 0">网络错误或预设获取失败</div>';
+    });
+  }
+
+  function showTargetCurveInfo(p) {
+    if (!targetInfo) return;
+    var curve = getTargetCurveDesc(p.details, p.author);
+    targetInfo.innerHTML = '<div style="font-weight:700;font-size:13px;margin-bottom:4px;color:var(--txt)">' + esc(curve.name) + ' · 目标曲线说明</div>' +
+                           '<div>' + esc(curve.tech) + '</div>' +
+                           '<div style="margin-top:6px;font-size:11.5px;color:var(--mut2)">' +
+                           '适用场景：' + esc(curve.scene) + ' | 前级增益：' + p.gainDb + ' dB | 滤波段数：' + p.bandsCount + ' 段参量滤波</div>';
+    targetInfo.style.display = 'block';
+  }
+
+  function applyOpraPreset(pid, eid, presets) {
+    api('/api/opra/apply', 'productId=' + encodeURIComponent(pid) + '&presetId=' + encodeURIComponent(eid)).then(function (j) {
+      if (!j.ok) { toast(j.error || '应用失败'); return; }
+      ADV.opraproduct = pid;
+      ADV.oprapreset = eid;
+      if (j.eqPath) ADV.eq = j.eqPath;
+      if (D('sp_eq')) D('sp_eq').value = ADV.eq;
+      saveSettings(true);
+      toast('已应用调音预设到 EQ');
+      Array.prototype.forEach.call(presetsBox.querySelectorAll('.preset-card'), function (c) {
+        var isThis = (c.dataset.id === eid);
+        c.classList.toggle('active', isThis);
+        var b = c.querySelector('.opra-apply-btn');
+        if (b) b.textContent = isThis ? '已应用当前预设' : '应用到 EQ';
+      });
+      var p = presets.find(function (x) { return x.id === eid; });
+      if (p) showTargetCurveInfo(p);
+    });
+  }
+
+  // 搜索框事件
+  if (sInput) {
+    sInput.oninput = function () { doSearch(this.value); };
+    sInput.onkeydown = function (ev) { if (ev.key === 'Enter') doSearch(this.value); };
+  }
+
+  // 热门品牌芯片点击
+  if (guide) {
+    Array.prototype.forEach.call(guide.querySelectorAll('.brand-chip'), function (btn) {
+      btn.onclick = function () {
+        var b = btn.dataset.brand;
+        if (sInput) {
+          sInput.value = b;
+          doSearch(b);
+        }
+      };
+    });
+  }
+
+  // 房间校正保存按钮
+  if (D('bSaveRoomEq')) {
+    D('bSaveRoomEq').onclick = function () {
+      if (D('sp_eq')) ADV.eq = (D('sp_eq').value || '').trim();
+      if (D('sp_ir')) ADV.ir = (D('sp_ir').value || '').trim();
+      if (D('sp_irgpu')) ADV.irgpu = D('sp_irgpu').checked ? 1 : 0;
+      saveSettings(true);
+      toast('已保存房间校正设置');
     };
   }
 
-  // 加载索引数据（带守卫，绝不重复拉取）
-  if (!OPRA_INDEX && !window._opraLoading) {
-    window._opraLoading = true;
-    api('/api/opra/index').then(function (j) {
-      window._opraLoading = false;
-      if (j && j.ok && Array.isArray(j.items)) {
-        OPRA_INDEX = j.items;
-        if (D('sp_opra_searchhint')) D('sp_opra_searchhint').textContent = '本地实时搜索 ' + OPRA_INDEX.length + ' 款耳机型号';
-        if (ADV.opraproduct) {
-          var hit = OPRA_INDEX.find(function (x) { return x[0] === ADV.opraproduct; });
-          var initialItems = hit ? [hit] : filterIndex('');
-          renderProductOptions(initialItems, ADV.opraproduct);
-          loadPresetsForProduct(ADV.opraproduct, ADV.oprapreset);
-        } else {
-          renderProductOptions(OPRA_INDEX.slice(0, 100));
-        }
-      }
-    }).catch(function () { window._opraLoading = false; });
-  } else if (OPRA_INDEX) {
-    if (ADV.opraproduct) {
-      var hit = OPRA_INDEX.find(function (x) { return x[0] === ADV.opraproduct; });
-      var initialItems = hit ? [hit] : filterIndex('');
-      renderProductOptions(initialItems, ADV.opraproduct);
-      loadPresetsForProduct(ADV.opraproduct, ADV.oprapreset);
-    } else {
-      renderProductOptions(OPRA_INDEX.slice(0, 100));
-    }
+  // 初始：若已有选择的型号，则初始化加载；否则保持空状态（0 个型号卡片）
+  if (ADV.opraproduct) {
+    sInput.value = ADV.opraproduct;
+    doSearch(ADV.opraproduct);
+  } else {
+    doSearch('');
   }
 }
 
+function initOpraControls() {
+  if (D('bGoEqNav')) {
+    D('bGoEqNav').onclick = function () {
+      setView('eq');
+      loadEqView();
+    };
+  }
+}
 // ============================================================================
 // 诊断导出（用户 2026-10-22 功能3）
 // ----------------------------------------------------------------------------
@@ -3398,9 +3791,9 @@ function collectSettings() {
   ADV.modorder = parseInt(D('sp_modorder').value, 10) || 5;
   ADV.modcut = parseFloat(D('sp_modcut').value) || 0;
   ADV.moddith = (D('sp_moddith').value === '') ? -1 : parseFloat(D('sp_moddith').value);
-  ADV.eq = (D('sp_eq').value || '').trim();
-  ADV.ir = (D('sp_ir').value || '').trim();
-  ADV.irgpu = D('sp_irgpu').checked ? 1 : 0;
+  if (D('sp_eq')) ADV.eq = (D('sp_eq').value || '').trim();
+  if (D('sp_ir')) ADV.ir = (D('sp_ir').value || '').trim();
+  if (D('sp_irgpu')) ADV.irgpu = D('sp_irgpu').checked ? 1 : 0;
   ADV.ramp = parseFloat(D('sp_ramp').value) || 0;
   ADV.gpuvendor = D('sp_gpu').value || 'auto';
   if (D('sGpu')) D('sGpu').value = ADV.gpuvendor;
@@ -3535,6 +3928,7 @@ function renderNp() {
   D('npSub').textContent = sub + (st ? '  ·  ' + st : '');
   // 元数据补全芯片（loadMeta 异步回来时也会走到这里刷一次）
   if (D('npMeta')) D('npMeta').innerHTML = S.npMetaHtml || '';
+  updateFavUi();
   var bg = (D('cv') && D('cv').style.backgroundImage) || '';
   if (bg && bg.indexOf('url(') === 0) {
     D('npbg').style.backgroundImage = bg;
@@ -3656,6 +4050,8 @@ D('bRep').onclick = cycleRep;
 if (D('sRep')) D('sRep').addEventListener('change', function () { applyRep(this.value); });
 
 /* ---------------- 启动 ---------------- */
+initFavs();
+if (D('npFavBtn')) D('npFavBtn').onclick = function (ev) { if (S.lastCur) toggleFav(S.lastCur, ev); };
 loadLibStats();
 loadSettings();
 loadFilterPhases();   // 功能2：相位预设真相源（/api/filters）
