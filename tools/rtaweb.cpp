@@ -3775,7 +3775,12 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         std::string summaryTarget = "";
         std::string summaryEid = "";
         bool summaryCached = false;
-        if (!fAlbum.empty()) {
+        // 单曲播放页显示的是【所属专辑】的简介，不是每首歌各调一次（用户 261023-03 #3）。
+        // 但标签缺失/在线补全把 album 覆盖成歌名时（实测：合辑单曲、假文件被在线匹配），
+        // 若仍按 release 生成就会变成「每首歌一次调用」→ 烧钱且内容重复。
+        // 这里加一道保守回退：album 为空或 album==title 时改按【艺术家】取 person 简介（按艺术家缓存一次）。
+        const bool album_usable = !fAlbum.empty() && fAlbum != fTitle;
+        if (album_usable) {
             summaryKind = "release";
             summaryTarget = fAlbum;
             summaryEid = (!fArtist.empty())

@@ -1,4 +1,4 @@
-﻿# make_dist.ps1 - build the ONE official release package (Full / self-contained).
+# make_dist.ps1 - build the ONE official release package (Full / self-contained).
 #
 # Policy since 1.0.2:
 #   * There is no "Lite" package any more. Every release is the official
@@ -15,7 +15,7 @@
 #
 # Usage: powershell -File tools/make_dist.ps1 [-Version 1.0.2] [-SkipGpuBuild]
 param(
-    [string]$Version = "1.3.8",
+    [string]$Version = "1.3.9",
     [switch]$SkipGpuBuild
 )
 

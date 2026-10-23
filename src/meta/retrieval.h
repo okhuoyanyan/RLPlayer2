@@ -32,6 +32,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -505,6 +506,22 @@ inline SummaryResult parse_synthesis_reply(const std::string& text,
         }
 
         // ⑤ citations.url 非空
+        // 2026-10-23（261023-03 实测）：DeepSeek 偶尔把 citations[].url 留空，但 id 是真实编号 [Mk]。
+        // 这里做**确定性修补**：id 形如 M<k> 且 k 落在材料范围内 → 用该材料自己的 URL 填回。
+        // 安全性不变：URL 仍来自我们的材料集合（不是 LLM 编的），随后照样走 allowed 集合硬门校验。
+        if (c.url.empty()) {
+            int midx = 0;
+            if (c.id.size() > 1 && (c.id[0] == 'M' || c.id[0] == 'm')) {
+                bool all_digits = true;
+                for (size_t ci = 1; ci < c.id.size(); ++ci) {
+                    if (c.id[ci] < '0' || c.id[ci] > '9') { all_digits = false; break; }
+                }
+                if (all_digits) midx = std::atoi(c.id.c_str() + 1);
+            }
+            if (midx >= 1 && (size_t)midx <= allowed_urls.size() && !allowed_urls[(size_t)midx - 1].empty()) {
+                c.url = allowed_urls[(size_t)midx - 1];
+            }
+        }
         if (c.url.empty()) {
             r.ok = false;
             r.error = "citation url 不能为空 (id=" + c.id + ")";
@@ -1148,42 +1165,40 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         return err_res;
     }
 
-    // 5. Step 4: llm_chat 综合（单次调用，不重试）
+    // 5. Step 4: llm_chat 综合
+    // 2026-10-23（261023-03 实测）：DeepSeek 偶发返回「缺 citations 数组 / 半截 JSON / 引用 url 为空」，
+    // 单次调用失败就让页面空着、用户会以为功能坏了。这里**自动重试一次**（最多 2 次调用，
+    // 只在失败时多花一次钱），仍失败才如实报错并回退旧缓存。
+    // 另外 2000 tokens 对「专辑」类资料（维基正文 + Discogs 发行说明）会截断成半截 JSON，
+    // 已提到 4000（实测揺れる想い/海阔天空通过）。
     const std::string promptEntityName = (!opts.artist.empty() && kind == EntityKind::Release)
         ? (opts.artist + " - " + name)
         : name;
     const std::vector<LlmMessage> msgs = build_synthesis_prompt(promptEntityName, kr.materials, fetched_hits, lang);
-    retrieval_rate_limiter().acquire();
-    // 2026-10-23（261023-03 实测）：2000 tokens 对「专辑」类资料（维基正文 + Discogs 发行说明）
-    // 会截断成半截 JSON，导致校验失败、页面什么都看不到。提到 4000 后揺れる想い/海阔天空均通过。
-    const LlmReply chat_rep = llm_chat(cfg, msgs, 4000, 0.2f, true);
-
-    if (!chat_rep.ok) {
-        // 网络综合失败时若有旧缓存则离线回退
-        if (have_cache && cached.ok) {
-            cached.from_cache = true;
-            cached.offline = true;
-            cached.error = "网络综合失败 (" + chat_rep.error + ")，已回退至本地缓存";
-            return cached;
+    SummaryResult parsed;
+    std::string last_err;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        retrieval_rate_limiter().acquire();
+        const LlmReply chat_rep = llm_chat(cfg, msgs, 4000, 0.2f, true);
+        if (!chat_rep.ok) {
+            last_err = "LLM 综合失败: " + chat_rep.error;
+            continue;
         }
-        SummaryResult err_res;
-        err_res.ok = false;
-        err_res.error = "LLM 综合失败: " + chat_rep.error;
-        return err_res;
+        parsed = parse_synthesis_reply(chat_rep.content, allowed_urls);
+        if (parsed.ok) break;
+        last_err = "综合结果校验失败: " + parsed.error;
     }
-
-    // 6. Step 5: 解析与严格引用校验
-    SummaryResult parsed = parse_synthesis_reply(chat_rep.content, allowed_urls);
     if (!parsed.ok) {
+        // 重试仍失败：有旧缓存则离线回退，否则如实报错（不伪造内容）
         if (have_cache && cached.ok) {
             cached.from_cache = true;
             cached.offline = true;
-            cached.error = "综合校验失败 (" + parsed.error + ")，已回退至本地缓存";
+            cached.error = "综合校验失败 (" + last_err + ")，已回退至本地缓存";
             return cached;
         }
         SummaryResult err_res;
         err_res.ok = false;
-        err_res.error = "综合结果校验失败: " + parsed.error;
+        err_res.error = last_err;
         return err_res;
     }
 
