@@ -693,11 +693,31 @@ async function waitFor(expr, ms = 8000) {
   ck(await evalJs("!!document.getElementById('npPlay') && !!document.getElementById('npSeek') && !!document.getElementById('npPrev')"), '正在播放页有播放控件');
   ck(await evalJs("!document.getElementById('npPage').classList.contains('on')"), '正在播放页可以关闭');
 
+  // 自检纪律：自检绝不污染用户实例状态。任何触发状态变更的控件测试，
+  // 测试前必须记录原值，测完必须通过界面/设置保存还原并断言后端值已恢复。
+  const origRepSetting = await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv&&j.kv.repeat!==undefined?String(j.kv.repeat):null)");
   const rep0 = await evalJs("document.getElementById('sRep').value");
   await evalJs("document.getElementById('bRep').click()");
   await sleep(200);
   const rep1 = await evalJs("document.getElementById('sRep').value");
   ck(rep0 !== rep1, '循环键能切换循环方式', rep0 + ' -> ' + rep1);
+
+  // 还原循环状态：通过界面点击还原，恢复至自检前原值（自检必须还原纪律）
+  await evalJs(`(function() {
+    var want = ${JSON.stringify(rep0)};
+    var cur = document.getElementById('sRep') ? document.getElementById('sRep').value : '0';
+    var tries = 0;
+    while (cur !== want && tries < 3) {
+      var btn = document.getElementById('bRep');
+      if (btn) btn.click();
+      cur = document.getElementById('sRep') ? document.getElementById('sRep').value : '0';
+      tries++;
+    }
+  })()`);
+  await sleep(200);
+  const repRestored = await evalJs("document.getElementById('sRep').value");
+  ck(repRestored === rep0, '循环键自检后界面状态还原', repRestored + ' === ' + rep0);
+  ck(await waitFor("fetch('/api/queue').then(r=>r.json()).then(j=>String(j.repeat)==='" + String(rep0) + "')", 4000), '自检跑完后循环模式恢复后端状态');
 
   ck(await evalJs("!!document.getElementById('dropmask')"), '拖拽提示层已就绪');
 
