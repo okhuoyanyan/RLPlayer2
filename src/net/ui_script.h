@@ -1015,6 +1015,8 @@ function renderWorkVersions(workTitle, composer, j) {
 function loadTracks(q) {
   S.view = 'tracks';
   S.tracksQuery = q || '';
+  // 评审：搜索结果页顶栏搜索框不回显当前关键词 → 这里同步（用户正在输入时值本来就相同，不会打断输入）
+  if (D('q') && String(D('q').value) !== String(q || '')) D('q').value = q || '';
   head(q ? ('搜索：' + q) : '曲目', '搜索中…', '');
   api('/api/lib/search?q=' + encodeURIComponent(q || '')).then(function (j) {
     if (S.view !== 'tracks') return;   // 已切走（261023-01 #4 同类问题）→ 丢弃，别覆写当前页面

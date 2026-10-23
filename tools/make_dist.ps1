@@ -1,4 +1,4 @@
-﻿﻿# make_dist.ps1 - build the ONE official release package (Full / self-contained).
+﻿# make_dist.ps1 - build the ONE official release package (Full / self-contained).
 #
 # Policy since 1.0.2:
 #   * There is no "Lite" package any more. Every release is the official

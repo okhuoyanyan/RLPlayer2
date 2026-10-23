@@ -1969,3 +1969,22 @@ DSD 源的 Integrator（IIR/FIR/CIC）与 Conversion（wide/narrow/XFi）、Dire
 4. **NVIDIA CUDA 后端**：只有选项与加载路径，仓库里没有 CUDA 源码（本机无 N 卡、无 nvcc）。
 5. **Native DSD**：需要驱动的 ASIO 通道类型是 DSD；本机 DAC 的驱动不是。
 6. **DSD512/1024 出声**：调制器能算（0.8 倍实时），但没有 DAC 支持，无法端到端验证。
+
+## 第三十二轮：1.3.10（2026-10-24）—— 261023-04 十五条 + CUDA DLL 随包 + 首个 AI 兜底
+
+- **输入**：用户 `反馈和开发/develop/261023-04.txt`（15 条：UI/UX 12 条 + AI/UPnP 3 条）；协作者 CUDA DLL（PR #3）。
+- **CUDA**：`rtagpu_cuda.dll`（766,464 B，sha256 BCE4093D…E6B，CUDA 12.9、19 档 fatbin、4 导出符号）合入 main；
+  Lead 独立复核字节数/hash/PE/dumpbin 后合并；`/api/gpu` 新增 `cudaUsable`（真加载+调 `rta_gpu_available()`），
+  AMD 机器实测 `cuda:true,cudaUsable:false` + 自动回退 AMD，不崩。`make_dist` 自动收录 → 本版包内置。
+- **UPnP #11 真根因**：Clash Verge TUN（198.18.0.0/15 fake-IP）抢走默认路由，SSDP 组播进隧道 → 局域网渲染器收不到。
+  改为逐网卡设 IP_MULTICAST_IF 连发 + 跳过代理/虚拟网卡；**实测搜到用户设备 N1000_UPNP @ 192.168.50.109**（修复前 0 台）。
+- **AI #14/#15**：无权威材料时不再直接拒绝，退回 AI 自有知识整理并标 `unverified`（UI 明示"AI 整理（未找到权威来源，仅供参考）"），
+  结果 7 天缓存；knowledge 失败负缓存 6h；新增 `kind=track` 歌曲级简介。塞壬唱片实测 11.1s 出 3 节、二次 2ms 命中缓存。
+- **UI**：r4-shell（底栏居中/chip、EQ 入设置页签、元数据两开关+两列高级、下拉对比度、状态卡横排、视图迟到响应守卫）+
+  r4-np（单曲页四行 Grid、多实体资料面板、EQ 芯片、边带同色消黑框、古典作品并入单曲页）。
+  Lead 合并后再修 3 个真实 bug（队列页标题空窗、**搜索防抖把视图顶回曲目**、资料默认 tab 被钉死）并按 UI 评审意见做一轮打磨
+  （窄窗收右抽屉、曲目名保底、弹层内滚、设置底栏吸底、诊断页隐藏底栏、EQ 去重复保存、流媒体空态卡、队列路径可读…）。
+- **事故（如实记录）**：r4-np 的测试脚本只 POST 单键触发旧版 `/api/settings` 截断重写 → backend/volume 被清 →
+  对真实设备（Portacapture X8）出声约 50 秒/0 dB。已修产品根因（**POST 改为合并写**）+ 双方加播放硬门禁；详见
+  `反馈和开发/develop/261023-04.txt.分析.md` §5.1。
+- **门禁**：build 0 错 / ctest 60/60 / 平台边界 PASS / uicheck「界面检查全部通过」/ npcheck 43/43。

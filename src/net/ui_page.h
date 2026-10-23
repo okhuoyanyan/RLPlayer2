@@ -388,9 +388,9 @@ inline std::string rta_ui_page() {
     h += ".plrow button{color:var(--mut2);font-size:14px;padding:0 5px}";
     h += ".plrow button:hover{color:var(--danger)}";
     // 弹层
-    h += "#modal{position:fixed;inset:0;z-index:40;background:rgba(0,0,0,.45);backdrop-filter:blur(3px);display:none;place-items:center;padding:16px;box-sizing:border-box;overflow:auto}";
+    h += "#modal{position:fixed;inset:0;z-index:40;background:rgba(0,0,0,.45);backdrop-filter:blur(3px);display:none;place-items:center;padding:12px;box-sizing:border-box;overflow:auto}";
     h += "#modal.on{display:grid}";
-    h += ".mcard{width:min(600px,92vw);max-height:calc(100vh - 32px);display:flex;flex-direction:column;overflow:hidden;background:var(--bg2);border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 70px var(--shadow)}";
+    h += ".mcard{width:min(600px,92vw);max-height:calc(100vh - 56px);display:flex;flex-direction:column;overflow:hidden;background:var(--bg2);border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 70px var(--shadow)}";
     h += ".mhead{display:flex;align-items:center;gap:9px;padding:14px 18px;border-bottom:1px solid var(--line);font-weight:650;flex:none}";
     h += ".mbody{padding:16px 18px 22px;flex:1;min-height:0;overflow:auto}";
     h += ".chain{display:flex;flex-direction:column;gap:0}";
@@ -431,6 +431,7 @@ inline std::string rta_ui_page() {
     h += ".stab.on{background:var(--acc-weak);color:var(--acc-text);border-color:rgba(59,130,246,.32);font-weight:600}";
     h += ".spane{display:none}.spane.on{display:block}";
     h += ".trimgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}";
+    h += "@media (max-width:1100px){#crumb,#sub{display:none}.search{max-width:320px}}";
     h += ".setfoot{display:flex;gap:10px;align-items:center;padding:12px 2px 10px;position:sticky;bottom:0;background:var(--bg);border-top:1px solid var(--line);z-index:6}";
     h += ".setfoot .sp{flex:1}";
     h += ".meter-bar{height:6px;border-radius:3px;background:var(--track);overflow:hidden;position:relative;margin:4px 0 2px}";
