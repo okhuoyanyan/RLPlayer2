@@ -54,6 +54,23 @@
 - 版本 1.1.1;产物 `dist\RLPlayer-1.1.1-win64.zip` = **388,465,510 字节 (370.47 MB)**,sha256 `3B72561242E4958DC7C0D52A9FB464048E14A2DC33DEF3358E5DEF46FA97BE3C`(打包门禁:ffmpeg 守卫 + Locales 守卫 + 兼容门禁 + GPU 裸 PATH smoke)。
 - 包内验证:新 CLI(rtacapture/rtacast/filter_report)+ data/opra_index.json + OPRA-NOTICE.txt 齐全;bundled 启动 v1.1.1;`/api/cast/state`、`/api/input/devices`、`/api/opra/index` 全 200;8899 全程无监听。
 
+## 7. P6b/P6c:解码与 DSD 抽取的性能改造(6a9054e / d0de0e8 → f17f393)
+
+### 7.1 P6b 解码免临时 WAV(流式管道)
+- `ffmpeg ... -f wav pipe:1` + CreatePipe/STARTUPINFO 重定向 stdout(stderr 后台线程异步读,防管道死锁);接口层新增 `parse_wav_header`(任意 chunk 顺序/JUNK 在前/奇数 chunk padding/WAVE_FORMAT_EXTENSIBLE/data 长度 0xFFFFFFFF)与 `read_wav_stream_pipe`(跨块任意切片逐位还原);
+- **6 种格式实测(flac/mp3/ogg/m4a/wav/dsf)**:流式 vs 旧临时 WAV **PCM 逐字节 100% 相同**;**磁盘写入 0 字节**(旧路径单曲 0.5 MB~13.5 MB);耗时略降(50~71 ms);
+- 回退:设置键 `streamdecode`(默认 1)/环境变量 `RLPLAYER_STREAM_DECODE`;需 seek 容器或管道异常自动回退旧路径并在 note 写明原因;瞬时占用重试/错误归因**未退化**(test_decode_retry 全绿);
+- ctest 57/57。
+
+### 7.2 P6c DSD 源抽取两级化(CIC 4× + 短 FIR)
+- 第一级 6 级 CIC 无乘法整数降 4×(镜像衰减 DSD64 −141.9~−179.1 dB / DSD256 −252.2 dB),第二级短 FIR(fmid=fs/4)+ 5 抽头最小二乘 CIC 下垂补偿;
+- **抽头数**:DSD64 narrow 163→**49**、wide 191→57、xfi 231→69;DSD256 narrow 135→43;
+- **频域**:全部 9 组(DSD64/128/256 × narrow/wide/xfi)带内最差纹波 ≤0.000013 dB、镜像/阻带 ≥124.16 dB(判据 ≤0.001 dB / ≥120 dB 全过);
+- **THD+N**:单级 99.29 dB → 两级 **99.29 dB(差 0.0010 dB,门禁 <0.05)**;通带频谱差 0.000000 dB;
+- **性能(合成 DSD256 5 分钟/807.5 MB 等效 PCM)**:单级 16.215 s(18.5×) → 两级 **7.065 s(42.5×),加速 2.30×**,峰值内存 11.34 MB 不变,输出帧数一致;
+- 分块(10 种块大小)与整块**逐位一致**;关闭 `dsd2stage` 回退单级且逐位同旧基线;
+- ctest 57→**58/58**;verify 11/11。
+
 # 第二十四轮:ROADMAP 剩余阶段开跑——P4 输入采集 / P5 UPnP 投放 / P1 调制器族 / P2 滤波器变体(2026-10-23)
 
 > 用户指令:无人值守连续开发(「直到开发结束」)。Lead 只核验/派单,编码全派 Gemini 3.8 Flash(high)子代理,并行用独立 worktree。

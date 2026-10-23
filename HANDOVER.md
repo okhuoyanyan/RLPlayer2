@@ -1,8 +1,10 @@
 # RLPlayer 交接说明
 
-> **当前状态(2026-10-23 第二十四轮后)**:ROADMAP **P1(调制器族)/P2(滤波器变体)/P4(输入采集)/P5(UPnP 投放)** 全部落地并合入 main;
+> **当前状态(2026-10-23 第二十五轮后)**:ROADMAP **P1/P2/P4/P5/P6(性能) 全部落地并合入 main**;
 > 之前完成的 ROON/元数据 P3 资料层 ②③④、耳机 EQ(OPRA)、基建三项(WebView2 双轨/精简 ffmpeg/裁 Locales)都在 main;
-> 源码树 ctest **53/53**、本机 verify **11/11(Fail 0)**、平台边界 PASS、uicheck 全过。**下一轮 = P6 性能 + P5b 投放 UI + 未解决项清理**。
+> 源码树 ctest **58/58**、本机 verify **11/11(Fail 0)**、平台边界 PASS、uicheck 全过。
+> **剩余都是外部/真机条件**:P3(NAA) 受 EULA 授权阻塞;UPnP 投放需真实渲染器;输入/资料层需真机复测;P4/P6 已完成实现。
+> **verify 必须在机器空闲时串行跑**——并行重型构建(出包/全量编译)会让 UI 自检与个别 ctest 出假红(已二次踩到)。
 > **1.1.1 已发布**(P6a 扫描并行 3.18× / P5b 投放 UI / L4 演绎去重 / 已知问题修复):`dist\RLPlayer-1.1.1-win64.zip`,**370.47 MB**,
 > sha256 `3B72561242E4958DC7C0D52A9FB464048E14A2DC33DEF3358E5DEF46FA97BE3C`(GitHub Release v1.1.1);
 > 1.1.0 / 1.0.10 旧包仍在 `dist\` 可回退。**下一步 = P6b 流式解码/DSD 两级抽取 + 投放/资料层端到端实测 + 剩余未解决项**。
@@ -11,7 +13,13 @@
 > (全景状态/代码地图/未解决项/工作方法/队列——新会话先读它),历史回合见 STATUS.md 第十三~**二十二**轮。
 > 以下为第十二轮及更早的通用交接内容,架构与坑清单仍然有效。
 >
-> **最近六轮的关键状态变化(接手必读)**:
+> **最近七轮的关键状态变化(接手必读)**:
+> - **第二十五轮(P6 性能 + 投放 UI + L4 演绎 + 已知问题)**:**P6a 库扫描并行化**(固定线程池/背压/结果逐字节一致;653 首 30.16s→9.47s **3.18×**)+
+>   信号链耗时统计;**P5b 投放设置页**(`cast_service.h` + `/api/cast/*` + 「投放（UPnP）」面板);**L4 演绎身份**
+>   (Discogs release 详情 → 指挥/乐团/独奏 + 按 `dedupKey` 去重,`complete=distinct>=5`;Boléro 11/Beethoven 10/Mahler 10);
+>   **已知问题**:WebView2 护栏 10 用例入 ctest、rateAuto 策略纯函数测试、`PLAY_ABORT` 显式归因;
+>   **P6b 流式解码**(免临时 WAV,PCM 逐位一致、磁盘写 0);**P6c DSD 两级抽取**(CIC 4×+短 FIR,DSD256 5 分钟 16.2s→7.1s **2.3×**,THD+N 不回退)。
+>   ⚠️ 合并时踩过:**P5b 的 `cast_service.h` 曾含 windows.h 平台越界**(已修 c6909f0);门禁要看 exit code 别只看尾行。
 > - **第二十四轮(ROADMAP 剩余四阶段)**:**P4 输入采集**(`src/audio/wasapi_capture.h` 无锁 SPSC/格式转换/THD+N + `tools/rtacapture.exe` + `/api/input/*` +
 >   设置页输入面板;监听=共享输出直通,非 bit-perfect);**P5 UPnP 投放**(`src/net/upnp_control.h` SOAP 9 动作/UPnPError/DIDL/Range + `UpnpHttpServer` 8912 +
 >   `tools/rtacast.exe`;本机局域网无渲染器,端到端重采样未实测);**P1 调制器族**(dsd/chebyshev/ec/ahm,键 `modfamily`;
