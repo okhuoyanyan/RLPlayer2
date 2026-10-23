@@ -2,6 +2,36 @@
 
 > **接手请先读**：[HANDOVER.md](HANDOVER.md)（架构/构建/已知坑）→ [ROADMAP.md](ROADMAP.md)（待开发与判据）。
 > 本文件按回合记录“做过什么、实测多少”，越往下越旧。
+# 第二十八轮:元数据最后三项遗留收口（E-4/E-9/E-8）+ 1.3.2(2026-10-23)
+
+> 承接第 27 轮：把 §1.6.E 里最后三个**代码级**遗留项收掉。至此该清单里只剩 P2/P3 的设计取舍与外部网络条件。
+
+## 1. E-4：probe_media 合并音频流标签（ogg/opus 缺口，8504acf → 761d8da）
+- 新增纯函数 `merge_tags`（键名大小写归一、剥 `tag:` 前缀、**format 优先、stream 补缺**、空值不注入）与 `probe_parse_json`；`probe_media` 改单次 ffprobe 取 format/stream 双节点；
+- 离线：真实 OGG / Opus / 混合覆盖 / 多流（封面 video + audio）四组 JSON 夹具全过；纯函数覆盖冲突、大小写、空白补缺；真文件 opt-in 亦过；
+- 影响：ogg/opus 的标题/艺术家等不再只能靠文件名（此前 format.tags 为空 → 全丢）。
+
+## 2. E-9：uicheck 循环键测试不再污染实例（33bf3ee）
+- 测前记录 `sRep` 原值 → 断言切换 → 界面点回原值 → `waitFor` 后端 `/api/queue repeat` 恢复；并写入「自检必须还原状态」纪律注释；
+- 证据：8911 临时实例连跑两次，跑前/跑后 repeat 均为 0。
+
+## 3. E-8：DeepSeek 月度调用上限 + 超限降级（b548048）
+- `src/meta/llm.h`：`yyyyMM` 分桶计数、原子落盘（不含任何 key）、设置键 `llmmonthlycap`（0=不限，默认 0）；超限在**发起 HTTP 之前**拦截并返回「本月 AI 调用已达上限 (N/Cap)」；
+- **分级隔离**：L3/L4（检索综合/版本点评）停用；**L1（Provider/标签）与 L2（knowledge.h 维基/萌娘直连）不经 llm.h，不受影响**；
+- **计费口径 = 按实际成功计**（HTTP 200 且 ok）；网络故障/5xx/非法响应不计；换月自动恢复（旧月分桶保留）；
+- `rtaweb`：`/api/settings` 放行 `llmmonthlycap`、`/api/llm` 展示 cap 与当月用量；
+- 测试（mock transport）：cap=2 时第 3 次**不发请求**且 httpCalls 保持 2；换月恢复；cap=0 不限；失败不计；JSON 不含 key。
+
+## 4. 门禁与交付
+- 合并后：build 0 error、ctest **60/60**、平台边界 PASS(exit 0)、本机 verify **11/11(Fail 0)**；
+- **1.3.2 正式包**：`dist\\RLPlayer-1.3.2-win64.zip` = **388,837,135 字节(370.83 MB)**，sha256 `1F51991165B5439F3221642169ACCF57C5A4D594E864B8ECE2AEEBD94D4C2DED`；包内 `/api/ping`=1.3.2、`/api/llm` 含 `monthlyCap:0`；17 个 CLI + OPRA 资产齐全。
+
+## 5. ⚠️ 仍未解决（铁律 4，均为设计取舍/外部条件）
+1. 写回预览不做 PICTURE 门探测（只读不启 ffmpeg），预览数与真批可能差 1~N（P2 既有设计取舍）；
+2. MusicBrainz 直连在部分网络不稳（代理 7897 后备）；Discogs 匿名 25 req/min 触发 429 熔断；
+3. 多碟盒装仅两层；"大 WAV + CUE" 依赖后续拆轨；古典乐团写在 PERFORMER 时按 Person 角色化；
+4. NAA(P3) 受 EULA 授权阻塞；UPnP/输入/CUDA/独占输出需真机复测。
+
 # 第二十七轮:元数据方向未解决项批量收口（E-5/E-12/E-13/E-14/E-15/E-16/E-17/E-18）(2026-10-23)
 
 > 无人值守续跑：把 docs/元数据补全调研与规划.md §1.6.E 里**所有非外部阻塞**的遗留项一次收完。
