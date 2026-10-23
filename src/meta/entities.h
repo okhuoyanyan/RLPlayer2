@@ -33,6 +33,7 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -969,17 +970,113 @@ inline EntityDirScan entity_scan_dir(const fsx::path& dir) {
     return s;
 }
 
-// 专辑目录 = 直接含音频文件的目录。注意"直接"是判据的全部要点：
-// 分类目录的下级有音频，但它自己一个也没有。
-inline bool entity_dir_is_album(const fsx::path& dir) {
-    return entity_scan_dir(dir).audioFiles > 0;
+// 多碟盒装子目录判定：CD1..CDn / Disc1..n / Disk1..n（大小写不敏感，允许前导空格/连字符）
+inline bool entity_is_disc_subdir_name(const std::string& name, int* discOut = nullptr) {
+    std::string s = entity_detail::ent_ascii_lower(entity_detail::ent_trim_ascii_ws(name));
+    if (s.empty()) return false;
+    size_t pos = 0;
+    if (s.rfind("cd", 0) == 0) {
+        pos = 2;
+    } else if (s.rfind("disc", 0) == 0 || s.rfind("disk", 0) == 0) {
+        pos = 4;
+    } else {
+        return false;
+    }
+    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '-' || s[pos] == '_' || s[pos] == '.')) {
+        ++pos;
+    }
+    if (pos >= s.size() || s[pos] < '0' || s[pos] > '9') return false;
+    int num = 0;
+    while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') {
+        num = num * 10 + (s[pos] - '0');
+        if (num > 9999) return false;
+        ++pos;
+    }
+    if (pos < s.size()) {
+        char c = s[pos];
+        if (c != ' ' && c != '-' && c != '_' && c != ':' && c != '(' && c != '[' && c != '.') {
+            return false;
+        }
+    }
+    if (discOut) *discOut = num;
+    return num > 0;
 }
 
-// 分类目录 = 自己无直接音频、但有子目录（本库的 MUSIC\专辑-原创&同人 / MUSIC\专辑-感动我的&RainLain）。
-// 单独给出这个函数是因为「空目录」与「分类目录」必须能分开：空目录不该被继续下钻，也不该产专辑名。
+// 判定一个目录是否是多碟盒装专辑目录：
+// 自身不要求有直接音频，但其直接子目录中【所有含音频的子目录】全部呈现 CD1..CDn / Disc1..n 碟片形态（至少 1 个碟片子目录）。
+inline bool entity_dir_is_boxset(const fsx::path& dir, std::vector<int>* discsOut = nullptr) {
+    std::error_code ec;
+    if (!fsx::is_directory(dir, ec) || ec) return false;
+    size_t discSubdirs = 0;
+    size_t audioSubdirs = 0;
+    std::vector<int> discs;
+
+    for (fsx::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_directory(ec)) continue;
+        const fsx::path subPath = it->path();
+        const std::string subName = meta_string_of(subPath.filename());
+        int dNo = 0;
+        const bool isDiscName = entity_is_disc_subdir_name(subName, &dNo);
+        const EntityDirScan s = entity_scan_dir(subPath);
+        if (s.audioFiles > 0) {
+            ++audioSubdirs;
+            if (isDiscName) {
+                ++discSubdirs;
+                if (dNo > 0) discs.push_back(dNo);
+            }
+        }
+    }
+    if (audioSubdirs > 0 && discSubdirs == audioSubdirs) {
+        if (discsOut) {
+            std::sort(discs.begin(), discs.end());
+            discs.erase(std::unique(discs.begin(), discs.end()), discs.end());
+            *discsOut = std::move(discs);
+        }
+        return true;
+    }
+    return false;
+}
+
+// 判定某个目录是否是多碟盒装的碟片子目录（例如 MyBoxSet/CD1）
+inline bool entity_dir_is_disc_subdir(const fsx::path& dir, int* discOut = nullptr) {
+    const std::string name = meta_string_of(dir.filename());
+    if (!entity_is_disc_subdir_name(name, discOut)) return false;
+    const fsx::path parent = dir.parent_path();
+    return entity_dir_is_boxset(parent);
+}
+
+// 专辑目录 = ① 直接含音频文件的目录（普通单碟专辑，且自身不是盒装下的 CD1/CD2 碟片子目录）；
+//           ② 或者自身为多碟盒装专辑目录（音频位于 CD1..CDn 子目录中）。
+inline bool entity_dir_is_album(const fsx::path& dir) {
+    if (entity_dir_is_disc_subdir(dir)) return false;
+    const EntityDirScan s = entity_scan_dir(dir);
+    if (s.audioFiles > 0) return true;
+    return entity_dir_is_boxset(dir);
+}
+
+// 分类目录 = 自己无直接音频、有子目录、且不是多碟盒装也不是碟片子目录。
 inline bool entity_dir_is_category(const fsx::path& dir) {
+    if (entity_dir_is_disc_subdir(dir)) return false;
+    if (entity_dir_is_boxset(dir)) return false;
     const EntityDirScan s = entity_scan_dir(dir);
     return s.readable && s.audioFiles == 0 && s.subdirs > 0;
+}
+
+// 给定曲目路径，查找其所属的真实专辑目录路径（处理单碟与多碟盒装），并可导出推断的碟号
+inline fsx::path entity_find_album_dir_for_track(const fsx::path& trackPath, int* discOut = nullptr) {
+    std::error_code ec;
+    fsx::path p = trackPath.parent_path();
+    if (p.empty()) return fsx::path();
+    // 1. 若父目录是盒装的碟片子目录（MyBoxSet/CD1），其真正的专辑目录是其上层盒装目录
+    if (entity_dir_is_disc_subdir(p, discOut)) {
+        return p.parent_path();
+    }
+    // 2. 若父目录本身就是专辑目录（普通单碟）
+    if (entity_dir_is_album(p)) {
+        if (discOut) *discOut = 1;
+        return p;
+    }
+    return fsx::path();
 }
 
 // 给定一个目录，若它是**专辑目录**则返回它的目录名（UTF-8 原样，交给
@@ -1040,15 +1137,38 @@ inline MetaSeed entity_seed_from_tags(const std::string& trackPath,
     return s;
 }
 
+// 从曲目路径与原始标签提取种子，并接入目录结构判据（多碟盒装/「专辑 @ 社团」目录名/碟号推断）
+inline MetaSeed entity_seed_from_track_path(const std::string& trackPath,
+                                            const std::map<std::string, std::string>& rawTags = {}) {
+    MetaSeed s = entity_seed_from_tags(trackPath, rawTags);
+    int discFromDir = 0;
+    const fsx::path albDir = entity_find_album_dir_for_track(meta_path_of(trackPath), &discFromDir);
+    if (!albDir.empty()) {
+        const std::string dn = meta_string_of(albDir.filename());
+        std::string a, c;
+        entity_parse_album_circle(dn, a, c);
+        if (s.album.empty() && !a.empty()) s.album = a;
+        if (s.circle.empty() && !c.empty()) s.circle = c;
+        if (discFromDir > 0) {
+            auto it = s.tags.find("disc");
+            if (it == s.tags.end()) it = s.tags.find("discNo");
+            if (it == s.tags.end()) it = s.tags.find("discno");
+            if (it == s.tags.end() || it->second.empty() || it->second == "0") {
+                s.tags["disc"] = std::to_string(discFromDir);
+                s.tags["discNo"] = std::to_string(discFromDir);
+            }
+        }
+    }
+    return s;
+}
+
 // store.h 的 TrackMeta → 种子（12 个常规字段原样透传成 tags，另把常用字段提到明面上）
-// 实现委托给 entity_seed_from_tags：字段映射只有一份，两个入口不会漂移
-// （TrackMeta 的键是小驼峰 albumArtist，entity_seed_from_tags 的别名表已含
-//  "albumartist" 归一比较，正好命中）。
+// 实现委托给 entity_seed_from_track_path：字段映射只有一份，且自动接线目录结构判据。
 inline MetaSeed entity_seed_from_track(const TrackMeta& tm) {
     std::map<std::string, std::string> flat;
     for (const auto& kv : tm.fields)
         if (!kv.second.value.empty()) flat[kv.first] = kv.second.value;
-    return entity_seed_from_tags(tm.path, flat);
+    return entity_seed_from_track_path(tm.path, flat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,6 +1243,29 @@ public:
         e.ts = ts_;
         it->second.edges.push_back(std::move(e));
         it->second.updatedTs = ts_;
+    }
+
+    // 合并另一张实体图（去重、alias 追加、属性按 mergeField 策略、边去重）
+    void merge(const EntityGraph& other) {
+        for (const auto& kv : other.entities) {
+            const Entity& src = kv.second;
+            auto it = g_.entities.find(src.id);
+            if (it == g_.entities.end()) {
+                g_.entities[src.id] = src;
+                it = g_.entities.find(src.id);
+                if (it->second.createdTs == 0) it->second.createdTs = ts_;
+                it->second.updatedTs = ts_;
+            } else {
+                for (const auto& a : src.aliases) it->second.addAlias(a);
+                for (const auto& akv : src.attrs) entity_merge_attr(it->second.attrs, akv.first, akv.second);
+                for (const auto& ed : src.edges) {
+                    if (!it->second.findEdge(ed.rel, ed.to, ed.role)) {
+                        it->second.edges.push_back(ed);
+                    }
+                }
+                if (ts_ > it->second.updatedTs) it->second.updatedTs = ts_;
+            }
+        }
     }
 
     const EntityGraph& graph() const { return g_; }
@@ -1286,6 +1429,21 @@ inline EntityGraph entity_graph_from_seed(const MetaSeed& s, long long ts) {
         // （MetaStore::hashOf == net/library.h fnv_hex，同一算法同一常数，全项目一致）。
         b.attr(trackId, "trackHash", MetaStore::hashOf(s.trackPath), "file");
     }
+    // 写入 Track 上的 discNo / trackNo 属性（供多碟判据与排序溯源）
+    for (const auto& k : { "discNo", "disc", "discno", "DISCNUMBER" }) {
+        auto it = s.tags.find(k);
+        if (it != s.tags.end() && !it->second.empty()) {
+            b.attr(trackId, "discNo", it->second, "tag");
+            break;
+        }
+    }
+    for (const auto& k : { "trackNo", "track", "trackno", "TRACKNUMBER" }) {
+        auto it = s.tags.find(k);
+        if (it != s.tags.end() && !it->second.empty()) {
+            b.attr(trackId, "trackNo", it->second, "tag");
+            break;
+        }
+    }
     b.link(trackId, entity_rel::kTrackOf, recordingId, "", "file");
     b.link(releaseId, entity_rel::kHasTrack, trackId, "", "file");
 
@@ -1306,6 +1464,96 @@ inline EntityGraph entity_graph_from_seed(const MetaSeed& s, long long ts) {
         b.link(releaseId, entity_rel::kByGroup, gid, "", "dir");
     }
     return b.take();
+}
+
+// ---------------------------------------------------------------------------
+// 真实批量入口：从音乐库扫描结果 / 种子列表构建实体图
+// ---------------------------------------------------------------------------
+
+// 辅助：获取某个 Release 实体下关联的碟片数
+inline size_t entity_release_disc_count(const EntityGraph& g, const std::string& releaseId) {
+    const Entity* rel = g.find(releaseId);
+    if (!rel || rel->kind != EntityKind::Release) return 0;
+    auto itDiscs = rel->attrs.find("discCount");
+    if (itDiscs == rel->attrs.end()) itDiscs = rel->attrs.find("discs");
+    if (itDiscs != rel->attrs.end()) {
+        int n = std::atoi(itDiscs->second.value.c_str());
+        if (n > 0) return (size_t)n;
+    }
+    std::set<int> discs;
+    for (const auto& e : rel->edges) {
+        if (e.rel == entity_rel::kHasTrack) {
+            const Entity* tr = g.find(e.to);
+            if (tr) {
+                auto itD = tr->attrs.find("discNo");
+                if (itD == tr->attrs.end()) itD = tr->attrs.find("disc");
+                if (itD != tr->attrs.end()) {
+                    int d = std::atoi(itD->second.value.c_str());
+                    if (d > 0) discs.insert(d);
+                }
+            }
+        }
+    }
+    return discs.empty() ? 1 : discs.size();
+}
+
+// 批量入口核心：将多个种子聚合构建为统一实体图（多碟盒装、同专辑不同曲目均收敛到同一 Release）
+inline EntityGraph entity_batch_build_graph(const std::vector<MetaSeed>& seeds, long long ts = 0) {
+    EntityBuilder b(ts);
+    std::map<std::string, std::set<int>> releaseDiscs;
+
+    for (const auto& s : seeds) {
+        EntityGraph gSeed = entity_graph_from_seed(s, ts);
+        std::string releaseId;
+        for (const auto& kv : gSeed.entities) {
+            if (kv.second.kind == EntityKind::Release) {
+                releaseId = kv.second.id;
+                break;
+            }
+        }
+        int dNo = 0;
+        for (const auto& k : { "discNo", "disc", "discno", "DISCNUMBER" }) {
+            auto it = s.tags.find(k);
+            if (it != s.tags.end() && !it->second.empty()) {
+                dNo = std::atoi(it->second.c_str());
+                if (dNo > 0) break;
+            }
+        }
+        if (dNo > 0 && !releaseId.empty()) {
+            releaseDiscs[releaseId].insert(dNo);
+        }
+        b.merge(gSeed);
+    }
+
+    for (const auto& kv : releaseDiscs) {
+        if (!kv.second.empty()) {
+            const std::string dCountStr = std::to_string(kv.second.size());
+            b.attr(kv.first, "discCount", dCountStr, "dir");
+            b.attr(kv.first, "discs", dCountStr, "dir");
+        }
+    }
+
+    return b.take();
+}
+
+// 从文件路径列表批量构建（自动应用目录结构判据与多碟聚合）
+inline EntityGraph entity_batch_from_paths(const std::vector<std::string>& filePaths, long long ts = 0) {
+    std::vector<MetaSeed> seeds;
+    seeds.reserve(filePaths.size());
+    for (const auto& p : filePaths) {
+        seeds.push_back(entity_seed_from_track_path(p));
+    }
+    return entity_batch_build_graph(seeds, ts);
+}
+
+// 从 TrackMeta 列表批量构建
+inline EntityGraph entity_batch_from_tracks(const std::vector<TrackMeta>& tracks, long long ts = 0) {
+    std::vector<MetaSeed> seeds;
+    seeds.reserve(tracks.size());
+    for (const auto& tm : tracks) {
+        seeds.push_back(entity_seed_from_track(tm));
+    }
+    return entity_batch_build_graph(seeds, ts);
 }
 
 } // namespace rta::meta

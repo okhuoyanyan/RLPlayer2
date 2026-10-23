@@ -17,6 +17,7 @@
 #include "audio/audio_loader.h"
 #include "audio/media_info.h"
 #include "net/scan_pool.h"
+#include "meta/entities.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -439,10 +440,21 @@ inline const std::vector<LibAlbum>& Library::albumVecLocked() const {
         const auto& t = tracks_[i];
         std::string aName = t.album;
         std::string aArtist = t.albumArtist.empty() ? t.artist : t.albumArtist;
-        if (aName.empty()) {
-            // 没有专辑标签：用父目录名，至少能分出「一张碟」
-            std::string dn = u8s(p8(t.path).parent_path().filename().u8string());
-            aName = dn.empty() ? "未知专辑" : dn;
+        int discForSort = t.discNo;
+        if (aName.empty() || discForSort == 0) {
+            int inferredDisc = 0;
+            const auto albDir = rta::meta::entity_find_album_dir_for_track(p8(t.path), &inferredDisc);
+            if (!albDir.empty()) {
+                if (aName.empty()) {
+                    std::string a, c;
+                    rta::meta::entity_parse_album_circle(u8s(albDir.filename().u8string()), a, c);
+                    aName = a.empty() ? u8s(albDir.filename().u8string()) : a;
+                }
+                if (discForSort == 0 && inferredDisc > 0) discForSort = inferredDisc;
+            } else if (aName.empty()) {
+                std::string dn = u8s(p8(t.path).parent_path().filename().u8string());
+                aName = dn.empty() ? "未知专辑" : dn;
+            }
         }
         const std::string rawKey = aArtist + "\x1f" + aName;
         auto it = byKey.find(rawKey);
@@ -462,7 +474,10 @@ inline const std::vector<LibAlbum>& Library::albumVecLocked() const {
     for (auto& a : albums_) {
         std::sort(a.idx.begin(), a.idx.end(), [&](size_t x, size_t y) {
             const auto& p = tracks_[x]; const auto& q = tracks_[y];
-            if (p.discNo != q.discNo) return p.discNo < q.discNo;
+            int pDisc = p.discNo, qDisc = q.discNo;
+            if (pDisc == 0) rta::meta::entity_find_album_dir_for_track(p8(p.path), &pDisc);
+            if (qDisc == 0) rta::meta::entity_find_album_dir_for_track(p8(q.path), &qDisc);
+            if (pDisc != qDisc) return pDisc < qDisc;
             if (p.trackNo != q.trackNo) return p.trackNo < q.trackNo;
             return p.path < q.path;
         });
@@ -666,6 +681,40 @@ inline void Library::startScan(bool forceFull) {
         }
         scanning_.store(false);
     });
+}
+
+// 真实批量入口：从音乐库 LibTrack 扫描结果构建实体图
+inline rta::meta::EntityGraph entity_graph_from_library_tracks(
+    const std::vector<LibTrack>& tracks, long long ts = 0) {
+    std::vector<rta::meta::MetaSeed> seeds;
+    seeds.reserve(tracks.size());
+    for (const auto& t : tracks) {
+        std::map<std::string, std::string> tags;
+        if (!t.title.empty()) tags["title"] = t.title;
+        if (!t.artist.empty()) tags["artist"] = t.artist;
+        if (!t.album.empty()) tags["album"] = t.album;
+        if (!t.albumArtist.empty()) tags["albumArtist"] = t.albumArtist;
+        if (!t.genre.empty()) tags["genre"] = t.genre;
+        if (t.year > 0) tags["year"] = std::to_string(t.year);
+        if (t.discNo > 0) {
+            tags["disc"] = std::to_string(t.discNo);
+            tags["discNo"] = std::to_string(t.discNo);
+        }
+        if (t.trackNo > 0) tags["track"] = std::to_string(t.trackNo);
+        seeds.push_back(rta::meta::entity_seed_from_track_path(t.path, tags));
+    }
+    return rta::meta::entity_batch_build_graph(seeds, ts);
+}
+
+inline rta::meta::EntityGraph entity_graph_from_library(const Library& lib, long long ts = 0) {
+    std::vector<LibTrack> trs;
+    const size_t n = lib.trackCount();
+    trs.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        LibTrack t;
+        if (lib.trackAt(i, t)) trs.push_back(std::move(t));
+    }
+    return entity_graph_from_library_tracks(trs, ts);
 }
 
 } // namespace rta::net
