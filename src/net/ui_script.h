@@ -1095,6 +1095,9 @@ function renderTracksView() {
 function loadFiles(d) {
   S.view = 'files';
   api('/api/files?dir=' + encodeURIComponent(d || '')).then(function (j) {
+    // 与 loadTracks 同一类问题（261023-01 #4）：请求在路上时用户可能已经切走，
+    // 迟到的响应不许覆写当前页面 —— 否则「文件夹」偶发空白/闪回别的页（本轮自检就踩到）。
+    if (S.view !== 'files') return;
     if (!j.ok) { D('list').innerHTML = '<div class=empty>' + esc(j.error) + '</div>'; return; }
     S.dir = j.dir;
     head('文件夹', '', '');
@@ -1687,6 +1690,10 @@ function saveSrc() {
 /* ---------------- 视图切换 ---------------- */
 function setView(v) {
   S.view = v;
+  // 2026-10-23（uicheck 复现的真实 bug）：全局搜索框有 260ms 防抖，输入后立刻点左侧别的导航，
+  // 定时器仍会触发 setView('tracks')+loadTracks，把用户刚切的页面顶掉（队列页就是这么被换掉的）。
+  // 规则：切换视图即取消未触发的搜索，"最后一次用户操作"胜出。
+  if (typeof searchTimer !== 'undefined' && searchTimer) { clearTimeout(searchTimer); searchTimer = 0; }
   Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
     e.classList.toggle('on', e.dataset.v === v || (v === 'artist' && e.dataset.v === 'artists') || (v === 'work' && e.dataset.v === 'works'));
   });
@@ -4017,7 +4024,7 @@ function renderQueuePage() {
   // 会出现"已经在队列页、标题还是上一页"的空窗。先同步写标题，再等数据补数量/按钮。
   head('播放队列', '', '');
   api('/api/queue').then(function (j) {
-    if (S.view !== 'queue') return;   // 已切走 → 丢弃，别覆写当前页面（与 loadTracks 同规则）
+    if (S.view !== 'queue') return;   // 已切走 → 丢弃，别覆写当前页面
     S.q = { items: j.items || [], index: j.index || 0 };
     var n = S.q.items.length;
     head('播放队列', n ? (n + ' 首') : '', n ? '<button class=btn id=qClrAll>清空队列</button>' : '');
