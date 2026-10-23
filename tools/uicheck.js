@@ -120,6 +120,8 @@ async function waitFor(expr, ms = 8000) {
   await sleep(500);
   const tr = await evalJs("document.querySelectorAll('.trow').length");
   ck(tr > 0, '曲目列表非空', tr + ' 首');
+  ck(await evalJs("!document.querySelector('.summary-sec')"),
+     '开关关闭时专辑页不出现简介板块（不请求、不留空白块）');
   const p2 = await shot('02-album');
 
   // 曲目视图
@@ -176,63 +178,12 @@ async function waitFor(expr, ms = 8000) {
      '点击来源芯片弹出「已复制来源链接」toast');
   ck(await evalJs("document.querySelectorAll('a[href^=http]').length === 0"),
      '带资料页面无 http 外链（永不跳转外部浏览器）');
-  // P3④b: 检查 AI 综合小节（状态分支断言：有缓存 vs 未开启/无缓存，二选一必须成立）
-  ck(await evalJs("!!document.querySelector('.ai-sec')"), '艺术家资料页包含 AI 综合小节');
-  const aiState = await evalJs(`(function(){
-    var sec = document.querySelector('.ai-sec');
-    if (!sec) return 'missing-ai-sec';
-    var badge = sec.querySelector('.ai-badge');
-    var hasBadge = !!badge && badge.textContent.indexOf('AI 生成') >= 0;
-    var chips = sec.querySelectorAll('.chip-copy').length;
-    var sups = sec.querySelectorAll('sup').length;
-    if (hasBadge && chips >= 1 && sups >= 1) {
-      return { branch: 'has-summary', chips: chips, sups: sups };
-    }
-
-    var empty = sec.querySelector('.empty-card');
-    var btn = sec.querySelector('#bGenSummary');
-    var txt = sec.textContent || '';
-    var hasHint = txt.indexOf('暂无 AI 综合简介') >= 0 || txt.indexOf('未开启 AI 资料综合') >= 0 || (empty && empty.textContent.indexOf('AI 综合') >= 0);
-    var hasBtn = !!btn;
-    if (!!empty && hasBtn && hasHint) {
-      return {
-        branch: 'no-summary',
-        btnDisabled: btn.disabled,
-        btnText: btn.textContent.trim(),
-        hint: txt.slice(0, 80)
-      };
-    }
-
-    return {
-      branch: 'unknown',
-      hasBadge: hasBadge,
-      chips: chips,
-      sups: sups,
-      empty: !!empty,
-      btn: hasBtn,
-      txt: txt.slice(0, 100)
-    };
-  })()`);
-
-  ck(aiState && (aiState.branch === 'has-summary' || aiState.branch === 'no-summary'),
-     'AI 综合小节状态合法（有摘要分支：显徽章+上标+来源芯片；无摘要分支：显空态+明确提示+生成按钮）',
-     aiState ? (aiState.branch + (aiState.branch === 'no-summary' ? ' (btnDisabled=' + aiState.btnDisabled + ')' : '')) : 'null');
-
-  if (aiState && aiState.branch === 'has-summary') {
-    ck(await evalJs("(function(){ var b = document.querySelector('.ai-sec .ai-badge'); return !!b && b.textContent.indexOf('AI 生成') >= 0; })()"),
-       'AI 综合小节常显「AI 生成」徽章');
-    ck(await evalJs("document.querySelectorAll('.ai-sec .chip-copy').length >= 1"),
-       'AI 综合小节包含来源引用复制芯片');
-    ck(await evalJs("document.querySelectorAll('.ai-sec sup').length >= 1"),
-       'AI 综合段落带有上标引用序号 [1][2]');
-  } else {
-    ck(await evalJs("!!document.querySelector('.ai-sec .empty-card')"),
-       'AI 综合小节无缓存时渲染空态卡片');
-    ck(await evalJs("(function(){ var s = document.querySelector('.ai-sec'); if(!s) return false; var t = s.textContent || ''; return t.indexOf('暂无 AI 综合简介') >= 0 || t.indexOf('未开启 AI 资料综合') >= 0 || t.indexOf('未生成 AI 简介') >= 0; })()"),
-       'AI 综合小节无缓存时包含明确状态提示');
-    ck(await evalJs("(function(){ var b = document.querySelector('.ai-sec #bGenSummary'); return !!b && (b.textContent.indexOf('生成 AI 简介') >= 0); })()"),
-       'AI 综合小节无缓存时包含「生成 AI 简介」按钮（未开启时禁用）');
-  }
+  // 2026-10-23 261023-03 #2/#3：不再有「AI 综合 / AI 生成 / 生成 AI 简介」字样与按钮。
+  // 设置开关默认关闭 → 艺术家页不应出现任何简介板块（不请求、不留空板块、不闪加载行）。
+  ck(await evalJs("!document.querySelector('.ai-sec') && !document.querySelector('.summary-sec')"),
+     '艺术家资料页默认不出现简介板块（开关关闭 → 不请求、不留空板块）');
+  ck(await evalJs("(function(){var t=document.body.textContent||'';return t.indexOf('AI 综合')<0 && t.indexOf('AI 生成')<0 && t.indexOf('生成 AI 简介')<0;})()"),
+     '艺术家资料页无「AI 综合 / AI 生成 / 生成 AI 简介」字样');
   const pZard = await shot('21-artist-profile-zard');
   await evalJs("document.getElementById('bBackArtists').click()");
   await sleep(500);
@@ -422,19 +373,24 @@ async function waitFor(expr, ms = 8000) {
     ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.metasrc_qq)==='" + origQq + "')", 6000),
        '「QQ音乐」源开关往返还原');
   }
-  // 总开关、DeepSeek 开关与 AI 综合开关保持固定
+  // 总开关、DeepSeek 开关与在线资料整理开关保持固定
   const metaFix = await evalJs("(function(){var ids=['sp_metaon','sp_metallm','sp_metasummary'];var p=document.querySelector('#setpage .spane[data-g=meta]');var miss=[];ids.forEach(function(i){var e=document.getElementById(i);if(!e||e.type!=='checkbox'||!p.contains(e)||!e.onchange)miss.push(i)});return miss;})()");
-  ck(Array.isArray(metaFix) && metaFix.length === 0, '总开关、DeepSeek 开关与 AI 综合开关存在且已绑定', JSON.stringify(metaFix));
+  ck(Array.isArray(metaFix) && metaFix.length === 0, '总开关、DeepSeek 开关与在线资料整理开关存在且已绑定', JSON.stringify(metaFix));
 
-  // P3④b: metasummary 默认关(0)，可保存并往返还原
+  // 2026-10-23 261023-03 #2：开关文案必须去掉「AI」字眼，并说明「自动整理 + 缓存」
+  const summLabel = await evalJs("(function(){var e=document.getElementById('sp_metasummary');return (e&&e.parentNode)?e.parentNode.textContent.trim():'';})()");
+  ck(summLabel.indexOf('在线整理音乐资料简介') >= 0 && summLabel.indexOf('AI') < 0,
+     '资料简介开关文案已去掉 AI 字眼', summLabel);
+
+  // metasummary 默认关(0)，可保存并往返还原
   const origSummary = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasummary||'0')"));
   ck(origSummary === '0', 'metasummary 默认关闭 (0)');
   await evalJs("var e=document.getElementById('sp_metasummary'); e.checked=true; e.dispatchEvent(new Event('change'));");
   ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.metasummary)==='1')", 6000),
-     '打开「允许 AI 资料综合」能保存到后端');
+     '打开「在线整理音乐资料简介」能保存到后端');
   await evalJs("var e=document.getElementById('sp_metasummary'); e.checked=" + (origSummary === '1') + "; e.dispatchEvent(new Event('change'));");
   ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.metasummary)==='" + origSummary + "')", 6000),
-     '「允许 AI 资料综合」往返还原');
+     '「在线整理音乐资料简介」往返还原');
   // metaon 关→开：走 UI 开关（onchange → saveSettings → POST /api/settings），往返一致。
   // 注意不能裸 POST 单键：/api/settings 的 POST 是整文件重写，只发一个键会把其余设置全抹掉。
   const origMetaon = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metaon||'1')"));
@@ -685,6 +641,9 @@ async function waitFor(expr, ms = 8000) {
   await sleep(400);
   ck(await evalJs("document.getElementById('npPage').classList.contains('on')"), '点封面可以打开正在播放页');
   ck(await evalJs("!!document.getElementById('npMeta') && document.getElementById('npMeta').closest('#npPage') !== null"), '正在播放页有 #npMeta 芯片容器');
+  ck(await evalJs("!!document.getElementById('npSummary') && document.getElementById('npSummary').closest('#npPage') !== null"), '正在播放页有 #npSummary 简介容器');
+  ck(await evalJs("getComputedStyle(document.getElementById('npSummary')).display === 'none'"),
+     '开关关闭时正在播放页不显示简介板块（不留空白块）');
   // 空态文案要用「清掉歌词后的 renderNpLyric」来验：实例上可能正停着一首带在线歌词的曲子
   // （LY.lines 非空 → 显示的是歌词而不是空态），那是正常业务态，不是文案缺失。
   ck(await evalJs("(function(){var keep=LY.lines;LY.lines=[];renderNpLyric();var ok=document.getElementById('npLyric').innerHTML.indexOf('在线补全')>=0;LY.lines=keep;var b=document.getElementById('npLyric');if(b){b.dataset.n='';}renderNpLyric();return ok;})()"), '歌词空态提示「播放时自动在线补全」');

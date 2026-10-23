@@ -2892,6 +2892,18 @@ static std::string llm_test_json() {
            std::to_string(ms) + ",\"tokens\":" + std::to_string(p.totalTokens) + "}";
 }
 
+// 简介返回 JSON 附带「实体种类 / 是否来自缓存」标志（2026-10-23 用户 261023-03 #2/#3）：
+// 前端据此决定加载态与是否重复请求；summary_to_json 本体是缓存文件格式，不掺入运行时标志。
+static std::string summary_json_with_flags(const rta::meta::SummaryResult& sr,
+                                           const std::string& kind, bool cached) {
+    std::string js = rta::meta::summary_to_json(sr);
+    const size_t close = js.find_last_of('}');
+    if (close == std::string::npos) return js;
+    js.insert(close, ",\"summaryKind\":\"" + jesc(kind) + "\",\"summaryCached\":" +
+                     (cached ? "true" : "false") + ",\"summaryAvailable\":true");
+    return js;
+}
+
 static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
     auto& ps = g_ps;
 
@@ -3633,13 +3645,15 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         metaOverride("genre", fGenre);
         metaOverride("lyrics", fLyrics);
 
-        // 简介可用性标志
+        // 简介可用性标志（2026-10-23 用户 261023-03 #2/#3/#5）
+        // 单曲播放整页据此决定：是否显示简介板块、是否显示「正在整理资料…」加载行。
+        // key 一律从 exe 同目录 rlplayer-llm.conf 读（与设置页 /api/llm 写的同一份，
+        // 不随进程工作目录漂移 —— 旧实现先读 "./rlplayer-llm.conf"，从别的 cwd 启动就漏判）。
         const MetaSettings msMeta = meta_settings_load();
         const std::string metabaseDir = path_in_exe_dir("rlplayer-meta");
         bool hasKeyMeta = false;
         {
-            rta::meta::LlmConfig cfg = rta::meta::llm_config_load();
-            if (cfg.apiKey.empty()) cfg = rta::meta::llm_config_load("build/rlplayer-llm.conf");
+            const rta::meta::LlmConfig cfg = rta::meta::llm_config_load(llm_conf_path());
             hasKeyMeta = !cfg.apiKey.empty();
         }
         std::string summaryKind = "";
@@ -3657,14 +3671,17 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             summaryTarget = fArtist;
             summaryEid = rta::meta::entity_id(rta::meta::EntityKind::Person, fArtist);
         }
+        bool summaryCacheOk = false;   // 有任何可读缓存（含已过期 → 无 key 时的离线回退）
         if (!summaryEid.empty()) {
             rta::meta::SummaryResult srCached;
             std::string cErr;
-            if (rta::meta::summary_load_cache(metabaseDir, summaryEid, "zh", srCached, &cErr) && srCached.ok && !rta::meta::summary_is_expired(srCached)) {
-                summaryCached = true;
+            if (rta::meta::summary_load_cache(metabaseDir, summaryEid, "zh", srCached, &cErr) && srCached.ok) {
+                summaryCacheOk = true;
+                summaryCached = !rta::meta::summary_is_expired(srCached);
             }
         }
-        const bool summaryAvailable = msMeta.summary && (summaryCached || hasKeyMeta);
+        // 可用 = 开关开 且（有缓存 或 有 key 能现场整理）。三者任一不成立 → 前端干脆不显示板块。
+        const bool summaryAvailable = msMeta.summary && (summaryCacheOk || hasKeyMeta);
         std::ostringstream j;
         j << "{\"ok\":true"
           << ",\"title\":\"" << jesc(fTitle) << "\""
@@ -3694,9 +3711,11 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         j << "}}"
           << ",\"summaryAvailable\":" << (summaryAvailable ? "true" : "false")
           << ",\"summaryCached\":" << (summaryCached ? "true" : "false")
+          << ",\"summaryCacheOk\":" << (summaryCacheOk ? "true" : "false")
           << ",\"summaryKind\":\"" << jesc(summaryKind) << "\""
           << ",\"summaryTarget\":\"" << jesc(summaryTarget) << "\""
           << ",\"hasLlmKey\":" << (hasKeyMeta ? "true" : "false")
+          << ",\"summaryEnabled\":" << (msMeta.summary ? "true" : "false")
           << "}";
         return j.str();
     }
@@ -3885,34 +3904,43 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             ? rta::meta::entity_make_id("release", rta::meta::entity_norm(artist) + "\x1f" + rta::meta::entity_norm(name))
             : rta::meta::entity_id(ek, name);
 
-        // 1. 若未开启 metasummary 设置：拒绝调用（设置关闭时不请求、不显示该区块）
+        // 1. 开关关闭：拒绝（前端也不显示板块；不产生任何在线调用）
         if (!ms.summary) {
-            return "{\"ok\":false,\"error\":\"未开启资料简介\",\"from_cache\":false,\"offline\":false}";
+            return "{\"ok\":false,\"error\":\"未开启在线资料整理\",\"summaryEnabled\":false,"
+                   "\"summaryKind\":\"" + jesc(kindStr) + "\",\"summaryCached\":false}";
         }
 
-        // 2. 自动生成与缓存策略：已生成过的读缓存（TTL 7天）
+        // 2. 缓存命中（TTL 7 天）→ 直接返回，绝不再调 LLM（用户 261023-03 #2：生成后保存为缓存）
         if (!refresh) {
             rta::meta::SummaryResult cached;
             std::string cache_err;
-            if (rta::meta::summary_load_cache(metabaseDir, eid, lang, cached, &cache_err) && cached.ok && !rta::meta::summary_is_expired(cached)) {
+            if (rta::meta::summary_load_cache(metabaseDir, eid, lang, cached, &cache_err) && cached.ok &&
+                !rta::meta::summary_is_expired(cached)) {
                 cached.from_cache = true;
-                return rta::meta::summary_to_json(cached);
+                play_log("SUMMARY cache-hit kind=" + kindStr + " name=" + name + " eid=" + eid);
+                return summary_json_with_flags(cached, kindStr, true);
             }
         }
 
-        // 3. 无未过期缓存或显式请求 refresh：自动调用 LLM 综合检索并写入缓存
+        // 3. 未命中（或显式 refresh）→ 自动检索 + 综合，成功即写缓存（每个实体一次在线调用）
         rta::meta::RetrievalOptions ropts;
         ropts.metabase = metabaseDir;
         ropts.artist = artist;
         ropts.entity_id = eid;
         ropts.refresh = refresh;
         ropts.timeout_ms = 25000;
+        ropts.llm_cfg = rta::meta::llm_config_load(llm_conf_path());   // 与设置页写的 key 同一份
 
+        play_log("SUMMARY generate kind=" + kindStr + " name=" + name + " eid=" + eid);
         const rta::meta::SummaryResult sr = rta::meta::retrieval_fetch(ek, name, lang, ropts);
         if (!sr.ok) {
-            return "{\"ok\":false,\"error\":\"" + jesc(sr.error.empty() ? "资料整理失败" : sr.error) + "\"}";
+            play_log("SUMMARY failed kind=" + kindStr + " name=" + name + " err=" + sr.error);
+            return "{\"ok\":false,\"error\":\"" + jesc(sr.error.empty() ? "资料整理失败" : sr.error) +
+                   "\",\"summaryKind\":\"" + jesc(kindStr) + "\",\"summaryCached\":false}";
         }
-        return rta::meta::summary_to_json(sr);
+        play_log("SUMMARY generated kind=" + kindStr + " name=" + name + " eid=" + eid +
+                 " fromCache=" + std::string(sr.from_cache ? "1" : "0"));
+        return summary_json_with_flags(sr, kindStr, sr.from_cache);
     }
 
     // ---------------- 资料层(P3④b Discogs L4 古典作品版本推荐): GET /api/entity/versions ----------------
@@ -5337,8 +5365,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         const MetaSettings msStat = meta_settings_load();
         bool hasKeyStat = false;
         {
-            rta::meta::LlmConfig cfg = rta::meta::llm_config_load();
-            if (cfg.apiKey.empty()) cfg = rta::meta::llm_config_load("build/rlplayer-llm.conf");
+            const rta::meta::LlmConfig cfg = rta::meta::llm_config_load(llm_conf_path());   // exe 同目录，不随 cwd 漂移
             hasKeyStat = !cfg.apiKey.empty();
         }
         j << ",\"hasLlmKey\":" << (hasKeyStat ? "true" : "false")

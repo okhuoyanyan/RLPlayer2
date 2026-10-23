@@ -1152,7 +1152,9 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         : name;
     const std::vector<LlmMessage> msgs = build_synthesis_prompt(promptEntityName, kr.materials, fetched_hits, lang);
     retrieval_rate_limiter().acquire();
-    const LlmReply chat_rep = llm_chat(cfg, msgs, 2000, 0.2f, true);
+    // 2026-10-23（261023-03 实测）：2000 tokens 对「专辑」类资料（维基正文 + Discogs 发行说明）
+    // 会截断成半截 JSON，导致校验失败、页面什么都看不到。提到 4000 后揺れる想い/海阔天空均通过。
+    const LlmReply chat_rep = llm_chat(cfg, msgs, 4000, 0.2f, true);
 
     if (!chat_rep.ok) {
         // 网络综合失败时若有旧缓存则离线回退
