@@ -27,6 +27,10 @@ rta-*.conf
 *.ilk
 *.exe
 *.dll
+# CUDA 构建产物
+*.cubin
+*.fatbin
+*.ptx
 *.log
 # ⚠️ 例外：third_party 里的【分发性】构建依赖必须进仓库
 #   WebView2Loader.dll 是 Microsoft WebView2 SDK 自带的可再分发组件，链接期必需。

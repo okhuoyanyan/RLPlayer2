@@ -124,3 +124,87 @@ rate\fmt 16/PCM  24/PCM  32/PCM  32/FLT
 - 在本机默认设备上，PCM 升频上限是 **96 kHz / 24-bit**
 - **不要**用 `--rate 705600` 之类的参数 —— 会以 UNSUPPORTED_FORMAT 失败
 - 低延迟起播的 100 ms 默认缓冲在这里有 30 倍余量（最小周期 3 ms）
+
+---
+
+# UltraLite-mk5 独占的三个坑（2026-10-23 实测）
+
+> 用户反馈「WASAPI 独占不可用」。逐层剥到最后，是**三个独立缺陷叠加**。
+> 排查工具：`tools/wasapi_ex_probe.cpp`（格式×配方矩阵 + 流测试，写全零静音不出声）。
+
+## 坑 1：独占格式必须是「32 位容器 + 24 位有效」
+
+`IsFormatSupported(EXCLUSIVE)` 的矩阵（MOTU，44100/48000 同结论）：
+
+| 格式 | IsFormatSupported |
+|---|---|
+| `WAVE_FORMAT_PCM` 16 | `0x88890008` UNSUPPORTED_FORMAT |
+| `EXTENSIBLE` 16/16 | `0x88890008` |
+| `EXTENSIBLE` 24/24（blockAlign=ch*3） | `0x88890008` ← **我们原来发的** |
+| **`EXTENSIBLE` 32 容器 / 24 有效（blockAlign=ch*4）** | **`S_OK`** |
+| `EXTENSIBLE` 32/32 int | `0x88890008` |
+| `EXTENSIBLE` 32/32 float | `0x88890008` |
+
+**这家驱动只认一种**。位数写在 `wValidBitsPerSample=24`，容器写 `wBitsPerSample=32`，
+数据在 32 位里**低 24 位对齐**（±2^23 直接放 int32，不要打包成 3 字节）。
+
+## 坑 2：`AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` 的重试必须换新 client
+
+首次 `Initialize` 返回 `0x88890019`（BUFFER_SIZE_NOT_ALIGNED）后，微软要求
+**`Release` 旧 `IAudioClient`、重新 `Activate`**，再用 `GetBufferSize` 算出的时长重试；
+`periodicity` 也取对齐值（本机 `per=0` 会被拒 `0x88890016`）。
+
+两个连带点（原实现两条都踩了）：
+- 复用同一个 client 重试 → `AUDCLNT_E_BUFFER_SIZE_ERROR`（0x88890016）
+- `open()` 在 `Activate` 之后**立刻 `dev->Release()`** → 重试时没有设备指针可用，
+  这条分支**从来没可能生效**。改为 RAII 持有 `IMMDevice` 到 Initialize 完成。
+
+## 坑 3：首写死锁——`pad == bufferFrames` 时永不写
+
+`write_available()` 用 `toWrite = bufferFrames_ - pad` 算空间。MOTU 在 `Start()` 之后
+**会报告 `pad == bufferFrames`**（即使一帧都没写过），于是 `toWrite` 恒为 0 → 永不写 →
+4 秒后判 `RENDERFAIL` → 回退共享。现场读数：
+
+```
+RENDERFAIL 设备流 4.02 秒未接受数据 … w0=201 wr=0 zp=201 zr=pad=full
+            last_pad=1024 缓冲=1024帧 GetBuffer HRESULT=-999
+```
+
+`HRESULT=-999` 是初始哨兵值——说明 `GetBuffer` **从未被调用**。
+修法：首次写入（`written_ == 0`）时直接试满缓冲，`GetBuffer` 真没空间就会失败返回 0，对正常路径无害。
+
+## 排查纪律（本轮绕远路的直接原因）
+
+**先排除自己的探针占着同一设备**。日志里 `Initialize 失败（全部配方）… 0x8889000A
+DEVICE_IN_USE` 出现过一次，当时正是探针在循环开关；此后 rlplayer 的
+`RENDERFAIL` 有一半是这个污染造成的假失败。硬件类排查的第一步：确认没有自家测试进程占用端点。
+
+## 主观听感差异（用户 2026-10-23 描述）
+
+同一首曲子、同一设备（UltraLite-mk5 Main Out 1-2）、同一 DSP 配置（poly-sinc-short-lp + LNS15）下，
+用户对比 **ASIO** 与 **WASAPI 独占** 的原话：
+
+> **「有少许听感差距，WASAPI 更炸一点。」**
+> （按用户裁定，"炸"指偏高、偏硬/毛刺那一类听感，不是音量大小——音量已在共享电平修复后对齐）
+
+数据层已证明两者等价，所以差异只能来自**交付机制**：
+
+| 维度 | ASIO | WASAPI 独占 |
+|---|---|---|
+| 打包 | `v = s / 2^23`，再 `× (2^31-1)` ≈ `s << 8` | `p[i] = s`（32 容器低 24 位） |
+| 换算差 | **≤ 2 LSB / 2^32**（折合 24 位域 0.0002 LSB，不可闻） | 同左 |
+| 时钟来源 | MOTU ASIO 驱动直递 | Windows 音频引擎调度后再交驱动 |
+| 缓冲深度 | 32 帧（≈0.7 ms @44.1k） | 1024 帧（≈23 ms @44.1k） |
+| 驱动路径 | 专属 ASIO 驱动 | WDM 内核流（独占 = 绕过混音器，但仍经引擎） |
+
+**结论**：数据层无可改。"更炸"属于 WDM 通路与 ASIO 通路在时钟/抖动上的固有差异（驱动侧特性），
+不是本程序的算法差异。要听感一致走 ASIO；要 Windows 系统集成（音量/独占切换/多设备）走 WASAPI。
+
+## 结论
+
+| 路径 | 44.1k 源 | bit-perfect |
+|---|---|---|
+| ASIO（MOTU Gen 5） | ✅ 直出 | ✅ |
+| WASAPI 独占 | ✅（三个坑修完后） | ✅ |
+| WASAPI 共享 | ✅ 经过 Windows 混音器 | ❌（受混音率与 SRC 影响） |
+

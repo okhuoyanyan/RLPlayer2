@@ -56,6 +56,24 @@ hipcc 默认编 gfx906；即使显式写 `--offload-arch=gfx1200`（Navi 44）�
 2. 构建命令必须显式 `--offload-arch=gfx1201`
 3. **不要相信 `hipDeviceSynchronize()` 的成功返回**——要检查 `hipGetLastError()` 与输出内容
 
+### 铁律 5 的 CUDA 侧对应（2026-10-22 新增，来源 PR #1）
+
+CUDA 不会像 HIP 那样"arch 写错就静默不执行"，但它**一样会骗人**，形态是两个：
+
+1. **fatbin 里带 PTX 时驱动会 JIT** —— arch 不对也"看起来能跑"（只是首次启动慢），
+   所以"没有报错"不能当通过。
+2. **sticky error**：上下文里更早的调用留下的错误会让后续 `cudaGetLastError()` 一直返回旧错；
+   探测前必须 `(void)cudaGetLastError()` 清一次。
+
+对应规则：
+
+- 构建一律用 `tools/build_gpu_cuda.ps1`。它做两道校验：`cuobjdump -lelf` 查每个请求的 arch
+  真的有 cubin 进二进制、`dumpbin /exports` 查 4 个导出符号在位（改名字不会报错，
+  只会静默退回 CPU）。手敲 nvcc 容易漏掉其中一道。
+- **CUDA 版本不能随便升级**：CUDA 13 已移除 Maxwell/Pascal/Volta。要覆盖 GTX 9/10 系，
+  必须留在 **12.x**（当前 12.9.41，实测支持 `compute_50`…`compute_121` 共 19 档，缺 `compute_110`）。
+- 运行时判据与 HIP 相同：平凡 kernel 写常数 → 读回比对，不看同步返回码。
+
 ## 🔴 铁律 6：正式发布版必须自包含
 
 用户 2026-10-21 明确要求：**以后只有 FULL 包，名字叫“正式发布版”，不再有 Lite/最小发布版**。

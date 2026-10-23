@@ -52,6 +52,10 @@ struct OutSink {
     virtual size_t write_one_period(const int32_t* pcm, size_t frames) = 0;
     // WASAPI 用它把设备缓冲补满；其它后端默认退回 write_one_period。
     virtual size_t write_available(const int32_t* pcm, size_t frames) { return write_one_period(pcm, frames); }
+    // 后端自己观测到的「实际写出峰值」（float 域，0..1）。默认 0 = 该后端不报。
+    // 为什么需要它：管线侧的 peak 是位深域读数，一旦换算与实际写出不一致，
+    // 内部所有判据都会显示正常（2026-10-23 共享路径 −48 dB 就是这么被藏住的）。
+    virtual double out_peak() const { return 0.0; }
     virtual void   pause() {}
     virtual void   resume() {}
     virtual void   close() {}
@@ -292,6 +296,9 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                    << " rate=" << h.deviceRate << " bits=" << h.outBits
                    << " pad=" << h.dbgPad->load()
                    << " peak=" << h.dbgPeak->load() << " clip=" << h.dbgClip->load()
+                   // fpeak = 后端实际写出的峰值（float 域）。与 peak（位深域）并列，
+                   // 两者不一致就说明换算/位深基准有问题（2026-10-23 共享电平定论用）。
+                   << " fpeak=" << sink.out_peak()
                    << " w0=" << h.dbgW0->load() << " wr=" << h.dbgWr->load();
                 // ★ 2026-10-22 反馈 20261022-02：w0 混着两种互斥成因，必须分开记。
                 //   zp=设备缓冲满（pad 满）  zs=供料不足一个周期（我们喂不上）

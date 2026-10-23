@@ -17,7 +17,10 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 if(MSVC)
-  add_compile_options(/W4 /permissive- /Zc:__cplusplus)
+  # /utf-8：本仓源码是 UTF-8 无 BOM，MSVC 默认按系统代码页（本机 936/GBK）解释，
+  # 于是中文字符串常量报 "C2001 常量中有换行符"、中文注释报 C4819。clang 下默认就是
+  # UTF-8，所以 /utf-8 是让两个编译器行为对齐，不是给 MSVC 开特例。
+  add_compile_options(/W4 /permissive- /Zc:__cplusplus /utf-8)
   add_compile_options($<$<CONFIG:Release>:/O2>)
 else()
   add_compile_options(-Wall -Wextra -Wno-unused-parameter)
@@ -68,6 +71,7 @@ target_link_libraries(rtacast PRIVATE rtadsp winhttp ws2_32)
 
 # ---------------- GPU 升频核验证 ----------------
 add_executable(gpu_resample_test tools/gpu_resample_test.cpp)
+target_include_directories(gpu_resample_test PRIVATE ${CMAKE_SOURCE_DIR}/src)   # dsp/gpu_pref.h：候选 DLL 顺序与管线同源
 target_link_libraries(gpu_resample_test PRIVATE ws2_32)
 
 # ---------------- 模拟 Navidrome（集成测试用）----------------

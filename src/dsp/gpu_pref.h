@@ -21,8 +21,8 @@ inline std::vector<const char*> gpu_dll_candidates() {
     const std::string& v = gpu_vendor();
     if (v == "off") return {};
     // 顺序：HIP（AMD）→ D3D12（AMD/NVIDIA/Intel 通用）→ CUDA（可选）
-    if (v == "amd")    return { "rtagpu.dll", "rtagpu_dx12.dll" };
-    if (v == "nvidia") return { "rtagpu_cuda.dll", "rtagpu_dx12.dll" };
+    if (v == "amd")                     return { "rtagpu.dll", "rtagpu_dx12.dll" };
+    if (v == "nvidia" || v == "cuda")   return { "rtagpu_cuda.dll", "rtagpu_dx12.dll" };
     return { "rtagpu.dll", "rtagpu_dx12.dll", "rtagpu_cuda.dll" };   // auto
 }
 
