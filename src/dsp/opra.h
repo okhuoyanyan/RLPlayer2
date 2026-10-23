@@ -429,6 +429,9 @@ public:
         if (!baseDir.empty()) {
             baseDir_ = baseDir;
         }
+        // 2026-10-23 DEBUG：旧判据只在「调用方传空 path」时才命中缓存，而所有调用方都传非空 →
+        // 每次 /api/opra/index|presets|apply 请求都重新解析 320KB / 6230 条索引。
+        if (index_.size() > 0 && !indexFilePath.empty() && indexPath_ == indexFilePath) return true;
         if (index_.size() > 0 && indexFilePath.empty()) {
             return true;
         }

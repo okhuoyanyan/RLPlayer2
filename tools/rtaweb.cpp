@@ -2704,18 +2704,30 @@ static void fav_load_if_needed() {
     }
 }
 
-static void fav_save_locked() {
+// 落盘收藏：**原子写**（tmp + rename）+ 返回是否成功。
+// 2026-10-23 DEBUG：旧实现 trunc 直写且失败静默 return，exe 在 Program Files/被杀软占用时
+// 会「前端弹已收藏、重启后全丢」；进程中断还会留半截 JSON 导致下次解析失败清空。
+static bool fav_save_locked() {
     const std::string path = path_in_exe_dir("rlplayer-favs.json");
-    std::ofstream f(fs::u8path(path), std::ios::binary | std::ios::trunc);
-    if (!f) return;
-    f << "{\"files\":[";
+    const std::string tmp = path + ".tmp";
+    std::string body = "{\"files\":[";
     bool first = true;
     for (const auto& file : g_favFiles) {
-        if (!first) f << ",";
+        if (!first) body += ",";
         first = false;
-        f << "\"" << jesc(file) << "\"";
+        body += "\"" + jesc(file) + "\"";
     }
-    f << "]}\n";
+    body += "]}\n";
+    {
+        std::ofstream f(fs::u8path(tmp), std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        f << body;
+        if (!f.good()) return false;
+    }
+    std::error_code ec;
+    fs::rename(fs::u8path(tmp), fs::u8path(path), ec);
+    if (ec) { std::error_code ec2; fs::remove(fs::u8path(tmp), ec2); return false; }
+    return true;
 }
 
 static void recent_add(const std::string& file, const std::string& title,
@@ -2961,6 +2973,47 @@ static std::string summary_json_with_flags(const rta::meta::SummaryResult& sr,
     js.insert(close, ",\"summaryKind\":\"" + jesc(kind) + "\",\"summaryCached\":" +
                      (cached ? "true" : "false") + ",\"summaryAvailable\":true");
     return js;
+}
+
+// ---------------- 资料简介后台生成（不阻塞单线程 HTTP accept）----------------
+// 背景（2026-10-23 DEBUG 定位）：WebUi 是单线程阻塞 accept，/api/entity/summary 原先在 handler 里
+// 同步跑 Wikipedia + Discogs + ds_search + LLM 综合，最坏可达数十秒；期间前端 400ms 一次的 /api/status
+// 以及播放/暂停/音量/seek 全部排队 → 用户看到的是「整个界面卡死」。
+// 现在：缓存命中仍然同步秒回；未命中则立即返回 {"pending":true} 并起后台线程，前端轮询同一 URL 取结果。
+struct SummaryJob {
+    bool running = false;
+    bool done = false;
+    bool ok = false;
+    std::string body;
+    long long started_at = 0;
+    long long finished_at = 0;
+};
+static std::mutex g_summ_mu;
+static std::map<std::string, SummaryJob> g_summ_jobs;
+
+static void summary_job_start(const std::string& key, rta::meta::EntityKind ek, const std::string& name,
+                              const std::string& lang, const std::string& kindStr,
+                              const rta::meta::RetrievalOptions& ropts) {
+    std::thread([key, ek, name, lang, kindStr, ropts]() {
+        const rta::meta::SummaryResult sr = rta::meta::retrieval_fetch(ek, name, lang, ropts);
+        std::string body;
+        if (!sr.ok) {
+            play_log("SUMMARY failed kind=" + kindStr + " name=" + name + " err=" + sr.error);
+            body = "{\"ok\":false,\"error\":\"" + jesc(sr.error.empty() ? "资料整理失败" : sr.error) +
+                   "\",\"summaryKind\":\"" + jesc(kindStr) + "\",\"summaryCached\":false}";
+        } else {
+            play_log("SUMMARY generated kind=" + kindStr + " name=" + name + " eid=" + key +
+                     " fromCache=" + std::string(sr.from_cache ? "1" : "0"));
+            body = summary_json_with_flags(sr, kindStr, sr.from_cache);
+        }
+        std::lock_guard<std::mutex> lk(g_summ_mu);
+        auto& job = g_summ_jobs[key];
+        job.running = false;
+        job.done = true;
+        job.ok = sr.ok;
+        job.body = body;
+        job.finished_at = (long long)std::time(nullptr);
+    }).detach();
 }
 
 static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
@@ -3578,6 +3631,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         }
         file = normalize_fav_path(file);
         bool on = (onStr == "1" || onStr == "true" || onStr == "on");
+        bool saved = false;
         {
             std::lock_guard<std::mutex> lk(g_favMu);
             if (on) {
@@ -3585,10 +3639,14 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             } else {
                 g_favFiles.erase(file);
             }
-            fav_save_locked();
+            saved = fav_save_locked();
         }
+        // 落盘失败要如实告诉前端（否则「弹已收藏、重启全丢」）；内存里的集合已改，本次会话仍生效。
         std::ostringstream j;
-        j << "{\"ok\":true,\"file\":\"" << jesc(file) << "\",\"on\":" << (on ? "true" : "false") << "}";
+        j << "{\"ok\":" << (saved ? "true" : "false")
+          << ",\"file\":\"" << jesc(file) << "\",\"on\":" << (on ? "true" : "false");
+        if (!saved) j << ",\"error\":\"收藏已生效但写入磁盘失败（目录不可写？），重启后可能丢失\"";
+        j << "}";
         return j.str();
     }
 
@@ -3773,23 +3831,30 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         }
         std::string summaryKind = "";
         std::string summaryTarget = "";
+        std::string summaryArtist = "";
         std::string summaryEid = "";
         bool summaryCached = false;
         // 单曲播放页显示的是【所属专辑】的简介，不是每首歌各调一次（用户 261023-03 #3）。
         // 但标签缺失/在线补全把 album 覆盖成歌名时（实测：合辑单曲、假文件被在线匹配），
         // 若仍按 release 生成就会变成「每首歌一次调用」→ 烧钱且内容重复。
         // 这里加一道保守回退：album 为空或 album==title 时改按【艺术家】取 person 简介（按艺术家缓存一次）。
+        // 实体 ID 里的 artist 必须与前端请求时带的 artist 完全一致，否则同一张专辑会算出
+        // 两个缓存键 → 明明有缓存却闪「正在整理资料」/ 重复付费（2026-10-23 DEBUG 定位）。
+        // 统一口径：albumArtist 优先，缺省用 artist；并把它作为 summaryArtist 回给前端。
+        const std::string album_artist_for_key = !fAlbumArtist.empty() ? fAlbumArtist : fArtist;
         const bool album_usable = !fAlbum.empty() && fAlbum != fTitle;
         if (album_usable) {
             summaryKind = "release";
             summaryTarget = fAlbum;
-            summaryEid = (!fArtist.empty())
-                ? rta::meta::entity_make_id("release", rta::meta::entity_norm(fArtist) + "\x1f" + rta::meta::entity_norm(fAlbum))
+            summaryArtist = album_artist_for_key;
+            summaryEid = (!album_artist_for_key.empty())
+                ? rta::meta::entity_make_id("release", rta::meta::entity_norm(album_artist_for_key) + "\x1f" + rta::meta::entity_norm(fAlbum))
                 : rta::meta::entity_id(rta::meta::EntityKind::Release, fAlbum);
-        } else if (!fArtist.empty()) {
+        } else if (!album_artist_for_key.empty()) {
             summaryKind = "person";
-            summaryTarget = fArtist;
-            summaryEid = rta::meta::entity_id(rta::meta::EntityKind::Person, fArtist);
+            summaryTarget = album_artist_for_key;
+            summaryArtist = album_artist_for_key;
+            summaryEid = rta::meta::entity_id(rta::meta::EntityKind::Person, album_artist_for_key);
         }
         bool summaryCacheOk = false;   // 有任何可读缓存（含已过期 → 无 key 时的离线回退）
         if (!summaryEid.empty()) {
@@ -3834,6 +3899,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
           << ",\"summaryCacheOk\":" << (summaryCacheOk ? "true" : "false")
           << ",\"summaryKind\":\"" << jesc(summaryKind) << "\""
           << ",\"summaryTarget\":\"" << jesc(summaryTarget) << "\""
+          << ",\"summaryArtist\":\"" << jesc(summaryArtist) << "\""
           << ",\"hasLlmKey\":" << (hasKeyMeta ? "true" : "false")
           << ",\"summaryEnabled\":" << (msMeta.summary ? "true" : "false")
           << "}";
@@ -4042,7 +4108,8 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             }
         }
 
-        // 3. 未命中（或显式 refresh）→ 自动检索 + 综合，成功即写缓存（每个实体一次在线调用）
+        // 3. 未命中（或显式 refresh）→ **后台生成**，handler 立即返回 pending，前端轮询。
+        //    绝不在这条单线程 accept 路径里同步跑网络+LLM（否则整站卡死，见 summary_job_start 注释）。
         rta::meta::RetrievalOptions ropts;
         ropts.metabase = metabaseDir;
         ropts.artist = artist;
@@ -4051,16 +4118,33 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         ropts.timeout_ms = 25000;
         ropts.llm_cfg = rta::meta::llm_config_load(llm_conf_path());   // 与设置页写的 key 同一份
 
-        play_log("SUMMARY generate kind=" + kindStr + " name=" + name + " eid=" + eid);
-        const rta::meta::SummaryResult sr = rta::meta::retrieval_fetch(ek, name, lang, ropts);
-        if (!sr.ok) {
-            play_log("SUMMARY failed kind=" + kindStr + " name=" + name + " err=" + sr.error);
-            return "{\"ok\":false,\"error\":\"" + jesc(sr.error.empty() ? "资料整理失败" : sr.error) +
-                   "\",\"summaryKind\":\"" + jesc(kindStr) + "\",\"summaryCached\":false}";
+        const std::string jobKey = eid + "|" + lang;
+        {
+            std::lock_guard<std::mutex> lk(g_summ_mu);
+            // 清理 10 分钟前的陈旧任务，避免 map 无限增长（正常前端拿到结果就会取走）
+            const long long now = (long long)std::time(nullptr);
+            for (auto it = g_summ_jobs.begin(); it != g_summ_jobs.end();) {
+                if (it->second.done && it->second.finished_at > 0 && now - it->second.finished_at > 600) {
+                    it = g_summ_jobs.erase(it);
+                } else ++it;
+            }
+            auto it = g_summ_jobs.find(jobKey);
+            if (it != g_summ_jobs.end() && it->second.done) {
+                std::string body = it->second.body;
+                g_summ_jobs.erase(it);   // 一次性交付；下次直接命中磁盘缓存
+                return body;
+            }
+            if (it == g_summ_jobs.end() || !it->second.running) {
+                SummaryJob job;
+                job.running = true;
+                job.started_at = now;
+                g_summ_jobs[jobKey] = job;
+                play_log("SUMMARY generate(async) kind=" + kindStr + " name=" + name + " eid=" + eid);
+                summary_job_start(jobKey, ek, name, lang, kindStr, ropts);
+            }
         }
-        play_log("SUMMARY generated kind=" + kindStr + " name=" + name + " eid=" + eid +
-                 " fromCache=" + std::string(sr.from_cache ? "1" : "0"));
-        return summary_json_with_flags(sr, kindStr, sr.from_cache);
+        return "{\"ok\":false,\"pending\":true,\"error\":\"正在整理资料\",\"summaryKind\":\"" +
+               jesc(kindStr) + "\",\"summaryCached\":false}";
     }
 
     // ---------------- 资料层(P3④b Discogs L4 古典作品版本推荐): GET /api/entity/versions ----------------
@@ -4409,6 +4493,14 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             q = urlDecode(rq.path.substr(qpos + 3));
             const size_t amp = q.find('&');      // 允许 &limit=... 之类后续参数
             if (amp != std::string::npos) q = q.substr(0, amp);
+        }
+        // 空白查询（?q=%20 / ?q=+）也要按空处理：用户 #6 的判据是「什么都没输入就不能列出型号」，
+        // 不能只在 protocol 层挡住空串（filter 内部才 trim，trim 后为空会回落成「全量前 100 条」）。
+        if (hasQ) {
+            size_t b = 0, e2 = q.size();
+            while (b < e2 && (unsigned char)q[b] <= ' ') ++b;
+            while (e2 > b && (unsigned char)q[e2 - 1] <= ' ') --e2;
+            q = q.substr(b, e2 - b);
         }
         std::ostringstream j;
         if (hasQ && q.empty()) {

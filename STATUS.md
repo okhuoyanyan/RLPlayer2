@@ -31,7 +31,21 @@
 - Lead 自写 CDP 验收(真实 DeepSeek + 临时曲库 + null 输出):**21/21 PASS**;
 - ⚠️ `upnp_control` 曾因 Clash Verge 恰好占用本地 8910 端口假红,连接释放后 60/60(环境性 flake)。
 
-## 4. 未验证(铁律 4)
+## 4. 子代理 DEBUG 轮(用户要求)
+
+合并完成后派了两个**独立只读**审查子代理(不同模型)：`opencode-go/deepseek-v4.1-flash`(后端/契约/成本) 与
+`agy/gemini-3.8-flash-tiered`(前端/UX)。两份报告互相印证出 11 个真问题，**已全部修复**，最重要的是：
+
+1. **整站卡死**：单线程 HTTP 后端 + 进页面自动生成 → 生成期间 /api/status 与播放控制全部排队。
+   改成**后台线程 + 前端轮询**后实测：首次请求 17 ms 返回 pending；生成期间 /api/status 延迟 **≤3 ms**。
+2. **成本漏洞**：同一专辑可能算出 2~3 个缓存键(artist 口径不一致)、单曲页每次切歌发 2 个相同请求、
+   Release 绕开 L2 缓存重打维基 —— 已统一 `summaryArtist` 口径、加在途锁、走回带缓存的 knowledge_fetch。
+3. **稳定性**：收藏落盘改原子写并在失败时如实报错；OPRA 索引不再每次请求重新解析 320KB；
+   `loadOpraIndex` 的 setInterval 泄漏改 promise；曲目页/专辑页补 S.view 异步守卫。
+
+详细逐条见 `反馈和开发/develop/261023-03.txt.分析.md` 第 6 节。
+
+## 5. 未验证(铁律 4)
 
 听感/真实卷积效果(禁发声)、Discogs 离线分支、合辑缓存覆盖率、万级大库排序性能、用户 8899 实例 + 真实 WebView2 窗口未复测。
 

@@ -348,7 +348,9 @@ inline std::vector<LlmMessage> build_synthesis_prompt(
         "   - 每段至少 1 条引用：每个段落的 citations 数组至少包含 1 条引用 ID（如 [\"M1\"]），无引用支撑的陈述一律禁止输出！\n"
         "   - citations 数组列出所有引用的条目，每个条目包含 \"id\"、\"title\"、\"url\"、\"source\"、\"fetched_at\"。\n"
         "   - 引用 URL 必须原样复制自输入材料中对应的 url，严禁修改或编造 URL！\n"
-        "4. 免责声明：disclaimer 固定为：\"仅依据下方来源材料综合整理；可能不完整，请以来源为准\"。\n\n"
+        "4. 免责声明：disclaimer 固定为：\"仅依据下方来源材料综合整理；可能不完整，请以来源为准\"。\n"
+        "5. 行文纪律：**不要提及「材料」「来源」「资料」「条目」「文中」等元话语**，也不要复述检索过程；"
+        "直接以陈述句写事实（例：不要写「材料列出的代表歌曲包括…」，直接写「代表歌曲包括…」）。\n\n"
         "JSON 格式模板：\n"
         "{\n"
         "  \"disclaimer\": \"仅依据下方来源材料综合整理；可能不完整，请以来源为准\",\n"
@@ -1056,22 +1058,40 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     kopts.refresh = opts.refresh;
     kopts.timeout_ms = opts.timeout_ms;
     KnowledgeResult kr;
+    // 「有真正正文的材料」：有 url 且不是维基消歧义页（消歧义页正文只有候选标题列表，
+    // 以前用 materials.empty() 判断会把它当成成功 → 艺术家消歧回退永远不触发，白付 LLM 费用）。
+    auto has_real_material = [](const KnowledgeResult& r) {
+        for (const auto& m : r.materials) {
+            if (!m.url.empty() && m.kind != "disambiguation") return true;
+        }
+        return false;
+    };
     if (kind == EntityKind::Release) {
-        kr = knowledge_wikipedia(name, lang, kopts);
-        if (kr.materials.empty() && !opts.artist.empty()) {
-            KnowledgeResult kr2 = knowledge_wikipedia(opts.artist + " " + name, lang, kopts);
-            if (!kr2.materials.empty()) {
-                kr.materials.insert(kr.materials.end(), kr2.materials.begin(), kr2.materials.end());
-            } else {
-                KnowledgeResult kr3 = knowledge_wikipedia(name + " (" + opts.artist + ")", lang, kopts);
-                if (!kr3.materials.empty()) {
-                    kr.materials.insert(kr.materials.end(), kr3.materials.begin(), kr3.materials.end());
+        // 2026-10-23 DEBUG：Release 原先直接调 knowledge_wikipedia（纯网络、不读不写 L2 缓存），
+        // 同一张专辑每次生成都要重打维基（失败还串行换写法再打两轮）。改回带缓存的 knowledge_fetch，
+        // 只有拿不到「非消歧义」正文时，才用「艺术家+专辑名」限定再试（罕见路径，最多 2 次）。
+        kr = knowledge_fetch(kind, name, kopts);
+        if (!has_real_material(kr) && !opts.artist.empty()) {
+            const std::string variants[2] = { opts.artist + " " + name, name + " (" + opts.artist + ")" };
+            for (const auto& q : variants) {
+                if (has_real_material(kr)) break;
+                KnowledgeResult k2 = knowledge_wikipedia(q, lang, kopts);
+                if (has_real_material(k2)) {
+                    kr.materials.insert(kr.materials.end(), k2.materials.begin(), k2.materials.end());
                 }
             }
         }
         KnowledgeMaterial dm = retrieval_fetch_discogs_release(name, opts.artist, opts.timeout_ms);
         if (!dm.url.empty()) {
             kr.materials.push_back(std::move(dm));
+        }
+        // 有真正文时丢掉消歧义候选列表（否则 LLM 会把候选标题当成事实写进简介）
+        if (has_real_material(kr)) {
+            std::vector<KnowledgeMaterial> kept;
+            for (auto& m : kr.materials) {
+                if (m.kind != "disambiguation") kept.push_back(std::move(m));
+            }
+            kr.materials.swap(kept);
         }
     } else {
         kr = knowledge_fetch(kind, name, kopts);
@@ -1178,8 +1198,16 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     SummaryResult parsed;
     std::string last_err;
     for (int attempt = 0; attempt < 2; ++attempt) {
+        // 第二次不要原样重发（确定性失败会白花一次 4000-token 调用）：追加一条修复提示。
+        std::vector<LlmMessage> attempt_msgs = msgs;
+        if (attempt > 0) {
+            attempt_msgs.push_back(LlmMessage{ "user",
+                "上一次输出未通过校验（" + last_err + "）。请只输出严格合法的 JSON 对象："
+                "必须包含 citations 数组（每条含 id/title/url/source，url 必须原样复制自上面材料的链接），"
+                "sections 里每段至少 1 条引用；内容请精简到 3 段以内，不要任何 Markdown 或解释文字。" });
+        }
         retrieval_rate_limiter().acquire();
-        const LlmReply chat_rep = llm_chat(cfg, msgs, 4000, 0.2f, true);
+        const LlmReply chat_rep = llm_chat(cfg, attempt_msgs, 4000, 0.2f, true);
         if (!chat_rep.ok) {
             last_err = "LLM 综合失败: " + chat_rep.error;
             continue;

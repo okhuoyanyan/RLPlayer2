@@ -364,6 +364,21 @@ function renderSummaryContent(summary, title) {
   return h;
 }
 
+// 简介请求（2026-10-23 DEBUG）：后端把「未命中缓存」的生成放到了后台线程，首次请求立即回
+// {"pending":true}，这里按 2s 轮询同一个 URL 直到出结果/超时。这样自动生成期间
+// /api/status（400ms 轮询）与播放控制不会被单线程 HTTP 后端堵住（以前会整站卡死）。
+function fetchSummary(url, onDone, tries) {
+  tries = tries || 0;
+  api(url).then(function (j) {
+    if (j && j.pending) {
+      if (tries >= 60) { onDone({ ok: false, error: '资料整理超时' }); return; }
+      setTimeout(function () { fetchSummary(url, onDone, tries + 1); }, 2000);
+      return;
+    }
+    onDone(j);
+  }).catch(function (e) { onDone({ ok: false, error: String(e) }); });
+}
+
 function bindCopyChips(container) {
   if (!container) return;
   Array.prototype.forEach.call(container.querySelectorAll('.chip-copy'), function (btn) {
@@ -387,6 +402,7 @@ function bindCopyChips(container) {
 function openAlbum(k) {
   S.view = 'album';
   api('/api/lib/album?k=' + encodeURIComponent(k)).then(function (j) {
+    if (S.view !== 'album') return;   // 已切走 → 丢弃（否则会把别页内容覆写成专辑页）
     if (!j.ok) { toast(j.error || '打不开专辑'); return; }
     S.album = j;
     var cv = "background-image:url('/api/lib/cover?k=" + j.k + "')";
@@ -430,9 +446,8 @@ function openAlbum(k) {
 
     if (META.summary == 1) {
       var albK = String(j.k);
-      api('/api/entity/summary?kind=release&name=' + encodeURIComponent(j.name) +
-          '&artist=' + encodeURIComponent(j.artist || '') + '&lang=zh')
-        .then(function (s) {
+      fetchSummary('/api/entity/summary?kind=release&name=' + encodeURIComponent(j.name) +
+          '&artist=' + encodeURIComponent(j.artist || '') + '&lang=zh', function (s) {
           var el = D('albumSummary');
           if (!el || el.dataset.k !== albK) return;   // 异步回来时已切到别的专辑 → 丢弃
           if (s && s.ok && s.sections && s.sections.length > 0) {
@@ -442,10 +457,6 @@ function openAlbum(k) {
           } else {
             el.remove();   // 无资料/无 key 又无缓存 → 干脆不显示
           }
-        })
-        .catch(function () {
-          var el = D('albumSummary');
-          if (el && el.dataset.k === albK) el.remove();
         });
     }
 
@@ -568,10 +579,8 @@ function openArtistProfile(who, refresh) {
     applyArtistSummary();
   });
   if (wantSumm) {
-    api(uSumm).then(function (s) {
+    fetchSummary(uSumm, function (s) {
       summState.done = true; summState.res = s; applyArtistSummary();
-    }).catch(function () {
-      summState.done = true; summState.res = null; applyArtistSummary();
     });
   }
 }
@@ -976,6 +985,7 @@ function loadTracks(q) {
   S.tracksQuery = q || '';
   head(q ? ('搜索：' + q) : '曲目', '搜索中…', '');
   api('/api/lib/search?q=' + encodeURIComponent(q || '')).then(function (j) {
+    if (S.view !== 'tracks') return;   // 已切走（261023-01 #4 同类问题）→ 丢弃，别覆写当前页面
     var t = j.tracks || [];
     S.currentTracks = t;
     renderTracksView();
@@ -983,6 +993,7 @@ function loadTracks(q) {
 }
 
 function renderTracksView() {
+  if (S.view !== 'tracks') return;
   var t = S.currentTracks || [];
   var q = S.tracksQuery || '';
   head(q ? ('搜索：' + q) : '曲目', t.length + ' 首', '');
@@ -1230,8 +1241,7 @@ function loadMeta(f) {
     // 补全芯片：存全局，renderNp 统一填进 #npMeta；整页开着就立刻刷一次（meta 是异步回来的）
     S.npMetaHtml = buildNpMetaHtml(m);
     if (D('npPage') && D('npPage').classList.contains('on')) {
-      renderNp();
-      updateNpSummary(m);
+      renderNp();   // renderNp 内部已调 updateNpSummary(S.curMeta)，不再重复请求
     }
   }).catch(function () { D('npt').textContent = nam(f); });
 }
@@ -3298,23 +3308,25 @@ function renderSettingsPage() {
 var OPRA_INDEX = null;
 var OPRA_PRESETS = [];
 var _opraLoading = false;
+var OPRA_CUR_PRODUCT = '';   // 当前请求预设的型号（连点竞态守卫）
 
+// 2026-10-23 DEBUG：旧实现用 setInterval(100ms) 轮询等 OPRA_INDEX，请求失败时 OPRA_INDEX 永远为 null
+// → 定时器永不清理（每敲一个字派生一个，后台 10Hz 空转）。改成 promise 缓存 + 失败后可重试。
+var _opraPromise = null;
 function loadOpraIndex(cb) {
   if (OPRA_INDEX) { if (cb) cb(); return; }
-  if (_opraLoading) {
-    var checkTimer = setInterval(function () {
-      if (OPRA_INDEX) { clearInterval(checkTimer); if (cb) cb(); }
-    }, 100);
+  if (!_opraPromise) {
+    _opraPromise = api('/api/opra/index').then(function (j) {
+      if (j && j.ok && Array.isArray(j.items)) OPRA_INDEX = j.items;
+    }).catch(function () {
+      // 失败不缓存 promise（下次进页面可重试）；本次直接让调用方走“未加载”分支
+    }).then(function () {
+      _opraPromise = null;
+      if (cb) cb();
+    });
     return;
   }
-  _opraLoading = true;
-  api('/api/opra/index').then(function (j) {
-    _opraLoading = false;
-    if (j && j.ok && Array.isArray(j.items)) {
-      OPRA_INDEX = j.items;
-      if (cb) cb();
-    }
-  }).catch(function () { _opraLoading = false; if (cb) cb(); });
+  _opraPromise.then(function () { if (cb) cb(); });
 }
 
 /* ---------------- 调音目标曲线示意（261023-03 第7条） ----------------
@@ -3651,8 +3663,9 @@ function initEqViewLogic() {
     if (presetsBox) presetsBox.innerHTML = '<div class=empty style="padding:20px 0">正在加载调音目标曲线…</div>';
     if (targetInfo) targetInfo.style.display = 'none';
 
+    OPRA_CUR_PRODUCT = productId;   // 连点不同型号时，只认最后一次选择（防止慢请求把旧预设盖到新型号上）
     api('/api/opra/presets?productId=' + encodeURIComponent(productId)).then(function (j) {
-      if (S.view !== 'eq') return;   // 切走页面后不再渲染
+      if (S.view !== 'eq' || OPRA_CUR_PRODUCT !== productId) return;   // 切走 / 已换型号 → 丢弃
       if (!j.ok || !j.items || !j.items.length) {
         if (msg) msg.textContent = '暂无可用预设';
         if (presetsBox) presetsBox.innerHTML = '<div class=empty style="padding:20px 0">该型号暂无可用调音预设</div>';
@@ -3670,10 +3683,10 @@ function initEqViewLogic() {
         ph += '<div class="preset-card card' + (isActive ? ' active' : '') + '" data-id="' + esc(p.id) + '">' +
               '<div>' +
               '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:4px">' +
-              '<b style="font-size:13.5px;color:var(--txt);line-height:1.35">' + esc(curve.name) + '</b>' +
+              '<b style="font-size:13.5px;color:var(--txt);line-height:1.35">' + esc((p.author || 'OPRA') + (p.details ? (' · ' + p.details) : '')) + '</b>' +
               '<span class="badge" style="background:var(--hov);white-space:nowrap">' + p.bandsCount + ' 段</span>' +
               '</div>' +
-              '<div style="font-size:11px;color:var(--mut2)">作者：' + esc(p.author || 'OPRA') + (p.details ? (' · 预设 ' + esc(p.details)) : '') + '</div>' +
+              '<div style="font-size:11px;color:var(--mut2)">目标曲线：' + esc(curve.name) + '</div>' +
               '<div class="tc-curve" title="目标曲线示意（手绘近似，非测量数据）">' + targetCurveSvg(curve.kind) + '</div>' +
               '<div style="font-size:12px;color:var(--txt2);line-height:1.5;margin:8px 0 0;background:var(--card);padding:8px 10px;border-radius:6px;border:1px solid var(--line)">' +
               '说明：' + esc(curve.scene) + '</div>' +
@@ -4058,6 +4071,7 @@ function openNowPlaying() {
 }
 function closeNowPlaying() { var pg = D('npPage'); if (pg) pg.classList.remove('on'); }
 
+var NP_SUMM_INFLIGHT = '';   // 单曲整页简介的在途请求键（防同一实体重复发请求）
 function updateNpSummary(m) {
   var el = D('npSummary');
   if (!el) return;
@@ -4071,7 +4085,8 @@ function updateNpSummary(m) {
   var targetArtist = '';
   if (targetKind === 'release') {
     if (!targetName) targetName = m.album || '';
-    targetArtist = m.albumArtist || m.artist || '';
+    // 与后端 /api/meta 计算实体 ID 时用同一个 artist（albumArtist 优先），否则同一专辑会算出两个缓存键 → 重复付费
+    targetArtist = m.summaryArtist || m.albumArtist || m.artist || '';
   } else if (!targetName) {
     targetName = m.artist || '';
   }
@@ -4096,7 +4111,10 @@ function updateNpSummary(m) {
 
   var u = '/api/entity/summary?kind=' + targetKind + '&name=' + encodeURIComponent(targetName) +
           (targetArtist ? ('&artist=' + encodeURIComponent(targetArtist)) : '') + '&lang=zh';
-  api(u).then(function (s) {
+  if (NP_SUMM_INFLIGHT === curKey) return;   // 同一实体在途 → 不重复发（每次切歌只发 1 个请求）
+  NP_SUMM_INFLIGHT = curKey;
+  fetchSummary(u, function (s) {
+    if (NP_SUMM_INFLIGHT === curKey) NP_SUMM_INFLIGHT = '';
     if (!D('npSummary') || el.dataset.targetKey !== curKey) return;
     if (s && s.ok && s.sections && s.sections.length > 0) {
       el.dataset.loaded = '1';
@@ -4106,10 +4124,18 @@ function updateNpSummary(m) {
     } else {
       hide();
     }
-  }).catch(function () {
-    if (el.dataset.targetKey === curKey) hide();
   });
 }
+
+// 单曲整页无内嵌封面时的占位图（内联 SVG，暗色黑胶；不引外部资源）
+var NP_COVER_PLACEHOLDER = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300">' +
+  '<rect width="300" height="300" fill="#15171c"/>' +
+  '<circle cx="150" cy="150" r="104" fill="none" stroke="#32353d" stroke-width="2"/>' +
+  '<circle cx="150" cy="150" r="74" fill="none" stroke="#282b32" stroke-width="1.5"/>' +
+  '<circle cx="150" cy="150" r="44" fill="none" stroke="#282b32" stroke-width="1.5"/>' +
+  '<circle cx="150" cy="150" r="16" fill="#3d414b"/>' +
+  '<circle cx="150" cy="150" r="4" fill="#15171c"/></svg>');
 
 function renderNp() {
   var pg = D('npPage'); if (!pg || !pg.classList.contains('on')) return;
@@ -4128,8 +4154,10 @@ function renderNp() {
     D('npCover').style.display = '';
   } else {
     D('npbg').style.backgroundImage = '';
-    D('npCover').removeAttribute('src');
-    D('npCover').style.display = 'none';
+    // 无封面时不再留一块黑斑（2026-10-23 DEBUG 视觉问题）：给一张内联 SVG 黑胶占位图，
+    // 不依赖任何外部/包内图片资源。
+    D('npCover').src = NP_COVER_PLACEHOLDER;
+    D('npCover').style.display = '';
   }
   renderNpLyric();
 }
