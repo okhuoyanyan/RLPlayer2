@@ -1420,7 +1420,12 @@ function setView(v) {
   D('app').classList.toggle('setmode', isSet);   // 设置页隐藏 crumb，页签自己吸顶
   applyRTab(isSet);
   if (D('setpage')) D('setpage').classList.toggle('on', isSet);
+  // 2026-10-23 用户反馈「切到作品栏后无法切回其它栏位」：干净环境下三种路径都复现不出来，
+  // 但这里确实存在一类残留风险 —— 只要有任何路径把 #list 置为 display:none（设置页就会），
+  // 离开设置页时若不显式恢复，视图就会「看起来卡住/空白」。此处按目标视图**强制**设定，
+  // 不再依赖「上一个视图是什么」。
   if (D('list')) D('list').style.display = isSet ? 'none' : '';
+  if (!isSet && D('scanbar')) D('scanbar').style.display = S.scanning ? '' : 'none';
   if (isSet) { head('设置', '所有参数都在这里，改完点「保存」', ''); renderSettingsPage(); }
   else if (D('scanbar')) D('scanbar').style.display = S.scanning ? '' : 'none';
 }
