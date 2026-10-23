@@ -2559,7 +2559,7 @@ static WbPreview writeback_preview_scan() {
             continue;
         }
         it.file = tm.path;
-        // 与 writeback_file 相同的门,只判断不落盘(DSD/ape/未知扩展/空字段/源缺失)
+        // 与 writeback_file 相同的门,只判断不落盘(DSD/ape/未知扩展/空字段/源缺失/PICTURE畸形)
         const std::string ext = rta::audio::lowerExt(tm.path);
         std::string reason;
         if (ext == ".dsf" || ext == ".dff") reason = "DSD(" + ext + ")按安全红线绝不写回";
@@ -2571,6 +2571,9 @@ static WbPreview writeback_preview_scan() {
         else {
             std::error_code e3;
             if (!fs::exists(fs::u8path(tm.path), e3) || e3) reason = "源文件不存在";
+            else if (rta::meta::writeback_detect_picture_malformed(tm.path, &reason)) {
+                // reason 已由纯容器头解析判定为 PICTURE 块/APIC 帧畸形
+            }
         }
         if (reason.empty()) {
             it.writable = true;

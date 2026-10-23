@@ -131,6 +131,286 @@ inline std::vector<WbField> writeback_collect(const TrackMeta& tm, bool vorbisFa
 }
 
 // ---------------------------------------------------------------------------
+// 纯解析内嵌封面保护门（不启动 ffmpeg，直接解析 FLAC/MP3 容器头部）
+// ---------------------------------------------------------------------------
+
+// 纯字节判定：解析内存中的容器头部字节链。
+// 支持格式：.flac（解析 fLaC 元数据块链中的 PICTURE 块）、.mp3（解析 ID3v2 标签中的 APIC 帧）。
+// 其它格式（ogg/opus/m4a/wav/wma/wv 等）暂不判，保持「未知不拦」（返回 false）。
+// 检测到明确畸形（空 MIME、MIME/数据长度越界、缺少必要字段等）返回 true，并在 *reason 中回填说明。
+inline bool writeback_detect_picture_malformed_bytes(
+    const unsigned char* data, const size_t size,
+    const std::string& ext, std::string* reason = nullptr) {
+    if (!data || size < 4) return false;
+
+    // 1. FLAC 容器头部 PICTURE 块解析
+    if (ext == ".flac") {
+        if (size < 4 || data[0] != 'f' || data[1] != 'L' || data[2] != 'a' || data[3] != 'C') {
+            return false;
+        }
+        size_t pos = 4;
+        bool isLast = false;
+        while (pos + 4 <= size && !isLast) {
+            const unsigned char h0 = data[pos];
+            isLast = (h0 & 0x80) != 0;
+            const int blockType = h0 & 0x7F;
+            const uint32_t blockLen = ((uint32_t)data[pos + 1] << 16) |
+                                      ((uint32_t)data[pos + 2] << 8)  |
+                                      (uint32_t)data[pos + 3];
+            const size_t dataStart = pos + 4;
+            const size_t nextPos = dataStart + (size_t)blockLen;
+
+            if (blockType == 6) { // PICTURE
+                if (dataStart > size || nextPos > size) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(块长度越界超文件大小),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+                if (blockLen < 8) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(块长度不足 8 字节),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+                const unsigned char* p = data + dataStart;
+                const uint32_t mimeLen = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                                         ((uint32_t)p[6] << 8)  | (uint32_t)p[7];
+                if (mimeLen == 0) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(MIME 字符串为空),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+                if ((size_t)mimeLen > blockLen - 8) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(MIME 字符串长度越界),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+                for (size_t i = 0; i < mimeLen; ++i) {
+                    const unsigned char c = p[8 + i];
+                    if (c < 0x20 || c > 0x7E) {
+                        if (reason) *reason = "源文件的 PICTURE 块畸形(MIME 字符串包含非法字符),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                        return true;
+                    }
+                }
+                size_t cur = 8 + (size_t)mimeLen;
+                if (cur + 4 > blockLen) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(缺少描述长度字段),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+                const uint32_t descLen = ((uint32_t)p[cur] << 24) | ((uint32_t)p[cur + 1] << 16) |
+                                         ((uint32_t)p[cur + 2] << 8) | (uint32_t)p[cur + 3];
+                cur += 4;
+                if ((size_t)descLen > blockLen - cur) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(描述字符串长度越界),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+                cur += (size_t)descLen;
+                if (cur + 16 + 4 > blockLen) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(缺少图片元信息或数据长度字段),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+                cur += 16; // width (4) + height (4) + depth (4) + colors (4)
+                const uint32_t dataLen = ((uint32_t)p[cur] << 24) | ((uint32_t)p[cur + 1] << 16) |
+                                         ((uint32_t)p[cur + 2] << 8) | (uint32_t)p[cur + 3];
+                cur += 4;
+                if (dataLen == 0) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(图片数据长度为 0),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+                if ((size_t)dataLen > blockLen - cur) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(图片数据长度越界),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+            }
+            pos = nextPos;
+        }
+        return false;
+    }
+
+    // 2. MP3 ID3v2 APIC 帧解析
+    if (ext == ".mp3") {
+        if (size < 10 || data[0] != 'I' || data[1] != 'D' || data[2] != '3') return false;
+        const unsigned char ver = data[3];
+        if (ver < 2 || ver > 4) return false;
+        const unsigned char flags = data[5];
+        const bool hasExt = (flags & 0x40) != 0;
+        for (int i = 6; i < 10; ++i) {
+            if (data[i] & 0x80) return false; // 非法 syncsafe
+        }
+        const uint32_t tagSize = ((uint32_t)(data[6] & 0x7F) << 21) |
+                                 ((uint32_t)(data[7] & 0x7F) << 14) |
+                                 ((uint32_t)(data[8] & 0x7F) << 7)  |
+                                 (uint32_t)(data[9] & 0x7F);
+        size_t tagLimit = 10 + (size_t)tagSize;
+        if (tagLimit > size) tagLimit = size;
+        size_t pos = 10;
+        if (hasExt) {
+            if (ver == 3) {
+                if (pos + 4 <= tagLimit) {
+                    const uint32_t extSize = ((uint32_t)data[pos] << 24) | ((uint32_t)data[pos + 1] << 16) |
+                                             ((uint32_t)data[pos + 2] << 8) | (uint32_t)data[pos + 3];
+                    pos += 4 + (size_t)extSize;
+                }
+            } else if (ver == 4) {
+                if (pos + 4 <= tagLimit) {
+                    const uint32_t extSize = ((uint32_t)(data[pos] & 0x7F) << 21) |
+                                             ((uint32_t)(data[pos + 1] & 0x7F) << 14) |
+                                             ((uint32_t)(data[pos + 2] & 0x7F) << 7) |
+                                             (uint32_t)(data[pos + 3] & 0x7F);
+                    pos += (size_t)extSize;
+                }
+            }
+        }
+        while (pos + 10 <= tagLimit) {
+            if (data[pos] == 0 && data[pos + 1] == 0) break; // 遭遇 padding，退出
+            const bool isApic = (data[pos] == 'A' && data[pos + 1] == 'P' &&
+                                 data[pos + 2] == 'I' && data[pos + 3] == 'C');
+            uint32_t fsize = 0;
+            if (ver == 4) {
+                if ((data[pos + 4] & 0x80) || (data[pos + 5] & 0x80) ||
+                    (data[pos + 6] & 0x80) || (data[pos + 7] & 0x80)) {
+                    if (isApic) {
+                        if (reason) *reason = "源文件的 PICTURE 块畸形(ID3v2 APIC 帧长编码非法),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                        return true;
+                    }
+                    break;
+                }
+                fsize = ((uint32_t)(data[pos + 4] & 0x7F) << 21) |
+                        ((uint32_t)(data[pos + 5] & 0x7F) << 14) |
+                        ((uint32_t)(data[pos + 6] & 0x7F) << 7)  |
+                        (uint32_t)(data[pos + 7] & 0x7F);
+            } else {
+                fsize = ((uint32_t)data[pos + 4] << 24) | ((uint32_t)data[pos + 5] << 16) |
+                        ((uint32_t)data[pos + 6] << 8)  | (uint32_t)data[pos + 7];
+            }
+            const size_t frameDataStart = pos + 10;
+            const size_t nextPos = frameDataStart + (size_t)fsize;
+            if (isApic) {
+                if (frameDataStart > tagLimit || nextPos > 10 + (size_t)tagSize || (size >= 10 + (size_t)tagSize && nextPos > size)) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(ID3v2 APIC 帧长越界),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+                if (fsize < 4) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(ID3v2 APIC 帧数据过短),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+                const unsigned char* fp = data + frameDataStart;
+                const unsigned char enc = fp[0];
+                if (enc > 3) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(ID3v2 APIC 编码字段非法),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+                size_t mimeEnd = 1;
+                while (mimeEnd < (size_t)fsize && fp[mimeEnd] != 0) ++mimeEnd;
+                if (mimeEnd >= (size_t)fsize) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(ID3v2 APIC MIME 缺少终止符),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+                const size_t mimeLen = mimeEnd - 1;
+                if (mimeLen == 0) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(ID3v2 APIC MIME 字符串为空),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+                for (size_t mi = 1; mi < mimeEnd; ++mi) {
+                    if (fp[mi] < 0x20 || fp[mi] > 0x7E) {
+                        if (reason) *reason = "源文件的 PICTURE 块畸形(ID3v2 APIC MIME 包含非法字符),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                        return true;
+                    }
+                }
+                if (mimeEnd + 1 >= (size_t)fsize) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(ID3v2 APIC 缺少图片类型),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+                const size_t descStart = mimeEnd + 2;
+                size_t descEnd = descStart;
+                if (enc == 0 || enc == 3) {
+                    while (descEnd < (size_t)fsize && fp[descEnd] != 0) ++descEnd;
+                    if (descEnd >= (size_t)fsize) {
+                        if (reason) *reason = "源文件的 PICTURE 块畸形(ID3v2 APIC 描述缺少终止符),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                        return true;
+                    }
+                    descEnd += 1;
+                } else {
+                    while (descEnd + 1 < (size_t)fsize && !(fp[descEnd] == 0 && fp[descEnd + 1] == 0 && ((descEnd - descStart) % 2 == 0))) {
+                        ++descEnd;
+                    }
+                    if (descEnd + 1 >= (size_t)fsize) {
+                        if (reason) *reason = "源文件的 PICTURE 块畸形(ID3v2 APIC 描述缺少双字节终止符),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                        return true;
+                    }
+                    descEnd += 2;
+                }
+                if (descEnd >= (size_t)fsize) {
+                    if (reason) *reason = "源文件的 PICTURE 块畸形(ID3v2 APIC 图片数据为空),remux 会静默丢失该封面块;已跳过写回。请先重建内嵌封面(重新嵌入图片)后再写回";
+                    return true;
+                }
+            }
+            pos = nextPos;
+        }
+        return false;
+    }
+
+    return false;
+}
+
+// 纯文件入口：读取文件头部字节（探测 FLAC/MP3 容器内嵌封面是否畸形，不启动 ffmpeg）
+inline bool writeback_detect_picture_malformed(const std::string& file, std::string* reason = nullptr) {
+    const std::string ext = rta::platform::lower_extension(file);
+    if (ext != ".flac" && ext != ".mp3") return false;
+
+    std::ifstream f(meta_path_of(file), std::ios::binary);
+    if (!f) return false;
+
+    f.seekg(0, std::ios::end);
+    const auto endPos = f.tellg();
+    if (endPos <= 0) return false;
+    const size_t fileSize = (size_t)endPos;
+    f.seekg(0, std::ios::beg);
+
+    // 默认读取前 1MB 探测；若封面更大则按需扩容
+    size_t toRead = std::min<size_t>(fileSize, 1024 * 1024);
+    std::vector<unsigned char> buf(toRead);
+    f.read((char*)buf.data(), (std::streamsize)toRead);
+    size_t nRead = (size_t)f.gcount();
+    buf.resize(nRead);
+
+    // 若是 FLAC，检查是否有 PICTURE 块超出了当前的 1MB 缓冲
+    if (ext == ".flac" && buf.size() >= 4 && buf[0] == 'f' && buf[1] == 'L' && buf[2] == 'a' && buf[3] == 'C') {
+        size_t pos = 4;
+        bool isLast = false;
+        while (pos + 4 <= buf.size() && !isLast) {
+            isLast = (buf[pos] & 0x80) != 0;
+            const int blockType = buf[pos] & 0x7F;
+            const uint32_t blockLen = ((uint32_t)buf[pos + 1] << 16) |
+                                      ((uint32_t)buf[pos + 2] << 8)  |
+                                      (uint32_t)buf[pos + 3];
+            const size_t nextPos = pos + 4 + (size_t)blockLen;
+            if (blockType == 6 && nextPos > buf.size()) {
+                if (nextPos <= fileSize && nextPos <= 50 * 1024 * 1024) {
+                    buf.resize(nextPos);
+                    f.seekg((std::streamoff)nRead);
+                    f.read((char*)buf.data() + nRead, (std::streamsize)(nextPos - nRead));
+                    nRead += (size_t)f.gcount();
+                    buf.resize(nRead);
+                }
+                break;
+            }
+            pos = nextPos;
+        }
+    } else if (ext == ".mp3" && buf.size() >= 10 && buf[0] == 'I' && buf[1] == 'D' && buf[2] == '3') {
+        const uint32_t tagSize = ((uint32_t)(buf[6] & 0x7F) << 21) |
+                                 ((uint32_t)(buf[7] & 0x7F) << 14) |
+                                 ((uint32_t)(buf[8] & 0x7F) << 7)  |
+                                 (uint32_t)(buf[9] & 0x7F);
+        const size_t needed = 10 + (size_t)tagSize;
+        if (needed > buf.size() && needed <= fileSize && needed <= 50 * 1024 * 1024) {
+            buf.resize(needed);
+            f.seekg((std::streamoff)nRead);
+            f.read((char*)buf.data() + nRead, (std::streamsize)(needed - nRead));
+            nRead += (size_t)f.gcount();
+            buf.resize(nRead);
+        }
+    }
+
+    return writeback_detect_picture_malformed_bytes(buf.data(), buf.size(), ext, reason);
+}
+
+// ---------------------------------------------------------------------------
 // 命令行拼装与进程执行(经 CreateProcessW 宽字符;ffmpeg 输出只用于错误消息)
 // ---------------------------------------------------------------------------
 
@@ -321,12 +601,14 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
         return r;
     }
 
-    // ③b 内嵌封面保护门(2026-10-22 实测发现:姜饼游行.flac 的 PICTURE 块畸形,
-    // ffmpeg 报 "Could not read mimetype from an attached picture",不暴露为封面流,
-    // -map 0 映射不到 → remux 会静默丢掉整个 PICTURE 块)。音频 PCM 有门禁保护,
-    // 但悄悄丢内嵌封面不符合「不静默」纪律 → 检测到即跳过,请用户先重建封面。
-    // 正常封面(绝大多数文件)走 attached_pic 流被 -c copy 保留,不受影响。
+    // ③b 内嵌封面保护门(纯解析门 + ffprobe 探测双保险)
     {
+        std::string picReason;
+        if (writeback_detect_picture_malformed(file, &picReason)) {
+            r.skipped = true;
+            r.note = picReason;
+            return r;
+        }
         const std::string ffprobe = rta::platform::find_executable("ffprobe");
         if (!ffprobe.empty()) {
             const std::string cmd = "\"" + ffprobe + "\" -hide_banner " + wb_quoted(file);
