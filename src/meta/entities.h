@@ -1149,7 +1149,17 @@ inline MetaSeed entity_seed_from_tags(const std::string& trackPath,
 // 从曲目路径与原始标签提取种子，并接入目录结构判据（多碟盒装/「专辑 @ 社团」目录名/碟号推断）
 inline MetaSeed entity_seed_from_track_path(const std::string& trackPath,
                                             const std::map<std::string, std::string>& rawTags = {}) {
-    MetaSeed s = entity_seed_from_tags(trackPath, rawTags);
+    std::map<std::string, std::string> effectiveTags = rawTags;
+    // E-15: 若未显式传入 rawTags，尝试从 MetaStore 中加载既有标签（实现 Enrich/Store 流程闭环）
+    if (effectiveTags.empty() && !trackPath.empty()) {
+        TrackMeta tm;
+        if (MetaStore::instance().load(trackPath, tm)) {
+            for (const auto& kv : tm.fields) {
+                if (!kv.second.value.empty()) effectiveTags[kv.first] = kv.second.value;
+            }
+        }
+    }
+    MetaSeed s = entity_seed_from_tags(trackPath, effectiveTags);
     int discFromDir = 0;
     const fsx::path albDir = entity_find_album_dir_for_track(meta_path_of(trackPath), &discFromDir);
     if (!albDir.empty()) {

@@ -27,6 +27,7 @@ namespace rta::audio {
 
 struct MediaInfo {
     std::string title, artist, album, date, genre, codec, track;
+    std::string composer, work, conductor, performer; // E-15 古典标签支持
     int    sampleRate = 0;
     int    channels = 0;
     int    bits = 0;
@@ -135,7 +136,7 @@ inline MediaInfo probe_media(const std::string& file) {
     {
         std::string out;
         const std::wstring cmd = L"\"" + widen(ffprobe) +
-            L"\" -v error -show_entries format=duration:format_tags=title,artist,album,date,genre "
+            L"\" -v error -show_entries format=duration:format_tags=title,artist,album,date,genre,composer,work,conductor,performer,ensemble,soloist "
             L"-of default=nw=1 \"" + widen(file) + L"\"";
         if (run_hidden(cmd, &out) == 0) {
             std::string line;
@@ -154,6 +155,11 @@ inline MediaInfo probe_media(const std::string& file) {
                         else if (k == "tag:date"   || k == "date")   mi.date = v;
                         else if (k == "tag:genre"  || k == "genre")  mi.genre = v;
                         else if (k == "tag:track"  || k == "track")  mi.track = v;
+                        else if (k == "tag:composer"  || k == "composer")  mi.composer = v;
+                        else if (k == "tag:work"      || k == "work")      mi.work = v;
+                        else if (k == "tag:conductor" || k == "conductor") mi.conductor = v;
+                        else if (k == "tag:performer" || k == "performer" || k == "tag:ensemble" || k == "ensemble" ||
+                                 k == "tag:soloist"   || k == "soloist")   mi.performer = v;
                         // duration 是 format 级字段，输出行形如 "duration=171.692290"，
                         // 【没有】TAG: 前缀；它恰好与 tag 键共处一个 k=v 循环，所以在此认。
                         // 解析失败一律保持 0（未知），绝不把 NaN/inf 传下去。

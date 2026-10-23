@@ -393,6 +393,11 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
     if (!best.artist.empty()) { mv.value = best.artist; mergeTracked("albumArtist", mv); }
     if (!best.year.empty())   { mv.value = best.year;   mergeTracked("year", mv); }
     if (!best.genre.empty())  { mv.value = best.genre;  mergeTracked("genre", mv); }
+    // E-15: 本地古典标签保留写入（若本地标签含 COMPOSER/WORK/CONDUCTOR/PERFORMER）
+    if (!mi.composer.empty())  { MetaValue v; v.value = mi.composer;  v.source = "tag"; v.confidence = 1.0f; v.ts = now; mergeTracked("composer", v); }
+    if (!mi.work.empty())      { MetaValue v; v.value = mi.work;      v.source = "tag"; v.confidence = 1.0f; v.ts = now; mergeTracked("work", v); }
+    if (!mi.conductor.empty()) { MetaValue v; v.value = mi.conductor; v.source = "tag"; v.confidence = 1.0f; v.ts = now; mergeTracked("conductor", v); }
+    if (!mi.performer.empty()) { MetaValue v; v.value = mi.performer; v.source = "tag"; v.confidence = 1.0f; v.ts = now; mergeTracked("performer", v); }
     auto fieldStillEmpty = [&](const char* f) {
         const auto it = tm.fields.find(f);
         return it == tm.fields.end() || it->second.value.empty();
