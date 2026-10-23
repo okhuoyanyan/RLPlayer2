@@ -5303,8 +5303,25 @@ int main(int argc, char** argv) {
     }
     // MetaBase 存放 exe 同目录 rlplayer-meta/(与播放日志/设置同位置约定);
     // 播放触发补全与 /api/enrich、/api/meta、/api/cover、/api/lyrics 都走这个单例
-    rta::meta::MetaStore::instance().setBaseDir(path_in_exe_dir("rlplayer-meta"));
-    rta::meta::EntityStore::instance().setBaseDir(path_in_exe_dir("rlplayer-meta"));
+    //
+    // 2026-10-23 真机 DEBUG(用户反馈「升级后封面/歌词没了」):
+    //   旧版把 metabase 落在**进程工作目录**,新版固定在 exe 目录 → 老用户既有的歌词/内嵌封面缓存
+    //   全部"看不见"(数据没丢,只是指到了另一个空目录)。这里做**一次性只读回退**:
+    //   exe 目录下没有 metabase、而工作目录下有 → 继续用工作目录那份,老用户无感;
+    //   exe 目录下已经有 → 用 exe 目录(新数据写新位置,不会两边分裂)。
+    {
+        std::string metaBase = path_in_exe_dir("rlplayer-meta");
+        std::error_code mec;
+        if (!fs::is_directory(fs::u8path(metaBase), mec)) {
+            const fs::path legacy = fs::u8path("rlplayer-meta");
+            if (fs::is_directory(legacy, mec)) {
+                metaBase = pathToUtf8(fs::absolute(legacy, mec));
+                play_log("METABASE legacy(工作目录): " + metaBase);
+            }
+        }
+        rta::meta::MetaStore::instance().setBaseDir(metaBase);
+        rta::meta::EntityStore::instance().setBaseDir(metaBase);
+    }
     rta::dsp::OpraService::instance().init(path_in_exe_dir("data\\opra_index.json"), path_in_exe_dir(""));
     {
         std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));

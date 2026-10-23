@@ -333,18 +333,30 @@ inline std::vector<unsigned char> get_cover(const std::string& file, std::string
     } catch (...) {}
 
     // 2) 内嵌封面
+    // 2026-10-23 真机 DEBUG（用户反馈「封面不显示」的第二个根因）：
+    //   原实现用 ffmpeg -c:v png **转码**成 PNG 再读。而发布包里的 ffmpeg 是**精简自建版**，
+    //   按体积裁掉了 PNG 编码器（只有 mjpeg 编码器）→ 命令静默失败 → 只拿到 1x1 占位图（77 字节）。
+    //   build 目录那份恰好能过，于是本地测"正常"、发包后用户全挂 —— 典型的"测试环境与发布物不一致"。
+    // 修法：**直接复制内嵌图片的原始字节**（-c:v copy），不转码。jpeg/png 都对，还省一次编解码，
+    //   并且不依赖任何编码器是否存在（以后 ffmpeg 再裁也安全）。
     {
         const std::string ffmpeg = find_tool("ffmpeg");
         if (!ffmpeg.empty()) {
-            const std::string tmp = temp_path(L".png");
+            const std::string tmp = temp_path(L".img");
             const std::wstring cmd = L"\"" + widen(ffmpeg) + L"\" -v error -y -i \"" + widen(file) +
-                L"\" -map 0:v:0 -c:v png -f image2 \"" + widen(tmp) + L"\"";
+                L"\" -map 0:v:0 -c:v copy -f image2 \"" + widen(tmp) + L"\"";
             run_hidden(cmd, nullptr);
             std::ifstream f(std::filesystem::u8path(tmp), std::ios::binary);
             if (f) {
                 std::vector<unsigned char> b{ std::istreambuf_iterator<char>(f), {} };
                 f.close();
-                if (b.size() > 64) { bytes = std::move(b); outMime = "image/png"; }
+                if (b.size() > 64) {
+                    // 拷贝模式下扩展名不可信，按文件头判真实 mime
+                    outMime = "image/jpeg";
+                    if (b.size() > 8 && b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) outMime = "image/png";
+                    else if (b.size() > 12 && b[0] == 0x52 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x46) outMime = "image/webp";
+                    bytes = std::move(b);
+                }
             }
             DeleteFileW(widen(tmp).c_str());
             if (!bytes.empty()) goto done;

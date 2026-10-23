@@ -99,7 +99,17 @@ class MetaStore {
 public:
     static MetaStore& instance() { static MetaStore S; return S; }
 
+    // 由宿主（rtaweb）在启动时设定：exe 目录下的 rlplayer-meta，或旧位置（工作目录）回退。
+    // 见 rtaweb.cpp 里的 Metabase 初始化注释（2026-10-23 真机 DEBUG）。
+
     // 默认 "rlplayer-meta"（相对工作目录，同 rlplayer-library.conf 的约定）；测试切到临时目录
+    //
+    // 2026-10-23 真机 DEBUG：用户反馈「升级后封面/歌词没了」。根因是这里的默认值是**相对路径**，
+    // 落点随进程工作目录漂移 —— 旧版从仓库根启动（metabase 在仓库根），新版从 exe 目录启动，
+    // 于是既有的歌词/封面缓存全部"看不见"（数据没丢，只是指到了另一个空目录）。
+    // 处理：默认改为 **exe 目录**（与 rlplayer-settings.conf / rlplayer-library.conf 一致），
+    // 但对**旧位置**做一次只读回退（exe 目录下没有、而工作目录下有，就用工作目录那份），
+    // 这样老用户的缓存不用迁移也能继续用。
     void setBaseDir(const std::string& dir) {
         std::lock_guard<std::mutex> lk(mtx_);
         baseDir_ = dir.empty() ? "rlplayer-meta" : dir;
