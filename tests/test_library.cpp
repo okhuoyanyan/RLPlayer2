@@ -42,6 +42,9 @@ int main() {
     // 字段顺序必须与 library.h 的 load() 一致
     {
         std::ofstream f("rlplayer-index.tsv", std::ios::binary);
+        // 2026-10-23：索引多了格式版本头（Library 会校验，不匹配就整份丢弃重建）。
+        // 测试夹具必须与真实 saveIndexLocked() 的输出格式保持一致，否则加载后为空。
+        f << "#libIndexV\t3\n";
         f << "#path\tmtime\tsize\talbum\talbumArtist\tartist\ttitle\ttrack\tdisc\tyear\tsr\tbits\tch\tdur\thasCover\tgenre\n";
         auto row = [&](const std::string& path, const std::string& alb, const std::string& aa,
                        const std::string& art, const std::string& ttl, int trk, int disc,
