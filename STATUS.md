@@ -2,7 +2,32 @@
 
 > **接手请先读**：[HANDOVER.md](HANDOVER.md)（架构/构建/已知坑）→ [ROADMAP.md](ROADMAP.md)（待开发与判据）。
 > 本文件按回合记录“做过什么、实测多少”，越往下越旧。
-# 第二十八轮:元数据最后三项遗留收口（E-4/E-9/E-8）+ 1.3.2(2026-10-23)
+# 第二十九轮:P5 UPnP 投放端到端实测 + 1.3.3 真机 BUG 修复(2026-10-23)
+
+## 0. 1.3.3 三个致命 BUG 的根因(用户真机反馈 261023-01)
+
+- **封面全不显示**:`hasCover` 扫描时**从未赋值**(恒 0) → UI 不请求封面;库配置/索引原先落 cwd → 升级后曲库变空。
+  修:`lib_has_cover_file()` 扫描时 stat cover/folder/front;配置改 exe 目录绝对路径 + `RLPLAYER_LIBRARY_DIR` 覆盖 + 非 8899 实例 `.p<port>` 后缀。实测 653→657 首、`cv:true`、封面 161,388 字节。
+- **无法播放**:1.3.0 把独占格式写死「32 容器/24 有效」(UltraLite 结论),而本机 TASCAM 只认**紧凑 24** 或 **float32**
+  (`wasapi_ex_probe` 真机矩阵:紧凑24→S_OK, 32/24→0x88890008) → 改为**格式阶梯×配方阶梯**,`pack()` 按实际容器宽度写。实测 `playing=true, outBits=24, 独占格式=EXT24/24 紧凑(3字节)`。
+- **元数据栏繁杂**:6 开关+Key+7 按钮 → 3 常用开关 + 「高级选项▾」折叠。
+- **作品栏切不回**:三种路径 CDP 复现均正常,**未复现**,已做实例隔离加固,待用户补现象。
+
+第 6 节:P5 端到端实测(见本文件末尾新增内容);1.3.3 已发布(370.85 MB, sha256 AC7CD8EB…4756)。
+
+## 6. P5 UPnP 投放端到端真机实测(2026-10-23,用户授权设备)
+
+- 设备:`192.168.50.109` = `N1000_UPNP`(upmpdcli 1.4.12 + MPD 0.22.0 + MiniDLNA);
+- **SSDP 组播在本机网络被完全拦截**(手写 M-SEARCH 亦 0 回应) → 但**直连描述 URL 完全可用**,`rtacast --dev http://IP:PORT/` 走通;
+- **控制面全部正确**:SetAVTransportURI(完整 DIDL+protocolInfo)/Play/GetTransportInfo/GetMediaInfo 均 200 OK,状态到 PLAYING;
+- **供源侧失败,判定为网络隔离**:MPD 报 `Failed to decode http://192.168.50.140:8912/... CURL failed: Connection timed out`;
+  逐步排除(本机自测 200 → 换最简 python http.server 仍超时 → 按端口与程序双口径放行防火墙仍超时 →
+  `Get-NetTCPConnection -RemoteAddress` **从未出现设备入站连接**),典型 **AP/客户端隔离**特征(icmp 通、TCP 入站不通);
+- **代码侧不需要改**(SOAP/DIDL/Range/供源均经受真机检验);顺手改进:`rtacast --list` 空发现时打印**直连用法**;
+- 待网络放通后用同一条命令复测即可:`rtacast --file <曲> --dev http://192.168.50.109:49152/ --seconds 15`,
+  判据 = MPD `status` 的 `time:` 推进 + `state: play` + 我们侧看到设备建立 TCP 与 Range 请求;
+- 详见 `docs/P5-UPnP端到端实测-2026-10-23.md`。
+
 
 > 承接第 27 轮：把 §1.6.E 里最后三个**代码级**遗留项收掉。至此该清单里只剩 P2/P3 的设计取舍与外部网络条件。
 
