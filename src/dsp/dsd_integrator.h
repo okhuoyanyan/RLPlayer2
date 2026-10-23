@@ -57,6 +57,7 @@ struct IntegratorConfig {
     int      order = 10;             // IIR 阶数（偶数，<=20）
     int      cicStages = 6;          // CIC 级数
     bool     cicCompensate = true;   // CIC 后接 1/sinc^N 补偿 FIR
+    bool     twoStage = true;        // 两级抽取（CIC 4x + 短 FIR），默认开启（仅对 FIR 且 taps==0 生效）
 };
 
 // ---------------- Conversion：DSD → PCM 抽取的「窄 / 宽 / XFi」三组预设 ----------------
@@ -96,12 +97,14 @@ inline double conversion_passband(DsdConversion c) {
 // 生成对应预设的抽取器配置（其余参数保持默认：FIR 120 dB / IIR 10 阶 / CIC 6 级）
 inline IntegratorConfig conversion_integrator(IntegratorKind kind, DsdConversion conv,
                                               uint32_t dsdRate, uint32_t outRate,
-                                              double attenDb = 120.0) {
+                                              double attenDb = 120.0,
+                                              bool twoStage = true) {
     IntegratorConfig cfg;
     cfg.kind = kind;
     cfg.dsdRate = dsdRate;
     cfg.outRate = outRate;
     cfg.attenDb = attenDb;
+    cfg.twoStage = twoStage;
     double p = conversion_passband(conv);
     const double limit = (double)outRate * 0.45;     // 再宽也要给阻带留 10%
     if (p > limit) p = limit;
@@ -117,11 +120,24 @@ public:
     uint32_t decimation() const { return M_; }
     uint32_t outRate() const { return cfg_.outRate; }
     double stopbandStartHz() const { return stopbandHz_; }
-    const std::vector<double>& firTaps() const { return h_; }
+    bool isTwoStage() const {
+        return cfg_.kind == IntegratorKind::Fir && cfg_.twoStage && cfg_.taps == 0 &&
+               (M_ >= 4) && (M_ % 4 == 0);
+    }
+    const std::vector<double>& firTaps() const { return isTwoStage() ? h2_ : h_; }
     const std::vector<double>& compTaps() const { return comp_; }
 
     // 设计响应（dB）。f 为 Hz；CIC 已含补偿（若启用）。
     double response_db(double f) const {
+        if (isTwoStage()) {
+            if (f < 1e-12) return 0.0;
+            const double sin_num = std::sin(kPi * f * (double)R1_ / (double)cfg_.dsdRate);
+            const double sin_den = (double)R1_ * std::sin(kPi * f / (double)cfg_.dsdRate);
+            double hcic = (std::fabs(sin_den) < 1e-300) ? 0.0 : std::pow(std::fabs(sin_num / sin_den), (double)cicStages_);
+            double db_cic = (hcic > 1e-300) ? 20.0 * std::log10(hcic) : -300.0;
+            double db_h2 = magnitude_db(h2_, 2.0 * f / (double)fmid_);
+            return db_cic + db_h2;
+        }
         switch (cfg_.kind) {
             case IntegratorKind::Fir:
                 return magnitude_db(h_, 2.0 * f / (double)cfg_.dsdRate);
@@ -155,14 +171,39 @@ public:
         std::fill(compRing_.begin(), compRing_.end(), 0.0);
         compPos_ = 0;
         inCount_ = 0;
+        midCount_ = 0;
+        std::fill(ring2_.begin(), ring2_.end(), 0.0);
+        ringPos2_ = 0;
+        for (int i = 0; i < 6; ++i) { integ6_[i] = 0; comb6_[i] = 0; }
     }
 
     // 处理一块 1-bit 流（MSB-first 打包，nbits 个采样），结果追加到 out。
     void process_bits(const uint8_t* packed, size_t nbits, std::vector<double>& out) {
         out.reserve(out.size() + nbits / (size_t)M_ + 4);
-        for (size_t i = 0; i < nbits; ++i) {
-            const double v = ((packed[i >> 3] >> (7 - (i & 7))) & 1u) ? 1.0 : -1.0;
-            step(v, out);
+        if (isTwoStage()) {
+            size_t i = 0;
+            while (i < nbits && ((inCount_ & 3) != 0 || (nbits - i) < 4 || (i & 3) != 0)) {
+                const bool bit = ((packed[i >> 3] >> (7 - (i & 7))) & 1u) != 0;
+                step_two_stage(bit, out);
+                ++i;
+            }
+
+            while (i + 4 <= nbits && (inCount_ & 3) == 0 && (i & 3) == 0) {
+                const uint8_t nibble = ((i & 7) == 0) ? (packed[i >> 3] >> 4) : (packed[i >> 3] & 0x0F);
+                step_nibble(nibble, out);
+                i += 4;
+            }
+
+            while (i < nbits) {
+                const bool bit = ((packed[i >> 3] >> (7 - (i & 7))) & 1u) != 0;
+                step_two_stage(bit, out);
+                ++i;
+            }
+        } else {
+            for (size_t i = 0; i < nbits; ++i) {
+                const double v = ((packed[i >> 3] >> (7 - (i & 7))) & 1u) ? 1.0 : -1.0;
+                step(v, out);
+            }
         }
     }
 
@@ -248,7 +289,10 @@ private:
         stopbandHz_ = (double)cfg_.outRate - cfg_.passbandHz;
 
         switch (cfg_.kind) {
-            case IntegratorKind::Fir:  design_fir(); break;
+            case IntegratorKind::Fir:
+                if (isTwoStage()) design_two_stage();
+                else design_fir();
+                break;
             case IntegratorKind::Iir:  design_iir(); break;
             case IntegratorKind::Cic:  design_cic(); break;
         }
@@ -315,7 +359,128 @@ private:
         compPos_ = 0;
     }
 
+    void design_two_stage() {
+        R1_ = 4;
+        R2_ = M_ / 4;
+        R2PowerOf2_ = (R2_ > 0) && ((R2_ & (R2_ - 1)) == 0);
+        R2Mask_ = R2PowerOf2_ ? (R2_ - 1) : 0;
+        fmid_ = cfg_.dsdRate / R1_;
+        cicStages_ = 6;
+        cicGain_ = std::pow(4.0, (double)cicStages_);
+        cicInvGain_ = 1.0 / cicGain_;
+
+        const double transNorm = (stopbandHz_ - cfg_.passbandHz) / (double)fmid_;
+        const double atten = std::max(cfg_.attenDb, 130.0);
+        int taps = kaiser_taps_for(atten, transNorm);
+        if ((taps & 1) == 0) ++taps;
+        LowpassSpec sp;
+        sp.taps = taps;
+        sp.cutoff = (cfg_.passbandHz + stopbandHz_) / (double)fmid_;
+        sp.attenDb = atten;
+        std::vector<double> h_lp = design_lowpass(sp);
+
+        const int Nf = 500;
+        double m11 = 0.0, m12 = 0.0, m22 = 0.0, b1 = 0.0, b2 = 0.0;
+        for (int i = 1; i <= Nf; ++i) {
+            const double f = cfg_.passbandHz * (double)i / (double)Nf;
+            const double x = kPi * f / (double)cfg_.dsdRate;
+            const double hcic = std::pow(std::cos(x) * std::cos(2.0 * x), (double)cicStages_);
+            const double theta = kPi * f / (double)fmid_;
+            const double a1 = -4.0 * std::sin(theta) * std::sin(theta);
+            const double a2 = -4.0 * std::sin(2.0 * theta) * std::sin(2.0 * theta);
+            const double y = 1.0 / hcic - 1.0;
+            m11 += a1 * a1; m12 += a1 * a2; m22 += a2 * a2;
+            b1 += a1 * y; b2 += a2 * y;
+        }
+        const double det = m11 * m22 - m12 * m12;
+        const double c1 = (b1 * m22 - b2 * m12) / det;
+        const double c2 = (m11 * b2 - m12 * b1) / det;
+        const double c0 = 1.0 - 2.0 * (c1 + c2);
+        const std::vector<double> comp = { c2, c1, c0, c1, c2 };
+
+        h2_.assign(h_lp.size() + comp.size() - 1, 0.0);
+        for (size_t i = 0; i < h_lp.size(); ++i)
+            for (size_t j = 0; j < comp.size(); ++j)
+                h2_[i + j] += h_lp[i] * comp[j];
+
+        double sum = 0.0;
+        for (double val : h2_) sum += val;
+        if (sum != 0.0) {
+            for (double& val : h2_) val /= sum;
+        }
+
+        L2_ = h2_.size();
+        ring2_.assign(2 * L2_, 0.0);
+        ringPos2_ = 0;
+
+        for (int i = 0; i < 6; ++i) { integ6_[i] = 0; comb6_[i] = 0; }
+    }
+
+    inline void step_comb(std::vector<double>& out) {
+        uint64_t c = integ6_[5];
+        uint64_t d0 = c - comb6_[0]; comb6_[0] = c;
+        uint64_t d1 = d0 - comb6_[1]; comb6_[1] = d0;
+        uint64_t d2 = d1 - comb6_[2]; comb6_[2] = d1;
+        uint64_t d3 = d2 - comb6_[3]; comb6_[3] = d2;
+        uint64_t d4 = d3 - comb6_[4]; comb6_[4] = d3;
+        uint64_t d5 = d4 - comb6_[5]; comb6_[5] = d4;
+        double mid = (double)(int64_t)d5 * cicInvGain_;
+
+        ring2_[ringPos2_] = mid;
+        ring2_[ringPos2_ + L2_] = mid;
+        const bool fire = R2PowerOf2_ ? ((midCount_++ & R2Mask_) == 0)
+                                      : ((midCount_++ % (uint64_t)R2_) == 0);
+        if (fire) {
+            const double* rp = &ring2_[ringPos2_ + 1];
+            const double* hp = h2_.data();
+            double acc = 0.0;
+            #pragma clang loop vectorize(enable)
+            for (size_t k = 0; k < L2_; ++k) acc += hp[k] * rp[k];
+            out.push_back(acc);
+        }
+        ringPos2_ = (ringPos2_ == 0) ? (L2_ - 1) : (ringPos2_ - 1);
+    }
+
+    inline void step_two_stage(bool bit, std::vector<double>& out) {
+        uint64_t x = bit ? 1ull : (uint64_t)-1ll;
+        integ6_[0] += x;
+        integ6_[1] += integ6_[0];
+        integ6_[2] += integ6_[1];
+        integ6_[3] += integ6_[2];
+        integ6_[4] += integ6_[3];
+        integ6_[5] += integ6_[4];
+        if ((inCount_++ & 3) == 0) {
+            step_comb(out);
+        }
+    }
+
+    inline void step_nibble(uint8_t nibble, std::vector<double>& out) {
+        uint64_t x0 = (nibble & 8) ? 1ull : (uint64_t)-1ll;
+        integ6_[0] += x0; integ6_[1] += integ6_[0]; integ6_[2] += integ6_[1];
+        integ6_[3] += integ6_[2]; integ6_[4] += integ6_[3]; integ6_[5] += integ6_[4];
+
+        step_comb(out);
+
+        uint64_t x1 = (nibble & 4) ? 1ull : (uint64_t)-1ll;
+        integ6_[0] += x1; integ6_[1] += integ6_[0]; integ6_[2] += integ6_[1];
+        integ6_[3] += integ6_[2]; integ6_[4] += integ6_[3]; integ6_[5] += integ6_[4];
+
+        uint64_t x2 = (nibble & 2) ? 1ull : (uint64_t)-1ll;
+        integ6_[0] += x2; integ6_[1] += integ6_[0]; integ6_[2] += integ6_[1];
+        integ6_[3] += integ6_[2]; integ6_[4] += integ6_[3]; integ6_[5] += integ6_[4];
+
+        uint64_t x3 = (nibble & 1) ? 1ull : (uint64_t)-1ll;
+        integ6_[0] += x3; integ6_[1] += integ6_[0]; integ6_[2] += integ6_[1];
+        integ6_[3] += integ6_[2]; integ6_[4] += integ6_[3]; integ6_[5] += integ6_[4];
+
+        inCount_ += 4;
+    }
+
     inline void step(double v, std::vector<double>& out) {
+        if (isTwoStage()) {
+            step_two_stage(v > 0.0, out);
+            return;
+        }
         switch (cfg_.kind) {
             case IntegratorKind::Fir: {
                 ring_[ringPos_] = v;
@@ -399,6 +564,21 @@ private:
     std::vector<double> comp_;
     std::vector<double> compRing_;
     size_t compPos_ = 0;
+
+    // 两级抽取（CIC 4x + 短 FIR）
+    uint32_t R1_ = 4;
+    uint32_t R2_ = 1;
+    uint32_t R2Mask_ = 0;
+    bool     R2PowerOf2_ = true;
+    uint32_t fmid_ = 0;
+    double   cicInvGain_ = 1.0;
+    uint64_t integ6_[6] = {0};
+    uint64_t comb6_[6] = {0};
+    std::vector<double> h2_;
+    std::vector<double> ring2_;
+    size_t   ringPos2_ = 0;
+    size_t   L2_ = 0;
+    uint64_t midCount_ = 0;
 };
 
 } // namespace rta::dsp

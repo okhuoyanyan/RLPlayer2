@@ -31,7 +31,7 @@ namespace audio = rta::audio;
 static void usage() {
     printf("用法:\n"
            "  dsdconv --in x.dsf --info\n"
-           "  dsdconv --in x.dsf [--kind fir|iir|cic] [--conv narrow|wide|xfi] [--rate 176400] [--out pcm.wav]\n"
+           "  dsdconv --in x.dsf [--kind fir|iir|cic] [--conv narrow|wide|xfi] [--rate 176400] [--out pcm.wav] [--two-stage|--single-stage]\n"
            "  dsdconv --in x.dsf --direct --out carrier.wav\n");
 }
 
@@ -47,7 +47,7 @@ int main(int argc, char** argv) {
 
     std::string in, out, kindName = "fir", convName = "narrow";
     uint32_t rate = 0;
-    bool info = false, direct = false;
+    bool info = false, direct = false, twoStage = true;
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
         auto next = [&](const char* d) -> std::string { return (i + 1 < argc) ? argv[++i] : d; };
@@ -58,6 +58,9 @@ int main(int argc, char** argv) {
         else if (k == "--rate") rate = (uint32_t)std::atoi(next("0").c_str());
         else if (k == "--info") info = true;
         else if (k == "--direct") direct = true;
+        else if (k == "--single-stage" || k == "--no-2stage" || k == "--no-two-stage") twoStage = false;
+        else if (k == "--two-stage" || k == "--2stage") twoStage = true;
+        else if (k == "--dsd2stage") twoStage = (next("1") != "0");
         else if (k == "-h" || k == "--help") { usage(); return 0; }
     }
     if (in.empty()) { usage(); return 2; }
@@ -126,10 +129,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     const DsdConversion conv = parse_conversion(convName);
-    IntegratorConfig cfg = conversion_integrator(parse_kind(kindName), conv, s.rate, outRate, 120.0);
+    IntegratorConfig cfg = conversion_integrator(parse_kind(kindName), conv, s.rate, outRate, 120.0, twoStage);
     DsdDecimator dec(cfg);
     auto planes = dec.process(s);
-    printf("  抽取器 %s / Conversion %s：%u → %u Hz（1/%u），通带 %.1f kHz，阻带起点 %.1f kHz\n",
+    printf("  抽取器 %s%s / Conversion %s：%u → %u Hz（1/%u），通带 %.1f kHz，阻带起点 %.1f kHz\n",
+           dec.isTwoStage() ? "两级 " : "",
            integrator_name(cfg.kind), conversion_name(conv), s.rate, outRate, dec.decimation(),
            cfg.passbandHz / 1000.0, dec.stopbandStartHz() / 1000.0);
     if (cfg.kind == IntegratorKind::Fir) printf("  FIR 抽头 %zu，通带最差 %.4f dB，镜像处 %.1f dB\n",
