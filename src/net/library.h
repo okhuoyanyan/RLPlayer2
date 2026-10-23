@@ -242,14 +242,20 @@ inline LibTrack lib_probe_one(const std::string& file, const std::string& ffprob
     if (ffprobe.empty()) return t;
 
     std::string out;
+    // 2026-10-23 真机 DEBUG（用户反馈「1.3.x 封面不显示」，实测曲目 C:\...\谭晶 - 游京 (长征版).flac）：
+    // 那首是**单文件 + 内嵌封面**（同目录没有 cover.jpg），而 hasCover 只看同目录文件 → cv:false → UI 不显示封面；
+    // 但 /api/cover 其实能抽出 706,780 字节的图。所以必须在这里同时问「有没有视频流（=内嵌封面）」。
+    // 做法：去掉 -select_streams（一次读出所有流），流里 codec_type=video 即内嵌封面/图片。
+    //   ⚠️ 注意：某些容器把封面报成 video 流，所以只看 codec_type 即可，不看 codec_name。
     const std::wstring cmd =
-        L"\"" + rta::audio::widen(ffprobe) + L"\" -v error -select_streams a:0"
-        L" -show_entries stream=codec_name,sample_rate,channels,bits_per_raw_sample"
+        L"\"" + rta::audio::widen(ffprobe) + L"\" -v error"
+        L" -show_entries stream=codec_type,codec_name,sample_rate,channels,bits_per_raw_sample"
         L" -show_entries format=duration:format_tags=title,artist,album,album_artist,date,genre,track,disc,tracktotal"
         L" -of default=nw=1 \"" + rta::audio::widen(file) + L"\"";
     if (rta::audio::run_hidden(cmd, &out) != 0) return t;
 
     std::string title, artist, album, aartist, date, genre, track, disc;
+    bool curIsAudio = false;   // 当前解析到的流是不是音频（封面流的字段不能覆盖音频参数）
     std::string line;
     for (size_t i = 0; i <= out.size(); ++i) {
         if (i == out.size() || out[i] == '\n') {
@@ -260,6 +266,13 @@ inline LibTrack lib_probe_one(const std::string& file, const std::string& ffprob
                 for (auto& c : k) c = (char)std::tolower((unsigned char)c);
                 if (k.compare(0, 4, "tag:") == 0) k = k.substr(4);
                 auto put = [&](std::string& dst) { dst = v; while (!dst.empty() && (dst.back() == '\r' || dst.back() == ' ')) dst.pop_back(); };
+                // 2026-10-23：内嵌封面判定 —— 出现任意 codec_type=video 的流即视为有封面
+                if (k == "codec_type") {
+                    std::string v2 = v; while (!v2.empty() && (v2.back() == '\r' || v2.back() == ' ')) v2.pop_back();
+                    if (v2 == "video") t.hasCover = 1;
+                    curIsAudio = (v2 == "audio");
+                    line.clear(); continue;
+                }
                 if      (k == "title")        put(title);
                 else if (k == "artist")       put(artist);
                 else if (k == "album")        put(album);
@@ -270,9 +283,11 @@ inline LibTrack lib_probe_one(const std::string& file, const std::string& ffprob
                 else if (k == "track")        put(track);
                 else if (k == "disc")         put(disc);
                 else if (k == "codec_name")   put(t.codec);
-                else if (k == "sample_rate")  t.sampleRate = atoi(v.c_str());
-                else if (k == "channels")     t.channels = atoi(v.c_str());
-                else if (k == "bits_per_raw_sample") t.bits = atoi(v.c_str());
+                // 2026-10-23：去掉 -select_streams 后，封面流（mjpeg）的字段会覆盖音频流
+                // （实测：24-bit FLAC + mjpeg 封面 → t.bits 被写成 8）。所以这里只在「当前流是音频」时采信。
+                else if (k == "sample_rate")  { if (curIsAudio) t.sampleRate = atoi(v.c_str()); }
+                else if (k == "channels")     { if (curIsAudio) t.channels = atoi(v.c_str()); }
+                else if (k == "bits_per_raw_sample") { if (curIsAudio) t.bits = atoi(v.c_str()); }
                 else if (k == "duration")     t.duration = atof(v.c_str());
             }
             line.clear();
@@ -288,7 +303,9 @@ inline LibTrack lib_probe_one(const std::string& file, const std::string& ffprob
     // 只 stat 同目录 cover/folder/front（与 get_cover 的查找顺序一致），不启动 ffmpeg，扫描开销可忽略。
     // 内嵌封面无法靠 stat 判断，这里只保证「有独立封面文件」的专辑能显示；没有独立文件的专辑
     // 仍会在 get_cover 阶段尝试内嵌抽取（UI 用 img onerror 兜底，不会裂图）。
-    t.hasCover = lib_has_cover_file(t.path) ? 1 : 0;
+    // 只置位不清零：上面若已从内嵌封面流判定为 1，不能被同目录探测覆盖回 0。
+    // （两种情况任一成立即视为有封面：内嵌 PICTURE/APIC 流，或同目录 cover/folder/front 文件。）
+    if (!t.hasCover && lib_has_cover_file(t.path)) t.hasCover = 1;
     return t;
 }
 
@@ -391,6 +408,13 @@ inline void Library::load() {
     std::string idx = readFile(indexPath());
     if (idx.size() >= 3 && (unsigned char)idx[0] == 0xEF && (unsigned char)idx[1] == 0xBB && (unsigned char)idx[2] == 0xBF)
         idx = idx.substr(3);
+    // 2026-10-23：索引格式版本校验。旧索引（无 #libIndexV 或版本不符）直接丢弃，
+    // 本次扫描会全量重建 —— 否则升级后「扫描逻辑改了但旧索引被复用」，修复永远不生效。
+    // 代价：升级后首次启动会全量扫一遍（653 首约 10 秒，并行 8 线程），之后照旧增量。
+    {
+        const bool fresh = (idx.find("#libIndexV\t3") != std::string::npos);
+        if (!fresh && !idx.empty()) idx.clear();
+    }
     std::vector<LibTrack> loaded;
     if (!idx.empty()) {
         std::string line;
@@ -467,6 +491,10 @@ inline void Library::saveRootsLocked() {
 inline void Library::saveIndexLocked() {
     std::string s;
     s.reserve(tracks_.size() * 160 + 64);
+    // 索引格式版本：改动「扫描产出字段」时必须 +1，否则旧索引会因为 mtime+size 未变而被整份复用，
+    // 新逻辑永远不生效（2026-10-23 真机踩到：加了内嵌封面判定，用户那首 cv 仍是 false）。
+    // v2 = 2026-10-23 起 hasCover 同时覆盖「内嵌封面流」与「同目录封面文件」。
+    s += "#libIndexV\t3\n";   // v3 = 2026-10-23 起「音频流字段不再被封面流覆盖」(24-bit 不再变 8)
     s += "#path\tmtime\tsize\talbum\talbumArtist\tartist\ttitle\ttrack\tdisc\tyear\tsr\tbits\tch\tdur\thasCover\tgenre\n";
     char buf[256];
     for (auto& t : tracks_) {
