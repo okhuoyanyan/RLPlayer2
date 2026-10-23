@@ -14,6 +14,7 @@
 #include <windows.h>
 #include "audio/audio_loader.h"
 #include "audio/dsd_reader.h"
+#include "net/json.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -97,6 +98,144 @@ inline bool is_dsd_path(const std::string& path) {
     return ext == ".dsf" || ext == ".dff";
 }
 
+// 纯函数：合并 format.tags 与 stream.tags（E-4）。
+// 规则：
+// 1. 键名大小写不敏感（统一转小写；剥除 tag: / TAG: 前缀）；
+// 2. format 优先：同名键若 format 有非空值，以 format 为准；
+// 3. stream 补缺：若 format 缺失该键或值为空/空白，用 stream 的非空值补全；
+// 4. 空值修剪：去首尾空白，两边皆空/空白的键不注入结果。
+inline std::map<std::string, std::string> merge_tags(
+    const std::map<std::string, std::string>& format_tags,
+    const std::map<std::string, std::string>& stream_tags) {
+    std::map<std::string, std::string> res;
+
+    auto norm_key = [](const std::string& raw) {
+        std::string k = trim(raw);
+        if (k.rfind("tag:", 0) == 0 || k.rfind("TAG:", 0) == 0) k = k.substr(4);
+        for (auto& c : k) c = (char)std::tolower((unsigned char)c);
+        return k;
+    };
+
+    // 1. 先把 stream_tags 写入
+    for (const auto& [rk, rv] : stream_tags) {
+        std::string k = norm_key(rk);
+        std::string v = trim(rv);
+        if (!k.empty() && !v.empty()) {
+            res[k] = v;
+        }
+    }
+
+    // 2. format_tags 优先覆盖（若 format 值为非空，则覆盖 stream；若 format 为空，保留 stream 补缺）
+    for (const auto& [rk, rv] : format_tags) {
+        std::string k = norm_key(rk);
+        std::string v = trim(rv);
+        if (k.empty()) continue;
+        if (!v.empty()) {
+            res[k] = v;
+        }
+    }
+
+    return res;
+}
+
+inline void apply_tags_to_media_info(MediaInfo& mi, const std::map<std::string, std::string>& tags) {
+    auto find_val = [&](const std::string& k) -> std::string {
+        auto it = tags.find(k);
+        return (it != tags.end()) ? it->second : std::string();
+    };
+
+    std::string v;
+    if (!(v = find_val("title")).empty()) mi.title = v;
+    if (!(v = find_val("artist")).empty()) mi.artist = v;
+    if (!(v = find_val("album")).empty()) mi.album = v;
+    if (!(v = find_val("date")).empty()) mi.date = v;
+    if (!(v = find_val("genre")).empty()) mi.genre = v;
+    if (!(v = find_val("track")).empty()) mi.track = v;
+    if (!(v = find_val("composer")).empty()) mi.composer = v;
+    if (!(v = find_val("work")).empty()) mi.work = v;
+    if (!(v = find_val("conductor")).empty()) mi.conductor = v;
+    if (!(v = find_val("performer")).empty()) mi.performer = v;
+    else if (!(v = find_val("ensemble")).empty()) mi.performer = v;
+    else if (!(v = find_val("soloist")).empty()) mi.performer = v;
+}
+
+// 纯函数：解析 ffprobe -of json 格式的输出（E-4）
+// 支持从 format.tags 与首个音频流（codec_type=audio）的 tags 提取并合并元数据，并提取流信息与时长。
+inline MediaInfo probe_parse_json(const std::string& raw_text, bool dsdHeaderOk = false, const MediaInfo& initial = MediaInfo()) {
+    MediaInfo mi = initial;
+    // 容错：run_hidden 把 stderr 与 stdout 合并，ffprobe 的警告（如 attached picture 警告）
+    // 会出现在 JSON 之前；剥离首个 '{' 之前和末尾 '}' 之后的日志字符。
+    const size_t start = raw_text.find('{');
+    const size_t end = raw_text.rfind('}');
+    if (start == std::string::npos || end == std::string::npos || end <= start) return mi;
+    const std::string json_text = raw_text.substr(start, end - start + 1);
+    const rta::net::Json root = rta::net::json_parse(json_text);
+    if (root.type != rta::net::Json::Obj) return mi;
+
+    std::map<std::string, std::string> format_tags;
+    std::map<std::string, std::string> stream_tags;
+
+    // 1. format 节点：duration 与 format_tags
+    if (root.has("format") && root["format"].type == rta::net::Json::Obj) {
+        const auto& fmt = root["format"];
+        if (fmt.has("duration") && !dsdHeaderOk) {
+            mi.duration = probe_parse_duration(fmt["duration"].s());
+        }
+        if (fmt.has("tags") && fmt["tags"].type == rta::net::Json::Obj) {
+            for (const auto& [k, v] : fmt["tags"].obj) {
+                format_tags[k] = v.s();
+            }
+        }
+    }
+
+    // 2. streams 节点：找到首个 audio 流
+    if (root.has("streams") && root["streams"].type == rta::net::Json::Arr) {
+        bool foundAudio = false;
+        for (size_t i = 0; i < root["streams"].size(); ++i) {
+            const auto& stm = root["streams"].at(i);
+            if (stm.type != rta::net::Json::Obj) continue;
+            const std::string ctype = stm.has("codec_type") ? stm["codec_type"].s() : "";
+            if (ctype == "audio") {
+                if (!foundAudio) {
+                    foundAudio = true;
+                    if (mi.codec.empty() && stm.has("codec_name")) {
+                        mi.codec = stm["codec_name"].s();
+                    }
+                    if (!dsdHeaderOk) {
+                        if (stm.has("sample_rate")) {
+                            mi.sampleRate = atoi(stm["sample_rate"].s().c_str());
+                        }
+                        if (stm.has("channels")) {
+                            mi.channels = (int)stm["channels"].n();
+                            if (mi.channels <= 0 && stm["channels"].type == rta::net::Json::Str) {
+                                mi.channels = atoi(stm["channels"].s().c_str());
+                            }
+                        }
+                        if (stm.has("bits_per_raw_sample")) {
+                            const std::string b = stm["bits_per_raw_sample"].s();
+                            if (b != "N/A" && !b.empty()) {
+                                mi.bits = atoi(b.c_str());
+                            }
+                        }
+                    }
+                    if (stm.has("tags") && stm["tags"].type == rta::net::Json::Obj) {
+                        for (const auto& [k, v] : stm["tags"].obj) {
+                            stream_tags[k] = v.s();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. 合并标签（format 优先，stream 补缺）
+    const auto merged = merge_tags(format_tags, stream_tags);
+    apply_tags_to_media_info(mi, merged);
+
+    if (mi.bits <= 0) mi.bits = dsdHeaderOk ? 1 : 16;
+    return mi;
+}
+
 inline MediaInfo probe_media(const std::string& file) {
     MediaInfo mi;
 
@@ -126,83 +265,14 @@ inline MediaInfo probe_media(const std::string& file) {
     const std::string ffprobe = find_tool("ffprobe");
     if (ffprobe.empty()) return mi;
 
-    // 格式级标签 + 格式级时长
-    //
-    // 为什么要在同一条命令里要 format=duration（2026-10-22 缺陷修复）：
-    // 原来只问 format_tags，MediaInfo::duration 恒为 0 → enrich.h 的 fileSec 恒 0 →
-    // match.h 的 mf_duration 一直走「任一侧缺失 → 0.5 中性」，文档里写的「时长差 ±3s
-    // 强信号」从 P1 起从未生效。duration 是 format 级字段（不是 TAG: 前缀的标签），
-    // 所以走同一个解析循环、按 k=="duration" 单独认，不跟 tag:xxx 混。
-    {
-        std::string out;
-        const std::wstring cmd = L"\"" + widen(ffprobe) +
-            L"\" -v error -show_entries format=duration:format_tags=title,artist,album,date,genre,composer,work,conductor,performer,ensemble,soloist "
-            L"-of default=nw=1 \"" + widen(file) + L"\"";
-        if (run_hidden(cmd, &out) == 0) {
-            std::string line;
-            for (size_t i = 0; i <= out.size(); ++i) {
-                if (i == out.size() || out[i] == '\n') {
-                    const size_t e = line.find('=');
-                    if (e != std::string::npos) {
-                        std::string k = trim(line.substr(0, e));
-                        const std::string v = trim(line.substr(e + 1));
-                        // ffprobe 保留原始大小写：有的文件是 TAG:Title，有的是 TAG:title。
-                        // 统一转小写再比较，否则会漏掉一半的库（本轮实测踩到）。
-                        for (auto& c : k) c = (char)std::tolower((unsigned char)c);
-                        if (k == "tag:title"  || k == "title")  mi.title = v;
-                        else if (k == "tag:artist" || k == "artist") mi.artist = v;
-                        else if (k == "tag:album"  || k == "album")  mi.album = v;
-                        else if (k == "tag:date"   || k == "date")   mi.date = v;
-                        else if (k == "tag:genre"  || k == "genre")  mi.genre = v;
-                        else if (k == "tag:track"  || k == "track")  mi.track = v;
-                        else if (k == "tag:composer"  || k == "composer")  mi.composer = v;
-                        else if (k == "tag:work"      || k == "work")      mi.work = v;
-                        else if (k == "tag:conductor" || k == "conductor") mi.conductor = v;
-                        else if (k == "tag:performer" || k == "performer" || k == "tag:ensemble" || k == "ensemble" ||
-                                 k == "tag:soloist"   || k == "soloist")   mi.performer = v;
-                        // duration 是 format 级字段，输出行形如 "duration=171.692290"，
-                        // 【没有】TAG: 前缀；它恰好与 tag 键共处一个 k=v 循环，所以在此认。
-                        // 解析失败一律保持 0（未知），绝不把 NaN/inf 传下去。
-                        // E-16：若 DSD header 已成功解析时长，保持 header 真实样本数口径；否则回退 ffprobe。
-                        else if (k == "duration") {
-                            if (!dsdHeaderOk) mi.duration = probe_parse_duration(v);
-                        }
-                    }
-                    line.clear();
-                } else if (line.size() < 4096) line += out[i];
-            }
-        }
-    }
-    // 流级参数
-    {
-        std::string out;
-        const std::wstring cmd = L"\"" + widen(ffprobe) +
-            L"\" -v error -select_streams a:0 -show_entries "
-            L"stream=codec_name,sample_rate,channels,bits_per_raw_sample "
-            L"-of default=nw=1 \"" + widen(file) + L"\"";
-        if (run_hidden(cmd, &out) == 0) {
-            std::string line;
-            for (size_t i = 0; i <= out.size(); ++i) {
-                if (i == out.size() || out[i] == '\n') {
-                    const size_t e = line.find('=');
-                    if (e != std::string::npos) {
-                        const std::string k = trim(line.substr(0, e));
-                        const std::string v = trim(line.substr(e + 1));
-                        if (k == "codec_name" && mi.codec.empty()) mi.codec = v;
-                        else if (k == "sample_rate") {
-                            if (!dsdHeaderOk) mi.sampleRate = atoi(v.c_str());
-                        }
-                        else if (k == "channels") {
-                            if (!dsdHeaderOk) mi.channels = atoi(v.c_str());
-                        }
-                        else if (k == "bits_per_raw_sample") {
-                            if (!dsdHeaderOk) mi.bits = atoi(v.c_str());
-                        }
-                    }
-                    line.clear();
-                } else if (line.size() < 512) line += out[i];
-            }
-        }
+    // E-4：合并 format.tags 与首个音频流（codec_type=audio）的 tags（format 优先，stream 补缺）
+    // 单次 ffprobe 同时输出 format 与 stream 元数据及参数，-of json 统一解析。
+    std::string out;
+    const std::wstring cmd = L"\"" + widen(ffprobe) +
+        L"\" -v error -show_entries format=duration:format_tags:stream=codec_name,codec_type,sample_rate,channels,bits_per_raw_sample:stream_tags "
+        L"-of json \"" + widen(file) + L"\"";
+    if (run_hidden(cmd, &out) == 0 && !out.empty()) {
+        mi = probe_parse_json(out, dsdHeaderOk, mi);
     }
     if (mi.bits <= 0) mi.bits = dsdHeaderOk ? 1 : 16;
     return mi;

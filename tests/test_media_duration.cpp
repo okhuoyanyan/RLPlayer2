@@ -547,6 +547,222 @@ int main() {
         }
     }
 
+    // ================= 8) E-4：音频流标签合并（ogg/opus 元数据缺口） =================
+    std::printf("- 8 音频流标签合并（E-4：merge_tags 纯函数 + ffprobe JSON 夹具）\n");
+    {
+        using rta::audio::merge_tags;
+        using rta::audio::probe_parse_json;
+
+        // 8.1 纯函数 merge_tags 单测：冲突 / 大小写 / 空值 / 独有键
+        std::printf("  8.1 纯函数 merge_tags 单测\n");
+        {
+            // 冲突：format 优先
+            std::map<std::string, std::string> fmt1 = { {"title", "FormatTitle"} };
+            std::map<std::string, std::string> stm1 = { {"title", "StreamTitle"} };
+            auto m1 = merge_tags(fmt1, stm1);
+            ck(m1["title"] == "FormatTitle", "merge_tags 冲突：format 优先覆盖 stream");
+
+            // 大小写不敏感：format Title vs stream title / TAG:title
+            std::map<std::string, std::string> fmt2 = { {"TITLE", "UpperFormat"} };
+            std::map<std::string, std::string> stm2 = { {"title", "lowerStream"}, {"TAG:ARTIST", "StreamArtist"} };
+            auto m2 = merge_tags(fmt2, stm2);
+            ck(m2["title"] == "UpperFormat", "merge_tags 大小写不敏感：TITLE 覆盖 title");
+            ck(m2["artist"] == "StreamArtist", "merge_tags 剥除 TAG: 前缀并归一化键名");
+
+            // 空值补缺：format 为空串或全空白，stream 有非空值
+            std::map<std::string, std::string> fmt3 = { {"title", "FmtTitle"}, {"artist", ""}, {"album", "   "} };
+            std::map<std::string, std::string> stm3 = { {"title", "StmTitle"}, {"artist", "StmArtist"}, {"album", "StmAlbum"} };
+            auto m3 = merge_tags(fmt3, stm3);
+            ck(m3["title"] == "FmtTitle", "format 非空 title 优先");
+            ck(m3["artist"] == "StmArtist", "format 为空串时 stream 补缺 artist");
+            ck(m3["album"] == "StmAlbum", "format 为全空白时 stream 补缺 album");
+
+            // 独有键与全空值
+            std::map<std::string, std::string> fmt4 = { {"comment", "NiceSong"}, {"empty1", ""} };
+            std::map<std::string, std::string> stm4 = { {"year", "2024"}, {"empty1", ""}, {"empty2", "  "} };
+            auto m4 = merge_tags(fmt4, stm4);
+            ck(m4["comment"] == "NiceSong", "format 独有键保留");
+            ck(m4["year"] == "2024", "stream 独有键补全");
+            ck(m4.find("empty1") == m4.end() && m4.find("empty2") == m4.end(), "两边皆空/空白的键不注入结果");
+        }
+
+        // 8.2 内置 ffprobe JSON 夹具断言
+        std::printf("  8.2 内置 ffprobe JSON 夹具（离线断言）\n");
+        {
+            // 夹具 1：真实 OGG Vorbis（标签全在 streams[0].tags）
+            const std::string kOggFixture = R"({
+                "streams": [
+                    {
+                        "index": 0,
+                        "codec_name": "vorbis",
+                        "codec_type": "audio",
+                        "sample_rate": "44100",
+                        "channels": 2,
+                        "bits_per_raw_sample": "N/A",
+                        "tags": {
+                            "TITLE": "Bad Apple!!",
+                            "ARTIST": "nomico",
+                            "ALBUM": "Lovable",
+                            "DATE": "2007",
+                            "GENRE": "Touhou",
+                            "TRACK": "1",
+                            "encoder": "Lavc libvorbis"
+                        }
+                    }
+                ],
+                "format": {
+                    "filename": "bad_apple.ogg",
+                    "duration": "208.520000"
+                }
+            })";
+            MediaInfo miOgg = probe_parse_json(kOggFixture);
+            ck(miOgg.title == "Bad Apple!!", "OGG 夹具：提取 stream tags title");
+            ck(miOgg.artist == "nomico", "OGG 夹具：提取 stream tags artist");
+            ck(miOgg.album == "Lovable", "OGG 夹具：提取 stream tags album");
+            ck(miOgg.date == "2007", "OGG 夹具：提取 stream tags date");
+            ck(miOgg.genre == "Touhou", "OGG 夹具：提取 stream tags genre");
+            ck(miOgg.track == "1", "OGG 夹具：提取 stream tags track");
+            ck(miOgg.codec == "vorbis", "OGG 夹具：codec 为 vorbis");
+            ck(miOgg.sampleRate == 44100 && miOgg.channels == 2, "OGG 夹具：流参数正确");
+            ck(std::fabs(miOgg.duration - 208.52) < 0.001, "OGG 夹具：duration 正确");
+
+            // 夹具 2：真实 Opus（标签在 streams[0].tags）
+            const std::string kOpusFixture = R"({
+                "streams": [
+                    {
+                        "index": 0,
+                        "codec_name": "opus",
+                        "codec_type": "audio",
+                        "sample_rate": "48000",
+                        "channels": 2,
+                        "tags": {
+                            "title": "Scarlet Zone",
+                            "artist": "tatsh",
+                            "album": "Material",
+                            "date": "2010"
+                        }
+                    }
+                ],
+                "format": {
+                    "filename": "scarlet.opus",
+                    "duration": "154.200000"
+                }
+            })";
+            MediaInfo miOpus = probe_parse_json(kOpusFixture);
+            ck(miOpus.title == "Scarlet Zone", "Opus 夹具：提取 stream tags title");
+            ck(miOpus.artist == "tatsh", "Opus 夹具：提取 stream tags artist");
+            ck(miOpus.album == "Material", "Opus 夹具：提取 stream tags album");
+            ck(miOpus.date == "2010", "Opus 夹具：提取 stream tags date");
+            ck(miOpus.codec == "opus", "Opus 夹具：codec 为 opus");
+            ck(miOpus.sampleRate == 48000 && miOpus.channels == 2, "Opus 夹具：流参数正确");
+            ck(std::fabs(miOpus.duration - 154.20) < 0.001, "Opus 夹具：duration 正确");
+
+            // 夹具 3：format 与 stream 标签混合冲突与补缺
+            const std::string kMixedFixture = R"({
+                "streams": [
+                    {
+                        "codec_name": "vorbis",
+                        "codec_type": "audio",
+                        "sample_rate": "44100",
+                        "channels": 2,
+                        "tags": {
+                            "TITLE": "StreamTitle",
+                            "ARTIST": "StreamArtist",
+                            "ALBUM": "StreamAlbum"
+                        }
+                    }
+                ],
+                "format": {
+                    "duration": "100.000000",
+                    "tags": {
+                        "title": "FormatTitle",
+                        "artist": "",
+                        "date": "2023"
+                    }
+                }
+            })";
+            MediaInfo miMixed = probe_parse_json(kMixedFixture);
+            ck(miMixed.title == "FormatTitle", "混合夹具：format title 优先于 stream title");
+            ck(miMixed.artist == "StreamArtist", "混合夹具：format artist 为空由 stream artist 补缺");
+            ck(miMixed.album == "StreamAlbum", "混合夹具：format 缺失 album 由 stream album 补全");
+            ck(miMixed.date == "2023", "混合夹具：format 独有 date 保留");
+
+            // 夹具 4：多流环境（video 封面流 + audio 流），只提取 audio 流的 tags
+            const std::string kMultiStreamFixture = R"({
+                "streams": [
+                    {
+                        "codec_name": "png",
+                        "codec_type": "video",
+                        "tags": {
+                            "title": "Cover Image Title",
+                            "comment": "Video stream comment"
+                        }
+                    },
+                    {
+                        "codec_name": "flac",
+                        "codec_type": "audio",
+                        "sample_rate": "96000",
+                        "channels": 2,
+                        "bits_per_raw_sample": "24",
+                        "tags": {
+                            "title": "Audio Stream Title",
+                            "artist": "Audio Artist"
+                        }
+                    }
+                ],
+                "format": {
+                    "duration": "60.000000"
+                }
+            })";
+            MediaInfo miMulti = probe_parse_json(kMultiStreamFixture);
+            ck(miMulti.title == "Audio Stream Title", "多流夹具：正确认 audio 流标签，忽略 video 流 tags");
+            ck(miMulti.artist == "Audio Artist", "多流夹具：提取 audio 流 artist");
+            ck(miMulti.codec == "flac", "多流夹具：正确提取 audio 流 codec");
+            ck(miMulti.sampleRate == 96000 && miMulti.bits == 24, "多流夹具：提取 audio 流采样率与位深");
+        }
+
+        // 8.3 真文件 opt-in（RTA_NET_TESTS=1）
+        std::printf("  8.3 真文件测试（opt-in：RTA_NET_TESTS=1）\n");
+        {
+            const char* opt = std::getenv("RTA_NET_TESTS");
+            if (opt && std::string(opt) == "1") {
+                const std::string ffmpeg = rta::audio::find_tool("ffmpeg");
+                if (ffmpeg.empty()) {
+                    std::printf("    [SKIP] 未找到 ffmpeg，跳过合成真文件测试\n");
+                } else {
+                    const std::string oggPath = temp_file("rta_synth_stream.ogg");
+                    const std::string opusPath = temp_file("rta_synth_stream.opus");
+
+                    // 用 ffmpeg 合成带 stream 标签的 ogg
+                    const std::wstring cmdOgg = L"\"" + rta::audio::widen(ffmpeg) +
+                        L"\" -v error -y -f lavfi -i \"sine=frequency=1000:duration=1\" "
+                        L"-metadata:s:a:0 title=\"SynthOggTitle\" -metadata:s:a:0 artist=\"SynthOggArtist\" \"" +
+                        rta::audio::widen(oggPath) + L"\"";
+                    if (rta::audio::run_hidden(cmdOgg) == 0 && std::filesystem::exists(u8p(oggPath))) {
+                        const MediaInfo mi = probe_media(oggPath);
+                        ck(mi.title == "SynthOggTitle", "真合成 OGG：probe_media 读取 stream title 成功", "got=" + mi.title);
+                        ck(mi.artist == "SynthOggArtist", "真合成 OGG：probe_media 读取 stream artist 成功", "got=" + mi.artist);
+                        remove_file(oggPath);
+                    }
+
+                    // 用 ffmpeg 合成带 stream 标签的 opus
+                    const std::wstring cmdOpus = L"\"" + rta::audio::widen(ffmpeg) +
+                        L"\" -v error -y -f lavfi -i \"sine=frequency=1000:duration=1\" -c:a libopus "
+                        L"-metadata:s:a:0 title=\"SynthOpusTitle\" -metadata:s:a:0 artist=\"SynthOpusArtist\" \"" +
+                        rta::audio::widen(opusPath) + L"\"";
+                    if (rta::audio::run_hidden(cmdOpus) == 0 && std::filesystem::exists(u8p(opusPath))) {
+                        const MediaInfo mi = probe_media(opusPath);
+                        ck(mi.title == "SynthOpusTitle", "真合成 Opus：probe_media 读取 stream title 成功", "got=" + mi.title);
+                        ck(mi.artist == "SynthOpusArtist", "真合成 Opus：probe_media 读取 stream artist 成功", "got=" + mi.artist);
+                        remove_file(opusPath);
+                    }
+                }
+            } else {
+                std::printf("    [SKIP] RTA_NET_TESTS 未设为 1，跳过 ffmpeg 合成文件测试（设置 $env:RTA_NET_TESTS=1 可启用）\n");
+            }
+        }
+    }
+
     remove_file(wav);
 
     std::printf("\n%s\n", g_fail == 0 ? "全部通过" : (std::to_string(g_fail) + " 项失败").c_str());
