@@ -132,3 +132,15 @@ kernel + 下载 + IFFT + 叠加。
 4. 把 GPU 侧也 GPU 化（cuFFT 或手写 FFT kernel），省掉 CPU 端 FFT 准备。
 5. 全 arch fatbin 的实机覆盖：本机只有 sm_89，其余 18 档只能靠 `cuobjdump` 证明"编进去了"，
    **无法在本机证明"能在对应卡上跑"**（铁律 4：这是如实的能力边界）。
+
+
+## 8. 二进制已交回（2026-10-23，PR #3 / `feat/cuda-dll`）
+
+`rtagpu_cuda.dll` 766,464 B，sha256 `BCE4093D…E6B`，CUDA 12.9.41、19 档 fatbin、4 导出符号齐全。
+已合入 main 并放到 `cuda-artifacts/`（打包时由 `make_dist.ps1` 自动收录进正式包）。
+
+运行期：在无 NVIDIA 卡的 AMD 机器上，`/api/gpu` 新增 `cudaUsable` 字段（LoadLibrary + `rta_gpu_available()` 实测），
+避免"文件在就报告就绪"的假象；播放仍自动回退 AMD/CPU，`/api/ping` 正常、不崩。
+
+因此第 7 节「下一轮」第 3 项（make_dist 收录）已完成；第 5 项（全 arch 实机覆盖）仍是能力边界：
+只有 sm_89 真机验证过，其余 18 档只能靠 cuobjdump 证明"编进去了"。

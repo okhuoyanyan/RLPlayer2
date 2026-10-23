@@ -3258,13 +3258,19 @@ function renderSettingsPage() {
     if (sg) {
       Array.prototype.forEach.call(sg.options, function (o) {
         if (o.value === 'amd') o.text = j.amd ? 'AMD（HIP）· 后端已就位' : 'AMD（HIP）· 本目录无 rtagpu.dll';
-        if (o.value === 'nvidia') o.text = j.cuda ? 'NVIDIA（CUDA）· 后端已就位' : 'NVIDIA（CUDA）· 本目录无 rtagpu_cuda.dll';
+        // 2026-10-23：CUDA DLL 自 1.3.10 起随包内置 → 还分「有文件」和「本机真的能用」两种状态，
+        // 否则 AMD 机器会看到"NVIDIA 后端已就位"的假象（cudaUsable=false）。
+        if (o.value === 'nvidia') {
+          o.text = !j.cuda ? 'NVIDIA（CUDA）· 本目录无 rtagpu_cuda.dll'
+                 : (j.cudaUsable === false ? 'NVIDIA（CUDA）· 已内置，本机未检测到可用 NVIDIA 显卡（会自动回退）'
+                                           : 'NVIDIA（CUDA）· 后端已就位');
+        }
       });
     }
     var m = D('sp_gpumsg');
     if (m) m.textContent = (j.available ? '当前 GPU 可用：' : '当前走 CPU：') + (j.status || '') +
       '；本目录 rtagpu.dll=' + (j.amd ? '有' : '无') +
-      '，rtagpu_cuda.dll=' + (j.cuda ? '有' : '无') +
+      '，rtagpu_cuda.dll=' + (j.cuda ? (j.cudaUsable === false ? '有（本机不可用）' : '有（可用）') : '无') +
       '，AMD HIP 运行库=' + (j.hip ? '有' : '无') +
       '；厂商偏好=' + (j.vendor || 'auto');
   }).catch(function () { });

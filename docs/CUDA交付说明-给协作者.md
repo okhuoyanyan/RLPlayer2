@@ -51,3 +51,27 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\build_gpu_cuda.ps1 -Ou
 - 主线代码：**已支持** CUDA 后端（加载、回退、UI、门禁全就绪）；
 - 发布包：**不含** `rtagpu_cuda.dll`，NVIDIA 用户当前会看到「CUDA 不可用」并自动走 AMD/CPU；
 - 因此 PR #1 的 CUDA 部分**只完成了一半**：软件侧全部到位，缺的是在 NVIDIA 机器上产出并验证那个 DLL。
+
+
+---
+
+## 四、✅ 已交回（2026-10-23，PR #3）
+
+协作者已按上面的流程交回二进制（分支 `feat/cuda-dll` → PR #3，已合入 main）：
+
+| 项 | 值 |
+|---|---|
+| 文件 | `cuda-artifacts/rtagpu_cuda.dll`（**766,464 字节**） |
+| sha256 | `BCE4093D45D0234B914335D558A18F174D904EB9A4C0FCBFC12CE35579739E6B` |
+| 编译器 | CUDA 12.9.41（非 13）；fatbin 覆盖 sm_50…sm_121 共 19 档（缺 compute_110 正常），另带 PTX compute_121 |
+| 导出 | 4 个符号齐全（rta_gpu_available / convolve / resample / resample_invalidate） |
+| 编译机 | RTX 4080 / 驱动 617.42（L0–L4 全绿：卷积相对 -138.0 dB、gpubench 2.4×） |
+
+**Lead 侧复核（AMD 机器，独立做）**：字节数/sha256 与 PR 一致；PE 头正常；`dumpbin /exports` 4 个符号与 PR 所列 RVA 完全一致。
+
+**运行期如实报告已加强**：把 DLL 放进 `build\` 后，在**没有 NVIDIA 卡的 AMD 机器**上
+`GET /api/gpu` 现在是 `{"cuda":true,"cudaUsable":false,...}`（文件在但本机不可用），
+播放自动走 AMD/CPU 且不崩 —— 这正是之前担心的"有文件就报就绪"的假象，已修掉。
+
+**还差最后一步（Lead 做）**：`make_dist.ps1` 自 12a23ac 起会**自动收录** `build\rtagpu_cuda.dll` →
+出 1.3.10 正式包后 CUDA 才算"真的随包自包含"（铁律 6）。

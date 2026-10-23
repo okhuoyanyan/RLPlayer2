@@ -5484,12 +5484,29 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         };
         const bool amd  = dll_here("rtagpu.dll");
         const bool hip  = dll_here("amdhip64_7.dll");
-        const bool cuda = dll_here("rtagpu_cuda.dll");   // 本版本不提供 CUDA 后端，仅用于如实报告
+        const bool cuda = dll_here("rtagpu_cuda.dll");   // 1.3.10 起正式包内置（可选组件）
+        // 2026-10-23（协作者交回 CUDA DLL 后）：光看"文件在不在"会骗人 ——
+        //   把 rtagpu_cuda.dll 放在 AMD 机器上也有文件，但 rta_gpu_available() 返回 0。
+        //   这里真加载一次并调用该导出函数，给 UI 一个"在位但本机不可用"的如实状态。
+        auto dll_usable = [](const char* n) -> bool {
+            const std::string p = path_in_exe_dir(n);
+            const DWORD a = GetFileAttributesA(p.c_str());
+            if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_DIRECTORY)) return false;
+            HMODULE h = ::LoadLibraryA(p.c_str());
+            if (!h) return false;
+            using AvailFn = int (*)();
+            AvailFn fn = (AvailFn)(void*)::GetProcAddress(h, "rta_gpu_available");
+            const bool usable = (fn != nullptr) && (fn() != 0);
+            ::FreeLibrary(h);
+            return usable;
+        };
+        const bool cuda_usable = dll_usable("rtagpu_cuda.dll");
         std::ostringstream j;
         j << "{\"ok\":true"
           << ",\"vendor\":\"" << jesc(rta::dsp::gpu_vendor()) << "\""
           << ",\"amd\":" << (amd ? "true" : "false")
           << ",\"cuda\":" << (cuda ? "true" : "false")
+          << ",\"cudaUsable\":" << (cuda_usable ? "true" : "false")
           << ",\"hip\":" << (hip ? "true" : "false")
           << ",\"available\":" << (rta::dsp::GpuBridge::instance().available() ? "true" : "false")
           << ",\"status\":\"" << jesc(rta::dsp::GpuBridge::instance().status()) << "\"}";
