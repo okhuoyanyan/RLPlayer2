@@ -34,6 +34,9 @@ int main() {
     fs::create_directories(tmp, ec);
     const std::string oldCwd = fs::current_path().string();
     fs::current_path(tmp, ec);
+    // 2026-10-23：库配置/索引默认落 exe 目录（修「升级后曲库变空」）。测试必须显式改到临时目录，
+    // 否则会读写真实 exe 目录里的 rlplayer-library.conf / index.tsv，污染用户库并让断言全错。
+    _putenv_s("RLPLAYER_LIBRARY_DIR", tmp.string().c_str());
 
     // 构造索引：2 张专辑 + 1 个没有专辑标签的目录级条目
     // 字段顺序必须与 library.h 的 load() 一致

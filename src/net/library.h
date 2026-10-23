@@ -171,6 +171,8 @@ private:
     const std::vector<LibAlbum>& albumVecLocked() const;
     static std::string readFile(const std::string& p);
     static void writeFile(const std::string& p, const std::string& s);
+    static std::string exeDirOrEmpty();   // 2026-10-23：库配置/索引固定落 exe 目录（见 confPath 注释）
+    static std::string libDataDir();      // 同样可被 RLPLAYER_LIBRARY_DIR 覆盖（测试/多实例）
     static std::string confPath();
     static std::string indexPath();
 
@@ -208,6 +210,18 @@ inline std::string lib_clean_field(const std::string& s) {
 // Windows 上 fs::path 的窄字符串构造按 ANSI（GBK）解释，UTF-8 路径必须先转宽字符
 inline std::string u8s(const std::u8string& s) { return std::string((const char*)s.data(), s.size()); }
 inline fsx::path p8(const std::string& s) { return fsx::path(rta::audio::widen(s)); }
+
+// 同目录是否存在独立封面文件（与 get_cover 的候选顺序/扩展名保持一致；只 stat）
+inline bool lib_has_cover_file(const std::string& trackPath) {
+    std::error_code ec;
+    fsx::path dir = p8(trackPath).parent_path();
+    static const char* kNames[] = { "cover", "folder", "front", "Cover", "Folder" };
+    static const char* kExts[]  = { ".jpg", ".jpeg", ".png", ".JPG", ".PNG" };
+    for (const char* n : kNames)
+        for (const char* e : kExts)
+            if (fsx::exists(dir / (std::string(n) + e), ec)) return true;
+    return false;
+}
 
 inline bool lib_is_audio(const fsx::path& p) {
     std::string ext = u8s(p.extension().u8string());
@@ -269,14 +283,42 @@ inline LibTrack lib_probe_one(const std::string& file, const std::string& ffprob
     t.discNo  = atoi(disc.c_str());
     t.year    = atoi(date.c_str());
     if (t.bits <= 0) t.bits = (t.codec == "flac" || t.codec == "alac") ? 16 : 16;
+    // 封面存在性（2026-10-23 修：此前 hasCover 恒 0，UI 因此不请求封面 → 「封面全部不显示」）
+    // 只 stat 同目录 cover/folder/front（与 get_cover 的查找顺序一致），不启动 ffmpeg，扫描开销可忽略。
+    // 内嵌封面无法靠 stat 判断，这里只保证「有独立封面文件」的专辑能显示；没有独立文件的专辑
+    // 仍会在 get_cover 阶段尝试内嵌抽取（UI 用 img onerror 兜底，不会裂图）。
+    t.hasCover = lib_has_cover_file(t.path) ? 1 : 0;
     return t;
 }
 
+// 2026-10-23 修复「曲库根丢失 / 索引漂移」：
+//   旧实现返回相对文件名 → 实际落在进程 cwd，而 8899 实例是从 exe 目录启动、自检沙箱是另一个 cwd，
+//   两边看到的是不同的 library.conf / index.tsv（用户升级后曲库变空、封面全无，就是这么来的）。
+//   统一改为 **exe 目录绝对路径**（取不到 exe 目录时退回相对名，保证老行为可用）。
+inline std::string Library::exeDirOrEmpty() {
+    const std::wstring w = rta::audio::exe_dir_w();
+    if (w.empty()) return std::string();
+    std::string u = rta::audio::wide_to_utf8(w);
+    while (!u.empty() && (u.back() == '\\' || u.back() == '/')) u.pop_back();
+    return u;
+}
+// 配置/索引落点：
+//   1) 环境变量 RLPLAYER_LIBRARY_DIR（测试 / 多实例 / 便携部署用；测试必须用它，否则会读到真实库配置）
+//   2) 否则用 exe 目录（与 rlplayer-settings.conf 一致，避免 8899 实例与自检沙箱看到两份不同的库）
+//   3) 再取不到 exe 目录才退回相对名（老行为）
+inline std::string Library::libDataDir() {
+    if (const char* env = std::getenv("RLPLAYER_LIBRARY_DIR")) {
+        if (*env) { std::string s(env); while (!s.empty() && (s.back() == '\\' || s.back() == '/')) s.pop_back(); if (!s.empty()) return s; }
+    }
+    return exeDirOrEmpty();
+}
 inline std::string Library::confPath() {
-    return "rlplayer-library.conf";
+    const std::string d = libDataDir();
+    return d.empty() ? std::string("rlplayer-library.conf") : d + "\\rlplayer-library.conf";
 }
 inline std::string Library::indexPath() {
-    return "rlplayer-index.tsv";
+    const std::string d = libDataDir();
+    return d.empty() ? std::string("rlplayer-index.tsv") : d + "\\rlplayer-index.tsv";
 }
 inline std::string Library::readFile(const std::string& p) {
     std::ifstream f(p, std::ios::binary);

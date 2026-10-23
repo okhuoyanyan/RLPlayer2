@@ -176,28 +176,40 @@ public:
                 if (SUCCEEDED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ac)) && ac) {
                     static const uint32_t cand[] = { 44100, 48000, 88200, 96000, 176400, 192000,
                                                      352800, 384000, 705600, 768000, 1536000 };
-                    WAVEFORMATEXTENSIBLE wfx{};
-                    // ★ 2026-10-23 实测（wasapi_ex_probe 矩阵）：UltraLite-mk5 的独占只接受
-                    // 「32 位容器 + 24 位有效」（wBitsPerSample=32 / wValidBitsPerSample=24 /
-                    // blockAlign=ch*4）。紧凑 24 位（blockAlign=ch*3）会被 IsFormatSupported
-                    // 判成 AUDCLNT_E_UNSUPPORTED_FORMAT —— 这就是"独占全位深都不支持"的真因。
-                    const int cont = (bits <= 16) ? 2 : 4;          // 每样本容器字节
-                    const int valid = bits;                          // 有效位深
-                    wfx.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
-                    wfx.Format.nChannels = (WORD)channels;
-                    wfx.Format.nSamplesPerSec = 48000;
-                    wfx.Format.wBitsPerSample = (WORD)(cont * 8);
-                    wfx.Format.nBlockAlign = (WORD)(channels * cont);
-                    wfx.Format.nAvgBytesPerSec = wfx.Format.nSamplesPerSec * wfx.Format.nBlockAlign;
-                    wfx.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-                    wfx.Samples.wValidBitsPerSample = (WORD)valid;
-                    wfx.dwChannelMask = channel_mask_for(channels);
-                    wfx.SubFormat = (bits == 32) ? KSDATAFORMAT_SUBTYPE_IEEE_FLOAT : KSDATAFORMAT_SUBTYPE_PCM;
-                    for (uint32_t r : cand) {
-                        wfx.Format.nSamplesPerSec = r;
-                        wfx.Format.nAvgBytesPerSec = r * wfx.Format.nBlockAlign;
-                        if (ac->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
-                                                  (WAVEFORMATEX*)&wfx, nullptr) == S_OK) ok.push_back(r);
+                    // ★ 2026-10-23 真机 DEBUG（wasapi_ex_probe 实测 TASCAM Portacapture X8）：
+                    //   紧凑 24(blockAlign=ch*3) → OK；EXT32/32 float → OK；PCM16/EXT16/EXT32int/EXT32容器24 → UNSUPPORTED
+                    // 而 UltraLite-mk5 恰好相反（只认 32 容器 + 24 有效）。**没有一种形态通吃**，
+                    // 所以探测也必须是「格式阶梯」：哪种形态在该设备上被接受就用哪种列采样率。
+                    struct ProbeFmt { int cont; int valid; bool flt; };
+                    std::vector<ProbeFmt> pf;
+                    if (bits <= 16) {
+                        pf.push_back({ 2, 16, false });
+                        pf.push_back({ 4, 32, true });
+                    } else {
+                        pf.push_back({ 3, 24, false });   // 紧凑 24（本机只认这个）
+                        pf.push_back({ 4, 32, true });    // float32
+                        pf.push_back({ 4, 24, false });   // 32 容器 + 24 有效（UltraLite）
+                        pf.push_back({ 4, 32, false });   // 32 int
+                    }
+                    for (const auto& f : pf) {
+                        if (!ok.empty()) break;           // 已有可用形态，不再试后面的
+                        WAVEFORMATEXTENSIBLE wfx{};
+                        wfx.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+                        wfx.Format.nChannels = (WORD)channels;
+                        wfx.Format.nSamplesPerSec = 48000;
+                        wfx.Format.wBitsPerSample = (WORD)(f.flt ? 32 : f.cont * 8);
+                        wfx.Format.nBlockAlign = (WORD)(channels * f.cont);
+                        wfx.Format.nAvgBytesPerSec = 48000 * wfx.Format.nBlockAlign;
+                        wfx.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+                        wfx.Samples.wValidBitsPerSample = (WORD)(f.flt ? 32 : f.valid);
+                        wfx.dwChannelMask = channel_mask_for(channels);
+                        wfx.SubFormat = f.flt ? KSDATAFORMAT_SUBTYPE_IEEE_FLOAT : KSDATAFORMAT_SUBTYPE_PCM;
+                        for (uint32_t r : cand) {
+                            wfx.Format.nSamplesPerSec = r;
+                            wfx.Format.nAvgBytesPerSec = r * wfx.Format.nBlockAlign;
+                            if (ac->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                                      (WAVEFORMATEX*)&wfx, nullptr) == S_OK) ok.push_back(r);
+                        }
                     }
                     ac->Release();
                 }
@@ -347,27 +359,35 @@ public:
             lastErr_ = "Activate(IAudioClient) 失败"; fillFail(hb); return false;
         }
 
-        // 构造 WAVEFORMATEXTENSIBLE
-        // ★ 2026-10-23：容器宽度与有效位深分开。UltraLite-mk5 独占只认「32 位容器 + 24 位有效」
-        //（实测：紧凑 24 → AUDCLNT_E_UNSUPPORTED_FORMAT；32/24 → IsFormatSupported OK 且
-        // Initialize 只返回 BUFFER_SIZE_NOT_ALIGNED，即可按对齐重试成功）。
-        static const GUID SUB_PCM = {0x00000001,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
-        const int contBytes = (bits <= 16) ? 2 : 4;   // 每样本容器字节数
-        std::memset(&wfx_, 0, sizeof(wfx_));
-        wfx_.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
-        wfx_.Format.nChannels       = (WORD)channels;
-        wfx_.Format.nSamplesPerSec  = rate;
-        wfx_.Format.wBitsPerSample  = (WORD)(contBytes * 8);
-        wfx_.Format.nBlockAlign     = (WORD)(channels * contBytes);
-        wfx_.Format.nAvgBytesPerSec = rate * wfx_.Format.nBlockAlign;
-        wfx_.Format.cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-        wfx_.Samples.wValidBitsPerSample = (WORD)bits;   // 有效位深（16 或 24）
-        wfx_.dwChannelMask          = channel_mask_for(channels);
-        wfx_.SubFormat              = SUB_PCM;
+        // ---------------- 独占格式阶梯（2026-10-23 真机 DEBUG 修复）----------------
+        // 现场证据（TASCAM Portacapture X8，build\wasapi_ex_probe.exe 实测，只 Initialize 不出声）：
+        //   PCM16 / EXT16       44.1k,48k → 0x88890008 UNSUPPORTED_FORMAT
+        //   EXT24/24 紧凑(3字节) 44.1k,48k → **S_OK**
+        //   EXT32容器/24有效     44.1k,48k → 0x88890008
+        //   EXT32/32 int         44.1k,48k → 0x88890008
+        //   EXT32/32 float       44.1k,48k → **S_OK**
+        // 也就是说：PR #1 那句「独占只认 32 位容器 + 24 位有效」只对 UltraLite-mk5 成立，
+        // 对本机 TASCAM 恰好相反 —— 它只认**紧凑 24**（或 float32）。写死单一形态必然有一批设备放不出来，
+        // 1.3.x「无法播放」就是这么来的（Initialize 全部配方失败 → 回退共享也被同样格式挡）。
+        // 因此这里改成：格式阶梯 × 配方阶梯，任一组合 Initialize 成功即采用，并如实记录选了哪种。
+        static const GUID SUB_PCM   = {0x00000001,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
+        static const GUID SUB_FLOAT = {0x00000003,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
 
-        // 多配方尝试（2026-10-23）：不同驱动对「独占 + 事件驱动」的参数组合脾气不同，
-        // 单一配方失败就判死会把可用的设备挡在外面（现场：同机别的播放器独占正常）。
-        // 每个配方都记 HRESULT，失败时整串带进 lastErr_，从此不用猜。
+        // 格式候选：{容器字节, 有效位深, 是否 float, 标签}
+        struct Fmt { int contBytes; int valid; bool flt; const char* tag; };
+        Fmt fmts[4];
+        int nFmt = 0;
+        if (bits <= 16) {
+            fmts[nFmt++] = { 2, 16, false, "PCM16/EXT16" };
+            fmts[nFmt++] = { 4, 32, true,  "EXT32/32 float" };
+        } else {
+            // 24-bit 源：紧凑 24 优先（多数消费/半专业驱动只认它），再 float32，再 32/24，最后 32 int
+            fmts[nFmt++] = { 3, 24, false, "EXT24/24 紧凑(3字节)" };
+            fmts[nFmt++] = { 4, 32, true,  "EXT32/32 float" };
+            fmts[nFmt++] = { 4, 24, false, "EXT32容器/24有效" };
+            fmts[nFmt++] = { 4, 32, false, "EXT32/32 int" };
+        }
+
         ev_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         REFERENCE_TIME dur = (REFERENCE_TIME)(bufferMs * 10000.0);
         struct Try { REFERENCE_TIME buf; REFERENCE_TIME per; DWORD flags; const char* why; };
@@ -380,6 +400,21 @@ public:
         };
         std::string trialLog;
         hr = E_FAIL;
+        const char* fmtUsed = "";
+        for (int fi = 0; fi < nFmt; ++fi) {
+          const Fmt& F = fmts[fi];
+          std::memset(&wfx_, 0, sizeof(wfx_));
+          wfx_.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
+          wfx_.Format.nChannels       = (WORD)channels;
+          wfx_.Format.nSamplesPerSec  = rate;
+          wfx_.Format.wBitsPerSample  = (WORD)(F.flt ? 32 : F.contBytes * 8);
+          wfx_.Format.nBlockAlign     = (WORD)(channels * F.contBytes);
+          wfx_.Format.nAvgBytesPerSec = rate * wfx_.Format.nBlockAlign;
+          wfx_.Format.cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+          wfx_.Samples.wValidBitsPerSample = (WORD)(F.flt ? 32 : F.valid);
+          wfx_.dwChannelMask          = channel_mask_for(channels);
+          wfx_.SubFormat              = F.flt ? SUB_FLOAT : SUB_PCM;
+          if (fi > 0) trialLog += std::string("[换格式 ") + F.tag + "] ";
         for (const auto& t : tries) {
             hr = ac_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, t.flags, t.buf, t.per,
                                  (WAVEFORMATEX*)&wfx_, nullptr);
@@ -417,10 +452,24 @@ public:
             }
             if (hr == S_OK) break;
         }
+          if (hr == S_OK) { fmtUsed = F.tag; break; }   // 该格式成功 → 不再试后面的格式
+        }
         if (hr != S_OK) {
-            lastErr_ = std::string("Initialize 失败（全部配方）：") + trialLog;
+            lastErr_ = std::string("Initialize 失败（全部格式×配方）：") + trialLog;
             fillFail(trialLog.c_str());   // HF-01：把请求格式与该位深的实际独占支持列表带出去
             close(); return false;
+        }
+        // 记下真正被驱动接受的格式（进 note / 日志，避免以后再靠猜）
+        {
+            for (int fi = 0; fi < nFmt; ++fi) {
+                if (std::strcmp(fmts[fi].tag, fmtUsed) == 0) {
+                    fmtBytes_ = fmts[fi].contBytes;
+                    fmtFloat_ = fmts[fi].flt;
+                    break;
+                }
+            }
+            fmtNote_ = std::string("独占格式=") + fmtUsed;
+            lastErr_.clear();
         }
 
         // 配方 2：SetEventHandle 在 Initialize 之后
@@ -633,6 +682,8 @@ public:
     }
     uint32_t rate() const { return rate_; }
     int bits() const { return bits_; }
+    // 实际被驱动接受的独占格式说明（"独占格式=EXT24/24 紧凑(3字节)"）；未成功打开时为空。
+    const std::string& fmt_note() const { return fmtNote_; }
     int channels() const { return channels_; }
     bool realigned() const { return realigned_; }
     const std::string& last_error() const { return lastErr_; }
@@ -659,29 +710,55 @@ private:
         detail::pcm_dump("wasapi-ex", src, frames * (size_t)channels_, bits_);   // 取证（默认关闭）
         const size_t n = frames * (size_t)channels_;
         if (gain_ != 1.0) {
-            // 慢路径：只用于用户拖动音量滑块的场合
-            if (bits_ == 16) {
+            // 慢路径：只用于用户拖动音量滑块的场合（必须与快路径用同一容器宽度，否则一拖音量就爆音）
+            if (fmtBytes_ == 2) {
                 auto* p = (int16_t*)dst;
                 for (size_t i = 0; i < n; ++i) p[i] = (int16_t)scaled(src[i]);
+            } else if (fmtBytes_ == 3) {
+                for (size_t i = 0; i < n; ++i) {
+                    const uint32_t v = (uint32_t)scaled(src[i]);
+                    dst[i * 3 + 0] = (BYTE)(v & 0xFF);
+                    dst[i * 3 + 1] = (BYTE)((v >> 8) & 0xFF);
+                    dst[i * 3 + 2] = (BYTE)((v >> 16) & 0xFF);
+                }
+            } else if (fmtFloat_) {
+                auto* p = (float*)dst;
+                const float k = 1.0f / 8388608.0f;
+                for (size_t i = 0; i < n; ++i) p[i] = (float)scaled(src[i]) * k;
             } else {
-                // 24 位也走 32 位容器（wBitsPerSample=32 / valid=24）：把 ±2^23 的值直接放
-                // int32 低位。驱动实测只认这个容器宽度（紧凑 3 字节会被判 UNSUPPORTED_FORMAT）。
                 auto* p = (int32_t*)dst;
                 for (size_t i = 0; i < n; ++i) p[i] = scaled(src[i]);
             }
             return;
         }
-        if (bits_ == 16) {
+        if (fmtBytes_ == 2) {
             auto* p = (int16_t*)dst;
             for (size_t i = 0; i < n; ++i) p[i] = (int16_t)src[i];
+        } else if (fmtBytes_ == 3) {
+            // 紧凑 24：3 字节小端，样本值域 ±2^23（TASCAM 等驱动只认这种）
+            for (size_t i = 0; i < n; ++i) {
+                const uint32_t v = (uint32_t)src[i];
+                dst[i * 3 + 0] = (BYTE)(v & 0xFF);
+                dst[i * 3 + 1] = (BYTE)((v >> 8) & 0xFF);
+                dst[i * 3 + 2] = (BYTE)((v >> 16) & 0xFF);
+            }
+        } else if (fmtFloat_) {
+            auto* p = (float*)dst;
+            const float k = 1.0f / 8388608.0f;   // 24-bit 定标 → float（±1.0）
+            for (size_t i = 0; i < n; ++i) p[i] = (float)src[i] * k;
         } else {
-            // 同上：24 位 = 32 位容器 + 24 位有效，写 int32
+            // 32 容器（有效 24 或 32）：int32
             auto* p = (int32_t*)dst;
             for (size_t i = 0; i < n; ++i) p[i] = src[i];
         }
     }
 
     bool comInit_ = false, running_ = false, realigned_ = false;
+    // 2026-10-23 真机 DEBUG：实际被驱动接受的独占格式（pack 必须按它取样字节数，
+    // 否则选到紧凑 24 却按 4 字节写 → 噪声/爆音）。由 open() 的格式阶梯设置。
+    int  fmtBytes_ = 4;      // 每样本容器字节数（2/3/4）
+    bool fmtFloat_ = false;  // 容器是 float32
+    std::string fmtNote_;    // 例："独占格式=EXT24/24 紧凑(3字节)"
     IAudioClient* ac_ = nullptr;
     IAudioRenderClient* rc_ = nullptr;
     IAudioClock* clock_ = nullptr;

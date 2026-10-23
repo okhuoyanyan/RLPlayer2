@@ -426,6 +426,9 @@ public:
     // HF-01/02：open 失败时的结构化原因（请求格式 / 支持列表 / HRESULT / 端点 id）。
     // 成功时内容无意义 —— 调用方只在 open 返回 false 后读它。
     const OpenFail& fail() const { return fail_; }
+    // 2026-10-23：成功时驱动实际接受的独占格式（"独占格式=EXT24/24 紧凑(3字节)"）。
+    // 以前这个信息只有失败时才带出，成功就丢 —— 用户看到 note 写"32-bit"却不知道驱动到底认了什么。
+    const std::string& fmt_note() const { return ao_.fmt_note(); }
     bool start() override {
         if (!ok_) return false;
         if (!ao_.start()) { err_ = ao_.last_error(); return false; }
@@ -2008,6 +2011,12 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             if (!note.text.empty()) msg += "；note=" + note.text;
             ps.error = msg;
             return false;
+        }
+        // 2026-10-23 真机 DEBUG：打开成功也要如实带出「驱动实际接受的是哪种独占格式」。
+        // 之前这句只有失败时才有，成功时用户只看到"32-bit"，根本不知道内部是紧凑24还是32容器，
+        // 1.3.x「能播/不能播」的原因因此全靠猜（本机是紧凑24、UltraLite 是32容器/24有效）。
+        if (auto* w = dynamic_cast<WasapiSink*>(sink.get())) {
+            if (!w->fmt_note().empty()) appendNote(w->fmt_note());
         }
         if (!sink->start()) {
             RQ.abort.store(true); RQ.cv.notify_all(); prod.join();
