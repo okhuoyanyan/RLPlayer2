@@ -235,22 +235,40 @@ inline std::string rta_ui_page() {
     // 窄屏（1024 级）：中间控制组收窄、右侧只压缩音量条与格式徽标 —— 歌词/信号链/音量必须还在。
     h += "@media (max-width:1180px){.bar{gap:10px;padding:0 12px}.ctr{width:300px}.np{max-width:260px}.np .cv2{width:48px;height:48px}.vol{gap:6px}.vol input[type=range]{width:64px}#fmt{display:none}}";
     h += "#bRep{position:relative}";
-    // 正在播放整页
-    // 2026-10-23 用户反馈「单曲播放页面四周有黑框」：
-    //   宿主（launcher）为了让 WM_NCHITTEST 拿到边缘缩放热区，把 WebView 内缩了 5px（kBandInset），
-    //   那 5px 由宿主按**主题 --bg** 上色。普通页面看不出来，但这个整页是全屏封面/深色底，
-    //   于是四周露出一圈与页面不同的边带 = 用户看到的"黑框"。
-    //   修法：把边带**延伸到页面外侧**（负 inset + padding 补偿），让页面内容盖住那条缝；
-    //   同时保留 5px 给宿主做缩放热区（负 inset 只是视觉外扩，不抢命中测试）。
-    h += "#npPage{position:fixed;top:-6px;left:-6px;right:-6px;bottom:-6px;z-index:70;display:none;background:var(--bg);overflow:hidden;padding:6px;box-sizing:border-box}";
+    // 正在播放整页（2026-10-23 用户 261023-04 #5：仍有黑边框）
+    // 根因更正：1.3.8 的「负 inset + padding 补偿」在几何上不可能盖住那条缝 ——
+    //   #npPage 是 WebView 内的覆盖层，CSS 只能超出**页面视口**，超不出 WebView 控件本身；
+    //   而 launcher 为了让 WM_NCHITTEST 拿到边缘缩放热区，把 WebView 内缩了 kBandInset(5 逻辑像素)，
+    //   这条边带由宿主用主题 --bg 上色，WebView 永远盖不到它。不同 DPI 下边带是 5~8 物理像素，
+    //   页面边缘却仍是模糊封面的彩色像素 ⟹ 视觉上就是一圈黑框。
+    // 现在的修法：让页面**最外圈像素自己等于 --bg**（8px 纯色 + 64px 柔和内阴影形成暗角），
+    //   宿主边带与 --bg 逐字节同色（launcher.cpp 的 kBgDark/kBgLight/kBgBlue 与 ui_page 的 --bg 一致），
+    //   接缝两侧颜色差 ≈ 0，任何 DPI/窗口尺寸都看不出来；缩放热区仍由宿主边带保留，不受影响。
+    h += "#npPage{position:fixed;inset:0;z-index:70;display:none;background:var(--bg);overflow:hidden}";
     h += "#npPage.on{display:block}";
+    // 边带同色暗角：最外 8px 纯 --bg（覆盖宿主 5~8 物理像素的边带），再向内 64px 柔和过渡。
+    // 用「8px 实心边框 + 内阴影」而不是两层 box-shadow：边框像素是纯 --bg（逐像素实测 08090C），
+    // 保证宿主 5px 边带与页面外圈逐字节同色；内阴影从边框内侧开始做暗角渐隐。
+    h += "#npPage .npedge{position:absolute;inset:0;z-index:1;pointer-events:none;border:8px solid var(--bg);box-sizing:border-box;box-shadow:inset 0 0 64px 22px var(--bg)}";
     // 拖拽条：贴顶 34px，透明，不挡下方内容（z-index 高于背景、低于关闭按钮）
     h += "#npPage .npgrip{position:absolute;top:0;left:0;right:0;height:34px;z-index:5;cursor:grab;background:transparent}";
     h += "#npPage .npgrip:active{cursor:grabbing}";
     h += ".npbg{position:absolute;inset:-60px;background-size:cover;background-position:center;filter:blur(64px) saturate(1.15) brightness(.38);transform:scale(1.08)}";
     h += ".npveil{position:absolute;inset:0;background:linear-gradient(180deg,rgba(8,9,12,.35),rgba(8,9,12,.82))}";
-    h += ".npwrap{position:relative;height:100%;display:grid;grid-template-columns:minmax(280px,420px) 1fr;gap:64px;align-items:center;padding:48px 84px 110px;z-index:2}";
-    h += ".npctl{position:absolute;left:0;right:0;bottom:34px;display:flex;flex-direction:column;align-items:center;gap:12px;z-index:3}";
+    // 四行网格（用户 261023-04 #6：任何尺寸下互不重叠）：
+    //   行1 封面+标题区 / 行2 资料区 / 行3 歌词区 / 行4 进度控制区。
+    //   资料区隐藏时不占行（.withdata 由 JS 按是否有可用资料切换）⟹ 不会留空白块。
+    h += ".npgrid{position:relative;z-index:2;height:100%;display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:16px;padding:44px 52px 16px;box-sizing:border-box}";
+    h += ".npgrid.withdata{grid-template-rows:auto minmax(0,.8fr) minmax(0,1fr) auto}";
+    h += ".nphero{display:grid;grid-template-columns:auto minmax(0,1fr);gap:26px;align-items:center;min-height:0}";
+    h += ".npcover{height:clamp(132px,24vh,236px)}";
+    h += ".npcover img{height:100%;width:auto;aspect-ratio:1/1;object-fit:cover;border-radius:14px;box-shadow:0 24px 70px rgba(0,0,0,.6);display:block}";
+    h += ".npinfo{min-width:0}";
+    h += ".npkind{font-size:10px;letter-spacing:1.6px;color:var(--mut2);font-weight:600;margin-bottom:8px}";
+    h += ".nptitleline{display:flex;align-items:center;gap:10px;min-width:0}";
+    h += ".nptit{font-size:clamp(19px,2.6vh,27px);font-weight:700;line-height:1.3;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
+    h += ".npsub{font-size:13px;color:var(--mut);margin-top:8px;line-height:1.6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
+    h += ".npmline{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:10px;min-height:22px}";
     // 时长行的 "/" 必须与下面播放键的中心严格对齐（用户 2026-10-22 UI3）。
     // 为什么「整行居中」不够：播放键两侧按钮数不同（左 2 右 2 但按钮宽度不同），
     // 更早的版本整行 flex 居中时播放键本身并不在容器正中 —— 那正是用户看到
@@ -276,15 +294,44 @@ inline std::string rta_ui_page() {
     h += ".npvol{display:flex;align-items:center;gap:9px;color:var(--mut);width:min(380px,42vw)}";
     h += ".npvol input[type=range]{flex:1;accent-color:var(--acc)}";
     h += ".npvol .vlab{font-size:11px;min-width:44px;text-align:right;font-variant-numeric:tabular-nums;color:var(--txt2)}";
-    h += ".npcover img{width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:14px;box-shadow:0 24px 70px rgba(0,0,0,.6)}";
-    h += ".nptit{font-size:26px;font-weight:700;margin-top:26px;line-height:1.3}";
-    h += ".npsub{font-size:13px;color:var(--mut);margin-top:8px;line-height:1.7}";
-    h += ".nplyric{height:58vh;overflow:auto;scrollbar-width:none;text-align:center}";
-    h += ".nplyric::-webkit-scrollbar{display:none}";
-    h += ".npline{font-size:17px;line-height:2.4;color:var(--mut2);transition:.18s}";
-    h += ".npline.on{color:var(--txt);font-weight:650;transform:scale(1.04)}";
-    h += ".npclose{position:absolute;top:18px;left:18px;width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,.12);display:flex;align-items:center;justify-content:center;color:var(--txt);z-index:3}";
+    // 行3：歌词区（独立滚动，min-height:0 保证网格行真的能压缩 —— 这是 1024x640 下
+    // 歌词压到进度条上的根因：旧实现 .nplyric 固定 58vh 且控件绝对定位，二者必然重叠）
+    h += ".nplyric2{min-height:0;overflow:auto;text-align:center;scrollbar-width:none;padding:2px 0}";
+    // 无歌词/纯音乐时把提示垂直居中，避免大片空白显得像没加载出来
+    h += ".nplyric2.empty{display:flex;flex-direction:column;align-items:center;justify-content:center}";
+    h += ".nplyric2::-webkit-scrollbar{display:none}";
+    h += ".npline{font-size:clamp(13px,1.9vh,17px);line-height:2.05;color:var(--mut2);transition:.18s}";
+    h += ".npline.on{color:var(--txt);font-weight:650;transform:scale(1.03)}";
+    // 行4：进度控制区（正常流式排版，不再绝对定位 ⟹ 与歌词/资料区不会重叠）
+    h += ".npctl2{min-height:0;display:grid;grid-template-rows:auto auto auto;gap:11px;justify-items:center}";
+    // 行2：资料面板（用户 261023-04 #7：按实体分区的 AI 资料；优雅加载态 + 缓存/未核对标注）
+    h += ".npdata{min-height:0;display:none;flex-direction:column;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09);border-radius:12px;padding:10px 14px 8px;box-sizing:border-box;overflow:hidden}";
+    h += ".npdata.on{display:flex}";
+    h += ".npdhead{display:flex;align-items:center;gap:8px;flex:none;flex-wrap:wrap}";
+    h += ".npdtabs{display:flex;align-items:center;gap:4px;flex-wrap:wrap}";
+    h += ".npdtab{padding:4px 12px;border-radius:999px;font-size:11.5px;color:var(--mut);border:1px solid transparent;transition:.13s;background:transparent}";
+    h += ".npdtab:hover{color:var(--txt);background:var(--hov)}";
+    h += ".npdtab.on{background:var(--acc-weak);border-color:var(--acc-weak);color:var(--acc-text);font-weight:600}";
+    h += ".npdstat{margin-left:auto;font-size:10.5px;color:var(--mut2);white-space:nowrap}";
+    h += ".npdbody{flex:1;min-height:0;overflow:auto;margin-top:8px;font-size:12.5px;line-height:1.7;color:var(--txt2);scrollbar-width:thin}";
+    h += ".npdbody::-webkit-scrollbar{width:6px}";
+    h += ".npdbody::-webkit-scrollbar-thumb{background:var(--line);border-radius:3px}";
+    h += ".npdsec{margin-bottom:8px}";
+    h += ".npdsec h4{font-size:12px;color:var(--txt);margin:0 0 4px;font-weight:650}";
+    h += ".npdbody p{margin:0 0 5px}";
+    h += ".npdskel i{display:block;height:9px;border-radius:5px;margin-bottom:8px;background:linear-gradient(90deg,var(--hov),var(--hov2) 45%,var(--hov));background-size:220% 100%;animation:npskel 1.4s ease-in-out infinite}";
+    h += "@keyframes npskel{0%{background-position:0 0}100%{background-position:-220% 0}}";
+    h += "@media (prefers-reduced-motion:reduce){.npdskel i{animation:none}}";
+    h += ".npdhint{font-size:11px;color:var(--mut2);line-height:1.6}";
+    h += ".npdwork{display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.07);font-size:11.5px;color:var(--txt2)}";
+    h += ".npdwork .wy{font-family:ui-monospace,Consolas,monospace;color:var(--mut);width:38px;flex:none}";
+    h += ".npdwork .wt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
+    h += ".npdwork .wp{color:var(--mut2);flex:none;max-width:34%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
+    h += ".npclose{position:absolute;top:16px;left:16px;width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,.12);display:flex;align-items:center;justify-content:center;color:var(--txt);z-index:4}";
     h += ".npclose:hover{background:rgba(255,255,255,.16)}";
+    // 窄/矮窗口（用户 261023-04 #6 的 1024x640）：压缩行高与留白，但行间距不小于 12px
+    h += "@media (max-height:720px){.npgrid{padding:36px 24px 10px;gap:12px}.nphero{gap:16px}.npcover{height:clamp(108px,22vh,164px)}.npkind{margin-bottom:5px}.nptit{font-size:19px}.npsub{font-size:11.5px;margin-top:5px}.npmline{margin-top:6px;min-height:20px}.npctl2{gap:8px}.npdbody{font-size:12px;line-height:1.6}}";
+    h += "@media (max-width:1120px){.npgrid{padding:38px 24px 12px}.nphero{gap:16px}.npcover{height:clamp(108px,20vh,180px)}}";
     // 浅色/浅蓝主题：整页跟随主题，Windows 原生标题栏（已按同一主题上色）才不会
     // 出现"上面一条浅色、下面一整块深色"的割裂感。
     h += "html[data-theme=light] .npbg,html[data-theme=blue] .npbg{filter:blur(64px) saturate(1.05) brightness(1.12)}";
@@ -294,6 +341,8 @@ inline std::string rta_ui_page() {
     h += "html[data-theme=light] .npclose:hover,html[data-theme=blue] .npclose:hover{background:rgba(15,23,42,.15)}";
     h += "html[data-theme=light] .npseek,html[data-theme=blue] .npseek{background:rgba(15,23,42,.16)}";
     h += "html[data-theme=light] .npcover img,html[data-theme=blue] .npcover img{box-shadow:0 24px 70px rgba(15,23,42,.22)}";
+    h += "html[data-theme=light] .npdata,html[data-theme=blue] .npdata{background:rgba(15,23,42,.035);border-color:rgba(15,23,42,.09)}";
+    h += "html[data-theme=light] .npdwork,html[data-theme=blue] .npdwork{border-bottom-color:var(--line)}";
     h += ".k{width:32px;height:32px;border-radius:9px;display:grid;place-items:center;color:var(--mut);transition:.13s}";
     h += ".k:hover{background:var(--hov2);color:var(--txt)}";
     h += ".k.big{width:40px;height:40px;border-radius:50%;background:linear-gradient(180deg,var(--acc),var(--acc2));color:#fff;box-shadow:0 3px 16px var(--acc-weak)}";
@@ -427,7 +476,8 @@ inline std::string rta_ui_page() {
     h += "<div class=side>";
     h += "<div class='nav on' data-v=albums><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><circle cx='12' cy='12' r='9'/><circle cx='12' cy='12' r='2.5'/></svg>专辑</div>";
     h += "<div class=nav data-v=artists><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><circle cx='12' cy='8' r='3.6'/><path d='M4.5 20.5c0-4.1 3.4-6.8 7.5-6.8s7.5 2.7 7.5 6.8'/></svg>艺术家</div>";
-    h += "<div class=nav data-v=works><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M9 18V5l12-2v13'/><circle cx='6' cy='18' r='3'/><circle cx='18' cy='16' r='3'/></svg>古典作品</div>";
+    // 2026-10-23 用户 261023-04 #9：「古典作品」不再占左导航（作品/版本推荐入口移到单曲页「作品」tab）。
+    // 实现仍保留 loadWorksView/openWorkVersions/renderWorkVersions，只是不再有导航入口。
     h += "<div class=nav data-v=tracks><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M14.5 4.5v11.2'/><circle cx='12' cy='17.5' r='2.8'/><path d='M14.5 4.5c2.6.6 4 2 4.5 4.2'/></svg>曲目</div>";
     h += "<div class=nav data-v=files><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M3 7.5a2 2 0 012-2h4l1.8 2H19a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z'/></svg>文件夹</div>";
     h += "<div class=nav data-v=remote><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M7 18a4.5 4.5 0 010-9 6 6 0 0111.6 1.6A3.7 3.7 0 0118 18z'/></svg>流媒体</div>";
@@ -516,30 +566,39 @@ inline std::string rta_ui_page() {
     h += "<svg width=14 height=14 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2 opacity=.55><path d='M3 10v4h4l5 4V6L7 10H3z'/><path d='M16.5 8.5a5 5 0 010 7'/></svg>";
     h += "<input id=vol type=range min=-60 max=0 step=0.5 value=0></div></div>";
     // ---------- 正在播放（点封面/曲名打开） ----------
+    // 布局：CSS Grid 四行（2026-10-23 用户 261023-04 #6）——
+    //   .nphero 封面+标题区 / .npdata 资料区 / #npLyric 歌词区 / .npctl2 进度控制区。
+    //   任何尺寸下四行互不重叠：每行 min-height:0 + 行内滚动，控件不再绝对定位。
     h += "<div id=npPage>";
     h += "<div class=npbg id=npbg></div><div class=npveil></div>";
+    // #5：页面最外圈刷成 --bg（暗角），与宿主 5px 边带同色 ⟹ 接缝不可见（见上方 CSS 注）
+    h += "<div class=npedge></div>";
     // 2026-10-23 用户反馈「单曲播放页面无法拖动窗口（主页面可以）」：
     //   主页面的拖拽热区在顶栏，而 npPage 是 fixed 全屏覆盖层、把顶栏盖住 → 没有可拖区域。
     //   这里加一条覆盖层自己的拖拽条：透明、贴顶、高度 34px，鼠标按下时通过
     //   chrome.webview.postMessage("drag") 交给 launcher 的 WM_NCLBUTTONDOWN/HTCAPTION。
     h += "<div class=npgrip id=npGrip title='拖拽移动窗口'></div>";
     h += "<button class=npclose id=npClose title='返回'><svg width=16 height=16 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2><path d='M15 5l-7 7 7 7'/></svg></button>";
-    h += "<div class=npwrap>";
-    h += "<div><div class=npcover><img id=npCover alt=''></div>";
-    // npMeta：元数据补全信息芯片容器（year/genre/albumArtist/已补全），由 ui_script 的 renderNp 填充。
-    // 只进整页，底栏不加（避免拥挤）；样式只用布局属性，颜色交给 .badge 自身的 CSS 变量。
-    h += "<div style='display:flex;align-items:center;gap:10px;margin-top:20px'>";
-    h += "<div class=nptit id=npTitle style='margin:0'>未播放</div>";
-    h += "<button class=fav-btn id=npFavBtn title='收藏' style='padding:4px;display:none'><svg width=20 height=20 viewBox='0 0 24 24' fill=none stroke='currentColor' stroke-width=2><path d='M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z'/></svg></button>";
-    h += "</div><div class=npsub id=npSub></div>";
-    h += "<div id=npMeta style='display:flex;flex-wrap:wrap;gap:6px;margin-top:8px'></div>";
-    // 整页简介：低调滚动区（不是大按钮/大动画）。高度给到 38vh，让 ROON 式介绍能读到几段；
-    // 内容多时页内滚动，不挤压右侧歌词列。
-    h += "<div id=npSummary style='display:none;margin-top:14px;max-height:38vh;overflow-y:auto;font-size:12px;line-height:1.6;color:var(--txt)'></div></div>";
-    h += "<div class=nplyric id=npLyric><div class=npline>还没有在播放</div></div>";
-    h += "</div>";
-    // 播放控件：整页也要能操作，否则进来就必须退出
-    h += "<div class=npctl>";
+    h += "<div class=npgrid id=npGrid>";
+    // 行1：封面 + 标题区（标题/副题/元数据芯片/EQ 芯片）
+    h += "<div class=nphero>";
+    h += "<div class=npcover><img id=npCover alt=''></div>";
+    h += "<div class=npinfo>";
+    h += "<div class=npkind id=npKind>正在播放</div>";
+    h += "<div class=nptitleline><div class=nptit id=npTitle>未播放</div>";
+    h += "<button class=fav-btn id=npFavBtn title='收藏' style='padding:4px;display:none'><svg width=20 height=20 viewBox='0 0 24 24' fill=none stroke='currentColor' stroke-width=2><path d='M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z'/></svg></button></div>";
+    h += "<div class=npsub id=npSub></div>";
+    // npMeta：元数据补全芯片（year/genre/albumArtist/已补全）+ 当前 EQ/IR 芯片，由 renderNp 填充
+    h += "<div class=npmline id=npMeta></div>";
+    h += "</div></div>";
+    // 行2：资料区（多实体 AI 资料；无可用资料时整行收起，不留空白块）
+    h += "<section class=npdata id=npData><div class=npdhead>";
+    h += "<div class=npdtabs id=npTabs></div><div class=npdstat id=npDataStat></div>";
+    h += "</div><div class=npdbody id=npDataBody></div></section>";
+    // 行3：歌词区
+    h += "<div class=nplyric2 id=npLyric><div class=npline>还没有在播放</div></div>";
+    // 行4：进度控制区（整页也要能操作，否则进来就必须退出）
+    h += "<div class=npctl2>";
     h += "<div class=npseek id=npSeek title='点击跳转'><i id=npBar></i></div>";
     // 时长行：3 列网格，中间列居中放「当前 x:xx / 总时长 y:yy」里的分隔符 "/"。
     // 因为左右两列都是 1fr（等宽），中间列的中心 == 容器中心；下面 .npkeys 的播放键
@@ -568,6 +627,8 @@ inline std::string rta_ui_page() {
     h += "<input id=npVol type=range min=-60 max=0 step=0.5 value=0 title='音量（dB）'>";
     h += "<span class=vlab id=npVolLab>0.0 dB</span></div></div>";
     h += "</div>";
+    // 关：.npctl2 → .npgrid → #npPage
+    h += "</div></div>";
 
     h += "<div id=modal><div class=mcard><div class=mhead><b id=mtitle>信号链</b><span class=sp></span><button class=ibtn id=mclose><svg width=15 height=15 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2><path d='M18 6L6 18M6 6l12 12'/></svg></button></div><div class=mbody id=mbody></div></div></div>";
     h += "<div class=toast id=toast></div></div>";
