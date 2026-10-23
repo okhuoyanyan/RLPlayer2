@@ -53,6 +53,12 @@ struct CastState {
     std::string transportState = "STOPPED";
     int64_t     servedBytes = 0;
     int         requestCount = 0;
+    // 261024-01 #9：UPnP 作为输出后端时，播放器（底栏进度条 / 时长 / 格式 / 暂停）
+    // 的状态统一取这次投放会话 —— 一条会话、一个状态源，避免两套控制互相打架。
+    double      durationSec = 0.0;
+    uint32_t    sampleRate = 0;
+    int         bits = 0;
+    bool        paused = false;
     std::string rateMatch = "unknown"; // match, mismatch, unknown
     std::string warning;
     std::string error;
@@ -130,6 +136,8 @@ public:
         }
 
         stopReq_.store(false);
+        pauseReq_.store(false);
+        seekReq_.store(-1.0);
         state_.running = true;
         state_.device = p.dev;
         state_.sourceFile = p.file;
@@ -140,6 +148,10 @@ public:
         state_.servedBytes = 0;
         state_.requestCount = 0;
         state_.rateMatch = "unknown";
+        state_.durationSec = 0.0;
+        state_.sampleRate = 0;
+        state_.bits = 0;
+        state_.paused = false;
         state_.warning.clear();
         state_.error.clear();
 
@@ -150,6 +162,11 @@ public:
         return {true, ""};
     }
 
+    // 播放器控制映射（后端 = UPnP 时 /api/pause、/api/seek 转交给投放会话）：
+    // HTTP 线程只写原子量，真正的 SOAP 动作在 worker 的轮询循环里做（不在请求线程里阻塞）。
+    void set_paused(bool on) { pauseReq_.store(on); }
+    void seek_seconds(double sec) { seekReq_.store(sec < 0.0 ? -1.0 : sec); }
+
     bool stop() {
         stopReq_.store(true);
         if (workerThread_.joinable()) {
@@ -159,6 +176,7 @@ public:
         state_.running = false;
         state_.phase = "stopped";
         state_.transportState = "STOPPED";
+        state_.paused = false;
         return true;
     }
 
@@ -168,6 +186,7 @@ private:
         bool needCleanupTemp = false;
         std::string wavToServe = p.file;
         AudioSourceFormat srcFormat;
+        double durationSec = 0.0;   // 供播放器进度条用（源文件时长，秒）
 
         auto fail = [this, &tempWavPath, &needCleanupTemp](const std::string& err) {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -298,6 +317,7 @@ private:
                 srcFormat.channels = dsd.channels;
                 srcFormat.isDsd = true;
                 srcFormat.encoding = "DSD over PCM (DoP v1.1)";
+                durationSec = (double)dsd.bits / (double)dsd.rate;
             } catch (const std::exception& e) {
                 fail(std::string("DSD 读取/打包失败: ") + e.what());
                 return;
@@ -311,6 +331,7 @@ private:
                     srcFormat.channels = ab.channels;
                     srcFormat.isDsd = false;
                     srcFormat.encoding = ab.isFloat ? "IEEE Float PCM" : "Linear PCM";
+                    durationSec = ab.rate ? (double)ab.frames() / (double)ab.rate : 0.0;
                     wavToServe = p.file;
                 } catch (const std::exception& e) {
                     fail(std::string("读取源 WAV 失败: ") + e.what());
@@ -366,6 +387,7 @@ private:
                     srcFormat.channels = ab.channels;
                     srcFormat.isDsd = false;
                     srcFormat.encoding = "Linear PCM";
+                    durationSec = ab.rate ? (double)ab.frames() / (double)ab.rate : 0.0;
                 } catch (const std::exception& e) {
                     fail(std::string("解码/写出临时 WAV 失败: ") + e.what());
                     return;
@@ -373,10 +395,19 @@ private:
             }
         }
 
+        {
+            // 供源格式与时长：播放器底栏（/api/status）在 UPnP 后端下直接取这份数据
+            std::lock_guard<std::mutex> lk(mtx_);
+            state_.sampleRate = srcFormat.sampleRate;
+            state_.bits = srcFormat.bits;
+            state_.durationSec = durationSec > 0.0 ? durationSec : 0.0;
+        }
+
         if (stopReq_.load()) {
             std::lock_guard<std::mutex> lk(mtx_);
             state_.running = false;
             state_.phase = "stopped";
+            state_.paused = false;
             if (needCleanupTemp && !tempWavPath.empty()) std::remove(tempWavPath.c_str());
             return;
         }
@@ -431,12 +462,39 @@ private:
 
         UpnpProtocolInfo proto = client.get_protocol_info();
         auto startTime = std::chrono::steady_clock::now();
+        bool pausedApplied = false;
 
         while (!stopReq_.load()) {
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double>(now - startTime).count();
             if (p.seconds > 0.0 && elapsed >= p.seconds) {
                 break;
+            }
+
+            // 261024-01 #9：暂停 / 跳转请求（来自播放器底栏）。HTTP 线程只写原子量，
+            // SOAP 动作在这里做 —— 请求线程不会因为渲染器慢响应而卡住整个 Web UI。
+            const bool wantPause = pauseReq_.load();
+            if (wantPause != pausedApplied) {
+                const UpnpActionResult pr = wantPause ? client.pause() : client.play("1");
+                if (pr.ok) {
+                    pausedApplied = wantPause;
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    state_.paused = wantPause;
+                }
+            }
+            {
+                const double seekSec = seekReq_.exchange(-1.0);
+                if (seekSec >= 0.0) {
+                    char hms[32]{};
+                    const int total = (int)(seekSec + 0.5);
+                    std::snprintf(hms, sizeof(hms), "%02d:%02d:%02d",
+                                  total / 3600, (total % 3600) / 60, total % 60);
+                    const UpnpActionResult sr = client.seek_rel_time(hms);
+                    if (sr.ok) {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        state_.positionSec = seekSec;
+                    }
+                }
             }
 
             UpnpTransportInfo transport = client.get_transport_info();
@@ -491,12 +549,15 @@ private:
             state_.running = false;
             state_.phase = "stopped";
             state_.transportState = "STOPPED";
+            state_.paused = false;
         }
     }
 
     std::mutex              mtx_;
     CastState               state_;
     std::atomic<bool>       stopReq_{false};
+    std::atomic<bool>       pauseReq_{false};
+    std::atomic<double>     seekReq_{-1.0};
     std::thread             workerThread_;
 
     std::mutex              devMutex_;

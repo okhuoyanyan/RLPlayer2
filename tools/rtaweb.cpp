@@ -59,6 +59,7 @@ using rta::render::SinkOpenOpts;
 #include "dsp/direct_sdm.h"
 #include "version.h"
 #include "crash_dump.h"            // 崩溃转储 + OS/CPU/tester 诊断（1.0.5 可观测性）
+#include "naa_discover.h"          // NAA 端点自动发现（261024-01 #11；CLI naa_scan 共用同一份）
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -130,8 +131,9 @@ struct PlayParams {
     // ---- 输出后端 / 多声道 / 每声道微调 ----
     std::string sdmFilter;            // SDM（DSD 输出）用的 1x 滤波器；空 = 沿用 filter
     std::string sdmFilterNx;          // SDM 用的 Nx 滤波器；空 = 沿用 filterNx
-    std::string backend = "wasapi";   // wasapi | asio | naa | null
-    std::string naaHost;              // NAA 端点 host:port
+    std::string backend = "wasapi";   // wasapi | asio | naa | upnp | null
+    std::string naaHost;              // NAA 端点 host:port（自动发现填进来，手动只是兜底）
+    std::string upnpDev;              // UPnP/DLNA 渲染器（设备描述 URL；后端 = upnp 时使用）
     int    outChannels = 0;           // 0 = 跟随源
     double trim[8] = {0,0,0,0,0,0,0,0};   // 每声道增益 dB
 
@@ -383,6 +385,7 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "sdmfiltnx") p.sdmFilterNx = v;
         else if (k == "backend") p.backend = v;
         else if (k == "naahost") p.naaHost = v;
+        else if (k == "upnpdev")  p.upnpDev = v;
         else if (k == "channels") p.outChannels = atoi(v.c_str());
         else if (k == "trim") {
             std::istringstream ts(v);
@@ -873,11 +876,129 @@ private:
 };
 
 static std::unique_ptr<OutSink> make_sink(const PlayParams& p) {
+    // 守门（261024-01 #9）：backend=upnp 由 /api/play 直接转交投放会话，本地播放线程根本不该启动。
+    // 万一将来有别的路径漏过来，也绝不能落到默认的 WasapiSink —— 那会真的接管本机声卡。
+    if (p.backend == "upnp")           return std::make_unique<NullSink>();
     if (p.backend == "null")           return std::make_unique<NullSink>();
     if (p.backend == "naa")            return std::make_unique<NaaSink>();
     if (p.backend == "asio")           return std::make_unique<AsioSink>();   // 见 audio/asio_out.h
     if (p.backend == "wasapi-shared")  return std::make_unique<WasapiSharedSink>();
     return std::make_unique<WasapiSink>();
+}
+
+// ---------------- UPnP / DLNA 输出后端（261024-01 #9）----------------
+// 用户原话：「输出，后端没有 UPNP 选项，那你是怎么测试连接我的数播的？漏了就给我加上」。
+//
+// 设计：不另起一套控制。后端下拉选中 upnp 后，播放启动路径（/api/play、/api/skip）
+// 把曲目交给现有的 CastManager（cast_service.h：本地 HTTP 供源 + AVTransport），
+// 底栏的暂停 / 跳转 / 停止也映射到同一条投放会话 —— 一条会话、一个状态源。
+//
+// 已知限制（写进 docs/WIP-t24-out.md）：投放按「源文件原采样率」供源，
+// 不经过播放器的升频 / 滤波器 / EQ / 音量 / DSP 链（cast_service 只做解码 → WAV/DoP）。
+// 要"把 DSP 处理后的流实时推给渲染器"需要另外的牵引式流式供源，本轮不做。
+static std::atomic<bool> g_upnpPlayer{false};   // true = 当前"播放器"由投放会话承担
+
+static bool upnp_is_dsd_file(const std::string& file) {
+    const std::string ext = rta::audio::lowerExt(file);
+    return ext == ".dsf" || ext == ".dff";
+}
+
+// 把一条曲目交给投放会话。切歌 / 重播都走这里：先停旧会话再起新会话
+//（CastManager 同一时刻只允许一条会话）。失败原因原样返回，界面直接显示，不假装成功。
+static bool upnp_start_track(const PlayParams& p, const std::string& file, std::string& err) {
+    if (p.upnpDev.empty()) {
+        err = "未选择 UPnP / DLNA 渲染器：设置 → 输出 → 目标渲染器（点「重新发现」刷新列表）";
+        return false;
+    }
+    if (file.empty()) { err = "未指定曲目"; return false; }
+    rta::net::CastStartParams cp;
+    cp.dev = p.upnpDev;
+    cp.file = file;
+    cp.port = 8912;
+    // DSD 源必须 DoP 打包（cast_service 对未开 DoP 的 DSD 会明确拒绝 —— 铁律 3：不悄悄转码降质）
+    cp.dop = upnp_is_dsd_file(file) || p.dsd >= 64;
+    rta::net::CastManager::instance().stop();
+    const auto r = rta::net::CastManager::instance().start(cp);
+    if (!r.ok) { err = "UPnP 投放启动失败：" + r.error; return false; }
+    return true;
+}
+
+// 投放模式下写播放器状态：底栏从 /api/status 读这些字段，必须与投放会话口径一致。
+static void upnp_mark_player_state(const std::string& file, bool ok, const std::string& err) {
+    auto& ps = g_ps;
+    std::lock_guard<std::mutex> lk(ps.mtx);
+    if (ok) {
+        ps.current = file;
+        ps.error.clear();
+        ps.bpState = "no";
+        ps.bpWhy = "UPnP 投放：源文件按原采样率供源，渲染器侧是否重采样由对方决定（本机 DSP 未介入）";
+    } else {
+        ps.error = err;
+        ps.bpState = "no";
+        ps.bpWhy = err;
+    }
+}
+
+// ---------------- NAA 端点自动发现（261024-01 #11）----------------
+// 用户原话：「NAA 端点（host:port）这个选项不应该出现啊，应该是自动获取的啊」。
+// 探测本体在 tools/naa_discover.h（与 CLI naa_scan 共用）。这里做异步任务：
+// Web UI 是单线程 accept，同步扫 254 个主机（每个最长 300ms）会把 /api/status 全部堵住，
+// 所以扫描放后台线程，前端轮询同一端点直到 scanning=false。
+struct NaaScanJob {
+    std::mutex  m;
+    bool        running = false;
+    bool        done = false;
+    rta::naa::DiscoverResult result;
+    std::chrono::steady_clock::time_point finishedAt{};
+};
+static NaaScanJob g_naaScan;
+
+static void naa_scan_worker() {
+    rta::naa::DiscoverResult res = rta::naa::discover(300, 48, 1.5);
+    std::lock_guard<std::mutex> lk(g_naaScan.m);
+    g_naaScan.result = std::move(res);
+    g_naaScan.running = false;
+    g_naaScan.done = true;
+    g_naaScan.finishedAt = std::chrono::steady_clock::now();
+}
+
+// GET /api/naa/discover[?refresh=1]
+//  - 首次 / refresh：起后台扫描，立刻返回 {"scanning":true}（前端 700ms 后再来）
+//  - 扫描完成后 30 秒内复用结果（避免设置页每次重开都扫一遍网段）
+static std::string naa_discover_json(bool force) {
+    {
+        std::lock_guard<std::mutex> lk(g_naaScan.m);
+        const double age = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - g_naaScan.finishedAt).count();
+        if (!g_naaScan.running && g_naaScan.done && !force && age < 30.0) {
+            // 掉到下面的序列化
+        } else if (g_naaScan.running) {
+            return "{\"ok\":true,\"scanning\":true}";
+        } else {
+            g_naaScan.running = true;
+            g_naaScan.done = false;
+            std::thread(naa_scan_worker).detach();
+            return "{\"ok\":true,\"scanning\":true,\"started\":true}";
+        }
+    }
+    std::lock_guard<std::mutex> lk(g_naaScan.m);
+    const auto& res = g_naaScan.result;
+    std::ostringstream j;
+    j << "{\"ok\":true,\"scanning\":false,\"probed\":" << res.probed
+      << ",\"multicastHeard\":" << (res.multicastHeard ? "true" : "false")
+      << ",\"note\":\"" << jesc(res.note) << "\",\"subnets\":[";
+    for (size_t i = 0; i < res.subnets.size(); ++i) {
+        if (i) j << ",";
+        j << "\"" << jesc(res.subnets[i]) << "\"";
+    }
+    j << "],\"endpoints\":[";
+    for (size_t i = 0; i < res.endpoints.size(); ++i) {
+        if (i) j << ",";
+        j << "{\"host\":\"" << jesc(res.endpoints[i].host) << "\",\"port\":"
+          << (int)res.endpoints[i].port << "}";
+    }
+    j << "]}";
+    return j.str();
 }
 
 // ---------------- DirectSDM：源 DSD 与目标 DSD 同速率时的逐位直通 ----------------
@@ -3498,6 +3619,11 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         ps.stop.store(true);
         ps.joinIfDone();
         ps.stop.store(false);
+        // 一条会话原则（261024-01 #9）：开始新的本地播放时，停掉可能还在跑的投放会话，
+        // 避免本机声卡与网络渲染器同时出声（两套控制互相打架）。
+        g_upnpPlayer.store(false);
+        if (rta::net::CastManager::instance().get_state().running)
+            rta::net::CastManager::instance().stop();
         {
             std::lock_guard<std::mutex> lk(ps.mtx);
             ps.error.clear();
@@ -3513,6 +3639,23 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         }
         ps.played.store(0);
         ps.total.store(0);
+        // 后端 = UPnP / DLNA：曲目交给投放会话（cast_service），不启动本地播放线程。
+        // 失败如实返回原因（note/前端 toast），绝不假装出声。
+        if (p.backend == "upnp") {
+            std::string err;
+            if (!upnp_start_track(p, p.file, err)) {
+                upnp_mark_player_state(p.file, false, err);
+                ps.playing.store(false);
+                g_upnpPlayer.store(false);
+                return std::string("{\"ok\":false,\"error\":\"") + jesc(err) + "\"}";
+            }
+            g_upnpPlayer.store(true);
+            upnp_mark_player_state(p.file, true, "");
+            ps.outRate = 0;
+            ps.outBits = 0;
+            ps.playing.store(true);
+            return "{\"ok\":true,\"upnp\":true}";
+        }
         ps.playing.store(true);
         const size_t st0 = g_q.index;
         ps.th = std::thread(queue_thread, p, st0);
@@ -4403,6 +4546,10 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         ps.joinIfDone();
         ps.stop.store(false);
         ps.playing.store(false);
+        // 清空队列同时结束投放会话（否则渲染器还会继续播上一首）
+        g_upnpPlayer.store(false);
+        if (rta::net::CastManager::instance().get_state().running)
+            rta::net::CastManager::instance().stop();
         {
             std::lock_guard<std::mutex> lk(g_lastEndMx);
             g_lastEnd.isPosZeroNoErr = false;
@@ -4453,6 +4600,28 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         if (!ok) return "{\"ok\":false,\"error\":\"已到队列边界\"}";
         ps.played.store(0);
         ps.total.store(0);
+        // 后端 = UPnP / DLNA：切歌同样转交投放会话（停旧会话 → 起新会话），
+        // 保证底栏「下一首 / 上一首」在投放模式下行为与本地播放一致。
+        if (p.backend == "upnp") {
+            std::string targetFile;
+            {
+                std::lock_guard<std::mutex> lk(g_q.mtx);
+                targetFile = g_q.items[target];
+            }
+            std::string err;
+            if (!upnp_start_track(p, targetFile, err)) {
+                upnp_mark_player_state(targetFile, false, err);
+                ps.playing.store(false);
+                g_upnpPlayer.store(false);
+                return std::string("{\"ok\":false,\"error\":\"") + jesc(err) + "\"}";
+            }
+            g_upnpPlayer.store(true);
+            upnp_mark_player_state(targetFile, true, "");
+            ps.outRate = 0;
+            ps.outBits = 0;
+            ps.playing.store(true);
+            return "{\"ok\":true,\"index\":" + std::to_string(target) + ",\"upnp\":true}";
+        }
         ps.playing.store(true);
         ps.th = std::thread(queue_thread, p, target);
         return "{\"ok\":true,\"index\":" + std::to_string(target) + "}";
@@ -4499,6 +4668,11 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
               << ",\"rateMatch\":\"" << jesc(st.rateMatch) << "\""
               << ",\"warning\":\"" << jesc(st.warning) << "\""
               << ",\"error\":\"" << jesc(st.error) << "\""
+              // 261024-01 #9：后端 = UPnP 时播放器底栏的进度/格式/暂停也取这份数据
+              << ",\"durationSec\":" << st.durationSec
+              << ",\"sampleRate\":" << st.sampleRate
+              << ",\"bits\":" << st.bits
+              << ",\"paused\":" << (st.paused ? "true" : "false")
               << "}";
             return j.str();
         }
@@ -4532,6 +4706,14 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                 }
             }
             if (p.port == 0) p.port = 8912;
+            // 一条会话原则（261024-01 #9）：手动「开始投放」先停本地播放，
+            // 避免本机声卡与网络渲染器同时出声；播放器状态交给投放会话接管前先清零。
+            ps.stop.store(true);
+            ps.joinIfDone();
+            ps.stop.store(false);
+            ps.playing.store(false);
+            ps.paused.store(false);
+            g_upnpPlayer.store(false);
             auto res = rta::net::CastManager::instance().start(p);
             if (!res.ok) {
                 return "{\"ok\":false,\"error\":\"" + jesc(res.error) + "\"}";
@@ -4540,9 +4722,25 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         }
         if (rq.path.rfind("/api/cast/stop", 0) == 0) {
             rta::net::CastManager::instance().stop();
+            g_upnpPlayer.store(false);
+            ps.playing.store(false);
+            ps.paused.store(false);
             return "{\"ok\":true,\"stopped\":true}";
         }
         return "{\"ok\":false,\"error\":\"未知的投放 API 路径\"}";
+    }
+
+    // ---------------- NAA 端点自动发现（261024-01 #11）----------------
+    // 用户原话：「NAA 端点（host:port）这个选项不应该出现啊，应该是自动获取的啊」。
+    // 异步扫描（tools/naa_discover.h）：先返回 scanning=true，前端 700ms 轮询；
+    // 扫描完成后 30 秒内复用结果（?refresh=1 强制重扫）。
+    if (rq.path.rfind("/api/naa", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        if (rq.path.rfind("/api/naa/discover", 0) == 0) {
+            const bool force = (rq.path.find("refresh=1") != std::string::npos);
+            return naa_discover_json(force);
+        }
+        return "{\"ok\":false,\"error\":\"未知的 NAA API 路径\"}";
     }
 
     if (rq.path.rfind("/api/upnp", 0) == 0) {
@@ -4803,7 +5001,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                                            "device", "bits", "taps", "atten", "transition", "phase",
                                            "modfamily", "oobgain", "ahmbits", "modcut", "moddith", "ir", "irgpu", "ramp", "theme", "eq",
                                            "gpuvendor", "dsdnative", "directsdm", "dsdkind", "dsdconv", "dsd2stage",
-                                           "backend", "naahost", "channels", "trim",
+                                           "backend", "naahost", "upnpdev", "channels", "trim",
                                            "inbackend", "indev", "inoffset", "inbuf", "inmon",
                                            "inseconds", "inout",
                                            "sdmfilt", "sdmfiltnx", "streamdecode",
@@ -5722,6 +5920,16 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         if (q != std::string::npos) frac = atof(rq.path.c_str() + q + 5);
         if (frac < 0.0) frac = 0.0;
         if (frac > 1.0) frac = 1.0;
+        // 后端 = UPnP（261024-01 #9）：进度条跳转转交投放会话（worker 里发 AVTransport Seek REL_TIME）。
+        // 时长未知（渲染器还没报）时不瞎跳，如实返回。
+        if (g_upnpPlayer.load()) {
+            const auto st = rta::net::CastManager::instance().get_state();
+            if (st.running && st.durationSec > 0.0) {
+                rta::net::CastManager::instance().seek_seconds(frac * st.durationSec);
+                return "{\"ok\":true,\"upnp\":true}";
+            }
+            return "{\"ok\":true,\"upnp\":true,\"skipped\":true}";
+        }
         ps.seekReq.store(frac);
         return "{\"ok\":true}";
     }
@@ -5731,6 +5939,11 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         int on = 1;
         const size_t q = rq.path.find("?on=");
         if (q != std::string::npos) on = atoi(rq.path.c_str() + q + 4);
+        // 后端 = UPnP：暂停 / 继续转交投放会话（AVTransport Pause / Play）
+        if (g_upnpPlayer.load()) {
+            rta::net::CastManager::instance().set_paused(on != 0);
+            return std::string("{\"ok\":true,\"paused\":") + ((on != 0) ? "true" : "false") + ",\"upnp\":true}";
+        }
         ps.pauseReq.store(on != 0);
         return std::string("{\"ok\":true,\"paused\":") + ((on != 0) ? "true" : "false") + "}";
     }
@@ -5748,26 +5961,52 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             std::lock_guard<std::mutex> lk(g_lastEndMx);
             g_lastEnd.isPosZeroNoErr = false;
         }
+        // 投放会话若还在跑（含手动「开始投放」的会话），一并停掉 —— 底栏「停止」只能有一个结果。
+        if (g_upnpPlayer.exchange(false) || rta::net::CastManager::instance().get_state().running)
+            rta::net::CastManager::instance().stop();
         return "{\"ok\":true}";
     }
 
     if (rq.path.rfind("/api/status", 0) == 0) {
         ct = "application/json; charset=utf-8";
+        // 261024-01 #9：后端 = UPnP 时，播放器状态唯一来源 = 投放会话（一条会话、一个数字），
+        // 否则底栏与「投放实时状态」会各显示一套进度，互相打架。
+        rta::net::CastState castSt;
+        bool castMode = false;
+        if (g_upnpPlayer.load()) {
+            castSt = rta::net::CastManager::instance().get_state();
+            if (castSt.running) {
+                castMode = true;
+            } else {
+                // 投放自然结束（渲染器播完 / 出错被停）：播放器回到停止态并清掉投放标志
+                g_upnpPlayer.store(false);
+                ps.playing.store(false);
+                ps.paused.store(false);
+            }
+        }
         std::lock_guard<std::mutex> lk(ps.mtx);
         std::ostringstream j;
         const size_t pl2 = ps.played.load(), tt = ps.total.load();
-        const double pos = ps.outRate > 0 ? (double)pl2 / ps.outRate : 0.0;
-        const double dur = ps.outRate > 0 ? (double)tt / ps.outRate : 0.0;
+        const double pos = castMode ? castSt.positionSec
+                                    : (ps.outRate > 0 ? (double)pl2 / ps.outRate : 0.0);
+        const double dur = castMode ? castSt.durationSec
+                                    : (ps.outRate > 0 ? (double)tt / ps.outRate : 0.0);
+        const bool playingStat = castMode ? true : ps.playing.load();
+        const bool pausedStat = castMode ? castSt.paused : ps.paused.load();
+        const std::string curStat = castMode ? castSt.sourceFile : ps.current;
+        const std::string errStat = castMode ? castSt.error : ps.error;
+        const uint32_t rateStat = castMode ? castSt.sampleRate : ps.outRate;
+        const int bitsStat = castMode ? castSt.bits : ps.outBits;
         j << "{\"ok\":true"
-          << ",\"playing\":" << (ps.playing.load() ? "true" : "false")
-          << ",\"current\":\"" << jesc(ps.current) << "\""
-          << ",\"error\":\"" << jesc(ps.error) << "\""
+          << ",\"playing\":" << (playingStat ? "true" : "false")
+          << ",\"current\":\"" << jesc(curStat) << "\""
+          << ",\"error\":\"" << jesc(errStat) << "\""
           << ",\"info\":\"" << jesc(ps.info) << "\""
-          << ",\"paused\":" << (ps.paused.load() ? "true" : "false")
+          << ",\"paused\":" << (pausedStat ? "true" : "false")
           << ",\"pos\":" << pos
           << ",\"dur\":" << dur
-          << ",\"outRate\":" << ps.outRate
-          << ",\"outBits\":" << ps.outBits
+          << ",\"outRate\":" << rateStat
+          << ",\"outBits\":" << bitsStat
           << ",\"gpu\":" << (ps.gpu ? "true" : "false")
           << ",\"volDb\":" << ps.volDb.load()
           << ",\"startDb\":" << ps.startDb.load()
