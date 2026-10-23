@@ -179,6 +179,10 @@ struct PlayerState {
     std::string error;
     std::string info;
     std::string signal;       // 本次播放的信号链快照（JSON），供界面画"每一环"
+    // 2026-10-23（用户 261023-02 #1）：本次播放的 bit-perfect 结论（direct/yes/no）+ 原因。
+    // 在信号链 JSON 生成处一并写入，/api/status 直接带出，供底栏常驻徽标使用。
+    std::string bpState;
+    std::string bpWhy;
     double outRate = 0;
     int    outBits = 0;
     bool   gpu = false;        // 本次播放是否由 GPU 升频
@@ -1811,6 +1815,11 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             << ",\"device\":\"" << jesc(dev) << "\""
             << ",\"deviceId\":\"" << jesc(devId) << "\""
             << ",\"bitsFallback\":\"" << jesc(bitNote) << "\""
+                // 2026-10-23（用户 261023-02 #1）：信号链要在显眼处给出**权威的 bit-perfect 结论**，
+                // 而不是让用户自己从 resample/volume/shaper/eq 等一堆字段里推。
+                // 判定口径（严格）：①不重采样（outRate == in.rate）②音量增益为 0 dB ③无抖动/整形器
+                // ④无 EQ / IR 卷积 ⑤非 DoP(DSD 载波必然重采样) ⑥位深未降(实际输出 ≥ 源位深)。
+                // 注意：DirectSDM 一比特直通是另一条更严格的路，单独标 bitPerfect=direct。
                 << ",\"resample\":" << (outRate != in.rate ? "true" : "false")
                 << ",\"twoStage\":" << ((cfg.twoStage && outRate >= in.rate * 8) ? "true" : "false")
                 << ",\"taps\":" << cfg.taps
@@ -1847,6 +1856,34 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 << ",\"eq\":" << (eqLoaded ? "true" : "false")
                 << ",\"directSdm\":false"
                 << ",\"directNote\":\"" << jesc(directNote) << "\""
+                // ---- bit-perfect 权威结论（用户 261023-02 #1）----
+                // 三态：direct（DirectSDM 1-bit 直通，最严格）/ yes / no（附原因）
+                // 口径：①不重采样 ②音量 0 dB ③无抖动/整形 ④无衰减 ⑤无 EQ/IR ⑥非 DoP ⑦位深未降
+                << ",\"bitPerfect\":\"" << ([&] {
+                       if (p.directSdm && directNote.empty()) return std::string("direct");
+                       if (outRate != in.rate) return std::string("no");
+                       if (cfg.volumeEnabled && std::fabs(cfg.volumeDb) > 1e-9) return std::string("no");
+                       if (cfg.shaper != rta::dsp::Shaper::None) return std::string("no");
+                       if (cfg.attenDb > 1e-9) return std::string("no");
+                       if (eqLoaded || convLoaded || dop) return std::string("no");
+                       if (in.bits > 0 && outBits > 0 && outBits < in.bits) return std::string("no");
+                       return std::string("yes");
+                   }()) << "\""
+                << ",\"bitPerfectWhy\":\"" << jesc([&] {
+                       if (p.directSdm && directNote.empty()) return std::string("DirectSDM：1-bit 直通，跳过 PCM 与调制");
+                       std::vector<std::string> why;
+                       if (outRate != in.rate) why.push_back("重采样 " + std::to_string(in.rate) + "→" + std::to_string(outRate) + " Hz");
+                       if (cfg.volumeEnabled && std::fabs(cfg.volumeDb) > 1e-9) why.push_back("音量 " + std::to_string((int)std::lround(cfg.volumeDb)) + " dB");
+                       if (cfg.shaper != rta::dsp::Shaper::None) why.push_back("抖动/整形");
+                       if (cfg.attenDb > 1e-9) why.push_back("衰减");
+                       if (eqLoaded) why.push_back("EQ");
+                       if (convLoaded) why.push_back("IR 卷积");
+                       if (dop) why.push_back("DoP 载波");
+                       if (in.bits > 0 && outBits > 0 && outBits < in.bits) why.push_back("位深降低");
+                       if (why.empty()) return std::string("源→解码→输出全程逐位一致");
+                       std::string s; for (size_t i = 0; i < why.size(); ++i) { if (i) s += "、"; s += why[i]; }
+                       return s;
+                   }()) << "\""
                 << ",\"decodeMs\":" << note.totalMs
                 << ",\"ffmpegMs\":" << note.ffmpegMs
                 << ",\"wavReadMs\":" << note.wavReadMs
@@ -1854,6 +1891,26 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 << "}";
             recent_add(file, mi.title.empty() ? stem_or_self(file) : mi.title,
                        mi.artist, mi.album);
+            // 把结论写进 ps 供 /api/status 带出（用同一个判定，避免两处口径漂移）
+            {
+                std::string bps = "no", bpw = "见信号链";
+                if (p.directSdm && directNote.empty()) { bps = "direct"; bpw = "DirectSDM：1-bit 直通，跳过 PCM 与调制"; }
+                else {
+                    std::vector<std::string> why;
+                    if (outRate != in.rate) why.push_back("重采样 " + std::to_string(in.rate) + "→" + std::to_string(outRate) + " Hz");
+                    if (cfg.volumeEnabled && std::fabs(cfg.volumeDb) > 1e-9) why.push_back("音量 " + std::to_string((int)std::lround(cfg.volumeDb)) + " dB");
+                    if (cfg.shaper != rta::dsp::Shaper::None) why.push_back("抖动/整形");
+                    if (cfg.attenDb > 1e-9) why.push_back("衰减");
+                    if (eqLoaded) why.push_back("EQ");
+                    if (convLoaded) why.push_back("IR 卷积");
+                    if (dop) why.push_back("DoP 载波");
+                    if (in.bits > 0 && outBits > 0 && outBits < in.bits) why.push_back("位深降低");
+                    if (why.empty()) { bps = "yes"; bpw = "源→解码→输出全程逐位一致"; }
+                    else { std::string s; for (size_t i = 0; i < why.size(); ++i) { if (i) s += "、"; s += why[i]; } bpw = s; }
+                }
+                std::lock_guard<std::mutex> lk(ps.mtx);
+                ps.bpState = bps; ps.bpWhy = bpw;
+            }
             dlog("stage recent-ok");
             play_log(std::string("PLAY v") + RLPLAYER_VERSION + " " + sig.str());
             dlog("stage playlog-ok");
@@ -5227,6 +5284,10 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
           << ",\"dspBlockMs\":" << (ps.dspChunks.load() > 0 ? (double)ps.dspTotalUs.load() / (ps.dspChunks.load() * 1000.0) : 0.0)
           << ",\"dspTotalMs\":" << ((double)ps.dspTotalUs.load() / 1000.0)
           << ",\"scanMs\":" << Library::instance().lastScanMs()
+          // 2026-10-23（用户 261023-02 #1）：status 也带上 bit-perfect 结论，
+          // 让底栏徽标不用额外请求 /api/signal 就能显示（轮询已经是 400ms 一次）。
+          << ",\"bitPerfect\":\"" << jesc(ps.bpState) << "\""
+          << ",\"bitPerfectWhy\":\"" << jesc(ps.bpWhy) << "\""
           << "}";
         return j.str();
     }

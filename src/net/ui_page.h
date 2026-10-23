@@ -210,8 +210,17 @@ inline std::string rta_ui_page() {
     h += ".ctr{display:flex;flex-direction:column;align-items:center;gap:7px}.keys{display:flex;align-items:center;gap:6px}";
     h += "#bRep{position:relative}";
     // 正在播放整页
-    h += "#npPage{position:fixed;inset:0;z-index:70;display:none;background:var(--bg);overflow:hidden}";
+    // 2026-10-23 用户反馈「单曲播放页面四周有黑框」：
+    //   宿主（launcher）为了让 WM_NCHITTEST 拿到边缘缩放热区，把 WebView 内缩了 5px（kBandInset），
+    //   那 5px 由宿主按**主题 --bg** 上色。普通页面看不出来，但这个整页是全屏封面/深色底，
+    //   于是四周露出一圈与页面不同的边带 = 用户看到的"黑框"。
+    //   修法：把边带**延伸到页面外侧**（负 inset + padding 补偿），让页面内容盖住那条缝；
+    //   同时保留 5px 给宿主做缩放热区（负 inset 只是视觉外扩，不抢命中测试）。
+    h += "#npPage{position:fixed;top:-6px;left:-6px;right:-6px;bottom:-6px;z-index:70;display:none;background:var(--bg);overflow:hidden;padding:6px;box-sizing:border-box}";
     h += "#npPage.on{display:block}";
+    // 拖拽条：贴顶 34px，透明，不挡下方内容（z-index 高于背景、低于关闭按钮）
+    h += "#npPage .npgrip{position:absolute;top:0;left:0;right:0;height:34px;z-index:5;cursor:grab;background:transparent}";
+    h += "#npPage .npgrip:active{cursor:grabbing}";
     h += ".npbg{position:absolute;inset:-60px;background-size:cover;background-position:center;filter:blur(64px) saturate(1.15) brightness(.38);transform:scale(1.08)}";
     h += ".npveil{position:absolute;inset:0;background:linear-gradient(180deg,rgba(8,9,12,.35),rgba(8,9,12,.82))}";
     h += ".npwrap{position:relative;height:100%;display:grid;grid-template-columns:minmax(280px,420px) 1fr;gap:64px;align-items:center;padding:48px 84px 110px;z-index:2}";
@@ -428,6 +437,9 @@ inline std::string rta_ui_page() {
     h += "<div class=bar><div class='np' id=npOpen title='打开正在播放'>";
     h += "<div class=cv2 id=cv></div><div class=tx><div class=t1 id=npt>未播放</div><div class=t2 id=npart></div>";
     h += "<div class=t2 id=nps>选择一个专辑开始</div></div></div>";
+    // 2026-10-23（用户 261023-02 #1）：底栏常驻 bit-perfect 徽标。
+    // 不点开信号链也能一眼看到「本次是否逐位」；颜色由 ui_script 按 direct/yes/no 三态设置。
+    h += "<div id=bpBadge style=\"font-size:10.5px;font-weight:700;letter-spacing:.4px;margin-left:12px;white-space:nowrap\" title=\"\"></div>";
     h += "<div class=ctr><div class=keys>";
     // 循环方式（关 / 列表 / 单曲）：放在播放键左边，凑齐五个键
     h += "<button class=k id=bRep title='循环方式'><svg width=17 height=17 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2>";
@@ -446,6 +458,11 @@ inline std::string rta_ui_page() {
     // ---------- 正在播放（点封面/曲名打开） ----------
     h += "<div id=npPage>";
     h += "<div class=npbg id=npbg></div><div class=npveil></div>";
+    // 2026-10-23 用户反馈「单曲播放页面无法拖动窗口（主页面可以）」：
+    //   主页面的拖拽热区在顶栏，而 npPage 是 fixed 全屏覆盖层、把顶栏盖住 → 没有可拖区域。
+    //   这里加一条覆盖层自己的拖拽条：透明、贴顶、高度 34px，鼠标按下时通过
+    //   chrome.webview.postMessage("drag") 交给 launcher 的 WM_NCLBUTTONDOWN/HTCAPTION。
+    h += "<div class=npgrip id=npGrip title='拖拽移动窗口'></div>";
     h += "<button class=npclose id=npClose title='返回'><svg width=16 height=16 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2><path d='M15 5l-7 7 7 7'/></svg></button>";
     h += "<div class=npwrap>";
     h += "<div><div class=npcover><img id=npCover alt=''></div>";

@@ -169,6 +169,18 @@ Array.prototype.forEach.call(document.querySelectorAll('.sw'), function (e) {
       wcmd('max');
     });
   }
+  // 2026-10-23 用户反馈「单曲播放页面无法拖动窗口」：npPage 是全屏覆盖层，把 topbar 的拖拽热区盖住了。
+  // 这里给覆盖层自己的拖拽条（#npGrip）绑同一套行为：左键按下 → launcher 走 HTCAPTION 拖窗；双击 → 最大化切换。
+  if (D('npGrip')) {
+    D('npGrip').addEventListener('mousedown', function (e) {
+      if (e.button !== 0) return;
+      wcmd('drag');
+    });
+    D('npGrip').addEventListener('dblclick', function (e) {
+      if (e.button !== 0) return;
+      wcmd('max');
+    });
+  }
   if (D('wMin')) D('wMin').onclick = function () { wcmd('min'); };
   if (D('wMax')) D('wMax').onclick = function () { wcmd('max'); };
   if (D('wClose')) D('wClose').onclick = function () { wcmd('close'); };
@@ -1005,6 +1017,8 @@ function loadMeta(f) {
 function tick() {
   api('/api/status').then(function (j) {
     S.playing = !!j.playing; S.paused = !!j.paused; S.dur = j.dur; S.pos = j.pos;
+    // 2026-10-23 #1：底栏 bit-perfect 徽标的数据源（后端权威判定，见 /api/status 的 bitPerfect 字段）
+    S.bpState = j.bitPerfect || ""; S.bpWhy = j.bitPerfectWhy || "";
     // 正在播放整页：进度条 / 时间 / 播放图标
     if (D('npPage') && D('npPage').classList.contains('on')) {
       if (D('npBar') && S.dur > 0) D('npBar').style.width = Math.min(100, S.pos / S.dur * 100) + '%';
@@ -1051,6 +1065,13 @@ function tick() {
       D('fmt').textContent = '--';
       D('gpub').style.display = 'none';
       if (S.lastCur) { S.lastCur = ''; D('npt').textContent = '未播放'; D('npart').textContent = ''; D('nps').textContent = '选择一个专辑开始'; D('cv').style.backgroundImage = ''; S.npMetaHtml = ''; if (D('npMeta')) D('npMeta').innerHTML = ''; }
+    }
+    // 2026-10-23 #1：底栏常驻一个「b-p」徽标，不打开信号链也能知道当前是否 bit-perfect。
+    if (D('bpBadge')) {
+      var bpv = S.bpState || '';
+      D('bpBadge').textContent = bpv === 'direct' ? 'BIT-PERFECT·1bit' : (bpv === 'yes' ? 'BIT-PERFECT' : (bpv === 'no' ? '非 bit-perfect' : ''));
+      D('bpBadge').style.color = bpv === 'direct' ? '#a78bfa' : (bpv === 'yes' ? '#34d399' : (bpv === 'no' ? '#fbbf24' : ''));
+      D('bpBadge').title = S.bpWhy || '';
     }
     if (j.error) D('nps').textContent = j.error;
   }).catch(function () { });
@@ -1691,9 +1712,20 @@ function parseLrc(s) {
   }
   return out;
 }
-function loadLyrics(file) {
+// 2026-10-23 用户反馈「歌词要等约 10 秒才出现」：
+// 根因是时序 —— 播放开始时后端才在后台线程触发元数据/歌词补全（meta_on_play），
+// 而这里的 loadLyrics 只请求**一次**：补全还没写回 metabase 时拿到空结果，之后永不重试，
+// 于是表现为「等很久才出现」或「必须切走再切回才出现」。
+// 处理：歌词为空时做**有限次退避重试**（1s/2s/3s/5s），并在切到歌词页时也触发一次。
+// 重试仅在前端，不增加后端负担；一旦拿到内容就停止。
+var LYRETRY = { file: "", n: 0, timer: 0 };
+function loadLyrics(file, isRetry) {
   if (!file) { D('lyricbox').innerHTML = '<div class="ly none">还没有播放曲目</div>'; return; }
   if (/^https?:/.test(file)) { D('lyricbox').innerHTML = '<div class="ly none">网络曲目暂无歌词</div>'; return; }
+  if (!isRetry) {
+    LYRETRY.file = file; LYRETRY.n = 0;
+    if (LYRETRY.timer) { clearTimeout(LYRETRY.timer); LYRETRY.timer = 0; }
+  }
   api('/api/lyrics?file=' + encodeURIComponent(file)).then(function (j) {
     LY.lines = j.ok ? parseLrc(j.lrc) : [];
     LY.at = -1;
@@ -1702,6 +1734,18 @@ function loadLyrics(file) {
           return '<div class="ly" data-i="' + i + '">' + esc(l.s) + '</div>';
         }).join('')
       : '<div class="ly none">没有歌词<br><span style="font-size:11px">同名 .lrc 文件、内嵌歌词，或播放时自动在线补全（可在设置-元数据补全关闭）</span></div>';
+    // 空结果 → 退避重试（后端可能正在后台补全；最多 4 次：1s/2s/3s/5s）
+    if (!LY.lines.length && LYRETRY.file === file && LYRETRY.n < 4) {
+      var waits = [1000, 2000, 3000, 5000];
+      var w = waits[LYRETRY.n] || 5000;
+      LYRETRY.n++;
+      if (LYRETRY.timer) clearTimeout(LYRETRY.timer);
+      LYRETRY.timer = setTimeout(function () {
+        if (LYRETRY.file === file && S.lastCur === file) loadLyrics(file, true);
+      }, w);
+      D("lyricbox").innerHTML = '<div class="ly none">歌词加载中…<br><span style="font-size:11px">正在等后台补全（首次播放新曲目时可能要几秒）</span></div>';
+      return;
+    }
     Array.prototype.forEach.call(D('lyricbox').children, function (e) {
       if (e.dataset.i === undefined) return;
       e.onclick = function () {
@@ -1750,6 +1794,19 @@ function showChain() {
     if (!j.ok) { D('mbody').innerHTML = '<div class=empty>还没有开始播放</div>'; return; }
     var p = j.path;
     var nodes = [];
+    // 2026-10-23（用户 261023-02 #1）：把「本次是否 bit-perfect」放在**最显眼的位置**（第一条），
+    // 并且结论来自后端的权威判定（/api/signal 的 bitPerfect 字段），不再让用户自己从一堆字段里推。
+    // 三态配色：direct=紫（DirectSDM 1-bit 直通）/ yes=绿 / no=黄（附具体原因）。
+    (function () {
+      var bp = p.bitPerfect || '';
+      var why = p.bitPerfectWhy || '';
+      var label, color, icon;
+      if (bp === 'direct') { label = 'BIT-PERFECT · 1-bit 直通'; color = '#a78bfa'; icon = '\u25c6'; }
+      else if (bp === 'yes') { label = 'BIT-PERFECT'; color = '#34d399'; icon = '\u2713'; }
+      else if (bp === 'no') { label = '非 bit-perfect'; color = '#fbbf24'; icon = '!'; }
+      else { label = 'BIT-PERFECT 状态未知'; color = '#94a3b8'; icon = '?'; }
+      nodes.push({ k: icon + ' ' + label, v: why || '（本次未记录）', _bp: bp, _color: color });
+    }());
     nodes.push({ k: '源文件', v: nam(p.src) + (p.codec ? '  \u00b7  ' + p.codec.toUpperCase() : '') });
     nodes.push({ k: '解码', v: (p.note || '原生无损解码') + '  \u00b7  ' + p.inRate + ' Hz / ' + p.inBits + ' bit / ' + p.inCh + ' ch' });
     if (p.resample) nodes.push({ k: '采样率转换', v: (p.filter || 'Kaiser sinc') + '  \u00b7  ' + p.phase + '  \u00b7  ' + p.taps + ' 抽头' + (p.twoStage ? '  \u00b7  两段式' : '') + '  \u2192  ' + p.outRate + ' Hz', gpu: true });
@@ -1798,7 +1855,13 @@ function showChain() {
     });
     var h = '<div class=chain>';
     nodes.forEach(function (n, i) {
-      h += '<div class="cnode' + (n.gpu ? ' gpu' : '') + '"><div class=dot></div><div><div class=k>' + esc(n.k) + '</div>' +
+      // _bp 节点是「本次是否 bit-perfect」横幅：整块高亮 + 左侧色条，要一眼能看到
+      var isBp = !!n._bp;
+      var style = isBp
+        ? ' style="border-left:3px solid ' + n._color + ';background:rgba(255,255,255,.04);padding-left:10px;border-radius:6px"'
+        : '';
+      var kStyle = isBp ? ' style="color:' + n._color + ';font-weight:700;letter-spacing:.3px"' : '';
+      h += '<div class="cnode' + (n.gpu ? ' gpu' : '') + '"' + style + '><div class=dot></div><div><div class=k' + kStyle + '>' + esc(n.k) + '</div>' +
            '<div class=v' + (n.id ? ' id=' + n.id : '') + '>' + esc(n.v) + '</div></div></div>';
       if (i !== nodes.length - 1) h += '<div class=cline></div>';
     });
@@ -2751,17 +2814,28 @@ function renderSettingsPage() {
          chk('sp_metaon', '自动补全', META.on == 1,
              '关闭后播放不再触发在线补全；已补全的结果仍在本地库，随时可以再打开')
        + chk('sp_metallm', 'DeepSeek 增强（无标签文件）', META.llm == 1, '用 LLM 解析无标签文件并与数据源结果互相校验；不影响已有标签的优先级')
-       + chk('sp_metasummary', '允许 AI 资料综合（按次计费）', META.summary == 1, '启用后可在艺术家/作品页手动生成 AI 简介；按次产生 DeepSeek 调用，默认关闭')
+       // 2026-10-23（用户 261023-02 #5）：「勾了允许 AI 资料综合，却没看到任何地方生成曲目介绍」——
+       // 入口在**艺术家页的「AI 综合」小节**（点艺术家名进入），设置页这里只有开关。直接把路径写出来。
+       + chk('sp_metasummary', '允许 AI 资料综合（按次计费）', META.summary == 1,
+             '开启后到「艺术家」页 → 点某个艺术家 → 页内「AI 综合」小节点「生成 AI 简介」。按次产生 DeepSeek 调用，默认关闭')
+       + '<div class=sfld wide><div class=hint style="color:var(--mut2)">'
+       + 'AI 简介的入口：左侧「艺术家」→ 点进任一艺术家 → 页面下方「AI 综合」→「生成 AI 简介」。'
+       + '（作品页另有「Discogs 版本推荐」，不需要 AI。）</div></div>'
        + '<div class=sfld wide style="margin-top:14px">'
        + '<button class=btn id=sp_metamore style="font-size:12px" aria-expanded="false">高级选项 ▾</button>'
-       + '<span style="font-size:11.5px;color:var(--mut2);margin-left:10px">数据源开关 / API Key / 标签写回</span>'
+       + '<span style="font-size:11.5px;color:var(--mut2);margin-left:10px">数据源 · DeepSeek Key · 标签写回</span>'
        + '</div>'
        + '<div id=sp_metaadv style="display:none">'
-       + '<div class=sfld wide><div style="font-size:12px;color:var(--mut);margin:10px 0 6px">数据源（越靠上优先级越高）</div>'
-       + '<div id=sp_metasrc>' + metaSrcHtml() + '</div></div>'
-       // ---- 功能4（用户 2026-10-22）：「元数据没有提供 ds 的 api 输入接口」----
-       // 红线：界面【只显示掩码】，输入框永不回填，保存后立刻清空；
-       // key 只写 exe 同目录 rlplayer-llm.conf（路径由后端决定，前端不碰文件）。
+       // 数据源小节（2026-10-23 #4：与 API Key 分成两块，不再黏在一起）
+       + '<div class=sfld wide><div style="font-size:12.5px;font-weight:600;color:var(--txt);margin:4px 0 2px">数据源</div>'
+       + '<div class=hint>越靠上优先级越高；关掉的源完全不参与补全（不需要任何 Key）</div></div>'
+       + '<div id=sp_metasrc>' + metaSrcHtml() + '</div>'
+       // ---- 2026-10-23（用户 261023-02 #4）：API Key 不要跟数据源黏在一起 ----
+       // 现在拆成独立小节：先「数据源」、再「DeepSeek 接入」、最后「标签写回」，中间用分割标题隔开。
+       // 红线不变：界面【只显示掩码】，输入框永不回填，保存后立刻清空；key 只写 exe 同目录 rlplayer-llm.conf。
+       + '<div class=sfld wide><div style="margin:18px 0 2px;padding-top:14px;border-top:1px solid var(--line)">'
+       + '<div style="font-size:12.5px;font-weight:600;color:var(--txt)">DeepSeek 接入</div>'
+       + '<div class=hint style="margin-top:4px">只用于「DeepSeek 增强」与「AI 资料综合」；不填也能用全部本地与公开数据源</div></div></div>'
        + '<div class=sfld><label>DeepSeek API Key</label>'
        + '<input type=password id=sp_llmkey autocomplete=off spellcheck=false placeholder="sk-…（粘贴后点保存，只显示掩码）">'
        + '<div class=hint>只存本机 build' + SEP + 'rlplayer-llm.conf；不进安装包，界面永不回显明文</div></div>'
@@ -2773,6 +2847,14 @@ function renderSettingsPage() {
        + '播放时自动补全标签/封面/歌词；数据源清单来自 /api/providers；DeepSeek 用上面填的 key</div></div>'
        // P2 标签写回：预览（只读扫描）/ 执行（后台批 + 轮询进度）。写回前服务端做
        // PCM 逐位校验（不一致绝不动原文件），原文件备份到 rlplayer-meta\backups。
+       // 2026-10-23（用户 261023-02 #4）：「预览写回 / 执行写回是什么东西？」—— 加白话解释。
+       + '<div class=sfld wide><div style="margin:18px 0 2px;padding-top:14px;border-top:1px solid var(--line)">'
+       + '<div style="font-size:12.5px;font-weight:600;color:var(--txt)">标签写回（可选）</div>'
+       + '<div class=hint style="margin-top:4px;line-height:1.8">'
+       + '<b>作用</b>：把在线补到的标签/封面<b>写进音频文件本身</b>，换播放器也能看到。<br>'
+       + '<b>预览写回</b>：只扫描并列出「哪些文件会被改成什么」，<b>不改任何文件</b>（先看效果再决定）。<br>'
+       + '<b>执行写回</b>：真正写入。写入前会把音频数据逐位校验一遍，任何不一致就放弃该文件；'
+       + '原文件备份在 rlplayer-meta' + SEP + 'backups，可随时手动还原。</div></div></div>'
        + '<div class="sfld wide"><div id=sp_wbdesc style="font-size:12px;color:var(--mut);line-height:1.7">'
        + '把补全结果写回音频文件标签。写回前自动校验音频数据逐位不变，原文件备份到 rlplayer-meta' + SEP + 'backups</div></div>'
        + '<div class="sfld wide"><button class=btn id=sp_wbdry>预览写回</button> '
