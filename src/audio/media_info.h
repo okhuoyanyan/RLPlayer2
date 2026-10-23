@@ -13,6 +13,7 @@
 #endif
 #include <windows.h>
 #include "audio/audio_loader.h"
+#include "audio/dsd_reader.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -87,8 +88,40 @@ inline int media_duration_sec(const double seconds) {
     return (int)r;
 }
 
+inline bool is_dsd_path(const std::string& path) {
+    const size_t d = path.find_last_of('.');
+    if (d == std::string::npos) return false;
+    std::string ext = path.substr(d);
+    for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+    return ext == ".dsf" || ext == ".dff";
+}
+
 inline MediaInfo probe_media(const std::string& file) {
     MediaInfo mi;
+
+    // E-16：对 .dsf/.dff 优先用 dsd_reader 解析 header 计算 duration
+    // DSF: fmt 块的 sampleCount(每声道 1-bit 样本数) ÷ samplingFrequency
+    // DFF: data 块字节数 ÷ 声道数 × 8 ÷ FS
+    // 若 header 解析失败再回退 ffprobe，行为保持现有回退链。
+    bool dsdHeaderOk = false;
+    if (is_dsd_path(file)) {
+        try {
+            const DsdInfo di = probe_dsd(file);
+            const double s = di.seconds();
+            if (std::isfinite(s) && s > 0.0) {
+                mi.duration = s;
+                dsdHeaderOk = true;
+            }
+            if (di.rate > 0) mi.sampleRate = (int)di.rate;
+            if (di.channels > 0) mi.channels = di.channels;
+            mi.bits = 1;
+            mi.codec = (di.container == "dsf" ? "dsd_lsbf" : "dsd_msbf");
+        } catch (...) {
+            // header 解析失败，回退 ffprobe
+            dsdHeaderOk = false;
+        }
+    }
+
     const std::string ffprobe = find_tool("ffprobe");
     if (ffprobe.empty()) return mi;
 
@@ -124,7 +157,10 @@ inline MediaInfo probe_media(const std::string& file) {
                         // duration 是 format 级字段，输出行形如 "duration=171.692290"，
                         // 【没有】TAG: 前缀；它恰好与 tag 键共处一个 k=v 循环，所以在此认。
                         // 解析失败一律保持 0（未知），绝不把 NaN/inf 传下去。
-                        else if (k == "duration")                    mi.duration = probe_parse_duration(v);
+                        // E-16：若 DSD header 已成功解析时长，保持 header 真实样本数口径；否则回退 ffprobe。
+                        else if (k == "duration") {
+                            if (!dsdHeaderOk) mi.duration = probe_parse_duration(v);
+                        }
                     }
                     line.clear();
                 } else if (line.size() < 4096) line += out[i];
@@ -146,17 +182,23 @@ inline MediaInfo probe_media(const std::string& file) {
                     if (e != std::string::npos) {
                         const std::string k = trim(line.substr(0, e));
                         const std::string v = trim(line.substr(e + 1));
-                        if (k == "codec_name") mi.codec = v;
-                        else if (k == "sample_rate") mi.sampleRate = atoi(v.c_str());
-                        else if (k == "channels") mi.channels = atoi(v.c_str());
-                        else if (k == "bits_per_raw_sample") mi.bits = atoi(v.c_str());
+                        if (k == "codec_name" && mi.codec.empty()) mi.codec = v;
+                        else if (k == "sample_rate") {
+                            if (!dsdHeaderOk) mi.sampleRate = atoi(v.c_str());
+                        }
+                        else if (k == "channels") {
+                            if (!dsdHeaderOk) mi.channels = atoi(v.c_str());
+                        }
+                        else if (k == "bits_per_raw_sample") {
+                            if (!dsdHeaderOk) mi.bits = atoi(v.c_str());
+                        }
                     }
                     line.clear();
                 } else if (line.size() < 512) line += out[i];
             }
         }
     }
-    if (mi.bits <= 0) mi.bits = 16;
+    if (mi.bits <= 0) mi.bits = dsdHeaderOk ? 1 : 16;
     return mi;
 }
 

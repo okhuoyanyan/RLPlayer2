@@ -28,10 +28,9 @@
 //     测试在别的机器上会因为「没有那首歌」而红，那是被判据误伤，不是缺陷。
 //     ⚠️ 因此「真实 FLAC 那一段」在无素材的机器上等于未验证；回归基线以合成 WAV +
 //     mf_duration 对照表为准（这两段恒执行、恒断言）。
-//   * DSD（.dsf/.dff）的真实时长未单独验证：本机 ffprobe 9.0 对 .dsf 的 format=duration
-//     读的是 data 块实际长度而不是 header 里的 sample count（实测改 header 的样本数
-//     不改变输出），也就是说 DSD 时长的口径由 ffprobe 决定，本测试不假设它。
-//     → 当前以「probe_media 对 DSD 拿不到时长则 duration=0 → match 中性」为回归基线。
+//   * DSD（.dsf/.dff）时长口径（E-16，2026-10-23 已解决）：
+//     优先用 dsd_reader 解析 header 真实样本数（DSF sampleCount / DFF dataSize），
+//     不再依赖 ffprobe 的文件实际长度口径。含篡改 header 对照测试与容错断言。
 // 抑制 CRT 的 getenv 弃用警告与 C++20 u8path 弃用警告（测试里都用得到，且语义正确）
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
@@ -91,6 +90,16 @@ static bool write_bytes(const std::string& path, const std::vector<uint8_t>& b) 
     if (!b.empty()) f.write(reinterpret_cast<const char*>(b.data()), (std::streamsize)b.size());
     f.close();
     return true;
+}
+static std::vector<uint8_t> read_bytes(const std::string& path) {
+    std::ifstream f(u8p(path), std::ios::binary);
+    if (!f) return {};
+    f.seekg(0, std::ios::end);
+    const size_t sz = (size_t)f.tellg();
+    f.seekg(0, std::ios::beg);
+    std::vector<uint8_t> b(sz);
+    if (sz > 0) f.read(reinterpret_cast<char*>(b.data()), (std::streamsize)sz);
+    return b;
 }
 static void remove_file(const std::string& path) {
     std::error_code ec;
@@ -351,6 +360,190 @@ int main() {
             ck(!mi.title.empty() && !mi.artist.empty() && !mi.album.empty(),
                "真实 FLAC 的 title/artist/album 照旧解析出来",
                "title=[" + mi.title + "] artist=[" + mi.artist + "] album=[" + mi.album + "]");
+        }
+    }
+
+    // ================= 7) E-16：DSD 时长口径（真实 header 样本数） =================
+    std::printf("- 7 DSD 时长口径（真实 header 样本数，E-16）\n");
+    {
+        const std::string ff = rta::audio::find_tool("ffprobe");
+        auto read_ffprobe_raw_duration = [&](const std::string& path) -> double {
+            if (ff.empty()) return 0.0;
+            const std::wstring cmd = L"\"" + rta::audio::widen(ff) +
+                L"\" -v error -show_entries format=duration -of default=nw=1 \"" +
+                rta::audio::widen(path) + L"\"";
+            std::string out;
+            if (rta::audio::run_hidden(cmd, &out) == 0) {
+                const size_t e = out.find('=');
+                if (e != std::string::npos) {
+                    return rta::audio::probe_parse_duration(out.substr(e + 1));
+                }
+            }
+            return 0.0;
+        };
+
+        auto make_dsd_file = [&](const std::string& path, uint32_t rateDsd, const char* kind) -> bool {
+            const std::string makeDsd = rta::audio::wide_to_utf8(rta::audio::exe_dir_w()) + "\\make_dsd.exe";
+            const std::wstring cmd = L"\"" + rta::audio::widen(makeDsd) + L"\" --out \"" +
+                rta::audio::widen(path) + L"\" --rate " + std::to_wstring(rateDsd) +
+                L" --seconds 1 --kind " + rta::audio::widen(kind);
+            if (rta::audio::run_hidden(cmd) == 0 && std::filesystem::exists(u8p(path))) {
+                return true;
+            }
+            // 回退直接写
+            const uint32_t rateHz = rateDsd * 44100;
+            const uint64_t bits = (uint64_t)rateHz;
+            rta::audio::DsdStream s;
+            s.rate = rateHz;
+            s.channels = 2;
+            s.bits = bits;
+            s.container = kind;
+            s.data.assign(2, std::vector<uint8_t>((size_t)((bits + 7) / 8), 0x55));
+            try {
+                if (std::string(kind) == "dsf") rta::audio::write_dsf(path, s);
+                else rta::audio::write_dff(path, s);
+                return true;
+            } catch (...) { return false; }
+        };
+
+        // 7.1 DSD64 / 128 / 256 各 1 秒：duration 误差 < 5ms
+        std::printf("  7.1 DSF/DFF 的 DSD64/128/256 各 1s：误差 < 5ms\n");
+        for (const char* kind : { "dsf", "dff" }) {
+            for (uint32_t r : { 64u, 128u, 256u }) {
+                const std::string p = temp_file(("rta_dur_" + std::string(kind) + "_" + std::to_string(r) + "." + kind).c_str());
+                ck(make_dsd_file(p, r, kind), std::string("生成 1s DSD") + std::to_string(r) + " (" + kind + ")");
+                const MediaInfo mi = probe_media(p);
+                const double errMs = std::fabs(mi.duration - 1.0) * 1000.0;
+                std::printf("      [%s] DSD%u: duration = %.6f s (误差 %.3f ms), rate = %d, ch = %d, bits = %d\n",
+                            kind, r, mi.duration, errMs, mi.sampleRate, mi.channels, mi.bits);
+                ck(errMs < 5.0, std::string(kind) + " DSD" + std::to_string(r) + "：duration 误差 < 5ms",
+                   "duration=" + std::to_string(mi.duration) + " errMs=" + std::to_string(errMs));
+                ck(mi.sampleRate == (int)(r * 44100) && mi.channels == 2 && mi.bits == 1,
+                   std::string(kind) + " DSD" + std::to_string(r) + "：流参数正确");
+                ck(rta::audio::media_duration_sec(mi.duration) == 1,
+                   std::string(kind) + " DSD" + std::to_string(r) + "：整秒转换 = 1");
+                remove_file(p);
+            }
+        }
+
+        // 7.2 DSF 篡改 header 样本数对照测试
+        std::printf("  7.2 DSF 篡改 header sampleCount 对照（证明跟随 header 而非看文件长度）\n");
+        {
+            const std::string origDsf = temp_file("rta_dur_orig.dsf");
+            const std::string tamperedDsf = temp_file("rta_dur_tampered.dsf");
+            ck(make_dsd_file(origDsf, 64, "dsf"), "生成 1s DSD64 DSF 基准文件");
+            std::vector<uint8_t> bytes = read_bytes(origDsf);
+            ck(bytes.size() >= 80, "DSF 基准文件读取成功");
+            if (bytes.size() >= 80) {
+                // sampleCount 在 fmt 块（offset 28）+ 24 = offset 64 处的 uint64_t
+                uint64_t origSampleCount = 0;
+                for (int i = 0; i < 8; ++i) origSampleCount |= ((uint64_t)bytes[64 + i]) << (8 * i);
+                ck(origSampleCount == 2822400, "原始 sampleCount == 2822400 (1.0s)");
+
+                // 篡改 sampleCount 为 7056000 (2.5s)
+                const uint64_t tamperedCount = 7056000;
+                for (int i = 0; i < 8; ++i) bytes[64 + i] = (uint8_t)((tamperedCount >> (8 * i)) & 0xFF);
+                ck(write_bytes(tamperedDsf, bytes), "写出篡改 header 样本数后的 DSF");
+
+                const MediaInfo miOrig = probe_media(origDsf);
+                const MediaInfo miTampered = probe_media(tamperedDsf);
+                const double ffOrig = read_ffprobe_raw_duration(origDsf);
+                const double ffTampered = read_ffprobe_raw_duration(tamperedDsf);
+
+                std::printf("    | 口径        | 篡改前（1s 样本数） | 篡改后（2.5s 样本数） | 结论                     |\n");
+                std::printf("    | ffprobe     | %15.6f s | %16.6f s | 恒 ~1.01s（看文件长度）  |\n",
+                            ffOrig, ffTampered);
+                std::printf("    | probe_media | %15.6f s | %16.6f s | 跟随 header 样本数      |\n",
+                            miOrig.duration, miTampered.duration);
+
+                ck(std::fabs(miTampered.duration - 2.5) < 0.005,
+                   "probe_media(tampered DSF)：duration 严格跟随 header 样本数 2.500s",
+                   "duration=" + std::to_string(miTampered.duration));
+                ck(std::fabs(ffTampered - ffOrig) < 0.005,
+                   "对照：ffprobe 在 header 篡改后输出不变（证明 ffprobe 只看数据长度）",
+                   "ffTampered=" + std::to_string(ffTampered) + " ffOrig=" + std::to_string(ffOrig));
+                ck(rta::audio::media_duration_sec(miTampered.duration) == 3,
+                   "篡改后 fileSec = 3 (四舍五入(2.5+0.5)=3)");
+            }
+            remove_file(origDsf);
+            remove_file(tamperedDsf);
+        }
+
+        // 7.3 DFF 篡改 header DSD chunk 大小对照测试
+        std::printf("  7.3 DFF 篡改 header DSD chunk 大小对照\n");
+        {
+            const std::string origDff = temp_file("rta_dur_orig.dff");
+            const std::string tamperedDff = temp_file("rta_dur_tampered.dff");
+            ck(make_dsd_file(origDff, 64, "dff"), "生成 1s DSD64 DFF 基准文件");
+            std::vector<uint8_t> bytes = read_bytes(origDff);
+            ck(bytes.size() >= 128, "DFF 基准文件读取成功");
+            if (bytes.size() >= 128) {
+                // 寻找 DSD chunk：大端 sz
+                size_t dsdChunkOff = 0;
+                for (size_t i = 16; i + 12 <= bytes.size(); ++i) {
+                    if (std::memcmp(bytes.data() + i, "DSD ", 4) == 0) {
+                        uint64_t sz = 0;
+                        for (int j = 0; j < 8; ++j) sz = (sz << 8) | bytes[i + 4 + j];
+                        if (sz == 705600) { dsdChunkOff = i; break; }
+                    }
+                }
+                ck(dsdChunkOff > 0, "找到原始 DFF 的 DSD chunk (705600 字节)");
+                if (dsdChunkOff > 0) {
+                    // 篡改为 1411200 字节 (2.0s)
+                    const uint64_t newSz = 1411200;
+                    for (int j = 0; j < 8; ++j) bytes[dsdChunkOff + 4 + j] = (uint8_t)((newSz >> (8 * (7 - j))) & 0xFF);
+                    ck(write_bytes(tamperedDff, bytes), "写出篡改 DSD chunk 大小后的 DFF");
+
+                    const MediaInfo miOrig = probe_media(origDff);
+                    const MediaInfo miTampered = probe_media(tamperedDff);
+                    const double ffOrig = read_ffprobe_raw_duration(origDff);
+                    const double ffTampered = read_ffprobe_raw_duration(tamperedDff);
+
+                    std::printf("    | 口径        | 篡改前（705600 字节）| 篡改后（1411200 字节）| 结论                     |\n");
+                    std::printf("    | ffprobe     | %15.6f s | %16.6f s | 恒 1.000s（看文件长度）  |\n",
+                                ffOrig, ffTampered);
+                    std::printf("    | probe_media | %15.6f s | %16.6f s | 跟随 header chunk 大小  |\n",
+                                miOrig.duration, miTampered.duration);
+
+                    ck(std::fabs(miTampered.duration - 2.0) < 0.005,
+                       "probe_media(tampered DFF)：duration 严格跟随 header chunk 大小 2.000s",
+                       "duration=" + std::to_string(miTampered.duration));
+                    ck(std::fabs(ffTampered - 1.0) < 0.01,
+                       "对照：ffprobe 对篡改后 DFF 仍报 1.000s",
+                       "ffTampered=" + std::to_string(ffTampered));
+                    ck(rta::audio::media_duration_sec(miTampered.duration) == 2,
+                       "篡改后 fileSec = 2");
+                }
+            }
+            remove_file(origDff);
+            remove_file(tamperedDff);
+        }
+
+        // 7.4 非法 / 截断 header 容错：不抛异常、duration == 0、回退安全
+        std::printf("  7.4 非法/截断 DSD header 容错\n");
+        {
+            auto test_bad = [&](const char* name, const std::vector<uint8_t>& b, const char* desc) {
+                const std::string p = temp_file(name);
+                write_bytes(p, b);
+                bool threw = false;
+                MediaInfo mi;
+                try { mi = probe_media(p); } catch (...) { threw = true; }
+                ck(!threw, std::string(desc) + "：不抛异常");
+                ck(mi.duration == 0.0, std::string(desc) + "：duration == 0",
+                   "duration=" + std::to_string(mi.duration));
+                ck(rta::audio::media_duration_sec(mi.duration) == 0,
+                   std::string(desc) + "：fileSec == 0（中性降级）");
+                remove_file(p);
+            };
+
+            // DSF 截断与非法
+            test_bad("bad_trunc1.dsf", { 'D', 'S', 'D', ' ' }, "DSF 仅 4 字节（截断）");
+            test_bad("bad_trunc2.dsf", std::vector<uint8_t>(50, 0), "DSF 50 字节（缺少完整 fmt 块）");
+            test_bad("bad_magic.dsf", std::vector<uint8_t>(90, 'X'), "DSF 错误魔数");
+
+            // DFF 截断与非法
+            test_bad("bad_trunc1.dff", { 'F', 'R', 'M', '8' }, "DFF 仅 4 字节（截断）");
+            test_bad("bad_magic.dff", std::vector<uint8_t>(90, 'Y'), "DFF 错误魔数");
         }
     }
 
