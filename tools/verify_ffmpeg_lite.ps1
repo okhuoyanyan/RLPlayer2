@@ -64,6 +64,35 @@ if ($missing.Count -gt 0) {
 }
 Write-Host ("OK  白名单 " + $required.Count + " 项齐全；解码器共 " + $decoders.Count + " 个")
 
+# ---- 2b. 编码器白名单（2026-10-23 新增）----
+# 为什么需要：用户反馈「1.3.x 封面不显示」，根因之一是 get_cover 用 -c:v png 转码取图，
+# 而精简 ffmpeg 只有 mjpeg 编码器、没有 png 编码器 → 命令静默失败 → 只返回 77 字节占位图。
+# 第 2 步只校验解码器，这类「用到编码器但被裁掉」的问题完全漏网。现在把编码器也钉住。
+Write-Host "--- 2b/3 必需编码器白名单 ---"
+$encoders = @()
+foreach ($line in @(& $ff -hide_banner -encoders 2>$null)) {
+    if ($line -match '^\s(A[.A-Z]{5})\s+([a-z0-9_.]+)') { $encoders += $matches[2] }
+}
+$requiredEnc = @('pcm_s16le', 'pcm_s24le', 'pcm_s32le', 'pcm_f32le')
+$missingEnc = @($requiredEnc | Where-Object { $encoders -notcontains $_ })
+if ($missingEnc.Count -gt 0) { Fail ("精简版缺必需编码器（" + $missingEnc.Count + " 项）：" + ($missingEnc -join ", ")) }
+Write-Host ("OK  编码器白名单 " + $requiredEnc.Count + " 项齐全；编码器共 " + $encoders.Count + " 个")
+
+# 封面抽取必须能工作：用 copy 通道，不依赖 png 编码器。占位 PNG 只有 77 字节，真实封面 >4KB。
+$coverProbe = Join-Path $root 'build\testdata\embedded.flac'
+if (Test-Path $coverProbe) {
+    $img = Join-Path $env:TEMP ('ffcover_' + [guid]::NewGuid().ToString('N') + '.img')
+    & $ff -v error -y -i $coverProbe -map 0:v:0 -c:v copy -f image2 $img 2>$null | Out-Null
+    $sz = if (Test-Path $img) { (Get-Item $img).Length } else { 0 }
+    Remove-Item $img -Force -ErrorAction SilentlyContinue
+    # 判据：get_cover 失败时返回内置 1x1 透明 PNG（77 字节）；成功则是真实图片（小样本也有上千字节）。
+    # 不能要求 >4096 —— testdata\embedded.flac 的封面本身只有 3 KB，那样会误报（已实测踩过）。
+    if ($sz -lt 200) { Fail ("内嵌封面抽取失败（只得到 $sz 字节；占位图是 77）—— 检查 get_cover 的 -c:v copy 通道") }
+    Write-Host ("OK  内嵌封面抽取正常（" + $sz + " 字节）")
+} else {
+    Write-Host "SKIP  缺少 build\testdata\embedded.flac，跳过内嵌封面抽取校验"
+}
+
 # ---- 3. 产品解码路径（格式矩阵）----
 Write-Host "--- 3/3 格式矩阵（rta::audio::read_any）---"
 if ($SkipMatrix) {
