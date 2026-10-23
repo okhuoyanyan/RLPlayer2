@@ -697,6 +697,38 @@ int main() {
     }
 
     // =====================================================================
+    // [9b] entity_artist_kind 与 entity_looks_label 启发式校准（E-12：单字社/団/团门槛与负例保护）
+    // =====================================================================
+    std::printf("[9b] 启发式校准（E-12：正例保留 + 负例「社会科学」「团结」等不误判）\n");
+    {
+        // 1. 现有正例保持正确
+        ck(entity_looks_label("塞壬唱片") == true, "正例：塞壬唱片 是 Label");
+        ck(entity_looks_label("塞壬唱片-MSR") == true, "正例：塞壬唱片-MSR 是 Label");
+        ck(entity_looks_label("Sony Records") == true, "正例：Sony Records 是 Label");
+        ck(entity_artist_kind("月華社") == EntityKind::Group, "正例：月華社 是 Group（后缀社）");
+        ck(entity_artist_kind("月華社 (Circle)") == EntityKind::Group, "正例：月華社 (Circle) 是 Group");
+        ck(entity_artist_kind("上海アリス幻樂団") == EntityKind::Group, "正例：上海アリス幻樂団 是 Group（樂団）");
+        ck(entity_artist_kind("Czech National Symphony Orchestra") == EntityKind::Group, "正例：Symphony Orchestra 是 Group");
+        ck(entity_artist_kind("早见沙织应援团") == EntityKind::Group, "正例：应援团 是 Group");
+        ck(entity_artist_kind("团结交响乐团") == EntityKind::Group, "正例：团结交响乐团 是 Group（强特征词覆盖负例前缀）");
+
+        // 2. 负例保护（不误判为 Group，退化为 Person，保证宁可拆开也不错并）
+        ck(entity_artist_kind("社会科学") == EntityKind::Person, "负例：社会科学 不误判为 Group（Person）");
+        ck(entity_artist_kind("团结") == EntityKind::Person, "负例：团结 不误判为 Group（Person）");
+        ck(entity_artist_kind("团子") == EntityKind::Person, "负例：团子 不误判为 Group（Person）");
+        ck(entity_artist_kind("社长") == EntityKind::Person, "负例：社长 不误判为 Group（Person）");
+        ck(entity_artist_kind("社交达人") == EntityKind::Person, "负例：社交达人 不误判为 Group（Person）");
+        ck(entity_artist_kind("社区工作者") == EntityKind::Person, "负例：社区工作者 不误判为 Group（Person）");
+        ck(entity_artist_kind("团") == EntityKind::Person, "单字「团」不误判为 Group（需>=2字）");
+        ck(entity_artist_kind("社") == EntityKind::Person, "单字「社」不误判为 Group（需>=2字）");
+
+        // 3. entity_looks_label 负例保护
+        ck(entity_looks_label("唱片机") == false, "负例：唱片机 不是 Label");
+        ck(entity_looks_label("唱片店") == false, "负例：唱片店 不是 Label");
+        ck(entity_looks_label("黑胶唱片机") == false, "负例：黑胶唱片机 不是 Label");
+    }
+
+    // =====================================================================
     // [10] entity_year4：4 位年份清洗（纯函数；Release 判等键的正解）
     // =====================================================================
     // 判据凭什么成立：这一组不只看"改对了的几个"，还专门钉住
@@ -733,6 +765,23 @@ int main() {
         ck(entity_year4("未出版") == "", "无数字文本 → 空串", entity_year4("未出版"));
         // 幂等：清洗结果再清洗不变（判等键必须幂等，否则同一输入会漂）
         ck(entity_year4(entity_year4("2022-08-16")) == "2022", "清洗幂等（结果再过一遍不变）");
+
+        // E-14 指定边界用例全覆盖：'1999'、'1999-05-01'、'[1000,2100] 窗口'、脏值（0/9999/-1/空）
+        ck(entity_year4("1999") == "1999", "E-14 覆盖：'1999' → '1999'", entity_year4("1999"));
+        ck(entity_year4("1999-05-01") == "1999", "E-14 覆盖：'1999-05-01' → '1999'", entity_year4("1999-05-01"));
+        ck(entity_year4("1000") == "1000", "E-14 窗口下界端点 1000", entity_year4("1000"));
+        ck(entity_year4("2100") == "2100", "E-14 窗口上界端点 2100", entity_year4("2100"));
+        ck(entity_year4("0999") == "", "E-14 窗口外下界 0999 → 空", entity_year4("0999"));
+        ck(entity_year4("2101") == "", "E-14 窗口外上界 2101 → 空", entity_year4("2101"));
+        ck(entity_year4("0") == "", "E-14 脏值 '0' → 空串", entity_year4("0"));
+        ck(entity_year4("9999") == "", "E-14 脏值 '9999'(>2100) → 空串", entity_year4("9999"));
+        ck(entity_year4("-1") == "", "E-14 脏值 '-1' → 空串", entity_year4("-1"));
+        ck(entity_year4("") == "", "E-14 脏值 空串 → 空串", entity_year4(""));
+        ck(entity_year4("1999") == pv_year4("1999") &&
+           entity_year4("1999-05-01") == pv_year4("1999-05-01") &&
+           entity_year4("0") == pv_year4("0") &&
+           entity_year4("9999") == pv_year4("9999"),
+           "E-14 实体 year 与 pv_year4 结果完全同一（统一底层实现）");
     }
 
     // =====================================================================
@@ -989,6 +1038,149 @@ int main() {
 
         // 只读红线复核：本节只做 is_directory / directory_iterator / extension()，不写 MUSIC
         ck(fs::exists(tmpRoot, ec), "本节同样没有往 MUSIC 写任何文件（写入点仍是 %TEMP%）");
+    }
+
+    // =====================================================================
+    // [13] 目录结构判据接进真实批量入口（E-13：多碟盒装聚合与 5 张专辑收敛）
+    // =====================================================================
+    std::printf("[13] 真实批量入口与多碟盒装聚合（5 张专辑收敛离线测试）\n");
+    {
+        std::error_code ec;
+        const fs::path batchRoot = tmpRoot / "batch_e13";
+        fs::remove_all(batchRoot, ec);
+        fs::create_directories(batchRoot, ec);
+
+        // 构造 5 张专辑：
+        // 专辑 1: 分类 1 下的单碟普通专辑
+        const fs::path alb1 = batchRoot / "cat1" / "AlbumOne";
+        fs::create_directories(alb1, ec);
+        { std::ofstream o(alb1 / "01.flac", std::ios::binary); o << "x"; }
+        { std::ofstream o(alb1 / "02.flac", std::ios::binary); o << "x"; }
+
+        // 专辑 2: 分类 1 下的同人社团专辑（带 @ 社团）
+        const fs::path alb2 = batchRoot / "cat1" / "AlbumTwo @ CircleAlpha";
+        fs::create_directories(alb2, ec);
+        { std::ofstream o(alb2 / "01.flac", std::ios::binary); o << "x"; }
+
+        // 专辑 3: 顶层直接存放的专辑
+        const fs::path alb3 = batchRoot / "AlbumThree";
+        fs::create_directories(alb3, ec);
+        { std::ofstream o(alb3 / "01.wav", std::ios::binary); o << "x"; }
+
+        // 专辑 4: 分类 2 下的单曲专辑
+        const fs::path alb4 = batchRoot / "cat2" / "AlbumFour";
+        fs::create_directories(alb4, ec);
+        { std::ofstream o(alb4 / "01.mp3", std::ios::binary); o << "x"; }
+
+        // 专辑 5: 分类 2 下的多碟盒装（专辑目录无直接音频，只有 CD1 和 CD2，且另附 Scans 目录）
+        const fs::path alb5 = batchRoot / "cat2" / "BoxSetFive @ CircleBeta";
+        fs::create_directories(alb5 / "CD1", ec);
+        fs::create_directories(alb5 / "CD2", ec);
+        fs::create_directories(alb5 / "Scans", ec);
+        { std::ofstream o(alb5 / "CD1" / "01.flac", std::ios::binary); o << "x"; }
+        { std::ofstream o(alb5 / "CD1" / "02.flac", std::ios::binary); o << "x"; }
+        { std::ofstream o(alb5 / "CD2" / "01.flac", std::ios::binary); o << "x"; }
+        { std::ofstream o(alb5 / "CD2" / "02.flac", std::ios::binary); o << "x"; }
+        { std::ofstream o(alb5 / "Scans" / "booklet.jpg", std::ios::binary); o << "x"; }
+
+        // 1. 结构判据直接断言
+        ck(entity_is_disc_subdir_name("CD1") && entity_is_disc_subdir_name("cd2") &&
+           entity_is_disc_subdir_name("Disc 1") && entity_is_disc_subdir_name("DISC-02"),
+           "CD1/cd2/Disc 1/DISC-02 均判定为碟片子目录名");
+        ck(!entity_is_disc_subdir_name("cat1") && !entity_is_disc_subdir_name("AlbumOne") &&
+           !entity_is_disc_subdir_name("Scans"),
+           "cat1/AlbumOne/Scans 均不是碟片子目录名");
+
+        ck(entity_dir_is_boxset(alb5), "BoxSetFive 识别为多碟盒装");
+        ck(entity_dir_is_album(alb5), "多碟盒装识别为专辑目录（不因无直接音频漏判）");
+        ck(!entity_dir_is_category(alb5), "多碟盒装不是分类目录（防止拆散）");
+        ck(entity_dir_is_disc_subdir(alb5 / "CD1"), "alb5/CD1 是盒装下的碟片子目录");
+        ck(entity_dir_is_disc_subdir(alb5 / "CD2"), "alb5/CD2 是盒装下的碟片子目录");
+        ck(!entity_dir_is_album(alb5 / "CD1"), "CD1 碟片子目录本身不作为独立专辑");
+
+        // 2. 收集全部音频文件路径
+        std::vector<std::string> allFiles;
+        for (const auto& de : fs::recursive_directory_iterator(batchRoot, ec)) {
+            if (!de.is_regular_file(ec)) continue;
+            if (entity_audio_ext_ok(u8s(de.path().extension().u8string()))) {
+                allFiles.push_back(u8s(de.path().u8string()));
+            }
+        }
+        std::sort(allFiles.begin(), allFiles.end());
+        ck(allFiles.size() == 9, "共 9 个音频文件（2 + 1 + 1 + 1 + 4）", std::to_string(allFiles.size()));
+
+        // 3. 走真实批量入口：entity_batch_from_paths
+        const EntityGraph g = entity_batch_from_paths(allFiles, 13000);
+
+        // 4. 断言核心：收敛为 5 个 Release 实体
+        const size_t relCount = g.count(EntityKind::Release);
+        ck(relCount == 5, "★ 5 张专辑（含 1 个多碟盒装）经真实批量入口严格收敛为 5 个 Release 实体",
+           std::to_string(relCount));
+
+        // 5. 断言多碟盒装：是 1 个实体且 disc 数为 2
+        std::string boxReleaseId;
+        const Entity* boxRel = nullptr;
+        for (const auto& kv : g.entities) {
+            if (kv.second.kind == EntityKind::Release && kv.second.name == "BoxSetFive") {
+                boxRel = &kv.second;
+                boxReleaseId = kv.second.id;
+                break;
+            }
+        }
+        ck(boxRel != nullptr, "多碟盒装在图里存在对应 Release 实体（名称取自盒装目录名 BoxSetFive）");
+        if (boxRel) {
+            const size_t dCount = entity_release_disc_count(g, boxReleaseId);
+            ck(dCount == 2, "★ 多碟盒装是 1 个实体且 disc 数正确（2 碟）", std::to_string(dCount));
+            // 验证社团边：挂载到 CircleBeta
+            const std::string circleId = entity_id(EntityKind::Group, "CircleBeta");
+            ck(boxRel->findEdge(entity_rel::kByGroup, circleId, "") != nullptr,
+               "多碟盒装从「BoxSetFive @ CircleBeta」目录名成功解析出 CircleBeta 社团实体并链接");
+        }
+
+        // 6. 验证音乐库 LibTrack 批量入口一致性
+        std::vector<rta::net::LibTrack> libTracks;
+        for (const auto& p : allFiles) {
+            rta::net::LibTrack t;
+            t.path = p;
+            t.title = u8s(fs::path(p).stem().u8string());
+            libTracks.push_back(t);
+        }
+        const EntityGraph gLib = rta::net::entity_graph_from_library_tracks(libTracks, 13001);
+        ck(gLib.count(EntityKind::Release) == 5,
+           "通过 LibTrack 批量入口（entity_graph_from_library_tracks）同样严格收敛为 5 个 Release 实体",
+           std::to_string(gLib.count(EntityKind::Release)));
+
+        // 7. EntityStore 落盘核验
+        EntityStore& st = EntityStore::instance();
+        const std::string oldBase = st.baseDir();
+        st.setBaseDir(u8s((batchRoot / "meta_store").u8string()));
+        const size_t saved = st.saveGraph(g);
+        ck(saved > 0, "实体图成功落盘", std::to_string(saved));
+        const auto releaseIdsOnDisk = st.listIds(EntityKind::Release);
+        ck(releaseIdsOnDisk.size() == 5, "落盘后 listIds(Release) 数量严格为 5",
+           std::to_string(releaseIdsOnDisk.size()));
+        st.setBaseDir(oldBase);
+
+        // 8. MUSIC 只读真实样本核验
+        const fs::path music = fs::path(L"D:\\RTA-hqplayer\\MUSIC");
+        if (fs::exists(music, ec)) {
+            size_t validAlbumDirFound = 0, totalAudios = 0;
+            for (const auto& de : fs::recursive_directory_iterator(music, ec)) {
+                if (!de.is_regular_file(ec)) continue;
+                if (!entity_audio_ext_ok(u8s(de.path().extension().u8string()))) continue;
+                ++totalAudios;
+                int inferredDisc = 0;
+                fsx::path ad = entity_find_album_dir_for_track(de.path(), &inferredDisc);
+                if (!ad.empty() && entity_dir_is_album(ad)) {
+                    ++validAlbumDirFound;
+                }
+            }
+            ck(totalAudios > 0 && validAlbumDirFound == totalAudios,
+               "真实曲库（MUSIC）只读核验：全部真实音频文件均通过结构判据定位到有效专辑目录",
+               std::to_string(validAlbumDirFound) + "/" + std::to_string(totalAudios));
+        } else {
+            skip("MUSIC 批量只读核对", "目录不存在");
+        }
     }
 
     std::printf("\n结果：%s  （通过 %s，失败 %d，跳过 %d）\n",
