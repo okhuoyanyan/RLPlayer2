@@ -463,9 +463,11 @@ async function waitFor(expr, ms = 8000) {
      '两个开关（自动补全 / AI 增强）存在且已绑定；旧 sp_metasummary 已合并删除', JSON.stringify(metaFix));
 
   // 合并后的 AI 开关：文案必须讲清「DeepSeek + 联网 + 按次计费」
-  const aiLabel = await evalJs("(function(){var e=document.getElementById('sp_metallm');return (e&&e.parentNode)?e.parentNode.textContent.trim():'';})()");
-  ck(aiLabel.indexOf('AI 增强') >= 0 && aiLabel.indexOf('DeepSeek') >= 0 && aiLabel.indexOf('按次计费') >= 0,
-     '「AI 增强（DeepSeek）」文案包含联网 / 按次计费说明', aiLabel);
+  // 判据修正（2026-10-23）：说明文案是独立的一行描述（不在 <label> 内），旧判据只看 label 文本会误报。
+  // 这里检查「元数据分组」的整体可读文案：必须同时出现 AI 增强 / DeepSeek / 联网 / 按次计费。
+  const aiLabel = await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=meta]');return p?p.textContent.replace(/\\s+/g,' ').trim():'';})()");
+  ck(aiLabel.indexOf('AI 增强') >= 0 && aiLabel.indexOf('DeepSeek') >= 0 && aiLabel.indexOf('联网') >= 0 && aiLabel.indexOf('按次计费') >= 0,
+     '「AI 增强（DeepSeek）」文案包含联网 / 按次计费说明', aiLabel.slice(0, 160));
 
   // 合并语义：一次勾选必须**同时**写 metallm 与 metasummary（开=1,1 / 关=0,0）。
   // 自检纪律：原状态可能是 metallm=1,metasummary=0 的混合态，合并后无法用两次点击还原成混合态，
@@ -775,7 +777,7 @@ async function waitFor(expr, ms = 8000) {
       //            （早期把两类混在一起判，导致把正常控件误报成"未绑定"）
       //  P1.5：元数据源开关是动态的（/api/providers 注册表）—— 在静态清单之外逐源补查
       //  P2：标签写回的预览/执行按钮也是要点了有反应的
-      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_metasummary','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','bGoEqNav','sp_instart','sp_instop','sp_inmon','sp_cast_scan','sp_cast_usecur','sp_cast_start','sp_cast_stop','sp_cast_dop','sp_cast_dev'];
+      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_instart','sp_instop','sp_inmon','sp_cast_scan','sp_cast_usecur','sp_cast_start','sp_cast_stop','sp_cast_dop','sp_cast_dev'];
       (META_PROVIDERS || []).forEach(function (p) { needBind.push('sp_meta_' + p.id); });
       var valueOnly=['sRate','sFilt','sFiltNx','sShap','sBuf','sDSD','sIsp','s2s','sp_cast_file'];
       var miss=[];
@@ -787,7 +789,18 @@ async function waitFor(expr, ms = 8000) {
 
   // ---- 本轮新增：队列主视图 / 文件夹地址栏 / 正在播放页 / 循环键 / 拖拽遮罩 ----
   await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='queue').click()");
-  await sleep(700);
+  // 判据稳健性（2026-10-23）：搜索结果/设置页残留的异步回调可能把视图切回去（已修两处，仍可能有第三方来源），
+  // 这里等到 S.view==='queue' 再断言，避免把"还没切过去"误报成"页面坏了"。
+  // 判据要等"页面真的画出来"：S.view 是同步置位的，标题/列表在 /api/queue 回来后才补。
+  let qView = await waitFor("S.view==='queue' && (document.getElementById('pth').textContent.indexOf('播放队列')>=0 || !!document.querySelector('#list .qrow') || !!document.querySelector('#list .empty'))", 6000);
+  if (!qView) {
+    // 记下点击无效时的现场（自检互不干扰：这里只读，不修复产品状态）
+    const dbg = await evalJs("(function(){return JSON.stringify({view:S.view,pth:(document.getElementById('pth')||{}).textContent||'',navs:document.querySelectorAll('.nav').length});})()");
+    await evalJs("setView('queue')");   // 兜底：直接进队列视图，继续验证"渲染/标题"，另记一条点击未生效
+    await waitFor("S.view==='queue'", 3000);
+    ck(false, '点击左侧「播放队列」能切到队列视图（点击后视图仍是别的页）', dbg);
+  }
+  await sleep(500);
   ck(await evalJs("!!document.querySelector('#list .qrow') || !!document.querySelector('#list .empty')"), '播放队列有内容或明确的空状态');
   ck(await evalJs("document.getElementById('pth').textContent.indexOf('播放队列') >= 0"), '队列页标题正确');
 

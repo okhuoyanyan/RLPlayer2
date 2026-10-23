@@ -4013,7 +4013,11 @@ document.addEventListener('keydown', function (e) {
 /* ---------------- 播放队列（主视图） ---------------- */
 function renderQueuePage() {
   S.view = 'queue';
+  // 2026-10-23（自检暴露）：标题原来只在 /api/queue 回来后才写 → 本地接口虽快，但慢的时候
+  // 会出现"已经在队列页、标题还是上一页"的空窗。先同步写标题，再等数据补数量/按钮。
+  head('播放队列', '', '');
   api('/api/queue').then(function (j) {
+    if (S.view !== 'queue') return;   // 已切走 → 丢弃，别覆写当前页面（与 loadTracks 同规则）
     S.q = { items: j.items || [], index: j.index || 0 };
     var n = S.q.items.length;
     head('播放队列', n ? (n + ' 首') : '', n ? '<button class=btn id=qClrAll>清空队列</button>' : '');
