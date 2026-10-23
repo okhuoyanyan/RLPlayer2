@@ -220,12 +220,18 @@ async function gotoFiles() {
     var hasBio = !!document.querySelector('.bio-sec');
     var hasEmpty = !!document.querySelector('.empty-card');
     var hasRetry = !!document.getElementById('bRetryKnowledge');
+    var aiCard = document.getElementById('artistSummary');
+    var hasAi = !!aiCard && (aiCard.querySelectorAll('.efrow').length > 0 || aiCard.querySelectorAll('.npdsec').length > 0);
     if (hasSources && hasBio) return 'data-branch';
     if (hasEmpty && hasRetry) return 'empty-branch';
-    return 'sources=' + hasSources + ' bio=' + hasBio + ' empty=' + hasEmpty + ' retry=' + hasRetry;
+    // 261024-01 #3a：没有权威词条时**不再**拍「权威词条暂缺」卡，直接安静显示 AI 整理资料
+    if (hasAi) return 'ai-branch';
+    return 'sources=' + hasSources + ' bio=' + hasBio + ' empty=' + hasEmpty + ' retry=' + hasRetry + ' ai=' + hasAi;
   })()`);
-  ck(profileState === 'data-branch' || profileState === 'empty-branch',
-     '艺术家资料页状态正常（有数据时有简介与来源芯片，无数据时有空态卡与重试按钮）', profileState);
+  ck(profileState === 'data-branch' || profileState === 'empty-branch' || profileState === 'ai-branch',
+     '艺术家资料页状态正常（有数据=简介+来源芯片；无权威=安静显示 AI 资料；离线=空态卡+重试）', profileState);
+  ck(await evalJs("(function(){var t=document.body.textContent||'';return t.indexOf('权威词条暂缺')<0 && t.indexOf('没有匹配条目')<0 && t.indexOf('权威资料暂缺')<0;})()"),
+     '艺术家资料页没有「权威词条暂缺 / 没有匹配条目 / 权威资料暂缺」解释文案（261024-01 #3a）');
   ck(await evalJs("document.querySelectorAll('a[href^=http]').length === 0"),
      '艺术家资料页无 http 外链（来源一律使用复制链接芯片）');
   if (profileState === 'data-branch') {
@@ -815,15 +821,19 @@ async function gotoFiles() {
   await sleep(400);
   ck(await evalJs("document.getElementById('npPage').classList.contains('on')"), '点封面可以打开正在播放页');
   ck(await evalJs("!!document.getElementById('npMeta') && document.getElementById('npMeta').closest('#npPage') !== null"), '正在播放页有 #npMeta 芯片容器');
-  // 261023-04 #7：单曲页资料区改为多实体分区面板（歌曲/专辑/艺术家/作品），#npSummary 已移除
-  ck(await evalJs("!!document.getElementById('npData') && document.getElementById('npData').closest('#npPage') !== null"), '正在播放页有 #npData 资料面板容器');
-  ck(await evalJs("!!document.getElementById('npTabs') && !!document.getElementById('npDataBody')"), '资料面板有 tab 条与内容区');
-  ck(await evalJs("!document.getElementById('npSummary')"), '旧的单一 #npSummary 简介容器已移除');
+  // 261024-01 #3b ③：资料默认隐藏，右侧只露标签；点标签才滑出抽屉
+  ck(await evalJs("!!document.getElementById('npRail') && document.getElementById('npRail').closest('#npPage') !== null"), '正在播放页有右侧资料标签栏 #npRail');
+  ck(await evalJs("!!document.getElementById('npTabs') && !!document.getElementById('npDrawer') && !!document.getElementById('npDataBody')"), '资料标签栏 + 抽屉 + 内容区齐全');
+  ck(await evalJs("(function(){var d=document.getElementById('npDrawer');return !!d && !d.classList.contains('on') && d.getBoundingClientRect().left >= innerWidth - 2;})()"),
+     '资料抽屉默认关闭且完全在视口外（默认不占版面）');
+  ck(await evalJs("!document.getElementById('npSummary') && !document.getElementById('npData')"), '旧的 #npSummary / 整行 #npData 面板已移除');
   // #6 几何回归：歌词区与进度条在任何窗口尺寸下不得重叠（1024x640 曾压在一起）
   ck(await evalJs("(function(){var a=document.getElementById('npLyric').getBoundingClientRect(),b=document.getElementById('npSeek').getBoundingClientRect();return a.bottom<=b.top && b.top-a.bottom>=12;})()"),
      '歌词区与进度条不重叠且间距 >= 12px');
-  ck(await evalJs("(function(){var a=document.getElementById('npData').getBoundingClientRect(),b=document.getElementById('npSeek').getBoundingClientRect();return a.bottom<=b.top;})()"),
-     '资料区与进度条不重叠');
+  ck(await evalJs("(function(){var r=document.getElementById('npRail'),l=document.getElementById('npLyric');if(!r||!l)return false;var a=r.getBoundingClientRect();if(a.width<2)return true;var b=l.getBoundingClientRect();if(b.width<2)return true;return a.left>=b.right-1&&Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top)>20;})()"),
+     '资料标签栏在歌词右侧同一行（左右排列，不是上下堆叠；本实例未配 AI 时标签栏本就不显示）');
+  ck(await evalJs("(function(){var v=document.getElementById('npVol'),p=document.getElementById('npPlay');if(!v||!p)return false;var a=v.getBoundingClientRect(),b=p.getBoundingClientRect();return Math.abs((a.top+a.height/2)-(b.top+b.height/2))<=10;})()"),
+     '音量与播放键同一行（不再单独占底部一行）');
   // 空态文案要用「清掉歌词后的 renderNpLyric」来验：实例上可能正停着一首带在线歌词的曲子
   // （LY.lines 非空 → 显示的是歌词而不是空态），那是正常业务态，不是文案缺失。
   ck(await evalJs("(function(){var keep=LY.lines;LY.lines=[];renderNpLyric();var ok=document.getElementById('npLyric').innerHTML.indexOf('在线补全')>=0;LY.lines=keep;var b=document.getElementById('npLyric');if(b){b.dataset.n='';}renderNpLyric();return ok;})()"), '歌词空态提示「播放时自动在线补全」');

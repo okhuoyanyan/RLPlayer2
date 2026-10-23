@@ -7,14 +7,25 @@
 // 用法：
 //   node tools/npcheck.js <url> <截图目录> [有歌词且专辑简介已缓存的曲目] [古典曲目]
 // 判据（全部打印 [PASS]/[FAIL]，exit code 0 = 全过）：
-//   1. #6 几何：四行（hero/data/lyric/ctl）任意两者不相交；歌词底与进度条顶间距 >= 12px；
+//   1. 几何（261024-01 #3b）：hero / 歌词+标签栏 / 控制区 三段互不相交；
+//      歌词区与进度条间距 >= 12px；**歌词在左、标签栏在右**（同一行、垂直区间重叠），不是上下堆叠；
 //      1024x640 与 1576x908 都测。
-//   2. #5 黑边：宿主已改「WebView 满幅」（launcher kBandInset=0），页面也不再自绘实色外圈/暗角。
-//      这里断言：.npedge 不再显示、#npPage 覆盖整个视口（>1px 误差即失败），并抽查边缘像素连续性。
-//   3. #7 资料：默认 tab = 专辑且命中缓存（状态「已缓存」）；切「歌曲」tab 才请求；
-//      无缓存专辑切歌后出现骨架加载态；古典曲目出现「作品」tab 且版本列表渲染。
-//   4. #4 EQ 芯片：有 eq 时出现、点击进入 EQ 页；清空后消失。
-//   5. #9 古典作品导航：导航里没有「古典作品」；作品 tab 的按钮可进入 works 页且有返回路径。
+//   2. 黑边：宿主已改「WebView 满幅」（launcher kBandInset=0），页面也不再自绘实色外圈/暗角。
+//      这里断言：.npedge 不再显示、#npPage 覆盖整个视口（>1px 误差即失败）。
+//   3. 控制区（#3b ①）：音量**与控制键同一行**（|音量中心 - 播放键中心| <= 10px），而不是单独一行；
+//      整页底部只有一块控制区。
+//   4. 资料（#3b ③ / #4）：默认**完全隐藏**（抽屉关闭、不预取、不产生请求）；右侧只有标签药丸；
+//      点标签才滑出抽屉，抽屉**不遮住控制区**；歌曲/专辑/艺术家三个标签分别请求 kind=track/release/person，
+//      渲染的是各自的 fields 网格（不是同一份内容塞进三个标签）；#npDataClose / Esc / 点遮罩都能关；
+//      古典曲目出现「作品」标签且版本列表渲染。
+//   5. 文案（#2）：资料里只出现「AI 整理」四个字，不得出现「未找到权威来源」「仅供参考」「未核对」。
+//   6. #4 EQ 芯片：有 eq 时出现、点击进入设置-EQ 页；清空后消失。
+//   7. #9 古典作品导航：导航里没有「古典作品」；作品标签的按钮可进入 works 页且有返回路径。
+//
+// ⚠️ 数据来源口径：本机测试实例没有 LLM key（不花钱、不出网），所以「资料内容」类判据用
+//    **页内契约 mock 注入**（拦截 fetch，返回 Lead 约定的 {kind, fields} 形状）：零真实调用、可复现。
+//    UI 渲染/交互/几何全部是对真实页面的断言；真实后端联调由 Lead 侧验证。
+//    传 --no-mock 可关掉注入（此时实例必须真有 AI 能力，否则资料类判据会 FAIL）。
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -23,10 +34,52 @@ const os = require('os');
 const URL_ = process.argv[2] || 'http://127.0.0.1:8916/';
 const OUT = process.argv[3] || path.join(os.tmpdir(), 'rta_npcheck');
 fs.mkdirSync(OUT, { recursive: true });
-const TRACK = process.argv[4] || '';
-const CLASSICAL = process.argv[5] || '';
-const LYRICS = process.argv[6] || '';
-const UNCACHED = process.argv[7] || '';
+// 可选夹具用 '-' 表示"没有"（PowerShell 会把空字符串参数吞掉，所以别依赖空串）
+const arg = i => ((process.argv[i] || '') === '-' ? '' : (process.argv[i] || ''));
+const TRACK = arg(4);
+const CLASSICAL = arg(5);
+const LYRICS = arg(6);
+const UNCACHED = arg(7);
+const NO_MOCK = process.argv.indexOf('--no-mock') >= 0;
+
+// 契约为 Lead 约定的 {ok, kind, fields:{标签:值}}。三个 kind 内容形状不同 ⟹ 顺带验证
+// "歌曲标签渲染的是歌曲级字段、专辑标签是专辑级字段"，不会串台。
+const MOCK_BY_KIND = {
+  track: { ok: true, kind: 'track', summaryKind: 'track', summaryCached: false, unverified: true, citations: [],
+    fields: { '演唱': 'MOCK-演唱', '作词': 'MOCK-作词', '作曲': 'MOCK-作曲', '歌曲风格': 'MOCK-风格',
+              '发行时间': 'MOCK-发行', '时长': 'MOCK-时长', '歌词赏析': 'MOCK-歌词赏析（长文，独占整行）' } },
+  release: { ok: true, kind: 'release', summaryKind: 'release', summaryCached: true, unverified: true, citations: [],
+    fields: { '艺术家': 'MOCK-艺术家', '发行时间': 'MOCK-发行', '专辑类型': 'MOCK-类型', '语种': 'MOCK-语种',
+              '出版方': 'MOCK-出版方', '专辑编号': 'MOCK-编号', '曲目列表': 'MOCK-曲目列表（长文）' } },
+  person: { ok: true, kind: 'person', summaryKind: 'person', summaryCached: true, unverified: true, citations: [],
+    fields: { '简介': 'MOCK-简介（长文，独占整行）', '国籍': 'MOCK-国籍', '活跃年代': 'MOCK-年代',
+              '风格': 'MOCK-流派', '代表作品': 'MOCK-代表作', '厂牌': 'MOCK-厂牌' } }
+};
+const MOCK_JS = String.raw`(function(){
+  window.__reqs = [];
+  if (window.__npMock) return true;
+  window.__npMock = 1;
+  var of = window.fetch;
+  window.fetch = function(u, o){
+    var s = String(u);
+    if (s.indexOf('/api/entity/summary') === 0) {
+      var m = /[?&]kind=([a-z]+)/.exec(s);
+      var kind = m ? m[1] : 'person';
+      window.__reqs.push(s);
+      var body = window.__MOCKDATA[kind] || { ok:false, error:'mock-none' };
+      return Promise.resolve(new Response(JSON.stringify(body), { status:200, headers:{'Content-Type':'application/json'} }));
+    }
+    if (s.indexOf('/api/status') === 0) {
+      return of.apply(this, arguments).then(function(r){ return r.json(); }).then(function(j){
+        j.hasLlmKey = true; j.summaryEnabled = true;
+        return new Response(JSON.stringify(j), { status:200, headers:{'Content-Type':'application/json'} });
+      });
+    }
+    return of.apply(this, arguments);
+  };
+  try { META.hasLlmKey = true; META.summary = 1; } catch(e){}
+  return true;
+})()`;
 
 const EDGE = ['C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
               'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'].find(p => fs.existsSync(p));
@@ -144,35 +197,63 @@ async function seamCheck(pngPath) {
   const expr = "(function(){var img=new Image();img.src='data:image/png;base64," + b64 + "';return new Promise(function(res){img.onload=function(){var c=document.createElement('canvas');c.width=img.width;c.height=img.height;var x=c.getContext('2d');x.drawImage(img,0,0);function px(a,b){var d=x.getImageData(a,b,1,1).data;return [d[0],d[1],d[2]];}var W=img.width,H=img.height,maxJump=0,maxRange=0,samples=0,ref=px(Math.round(W/2),2);function scan(fn){for(var i=0;i<8;i++){var prev=null,mn=[255,255,255],mx=[0,0,0];for(var d=0;d<=7;d++){var q=fn(d,i);for(var k=0;k<3;k++){if(q[k]<mn[k])mn[k]=q[k];if(q[k]>mx[k])mx[k]=q[k];if(prev)maxJump=Math.max(maxJump,Math.abs(q[k]-prev[k]));}prev=q;}for(var k=0;k<3;k++)maxRange=Math.max(maxRange,mx[k]-mn[k]);samples++;}}scan(function(d,i){return px(d,Math.round((i+0.5)*H/8));});scan(function(d,i){return px(W-1-d,Math.round((i+0.5)*H/8));});scan(function(d,i){return px(Math.round((i+0.5)*W/8),d);});scan(function(d,i){return px(Math.round((i+0.5)*W/8),H-1-d);});res({maxJump:maxJump,maxRange:maxRange,samples:samples,ref:ref});};});})()";
   return await evalJs(expr);
 }
+function box(sel) {
+  return evalJs("(function(){var e=document.querySelector(" + JSON.stringify(sel) + ");if(!e)return null;var b=e.getBoundingClientRect();return {t:Math.round(b.top),b:Math.round(b.bottom),l:Math.round(b.left),r:Math.round(b.right),w:Math.round(b.width),h:Math.round(b.height)};})()");
+}
 async function gapChecks(W, H) {
-  const hero = await rect('npGrid') && await evalJs("(function(){var e=document.querySelector('.nphero');if(!e)return null;var b=e.getBoundingClientRect();return {t:Math.round(b.top),b:Math.round(b.bottom),l:Math.round(b.left),r:Math.round(b.right)};})()");
-  const data = await rect('npData');
-  const lyric = await rect('npLyric');
-  const seek = await rect('npSeek');
-  const ctl = await evalJs("(function(){var e=document.querySelector('.npctl2');if(!e)return null;var b=e.getBoundingClientRect();return {t:Math.round(b.top),b:Math.round(b.bottom),l:Math.round(b.left),r:Math.round(b.right)};})()");
+  const hero = await box('.nphero');
+  const body = await box('.npbody');
+  const lyric = await box('#npLyric');
+  const rail = await box('#npRail');
+  const seek = await box('#npSeek');
+  const ctl = await box('.npctl2');
   const tag = ' @' + W + 'x' + H;
-  ck(noOverlap(hero, data), '封面+标题区 与 资料区 不重叠' + tag, JSON.stringify({ hero: hero && hero.b, data: data && data.t }));
-  ck(noOverlap(data, lyric), '资料区 与 歌词区 不重叠' + tag, JSON.stringify({ data: data && data.b, lyric: lyric && lyric.t }));
-  ck(noOverlap(lyric, seek), '歌词区 与 进度条 不重叠' + tag, JSON.stringify({ lyric: lyric && lyric.b, seek: seek && seek.t }));
-  ck(noOverlap(lyric, ctl), '歌词区 与 控制区 不重叠' + tag, JSON.stringify({ lyric: lyric && lyric.b, ctl: ctl && ctl.t }));
-  ck(noOverlap(data, seek), '资料区 与 进度条 不重叠' + tag, '');
-  const gap = (seek && lyric) ? (seek.t - lyric.b) : -1;
-  ck(gap >= 12, '1024/1576 下歌词与进度条间距 >= 12px' + tag, 'gap=' + gap + 'px');
+  ck(noOverlap(hero, body), '封面+标题区 与 歌词/资料区 不重叠' + tag, 'hero.b=' + (hero && hero.b) + ' body.t=' + (body && body.t));
+  ck(noOverlap(body, ctl), '歌词/资料区 与 控制区 不重叠' + tag, 'body.b=' + (body && body.b) + ' ctl.t=' + (ctl && ctl.t));
+  ck(noOverlap(lyric, seek), '歌词区 与 进度条 不重叠' + tag, 'lyric.b=' + (lyric && lyric.b) + ' seek.t=' + (seek && seek.t));
+  const gap = (seek && body) ? (seek.t - body.b) : -1;
+  ck(gap >= 6, '歌词/资料区 与 进度条 间距 >= 6px' + tag, 'gap=' + gap + 'px');
+  // #3b ② 左右排列判据：歌词在左、标签栏在右，且两者垂直区间重叠（=同一行），绝不是上下堆叠。
+  if (rail && rail.w > 0) {
+    if (lyric && lyric.w > 2) {
+      const vOverlap = Math.min(lyric.b, rail.b) - Math.max(lyric.t, rail.t);
+      ck(lyric.r <= rail.l && vOverlap > 40 && !overlaps(lyric, rail),
+         '歌词在左 / 资料标签栏在右 同行排列（不是上下堆叠）' + tag,
+         'lyric.r=' + lyric.r + ' rail.l=' + rail.l + ' 垂直重叠=' + vOverlap + 'px');
+    } else {
+      // 纯音乐/无歌词：歌词区收起，标签栏仍在正文区且在控制区之上
+      ck(rail.t >= (body ? body.t - 1 : 0) && rail.b <= (ctl ? ctl.t + 1 : 99999),
+         '无歌词时标签栏仍在正文区、不压控制区' + tag, 'rail=' + JSON.stringify(rail));
+    }
+  } else {
+    ck(false, '右侧资料标签栏显示（有可用实体时）' + tag, JSON.stringify({ rail: rail }));
+  }
+  // #3b ① 音量必须在控制行里，和播放键同一行（用户：不能单独一行放最下面）
+  const vm = await evalJs("(function(){var v=document.getElementById('npVol'),p=document.getElementById('npPlay');if(!v||!p)return null;var a=v.getBoundingClientRect(),b=p.getBoundingClientRect();var row=document.querySelector('.npctlrow');var rb=row?row.getBoundingClientRect():null;return {vc:Math.round(a.top+a.height/2),pc:Math.round(b.top+b.height/2),vBottom:Math.round(a.bottom),ctlBottom:Math.round(rb?rb.bottom:0)};})()");
+  ck(vm && Math.abs(vm.vc - vm.pc) <= 10, '音量与控制键同一行（中心差 <= 10px）' + tag, JSON.stringify(vm));
   // 2026-10-24：宿主改为 WebView 满幅（launcher kBandInset=0），页面不再自绘实色外圈/暗角。
-  // 这里断言两件事：① 那个"假边带"元素确实不显示；② 单曲页覆盖整个视口（有 1px 以上缩进就是黑边回来了）。
   const edge = await evalJs("(function(){var ep=document.querySelector('.npedge');var b=document.getElementById('npPage').getBoundingClientRect();return {npedge:ep?getComputedStyle(ep).display:'(missing)',np:[Math.round(b.left),Math.round(b.top),Math.round(b.right),Math.round(b.bottom)],vp:[innerWidth,innerHeight]};})()");
   ck(edge && edge.npedge === 'none', '页面不再自绘实色边框/暗角（.npedge 已隐藏）' + tag, JSON.stringify(edge));
   ck(edge && Math.abs(edge.np[0]) <= 1 && Math.abs(edge.np[1]) <= 1 && Math.abs(edge.np[2] - edge.vp[0]) <= 1 && Math.abs(edge.np[3] - edge.vp[1]) <= 1,
      '单曲页铺满整个视口（无内缩 ⟹ 无黑边）' + tag, edge ? JSON.stringify({ np: edge.np, vp: edge.vp }) : '');
-  return { hero: hero, data: data, lyric: lyric, seek: seek, ctl: ctl };
+  return { hero: hero, body: body, lyric: lyric, rail: rail, seek: seek, ctl: ctl };
 }
+// 标签bar（261024-01 #3b ③）：.npchip 取代旧的 .npdtab
 async function tabClick(label) {
-  return evalJs("(function(){var b=Array.from(document.querySelectorAll('.npdtab')).filter(function(x){return x.textContent.trim()===" + JSON.stringify(label) + ";});if(!b.length)return false;b[0].click();return true;})()");
+  return evalJs("(function(){var b=Array.from(document.querySelectorAll('.npchip')).filter(function(x){return x.textContent.trim()===" + JSON.stringify(label) + ";});if(!b.length)return false;b[0].click();return true;})()");
 }
 async function activeTab() {
-  return evalJs("(function(){var b=document.querySelector('.npdtab.on');return b?b.textContent.trim():'';})()");
+  return evalJs("(function(){var b=document.querySelector('.npchip.on');return b?b.textContent.trim():'';})()");
 }
-async function dataStat() { return evalJs("document.getElementById('npDataStat').textContent.trim()"); }
+async function dataStat() { return evalJs("(document.getElementById('npDataStat')||{}).textContent||''"); }
+async function drawerOpen() { return evalJs("(function(){var d=document.getElementById('npDrawer');return !!(d&&d.classList.contains('on'));})()"); }
+async function drawerState() {
+  return evalJs("(function(){var d=document.getElementById('npDrawer');var b=d.getBoundingClientRect();var ctl=document.querySelector('.npctl2');var cb=ctl?ctl.getBoundingClientRect():null;return {on:d.classList.contains('on'),l:Math.round(b.left),r:Math.round(b.right),t:Math.round(b.top),b:Math.round(b.bottom),w:Math.round(b.width),kind:(document.getElementById('npDrawerKind')||{}).textContent,name:(document.getElementById('npDrawerName')||{}).textContent,rows:document.querySelectorAll('#npDataBody .efrow').length,ctlTop:cb?Math.round(cb.top):0,body:(document.getElementById('npDataBody')||{}).textContent||''};})()");
+}
+async function installMock() {
+  await evalJs("window.__MOCKDATA = " + JSON.stringify(MOCK_BY_KIND) + ";");
+  await evalJs(MOCK_JS);
+}
 
 (async () => {
   let pages = [];
@@ -196,6 +277,8 @@ async function dataStat() { return evalJs("document.getElementById('npDataStat')
   await send('Page.navigate', { url: URL_ });
   await sleep(1000);
   await waitFor("document.querySelectorAll('.card').length > 0", 20000);
+  // 契约 mock（见文件头「数据来源口径」）：本实例无 LLM key，资料类判据用页内注入的 {kind, fields}
+  if (!NO_MOCK) { await installMock(); console.log('  [mock] 已注入 /api/entity/summary 契约 mock（零真实调用）'); }
   const navs = await evalJs("Array.from(document.querySelectorAll('.nav')).map(function(e){return e.textContent.trim();})");
   ck(navs.indexOf('古典作品') < 0, '左侧导航没有「古典作品」入口（#9）', JSON.stringify(navs));
   // 2026-10-23 合并后更新：EQ 已按 #2 移入设置页，导航里也不该再有它（r4-np 分支当时还是旧布局）
@@ -208,30 +291,75 @@ async function dataStat() { return evalJs("document.getElementById('npDataStat')
       await setSize(W, H);
       // 2026-10-23：上一档尺寸里用户手动点过「歌曲」tab，产品会尊重手动选择（不该被自动抢回默认），
       // 所以每个尺寸作为独立场景前，先清掉"手动选择"标记与面板缓存，再验证默认 tab。
-      await evalJs("(function(){if(typeof NP_DATA!=='undefined'){NP_DATA.userPicked=false;NP_DATA.active='';}if(typeof npDataReset==='function')npDataReset();})()");
-      // 切换尺寸后整页重排；用缓存命中曲目作为「默认态」
+      await evalJs("(function(){if(typeof npDataReset==='function')npDataReset();window.__reqs=[];})()");
+      // 切换尺寸后整页重排
       await play(TRACK);
       await ensureNpOpen();
-      const dataShown = await waitFor("document.getElementById('npData') && getComputedStyle(document.getElementById('npData')).display !== 'none'", 25000);
-      ck(dataShown, '资料面板显示（有缓存，开关开启）' + tag, '');
-      await waitFor("document.getElementById('npDataStat') && document.getElementById('npDataStat').textContent.indexOf('缓存') >= 0", 20000);
-      ck((await activeTab()) === '专辑', '默认 tab = 专辑' + tag, await activeTab());
-      ck((await dataStat()).indexOf('缓存') >= 0, '命中的缓存直接出内容（不闪加载行）' + tag, await dataStat());
-      const tabs = await evalJs("Array.from(document.querySelectorAll('.npdtab')).map(function(b){return b.textContent.trim();})");
-      ck(tabs.indexOf('歌曲') >= 0 && tabs.indexOf('专辑') >= 0 && tabs.indexOf('艺术家') >= 0, '资料分区含 歌曲/专辑/艺术家' + tag, JSON.stringify(tabs));
+      await sleep(500);
+      // ---- 默认态（#3b ③）：资料**完全不占版面**，右侧只有标签药丸；且不预取（不产生任何请求）----
+      const chips = await evalJs("Array.from(document.querySelectorAll('.npchip')).map(function(b){return b.textContent.trim();})");
+      ck(chips.length >= 3 && chips.indexOf('歌曲') >= 0 && chips.indexOf('专辑') >= 0 && chips.indexOf('艺术家') >= 0,
+         '右侧有 歌曲/专辑/艺术家 标签（作品按古典判定出现）' + tag, JSON.stringify(chips));
+      const d0 = await drawerState();
+      ck(!d0.on, '默认不打开资料抽屉（资料默认隐藏）' + tag, 'on=' + d0.on);
+      ck(d0.l >= (W - 2) || d0.l >= W, '抽屉关闭时完全移出视口（不占版面）' + tag, 'drawer.l=' + d0.l + ' W=' + W);
+      const req0 = await evalJs("(window.__reqs||[]).length");
+      ck(req0 === 0, '默认不预取任何实体（不点标签 = 不产生 AI 请求）' + tag, 'reqs=' + req0);
       const r = await gapChecks(W, H);
-      await shot('np-' + W + 'x' + H + '-01-cached');
-      // 2026-10-24：旧的"模拟宿主边带 + 接缝像素"判据随满幅方案作废（页面已无外圈元素）；
-      // 黑边判据改为上面 gapChecks 里的「npedge 隐藏 + npPage 满视口」两条。
-      await shot('np-' + W + 'x' + H + '-02-cached');
-      // 点「歌曲」tab：只在这时才请求（费用纪律）
-      await tabClick('歌曲');
-      await sleep(300);
-      ck((await activeTab()) === '歌曲', '切到「歌曲」tab' + tag, '');
-      const songHasContent = await evalJs("document.querySelector('#npDataBody .npdsec, #npDataBody .npdskel') !== null");
-      ck(songHasContent, '歌曲 tab 有内容或骨架（切 tab 才加载）' + tag, '');
-      await waitFor("document.getElementById('npDataBody') && (document.querySelector('#npDataBody .npdsec') || document.getElementById('npDataStat').textContent.indexOf('暂无') >= 0)", 60000);
+      await shot('np-' + W + 'x' + H + '-01-default');
+      // ---- 点「专辑」标签：才请求 kind=release，抽屉滑出且不遮住控制区 ----
+      ck(await tabClick('专辑'), '点「专辑」标签' + tag, '');
+      await sleep(600);
+      const dAlb = await drawerState();
+      ck(dAlb.on && dAlb.kind === '专辑', '抽屉滑出且头部显示「专辑」' + tag, JSON.stringify({ on: dAlb.on, kind: dAlb.kind }));
+      ck(dAlb.b <= dAlb.ctlTop + 1, '抽屉不遮住播放控制区' + tag, 'drawer.b=' + dAlb.b + ' ctl.t=' + dAlb.ctlTop);
+      ck(dAlb.rows >= 3, '专辑标签渲染字段网格（.efrow >= 3 行）' + tag, 'rows=' + dAlb.rows);
+      const relReq = await evalJs("(window.__reqs||[]).filter(function(s){return /[?&]kind=release/.test(s);}).length");
+      ck(relReq >= 1, '专辑标签请求的是 kind=release' + tag, 'release 请求 ' + relReq + ' 次');
+      ck(await evalJs("(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-艺术家')>=0||t.indexOf('MOCK-类型')>=0;})()"),
+         '专辑标签内容来自 release 级字段（不串台）' + tag, '');
+      await shot('np-' + W + 'x' + H + '-02-album-tab');
+      // 关闭（#npDataClose）
+      await evalJs("document.getElementById('npDataClose').click()");
+      await sleep(350);
+      ck(!(await drawerOpen()), '点右上关闭按钮收起抽屉' + tag, '');
+      // ---- 点「歌曲」标签：请求 kind=track，内容必须是曲目级 ----
+      ck(await tabClick('歌曲'), '点「歌曲」标签' + tag, '');
+      await sleep(600);
+      const dTrk = await drawerState();
+      ck(dTrk.on && dTrk.kind === '歌曲', '抽屉头部显示「歌曲」' + tag, JSON.stringify({ kind: dTrk.kind }));
+      ck(await evalJs("(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-演唱')>=0||t.indexOf('MOCK-作词')>=0;})()"),
+         '歌曲标签渲染曲目级字段（演唱/作词…，不是歌手简介）' + tag, '');
+      // 实体串台硬判据：歌曲 tab 里不得出现艺术家级字段
+      ck(await evalJs("(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-国籍')<0&&t.indexOf('MOCK-厂牌')<0;})()"),
+         '歌曲标签里没有艺术家级字段（国籍/厂牌）—— 不串台' + tag, '');
+      const trkReq = await evalJs("(window.__reqs||[]).filter(function(s){return /[?&]kind=track/.test(s);}).length");
+      ck(trkReq >= 1, '歌曲标签请求的是 kind=track' + tag, 'track 请求 ' + trkReq + ' 次');
       await shot('np-' + W + 'x' + H + '-03-song-tab');
+      // ---- 点「艺术家」标签：kind=person ----
+      ck(await tabClick('艺术家'), '点「艺术家」标签' + tag, '');
+      await sleep(600);
+      const dPer = await drawerState();
+      ck(dPer.on && dPer.kind === '艺术家', '抽屉头部显示「艺术家」' + tag, JSON.stringify({ kind: dPer.kind }));
+      ck(await evalJs("(function(){var t=document.getElementById('npDataBody').textContent;return t.indexOf('MOCK-国籍')>=0||t.indexOf('MOCK-代表作')>=0;})()"),
+         '艺术家标签渲染表演者级字段（国籍/代表作品…）' + tag, '');
+      const perReq = await evalJs("(window.__reqs||[]).filter(function(s){return /[?&]kind=person/.test(s);}).length");
+      ck(perReq >= 1, '艺术家标签请求的是 kind=person' + tag, 'person 请求 ' + perReq + ' 次');
+      await shot('np-' + W + 'x' + H + '-04-artist-tab');
+      // ---- Esc 关抽屉（不关整页）----
+      await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+      await sleep(400);
+      ck(!(await drawerOpen()), 'Esc 收起抽屉' + tag, '');
+      ck(await evalJs("document.getElementById('npPage').classList.contains('on')"), 'Esc 收抽屉时整页仍开着' + tag, '');
+      // ---- 正文文案（#2）：只留「AI 整理」----
+      await tabClick('专辑');
+      await sleep(500);
+      const txt = await evalJs("document.getElementById('npDataBody').textContent");
+      ck(txt.indexOf('未找到权威来源') < 0 && txt.indexOf('仅供参考') < 0 && txt.indexOf('未核对') < 0,
+         '资料里没有「未找到权威来源/仅供参考/未核对」' + tag, '');
+      ck(txt.indexOf('AI 整理') >= 0, '资料里有「AI 整理」标注（诚实标注保留）' + tag, '');
+      await evalJs("document.getElementById('npDataClose').click()");
+      await sleep(300);
       // 有歌词的曲目：用真实多行歌词验 1024x640 的「歌词压进度条」回归
       if (LYRICS) {
         await play(LYRICS);
@@ -241,15 +369,19 @@ async function dataStat() { return evalJs("document.getElementById('npDataStat')
         await gapChecks(W, H);
         await shot('np-' + W + 'x' + H + '-03b-lyrics');
       }
-      // 无缓存专辑：切歌后自动加载 → 骨架（两个尺寸都拍；该实体每轮都会重新尝试且无权威材料时快速失败，成本可控）
+      // 无缓存实体：点开标签后必须进入**明确终态**（内容或「暂无资料」+重试），不能永远停在骨架
+      //（#3b ③ 默认不预取，所以加载态只能由点击触发）
       if (UNCACHED) {
         await play(UNCACHED);
-        await sleep(700);
-        const loading = await evalJs("(function(){var b=document.getElementById('npDataBody');return !!(b && b.querySelector('.npdskel'));})()");
-        ck(loading, '无缓存实体加载态为骨架（不是大块空白）' + tag, '');
-        await shot('np-' + W + 'x' + H + '-04-loading');
-        await waitFor("document.getElementById('npDataStat') && document.getElementById('npDataStat').textContent.indexOf('暂无') < 0 && !document.querySelector('#npDataBody .npdskel')", 60000);
-        await shot('np-' + W + 'x' + H + '-04b-loaded');
+        // /api/meta 分两拍回来：等标签栏出现再点（否则是竞态假失败）
+        await waitFor("document.querySelectorAll('.npchip').length > 0", 20000);
+        await sleep(300);
+        let opened = await tabClick('专辑');
+        if (!opened) opened = await tabClick('歌曲');
+        ck(opened, '无缓存曲目也能点开资料标签（专辑/歌曲）' + tag, '');
+        const settled = await waitFor("(function(){var b=document.getElementById('npDataBody');if(!b)return false;return !b.querySelector('.npdskel');})()", 60000);
+        ck(settled, '点开后进入明确终态（内容或暂无资料，不停在骨架）' + tag, '');
+        await shot('np-' + W + 'x' + H + '-05-uncached');
       }
       if (CLASSICAL) {
         await play(CLASSICAL);
@@ -266,7 +398,7 @@ async function dataStat() { return evalJs("document.getElementById('npDataStat')
             }
           }
         } catch (e) { }
-        const hasWork = await evalJs("Array.from(document.querySelectorAll('.npdtab')).some(function(b){return b.textContent.trim()==='作品';})");
+        const hasWork = await evalJs("Array.from(document.querySelectorAll('.npchip')).some(function(b){return b.textContent.trim()==='作品';})");
         ck(hasWork, '古典曲目出现「作品」tab' + tag, '');
         await tabClick('作品');
         await sleep(500);
@@ -295,7 +427,9 @@ async function dataStat() { return evalJs("document.getElementById('npDataStat')
           ck(await evalJs("document.getElementById('npPage').classList.contains('on')"), '可从 works 页返回单曲页' + tag, '');
         }
       }
-      // 收起单曲页，回到列表（避免影响下一尺寸）
+      // 收起单曲页，回到列表（避免影响下一尺寸）；抽屉先收，避免残留状态
+      await evalJs("(function(){var d=document.getElementById('npDrawer');if(d&&d.classList.contains('on')&&document.getElementById('npDataClose'))document.getElementById('npDataClose').click();})()");
+      await sleep(200);
       await evalJs("document.getElementById('npClose').click()");
       await sleep(300);
     }
