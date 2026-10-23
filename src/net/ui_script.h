@@ -1631,10 +1631,25 @@ function loadRates() {
 }
 
 /* ---------------- 媒体库状态 ---------------- */
+// 2026-10-24（用户 261024-01 #6/#7）：本地音乐库页用「数字」代替一段说明文字 ——
+// 曲目 / 专辑 / 扫描线程 / 上次扫描耗时 一眼可见，说明文字全部收进 (?)。
+function renderLibStats(j) {
+  var box = D('sp_libstats'); if (!box) return;
+  var th = parseInt(j.scanThreads, 10) || 0;
+  var ms = parseFloat(j.lastScanMs) || 0;
+  function it(lbl, val) {
+    return '<div class=it><span class=lbl>' + lbl + '</span><span class=val>' + val + '</span></div>';
+  }
+  var h = it('曲目', (j.tracks || 0)) + it('专辑', (j.albums || 0)) +
+          it('扫描线程', th ? th : '自动') + it('上次扫描', ms > 0 ? (ms / 1000).toFixed(1) + ' s' : '—');
+  if (j.scanning) h += it('进度', (j.scanned || 0) + ' / ' + (j.total || 0));
+  box.innerHTML = h;
+}
 function loadLibStats() {
   api('/api/lib/stats').then(function (j) {
     S.scanning = !!j.scanning;
     S.roots = j.roots || [];
+    renderLibStats(j);
     if (S.scanning) {
       D('scanbar').style.display = '';
       var pct = j.total > 0 ? Math.min(100, j.scanned / j.total * 100) : 0;
@@ -1671,10 +1686,10 @@ function loadRemote(id) {
       D('list').innerHTML = '<div class="card" style="max-width:560px;width:100%;margin:clamp(24px,10vh,90px) auto 0;padding:24px 26px;background:var(--phbg);border:1px solid var(--line);border-radius:12px">' +
         '<div style="font-size:14px;font-weight:650;margin-bottom:6px">还没有可浏览的流媒体服务器</div>' +
         '<div style="color:var(--mut);font-size:12.5px;line-height:1.7;margin-bottom:14px">' +
-        esc(j.err) + '<br>支持 Navidrome / Subsonic / Emby（只取原始文件，不转码）。先在「设置 → 高级 → 流媒体服务器」填地址与账号，保存后回到这里即可浏览。</div>' +
+        esc(j.err) + '<br>支持 Navidrome / Subsonic / Emby（只取原始文件，不转码）。先在「设置 → 流媒体」添加并启用一台服务器，保存后回到这里即可浏览。</div>' +
         '<button class="btn pri" id=remoteGoSet>去设置里配置</button>' +
         '<button class="btn" id=remoteRetry style="margin-left:8px">重试</button></div>';
-      if (D('remoteGoSet')) D('remoteGoSet').onclick = function () { openSettingsTab('adv'); };
+      if (D('remoteGoSet')) D('remoteGoSet').onclick = function () { openSettingsTab('stream'); };
       if (D('remoteRetry')) D('remoteRetry').onclick = function () { loadRemote(id || ''); };
       return;
     }
@@ -1700,22 +1715,159 @@ function loadRemote(id) {
   }).catch(function (e) { D('list').innerHTML = '<div class=empty>' + esc(e) + '</div>'; });
 }
 
+/* ---------------- 流媒体服务器（多台；用户 261024-01 #5） ----------------
+   后端契约（tools/rtaweb.cpp）：
+     GET  /api/src/config  → {servers:[{id,name,kind,base,user,hasPass,active}], active}
+     POST /api/src/config   action=add|update|remove|active（update 时 password 留空 = 保持原密码）
+     POST /api/src/ping     表单里还没保存的配置也能先测；?id=N 测已保存的某台
+   密码红线：GET 不回明文，界面也不回填；编辑时留空即不改。 */
+var SRC = { servers: [], active: '', editing: '' };
+var SRC_FORM_OPEN = false;
+
+function srcKindName(k) { return k === 'emby' ? 'Emby' : 'Navidrome / Subsonic'; }
+function srcFormMsg(t, ok) {
+  var e = D('sp_src_fmsg'); if (!e) return;
+  e.textContent = t || '';
+  e.style.color = (ok === undefined) ? '' : (ok ? 'var(--ok-text)' : 'var(--danger)');
+}
+function srcShowForm(open, s) {
+  var box = D('sp_src_form'); if (!box) return;
+  SRC_FORM_OPEN = !!open;
+  box.style.display = open ? '' : 'none';
+  if (!open) { SRC.editing = ''; return; }
+  SRC.editing = s ? String(s.id) : '';
+  D('sp_src_name').value = s ? (s.name || '') : '';
+  D('sp_src_kind').value = s ? (s.kind || 'subsonic') : 'subsonic';
+  D('sp_src_base').value = s ? (s.base || '') : '';
+  D('sp_src_user').value = s ? (s.user || '') : '';
+  D('sp_src_pass').value = '';
+  D('sp_src_pass').placeholder = s ? '留空 = 保持原密码' : '密码';
+  srcFormMsg(s ? ('正在编辑「' + (s.name || s.base) + '」') : '');
+  var f = D('sp_src_name'); if (f) f.focus();
+}
+function srcFormBody() {
+  return 'kind=' + encodeURIComponent(D('sp_src_kind').value) +
+         '&name=' + encodeURIComponent((D('sp_src_name').value || '').trim()) +
+         '&base=' + encodeURIComponent((D('sp_src_base').value || '').trim()) +
+         '&user=' + encodeURIComponent((D('sp_src_user').value || '').trim()) +
+         '&pass=' + encodeURIComponent(D('sp_src_pass').value || '');
+}
+function renderSrcList() {
+  var box = D('sp_src_list'); if (!box) return;
+  var list = SRC.servers || [];
+  if (!list.length) {
+    box.innerHTML = '<div class=srvempty>还没有流媒体服务器 —— 点上面的「添加服务器」</div>';
+    return;
+  }
+  var h = '';
+  list.forEach(function (s) {
+    var act = !!s.active;
+    h += '<div class="srvrow' + (act ? ' on' : '') + '" data-id="' + esc(s.id) + '">'
+       + '<span class=srvdots></span>'
+       + '<div class=srvmain><div class=srvname><span class=nm>' + esc(s.name || s.base) + '</span>'
+       + '<span class="srvtag kind">' + esc(srcKindName(s.kind)) + '</span>'
+       + (act ? '<span class="srvtag on">已启用</span>' : '') + '</div>'
+       + '<div class=srvurl>' + esc(s.base || '') + (s.user ? ' · ' + esc(s.user) : '') + '</div></div>'
+       + '<div class=srvacts>'
+       + (act ? '' : '<button class="srvbtn pri" data-a=on>启用</button>')
+       + '<button class=srvbtn data-a=test>测试</button>'
+       + '<button class=srvbtn data-a=edit>编辑</button>'
+       + '<button class="srvbtn del" data-a=del>删除</button>'
+       + '</div></div>';
+  });
+  box.innerHTML = h;
+  Array.prototype.forEach.call(box.querySelectorAll('.srvbtn'), function (b) {
+    b.onclick = function () {
+      var row = b.closest('.srvrow'); if (!row) return;
+      var id = row.dataset.id, s = null;
+      (SRC.servers || []).forEach(function (x) { if (String(x.id) === id) s = x; });
+      var a = b.dataset.a;
+      if (a === 'edit') { srcShowForm(true, s); return; }
+      if (a === 'test') { srcTestSaved(id, b); return; }
+      if (a === 'on') {
+        api('/api/src/config', 'action=active&id=' + encodeURIComponent(id)).then(function (j) {
+          if (!j || !j.ok) { toast('启用失败：' + ((j && j.error) || '未知错误')); return; }
+          toast('已启用「' + (s ? (s.name || s.base) : id) + '」');
+          loadSrcConfig();
+        }).catch(function () { toast('启用失败：服务没响应'); });
+        return;
+      }
+      if (a === 'del') {
+        if (!confirm('删除服务器「' + (s ? (s.name || s.base) : id) + '」？只删配置，不动已下载缓存。')) return;
+        api('/api/src/config', 'action=remove&id=' + encodeURIComponent(id)).then(function (j) {
+          if (!j || !j.ok) { toast('删除失败：' + ((j && j.error) || '未知错误')); return; }
+          if (String(SRC.editing) === String(id)) srcShowForm(false);
+          toast('已删除');
+          loadSrcConfig();
+        }).catch(function () { toast('删除失败：服务没响应'); });
+      }
+    };
+  });
+}
 function loadSrcConfig() {
-  if (!D('sKind')) return;    // 这些控件现在渲染在「高级」页里，没渲染就不取
-  api('/api/src/config').then(function (j) {
-    if (j.kind) D('sKind').value = j.kind;
-    if (j.base) D('sBase').value = j.base;
-    if (j.user) D('sUser').value = j.user;
+  if (!D('sp_src_list')) return;    // 流媒体页没渲染就不取
+  return api('/api/src/config').then(function (j) {
+    if (!j || !j.ok) return;
+    SRC.servers = j.servers || [];
+    SRC.active = j.active || '';
+    renderSrcList();
   }).catch(function () { });
 }
-function saveSrc() {
-  var body = 'kind=' + encodeURIComponent(D('sKind').value) + '&base=' + encodeURIComponent(D('sBase').value.trim()) +
-             '&user=' + encodeURIComponent(D('sUser').value.trim()) + '&pass=' + encodeURIComponent(D('sPass').value);
-  api('/api/src/config', body).then(function () { return api('/api/src/ping'); }).then(function (j) {
-    D('srcMsg').textContent = j.ok ? '\u2713 已连接' : ('\u2717 ' + (j.error || '失败'));
-    D('srcMsg').style.color = j.ok ? '#34d399' : '#e8654b';
-    if (j.ok) toast('流媒体服务器已连接');
-  }).catch(function (e) { D('srcMsg').textContent = '\u2717 ' + e; });
+function bindSrcPage() {
+  if (D('sp_src_add')) D('sp_src_add').onclick = function () { srcShowForm(true, null); };
+  if (D('sp_src_cancel')) D('sp_src_cancel').onclick = function () { srcShowForm(false); };
+  if (D('sp_src_save')) D('sp_src_save').onclick = srcSave;
+  if (D('sp_src_testform')) D('sp_src_testform').onclick = srcTestForm;
+  if (D('sp_upnp')) D('sp_upnp').onclick = discoverDlna;
+  ['sp_src_base', 'sp_src_user'].forEach(function (id) {
+    var e = D(id);
+    if (e) e.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') srcSave(); });
+  });
+}
+function srcSave() {
+  if (!SRC_FORM_OPEN) return;
+  var base = (D('sp_src_base').value || '').trim();
+  var user = (D('sp_src_user').value || '').trim();
+  if (!base) { srcFormMsg('请填写服务器地址', false); return; }
+  if (base.indexOf('http://') !== 0 && base.indexOf('https://') !== 0) {
+    srcFormMsg('地址要以 http:// 或 https:// 开头', false); return;
+  }
+  if (!user) { srcFormMsg('请填写用户名', false); return; }
+  var body = 'action=' + (SRC.editing ? 'update' : 'add') +
+             (SRC.editing ? ('&id=' + encodeURIComponent(SRC.editing)) : '') + '&' + srcFormBody();
+  srcFormMsg('保存中…');
+  api('/api/src/config', body).then(function (j) {
+    if (!j || !j.ok) { srcFormMsg('保存失败：' + ((j && j.error) || '未知错误'), false); return; }
+    var wasEdit = !!SRC.editing;
+    srcShowForm(false);
+    toast(wasEdit ? '服务器已更新' : '服务器已添加');
+    loadSrcConfig();
+  }).catch(function () { srcFormMsg('保存失败：服务没响应', false); });
+}
+function srcTestForm() {
+  srcFormMsg('测试中…');
+  api('/api/src/ping', srcFormBody()).then(function (j) {
+    srcFormMsg(j && j.ok ? '\u2713 连接成功' : ('\u2717 ' + ((j && j.error) || '失败')), !!(j && j.ok));
+  }).catch(function () { srcFormMsg('\u2717 服务没响应', false); });
+}
+function srcTestSaved(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = '测试中…'; }
+  api('/api/src/ping?id=' + encodeURIComponent(id)).then(function (j) {
+    if (btn) { btn.disabled = false; btn.textContent = '测试'; }
+    toast(j && j.ok ? '连接成功' : ('连接失败：' + ((j && j.error) || '未知错误')));
+  }).catch(function () {
+    if (btn) { btn.disabled = false; btn.textContent = '测试'; }
+    toast('连接失败：服务没响应');
+  });
+}
+function discoverDlna() {
+  var m = D('sp_upnpmsg'); if (!m) return;
+  m.textContent = '正在搜索…';
+  api('/api/upnp').then(function (j) {
+    var devs = (j && j.devices) || [];
+    if (!devs.length) { m.textContent = '没发现 DLNA 渲染器'; return; }
+    m.innerHTML = devs.map(function (d) { return esc(d.name) + ' — ' + esc(d.host) + ':' + esc(d.port); }).join('<br>');
+  }).catch(function () { m.textContent = '搜索失败：服务没响应'; });
 }
 
 /* ---------------- 视图切换 ---------------- */
@@ -1886,7 +2038,8 @@ D('sLoud').onchange = function () { S.loud = this.checked; saveSettings(); };
   e.addEventListener('change', saveSettings);
 });
 D('vol').addEventListener('change', saveSettings);
-if (D('srcSave')) D('srcSave').onclick = saveSrc;   // 只在设置页里存在
+// 2026-10-24 #5：旧的「流媒体服务器」单表单（srcSave/saveSrc）已删除，改由设置页「流媒体」页签的
+// bindSrcPage() 绑定（多服务器列表）。这里的隐藏快捷面板不保留副本。
 D('bUpnp').onclick = function () {
   D('upnpList').innerHTML = '<div style="font-size:11px;color:#5b6478">正在搜索（约 2 秒）…</div>';
   api('/api/upnp').then(function (j) {
@@ -2183,23 +2336,34 @@ var SET_GROUPS = null;
 function opt(v, label, cur) {
   return '<option value="' + esc(v) + '"' + (String(cur) === String(v) ? ' selected' : '') + '>' + esc(label) + '</option>';
 }
+// 2026-10-24（用户 261024-01 #7）：「文字量太大……做成鼠标移上去的提示文本，要么就给我去掉」。
+// 约定：
+//   tip(说明)     → label 右侧的 (?) 图标，hover / 键盘 focus 才显示（长说明一律用这个）；
+//   inlineHint()  → 真正需要常驻的安全警告，压成一句放控件下面；
+//   sgroup(title, tipText, body) → 分组标题右侧同样是一个 (?)。
+// 开发者注释（"实测 THD+N…""顺序挑第一个能跑的后端"这类）不进入界面。
+function tip(t) {
+  return t ? '<span class=tip tabindex=0 role=note data-tip="' + esc(t) + '">?</span>' : '';
+}
+function inlineHint(t) {
+  return t ? '<div class=hint>' + t + '</div>' : '';
+}
 function num(id, val, min, max, step, hint) {
-  return '<div class=sfld><label>' + id.label + '</label><input type=number id=' + id.id +
-         ' value="' + val + '" min=' + min + ' max=' + max + ' step=' + step + '>' +
-         (hint ? '<div class=hint>' + hint + '</div>' : '') + '</div>';
+  return '<div class=sfld><label>' + id.label + tip(hint) + '</label><input type=number id=' + id.id +
+         ' value="' + val + '" min=' + min + ' max=' + max + ' step=' + step + '></div>';
 }
 function sel(id, label, optsHtml, hint) {
-  return '<div class=sfld><label>' + label + '</label><select id=' + id + '>' + optsHtml + '</select>' +
-         (hint ? '<div class=hint>' + hint + '</div>' : '') + '</div>';
+  return '<div class=sfld><label>' + label + tip(hint) + '</label><select id=' + id + '>' + optsHtml + '</select></div>';
 }
-// wide=true 时整行显示（用于描述文字较长的开关，避免被 .sgbody 的多列网格压成窄条）
+// wide=true 时整行显示（用于说明较长的开关，避免被 .sgbody 的多列网格压成窄条）
 function chk(id, label, checked, hint, wide) {
   return '<div class="sfld' + (wide ? ' wide' : '') + '"><label class=chk><input type=checkbox id=' + id + (checked ? ' checked' : '') + '>' +
-         label + '</label>' + (hint ? '<div class=hint>' + hint + '</div>' : '') + '</div>';
+         label + (hint ? '<span class=tip tabindex=0 role=note data-tip="' + esc(hint) +
+           '" onclick="event.preventDefault();event.stopPropagation()">?</span>' : '') + '</label></div>';
 }
 function txt(id, label, val, hint, ph) {
-  return '<div class="sfld wide"><label>' + label + '</label><input type=text id=' + id + ' value="' + esc(val || '') +
-         '" placeholder="' + esc(ph || '') + '">' + (hint ? '<div class=hint>' + hint + '</div>' : '') + '</div>';
+  return '<div class="sfld wide"><label>' + label + tip(hint) + '</label><input type=text id=' + id + ' value="' + esc(val || '') +
+         '" placeholder="' + esc(ph || '') + '"></div>';
 }
 
 /* ---------------- 输出后端 / 输入设备 ---------------- */
@@ -2208,15 +2372,13 @@ function backendHint() {
   var m = D('sp_backendmsg'); if (!m) return;
   var bk = (D('sp_backend') && D('sp_backend').value) || 'wasapi';
   if (bk === 'wasapi') {
-    m.textContent = 'WASAPI 独占 · 事件驱动：本机可用。多声道走 WAVEFORMATEXTENSIBLE 的声道掩码。';
+    m.textContent = '独占 · 事件驱动 · bit-perfect；播放期间会静音系统其他声音。';
   } else if (bk === 'wasapi-shared') {
-    m.textContent = 'WASAPI 共享：兼容性最好（虚拟机/远程桌面）；经系统混音，非 bit-perfect。' +
-      '采样率/声道由系统混音格式决定；不支持 DoP/DSD 输出；独占流无响应时会自动回退到它。';
+    m.textContent = '共享：经系统混音，非 bit-perfect；不支持 DoP / DSD。';
   } else if (bk === 'null') {
-    m.textContent = 'Null output：照常跑完整 DSP，数据直接丢弃、不出声，用于离线验证与频谱分析。';
+    m.textContent = 'Null output：跑完整 DSP，不出声。';
   } else if (bk === 'naa') {
-    m.textContent = 'NAA：把 PCM 按 RTANet 协议推到端点 ' +
-      (((D('sp_naahost') && D('sp_naahost').value) || '')) + '（端点机需运行 rtanet_rx）。';
+    m.textContent = 'NAA → ' + (((D('sp_naahost') && D('sp_naahost').value) || '')) + '（端点机需运行 rtanet_rx）';
   } else if (bk === 'asio') {
     if (ASIO_DRIVERS === null) m.textContent = 'ASIO：正在检测本机驱动…';
     else if (!ASIO_DRIVERS.length) m.textContent = 'ASIO：本机未检测到 ASIO 驱动。';
@@ -2671,12 +2833,22 @@ function dsdRateOf() {
 }
 function dsdPackOf() { return ((D('sDSD') && D('sDSD').value) || '').indexOf('nat') === 0 ? 'nat' : 'dop'; }
 // 三个控件合成隐藏的 sDSD（params()/saveSettings 仍然只认这一个状态）
+// 2026-10-24（用户 261024-01 #12）：这里的 disabled 逻辑整个删掉。
+// 「SDM 的比特率和封装为什么灰了无法选？」—— 根因就是这一句：只在输出模式已经是 DSD 时才允许改，
+// 而默认是 PCM ⟹ 两个下拉永远灰着。现在它们始终可选；在 PCM 下改动会自动把输出切到 DSD
+//（联动在控件 onchange 里），并有一句常驻说明指出这件事。
 function applyDsdState() {
   var isDsd = D('sp_outmode') && D('sp_outmode').value === 'dsd';
   ['sp_dsdrate', 'sp_dsdpk'].forEach(function (id) {
     var e = D(id);
-    if (e) { e.disabled = !isDsd; e.style.opacity = isDsd ? '1' : '.5'; }
+    if (!e) return;
+    e.disabled = false;
+    e.style.opacity = '1';
+    e.removeAttribute('aria-disabled');
+    e.title = isDsd ? '' : '改这里会把输出模式切到 DSD（SDM）';
   });
+  var note = D('sp_dsdmodenote');
+  if (note) note.style.display = isDsd ? 'none' : '';
 }
 function applyDsd() {
   var out = D('sp_outmode') ? D('sp_outmode').value : 'pcm';
@@ -2720,8 +2892,7 @@ function trimFields(chSel) {
 
 function sgroup(title, hint, body) {
   if (body === undefined) { body = hint; hint = ''; }
-  return '<div class=sgroup><div class=sghead>' + title +
-         (hint ? '<span class=hint>' + hint + '</span>' : '') +
+  return '<div class=sgroup><div class=sghead>' + title + tip(hint) +
          '</div><div class=sgbody>' + (body || '') + '</div></div>';
 }
 
@@ -2743,20 +2914,18 @@ function bindPhaseHint() {
   if (!msg) return;
   var fname = (D('sp_filt') && D('sp_filt').value) || '';
   var override = (D('sp_phase') && D('sp_phase').value) || '';
-  if (!fname) { msg.textContent = '先在上面选一个 1x 滤波器'; return; }
+  if (!fname) { msg.textContent = ''; return; }
   var it = FILTER_PHASES ? FILTER_PHASES[fname] : null;
   if (!it) {
     // 相位表还没回来（或该滤波器不在表里）：只说清"预设"是什么，不编造具体相位
-    msg.textContent = '「预设」=「' + fname + '」这个滤波器自带的相位（相位表读取中…）';
+    msg.textContent = '预设相位：读取中…';
     return;
   }
   var actual = override
     ? ({ linear: '线性相位', minimum: '最小相位', intermediate: '混合相位' }[override] || override)
     : it.phaseName;
-  msg.textContent = '当前 1x 滤波器「' + fname + '」的预设相位 = ' + it.phaseName +
-    '（抽头 ' + it.taps + '）。' +
-    (override ? ('你选了强制覆盖 ⟹ 实际按「' + actual + '」跑。')
-              : ('选「跟随预设」⟹ 实际就按「' + actual + '」跑（不覆盖）。'));
+  // 2026-10-24 #7：一行说清「预设 / 实际」，不再展开解释什么叫覆盖。
+  msg.textContent = '预设 ' + it.phaseName + '（抽头 ' + it.taps + '）· 实际输出 ' + actual + (override ? '（强制覆盖）' : '');
 }
 
 // ---- 功能4（用户 2026-10-22）：DeepSeek API Key 的界面入口 ----
@@ -2839,6 +3008,8 @@ function renderSettingsPage() {
      // 2026-10-23 用户 261023-04 #2：EQ 与房间校正从左侧主导航移到这里，单开一个页签。
      + '<button class=stab data-g=eq>EQ</button>'
      + '<button class=stab data-g=meta>元数据</button>'
+     // 2026-10-24（用户 261024-01 #5）：「流媒体」从「高级」拆出来的独立页签。
+     + '<button class=stab data-g=stream>流媒体</button>'
      // 「诊断」独立成页：用户 2026-10-22 功能3 明确要求不要塞在元数据里。
      // 开发期它是必需品（报错时要拿现场），所以与输入/输出/PCM/SDM/高级 平级。
      + '<button class=stab data-g=diag>诊断</button>'
@@ -2853,69 +3024,64 @@ function renderSettingsPage() {
              opt('asio', 'ASIO', BK) +
              opt('naa', 'NetworkAudioAdapter（NAA / RTANet）', BK) + opt('null', 'Null output（只跑 DSP，不出声）', BK),
              '选到当前不可用的后端时，播放会直接返回原因，不会假装出声')
-       + '<div class=sfld><label>NAA 端点（host:port）</label><input type=text id=sp_naahost value="' +
-           esc(ADV.naaHost || '127.0.0.1:43210') + '"><div class=hint>只在后端选 NAA 时使用</div></div>'
-       + sel('sp_device', '输出设备', '<option value="">默认设备</option>', '独占模式会接管这个设备；共享模式经系统混音，不接管')
-       + sel('sp_outmode', '输出模式',
-             opt('pcm', 'PCM', outModeOf()) + opt('dsd', 'DSD（SDM）', outModeOf()),
-             'DSD 的比特率与封装（DoP / Native）在 SDM 页设置')
-       + sel('sp_rate', '输出采样率', D('sRate').innerHTML, '自动 = 所选设备的最高采样率')
-       + sel('sp_bits', '输出位深（PCM）',
-             opt(0, '24 bit', ADV.bits) + opt(16, '16 bit', ADV.bits) + opt(32, '32 bit', ADV.bits),
-             'DSD 输出恒为 1 bit，此项只在 PCM 模式生效')
-       + sel('sp_ch', '输出声道数',
-             opt('0', '跟随源声道数', CH) + opt('2', '2 声道（立体声）', CH) +
-             opt('6', '5.1（6 声道）', CH) + opt('8', '7.1（8 声道）', CH),
-             '设备必须支持该声道数；多声道用 WAVEFORMATEXTENSIBLE 的声道掩码声明布局')
-       + num({ id: 'sp_buffer', label: '缓冲（毫秒）' }, D('sBuf').value, 10, 500, 10, '越小延迟越低，但更容易欠载')
-       + num({ id: 'sp_ramp', label: '音量渐变（毫秒）' }, ADV.ramp, 0, 2000, 10, '0 = 立即生效（可能爆音）')
-       + '<div class="sfld wide"><div id=sp_backendmsg class=hint></div></div>')
-     + sgroup('声道音量微调', '按声道名标注，0 dB = 不动',
-         '<div class="sfld wide"><div class=trimgrid>'+ trimFields(CH) + '</div>' +
-         '<div class=hint>显示的是「输出声道数」对应的实际声道。2 = 左/右；5.1 = 左/右/中置/低音/左环绕/右环绕；7.1 再加左后/右后</div></div>')
-     + sgroup('投放（UPnP）', '将本地音频流式推送到网络播放器/音箱（DLNA MediaRenderer）',
-         // 2026-10-23 用户 261023-04 #12：渲染器名字常常很长（friendlyName + 型号），
-         // 放在 260px 的小格里会被截断得只剩几个字；改成整行、下拉铺满宽度。
-         '<div class="sfld wide"><label>目标渲染器</label>'
-       + '<select id=sp_cast_dev style="width:100%"><option value="">（未发现 UPnP 渲染器）</option></select>'
-       + '<div class=hint>选择局域网内的 DLNA/UPnP MediaRenderer 设备</div></div>'
-       + '<div class="sfld" style="display:flex;align-items:flex-end">'
-       + '<button class=btn id=sp_cast_scan>重新扫描</button>'
-       + '<span id=sp_cast_devmsg class=hint style="margin-left:10px;line-height:30px"></span>'
-       + '</div>'
-       + '<div class="sfld wide"><label>源音频文件</label>'
-       + '<div style="display:flex;gap:8px">'
-       + '<input type=text id=sp_cast_file placeholder="输入音频文件绝对路径（如 D:\\Music\\test.wav）" style="flex:1">'
-       + '<button class=btn id=sp_cast_usecur style="white-space:nowrap">用当前播放文件</button>'
-       + '</div>'
-       + '<div class=hint id=sp_cast_filehint>支持 WAV、FLAC、DSF/DFF 等本地音频格式</div>'
-       + '</div>'
-       + chk('sp_cast_dop', 'DoP 打包（DSD 源必须勾选）', false,
-             'DSD 素材（.dsf / .dff）打包为 DoP v1.1 24-bit WAV 供源；若未勾选遇 DSD 源，后端为保证音质将明确拒绝（铁律 3）')
-       + '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;margin-top:6px">'
-       + '<button class="btn pri" id=sp_cast_start>开始投放</button>'
-       + '<button class=btn id=sp_cast_stop disabled>停止投放</button>'
-       + '<span id=sp_cast_msg class=hint style="margin:0"></span>'
-       + '</div>')
-     // 2026-10-23 用户 261023-04 #12：状态网格必须跨满整张卡片（.sfld.wide），
-     // 否则外层 .sgbody 的 auto-fill 网格把它压进单个 260px 单元 → 内层只剩 1 列，指标竖排成长条。
-     + sgroup('投放实时状态', '1 秒自动轮询',
-         '<div class="sfld wide in-stat-grid">'
-       + '<div class=in-stat-item><span class=lbl>运行阶段</span><span class=val id=sp_cast_stat_phase>已停止</span></div>'
-       + '<div class=in-stat-item><span class=lbl>目标渲染器</span><span class="val sm" id=sp_cast_stat_dev>-</span></div>'
-       + '<div class=in-stat-item><span class=lbl>播放进度</span><span class=val id=sp_cast_stat_pos>0:00</span></div>'
-       + '<div class=in-stat-item><span class=lbl>传输状态</span><span class=val id=sp_cast_stat_transport>STOPPED</span></div>'
-       + '<div class=in-stat-item><span class=lbl>供源传输字节</span><span class=val id=sp_cast_stat_bytes>0 B</span></div>'
-       + '<div class=in-stat-item><span class=lbl>供源请求数</span><span class=val id=sp_cast_stat_reqs>0 次</span></div>'
-       + '<div class=in-stat-item><span class=lbl>供源端口</span><span class=val id=sp_cast_stat_port>8912</span></div>'
-       + '<div class=in-stat-item><span class=lbl>采样率取证</span><span class=val id=sp_cast_stat_ratematch>未取证</span></div>'
-       + '<div class=in-stat-item id=sp_cast_stat_warn_box style="grid-column:1/-1;display:none;color:var(--warn, #eab308)">'
-       + '<span class=lbl style="color:var(--warn, #eab308)">采样率告警</span><span class=val id=sp_cast_stat_warn></span></div>'
-       + '<div class=in-stat-item id=sp_cast_stat_err_box style="grid-column:1/-1;display:none;color:var(--err)">'
-       + '<span class=lbl style="color:var(--err)">错误信息</span><span class=val id=sp_cast_stat_err></span></div>'
-       + '</div>')
-     + '</div>';
-
+        + '<div class=sfld><label>NAA 端点（host:port）' + tip('只在后端选 NAA 时使用') + '</label><input type=text id=sp_naahost value="' +
+            esc(ADV.naaHost || '127.0.0.1:43210') + '"></div>'
+        + sel('sp_device', '输出设备', '<option value="">默认设备</option>', '独占模式会接管这个设备；共享模式经系统混音，不接管')
+        + sel('sp_outmode', '输出模式',
+              opt('pcm', 'PCM', outModeOf()) + opt('dsd', 'DSD（SDM）', outModeOf()),
+              'DSD 的比特率与封装在「SDM」页设置')
+        + sel('sp_rate', '输出采样率', D('sRate').innerHTML, '自动 = 所选设备的最高采样率')
+        + sel('sp_bits', '输出位深（PCM）',
+              opt(0, '24 bit', ADV.bits) + opt(16, '16 bit', ADV.bits) + opt(32, '32 bit', ADV.bits),
+              'DSD 输出恒为 1 bit，此项只在 PCM 模式生效')
+        + sel('sp_ch', '输出声道数',
+              opt('0', '跟随源声道数', CH) + opt('2', '2 声道（立体声）', CH) +
+              opt('6', '5.1（6 声道）', CH) + opt('8', '7.1（8 声道）', CH),
+              '设备必须支持该声道数；多声道用 WAVEFORMATEXTENSIBLE 的声道掩码声明布局')
+        + num({ id: 'sp_buffer', label: '缓冲（毫秒）' }, D('sBuf').value, 10, 500, 10, '越小延迟越低，但更容易欠载')
+        + num({ id: 'sp_ramp', label: '音量渐变（毫秒）' }, ADV.ramp, 0, 2000, 10, '0 = 立即生效（可能爆音）')
+        + '<div class="sfld wide"><div id=sp_backendmsg class=hint></div></div>')
+      + sgroup('声道音量微调', '按声道名标注，0 dB = 不动',
+          '<div class="sfld wide"><div class=trimgrid>' + trimFields(CH) + '</div></div>')
+      + sgroup('投放（UPnP）', '把本地音频流推送到网络播放器 / 音箱（DLNA MediaRenderer）',
+          '<div class="sfld wide"><label>目标渲染器' + tip('局域网内的 DLNA / UPnP MediaRenderer 设备；名字过长时整行显示') + '</label>'
+        + '<select id=sp_cast_dev style="width:100%"><option value="">（未发现 UPnP 渲染器）</option></select></div>'
+        + '<div class="sfld wide" style="display:flex;align-items:center;gap:10px">'
+        + '<button class=btn id=sp_cast_scan>重新扫描</button>'
+        + '<span id=sp_cast_devmsg class=hint style="margin:0"></span>'
+        + '</div>'
+        + '<div class="sfld wide"><label>源音频文件' + tip('支持 WAV、FLAC、DSF/DFF 等本地格式') + '</label>'
+        + '<div style="display:flex;gap:8px">'
+        + '<input type=text id=sp_cast_file placeholder="音频文件绝对路径（如 D:\\Music\\test.wav）" style="flex:1">'
+        + '<button class=btn id=sp_cast_usecur style="white-space:nowrap">用当前播放文件</button>'
+        + '</div>'
+        + '<div class=hint id=sp_cast_filehint>支持 WAV、FLAC、DSF/DFF 等本地音频格式</div>'
+        + '</div>'
+        + chk('sp_cast_dop', 'DoP 打包（DSD 源必须勾选）', false,
+              'DSD 素材打包为 DoP v1.1 24-bit WAV 供源；未勾选时遇 DSD 源会直接拒绝，不偷偷转码')
+        + '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;margin-top:2px">'
+        + '<button class="btn pri" id=sp_cast_start>开始投放</button>'
+        + '<button class=btn id=sp_cast_stop disabled>停止投放</button>'
+        + '<span id=sp_cast_msg class=hint style="margin:0"></span>'
+        + '</div>')
+      // 2026-10-23 用户 261023-04 #12：状态网格必须跨满整张卡片（.sfld.wide），
+      // 否则外层 .sgbody 的 auto-fill 网格把它压进单个 260px 单元 → 内层只剩 1 列，指标竖排成长条。
+      + sgroup('投放实时状态', '1 秒自动轮询',
+          '<div class="sfld wide in-stat-grid">'
+        + '<div class=in-stat-item><span class=lbl>运行阶段</span><span class=val id=sp_cast_stat_phase>已停止</span></div>'
+        + '<div class=in-stat-item><span class=lbl>目标渲染器</span><span class="val sm" id=sp_cast_stat_dev>-</span></div>'
+        + '<div class=in-stat-item><span class=lbl>播放进度</span><span class=val id=sp_cast_stat_pos>0:00</span></div>'
+        + '<div class=in-stat-item><span class=lbl>传输状态</span><span class=val id=sp_cast_stat_transport>STOPPED</span></div>'
+        + '<div class=in-stat-item><span class=lbl>供源传输字节</span><span class=val id=sp_cast_stat_bytes>0 B</span></div>'
+        + '<div class=in-stat-item><span class=lbl>供源请求数</span><span class=val id=sp_cast_stat_reqs>0 次</span></div>'
+        + '<div class=in-stat-item><span class=lbl>供源端口</span><span class=val id=sp_cast_stat_port>8912</span></div>'
+        + '<div class=in-stat-item><span class=lbl>采样率取证</span><span class=val id=sp_cast_stat_ratematch>未取证</span></div>'
+        + '<div class=in-stat-item id=sp_cast_stat_warn_box style="grid-column:1/-1;display:none;color:var(--warn, #eab308)">'
+        + '<span class=lbl style="color:var(--warn, #eab308)">采样率告警</span><span class=val id=sp_cast_stat_warn></span></div>'
+        + '<div class=in-stat-item id=sp_cast_stat_err_box style="grid-column:1/-1;display:none;color:var(--err)">'
+        + '<span class=lbl style="color:var(--err)">错误信息</span><span class=val id=sp_cast_stat_err></span></div>'
+        + '</div>')
+      + '</div>';
   // ---------- PCM ----------
   h += '<div class=spane data-g=pcm>'
      + sgroup('升频与滤波', 'HQPlayer 的 poly-sinc 家族',
@@ -2927,14 +3093,11 @@ function renderSettingsPage() {
              opt('linear', '强制线性相位', ADV.phase) +
              opt('minimum', '强制最小相位', ADV.phase) +
              opt('intermediate', '强制混合相位（线性/最小 各 50%）', ADV.phase),
-             '「预设」= 上面 1x / Nx 滤波器自带的相位（手册里 -lp 是线性、-mp 是最小）。' +
-             '选「跟随预设」就不覆盖。强制项会覆盖预设：' +
-             '线性 = 无相位失真、有前振铃；最小 = 无预振铃、群延迟低；' +
-             '混合 = 两者冲激响应按 50:50 叠加（幅频不变）')
+             '「跟随预设」= 不覆盖滤波器自带相位。强制项会覆盖预设：' +
+             '线性 = 无相位失真、有前振铃；最小 = 无预振铃、群延迟低；混合 = 两者按 50:50 叠加（幅频不变）')
        + '<div class="sfld wide"><div class=hint id=sp_phasemsg></div></div>'
        + num({ id: 'sp_taps', label: '原型抽头数（0 = 按预设自动）' }, ADV.taps, 0, 2097152, 1024,
-             '抽头数 = 原型低通滤波器的系数个数，也就是滤波器长度。多相分解后每一相的抽头数 ≈ 抽头数 ÷ 升频比，' +
-             '每输出一个采样要做这么多乘加。0 表示不覆盖，直接用所选滤波器预设自带的长度')
+             '多相分解后每一相的抽头数 ≈ 抽头数 ÷ 升频比；0 = 用所选滤波器预设自带长度')
        + num({ id: 'sp_atten', label: '阻带衰减（dB，0 = 用预设）' }, ADV.atten, 0, 300, 10,
              '目标阻带深度；实际能不能达到还要看抽头数')
        + num({ id: 'sp_transition', label: '过渡带占比（0 = 用预设）' }, ADV.transition, 0, 0.45, 0.005,
@@ -2944,7 +3107,6 @@ function renderSettingsPage() {
          sel('sp_shaper', '抖动 / 噪声整形', shaps, 'auto = 按输出位深自动选型')
        + chk('sp_isp', '过采样峰值保护（ISP）', D('sIsp').checked, '检测到插值峰值超满幅时预衰减'))
      + '</div>';
-
   // ---------- SDM ----------
   h += '<div class=spane data-g=sdm>'
      + sgroup('SDM 输出', '只在输出 DSD 时生效',
@@ -2953,45 +3115,46 @@ function renderSettingsPage() {
              '与 PCM 页独立：输出 DSD 时用这一组滤波器。留空则沿用 PCM 页的 1x')
        + sel('sp_sdmoNx', 'Oversampling Nx（88.2 kHz 及以上音源）', '<option value="">跟随上面的 1x</option>' + filts,
              '输出 DSD 且源文件 >= 88.2 kHz 时使用')
-       + sel('sp_dsdrate', '比特率（/Limit）',
+       + sel('sp_dsdrate', '比特率',
              opt('64', 'DSD64（2.8224 MHz）', dsdRateOf()) + opt('128', 'DSD128（5.6448 MHz）', dsdRateOf()) +
              opt('256', 'DSD256（11.2896 MHz）', dsdRateOf()) + opt('512', 'DSD512（22.5792 MHz）', dsdRateOf()) +
              opt('1024', 'DSD1024（45.1584 MHz）', dsdRateOf()),
              'DSD512 / 1024 的 DoP 载波是 1411.2 / 2822.4 kHz，绝大多数设备不支持')
        + sel('sp_dsdpk', '封装',
-             opt('dop', 'DoP（封在 24-bit PCM 容器里，WASAPI / ASIO 都行）', dsdPackOf()) +
-             opt('nat', 'Native（直接用 DSD 采样率，只能走 ASIO）', dsdPackOf()),
-             '两者数值等价，差别只在传输方式')
+             opt('dop', 'DoP（WASAPI / ASIO 均可）', dsdPackOf()) +
+             opt('nat', 'Native（仅 ASIO）', dsdPackOf()),
+             '两者数值等价，差别只在传输方式；Native 只能走 ASIO')
+       // 2026-10-24（用户 261024-01 #12）：这两个控件不再灰掉（见 applyDsdState）。
+       // 当前输出是 PCM 时，改这里会自动把输出模式联动到 DSD —— 一句常驻说明交代清楚。
+       + '<div class="sfld wide" id=sp_dsdmodenote style="display:none"><div class=hint>' +
+         '当前输出 PCM：改动比特率 / 封装会自动把输出切到 DSD（SDM）' + '</div></div>'
        + sel('sp_modfamily', '调制器族',
               opt('dsd', 'DSD 标准（Butterworth NTF，1-bit）', ADV.modfamily || 'dsd') +
               opt('chebyshev', 'Chebyshev（可配带外增益与截止，1-bit 保护运行于 5 阶）', ADV.modfamily || 'dsd') +
               opt('ec', 'EC 误差反馈（频带零点扩展消除）', ADV.modfamily || 'dsd') +
               opt('ahm', 'AHM 多电平（6~8 bit 风格）', ADV.modfamily || 'dsd'),
-              '提供多种 NTF 滤波与量化架构；非专有黑盒曲线')
+              '多种 NTF 滤波与量化架构')
         + sel('sp_modorder', '调制器阶数',
              opt(5, '5 阶（DSD64 起）', ADV.modorder || 5) + opt(7, '7 阶（需 DSD128 以上）', ADV.modorder || 5),
-             '实测 7 阶在低采样率或 Chebyshev 1-bit 下会饱和失稳，程序会自动降为 5 阶')
+             '7 阶在低采样率或 Chebyshev 1-bit 下不稳定，程序会自动降为 5 阶')
        + num({ id: 'sp_modcut', label: '噪声整形拐点（kHz，0 = 100）' }, ADV.modcut, 0, 200, 5)
        + num({ id: 'sp_moddith', label: '调制器抖动（LSB，-1 = 默认）' }, ADV.moddith, -1, 1, 0.001, '抑制空闲音'))
      + sgroup('SDM 源（DSD 文件）', '原生读取 + DirectSDM',
          chk('sp_directsdm', 'DirectSDM：DSD 源同速率直通（逐位一致）', ADV.directsdm == 1,
-             '源 DSD 速率 == 目标速率、音量 0 dB、无 EQ / 卷积 / 声道改动时，1-bit 流直接装进 DoP，' +
-             '不再「DSD 进 → PCM 中转 → 重新调制」。条件不满足会自动回退普通路径，并在信号链里写明原因。') +
-         '<div class="sfld wide"><div class=hint>DSD 文件（.dsf / .dff）现在由播放器原生读取，' +
-         '读取失败才回退 ffmpeg。速率不同（例如 DSD64 源 → DSD256 输出）时仍走「抽取成 PCM → 升频 → 重新调制」。</div></div>' +
-         sel('sp_dsdkind', 'DSD 源抽取器',
+             '源 DSD 速率 == 目标速率、音量 0 dB、无 EQ / 卷积 / 声道改动时，1-bit 流直接装进 DoP；' +
+             '条件不满足自动回退普通路径，并在信号链里写明原因。')
+       + sel('sp_dsdkind', 'DSD 源抽取器',
              opt('fir', 'FIR（Kaiser 120 dB，默认）', ADV.dsdKind || 'fir') +
              opt('iir', 'IIR（Butterworth 10 阶，相位非线性）', ADV.dsdKind || 'fir') +
              opt('cic', 'CIC（6 级无乘法 + 补偿）', ADV.dsdKind || 'fir'),
-             '只在「DSD 源 → PCM」路径生效；DirectSDM 直通时整条 PCM 链都被跳过。实测 THD+N 三者都约 99 dB') +
-         sel('sp_dsdconv', 'DSD 源 Conversion',
+             '只在「DSD 源 → PCM」路径生效；DirectSDM 直通时整条 PCM 链都被跳过')
+       + sel('sp_dsdconv', 'DSD 源 Conversion',
              opt('narrow', 'narrow（通带 20 kHz，默认）', ADV.dsdConv || 'narrow') +
              opt('wide', 'wide（通带 30 kHz）', ADV.dsdConv || 'narrow') +
              opt('xfi', 'XFi（通带 40 kHz）', ADV.dsdConv || 'narrow'),
-             '通带越宽，阻带起点（outRate − 通带）越靠近，过渡带越窄、抽头越多；三组都是真参数，测试里有数值表') +
-         '<div class="sfld wide"><div class=hint id=sp_dsdmsg></div></div>')
+             '通带越宽，阻带起点越靠近、过渡带越窄、抽头越多')
+       + '<div class="sfld wide"><div class=hint id=sp_dsdmsg></div></div>')
      + '</div>';
-
   // ---------- 输入 ----------
   h += '<div class="spane on" data-g=in>'
      + sgroup('输入设备与采集', 'WASAPI 共享模式采集 / 录制与直通监听',
@@ -3003,18 +3166,17 @@ function renderSettingsPage() {
              '多声道接口只取其中几路时用')
        + num({ id: 'sp_inbuf', label: '输入缓冲（毫秒）' }, ADV.inBuf || 100, 10, 500, 10, '环形缓冲时间深度')
        + chk('sp_inmon', '直通监听（非 bit-perfect）', ADV.inMonitor == 1,
-             '勾选后启动采集将直接经系统默认共享端点监听输出；不勾选为录制保存至 WAV 文件')
+             '勾选后把采集直接送到系统默认共享端点监听；不勾选则录制保存为 WAV')
        + num({ id: 'sp_inseconds', label: '录制时长（秒，0 为不限）' }, ADV.inSeconds || 0, 0, 86400, 1,
-             '达到指定时长自动停止；0 表示持续采集直到手动停止')
-       + '<div class="sfld wide"><label>输出文件路径（WAV）</label><input type=text id=sp_inout value="' +
-             esc(ADV.inOut || '') + '" placeholder="留空由系统自动存至 recordings' + SEP + 'cap-时间戳.wav">' +
-             '<div class=hint>仅录制模式生效；留空时自动保存在程序目录 recordings 文件夹下</div></div>'
-       + '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;margin-top:6px">'
+             '达到指定时长自动停止；0 = 持续采集直到手动停止')
+       + '<div class="sfld wide"><label>输出文件路径（WAV）' +
+           tip('仅录制模式生效；留空自动保存在程序目录 recordings 下') + '</label><input type=text id=sp_inout value="' +
+             esc(ADV.inOut || '') + '" placeholder="留空自动存至 recordings' + SEP + 'cap-时间戳.wav"></div>'
+       + '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;margin-top:2px">'
        + '<button class="btn pri" id=sp_instart>开始采集</button>'
        + '<button class=btn id=sp_instop disabled>停止采集</button>'
        + '<span id=sp_inmsg class=hint style="margin:0"></span>'
        + '</div>')
-     // 2026-10-23 用户 261023-04 #10：采集状态同样改成跨满整行的横向卡片网格。
      + sgroup('采集实时状态', '1 秒自动轮询',
          '<div class="sfld wide in-stat-grid">'
        + '<div class=in-stat-item><span class=lbl>运行状态</span><span class=val id=sp_stat_running>空闲</span></div>'
@@ -3034,38 +3196,33 @@ function renderSettingsPage() {
        + '</div>')
      + '</div>';
 
+
   // ---------- 高级 ----------
   h += '<div class=spane data-g=adv>'
-     + sgroup('外观', '主题会记住',
-         '<div class=sfld><label>主题</label><select id=sp_theme>'
+     + sgroup('外观',
+         '<div class=sfld><label>主题' + tip('顶栏右侧的小圆点也可以快速切换主题') + '</label><select id=sp_theme>'
        + opt('dark', '深色（默认）', S.theme) + opt('light', '白色', S.theme) + opt('blue', '浅蓝色', S.theme)
-       + '</select><div class=hint>顶栏右侧的小圆点也可以快速切换</div></div>')
+       + '</select></div>')
      + sgroup('GPU',
          sel('sp_gpu', 'GPU 后端',
              opt('auto', '自动', ADV.gpuvendor || 'auto') + opt('amd', 'AMD（HIP）', ADV.gpuvendor || 'auto') +
              opt('nvidia', 'NVIDIA（CUDA）', ADV.gpuvendor || 'auto') +
              opt('off', '关闭（纯 CPU）', ADV.gpuvendor || 'auto'),
-             '自动＝按 rtagpu.dll（AMD/HIP）→ rtagpu_dx12.dll → rtagpu_cuda.dll（NVIDIA/CUDA）的顺序挑第一个能真正跑起来的后端；' +
-             '选了具体厂商就只试该厂商的 DLL。后端缺失或 kernel 不可执行时自动退回 CPU 分块 FFT，并在信号链里写明实际用的哪个 DLL。')
+             '自动 = 依次尝试 AMD HIP → DX12 → NVIDIA CUDA，选第一个真正能跑起来的后端；' +
+             '后端缺失或 kernel 不可执行时自动退回 CPU 分块 FFT')
        + '<div class="sfld wide"><div id=sp_gpumsg class=hint></div></div>'
        + '<div class="sfld wide"><div id=sp_asiomsg class=hint></div></div>')
-     // 2026-10-23 用户 261023-04 #2：EQ 与房间校正已移进设置页的「EQ」页签，
-     // 原来这里的「前往…页面」跳转按钮没有意义了，整组删掉（不再有重复 id / 失效入口）。
-     + sgroup('流媒体服务器', 'Navidrome / Subsonic / Emby（只取原始文件，不用转码流）',
-         '<div class="sfld wide"><div class=hint>DLNA/UPnP 是"发现网络上的播放器"，与这里的"登录音乐服务器"是两件事。' +
-         '要连 Emby / Navidrome，在这一栏填地址与账号。</div></div>'
-       + '<div class=sfld><label>类型</label><select id=sKind><option value=subsonic>Navidrome / Subsonic</option><option value=emby>Emby</option></select></div>'
-       + '<div class=sfld><label>服务器地址</label><input type=text id=sBase placeholder="http://192.168.1.10:4533"></div>'
-       + '<div class=sfld><label>用户名</label><input type=text id=sUser placeholder="用户名"></div>'
-       + '<div class=sfld><label>密码</label><input type=password id=sPass placeholder="密码"></div>'
-       + '<div class="sfld wide"><div class=hint id=srcMsg></div></div>'
-       + '<div class="sfld wide"><button class="btn pri" id=srcSave>保存并测试连接</button></div>')
-     + sgroup('音乐库与网络', '',
-         txt('sp_root', '添加音乐目录', '', '填好后点下面的按钮', 'D:\Music')
-       + '<div class="sfld wide"><button class="btn" id=sp_addroot>添加目录</button> <button class="btn" id=sp_rescan>重新扫描全部</button> <button class="btn" id=sp_upnp>发现 DLNA 设备</button></div>'
-       + num({id:'sp_scanthreads', label:'扫描线程数'}, ADV.scanThreads || 0, 0, 32, 1, '库扫描并行线程数，0 为自动（默认 min(CPU, 8)）')
-       + '<div class="sfld wide"><div id=sp_roots class=rootlist></div></div>'
-       + '<div class="sfld wide"><div id=sp_upnpmsg style="font-size:11px;color:var(--mut2)"></div></div>')
+     // 2026-10-24（用户 261024-01 #5/#6）：
+     //   ① 「流媒体服务器」整组搬去新增的「流媒体」页签（这里不再保留副本，避免重复 id）；
+     //   ② 「音乐库与网络」改名「本地音乐库」—— 只放本地库根目录 / 扫描 / 线程；
+     //   ③ 原组里的「发现 DLNA 设备」与结果区搬去「流媒体」页（DLNA 归流媒体）。
+     + sgroup('本地音乐库', '本地目录扫描入索引；DLNA / UPnP 在「流媒体」页',
+         '<div class="sfld wide libstats" id=sp_libstats></div>'
+       + txt('sp_root', '添加音乐目录', '', '填好后点「添加目录」', 'D:\\Music')
+       + '<div class="sfld wide" style="display:flex;gap:8px;flex-wrap:wrap">'
+       + '<button class="btn" id=sp_addroot>添加目录</button> <button class="btn" id=sp_rescan>重新扫描全部</button></div>'
+       + num({id:'sp_scanthreads', label:'扫描线程数'}, ADV.scanThreads || 0, 0, 32, 1, '0 = 自动（默认 min(CPU, 8)）')
+       + '<div class="sfld wide"><div id=sp_roots class=rootlist></div></div>')
      + sgroup('播放', '',
          sel('sp_rep', '循环模式', D('sRep').innerHTML, '')
        + chk('sp_shuf', '随机播放', D('sShuf').checked, '关掉会恢复原顺序')
@@ -3075,27 +3232,49 @@ function renderSettingsPage() {
   // ---------- EQ 与房间校正（用户 261023-04 #2：从主导航移进设置页的独立页签）----------
   h += '<div class=spane data-g=eq>' + eqSettingsHtml() + '</div>';
 
+  // ---------- 流媒体（用户 261024-01 #5/#6：从「高级」拆成独立页签 + 多服务器 + DLNA 归位）----------
+  h += '<div class=spane data-g=stream>'
+     + sgroup('流媒体服务器', '可保存多台，同一时刻启用一台；只取原始文件，不转码',
+         '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
+       + '<button class="btn pri" id=sp_src_add>添加服务器</button>'
+       + '<span class=hint style="margin:0">Navidrome / Subsonic / Emby</span></div>'
+       + '<div class="sfld wide"><div id=sp_src_list class=srvlist></div></div>'
+       + '<div class="sfld wide" id=sp_src_form style="display:none">'
+       + '<div class=srvform>'
+       + '<div class=sfld><label>名称</label><input type=text id=sp_src_name placeholder="例如 客厅 NAS"></div>'
+       + '<div class=sfld><label>类型</label><select id=sp_src_kind>'
+       + '<option value=subsonic>Navidrome / Subsonic</option><option value=emby>Emby</option></select></div>'
+       + '<div class="sfld wide"><label>服务器地址' + tip('带 http:// 或 https://，例如 http://192.168.1.10:4533') + '</label>'
+       + '<input type=text id=sp_src_base placeholder="http://192.168.1.10:4533"></div>'
+       + '<div class=sfld><label>用户名</label><input type=text id=sp_src_user autocomplete=off spellcheck=false></div>'
+       + '<div class=sfld><label>密码' + tip('编辑已有服务器时留空 = 保持原密码不变；密码只存本机 rlplayer-sources.conf') + '</label>'
+       + '<input type=password id=sp_src_pass autocomplete=new-password placeholder="留空 = 不修改"></div>'
+       + '<div class="sfld wide" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+       + '<button class="btn pri" id=sp_src_save>保存</button>'
+       + '<button class=btn id=sp_src_testform>测试连接</button>'
+       + '<button class=btn id=sp_src_cancel>取消</button>'
+       + '<span class=hint id=sp_src_fmsg style="margin:0"></span></div>'
+       + '</div></div>')
+     + sgroup('DLNA / UPnP 设备发现', '发现局域网里可投放的播放器（MediaRenderer）',
+         '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
+       + '<button class=btn id=sp_upnp>发现 DLNA 设备</button>'
+       + '<span class=hint id=sp_upnpmsg style="margin:0"></span></div>')
+     + '</div>';
+
   // ---------- 诊断（用户 2026-10-22 功能3：独立页签）----------
   // 用户原话：「导出诊断信息其实就是一个 log，最好是直接导出一个压缩包或一个整体的
   // 文件，不要用户单独找 rlplayer-diag.json / rlplayer-playback.log / launcher.log
   // 三份文件；另外这个选项放在元数据这里明显不合适，单独出来做选项卡吧，
   // 我们还在开发，报错是必不可少的。」
-  // 所以：① 独立页签；② 一个 ZIP 打走全部；③ 先把包内容列清楚再给按钮。
+  // 2026-10-24（用户 261024-01 #7）：包内清单从页面正文挪进 (?) 提示，页面只留一句话 + 两个按钮。
   h += '<div class=spane data-g=diag>'
      + sgroup('导出诊断包', '一个文件，不用再到处找日志',
-         '<div class="sfld wide"><div style="font-size:12px;color:var(--mut);line-height:1.8">'
-       + '点下面的按钮，会生成一个 <b>rlplayer-diag-日期时间.zip</b>，里面已经装好：'
-       + '<br>· rlplayer-diag.json —— 版本 / 系统 / CPU / GPU / 端口'
-       + '<br>· rlplayer-playback.log（含 .1 / .2 轮转）—— 播放格式、峰值、欠载、失败原因'
-       + '<br>· launcher.log —— 启动器日志（启动横幅、主题、子进程）'
-       + '<br>· dumps-manifest.txt —— 崩溃转储清单（dump 本体不打包，体积太大）'
-       + '<br>· settings-summary.txt —— 设置摘要（仅白名单键）'
-       + '<br><span style="color:var(--mut2)">已脱敏：api_key / token / password 的值一律替换为 ***；'
-       + '配置文件本体（rlplayer-llm.conf）不会被打进包。</span>'
-       + '</div></div>'
-       + '<div class="sfld wide"><button class="btn pri" id=sp_diagzip>导出诊断包（.zip）</button> '
+         '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
+       + '<button class="btn pri" id=sp_diagzip>导出诊断包（.zip）</button>'
        + '<button class=btn id=sp_diagjson>只要 JSON</button>'
-       + '<span style="font-size:11.5px;color:var(--mut2);margin-left:10px" id=sp_diagmsg></span></div>')
+       + tip('包内：rlplayer-diag.json（版本 / 系统 / CPU / GPU / 端口）、rlplayer-playback.log（含 .1/.2 轮转）、launcher.log、dumps-manifest.txt、settings-summary.txt；' +
+             'api_key / token / password 一律脱敏为 ***，rlplayer-llm.conf 本体不会被打进包。')
+       + '<span style="font-size:11.5px;color:var(--mut2);margin-left:2px" id=sp_diagmsg></span></div>')
      + '</div>';
 
   // ---------- 元数据补全（排在「高级」之后）----------
@@ -3105,47 +3284,42 @@ function renderSettingsPage() {
   //   ①「自动补全（不用 AI）」= metaon（只走公开数据源，不产生费用）；
   //   ②「AI 增强（DeepSeek）」= 原「DeepSeek 增强（无标签文件）」+「在线整理音乐资料简介」合并，
   //      保存时同时写 metallm 与 metasummary（开 = 1,1；关 = 0,0）。
-  // 高级选项：左右两列卡片（左 = 数据源，右 = DeepSeek 接入 + 标签写回），铺满宽度、留足间距。
+  // 2026-10-24（用户 261024-01 #7/#8）：
+  //   * 长说明全部收进 (?)；页面只留两个开关 + 一个「高级选项」入口；
+  //   * 标签写回不再有「可选」字样/开关 —— 能力默认开启（后端本来就没有开关，永远可用）。
   var aiOn = (META.llm == 1 && META.summary == 1);
   h += '<div class=spane data-g=meta>'
      + sgroup('元数据补全', '播放时后台补全标签 / 封面 / 歌词，结果落在本地库',
          chk('sp_metaon', '自动补全（不用 AI）', META.on == 1,
              '只用公开数据源（QQ音乐 / 网易云 / iTunes / dizzylab / lrclib）补全标签、封面、歌词；全程不调用 AI，不产生费用', true)
        + chk('sp_metallm', 'AI 增强（DeepSeek）', aiOn,
-             '合并原「DeepSeek 解析无标签文件」与「在线整理音乐资料简介」：开启后会联网调用 DeepSeek（按次计费）；' +
-             '关闭则两项都停（不解析无标签文件、也不整理简介），本地与公开数据源照常工作', true)
-       + '<div class="sfld wide"><div class=hint style="color:var(--mut2)">'
-       + 'AI 增强用于两件事：① 解析没有标签的文件，并与数据源结果互相校验；② 进入艺术家 / 专辑 / 单曲播放页时自动整理简介并缓存（同一条目只整理一次，缓存 7 天有效）。'
-       + '不需要 AI 时可只开「自动补全（不用 AI）」。</div></div>'
-       + '<div class="sfld wide" style="margin-top:6px">'
+             '联网调用 DeepSeek（按次计费）：解析无标签文件、并在艺术家 / 专辑 / 单曲页整理简介并缓存（7 天有效）。' +
+             '关闭后两项都停，本地与公开数据源照常工作', true)
+       + '<div class="sfld wide" style="margin-top:2px">'
        + '<button class=btn id=sp_metamore style="font-size:12px" aria-expanded="false">高级选项 ▾</button>'
-       + '<span style="font-size:11.5px;color:var(--mut2);margin-left:10px">数据源 · DeepSeek Key · 标签写回</span>'
        + '</div>'
        // #sp_metaadv 必须跨满 .sgbody 的整行（否则会被压进单个 260px 网格单元，两列各只剩 140px）
        + '<div class="sfld wide" id=sp_metaadv style="display:none;margin-top:14px">'
        + '<div class=meta-adv-grid>'
        // 左列：数据源（逐源开关，注册表驱动渲染进 #sp_metasrc）
        + '<div class=meta-card>'
-       + '<div class=mh>数据源<span class=hint style="font-weight:400">越靠上优先级越高；关掉的源完全不参与补全</span></div>'
+       + '<div class=mh>数据源' + tip('越靠上优先级越高；关掉的源完全不参与补全') + '</div>'
        + '<div id=sp_metasrc class=meta-src-grid>' + metaSrcHtml() + '</div>'
        + '</div>'
        // 右列：DeepSeek 接入 + 标签写回
        + '<div class=meta-card>'
-       + '<div class=mh>DeepSeek 接入</div>'
-       + '<div class=hint style="margin-bottom:8px">只用于上面的「AI 增强」；不填也能用全部本地与公开数据源</div>'
-       + '<label style="display:block;font-size:11px;color:var(--mut);margin-bottom:5px">DeepSeek API Key</label>'
+       + '<div class=mh>DeepSeek 接入' + tip('只用于上面的「AI 增强」；不填也能用全部本地与公开数据源') + '</div>'
+       + '<label style="display:block;font-size:11px;color:var(--mut);margin-bottom:5px">DeepSeek API Key' +
+           tip('只存本机 build' + SEP + 'rlplayer-llm.conf；不进安装包，界面永不回显明文') + '</label>'
        + '<input type=password id=sp_llmkey autocomplete=off spellcheck=false placeholder="sk-…（粘贴后点保存，只显示掩码）" style="width:100%">'
-       + '<div class=hint style="margin-top:4px">只存本机 build' + SEP + 'rlplayer-llm.conf；不进安装包，界面永不回显明文</div>'
        + '<div class=hint id=sp_llmmsg style="margin-top:6px">读取配置中…</div>'
        + '<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">'
        + '<button class="btn pri" id=sp_llmsave>保存 Key</button>'
        + '<button class=btn id=sp_llmtest>测试连接</button>'
        + '<button class=btn id=sp_llmclear>清除 Key</button></div>'
-       + '<div class="mh sub">标签写回<span class=hint style="font-weight:400">可选</span></div>'
-       + '<div style="font-size:12px;color:var(--mut);line-height:1.75">'
-       + '把在线补到的标签/封面<b>写进音频文件本身</b>，换播放器也能看到。<b>预览写回</b>只扫描并列出「哪些文件会被改成什么」，<b>不改任何文件</b>；'
-       + '<b>执行写回</b>真正写入，写前逐位校验音频数据，任何不一致就放弃该文件，原文件备份在 rlplayer-meta' + SEP + 'backups。</div>'
-       + '<div class=hint id=sp_wbdesc style="margin-top:6px;line-height:1.7">写回前自动校验音频数据逐位不变，原文件备份到 rlplayer-meta' + SEP + 'backups</div>'
+       // 用户 261024-01 #8：默认开启，不提供开关 —— 只说明能力，两个动作按钮照旧。
+       + '<div class="mh sub">标签写回<span class=hint style="font-weight:400">默认开启</span></div>'
+       + '<div class=hint id=sp_wbdesc style="margin:2px 0 9px">补全到的标签 / 封面写回音频文件本身；写前校验音频数据逐位不变，原文件备份到 rlplayer-meta' + SEP + 'backups</div>'
        + '<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center">'
        + '<button class=btn id=sp_wbdry>预览写回</button>'
        + '<button class=btn id=sp_wbapply>执行写回</button>'
@@ -3197,15 +3371,18 @@ function renderSettingsPage() {
       Array.prototype.forEach.call(document.querySelectorAll('#setpage .spane'), function (p) {
         p.classList.toggle('on', p.dataset.g === b.dataset.g);
       });
-      // 评审 #12：诊断页是纯操作页（导出/写回），底部「保存设置/恢复默认」在这里没有意义 → 隐藏
+      // 评审 #12：诊断页是纯操作页（导出/写回），底部「保存设置/恢复默认」在这里没有意义 → 隐藏。
+      // 2026-10-24 #5：流媒体页的增删改/启用都是即时落盘，同样不需要底部保存。
       var foot = document.querySelector('#setpage .setfoot');
-      if (foot) foot.style.display = (b.dataset.g === 'diag') ? 'none' : '';
+      if (foot) foot.style.display = (b.dataset.g === 'diag' || b.dataset.g === 'stream') ? 'none' : '';
       if (b.dataset.g === 'in') {
         loadInputDevices();
         pollInputState();
       } else if (b.dataset.g === 'out') {
         scanCastDevices(false);
         pollCastState();
+      } else if (b.dataset.g === 'stream') {
+        loadSrcConfig();
       }
     };
   });
@@ -3225,9 +3402,19 @@ function renderSettingsPage() {
     if (g) { g.innerHTML = trimFields(this.value); bindTrims(); }   // 标签跟着声道布局换
   };
   bindTrims();
+  // 2026-10-24（用户 261024-01 #12）：比特率 / 封装永远可选。
+  // 在输出 PCM 时改这两个控件 = 用户明确想要 DSD ⟹ 输出模式自动联动到 DSD（并 toast 说明），
+  // 不再出现"灰掉点不了"的控件。
   ['sp_outmode', 'sp_dsdrate', 'sp_dsdpk'].forEach(function (id) {
     var e = D(id);
-    if (e) e.onchange = function () { applyDsd(); saveSettings(); applyDsdState(); };
+    if (!e) return;
+    e.onchange = function () {
+      if (id !== 'sp_outmode' && D('sp_outmode') && D('sp_outmode').value !== 'dsd') {
+        D('sp_outmode').value = 'dsd';
+        toast('输出模式已切到 DSD（SDM）');
+      }
+      applyDsd(); saveSettings(); applyDsdState();
+    };
   });
   ['sp_sdmo1', 'sp_sdmoNx'].forEach(function (id) {
     var e = D(id);
@@ -3328,11 +3515,14 @@ function renderSettingsPage() {
       });
     }
     var m = D('sp_gpumsg');
-    if (m) m.textContent = (j.available ? '当前 GPU 可用：' : '当前走 CPU：') + (j.status || '') +
-      '；本目录 rtagpu.dll=' + (j.amd ? '有' : '无') +
-      '，rtagpu_cuda.dll=' + (j.cuda ? (j.cudaUsable === false ? '有（本机不可用）' : '有（可用）') : '无') +
-      '，AMD HIP 运行库=' + (j.hip ? '有' : '无') +
-      '；厂商偏好=' + (j.vendor || 'auto');
+    if (m) {
+      // 2026-10-24 #7：只在页面上留一句结论，DLL 明细收进 (?) 提示（动态内容写 title）。
+      m.textContent = '当前状态：' + (j.available ? 'GPU 可用' : '走 CPU（未找到可执行的 GPU 后端）');
+      m.title = 'rtagpu.dll=' + (j.amd ? '有' : '无') +
+                '，rtagpu_cuda.dll=' + (j.cuda ? (j.cudaUsable === false ? '有（本机不可用）' : '有（可用）') : '无') +
+                '，AMD HIP 运行库=' + (j.hip ? '有' : '无') +
+                '；厂商偏好=' + (j.vendor || 'auto');
+    }
   }).catch(function () { });
   // ASIO 驱动列表（Native DSD 需要 ASIO 后端）
   api('/api/asio').then(function (j) {
@@ -3340,12 +3530,16 @@ function renderSettingsPage() {
     ASIO_DRIVERS = d;
     backendHint();
     var m = D('sp_asiomsg'); if (!m) return;
+    // 2026-10-24 #7：驱动清单收进 title，页面只留结论。
     m.textContent = d.length
-      ? ('本机 ASIO 驱动：' + d.join('、') + '。Native DSD 后端尚未实现：选 Native 时不会出声，只返回未实现的原因')
-      : '本机未检测到 ASIO 驱动。Native DSD 只能经 ASIO 输出，当前无可用后端';
+      ? ('本机 ASIO 驱动 ' + d.length + ' 个 · Native DSD 尚未实现（选 Native 不会出声）')
+      : '本机未检测到 ASIO 驱动 · Native DSD 不可用';
+    m.title = d.length ? d.join('、') : '';
   }).catch(function () { });
   if (ADV.inBackend === 'wasapi') loadInputDevices();
-  if (D('srcSave')) { D('srcSave').onclick = saveSrc; loadSrcConfig(); }
+  // 流媒体页（用户 261024-01 #5）：列表 / 添加 / 编辑 / 删除 / 启用 / 测试 —— 全部即时落盘
+  bindSrcPage();
+  loadSrcConfig();
   D('sp_save').onclick = applySettings;
   D('sp_reset').onclick = function () {
     if (!confirm('把所有参数恢复成默认值？')) return;
@@ -3376,14 +3570,7 @@ function renderSettingsPage() {
       saveSettings();
     };
   }
-  D('sp_upnp').onclick = function () {
-    D('sp_upnpmsg').textContent = '正在搜索…';
-    api('/api/upnp').then(function (j) {
-      var hh = '';
-      (j.devices || []).forEach(function (d) { hh += '<div>' + esc(d.name) + ' — ' + esc(d.host) + ':' + esc(d.port) + '</div>'; });
-      D('sp_upnpmsg').innerHTML = hh || '没发现 DLNA 渲染器';
-    });
-  };
+  // DLNA 发现按钮已移到「流媒体」页（用户 261024-01 #6），绑定在 bindSrcPage() 里做。
   drawRoots();
   // EQ 页签的内容在 renderSettingsPage 里一并渲染；这里统一做一次事件绑定 + 初始 OPRA 状态。
   initEqViewLogic();
@@ -3587,7 +3774,6 @@ function eqSettingsHtml() {
     + '<svg width=12 height=12 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 style="margin-right:4px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>https://opra.roon.app/</span>'
     + '</div>'
     + '<div class="sfld wide" id=eqSearchGuide style="padding:2px 0 0">'
-    + '<div style="font-size:12px;color:var(--mut2);margin-bottom:8px">输入品牌或型号检索耳机，或直接点击下方热门品牌快速筛选：</div>'
     + '<div style="display:flex;flex-wrap:wrap;gap:8px" id=eqBrandChips>'
     + '<button class="btn brand-chip" data-brand="Sennheiser">森海塞尔 Sennheiser</button>'
     + '<button class="btn brand-chip" data-brand="Sony">索尼 Sony</button>'
@@ -3609,15 +3795,13 @@ function eqSettingsHtml() {
     + '<div id=eqTargetCurveInfo style="margin-top:16px;padding:14px 16px;background:var(--field);border:1px solid var(--line);border-radius:8px;font-size:12.5px;color:var(--txt2);line-height:1.6;display:none"></div>'
     + '</div>');
   // 2. EQ 文件（REW / AutoEq 文本）
-  h += sgroup('EQ 文件（REW / AutoEq 文本）', '参量 EQ 支持 REW / AutoEq 标准文本，按文件里的 Filter 行生成双二阶滤波器组',
-      '<div class="sfld wide"><label>EQ 文件路径</label>'
-    + '<input type=text id=sp_eq value="' + esc(ADV.eq || '') + '" placeholder="D:\\Music\\headphone-eq.txt">'
-    + '<div class=hint>每行如 Filter 1: ON PK Fc 1000 Hz Gain -3.0 dB Q 1.41</div></div>');
+  h += sgroup('EQ 文件（REW / AutoEq 文本）', '按文件里的 Filter 行生成双二阶滤波器组',
+      '<div class="sfld wide"><label>EQ 文件路径' + tip('每行形如 Filter 1: ON PK Fc 1000 Hz Gain -3.0 dB Q 1.41') + '</label>'
+    + '<input type=text id=sp_eq value="' + esc(ADV.eq || '') + '" placeholder="D:\\Music\\headphone-eq.txt"></div>');
   // 3. 房间校正 IR（WAV 路径 + GPU 卷积开关）
-  h += sgroup('房间校正 IR（WAV 脉冲响应）', '把测量到的房间 / 耳机脉冲响应用 FIR 卷积叠进播放链路，做声学校正',
-      '<div class="sfld wide"><label>IR 脉冲响应卷积文件（WAV）</label>'
-    + '<input type=text id=sp_ir value="' + esc(ADV.ir || '') + '" placeholder="D:\\Music\\room.wav">'
-    + '<div class=hint>留空 = 不做卷积；支持立体声 / 多声道 FIR 房间校正</div></div>'
+  h += sgroup('房间校正 IR（WAV 脉冲响应）', '把房间 / 耳机脉冲响应用 FIR 卷积叠进播放链路',
+      '<div class="sfld wide"><label>IR 脉冲响应卷积文件（WAV）' + tip('留空 = 不做卷积；支持立体声 / 多声道 FIR 房间校正') + '</label>'
+    + '<input type=text id=sp_ir value="' + esc(ADV.ir || '') + '" placeholder="D:\\Music\\room.wav"></div>'
     + chk('sp_irgpu', '卷积走 GPU 硬件加速（需要 rtagpu.dll 就位）', ADV.irgpu == 1,
           '房间 / 耳机 FIR 卷积交给 GPU；没有可用后端时自动退回 CPU')
     // 评审 #11：这里原来还有一个「保存 EQ 与房间校正设置」按钮，与底部全局「保存设置」重复 → 移除；
