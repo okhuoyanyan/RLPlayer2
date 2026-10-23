@@ -139,11 +139,13 @@ target_link_libraries(aidecode PRIVATE rtadsp)
 # ---------------- 网页播放器 ----------------
 # dbghelp:崩溃转储(crash_dump.h,SetUnhandledExceptionFilter + MiniDumpWriteDump)
 add_executable(rtaweb tools/rtaweb.cpp)
-target_link_libraries(rtaweb PRIVATE rtadsp ws2_32 winmm avrt dbghelp)
+# iphlpapi: /api/naa/discover 通过 tools/naa_discover.h 枚举本机网卡（自动选网段）
+target_link_libraries(rtaweb PRIVATE rtadsp ws2_32 winmm avrt dbghelp iphlpapi)
 
 # ---------------- NAA 端点发现 ----------------
 add_executable(naa_scan tools/naa_scan.cpp)
-target_link_libraries(naa_scan PRIVATE ws2_32)
+# iphlpapi: tools/naa_discover.h 用 GetAdaptersAddresses 枚举本机网卡（自动选网段）
+target_link_libraries(naa_scan PRIVATE ws2_32 iphlpapi)
 
 # NAA 控制通道黑盒探针（只做 TCP 交换，不发音频）
 add_executable(naa_probe tools/naa_probe.cpp)
