@@ -331,31 +331,88 @@ function updateFavUi() {
   }
 }
 
-function renderSummaryContent(summary, title) {
-  if (!summary || !summary.ok || !summary.sections || !summary.sections.length) return '';
-  var h = '';
-  h += '<div style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:8px">' + esc(title || '简介') + '</div>';
-  var citMap = {};
-  (summary.citations || []).forEach(function (c, idx) {
-    citMap[c.id] = { idx: idx + 1, c: c };
+/* ---- 结构化标签值网格（261024-01 #4）----
+   后端契约（Lead）：/api/entity/summary 与 /api/entity/knowledge 的返回里带
+     kind: 'track' | 'release' | 'person' | 'work'
+     fields: { 标签: 值, ... }        // AI 只知道它能确认的；不知道的标签**根本不出现**
+   前端职责：按实体类型排好序、长文本独占整行、空值一律不渲染（不占位、不写"未知"）。
+   没有 fields（旧缓存/后端未升级）时自动退回 sections 段落渲染，绝不白屏。 */
+// 每类实体「应该出现」的标签顺序（用户 #4 的思路 + 补全）。顺序 = 渲染顺序。
+var EF_ORDER = {
+  track: ['演唱', '作词', '作曲', '编曲', '歌曲风格', '发行时间', '所属专辑', '时长', '版本说明', '衍生作品', '歌词赏析'],
+  person: ['简介', '国籍', '活跃年代', '风格', '代表作品', '厂牌', '合作'],
+  release: ['艺术家', '发行时间', '专辑类型', '语种', '出版方', '专辑编号', '时长', '专辑介绍', '曲目列表', '制作人员', '关联'],
+  work: ['作曲家', '创作年代', '体裁']
+};
+// 长文本标签：独占整行并保留换行（这些一定不是一格能装下的）
+// 只有"一定是一整段/一整列"的标签才独占整行；代表作品/合作这类是短列表，留在网格里更紧凑（信息密度）。
+var EF_WIDE = { '简介': 1, '专辑介绍': 1, '曲目列表': 1, '制作人员': 1, '歌词赏析': 1, '关联': 1, '衍生作品': 1, '版本说明': 1 };
+function efValueText(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'string') return v.replace(/\s+$/, '').replace(/^\s+/, '');
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (Object.prototype.toString.call(v) === '[object Array]') {
+    var out = [];
+    for (var i = 0; i < v.length; ++i) { var s = efValueText(v[i]); if (s) out.push(s); }
+    return out.join('\n');
+  }
+  try { return JSON.stringify(v); } catch (e) { return ''; }
+}
+function renderFieldGrid(fields, kind, opts) {
+  if (!fields || typeof fields !== 'object') return '';
+  var skip = (opts && opts.skip) || {};
+  var labels = [], seen = {};
+  var order = EF_ORDER[kind] || [];
+  order.forEach(function (lb) {
+    if (fields[lb] !== undefined && fields[lb] !== null && !skip[lb]) { labels.push(lb); seen[lb] = 1; }
   });
-  summary.sections.forEach(function (sec) {
-    h += '<div style="margin-bottom:10px">';
-    if (sec.heading && sec.heading !== '概述' && sec.heading !== '简介') {
-      h += '<div style="font-size:12.5px;font-weight:600;color:var(--txt);margin:6px 0 4px">' + esc(sec.heading) + '</div>';
-    }
-    (sec.paragraphs || []).forEach(function (p) {
-      var sups = '';
-      (p.citations || []).forEach(function (cid) {
-        var found = citMap[cid];
-        if (found) sups += '<sup style="color:var(--mut);font-size:10px;margin-left:2px">[' + found.idx + ']</sup>';
+  Object.keys(fields).forEach(function (lb) {   // 契约外的标签也照渲染（前端不许丢后端给的内容）
+    if (!seen[lb] && !skip[lb] && labels.indexOf(lb) < 0) labels.push(lb);
+  });
+  var rows = '';
+  labels.forEach(function (lb) {
+    var v = efValueText(fields[lb]);
+    if (!v) return;                              // 空值 = 后端不知道 ⟹ 不占位
+    var wide = !!EF_WIDE[lb] || v.length > 46 || v.indexOf('\n') >= 0;
+    rows += '<div class="efrow' + (wide ? ' wide' : '') + '">' +
+            '<div class=lb>' + esc(lb) + '</div><div class=vl>' + esc(v) + '</div></div>';
+  });
+  return rows ? ('<div class=efields>' + rows + '</div>') : '';
+}
+// 简介类区块的统一渲染：优先 fields 网格，兜底 sections 段落。
+// title 非空时作为小标题（内容全是 AI 整理的板块一律传「AI 整理」，全站同一措辞 —— 261024-01 #2）。
+function renderSummaryContent(summary, title, kind, opts) {
+  if (!summary) return '';
+  var sections = (summary.sections || []);
+  var body = renderFieldGrid(summary.fields, (summary.kind || kind || ''), opts);
+  if (!body) {
+    if (!(summary.ok && sections.length)) return '';
+    var citMap0 = {};
+    (summary.citations || []).forEach(function (c, idx) { citMap0[c.id] = idx + 1; });
+    var b0 = '';
+    sections.forEach(function (sec) {
+      b0 += '<div style="margin-bottom:10px">';
+      if (sec.heading && sec.heading !== '概述' && sec.heading !== '简介') {
+        b0 += '<div style="font-size:12.5px;font-weight:600;color:var(--txt);margin:6px 0 4px">' + esc(sec.heading) + '</div>';
+      }
+      (sec.paragraphs || []).forEach(function (p) {
+        var sups = '';
+        (p.citations || []).forEach(function (cid) {
+          var found = citMap0[cid];
+          if (found) sups += '<sup style="color:var(--mut);font-size:10px;margin-left:2px">[' + found + ']</sup>';
+        });
+        b0 += '<div style="font-size:12.5px;line-height:1.7;color:var(--txt);margin-bottom:6px">' + esc(p.text) + sups + '</div>';
       });
-      h += '<div style="font-size:12.5px;line-height:1.7;color:var(--txt);margin-bottom:6px">' + esc(p.text) + sups + '</div>';
+      b0 += '</div>';
     });
-    h += '</div>';
-  });
+    body = b0;
+  }
+  if (!body) return '';
+  var h = '';
+  if (title) h += '<div style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:8px">' + esc(title) + '</div>';
+  h += body;
   if (summary.citations && summary.citations.length > 0) {
-    h += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">';
+    h += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">';
     summary.citations.forEach(function (c, idx) {
       var label = '[' + (idx + 1) + '] ' + (c.title || c.source || '来源');
       h += '<button class="btn chip-copy" data-url="' + esc(c.url) + '" title="复制来源链接" style="font-size:11px;padding:2px 8px">' +
@@ -365,12 +422,16 @@ function renderSummaryContent(summary, title) {
     });
     h += '</div>';
   }
-  // 说明行：不写「AI 生成」这类字眼（用户 261023-03 #2），也不回显旧缓存里的旧措辞
-  // 261023-04 #14/#15：没有任何权威材料时走 AI 自有知识整理，必须如实标注（不许冒充带来源的综合）
-  if (summary.unverified) {
-    h += '<div style="font-size:11px;color:#d8a24a;margin-top:8px">AI 整理（未找到权威来源，仅供参考）</div>';
-  } else {
-    h += '<div style="font-size:11px;color:var(--mut2);margin-top:8px">依据上面的来源整理，可能不完整，请以来源为准</div>';
+  // 说明行：不写「AI 生成」这类字眼（用户 261023-03 #2）。
+  // 261024-01 #2：用户明确要求**只显示「AI 整理」四个字** ⟹ 旧的
+  // 「AI 整理（未找到权威来源，仅供参考）」/「未核对 · 依据来源整理…」一律删掉；
+  // 有标题的板块（标题就是「AI 整理」）不再重复；有真实来源时才留一行来源提示。
+  if (!summary.unverified) {
+    if (summary.citations && summary.citations.length > 0) {
+      h += '<div style="font-size:11px;color:var(--mut2);margin-top:8px">依据上面的来源整理，可能不完整，请以来源为准</div>';
+    }
+  } else if (!title) {
+    h += '<div style="font-size:10.5px;color:var(--mut2);letter-spacing:.6px;margin-top:10px">AI 整理</div>';
   }
   return h;
 }
@@ -461,9 +522,11 @@ function openAlbum(k) {
           '&artist=' + encodeURIComponent(j.artist || '') + '&lang=zh', function (s) {
           var el = D('albumSummary');
           if (!el || el.dataset.k !== albK) return;   // 异步回来时已切到别的专辑 → 丢弃
-          if (s && s.ok && s.sections && s.sections.length > 0) {
+          // 261024-01 #4：后端现在回结构化 fields（可能没有 sections）⟹ 判据用"能渲染出东西"
+          var albHtml = s ? renderSummaryContent(s, 'AI 整理', 'release') : '';
+          if (albHtml) {
             el.style.display = '';
-            el.innerHTML = renderSummaryContent(s, '简介');
+            el.innerHTML = albHtml;
             bindCopyChips(el);
           } else {
             el.remove();   // 无资料/无 key 又无缓存 → 干脆不显示
@@ -579,9 +642,12 @@ function openArtistProfile(who, refresh) {
     if (!el) return;
     if (!summState.done) return;
     var ss = summState.res;
-    if (ss && ss.ok && ss.sections && ss.sections.length > 0) {
+    // 261024-01 #4：AI 资料优先按后端结构化 fields 渲染成标签值网格；旧缓存只有 sections 也能显示。
+    var hasBody = ss && ((ss.fields && Object.keys(ss.fields).length > 0) ||
+                         (ss.ok && ss.sections && ss.sections.length > 0));
+    if (hasBody) {
       el.style.display = '';
-      el.innerHTML = renderSummaryContent(ss, '延伸简介');
+      el.innerHTML = renderSummaryContent(ss, 'AI 整理', 'person', { skip: (summState.skipBio ? { '简介': 1 } : {}) });
       bindCopyChips(el);
     } else {
       el.remove();   // 无资料/失败/无 key 又无缓存 → 不留空白板块
@@ -614,6 +680,14 @@ function renderArtistProfile(who, j, summary) {
 
   var mats = (j && j.materials) || [];
   var isOk = j && j.ok && mats.length > 0;
+  // 权威材料解析提前到这里：AI 资料网格要知道"简介"是否已由权威词条给出（避免同一页两段简介）。
+  var bioMat = null;
+  var stylesMats = [];
+  mats.forEach(function (m) {
+    if (!bioMat && (m.kind === 'biography' || m.kind === 'disambiguation' || m.text)) bioMat = m;
+    if (m.kind === 'genre' || m.kind === 'similar') stylesMats.push(m);
+  });
+  var bioText = (isOk && bioMat) ? (bioMat.text || '') : '';
 
   var subText = '';
   if (isOk) {
@@ -623,9 +697,9 @@ function renderArtistProfile(who, j, summary) {
     } else {
       subText = '权威资料' + (firstDate ? (' · ' + firstDate + ' 取回') : '');
     }
-  } else {
-    subText = '权威资料暂缺';
   }
+  // 261024-01 #3a：无权威资料时**不显示**「权威资料暂缺」这类状态小字 —— 顶部只留名字，
+  // 下方安静地给 AI 整理资料；没有资料就什么都不显示（用户原话：那句说明"纯粹多余"）。
 
   head(who, subText, '<button class=btn id=bTopBack>返回艺术家列表</button>');
   if (D('bTopBack')) D('bTopBack').onclick = function () { loadArtists(); };
@@ -648,58 +722,41 @@ function renderArtistProfile(who, j, summary) {
 
   h += '<div class=artist-body style="padding:0 22px 30px">';
 
-  // 延伸简介（AI 资料）HTML 先算好：有权威词条时排在「风格」之后、无条目时紧跟提示卡（261023-04 #14）
+  // AI 整理资料（261024-01 #3a/#4）：这是本页**主内容**，紧跟 hero 之后；
+  //   无权威词条时不再有任何"权威词条暂缺 / 维基百科没有匹配条目…"的解释卡（用户：那句纯粹多余）。
+  //   结构化 fields → 标签值网格；旧缓存只有 sections → 段落兜底；两者都没有就整卡不渲染。
   var summHtml = '';
   if (META.summary == 1) {
     var sumObj = (summary && summary.enabled && summary.done) ? summary.res : null;
-    var hasSummary = sumObj && sumObj.ok && sumObj.sections && sumObj.sections.length > 0;
+    var hasSummary = sumObj && ((sumObj.fields && Object.keys(sumObj.fields).length > 0) ||
+                                (sumObj.ok && sumObj.sections && sumObj.sections.length > 0));
     var sumLoading = (META.hasLlmKey === true && !hasSummary);
-    summHtml = '<div class="sec-card summary-sec" id="artistSummary" style="margin-bottom:24px' + (sumLoading ? '' : ';display:none') + '">';
+    if (summary) summary.skipBio = !!bioText;   // 权威简介已在下面展示 → AI 网格里不重复「简介」
+    summHtml = '<div class="sec-card summary-sec" id="artistSummary" style="margin-bottom:20px' + (sumLoading ? '' : ';display:none') + '">';
     if (hasSummary) {
-      summHtml += renderSummaryContent(sumObj, '延伸简介');
+      summHtml += renderSummaryContent(sumObj, 'AI 整理', 'person', { skip: (bioText ? { '简介': 1 } : {}) });
     } else if (sumLoading) {
       summHtml += '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>';
     }
     summHtml += '</div>';
   }
+  h += summHtml;
 
   if (!isOk) {
-    // 2026-10-23（用户 261023-04 #14）：夏壬唱片这类维基没有条目的实体，旧版在这里拍一张大空态卡，
-    // 而下面其实还有 AI 整理简介 → 用户看到"暂无权威资料"就以为功能坏了。
-    // 现在：开了「在线整理」时只留一行低调说明（AI 简介会在下面自动出现）；没开才保留空态卡+重试。
-    if (META.summary == 1) {
-      h += '<div class="card" style="padding:14px 18px;background:var(--phbg);border:1px solid var(--line);border-radius:10px;margin-top:14px">' +
-           '<div style="font-size:13px;font-weight:600;margin-bottom:4px;color:var(--txt)">权威词条暂缺</div>' +
-           '<div style="color:var(--mut);font-size:12px;line-height:1.6">维基百科 / 萌娘百科没有匹配条目。下方会用 AI 依据通识整理一段简介（标注「AI 整理」，仅供参考）；也可点上方「刷新资料」重试权威来源。</div>' +
-           '</div>';
-      h += summHtml;
-    } else {
-      var errMsg = (j && j.errors && j.errors[0] && j.errors[0].error) || (j && j.error) || '未在维基百科或萌娘百科匹配到权威词条，或当前网络不可达。';
-      h += '<div class="card empty-card" style="padding:36px 20px;text-align:center;background:var(--phbg);border:1px solid var(--line);border-radius:12px;margin-top:14px">' +
-           '<div style="font-size:15px;font-weight:600;margin-bottom:8px;color:var(--txt)">暂无权威资料或网络连接失败</div>' +
-           '<div style="color:var(--mut);font-size:12.5px;margin-bottom:18px;max-width:520px;margin-left:auto;margin-right:auto;line-height:1.6">' +
-           esc(errMsg) + '</div>' +
-           '<button class="btn pri" id=bRetryKnowledge>重试获取</button>' +
+    // 261024-01 #3a：**删除整个「权威词条暂缺」说明块**。没有权威资料 → 上面 AI 资料安静显示，这里什么都不放。
+    // 只有"在线整理也没开"这种确实无内容可显示的情况，才给一行极简空态 + 重试（绝不写一大段解释）。
+    if (META.summary != 1) {
+      h += '<div class="card empty-card" style="padding:22px 20px;text-align:center;background:var(--phbg);border:1px solid var(--line);border-radius:12px;margin-top:14px">' +
+           '<div style="color:var(--mut);font-size:12.5px">暂无资料</div>' +
+           '<button class="btn" id=bRetryKnowledge style="margin-top:12px">重试获取</button>' +
            '</div>';
     }
   } else {
-    // 1) 简介（L2 原文，长文折叠「展开」）
-    var bioMat = null;
-    var stylesMats = [];
-    mats.forEach(function (m) {
-      if (!bioMat && (m.kind === 'biography' || m.kind === 'disambiguation' || m.text)) {
-        bioMat = m;
-      }
-      if (m.kind === 'genre' || m.kind === 'similar') {
-        stylesMats.push(m);
-      }
-    });
-
-    var bioText = bioMat ? bioMat.text : '';
+    // 1) 权威简介（L2 原文，长文折叠「展开」）—— 排在 AI 资料之后，是"佐证"而不是主内容
     var isLong = bioText.length > 280 || (bioText.split('\n').length > 5);
 
     h += '<div class="sec-card bio-sec" style="margin-bottom:24px">' +
-         '<div style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:10px">简介</div>' +
+         '<div style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:10px">权威简介</div>' +
          '<div class="bio-box ' + (isLong ? 'collapsed' : '') + '" id=bioBox>' +
          esc(bioText || '暂无详细文字介绍') +
          '</div>' +
@@ -717,10 +774,7 @@ function renderArtistProfile(who, j, summary) {
       h += '</div></div>';
     }
 
-    // 3) 延伸简介（AI 资料）
-    h += summHtml;
-
-    // 4) 来源：来源徽章、标题、取回日期、「复制链接」芯片（绝不 window.open / <a target=_blank>）
+    // 3) 来源：来源徽章、标题、取回日期、「复制链接」芯片（绝不 window.open / <a target=_blank>）
     h += '<div class="sec-card sources-sec" style="margin-bottom:24px">' +
          '<div style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:12px">资料来源</div>' +
          '<div style="display:flex;flex-direction:column;gap:8px">';
@@ -1814,6 +1868,9 @@ D('bPause').onclick = playOrPause;
 D('qclr').onclick = function () { api('/api/clear', '').then(function () { loadQ(); if (S.view === 'queue') renderQueuePage(); }); };
 D('npOpen').onclick = openNowPlaying;
 D('npClose').onclick = closeNowPlaying;
+// 资料抽屉（261024-01 #3b ③）：关闭按钮 / 点遮罩 / 再点同一标签 都能收起
+if (D('npDataClose')) D('npDataClose').onclick = function () { npDrawerClose(); npDataRenderBody(); };
+if (D('npDrawerBg')) D('npDrawerBg').onclick = function () { npDrawerClose(); npDataRenderBody(); };
 // 整页里的播放控件：直接复用底栏那套动作，避免两处逻辑漂移
 D('npPrev').onclick = function () { api('/api/skip?dir=-1', '').then(loadQ); };
 D('npNext').onclick = function () { api('/api/skip?dir=1', '').then(loadQ); };
@@ -4061,7 +4118,11 @@ document.addEventListener('keydown', function (e) {
   else if (e.key === 'p') D('bPrev').click();
   else if (e.key === 's') D('bStop').click();
   else if (e.key === 'l') D('bLyric').click();
-  else if (e.key === 'Escape' && D('npPage') && D('npPage').classList.contains('on')) closeNowPlaying();
+  // Esc：资料抽屉开着先收抽屉（不把整页一起关掉），再按一次才退出单曲页
+  else if (e.key === 'Escape' && D('npPage') && D('npPage').classList.contains('on')) {
+    if (npDrawerIsOpen()) { npDrawerClose(); npDataRenderBody(); }
+    else closeNowPlaying();
+  }
   else if (e.key === 'i') showChain();
 });
 
@@ -4140,7 +4201,7 @@ function closeNowPlaying() { var pg = D('npPage'); if (pg) pg.classList.remove('
      - 「作品」只在判定为古典时出现，走 /api/entity/versions（Discogs 版本推荐），
        并提供进入「古典作品」整页的入口（左导航已按 #9 移除）。
    状态机：idle → loading（骨架）→ ok / error；切歌/关页丢弃过期回调。 */
-var NP_DATA = { key: '', active: '', tabs: [], cache: {}, inflight: {}, req: 0 };
+var NP_DATA = { key: '', active: '', tabs: [], cache: {}, inflight: {}, req: 0, bodyKey: '', tabSig: '' };
 
 function npFileName(p) {
   var s = String(p || '').replace(/\\/g, '/');
@@ -4212,10 +4273,42 @@ function npBindEqChips() {
   if (ir) ir.onclick = function () { closeNowPlaying(); openSettingsTab('eq'); };
 }
 function npDataReset() {
-  NP_DATA = { key: '', active: '', userPicked: false, tabs: [], cache: {}, inflight: {}, req: 0 };
+  NP_DATA = { key: '', active: '', tabs: [], cache: {}, inflight: {}, req: 0, bodyKey: '', tabSig: '' };
   var b = D('npDataBody'); if (b) b.innerHTML = '';
   var t = D('npTabs'); if (t) t.innerHTML = '';
   var s = D('npDataStat'); if (s) s.textContent = '';
+  npDrawerClose();
+}
+// 抽屉开关（#3b ③）：资料默认不占版面，点标签才从右侧滑出
+// 抽屉底边动态让出控制区高度（Lead 复核要求：1024x640 下抽屉不许盖住播放控制条）
+function npDrawerFit() {
+  var dr = D('npDrawer');
+  if (!dr) return;
+  var ctl = document.querySelector('#npPage .npctl2');
+  var vh = window.innerHeight || 0;
+  var bottom = 14;
+  if (ctl) {
+    var b = ctl.getBoundingClientRect();
+    if (b.top > 0 && b.top < vh) bottom = Math.max(12, Math.round(vh - b.top + 8));
+  }
+  dr.style.bottom = bottom + 'px';
+}
+function npDrawerOpen() {
+  var dr = D('npDrawer'), bg = D('npDrawerBg');
+  npDrawerFit();
+  if (dr) dr.classList.add('on');
+  if (bg) bg.classList.add('on');
+}
+function npDrawerClose() {
+  var dr = D('npDrawer'), bg = D('npDrawerBg');
+  if (dr) dr.classList.remove('on');
+  if (bg) bg.classList.remove('on');
+  NP_DATA.active = '';
+  npDataRenderTabs();
+}
+function npDrawerIsOpen() {
+  var dr = D('npDrawer');
+  return !!(dr && dr.classList.contains('on'));
 }
 function npDataTargets(m) {
   var out = [];
@@ -4244,59 +4337,57 @@ function npDataTab(kind) {
   for (var i = 0; i < tabs.length; ++i) if (tabs[i].k === kind) return tabs[i];
   return null;
 }
+// 右侧标签栏（#3b ③）：默认只露「歌曲 / 专辑 / 艺术家 / 作品」四类药丸；
+// 每个药丸带一个状态点（灰=没取过、脉冲=整理中、绿=已有内容、黄=取不到），点开才请求、才出抽屉。
+function npDataTabsSig() {
+  return (NP_DATA.tabs || []).map(function (t) {
+    var st = NP_DATA.cache[t.k] || { state: 'idle' };
+    return t.k + ':' + t.label + ':' + st.state + ':' + (NP_DATA.active === t.k ? '1' : '0');
+  }).join('|');
+}
 function npDataRenderTabs() {
   var el = D('npTabs'); if (!el) return;
+  var sig = npDataTabsSig();
+  if (sig === NP_DATA.tabSig) return;     // renderNp 每 400ms 调一次：没变化绝不重绘（否则悬停会闪）
+  NP_DATA.tabSig = sig;
   var h = '';
   (NP_DATA.tabs || []).forEach(function (t) {
-    h += '<button class="npdtab' + (NP_DATA.active === t.k ? ' on' : '') + '" data-k="' + esc(t.k) + '">' + esc(t.label) + '</button>';
+    var st = NP_DATA.cache[t.k] || { state: 'idle' };
+    var cls = st.state === 'ok' ? ' ok' : (st.state === 'loading' ? ' busy' : (st.state === 'error' ? ' err' : ''));
+    h += '<button class="npchip' + cls + (NP_DATA.active === t.k ? ' on' : '') + '" data-k="' + esc(t.k) + '"' +
+         ' title="' + esc(t.label + '：' + (t.name || '') + '（点击查看 AI 整理的资料）') + '">' +
+         '<i class=dot></i>' + esc(t.label) + '</button>';
   });
   el.innerHTML = h;
-  Array.prototype.forEach.call(el.querySelectorAll('.npdtab'), function (b) {
-    b.onclick = function () { npDataActivate(b.dataset.k); };
+  Array.prototype.forEach.call(el.querySelectorAll('.npchip'), function (b) {
+    b.onclick = function () { npDataToggle(b.dataset.k); };
   });
 }
+// 再点同一个标签 = 收起抽屉（浮层"看一眼就走"，不逼用户找关闭按钮）
+function npDataToggle(kind) {
+  if (NP_DATA.active === kind && npDrawerIsOpen()) { npDrawerClose(); npDataRenderBody(); return; }
+  npDataActivate(kind);
+}
 function npDataStatHtml(kind, st) {
-  if (st.state === 'idle' || st.state === 'loading') return '整理中…';
+  if (!st || st.state === 'idle' || st.state === 'loading') return '整理中…';
   if (st.state === 'error') return '暂无资料';
   var d = st.data || {};
   if (kind === 'work') {
     var n = (d.performances || []).length;
-    return (d.from_cache ? '缓存' : 'Discogs 实时') + (n ? ' · ' + n + ' 个版本' : '');
+    return (d.from_cache ? '缓存' : '实时') + (n ? ' · ' + n + ' 个版本' : '');
   }
-  return (d.summaryCached ? '已缓存' : '刚刚整理') + (d.unverified ? ' · 未核对' : '');
+  // 261024-01 #2：只标注来源状态（已缓存 / 刚刚整理），不再叠「未核对」这类长尾文案。
+  return d.summaryCached ? '已缓存' : '刚刚整理';
 }
 function npDataSkeleton() {
   return '<div class=npdskel><i style="width:92%"></i><i style="width:76%"></i><i style="width:84%"></i></div>' +
          '<div class=npdhint>正在整理资料…</div>';
 }
-function npDataSummaryBody(d) {
-  var h = '';
-  var citMap = {};
-  (d.citations || []).forEach(function (c, idx) { citMap[c.id] = idx + 1; });
-  (d.sections || []).forEach(function (sec) {
-    h += '<div class=npdsec>';
-    if (sec.heading && sec.heading !== '概述' && sec.heading !== '简介') h += '<h4>' + esc(sec.heading) + '</h4>';
-    (sec.paragraphs || []).forEach(function (p) {
-      var sups = '';
-      (p.citations || []).forEach(function (cid) {
-        if (citMap[cid]) sups += '<sup style="color:var(--mut2);font-size:10px;margin-left:1px">[' + citMap[cid] + ']</sup>';
-      });
-      h += '<p>' + esc(p.text) + sups + '</p>';
-    });
-    h += '</div>';
-  });
-  if ((d.citations || []).length) {
-    h += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 6px">';
-    (d.citations || []).forEach(function (c, idx) {
-      h += '<button class="btn chip-copy" data-url="' + esc(c.url) + '" title="复制来源链接" style="font-size:10.5px;padding:1px 7px">[' + (idx + 1) + '] ' + esc(c.title || c.source || '来源') + '</button>';
-    });
-    h += '</div>';
-  }
-  // Lead 约定：无权威材料时后端回 unverified=true（AI 整理），这里必须明确标注，
-  // 不能让用户把 AI 组织的内容当成权威资料。
-  if (d.unverified) h += '<div class=npdhint style="margin-bottom:4px">AI 整理（未找到权威来源，仅供参考）</div>';
-  h += '<div class=npdhint>' + (d.unverified ? '未核对 · ' : '') +
-       (d.summaryCached ? '缓存结果 · ' : '实时整理 · ') + '依据来源整理，可能不完整，请以来源为准</div>';
+function npDataSummaryBody(d, kind) {
+  // 261024-01 #4：结构化 filters/fields → 标签值网格（renderSummaryContent 内部优先 fields）；
+  // 261024-01 #2：脚注只留「AI 整理」，删掉「未找到权威来源，仅供参考」「未核对 · 依据来源整理…」。
+  var h = renderSummaryContent(d || {}, '', kind || NP_DATA.active);
+  if (!h) h = '<div class=npdhint>该实体暂无可用的 AI 整理资料。</div>';
   return h;
 }
 function npDataWorkBody(d) {
@@ -4324,30 +4415,52 @@ function npDataWorkBody(d) {
   h += '<div style="margin-top:10px"><button class="btn pri" id=npWorkOpen>查看 Discogs 版本推荐 →</button></div>';
   return h;
 }
-function npDataRenderBody() {
-  var body = D('npDataBody'), stat = D('npDataStat');
+// 抽屉头部：类型标签 + 实体名 + 状态（#3b ③：默认看不到这些，点标签才滑出）
+function npDataHeader(kind, st) {
+  var t = kind ? (npDataTab(kind) || { label: '', name: '' }) : { label: '', name: '' };
+  var k = D('npDrawerKind'), n = D('npDrawerName'), s = D('npDataStat');
+  if (k) k.textContent = t.label || '资料';
+  if (n) n.textContent = t.name || '';
+  if (s) s.textContent = kind ? npDataStatHtml(kind, st) : '';
+}
+function npDataRenderBody(force) {
+  var body = D('npDataBody');
   if (!body) return;
   var kind = NP_DATA.active;
-  if (!kind) { body.innerHTML = ''; if (stat) stat.textContent = ''; return; }
+  if (!kind) {
+    if (NP_DATA.bodyKey) { body.innerHTML = ''; NP_DATA.bodyKey = ''; }
+    npDataHeader('', null);
+    return;
+  }
   var st = NP_DATA.cache[kind] || { state: 'idle' };
-  if (stat) stat.textContent = npDataStatHtml(kind, st);
+  npDataHeader(kind, st);
+  // renderNp 400ms 一次：内容没变就不重绘（否则抽屉里的滚动位置会被反复重置）
+  var sig = kind + '|' + st.state + '|' + (st.data ? (st.data.generated_at || (st.data.summaryCached ? 'c' : 'f')) : (st.error || ''));
+  var need = (sig !== NP_DATA.bodyKey);
+  if (!need && !force) return;
+  NP_DATA.bodyKey = sig;
   if (st.state === 'idle' || st.state === 'loading') { body.innerHTML = npDataSkeleton(); return; }
   if (st.state === 'error') {
     body.innerHTML = '<div class=npdhint>暂无该实体的资料。' + (st.error ? ('（' + esc(st.error) + '）') : '') + '</div>' +
-      '<div style="margin-top:8px"><button class=btn id=npDataRetry>重试</button></div>';
+      '<div style="margin-top:10px"><button class=btn id=npDataRetry>重试</button></div>';
     var rb = D('npDataRetry');
     if (rb) rb.onclick = function () { npDataEnsure(kind, true); };
     return;
   }
   if (kind === 'work') {
-    body.innerHTML = npDataWorkBody(st.data);
+    body.innerHTML = npDataWorkBody(st.data) +
+      '<div style="margin-top:14px"><button class="btn" id=npDataRefresh style="font-size:11px;padding:3px 10px">重新查询</button></div>';
     bindCopyChips(body);
     var wo = D('npWorkOpen'); if (wo) wo.onclick = npOpenWorks;
     var wr = D('npWorkRetry'); if (wr) wr.onclick = function () { npDataEnsure('work', true); };
+    var wf = D('npDataRefresh'); if (wf) wf.onclick = function () { npDataEnsure('work', true); };
     return;
   }
-  body.innerHTML = npDataSummaryBody(st.data);
+  body.innerHTML = npDataSummaryBody(st.data, kind) +
+    '<div style="margin-top:16px"><button class="btn" id=npDataRefresh style="font-size:11px;padding:3px 10px" title="重新请求 AI 整理（会消耗一次模型调用）">重新整理</button></div>';
   bindCopyChips(body);
+  var rf = D('npDataRefresh');
+  if (rf) rf.onclick = function () { npDataEnsure(kind, true); };
 }
 function npDataEnsure(kind, force) {
   var t = npDataTab(kind); if (!t) return;
@@ -4378,16 +4491,19 @@ function npDataEnsure(kind, force) {
   var u = '/api/entity/summary?kind=' + kind + '&name=' + encodeURIComponent(t.name) +
           (t.artist ? ('&artist=' + encodeURIComponent(t.artist)) : '') + '&lang=zh' + (force ? '&refresh=1' : '');
   fetchSummary(u, function (s) {
-    if (s && s.ok && s.sections && s.sections.length > 0) done(s, '');
+    // 261024-01 #4：后端新增结构化 fields（可能没有 sections）⟹ 有 fields 也算有资料
+    var hasFields = s && s.fields && Object.keys(s.fields).length > 0;
+    var hasSecs = s && s.ok && s.sections && s.sections.length > 0;
+    if (hasFields || hasSecs) done(s, '');
     else done(null, (s && s.error) || '');
   });
 }
 function npDataActivate(kind) {
   NP_DATA.active = kind;
-  NP_DATA.userPicked = true;   // 用户手动点过 tab → 之后元数据补全回来也不再自动抢回默认 tab
   npDataRenderTabs();
-  npDataEnsure(kind, false);
   npDataRenderBody();
+  npDrawerOpen();          // 先滑出抽屉（骨架态），再请求 —— 点一下就有反馈，不做"静默等 10 秒"
+  npDataEnsure(kind, false);
 }
 // 打开「古典作品 · 演绎版本」整页（左导航已移除，这是唯一入口；返回按钮见 loadWorksView）
 function npOpenWorks() {
@@ -4396,31 +4512,28 @@ function npOpenWorks() {
   loadWorksView(w.title || '', w.composer || '', true);
 }
 function updateNpData(m) {
-  var sec = D('npData'), grid = D('npGrid');
-  if (!sec) return;
+  var rail = D('npRail'), grid = D('npGrid');
+  if (!rail) return;
   var key = S.lastCur || '';
   if (NP_DATA.key !== key) { npDataReset(); NP_DATA.key = key; NP_DATA.req++; }
   var can = npDataCan(m);
   var tabs = can ? npDataTargets(m) : [];
   if (!can || !tabs.length) {
-    sec.classList.remove('on');
+    // 没有任何可用资料：整个标签栏收起（不占版面、不留空白块），抽屉也收起
+    rail.classList.remove('on');
     if (grid) grid.classList.remove('withdata');
+    if (NP_DATA.active) npDrawerClose();
     return;
   }
-  sec.classList.add('on');
-  if (grid) grid.classList.add('withdata');
+  rail.classList.add('on');
   NP_DATA.tabs = tabs;
-  function has(k) { return tabs.some(function (t) { return t.k === k; }); }
-  // 2026-10-23（npcheck 1024 档暴露）：/api/meta 分两拍回来 —— 先只有标题（tabs=[歌曲]），
-  // 后到专辑/艺术家字段。旧逻辑「active 有效就不动」会把默认 tab 永久钉在「歌曲」上。
-  // 现在：用户没手动选过时，每次都按"专辑 → 艺术家 → 歌曲"重新取默认；手动选过则尊重用户。
-  var defaultKind = has('release') ? 'release' : (has('person') ? 'person' : (has('track') ? 'track' : 'work'));
-  if (!NP_DATA.userPicked || !NP_DATA.active || !has(NP_DATA.active)) {
-    NP_DATA.active = defaultKind;
-  }
+  // 切歌/元数据分两拍回来时，标签集合会变：抽屉开着的实体若已不存在 → 收起抽屉
+  var activeStill = false;
+  for (var i = 0; i < tabs.length; ++i) if (tabs[i].k === NP_DATA.active) activeStill = true;
+  if (NP_DATA.active && !activeStill) npDrawerClose();
   npDataRenderTabs();
-  // 自动预取「专辑 + 艺术家」；「歌曲」「作品」必须用户点 tab 才请求（费用纪律）
-  ['release', 'person'].forEach(function (k) { if (has(k) && !NP_DATA.cache[k]) npDataEnsure(k, false); });
+  // 261024-01 #3b ③「默认隐藏」⟹ 默认**不预取**任何实体：不点标签 = 不产生任何 AI 调用。
+  if (NP_DATA.active) npDataEnsure(NP_DATA.active, false);
   npDataRenderBody();
 }
 
@@ -4448,6 +4561,8 @@ function renderNp() {
   }
   updateFavUi();
   updateNpData(S.curMeta);
+  // 视口/行高变化后抽屉底边要重新让出控制区（否则矮窗下会压住播放控制条）
+  if (npDrawerIsOpen()) npDrawerFit();
   var bg = (D('cv') && D('cv').style.backgroundImage) || '';
   if (bg && bg.indexOf('url(') === 0) {
     D('npbg').style.backgroundImage = bg;
