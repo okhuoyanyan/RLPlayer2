@@ -712,6 +712,18 @@ int main() {
         ck(entity_artist_kind("早见沙织应援团") == EntityKind::Group, "正例：应援团 是 Group");
         ck(entity_artist_kind("团结交响乐团") == EntityKind::Group, "正例：团结交响乐团 是 Group（强特征词覆盖负例前缀）");
 
+        // 乐团词表扩展正例（Philharmoniker/Philharmonic/Philharmonia/Sinfonieorchester/Symphonieorchester/交響楽団/管弦乐团/交响乐团/室内乐团/合唱团 等）
+        ck(entity_artist_kind("Berliner Philharmoniker") == EntityKind::Group, "正例：Berliner Philharmoniker 是 Group");
+        ck(entity_artist_kind("Wiener Philharmoniker") == EntityKind::Group, "正例：Wiener Philharmoniker 是 Group");
+        ck(entity_artist_kind("Philharmonia Orchestra") == EntityKind::Group, "正例：Philharmonia Orchestra 是 Group");
+        ck(entity_artist_kind("NDR Sinfonieorchester") == EntityKind::Group, "正例：NDR Sinfonieorchester 是 Group");
+        ck(entity_artist_kind("Symphonieorchester des Bayerischen Rundfunks") == EntityKind::Group, "正例：Symphonieorchester 是 Group");
+        ck(entity_artist_kind("NHK交響楽団") == EntityKind::Group, "正例：NHK交響楽団 是 Group");
+        ck(entity_artist_kind("国家大剧院管弦乐团") == EntityKind::Group, "正例：国家大剧院管弦乐团 是 Group");
+        ck(entity_artist_kind("中国爱乐乐团") == EntityKind::Group, "正例：中国爱乐乐团 是 Group");
+        ck(entity_artist_kind("维也纳室内乐团") == EntityKind::Group, "正例：维也纳室内乐团 是 Group");
+        ck(entity_artist_kind("中央歌剧院合唱团") == EntityKind::Group, "正例：中央歌剧院合唱团 是 Group");
+
         // 2. 负例保护（不误判为 Group，退化为 Person，保证宁可拆开也不错并）
         ck(entity_artist_kind("社会科学") == EntityKind::Person, "负例：社会科学 不误判为 Group（Person）");
         ck(entity_artist_kind("团结") == EntityKind::Person, "负例：团结 不误判为 Group（Person）");
@@ -721,6 +733,36 @@ int main() {
         ck(entity_artist_kind("社区工作者") == EntityKind::Person, "负例：社区工作者 不误判为 Group（Person）");
         ck(entity_artist_kind("团") == EntityKind::Person, "单字「团」不误判为 Group（需>=2字）");
         ck(entity_artist_kind("社") == EntityKind::Person, "单字「社」不误判为 Group（需>=2字）");
+
+        // 人名与含 Philharmonic 专辑名负例保护：人名退化为 Person，专辑名建为 Release 而不是假 Group
+        ck(entity_artist_kind("Herbert von Karajan") == EntityKind::Person, "负例：指挥家 Karajan 是 Person");
+        ck(entity_artist_kind("Glenn Gould") == EntityKind::Person, "负例：独奏家 Glenn Gould 是 Person");
+        ck(entity_artist_kind("Ludwig van Beethoven") == EntityKind::Person, "负例：作曲家 Beethoven 是 Person");
+
+        // 图级别负例：专辑名含 Philharmonic（如 Live at the Philharmonic）时，艺人与专辑不被误判为 Group
+        MetaSeed negSeed;
+        negSeed.artist = "Miles Davis";
+        negSeed.album = "Live at the Philharmonic";
+        negSeed.title = "Autumn Leaves";
+        const EntityGraph gNeg = entity_graph_from_seed(negSeed, 13050);
+        const Entity* aEnt = gNeg.find(entity_id(EntityKind::Person, "Miles Davis"));
+        ck(aEnt != nullptr && aEnt->kind == EntityKind::Person, "含 Philharmonic 专辑名时，艺人仍为 Person");
+        const Entity* relEnt = gNeg.find(entity_id(EntityKind::Release, "Live at the Philharmonic"));
+        ck(relEnt != nullptr && relEnt->kind == EntityKind::Release, "Live at the Philharmonic 实体种类为 Release（非 Group）");
+        ck(gNeg.find(entity_id(EntityKind::Group, "Live at the Philharmonic")) == nullptr, "专辑名未被误判创建为 Group 实体");
+
+        // 古典 PERFORMER 独奏家负例（非乐团名称角色仍为 performer 但种类为 Person）
+        MetaSeed perfSeed;
+        perfSeed.tags["composer"] = "Johann Sebastian Bach";
+        perfSeed.tags["performer"] = "Glenn Gould";
+        perfSeed.title = "Goldberg Variations, BWV 988";
+        const EntityGraph gPerf = entity_graph_from_seed(perfSeed, 13051);
+        const Entity* ggEnt = gPerf.find(entity_id(EntityKind::Person, "Glenn Gould"));
+        ck(ggEnt != nullptr && ggEnt->kind == EntityKind::Person, "古典独奏家 PERFORMER（Glenn Gould）判定为 Person 实体");
+        if (ggEnt) {
+            auto itRole = ggEnt->attrs.find("role");
+            ck(itRole != ggEnt->attrs.end() && itRole->second.value == "performer", "Glenn Gould 角色属性为 performer");
+        }
 
         // 3. entity_looks_label 负例保护
         ck(entity_looks_label("唱片机") == false, "负例：唱片机 不是 Label");

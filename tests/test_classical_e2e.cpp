@@ -213,12 +213,12 @@ int main() {
                 const Entity* condEnt = g.find(condId);
                 ck(condEnt != nullptr && condEnt->kind == EntityKind::Person, "指挥是 Person 实体");
 
-                // 演奏者是 Person (role=performer)
-                const std::string bpoId = entity_id(EntityKind::Person, "Berliner Philharmoniker");
+                // 演奏者是 Group (role=performer) —— 乐团名启发式扩展后正确判定为 Group
+                const std::string bpoId = entity_id(EntityKind::Group, "Berliner Philharmoniker");
                 const EntityEdge* bpoEdge = recEnt->findEdge(entity_rel::kCredit, bpoId, "performer");
-                ck(bpoEdge != nullptr, "Recording --credit(performer)--> Berliner Philharmoniker(Person)");
+                ck(bpoEdge != nullptr, "Recording --credit(performer)--> Berliner Philharmoniker(Group)");
                 const Entity* bpoEnt = g.find(bpoId);
-                ck(bpoEnt != nullptr && bpoEnt->kind == EntityKind::Person, "演奏者是 Person 实体");
+                ck(bpoEnt != nullptr && bpoEnt->kind == EntityKind::Group, "演奏者是 Group 实体（乐团）");
             }
         }
     }

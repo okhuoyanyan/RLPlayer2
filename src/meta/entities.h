@@ -841,21 +841,24 @@ inline EntityKind entity_artist_kind(const std::string& raw) {
         }
     }
 
-    // 2. 强团体特征英文词表
-    static const char* kWord[] = { "orchestra", "ensemble", "choir", "chorus", "band",
-                                   "quartet", "trio", "singers", "philharmonic", "symphony",
-                                   "group", "project" };
+    // 2. 强团体特征英文/德文/西文乐团词表
+    static const char* kWord[] = {
+        "orchestra", "ensemble", "choir", "chorus", "band",
+        "quartet", "trio", "singers", "philharmonic", "philharmoniker",
+        "philharmonia", "sinfonieorchester", "symphonieorchester", "kammerorchester",
+        "symphony", "staatskapelle", "group", "project"
+    };
     for (const char* w : kWord)
         if (n.find(w) != std::string::npos) return EntityKind::Group;
 
     // 3. 强团体特征多字 CJK 词表（即使含负例词根，有强团体词也算团体，如“团结交响乐团”）
-    static const char* kCjkMulti[] = { "乐团", "樂團", "乐队", "樂隊", "合唱", "组合", "組合",
-                                       "社团", "社團", "剧团", "劇團" };
+    static const char* kCjkMulti[] = {
+        "交響楽団", "管弦乐团", "管弦樂團", "交响乐团", "交響樂團", "室内乐团", "室內樂團",
+        "合唱团", "合唱團", "爱乐乐团", "愛樂樂團", "乐团", "樂團", "乐队", "樂隊",
+        "合唱", "组合", "組合", "社团", "社團", "剧团", "劇團"
+    };
     for (const char* w : kCjkMulti)
         if (raw.find(w) != std::string::npos) return EntityKind::Group;
-
-    if (isNegative) return EntityKind::Person;
-
     // 4. 单字「社」「団」「团」：加上下文/后缀门槛（必须为后缀或后接修饰符，且长度>单字）
     if (entity_detail_has_cjk_suffix(n, "社")) return EntityKind::Group;
     if (entity_detail_has_cjk_suffix(n, "団")) return EntityKind::Group;
@@ -1481,7 +1484,8 @@ inline EntityGraph entity_graph_from_seed(const MetaSeed& s, long long ts) {
             b.link(recordingId, entity_rel::kCredit, pid, "conductor", "tag");
         }
         if (!performer.empty()) {
-            const std::string pid = b.add(EntityKind::Person, performer, "tag");
+            const EntityKind pk = entity_artist_kind(performer);
+            const std::string pid = b.add(pk, performer, "tag");
             b.attr(pid, "role", "performer", "tag");
             b.link(recordingId, entity_rel::kCredit, pid, "performer", "tag");
         }
