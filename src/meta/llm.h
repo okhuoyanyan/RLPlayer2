@@ -21,11 +21,14 @@
 #include "net/json.h"
 #include <string>
 #include <vector>
+#include <map>
 #include <sstream>
 #include <fstream>
 #include <filesystem>
 #include <cstdio>
 #include <iterator>
+#include <functional>
+#include <ctime>
 
 namespace rta::meta {
 
@@ -101,30 +104,63 @@ struct LlmConfig {
     std::string baseUrl = "https://api.deepseek.com";
     std::string apiKey;                    // 只进请求头；缺文件时为空
     std::string model   = "deepseek-flash";
+    int monthlyCap = 0;                    // 设置键 llmmonthlycap（0=不限，默认 0）
+    std::string usagePath;                 // 用量文件路径，为空则自动定位
+    std::string monthOverride;             // 测试用：模拟当前月份（如 "202611"）
+    // mock transport 钩子（测试用，离线无网络）
+    std::function<rta::net::HttpResponse(const std::string& url,
+                                         const std::string& body,
+                                         const std::vector<std::string>& headers)> transport;
 };
 
-// 缺文件 → 返回默认值（空 key）。key 名：base_url / api_key / model；其他键忽略。
+// 缺文件 → 返回默认值（空 key）。key 名：base_url / api_key / model / llmmonthlycap；其他键忽略。
 inline LlmConfig llm_config_load(const std::string& path = "rlplayer-llm.conf") {
     LlmConfig c;
     std::ifstream f(path, std::ios::binary);
-    if (!f) return c;
-    const std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    std::string line;
-    for (size_t i = 0; i <= all.size(); ++i) {
-        if (i == all.size() || all[i] == '\n') {
-            while (!line.empty() && line.back() == '\r') line.pop_back();
-            const std::string t = llm_trim(line);
-            line.clear();
-            if (t.empty() || t[0] == '#') continue;      // 注释与空行
-            const size_t eq = t.find('=');
-            if (eq == std::string::npos) continue;
-            const std::string k = llm_trim(t.substr(0, eq));
-            const std::string v = llm_trim(t.substr(eq + 1));   // 值做 trim
-            if      (k == "base_url") c.baseUrl = v;
-            else if (k == "api_key")  c.apiKey  = v;
-            else if (k == "model")    c.model   = v;
-        } else {
-            line += all[i];
+    if (f) {
+        const std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        std::string line;
+        for (size_t i = 0; i <= all.size(); ++i) {
+            if (i == all.size() || all[i] == '\n') {
+                while (!line.empty() && line.back() == '\r') line.pop_back();
+                const std::string t = llm_trim(line);
+                line.clear();
+                if (t.empty() || t[0] == '#') continue;      // 注释与空行
+                const size_t eq = t.find('=');
+                if (eq == std::string::npos) continue;
+                const std::string k = llm_trim(t.substr(0, eq));
+                const std::string v = llm_trim(t.substr(eq + 1));   // 值做 trim
+                if      (k == "base_url") c.baseUrl = v;
+                else if (k == "api_key")  c.apiKey  = v;
+                else if (k == "model")    c.model   = v;
+                else if (k == "llmmonthlycap" || k == "monthly_cap" || k == "monthlycap") c.monthlyCap = atoi(v.c_str());
+                else if (k == "usage_path") c.usagePath = v;
+            } else {
+                line += all[i];
+            }
+        }
+    }
+    // 若 conf 里未写 monthlyCap，尝试从同级或全局 rlplayer-settings.conf 补充
+    if (c.monthlyCap == 0) {
+        std::error_code ec;
+        std::filesystem::path p(path);
+        std::string sp = (p.parent_path() / "rlplayer-settings.conf").string();
+        if (sp == "rlplayer-settings.conf" || sp.empty()) sp = "rlplayer-settings.conf";
+        std::ifstream sf(sp, std::ios::binary);
+        if (sf) {
+            std::string sline;
+            while (std::getline(sf, sline)) {
+                while (!sline.empty() && sline.back() == '\r') sline.pop_back();
+                const size_t eq = sline.find('=');
+                if (eq != std::string::npos) {
+                    const std::string sk = llm_trim(sline.substr(0, eq));
+                    const std::string sv = llm_trim(sline.substr(eq + 1));
+                    if (sk == "llmmonthlycap" || sk == "monthly_cap") {
+                        c.monthlyCap = atoi(sv.c_str());
+                        break;
+                    }
+                }
+            }
         }
     }
     return c;
@@ -137,6 +173,8 @@ inline bool llm_config_save(const LlmConfig& c, const std::string& path = "rlpla
     o << "base_url=" << c.baseUrl << "\n";
     o << "api_key=" << c.apiKey << "\n";
     o << "model=" << c.model << "\n";
+    if (c.monthlyCap > 0) o << "llmmonthlycap=" << c.monthlyCap << "\n";
+    if (!c.usagePath.empty()) o << "usage_path=" << c.usagePath << "\n";
     const std::string s = o.str();
     const std::string tmp = path + ".tmp";
     {
@@ -150,13 +188,13 @@ inline bool llm_config_save(const LlmConfig& c, const std::string& path = "rlpla
     return !ec;
 }
 
-// 合并写（界面保存 key 用）：只替换 base_url / api_key / model 三行，
+// 合并写（界面保存 key 用）：替换 base_url / api_key / model / llmmonthlycap 行，
 // 其余行【原样保留】—— 尤其是 proxy=host:port（P1.5 的后备代理）与注释。
 // 为什么不能用上面的 llm_config_save：它是整文件重写，界面保存一次 key 就会把
 // 用户的 proxy 行冲掉（2026-10-22 功能4 的红线）。文件不存在时等价于新建。
 inline bool llm_config_save_merge(const LlmConfig& c, const std::string& path = "rlplayer-llm.conf") {
     std::vector<std::string> out;
-    bool wroteBase = false, wroteKey = false, wroteModel = false;
+    bool wroteBase = false, wroteKey = false, wroteModel = false, wroteCap = false, wroteUsage = false;
     {
         std::ifstream f(path, std::ios::binary);
         std::string line;
@@ -177,6 +215,14 @@ inline bool llm_config_save_merge(const LlmConfig& c, const std::string& path = 
             } else if (k == "model") {
                 if (wroteModel) continue;
                 out.push_back("model=" + c.model); wroteModel = true;
+            } else if (k == "llmmonthlycap" || k == "monthly_cap") {
+                if (wroteCap) continue;
+                if (c.monthlyCap > 0) out.push_back("llmmonthlycap=" + std::to_string(c.monthlyCap));
+                wroteCap = true;
+            } else if (k == "usage_path") {
+                if (wroteUsage) continue;
+                if (!c.usagePath.empty()) out.push_back("usage_path=" + c.usagePath);
+                wroteUsage = true;
             } else {
                 out.push_back(line);                     // 注释 / 空行 / proxy= / 未知键
             }
@@ -185,6 +231,8 @@ inline bool llm_config_save_merge(const LlmConfig& c, const std::string& path = 
     if (!wroteBase) out.push_back("base_url=" + c.baseUrl);
     if (!wroteKey) out.push_back("api_key=" + c.apiKey);
     if (!wroteModel) out.push_back("model=" + c.model);
+    if (!wroteCap && c.monthlyCap > 0) out.push_back("llmmonthlycap=" + std::to_string(c.monthlyCap));
+    if (!wroteUsage && !c.usagePath.empty()) out.push_back("usage_path=" + c.usagePath);
     std::string s;
     for (const std::string& l : out) { s += l; s += "\n"; }
     const std::string tmp = path + ".tmp";
@@ -197,6 +245,139 @@ inline bool llm_config_save_merge(const LlmConfig& c, const std::string& path = 
     std::error_code ec;
     std::filesystem::rename(tmp, path, ec);
     return !ec;
+}
+
+// ---------------------------------------------------------------------------
+// 月度调用配额与用量统计（E-8）
+// ---------------------------------------------------------------------------
+
+struct LlmMonthlyUsage {
+    int total = 0;
+    int chat = 0;
+    int search = 0;
+    int fetch = 0;
+};
+
+inline std::string llm_usage_path(const std::string& customPath = "") {
+    if (!customPath.empty()) return customPath;
+    std::error_code ec;
+    if (std::filesystem::is_directory("build", ec)) {
+        return "build/rlplayer-llm-usage.json";
+    }
+    if (std::filesystem::is_directory("rlplayer-meta", ec)) {
+        return "rlplayer-meta/llm-usage.json";
+    }
+    return "rlplayer-llm-usage.json";
+}
+
+inline std::string llm_format_month(std::time_t t) {
+    std::tm* m = std::localtime(&t);
+    if (!m) return "197001";
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%04d%02d", m->tm_year + 1900, m->tm_mon + 1);
+    return std::string(buf);
+}
+
+inline std::string llm_current_month() {
+    return llm_format_month(std::time(nullptr));
+}
+
+inline LlmMonthlyUsage llm_get_usage(const std::string& month, const std::string& customPath = "") {
+    LlmMonthlyUsage u;
+    const std::string p = llm_usage_path(customPath);
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return u;
+    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const rta::net::Json j = rta::net::json_parse(text);
+    if (j.type != rta::net::Json::Obj || !j.has(month)) return u;
+    const auto& m = j[month];
+    if (m.type != rta::net::Json::Obj) return u;
+    if (m.has("total"))  u.total  = (int)m["total"].n();
+    if (m.has("chat"))   u.chat   = (int)m["chat"].n();
+    if (m.has("search")) u.search = (int)m["search"].n();
+    if (m.has("fetch"))  u.fetch  = (int)m["fetch"].n();
+    return u;
+}
+
+inline int llm_get_monthly_count(const std::string& month, const std::string& customPath = "") {
+    return llm_get_usage(month, customPath).total;
+}
+
+// 记录调用次数（原子写盘 tmp+rename；格式纯 JSON，绝不记录 key 等敏感信息）
+inline bool llm_record_usage(const std::string& month, const std::string& callType, const std::string& customPath = "") {
+    const std::string p = llm_usage_path(customPath);
+    std::error_code ec;
+    const auto parent = std::filesystem::path(p).parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+    }
+
+    std::map<std::string, LlmMonthlyUsage> all;
+    {
+        std::ifstream f(p, std::ios::binary);
+        if (f) {
+            const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            const rta::net::Json j = rta::net::json_parse(text);
+            if (j.type == rta::net::Json::Obj) {
+                for (const auto& [mKey, mVal] : j.obj) {
+                    if (mVal.type == rta::net::Json::Obj) {
+                        LlmMonthlyUsage u;
+                        if (mVal.has("total"))  u.total  = (int)mVal["total"].n();
+                        if (mVal.has("chat"))   u.chat   = (int)mVal["chat"].n();
+                        if (mVal.has("search")) u.search = (int)mVal["search"].n();
+                        if (mVal.has("fetch"))  u.fetch  = (int)mVal["fetch"].n();
+                        all[mKey] = u;
+                    }
+                }
+            }
+        }
+    }
+
+    LlmMonthlyUsage& cur = all[month];
+    cur.total++;
+    if (callType == "chat") cur.chat++;
+    else if (callType == "search") cur.search++;
+    else if (callType == "fetch") cur.fetch++;
+
+    std::ostringstream o;
+    o << "{\n";
+    bool firstMonth = true;
+    for (const auto& [mKey, u] : all) {
+        if (!firstMonth) o << ",\n";
+        firstMonth = false;
+        o << "  \"" << llm_esc(mKey) << "\": {\n"
+          << "    \"total\": " << u.total << ",\n"
+          << "    \"chat\": " << u.chat << ",\n"
+          << "    \"search\": " << u.search << ",\n"
+          << "    \"fetch\": " << u.fetch << "\n"
+          << "  }";
+    }
+    o << "\n}\n";
+
+    const std::string tmp = p + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        const std::string s = o.str();
+        f.write(s.data(), (std::streamsize)s.size());
+        if (!f.good()) return false;
+    }
+    std::filesystem::rename(tmp, p, ec);
+    return !ec;
+}
+
+// 检查是否已达月度调用上限（cfg.monthlyCap == 0 为不限，默认 0）
+inline bool llm_check_cap(const LlmConfig& cfg, const std::string& month = "", std::string* outError = nullptr) {
+    if (cfg.monthlyCap <= 0) return true; // 0=不限
+    const std::string m = month.empty() ? (cfg.monthOverride.empty() ? llm_current_month() : cfg.monthOverride) : month;
+    const int current = llm_get_monthly_count(m, cfg.usagePath);
+    if (current >= cfg.monthlyCap) {
+        if (outError) {
+            *outError = "本月 AI 调用已达上限 (" + std::to_string(current) + "/" + std::to_string(cfg.monthlyCap) + ")";
+        }
+        return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -263,10 +444,25 @@ inline LlmReply llm_chat(const LlmConfig& cfg, const std::vector<LlmMessage>& ms
                          int maxTokens = 800, float temperature = 0.2f, bool jsonObject = false) {
     LlmReply r;
     if (cfg.apiKey.empty()) { r.error = "未配置 api_key（rlplayer-llm.conf）"; return r; }
+
+    // E-8: 月度调用上限与超限降级（超限不发起 HTTP）
+    std::string capErr;
+    if (!llm_check_cap(cfg, "", &capErr)) {
+        r.error = capErr;
+        return r;
+    }
+
     const std::string body = llm_build_chat_body(cfg.model, msgs, maxTokens, temperature, jsonObject);
-    const rta::net::HttpResponse resp = rta::net::http_post(
-        llm_base_url(cfg.baseUrl) + "/chat/completions", body,
-        { "Authorization: Bearer " + cfg.apiKey }, "application/json", 60000);
+    const std::string url = llm_base_url(cfg.baseUrl) + "/chat/completions";
+    const std::vector<std::string> headers = { "Authorization: Bearer " + cfg.apiKey };
+
+    rta::net::HttpResponse resp;
+    if (cfg.transport) {
+        resp = cfg.transport(url, body, headers);
+    } else {
+        resp = rta::net::http_post(url, body, headers, "application/json", 60000);
+    }
+
     if (resp.status == 0) {
         r.error = llm_redact(cfg.apiKey, "网络请求失败: " + resp.error);
         return r;
@@ -279,7 +475,13 @@ inline LlmReply llm_chat(const LlmConfig& cfg, const std::vector<LlmMessage>& ms
         return r;
     }
     r = llm_parse_chat_response(text);
-    if (!r.ok) r.error = llm_redact(cfg.apiKey, r.error);
+    if (!r.ok) {
+        r.error = llm_redact(cfg.apiKey, r.error);
+    } else {
+        // E-8: 成功响应计费口径（按实际成功计）
+        const std::string m = cfg.monthOverride.empty() ? llm_current_month() : cfg.monthOverride;
+        llm_record_usage(m, "chat", cfg.usagePath);
+    }
     return r;
 }
 
@@ -369,10 +571,25 @@ inline std::string ds_http_error(const std::string& apiKey, int status, const st
 inline DsSearchReply ds_search(const LlmConfig& cfg, const std::string& query, int count = 5) {
     DsSearchReply r;
     if (cfg.apiKey.empty()) { r.error = "未配置 api_key（rlplayer-llm.conf）"; return r; }
-    const rta::net::HttpResponse resp = rta::net::http_post(
-        llm_base_url(cfg.baseUrl) + "/v1/tools/search",
-        ds_build_search_body(query, count),
-        { "Authorization: Bearer " + cfg.apiKey }, "application/json", 60000);
+
+    // E-8: 月度调用上限与超限降级（超限不发起 HTTP）
+    std::string capErr;
+    if (!llm_check_cap(cfg, "", &capErr)) {
+        r.error = capErr;
+        return r;
+    }
+
+    const std::string body = ds_build_search_body(query, count);
+    const std::string url = llm_base_url(cfg.baseUrl) + "/v1/tools/search";
+    const std::vector<std::string> headers = { "Authorization: Bearer " + cfg.apiKey };
+
+    rta::net::HttpResponse resp;
+    if (cfg.transport) {
+        resp = cfg.transport(url, body, headers);
+    } else {
+        resp = rta::net::http_post(url, body, headers, "application/json", 60000);
+    }
+
     if (resp.status == 0) {
         r.error = llm_redact(cfg.apiKey, "网络请求失败: " + resp.error);
         return r;
@@ -380,7 +597,13 @@ inline DsSearchReply ds_search(const LlmConfig& cfg, const std::string& query, i
     const std::string text(resp.body.begin(), resp.body.end());
     if (resp.status < 200 || resp.status >= 300) { r.error = ds_http_error(cfg.apiKey, resp.status, text); return r; }
     r = ds_parse_search_response(text);
-    if (!r.ok) r.error = llm_redact(cfg.apiKey, r.error);
+    if (!r.ok) {
+        r.error = llm_redact(cfg.apiKey, r.error);
+    } else {
+        // E-8: 成功响应计费口径（按实际成功计）
+        const std::string m = cfg.monthOverride.empty() ? llm_current_month() : cfg.monthOverride;
+        llm_record_usage(m, "search", cfg.usagePath);
+    }
     return r;
 }
 
@@ -388,10 +611,25 @@ inline DsSearchReply ds_search(const LlmConfig& cfg, const std::string& query, i
 inline DsFetchReply ds_fetch(const LlmConfig& cfg, const std::string& url) {
     DsFetchReply r;
     if (cfg.apiKey.empty()) { r.error = "未配置 api_key（rlplayer-llm.conf）"; return r; }
-    const rta::net::HttpResponse resp = rta::net::http_post(
-        llm_base_url(cfg.baseUrl) + "/v1/tools/fetch",
-        ds_build_fetch_body(url),
-        { "Authorization: Bearer " + cfg.apiKey }, "application/json", 60000);
+
+    // E-8: 月度调用上限与超限降级（超限不发起 HTTP）
+    std::string capErr;
+    if (!llm_check_cap(cfg, "", &capErr)) {
+        r.error = capErr;
+        return r;
+    }
+
+    const std::string body = ds_build_fetch_body(url);
+    const std::string reqUrl = llm_base_url(cfg.baseUrl) + "/v1/tools/fetch";
+    const std::vector<std::string> headers = { "Authorization: Bearer " + cfg.apiKey };
+
+    rta::net::HttpResponse resp;
+    if (cfg.transport) {
+        resp = cfg.transport(reqUrl, body, headers);
+    } else {
+        resp = rta::net::http_post(reqUrl, body, headers, "application/json", 60000);
+    }
+
     if (resp.status == 0) {
         r.error = llm_redact(cfg.apiKey, "网络请求失败: " + resp.error);
         return r;
@@ -399,7 +637,13 @@ inline DsFetchReply ds_fetch(const LlmConfig& cfg, const std::string& url) {
     const std::string text(resp.body.begin(), resp.body.end());
     if (resp.status < 200 || resp.status >= 300) { r.error = ds_http_error(cfg.apiKey, resp.status, text); return r; }
     r = ds_parse_fetch_response(text);
-    if (!r.ok) r.error = llm_redact(cfg.apiKey, r.error);
+    if (!r.ok) {
+        r.error = llm_redact(cfg.apiKey, r.error);
+    } else {
+        // E-8: 成功响应计费口径（按实际成功计）
+        const std::string m = cfg.monthOverride.empty() ? llm_current_month() : cfg.monthOverride;
+        llm_record_usage(m, "fetch", cfg.usagePath);
+    }
     return r;
 }
 
