@@ -71,3 +71,5 @@ HQPlayer*.exe
 Thumbs.db
 desktop.ini
 docs/shots-ui03/
+%SystemDrive%/
+*SystemDrive*
