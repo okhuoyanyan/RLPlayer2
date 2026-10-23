@@ -163,6 +163,23 @@ int main() {
            "top=" + std::to_string(r.front().idx) + " pick=" + std::to_string(pick));
     }
 
+    // ---- E-5: genre 多源与事实源 rank ----
+    std::printf("-- E-5: genre 多源与事实源 rank --\n");
+    {
+        ck(meta_source_rank("discogs") == 50, "discogs 属于 L1 事实源(rank=50)");
+        ck(meta_source_rank("itunes") == 50, "itunes 属于 L1 事实源(rank=50)");
+        ck(meta_source_rank("user") > meta_source_rank("discogs"), "user(100) 优先于 discogs(50)，绝不覆盖用户手改");
+        ck(meta_source_rank("tag") > meta_source_rank("discogs"), "tag(90) 优先于 discogs(50)，绝不覆盖文件既有标签");
+
+        // 离线验证：mergeField 防覆盖
+        TrackMeta tm;
+        MetaValue userVal; userVal.value = "UserCustomGenre"; userVal.source = "user";
+        MetaStore::mergeField(tm, "genre", userVal);
+        MetaValue discogsVal; discogsVal.value = "Classical"; discogsVal.source = "discogs";
+        MetaStore::mergeField(tm, "genre", discogsVal);
+        ck(tm.fields["genre"].value == "UserCustomGenre", "user 手改不被 discogs 静默覆盖");
+    }
+
     // ---- enrich_adopt(2026-10-22 P2 HF:采纳门槛) ----
     // 背景:P1.5 抽样人工核对出 4 例错配(#1/#6/#7/#10),全部是「低分 top1(0.32~0.49)
     // + LLM 裁决=-1(或单候选没触发裁决)仍被采纳写入」。这里把门槛本身当纯函数测:

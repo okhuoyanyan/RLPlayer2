@@ -46,7 +46,9 @@ static const char* kFixtureSearchNormal = R"json({
       "label": ["Tacet"],
       "format": ["SACD", "Hybrid", "Multichannel", "Stereo"],
       "country": "Germany",
-      "uri": "/master/1820755"
+      "uri": "/master/1820755",
+      "genre": ["Classical"],
+      "style": ["Modern", "Impressionist"]
     },
     {
       "id": 1025098,
@@ -135,6 +137,8 @@ static const char* kFixtureReleaseFull = R"json({
   "country": "Germany",
   "labels": [ { "name": "TELDEC", "catno": "6.20413" } ],
   "formats": [ { "name": "Vinyl", "descriptions": ["12\"", "45 RPM", "Maxi-Single"] } ],
+  "genres": ["Classical"],
+  "styles": ["Modern", "Impressionist"],
   "extraartists": [
     { "name": "Maurice Ravel", "role": "Composed By", "id": 216140 },
     { "name": "Franz André", "role": "Conductor", "id": 872648 },
@@ -228,6 +232,9 @@ int main() {
         ck(hits[0].year == 2013, "年份解析正确", "year=" + std::to_string(hits[0].year));
         ck(hits[0].label == "Tacet", "厂牌数组第一项正确提取");
         ck(hits[0].format.find("SACD") != std::string::npos, "格式数组正确连接");
+        // E-5: genres 与 styles 解析断言
+        ck(hits[0].genres.size() == 1 && hits[0].genres[0] == "Classical", "search 提取 genres 成功");
+        ck(hits[0].styles.size() == 2 && hits[0].styles[0] == "Modern" && hits[0].styles[1] == "Impressionist", "search 提取 styles 成功");
 
         std::vector<SearchResultItem> hitsPartial;
         ck(parse_discogs_search_json(kFixtureSearchMissingFields, hitsPartial), "缺失非必填字段容错成功");
@@ -415,6 +422,9 @@ int main() {
         ck(det1.year == 1985 && det1.label == "TELDEC" && det1.country == "Germany", "年份、厂牌与国家提取正确");
         ck(det1.format.find("Vinyl") != std::string::npos, "格式包含 Vinyl");
         ck(det1.soloists.empty(), "母带制作工程师未被误判为独奏");
+        // E-5: release 详情 genres 与 styles 解析断言
+        ck(det1.genres.size() == 1 && det1.genres[0] == "Classical", "release 提取 genres 成功");
+        ck(det1.styles.size() == 2 && det1.styles[0] == "Modern" && det1.styles[1] == "Impressionist", "release 提取 styles 成功");
 
         DiscogsReleaseDetail det2;
         ck(parse_discogs_release_json(kFixtureReleaseAlternativeRoles, det2), "多种角色别名解析成功");
@@ -433,6 +443,32 @@ int main() {
         DiscogsReleaseDetail det4;
         ck(parse_discogs_release_json(kFixtureReleaseMissingCredits, det4), "无演职人员 release 安全解析");
         ck(det4.conductor.empty() && det4.ensemble.empty() && det4.soloists.empty(), "演职字段安全为空");
+    }
+
+    // 7b. E-5: format_discogs_genre 与 lookup
+    std::printf("-- 7b. E-5: format_discogs_genre 与 lookup --\n");
+    {
+        std::vector<std::string> g = { "Classical" };
+        std::vector<std::string> s = { "Modern", "Impressionist" };
+        ck(format_discogs_genre(g, s) == "Modern, Impressionist", "styles 优先连接");
+        ck(format_discogs_genre(g, {}) == "Classical", "styles 为空时回退到 genres");
+        ck(format_discogs_genre({}, {}) == "", "双空时返回空串");
+
+        // mock transport 测试 discogs_lookup_genre
+        set_discogs_transport_for_test([&](const std::string&,
+                                           const std::vector<std::string>&,
+                                           int) -> rta::net::HttpResponse {
+            rta::net::HttpResponse resp;
+            resp.status = 200;
+            resp.body.assign(kFixtureSearchNormal, kFixtureSearchNormal + std::strlen(kFixtureSearchNormal));
+            return resp;
+        });
+
+        std::string lErr;
+        const std::string genreGot = discogs_lookup_genre("Maurice Ravel", "Boléro", "", lErr);
+        ck(genreGot == "Modern, Impressionist", "discogs_lookup_genre 从 search 结果成功提取 styles 作为 genre");
+
+        set_discogs_transport_for_test(nullptr);
     }
 
     // 8. dedupKey 规范化
@@ -605,6 +641,11 @@ int main() {
             if (!liveRes.performances.empty()) {
                 ck(!liveRes.performances[0].url.empty(), "第 1 条版本有真实 url: " + liveRes.performances[0].url);
             }
+
+            // E-5: 真网检索 Boléro 的 styles / genres
+            std::string liveGErr;
+            const std::string liveG = discogs_lookup_genre("Maurice Ravel", "Boléro", "", liveGErr);
+            ck(!liveG.empty(), "E-5: 真实 Discogs 检索 Boléro 返回非空 styles/genres: " + liveG);
         }
         if (net_env) free(net_env);
     }

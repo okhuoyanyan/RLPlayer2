@@ -396,6 +396,12 @@ add_executable(test_entities tests/test_entities.cpp)
 target_include_directories(test_entities PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME entities COMMAND test_entities)
 
+# E-15: 古典 COMPOSER→Work 四层端到端（合成样本 + 真实批量入口）
+add_executable(test_classical_e2e tests/test_classical_e2e.cpp)
+target_include_directories(test_classical_e2e PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_classical_e2e PRIVATE winhttp)
+add_test(NAME classical_e2e COMMAND test_classical_e2e)
+
 # E-14 年份清洗纯函数（统一窗口 [1000, 2100] 与清洗规则）：全离线
 add_executable(test_year tests/test_year.cpp)
 target_include_directories(test_year PRIVATE ${CMAKE_SOURCE_DIR}/src)

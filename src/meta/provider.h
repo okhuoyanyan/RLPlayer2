@@ -96,6 +96,24 @@ struct LyricRequest {
 //   canLyric  参与歌词链(true 才会被歌词链调用,lyric 才非空)
 //   search   std::vector<Candidate> (*)(const std::string& query, std::string& err)
 //   lyric    LyricResult (*)(const LyricRequest&, std::string& err) —— 统一歌词入口
+// 搜索扩展查询请求（E-17: 允许可选传入 album / circle / dirName 上下文）
+struct ProviderQuery {
+    std::string query;      // 基础查询串，默认 artist + " " + title
+    std::string title;
+    std::string artist;
+    std::string album;
+    std::string circle;
+    std::string dirName;    // 父目录名（如「专辑名 @ 社团」）
+};
+
+// 数据源描述符(P1.5 / E-17): 新增数据源 = 往 provider_registry() 注册一项 + 实现函数,零接线。
+//   id          设置键后缀与溯源名("qq"/"netease"/"itunes"/"lrclib"/"dizzylab")
+//   name        设置页显示名("QQ音乐"/"网易云"/"iTunes"/"lrclib 歌词"/"dizzylab")
+//   canSearch   参与标签/封面搜索(true 才会被搜索链调用,search 才非空)
+//   canLyric    参与歌词链(true 才会被歌词链调用,lyric 才非空)
+//   search      传统单字符串签名 std::vector<Candidate> (*)(const std::string& query, std::string& err)
+//   lyric       LyricResult (*)(const LyricRequest&, std::string& err) —— 统一歌词入口
+//   searchQuery 支持扩展上下文的可选签名（E-17，若非空优先调用，其它源保持 nullptr）
 struct ProviderDesc {
     const char* id;
     const char* name;
@@ -103,6 +121,7 @@ struct ProviderDesc {
     bool canLyric;
     std::vector<Candidate> (*search)(const std::string&, std::string&);   // canSearch 才非空
     LyricResult (*lyric)(const LyricRequest&, std::string& err);          // canLyric 才非空
+    std::vector<Candidate> (*searchQuery)(const ProviderQuery&, std::string&) = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -889,8 +908,10 @@ inline std::vector<Candidate> parse_dizzylab_album(const std::string& text, cons
 // 全串 → 末 3 词 → 末 2 词 → 末 1 词;去重保序;最多 kMax 次(每次 1 个请求,礼节)。
 // 为什么要放宽:实测 dizzylab 检索是全词 AND,"Khrisma Pixel Library" 零命中而
 // "Pixel Library" 命中(见头注)。
-inline constexpr size_t kDizzylabMaxSearchAttempts = 3;
+// 搜索重试阶梯上限（E-17: 增加目录名/专辑+社团前导变体，上限由 3 提升到 6，保留现有关键词放宽兜底）
+inline constexpr size_t kDizzylabMaxSearchAttempts = 6;
 
+// 单查询串基础阶梯（纯函数）：全串 → 末 3 词 → 末 2 词 → 末 1 词；去重保序
 inline std::vector<std::string> pv_dl_query_ladder(const std::string& query) {
     // ① 切词:ASCII 空白 + 全角空格 U+3000(E3 80 80)都当分隔。
     //    为什么不直接把原串当第一个变体:全角空格发到表单里会被编成 %E3%80%80,
@@ -935,6 +956,45 @@ inline std::vector<std::string> pv_dl_query_ladder(const std::string& query) {
         push(joinFrom(toks.size() - n));
         if (out.size() >= kDizzylabMaxSearchAttempts) break;
     }
+    if (out.size() > kDizzylabMaxSearchAttempts) out.resize(kDizzylabMaxSearchAttempts);
+    return out;
+}
+
+// 关键词扩展阶梯（E-17 纯函数）：
+// 优先：目录名 / 专辑+社团（「专辑名 社团名」） → artist+title → 后缀放宽阶梯
+inline std::vector<std::string> pv_dl_query_ladder(const ProviderQuery& q) {
+    std::vector<std::string> out;
+    auto push = [&](const std::string& v) {
+        std::string trimmed = dl_detail::dl_trim(v);
+        if (trimmed.size() < 2) return;
+        for (const std::string& x : out) if (x == trimmed) return;
+        out.push_back(trimmed);
+    };
+
+    // ① 优先用「目录名 / 专辑+社团」
+    if (!q.dirName.empty()) {
+        push(q.dirName);
+        const size_t at = q.dirName.find(" @ ");
+        if (at != std::string::npos) {
+            const std::string da = dl_detail::dl_trim(q.dirName.substr(0, at));
+            const std::string dc = dl_detail::dl_trim(q.dirName.substr(at + 3));
+            if (!da.empty() && !dc.empty()) {
+                push(da + " " + dc);
+            }
+        }
+    }
+    if (!q.album.empty() && !q.circle.empty()) {
+        push(q.album + " " + q.circle);
+    }
+
+    // ② 兜底阶梯：artist + title 以及后缀放宽变体
+    if (!q.query.empty()) {
+        const std::vector<std::string> baseLadder = pv_dl_query_ladder(q.query);
+        for (const auto& item : baseLadder) {
+            push(item);
+        }
+    }
+
     if (out.size() > kDizzylabMaxSearchAttempts) out.resize(kDizzylabMaxSearchAttempts);
     return out;
 }
@@ -1077,18 +1137,20 @@ inline bool dl_text_hit(const std::string& qNorm, const std::string& cand) {
 // 每张 1 次请求 —— 礼节上限:最多 kDizzylabMaxSearchAttempts(搜索) + 2(专辑)= 5 次/次调用。
 inline constexpr size_t kDizzylabMaxAlbums = 2;
 
-// 搜索:GET /search/?s=…(阶梯)→ 作品卡片按与查询串的相似度排序 → 取前 2 张专辑页 →
-// 每张专辑按轨筛候选。err 空 = 成功(0 条也是合法空结果)。
-inline std::vector<Candidate> search_dizzylab(const std::string& query, std::string& err) {
+// 搜索（E-17 支持 ProviderQuery 扩展）: GET /search/?s=…(阶梯) → 作品卡片按相关性排序 →
+// 取前 2 张专辑页 → 每张专辑按轨筛候选。err 空 = 成功(0 条也是合法空结果)。
+inline std::vector<Candidate> search_dizzylab(const ProviderQuery& pq, std::string& err) {
     err.clear();
-    const std::string q = dl_detail::dl_trim(query);
-    if (q.size() < 2) { err = "dizzylab search: 查询串过短"; return {}; }
-    const std::string qNorm = match_norm(q);
+    const std::vector<std::string> ladder = pv_dl_query_ladder(pq);
+    if (ladder.empty()) { err = "dizzylab search: 查询串过短"; return {}; }
+    const std::string qNorm = match_norm(pq.query);
+    const std::string titleNorm = match_norm(pq.title);
+    const std::string albumNorm = match_norm(pq.album);
 
     // ① 搜索页阶梯:第一个拿到作品卡片的变体就算命中
     std::vector<Candidate> cards;
     std::vector<std::string> tried;
-    for (const std::string& variant : pv_dl_query_ladder(q)) {
+    for (const std::string& variant : ladder) {
         tried.push_back(variant);
         std::string herr;
         const std::string html = dl_http_get(dizzylab_build_search_url(variant), herr);
@@ -1108,11 +1170,14 @@ inline std::vector<Candidate> search_dizzylab(const std::string& query, std::str
         return {};
     }
 
-    // ② 选专辑:作品名/社团名与查询串沾边优先,其余按原序补位(最多 2 张)
+    // ② 选专辑:作品名/社团名与查询串/专辑/标题沾边优先,其余按原序补位(最多 2 张)
     std::vector<size_t> order;
-    for (size_t i = 0; i < cards.size(); ++i)
-        if (dl_text_hit(qNorm, cards[i].album) || dl_text_hit(qNorm, cards[i].artist))
-            order.push_back(i);
+    for (size_t i = 0; i < cards.size(); ++i) {
+        const bool hit = (!qNorm.empty() && (dl_text_hit(qNorm, cards[i].album) || dl_text_hit(qNorm, cards[i].artist))) ||
+                         (!albumNorm.empty() && dl_text_hit(albumNorm, cards[i].album)) ||
+                         (!titleNorm.empty() && dl_text_hit(titleNorm, cards[i].album));
+        if (hit) order.push_back(i);
+    }
     for (size_t i = 0; i < cards.size() && order.size() < kDizzylabMaxAlbums; ++i) {
         bool dup = false;
         for (const size_t k : order) if (k == i) dup = true;
@@ -1134,10 +1199,13 @@ inline std::vector<Candidate> search_dizzylab(const std::string& query, std::str
         if (tracks.empty()) { if (!aerr.empty()) lastErr = aerr; continue; }
 
         // 作品名是否本身就是用户在找的东西(拿专辑名搜):命中则整张都给
-        const bool albumItselfHit = dl_text_hit(qNorm, card.album);
+        const bool albumItselfHit = (!qNorm.empty() && dl_text_hit(qNorm, card.album)) ||
+                                    (!albumNorm.empty() && dl_text_hit(albumNorm, card.album));
         for (Candidate& t : tracks) {
             if (out.size() >= 8) break;
-            if (!albumItselfHit && !dl_text_hit(qNorm, t.title)) continue;
+            const bool titleHit = (!titleNorm.empty() && dl_text_hit(titleNorm, t.title)) ||
+                                  (!qNorm.empty() && dl_text_hit(qNorm, t.title));
+            if (!albumItselfHit && !titleHit) continue;
             // 艺术家优先取【曲目行自带的那一轨】(实测 "1. Pixel Library - Khrisma"),
             // 它才是真实艺人;卡片 h3 / 专辑页 /l/ 是社团名,仅在一轨没写艺术家时兜底。
             // 用社团名当 artist 会让 artist_score 归零(0/1.0 之差直接决定过不过采纳门槛)。
@@ -1147,6 +1215,18 @@ inline std::vector<Candidate> search_dizzylab(const std::string& query, std::str
     }
     if (out.empty() && !lastErr.empty()) err = lastErr;    // 有专辑但一条轨都没筛出来:如实报
     return out;
+}
+
+// 传统单字符串查询接口（向前兼容既有调用点与单测）
+inline std::vector<Candidate> search_dizzylab(const std::string& query, std::string& err) {
+    ProviderQuery pq;
+    pq.query = query;
+    return search_dizzylab(pq, err);
+}
+
+// ProviderDesc searchQuery 签名封装
+inline std::vector<Candidate> search_dizzylab_query(const ProviderQuery& pq, std::string& err) {
+    return search_dizzylab(pq, err);
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,11 +1481,11 @@ inline LyricResult lyric_lrclib_entry(const LyricRequest& rq, std::string& err) 
 // 与 P1 的固定歌词顺序完全一致 —— tests/test_metaproviders.cpp 有该顺序断言。
 inline const std::vector<ProviderDesc>& provider_registry() {
     static const std::vector<ProviderDesc> reg = {
-        { "dizzylab", "dizzylab",   true,  false, search_dizzylab, nullptr             },
-        { "qq",       "QQ音乐",      true,  true,  search_qq,       lyric_qq_entry      },
-        { "netease",  "网易云",       true,  true,  search_netease,  lyric_netease_entry },
-        { "itunes",   "iTunes",      true,  false, search_itunes,   nullptr             },
-        { "lrclib",   "lrclib 歌词",  false, true,  nullptr,         lyric_lrclib_entry  },
+        { "dizzylab", "dizzylab",   true,  false, search_dizzylab, nullptr,             search_dizzylab_query },
+        { "qq",       "QQ音乐",      true,  true,  search_qq,       lyric_qq_entry,      nullptr               },
+        { "netease",  "网易云",       true,  true,  search_netease,  lyric_netease_entry, nullptr               },
+        { "itunes",   "iTunes",      true,  false, search_itunes,   nullptr,             nullptr               },
+        { "lrclib",   "lrclib 歌词",  false, true,  nullptr,         lyric_lrclib_entry,  nullptr               },
     };
     return reg;
 }

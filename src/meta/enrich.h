@@ -35,6 +35,7 @@
 #include "meta/llm.h"
 #include "meta/provider.h"
 #include "meta/match.h"
+#include "meta/discogs.h"
 #include "audio/media_info.h"
 #include <algorithm>
 #include <chrono>
@@ -235,8 +236,13 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
     // 行为（本机实测 1e10 → -4），负秒会让 match 静默退回中性分而缺陷无声。
     const int fileSec = rta::audio::media_duration_sec(mi.duration);
     const std::string parentName = meta_string_of(meta_path_of(file).parent_path().filename());
-    if (parentName.find(" @ ") != std::string::npos)
-        notes.push_back("父目录「" + parentName + "」(同人盘形态,未参与查询)");
+    std::string dirAlbum, dirCircle;
+    if (parentName.find(" @ ") != std::string::npos) {
+        const size_t at = parentName.find(" @ ");
+        dirAlbum = parentName.substr(0, at);
+        dirCircle = parentName.substr(at + 3);
+        notes.push_back("父目录「" + parentName + "」(同人盘形态,参与扩展查询)");
+    }
 
     // ---- 3) 查询侧 ParsedName:标签优先 → 文件名规则 → LLM 兜底 ----
     const std::string stem = meta_string_of(meta_path_of(file).stem());
@@ -270,17 +276,32 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
     }
 
     // ---- 4) 搜索(遍历注册表,canSearch 且启用的源逐个调;调用间 ≥300ms;错误记 note 继续) ----
-    // 注册表顺序 = 搜索优先级(qq → netease → itunes),与 P1 固定顺序一致。
+    // 注册表顺序 = 搜索优先级(dizzylab → qq → netease → itunes)。
+    // E-17 扩展：构造 ProviderQuery 传递 album/circle/dirName 供 dizzylab 优先命中，
+    // 其它源无 searchQuery 指针，继续沿用 query（默认忽略新参数）。
+    ProviderQuery pq;
+    pq.query   = query;
+    pq.title   = p.title;
+    pq.artist  = p.artist;
+    pq.album   = !mi.album.empty() ? mi.album : dirAlbum;
+    pq.circle  = dirCircle;
+    pq.dirName = parentName;
+
     std::vector<Candidate> cands;
     std::vector<std::string> srcErrs;
     bool firstCall = true;
     for (const ProviderDesc& pd : provider_registry()) {
-        if (!pd.canSearch || !pd.search) continue;
+        if (!pd.canSearch) continue;
         if (!opts.enabled(pd.id)) continue;
         if (!firstCall) std::this_thread::sleep_for(std::chrono::milliseconds(300));
         firstCall = false;
         std::string err;
-        std::vector<Candidate> got = pd.search(query, err);
+        std::vector<Candidate> got;
+        if (pd.searchQuery) {
+            got = pd.searchQuery(pq, err);
+        } else if (pd.search) {
+            got = pd.search(pq.query, err);
+        }
         if (!err.empty()) srcErrs.push_back(std::string(pd.id) + ": " + err);
         for (Candidate& c : got) cands.push_back(std::move(c));
     }
@@ -372,6 +393,11 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
     if (!best.artist.empty()) { mv.value = best.artist; mergeTracked("albumArtist", mv); }
     if (!best.year.empty())   { mv.value = best.year;   mergeTracked("year", mv); }
     if (!best.genre.empty())  { mv.value = best.genre;  mergeTracked("genre", mv); }
+    // E-15: 本地古典标签保留写入（若本地标签含 COMPOSER/WORK/CONDUCTOR/PERFORMER）
+    if (!mi.composer.empty())  { MetaValue v; v.value = mi.composer;  v.source = "tag"; v.confidence = 1.0f; v.ts = now; mergeTracked("composer", v); }
+    if (!mi.work.empty())      { MetaValue v; v.value = mi.work;      v.source = "tag"; v.confidence = 1.0f; v.ts = now; mergeTracked("work", v); }
+    if (!mi.conductor.empty()) { MetaValue v; v.value = mi.conductor; v.source = "tag"; v.confidence = 1.0f; v.ts = now; mergeTracked("conductor", v); }
+    if (!mi.performer.empty()) { MetaValue v; v.value = mi.performer; v.source = "tag"; v.confidence = 1.0f; v.ts = now; mergeTracked("performer", v); }
     auto fieldStillEmpty = [&](const char* f) {
         const auto it = tm.fields.find(f);
         return it == tm.fields.end() || it->second.value.empty();
@@ -390,6 +416,23 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
         fv.ts         = now;
         fv.confidence = (float)scoreJ;
         mergeTracked(f, fv);
+    }
+
+    // ---- 6.5) E-5: genre 多源（Discogs styles 接入作为 backfill 来源）----
+    // 保持采纳门槛语义不变（在此之前采纳门槛已裁决并过门），保留 iTunes 优先（仅当 genre 仍为空时尝试 Discogs）
+    if (fieldStillEmpty("genre") && opts.enabled("discogs")) {
+        std::string dErr;
+        const std::string alb = !best.album.empty() ? best.album : mi.album;
+        const std::string dg = discogs_lookup_genre(p.artist, p.title, alb, dErr);
+        if (!dg.empty()) {
+            MetaValue gv;
+            gv.value = dg;
+            gv.source = "discogs";
+            gv.ts = now;
+            gv.confidence = (float)st.bestScore; // 按事实源规则，随采纳置信度
+            mergeTracked("genre", gv);
+            notes.push_back("genre=discogs(" + dg + ")");
+        }
     }
 
     // ---- 7) 封面:记录缺封面且首选候选有 URL → 下载(>2KB 才收) ----

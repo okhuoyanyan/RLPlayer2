@@ -432,6 +432,82 @@ int main() {
         ck(l4.size() == 1, "单词查询变体唯一去重", std::to_string(l4.size()));
     }
 
+    // ---------------- 7b) E-17: 关键词扩展（目录名/专辑+社团 → artist+title → 后缀放宽） ----------------
+    std::printf("-- E-17: pv_dl_query_ladder(ProviderQuery) 关键词顺序 --\n");
+    {
+        ProviderQuery pq;
+        pq.dirName = "2 Pixels @ 月華社";
+        pq.album   = "2 Pixels";
+        pq.circle  = "月華社";
+        pq.artist  = "Khrisma";
+        pq.title   = "Pixel Library";
+        pq.query   = "Khrisma Pixel Library";
+
+        const std::vector<std::string> ladder = pv_dl_query_ladder(pq);
+        ck(ladder.size() == 5, "完整上下文阶梯共 5 项", std::to_string(ladder.size()));
+        if (ladder.size() == 5) {
+            ck_eq(ladder[0], "2 Pixels @ 月華社", "第 1 变体: 目录名");
+            ck_eq(ladder[1], "2 Pixels 月華社",   "第 2 变体: 专辑+社团");
+            ck_eq(ladder[2], "Khrisma Pixel Library", "第 3 变体: artist+title(基础 query)");
+            ck_eq(ladder[3], "Pixel Library",   "第 4 变体: 后缀放宽末 2 词");
+            ck_eq(ladder[4], "Library",         "第 5 变体: 后缀放宽末 1 词");
+        }
+
+        // 仅有目录名形态（由目录名拆出专辑+社团）
+        ProviderQuery pqDirOnly;
+        pqDirOnly.dirName = "2 Pixels @ 月華社";
+        pqDirOnly.query   = "Khrisma Pixel Library";
+        const std::vector<std::string> lDir = pv_dl_query_ladder(pqDirOnly);
+        ck(lDir.size() >= 2 && lDir[0] == "2 Pixels @ 月華社" && lDir[1] == "2 Pixels 月華社",
+           "仅传目录名时由「 @ 」自动派生「专辑名 社团名」前导变体");
+
+        // 仅有专辑+社团形态（无目录名）
+        ProviderQuery pqAlbOnly;
+        pqAlbOnly.album  = "2 Pixels";
+        pqAlbOnly.circle = "月華社";
+        pqAlbOnly.query  = "Pixel Library";
+        const std::vector<std::string> lAlb = pv_dl_query_ladder(pqAlbOnly);
+        ck(lAlb.size() >= 1 && lAlb[0] == "2 Pixels 月華社",
+           "无目录名但有 album+circle 时优先试「专辑名 社团名」");
+
+        // 离线 Mock Transport 端到端验证：断言 dizzylab 实际发起的请求 URL 顺序
+        std::vector<std::string> requestedKeywords;
+        set_dizzylab_transport_for_test([&](const std::string& url,
+                                            const std::vector<std::string>&,
+                                            int) -> rta::net::HttpResponse {
+            const size_t pos = url.find("?s=");
+            if (pos != std::string::npos) {
+                requestedKeywords.push_back(url.substr(pos + 3));
+            }
+            rta::net::HttpResponse resp;
+            resp.status = 200;
+            // 前 3 个请求（目录名、专辑社团、全串）模拟 0 结果，第 4 个（Pixel Library）命中真实卡片
+            if (url.find("Pixel%20Library") != std::string::npos && url.find("Khrisma") == std::string::npos) {
+                resp.body.assign(kSearchWorksSection, kSearchWorksSection + std::strlen(kSearchWorksSection));
+            } else if (url.find("/d/GKCD-013") != std::string::npos) {
+                resp.body.assign(kAlbumGksl003, kAlbumGksl003 + std::strlen(kAlbumGksl003));
+            } else {
+                const std::string zero = "<form action=\"/albums/search\"><input type=\"search\" name=\"s\" value=\"\" /></form>";
+                resp.body.assign(zero.begin(), zero.end());
+            }
+            return resp;
+        });
+
+        std::string mockErr;
+        const auto mockCands = search_dizzylab(pq, mockErr);
+        ck(!mockCands.empty(), "经过阶梯兜底最终命中 Pixel Library 候选");
+        ck(requestedKeywords.size() == 4, "实际发出了 4 个搜索请求（目录名 -> 专辑+社团 -> artist+title -> 后缀放宽命中后 break）",
+           std::to_string(requestedKeywords.size()));
+        if (requestedKeywords.size() == 4) {
+            ck(requestedKeywords[0].find("2%20Pixels%20%40%20") != std::string::npos, "请求 1: 目录名");
+            ck(requestedKeywords[1].find("2%20Pixels%20") != std::string::npos && requestedKeywords[1].find("%40") == std::string::npos, "请求 2: 专辑+社团");
+            ck(requestedKeywords[2].find("Khrisma%20Pixel%20Library") != std::string::npos, "请求 3: artist+title 全串");
+            ck(requestedKeywords[3] == "Pixel%20Library", "请求 4: 后缀放宽末 2 词");
+        }
+
+        set_dizzylab_transport_for_test(nullptr);
+    }
+
     // ---------------- 8) 沾边筛选(轨名 vs 查询串) ----------------
     std::printf("-- 轨道相关性筛 --\n");
     {
@@ -675,6 +751,42 @@ int main() {
         std::string e2;
         const std::vector<Candidate> none = search_dizzylab("zzzzqqqq不存在的作品名", e2);
         ck(none.empty() && e2.empty(), "真网:零结果 = 空候选且无错误", e2);
+
+        // E-17: 6 首拒采曲名单（§1.5）真网重跑并统计命中数
+        struct SampleTrack {
+            const char* name;
+            ProviderQuery pq;
+        };
+        const SampleTrack samples[6] = {
+            { "#1 Pixel Library",
+              ProviderQuery{ "Pixel Library", "Pixel Library", "Khrisma", "2 Pixels", "月華社", "2 Pixels @ 月華社" } },
+            { "#3 Pick me!",
+              ProviderQuery{ "Pick me!", "Pick me!", "Peak", "SSParty!!", "Haru.jpg", "SSParty!! @ Haru.jpg" } },
+            { "#6 Retro Shoujo",
+              ProviderQuery{ "Retro Shoujo", "Retro Shoujo", "Khrisma", "2 Pixels", "月華社", "2 Pixels @ 月華社" } },
+            { "#7 終焉の鴉inst.",
+              ProviderQuery{ "終焉の鴉inst.", "終焉の鴉inst.", "", "旧火の輪廻", "疯帽子茶会", "旧火の輪廻 @ 疯帽子茶会" } },
+            { "#10 音轨03",
+              ProviderQuery{ "音轨03", "音轨03", "未知艺术家", "盈月纪年", "", "盈月纪年" } },
+            { "#17 たいせつなきみのために",
+              ProviderQuery{ "たいせつなきみのために、ぼくにできるいちばんのこと", "たいせつなきみのために、ぼくにできるいちばんのこと", "", "", "", "TEST站测评曲" } }
+        };
+
+        int hitCount = 0;
+        std::printf("  -- E-17 6 首拒采曲真网复验 --\n");
+        for (const auto& s : samples) {
+            std::string sErr;
+            const auto res = search_dizzylab(s.pq, sErr);
+            if (!res.empty()) {
+                ++hitCount;
+                std::printf("    [HIT] %s -> 命中 %zu 条, 首条: %s | %s | %s\n",
+                            s.name, res.size(), res[0].title.c_str(), res[0].artist.c_str(), res[0].album.c_str());
+            } else {
+                std::printf("    [MISS] %s -> 0 命中 (dizzylab 确无此条目/查询不匹配)\n", s.name);
+            }
+        }
+        std::printf("  -- 6 首拒采曲命中结果: %d/6 命中 --\n", hitCount);
+        ck(hitCount >= 4, "E-17: 6 首拒采曲真网命中至少 4/6(与 §1.5 核对结论一致)", std::to_string(hitCount) + "/6");
     }
 
     std::printf("\n%s\n", g_fail == 0 ? "全部通过" : (std::to_string(g_fail) + " 项失败").c_str());
