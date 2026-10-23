@@ -4310,13 +4310,23 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         ct = "application/json; charset=utf-8";
         rta::dsp::OpraService::instance().init(path_in_exe_dir("data\\opra_index.json"), path_in_exe_dir(""));
         const auto& index = rta::dsp::OpraService::instance().index();
+        // 261023-03 第6条：显式带 ?q= 但值为空 → 返回空列表。
+        // 用户抱怨「什么都没输入就匹配到 100 个」：旧逻辑 q 为空时会走「全量索引」分支。
+        // 注意保留「不带 q 参数 = 全量索引」的老语义：前端第一次搜索时靠它一次性拉
+        // data/opra_index.json 做本地过滤（loadOpraIndex），不能一起改空。
         std::string q;
+        bool hasQ = false;
         const size_t qpos = rq.path.find("?q=");
         if (qpos != std::string::npos) {
+            hasQ = true;
             q = urlDecode(rq.path.substr(qpos + 3));
+            const size_t amp = q.find('&');      // 允许 &limit=... 之类后续参数
+            if (amp != std::string::npos) q = q.substr(0, amp);
         }
         std::ostringstream j;
-        if (!q.empty()) {
+        if (hasQ && q.empty()) {
+            j << "{\"ok\":true,\"count\":0,\"items\":[],\"q\":\"\",\"emptyQuery\":true}";
+        } else if (hasQ) {
             auto items = index.filter(q, 100);
             j << "{\"ok\":true,\"count\":" << items.size() << ",\"items\":[";
             for (size_t i = 0; i < items.size(); ++i) {
@@ -4325,6 +4335,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             }
             j << "]}";
         } else {
+            // 不带 q：索引 bootstrap（全量给前端做本地过滤）
             j << "{\"ok\":true,\"count\":" << index.size() << ",\"items\":[";
             bool first = true;
             for (const auto& it : index.items()) {

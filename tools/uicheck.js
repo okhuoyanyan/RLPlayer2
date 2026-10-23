@@ -577,7 +577,10 @@ async function waitFor(expr, ms = 8000) {
   ck(nGroups >= 6, '设置页分了多组', nGroups + ' 组');
   const nFields = await evalJs("document.querySelectorAll('#setpage select, #setpage input').length");
   ck(nFields >= 15, '设置项数量足够', nFields + ' 个控件');
-  ck(await evalJs("!!document.getElementById('sp_taps') && !!document.getElementById('sp_atten') && !!document.getElementById('sp_ir') && !!document.getElementById('sp_eq')"), '包含抽头/衰减/卷积/EQ 等高级项');
+  // 261023-03 第6条：EQ 文件 / 房间校正 IR 已从设置页搬到独立「EQ 与房间校正」页，
+  // 设置页只保留跳转入口（bGoEqNav）。所以这里接受「跳转入口」或「旧控件」任一形态，
+  // 但抽头/衰减必须还在高级页 —— 否则就是高级项真的丢了。
+  ck(await evalJs("!!document.getElementById('sp_taps') && !!document.getElementById('sp_atten') && (!!document.getElementById('bGoEqNav') || (!!document.getElementById('sp_ir') && !!document.getElementById('sp_eq')))"), '包含抽头/衰减/卷积/EQ 等高级项（EQ/IR 已独立成页，设置页保留入口）');
   ck(await evalJs("document.querySelectorAll('#sp_device option').length > 1"), '输出设备下拉有内容', (await evalJs("document.querySelectorAll('#sp_device option').length")) + ' 项');
   // ---- 本轮新增：WASAPI 共享后端（选项存在 / 说明文案 / 能保存；!! 跑完必须还原，
   //      与 taps 同一原则 —— 自检不许改用户的输出后端）----

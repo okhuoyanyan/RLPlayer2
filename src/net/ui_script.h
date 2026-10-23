@@ -720,8 +720,9 @@ function loadWorksView(initialTitle, initialComposer) {
   var h = '<div style="padding:10px 22px 30px">';
 
   // 首次进入顶部说明文案（261023-03 第4条）
-  h += '<div style="font-size:12.5px;color:var(--mut2);margin-bottom:12px;line-height:1.5">' +
-       '这个页面用来按作品名查不同指挥/乐团/年代的录音版本，点击下方示例可直接检索。</div>';
+  h += '<div style="font-size:12.5px;color:var(--mut2);margin-bottom:12px;line-height:1.6">' +
+       '古典作品页：按「作品名 + 作曲家」检索 Discogs 上的不同录音版本（指挥 / 乐团 / 年代 / 厂牌），' +
+       '帮你在同一首作品的不同演绎里挑到更对味的一张。可以自己填作品名查询，也可以直接点下方「示例作品」芯片一键检索。</div>';
 
   // 搜索卡片
   h += '<div class=card style="padding:16px 20px;margin-bottom:20px;background:var(--hov);border:1px solid var(--line);border-radius:10px">';
@@ -736,12 +737,14 @@ function loadWorksView(initialTitle, initialComposer) {
        '</div>';
   h += '</div>';
 
-  // 快捷预设芯片
+  // 示例作品芯片（261023-03 第4条：点击直接检索）
   h += '<div style="display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap">' +
-       '<span style="font-size:12px;color:var(--mut2)">常用作品:</span>' +
-       '<button class="btn chip-work" data-title="Boléro" data-composer="Maurice Ravel" style="font-size:11.5px;padding:2px 8px">Boléro (拉威尔)</button>' +
-       '<button class="btn chip-work" data-title="Symphony No. 5" data-composer="Ludwig van Beethoven" style="font-size:11.5px;padding:2px 8px">贝多芬第五交响曲</button>' +
-       '<button class="btn chip-work" data-title="Symphony No. 5" data-composer="Gustav Mahler" style="font-size:11.5px;padding:2px 8px">马勒第五交响曲</button>' +
+       '<span style="font-size:12px;color:var(--mut2)">示例作品：</span>' +
+       '<button class="btn chip-work" data-title="Boléro" data-composer="Maurice Ravel" style="font-size:11.5px;padding:2px 8px" title="Maurice Ravel — Boléro">Boléro（拉威尔）</button>' +
+       '<button class="btn chip-work" data-title="Symphony No. 5" data-composer="Ludwig van Beethoven" style="font-size:11.5px;padding:2px 8px" title="Ludwig van Beethoven — Symphony No. 5">贝多芬第五交响曲</button>' +
+       '<button class="btn chip-work" data-title="Brandenburg Concerto No. 3" data-composer="Johann Sebastian Bach" style="font-size:11.5px;padding:2px 8px" title="J.S. Bach — Brandenburg Concerto No. 3">勃兰登堡协奏曲</button>' +
+       '<button class="btn chip-work" data-title="The Four Seasons" data-composer="Antonio Vivaldi" style="font-size:11.5px;padding:2px 8px" title="Antonio Vivaldi — The Four Seasons">四季（维瓦尔第）</button>' +
+       '<button class="btn chip-work" data-title="Symphony No. 5" data-composer="Gustav Mahler" style="font-size:11.5px;padding:2px 8px" title="Gustav Mahler — Symphony No. 5">马勒第五交响曲</button>' +
        '</div>';
   h += '</div>';
 
@@ -783,8 +786,13 @@ function loadWorksView(initialTitle, initialComposer) {
 }
 
 function openWorkVersions(workTitle, composer, refresh) {
+  // 261023-03 第4条：切走后再点别的栏目时，异步回调必须能识别自己已经过期。
+  // 两道保险：① S.view 守卫（离开 works 直接丢弃）；② 请求序号（同一视图内连点只认最后一次）。
+  if (S.view !== 'works') return;
   var box = D('worksResult');
   if (!box) return;
+  S.worksReq = (S.worksReq || 0) + 1;
+  var req = S.worksReq;
   box.innerHTML = '<div class=empty style="padding:60px 0">正在从 Discogs 检索版本…</div>';
 
   var u = '/api/entity/versions?kind=work&name=' + encodeURIComponent(workTitle) +
@@ -799,15 +807,17 @@ function openWorkVersions(workTitle, composer, refresh) {
     return S.view === 'works' && !!D('worksResult');
   };
   api(u).then(function (j) {
-    if (!stillWorks()) return;                 // 已切走：丢弃这次结果
+    // 双守卫：视图已切走 → 丢弃；同一视图内连点 → 只认最后一次请求（S.worksReq 序号）
+    if (!stillWorks() || req !== S.worksReq) return;
     renderWorkVersions(workTitle, composer, j);
   }).catch(function (err) {
-    if (!stillWorks()) return;
+    if (!stillWorks() || req !== S.worksReq) return;
     renderWorkVersions(workTitle, composer, { ok: false, errors: [String(err)], performances: [] });
   });
 }
 
 function renderWorkVersions(workTitle, composer, j) {
+  if (S.view !== 'works') return;   // 261023-03 第4条：已离开作品页，丢弃过期结果
   var box = D('worksResult');
   if (!box) return;
   // 同 openWorkVersions 的守卫：视图已经切走就别再动 DOM（防「切不回去」的残留内容）
@@ -2908,8 +2918,9 @@ function renderSettingsPage() {
      + sgroup('EQ 与房间校正', '耳机校准预设 · 房间声学 IR 卷积 · 调音管理（已移至主导航）',
          '<div class="sfld wide"><div class=hint style="margin-bottom:8px">耳机 EQ、调音预设与房间声学校正已独立为左侧主导航「EQ 与房间校正」页面。</div>'
        + '<button class="btn pri" id=bGoEqNav type="button" style="font-size:12px;padding:6px 14px">前往「EQ 与房间校正」页面 →</button></div>'
-       + '<input type=hidden id=sp_eq value="' + esc(ADV.eq || '') + '">'
-       + '<input type=hidden id=sp_ir value="' + esc(ADV.ir || '') + '">')
+       // 261023-03 第6条：这里**不能**再放 sp_eq / sp_ir 旧控件 ——
+       // 独立 EQ 页各有一份，重复 id 会让 D() 取到设置页这份的陈旧值（隐藏控件陷阱）。
+       + '<div class="sfld wide"><div class=hint>EQ 文件路径、房间校正 IR 与 GPU 卷积开关都在该页面里填写；这里只保留入口。</div></div>')
      + sgroup('流媒体服务器', 'Navidrome / Subsonic / Emby（只取原始文件，不用转码流）',
          '<div class="sfld wide"><div class=hint>DLNA/UPnP 是"发现网络上的播放器"，与这里的"登录音乐服务器"是两件事。' +
          '要连 Emby / Navidrome，在这一栏填地址与账号。</div></div>'
@@ -3257,7 +3268,79 @@ function loadOpraIndex(cb) {
   }).catch(function () { _opraLoading = false; if (cb) cb(); });
 }
 
+/* ---------------- 调音目标曲线示意（261023-03 第7条） ----------------
+   内联 SVG 手绘近似：横轴 20Hz→20kHz（对数近似），纵轴相对 dB。
+   只用作「这条目标曲线大概长什么样」的示意，不是测量数据；不引外部图片。
+   颜色只用 CSS 变量（--line / --acc / --mut2），跟随深色/浅色主题。 */
+var TARGET_CURVES = {
+  harman_oe: { label: 'Harman 头戴目标：低频温和提升、中高频平顺',
+    pts: [[0,6],[0.08,6],[0.15,5],[0.22,2.6],[0.30,0.8],[0.38,0],[0.47,0.5],[0.54,2.0],[0.60,2.6],[0.66,1.5],[0.72,0.3],[0.80,-0.4],[0.90,-0.2],[1.0,0.9]] },
+  harman_iem: { label: 'Harman 入耳目标：低频更厚、3kHz 耳道增益',
+    pts: [[0,9],[0.07,9],[0.13,7.2],[0.20,3.4],[0.27,0.8],[0.34,0],[0.44,0.4],[0.50,1.8],[0.55,6.0],[0.59,7.2],[0.64,2.6],[0.70,0.4],[0.80,-1.0],[0.90,-0.6],[1.0,1.2]] },
+  autoeq: { label: 'AutoEQ 校准：按实测目标平直化，小幅低频架',
+    pts: [[0,3.8],[0.10,3.8],[0.18,2.8],[0.26,1.0],[0.34,0],[0.46,0.5],[0.53,1.8],[0.60,0.6],[0.70,-0.3],[0.82,0],[1.0,0.6]] },
+  studio: { label: '录音室中性：全频段尽量平直',
+    pts: [[0,0],[0.12,-0.3],[0.24,-0.6],[0.36,-0.2],[0.50,0.2],[0.62,0.5],[0.74,0],[0.86,-0.3],[1.0,0]] },
+  consumer: { label: '消费级曲线：低频与极高频微抬',
+    pts: [[0,4.5],[0.12,4.5],[0.20,3.0],[0.30,0.8],[0.40,0],[0.52,0.8],[0.58,2.2],[0.65,0.8],[0.75,0.2],[0.85,0.8],[1.0,2.6]] },
+  diffuse: { label: '扩散场目标：声场开阔、高频细节多',
+    pts: [[0,0],[0.10,-0.3],[0.20,-0.6],[0.30,-0.6],[0.40,-0.3],[0.50,0.2],[0.60,1.0],[0.70,2.0],[0.80,2.8],[0.90,3.3],[1.0,3.6]] },
+  freefield: { label: '自由场目标：接近消音室直达声',
+    pts: [[0,0],[0.15,-0.2],[0.30,-0.5],[0.45,-0.4],[0.55,-0.1],[0.65,0.3],[0.75,0.9],[0.85,1.6],[1.0,2.4]] },
+  senselab: { label: 'SenseLab 目标：高频峰谷精细补偿',
+    pts: [[0,0.5],[0.15,0.2],[0.28,-0.2],[0.40,-0.3],[0.52,0.2],[0.60,1.2],[0.68,0.4],[0.80,-0.2],[1.0,0.4]] },
+  rtings: { label: 'Rtings 参考目标：平直均衡',
+    pts: [[0,2.5],[0.12,2.5],[0.22,1.4],[0.32,0.2],[0.45,0],[0.55,0.6],[0.62,1.2],[0.72,0],[0.85,-0.4],[1.0,0.3]] },
+  optimum: { label: 'Optimum HiFi：低频克制、中频通透',
+    pts: [[0,2.0],[0.14,2.0],[0.24,1.0],[0.34,0],[0.48,0.3],[0.56,1.0],[0.66,0.2],[0.80,-0.4],[1.0,0]] },
+  neutral: { label: 'IEF 中性：平直无染',
+    pts: [[0,0],[0.12,0],[0.24,-0.2],[0.36,-0.2],[0.50,0],[0.58,0.8],[0.66,0.2],[0.80,-0.4],[1.0,0]] }
+};
+
+// 判据与 getTargetCurveDescInfo 各分支保持一致（只用于挑 SVG 示意）
+function curveKindOfDetails(details) {
+  var d = (details || '').toLowerCase();
+  if (d.indexOf('harman') >= 0) return (d.indexOf('in-ear') >= 0 || d.indexOf('iem') >= 0) ? 'harman_iem' : 'harman_oe';
+  if (d.indexOf('soundguys_studio') >= 0) return 'studio';
+  if (d.indexOf('soundguys_consumer') >= 0) return 'consumer';
+  if (d.indexOf('diffuse') >= 0 || d.indexOf('hrtf') >= 0) return 'diffuse';
+  if (d.indexOf('free_field') >= 0) return 'freefield';
+  if (d.indexOf('senselab') >= 0) return 'senselab';
+  if (d.indexOf('rtings') >= 0) return 'rtings';
+  if (d.indexOf('optimum') >= 0 || d.indexOf('hifi') >= 0) return 'optimum';
+  if (d.indexOf('neutral') >= 0 || d.indexOf('ief') >= 0) return 'neutral';
+  return 'autoeq';
+}
+
+function targetCurveSvg(kind, H) {
+  var c = TARGET_CURVES[kind] || TARGET_CURVES.autoeq;
+  var W = 260, HH = H || 58, PAD = 6, MAXDB = 9, MINDB = -2;
+  function px(x) { return PAD + x * (W - 2 * PAD); }
+  function py(db) { return PAD + (MAXDB - db) / (MAXDB - MINDB) * (HH - 2 * PAD); }
+  var pts = c.pts.map(function (p) { return px(p[0]).toFixed(1) + ',' + py(p[1]).toFixed(1); }).join(' ');
+  var s = '<svg viewBox="0 0 ' + W + ' ' + HH + '" style="display:block;width:100%;height:auto" role="img" aria-label="' + esc(c.label) + '">';
+  // 0dB 基准线 + 1kHz / 10kHz 竖向参考线
+  s += '<line x1="' + PAD + '" y1="' + py(0).toFixed(1) + '" x2="' + (W - PAD) + '" y2="' + py(0).toFixed(1) + '" stroke="var(--line)" stroke-width="1" stroke-dasharray="3 3"/>';
+  s += '<line x1="' + px(0.52).toFixed(1) + '" y1="' + PAD + '" x2="' + px(0.52).toFixed(1) + '" y2="' + (HH - PAD) + '" stroke="var(--line)" stroke-width="1" stroke-dasharray="2 4" opacity=".7"/>';
+  s += '<line x1="' + px(0.80).toFixed(1) + '" y1="' + PAD + '" x2="' + px(0.80).toFixed(1) + '" y2="' + (HH - PAD) + '" stroke="var(--line)" stroke-width="1" stroke-dasharray="2 4" opacity=".7"/>';
+  s += '<polyline points="' + pts + '" fill="none" stroke="var(--acc)" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>';
+  s += '<circle cx="' + px(c.pts[0][0]).toFixed(1) + '" cy="' + py(c.pts[0][1]).toFixed(1) + '" r="2" fill="var(--acc)"/>';
+  s += '<circle cx="' + px(c.pts[c.pts.length - 1][0]).toFixed(1) + '" cy="' + py(c.pts[c.pts.length - 1][1]).toFixed(1) + '" r="2" fill="var(--acc)"/>';
+  s += '<text x="' + PAD + '" y="' + (HH - 1) + '" font-size="7" fill="var(--mut2)">20Hz</text>';
+  s += '<text x="' + (px(0.52) - 8).toFixed(1) + '" y="' + (HH - 1) + '" font-size="7" fill="var(--mut2)">1k</text>';
+  s += '<text x="' + (W - PAD - 16) + '" y="' + (HH - 1) + '" font-size="7" fill="var(--mut2)">20k</text>';
+  s += '</svg>';
+  return s;
+}
+
+// 对外接口：在原有「中文解释」上补一个 kind（用于选 SVG 示意），不改变原判据
 function getTargetCurveDesc(details, author) {
+  var c = getTargetCurveDescInfo(details, author);
+  c.kind = curveKindOfDetails(details);
+  return c;
+}
+
+function getTargetCurveDescInfo(details, author) {
   var d = (details || '').toLowerCase();
   var a = (author || '').toLowerCase();
   if (d.indexOf('harman') >= 0 && (d.indexOf('in-ear') >= 0 || d.indexOf('iem') >= 0)) {
@@ -3380,12 +3463,6 @@ function loadEqView() {
   // 型号卡片容器（空输入时 0 个，有输入时 <= 30 个，261023-03 第6条判据）
   h += '<div id=eqModelCards style="display:grid;grid-template-columns:repeat(auto-fill, minmax(220px, 1fr));gap:10px;margin-bottom:14px"></div>';
 
-  // 兼容老代码的隐藏控件
-  h += '<select id=sp_opra_product style="display:none"></select>' +
-       '<select id=sp_opra_preset style="display:none"></select>' +
-       '<button id=sp_opra_apply style="display:none">应用</button>' +
-       '<div id=sp_opra_card style="display:none"></div>';
-
   // 预设选择与目标曲线卡片展示区（选中某款耳机后渲染）
   h += '<div id=eqPresetsArea style="display:none;margin-top:20px;padding-top:18px;border-top:1px dashed var(--line)">' +
        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">' +
@@ -3398,20 +3475,25 @@ function loadEqView() {
 
   h += '</div>'; // 结束第一部分
 
-  // 2. 房间校正与通用 EQ 卡片
-  h += '<div class=card style="padding:22px 24px;background:var(--hov);border:1px solid var(--line);border-radius:12px">' +
-       '<h2 style="font-size:16px;margin:0 0 4px;font-weight:700">EQ 与房间声学校正</h2>' +
-       '<div style="font-size:12px;color:var(--mut2);margin-bottom:16px">FIR 卷积用 WAV 脉冲响应，参量 EQ 支持 REW / AutoEq 标准文本格式</div>' +
-       '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:14px">' +
-       '<div><label style="display:block;font-size:12px;color:var(--mut2);margin-bottom:6px;font-weight:500">EQ 文件路径（REW / AutoEq 文本）</label>' +
+  // 2. EQ 文件（REW / AutoEq 文本）—— 261023-03 第6条 ②
+  h += '<div class=card style="padding:22px 24px;margin-bottom:24px;background:var(--hov);border:1px solid var(--line);border-radius:12px">' +
+       '<h2 style="font-size:16px;margin:0 0 4px;font-weight:700">EQ 文件（REW / AutoEq 文本）</h2>' +
+       '<div style="font-size:12px;color:var(--mut2);margin-bottom:14px">参量 EQ 支持 REW / AutoEq 的标准文本格式，按文件里的 Filter 行生成双二阶滤波器组。</div>' +
+       '<label style="display:block;font-size:12px;color:var(--mut2);margin-bottom:6px;font-weight:500">EQ 文件路径</label>' +
        '<input type=text id=sp_eq value="' + esc(ADV.eq || '') + '" placeholder="D:\\Music\\headphone-eq.txt" style="width:100%;height:34px;padding:0 10px;background:var(--card);border:1px solid var(--line);border-radius:6px;color:var(--txt);box-sizing:border-box">' +
-       '<div style="font-size:11px;color:var(--mut2);margin-top:4px">每行如 Filter 1: ON PK Fc 1000 Hz Gain -3.0 dB Q 1.41</div></div>' +
-       '<div><label style="display:block;font-size:12px;color:var(--mut2);margin-bottom:6px;font-weight:500">IR 脉冲响应卷积文件（WAV）</label>' +
+       '<div style="font-size:11px;color:var(--mut2);margin-top:4px">每行如 Filter 1: ON PK Fc 1000 Hz Gain -3.0 dB Q 1.41</div>' +
+       '</div>';
+
+  // 3. 房间校正 IR（WAV 路径 + GPU 卷积开关）—— 261023-03 第6条 ③
+  h += '<div class=card style="padding:22px 24px;background:var(--hov);border:1px solid var(--line);border-radius:12px">' +
+       '<h2 style="font-size:16px;margin:0 0 4px;font-weight:700">房间校正 IR（WAV 脉冲响应）</h2>' +
+       '<div style="font-size:12px;color:var(--mut2);margin-bottom:14px">把测量到的房间 / 耳机脉冲响应用 FIR 卷积叠进播放链路，做声学校正。</div>' +
+       '<label style="display:block;font-size:12px;color:var(--mut2);margin-bottom:6px;font-weight:500">IR 脉冲响应卷积文件（WAV）</label>' +
        '<input type=text id=sp_ir value="' + esc(ADV.ir || '') + '" placeholder="D:\\Music\\room.wav" style="width:100%;height:34px;padding:0 10px;background:var(--card);border:1px solid var(--line);border-radius:6px;color:var(--txt);box-sizing:border-box">' +
-       '<div style="font-size:11px;color:var(--mut2);margin-top:4px">留空 = 不做卷积；支持立体声/多声道 FIR 房间校正</div></div></div>' +
-       '<div style="display:flex;align-items:center;justify-content:space-between;margin-top:14px">' +
+       '<div style="font-size:11px;color:var(--mut2);margin-top:4px">留空 = 不做卷积；支持立体声 / 多声道 FIR 房间校正</div>' +
+       '<div style="display:flex;align-items:center;justify-content:space-between;margin-top:14px;flex-wrap:wrap;gap:10px">' +
        '<label class=chk style="margin:0"><input type=checkbox id=sp_irgpu' + (ADV.irgpu == 1 ? ' checked' : '') + '> 卷积走 GPU 硬件加速（需要 rtagpu.dll 就位）</label>' +
-       '<button class="btn pri" id=bSaveRoomEq>保存房间校正设置</button>' +
+       '<button class="btn pri" id=bSaveRoomEq>保存 EQ 与房间校正设置</button>' +
        '</div></div>';
 
   h += '</div>';
@@ -3459,7 +3541,7 @@ function initEqViewLogic() {
 
     if (!OPRA_INDEX) {
       if (hint) { hint.textContent = '正在加载耳机数据库…'; hint.style.display = 'block'; }
-      loadOpraIndex(function () { doSearch(q); });
+      loadOpraIndex(function () { if (S.view === 'eq') doSearch(q); });   // 切走后丢弃过期回调
       return;
     }
 
@@ -3493,35 +3575,21 @@ function initEqViewLogic() {
     hits.forEach(function (it) {
       var id = it[0], vendor = it[1], name = it[2];
       var isCur = (id === ADV.opraproduct);
+      // 每项统一显示「品牌 · 型号」（261023-03 第6条：品牌/型号不能是两个互相重叠的搜索框）
       ch += '<div class="model-card card' + (isCur ? ' active' : '') + '" data-id="' + esc(id) + '" data-vendor="' + esc(vendor) + '" data-name="' + esc(name) + '">' +
-            '<div style="font-size:11px;color:var(--mut2);font-weight:600">' + esc(vendor) + '</div>' +
-            '<div style="font-size:13.5px;font-weight:600;margin:3px 0 6px;color:var(--txt)">' + esc(name) + '</div>' +
-            '<div style="font-size:11.5px;color:var(--mut2);display:flex;align-items:center;justify-content:space-between">' +
-            '<span>OPRA 预设</span><span class="badge" style="font-size:10px">查看预设</span>' +
+            '<div style="font-size:13px;font-weight:600;line-height:1.35;color:var(--txt)">' + esc(vendor) + ' · ' + esc(name) + '</div>' +
+            '<div style="font-size:11px;color:var(--mut2);margin-top:5px;display:flex;align-items:center;justify-content:space-between">' +
+            '<span>OPRA 校准预设</span><span class="badge" style="font-size:10px">查看调音预设</span>' +
             '</div></div>';
     });
     cardsBox.innerHTML = ch;
-
-    // 兼容老 select
-    var pSel = D('sp_opra_product');
-    if (pSel) {
-      var oph = '<option value="">（选择耳机型号）</option>';
-      hits.forEach(function (it) {
-        oph += '<option value="' + esc(it[0]) + '">' + esc(it[1] + ' - ' + it[2]) + '</option>';
-      });
-      pSel.innerHTML = oph;
-    }
 
     // 绑定点击型号卡片
     Array.prototype.forEach.call(cardsBox.querySelectorAll('.model-card'), function (card) {
       card.onclick = function () {
         Array.prototype.forEach.call(cardsBox.querySelectorAll('.model-card'), function (c) { c.classList.remove('active'); });
         card.classList.add('active');
-        var pid = card.dataset.id;
-        var pvendor = card.dataset.vendor;
-        var pname = card.dataset.name;
-        if (pSel) pSel.value = pid;
-        loadProductPresets(pid, pvendor, pname);
+        loadProductPresets(card.dataset.id, card.dataset.vendor, card.dataset.name);
       };
     });
   }
@@ -3535,6 +3603,7 @@ function initEqViewLogic() {
     if (targetInfo) targetInfo.style.display = 'none';
 
     api('/api/opra/presets?productId=' + encodeURIComponent(productId)).then(function (j) {
+      if (S.view !== 'eq') return;   // 切走页面后不再渲染
       if (!j.ok || !j.items || !j.items.length) {
         if (msg) msg.textContent = '暂无可用预设';
         if (presetsBox) presetsBox.innerHTML = '<div class=empty style="padding:20px 0">该型号暂无可用调音预设</div>';
@@ -3544,16 +3613,6 @@ function initEqViewLogic() {
       OPRA_PRESETS = presets;
       if (msg) msg.textContent = (j.fromCache ? '已加载本地缓存（' : '共 ') + presets.length + ' 种调音目标）';
 
-      // 兼容老 select
-      var presSel = D('sp_opra_preset');
-      if (presSel) {
-        var optsh = '<option value="">（请选择预设）</option>';
-        presets.forEach(function (p) {
-          optsh += '<option value="' + esc(p.id) + '">' + esc(p.author + ' ' + p.details) + '</option>';
-        });
-        presSel.innerHTML = optsh;
-      }
-
       // 渲染卡片式调音预设（至少 3 张卡，261023-03 第7条）
       var ph = '';
       presets.forEach(function (p) {
@@ -3561,16 +3620,18 @@ function initEqViewLogic() {
         var isActive = (ADV.opraproduct === productId && ADV.oprapreset === p.id);
         ph += '<div class="preset-card card' + (isActive ? ' active' : '') + '" data-id="' + esc(p.id) + '">' +
               '<div>' +
-              '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">' +
-              '<b style="font-size:13.5px;color:var(--txt)">' + esc(curve.name) + '</b>' +
-              '<span class="badge" style="background:var(--hov)">' + p.bandsCount + ' 段 EQ</span>' +
+              '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:4px">' +
+              '<b style="font-size:13.5px;color:var(--txt);line-height:1.35">' + esc(curve.name) + '</b>' +
+              '<span class="badge" style="background:var(--hov);white-space:nowrap">' + p.bandsCount + ' 段</span>' +
               '</div>' +
-              '<div style="font-size:11px;color:var(--mut2);margin-bottom:6px">测量出处：' + esc(p.author || 'OPRA') + (p.details ? (' (' + esc(p.details) + ')') : '') + '</div>' +
-              '<div style="font-size:12px;color:var(--txt2);line-height:1.5;margin:8px 0;background:var(--card);padding:8px 10px;border-radius:6px;border:1px solid var(--line)">' +
-              esc(curve.scene) + '</div>' +
-              '<div style="font-size:11.5px;color:var(--mut2)">前级增益（Preamp）：<b>' + p.gainDb + ' dB</b>（独立衰减防削波）</div>' +
+              '<div style="font-size:11px;color:var(--mut2)">作者：' + esc(p.author || 'OPRA') + (p.details ? (' · 预设 ' + esc(p.details)) : '') + '</div>' +
+              '<div class="tc-curve" title="目标曲线示意（手绘近似，非测量数据）">' + targetCurveSvg(curve.kind) + '</div>' +
+              '<div style="font-size:12px;color:var(--txt2);line-height:1.5;margin:8px 0 0;background:var(--card);padding:8px 10px;border-radius:6px;border:1px solid var(--line)">' +
+              '说明：' + esc(curve.scene) + '</div>' +
+              '<div style="font-size:11.5px;color:var(--mut2);margin-top:8px">前级增益：<b>' + p.gainDb + ' dB</b> · 频段数：<b>' + p.bandsCount + ' 段</b></div>' +
               '</div>' +
-              '<div style="margin-top:12px;display:flex;align-items:center;justify-content:space-between">' +
+              '<div style="margin-top:12px;display:flex;align-items:center;justify-content:space-between;gap:8px">' +
+              '<span style="font-size:11px;color:var(--mut2)">点击卡片选中</span>' +
               '<button class="btn pri opra-apply-btn" data-pid="' + esc(productId) + '" data-eid="' + esc(p.id) + '" style="font-size:12px;padding:5px 14px">' +
               (isActive ? '已应用当前预设' : '应用到 EQ') + '</button>' +
               '</div></div>';
@@ -3586,6 +3647,9 @@ function initEqViewLogic() {
       // 绑定应用按钮与卡片点击
       Array.prototype.forEach.call(presetsBox.querySelectorAll('.preset-card'), function (pcard) {
         pcard.onclick = function () {
+          // 选中高亮（261023-03 第7条）：点卡片只选中/预览；真正写入 EQ 要再点「应用到 EQ」
+          Array.prototype.forEach.call(presetsBox.querySelectorAll('.preset-card'), function (c) { c.classList.remove('active'); });
+          pcard.classList.add('active');
           var eid = pcard.dataset.id;
           var p = presets.find(function (x) { return x.id === eid; });
           if (p) showTargetCurveInfo(p);
@@ -3609,10 +3673,19 @@ function initEqViewLogic() {
   function showTargetCurveInfo(p) {
     if (!targetInfo) return;
     var curve = getTargetCurveDesc(p.details, p.author);
-    targetInfo.innerHTML = '<div style="font-weight:700;font-size:13px;margin-bottom:4px;color:var(--txt)">' + esc(curve.name) + ' · 目标曲线说明</div>' +
-                           '<div>' + esc(curve.tech) + '</div>' +
-                           '<div style="margin-top:6px;font-size:11.5px;color:var(--mut2)">' +
-                           '适用场景：' + esc(curve.scene) + ' | 前级增益：' + p.gainDb + ' dB | 滤波段数：' + p.bandsCount + ' 段参量滤波</div>';
+    targetInfo.innerHTML = '<div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start">' +
+      '<div style="flex:1;min-width:260px">' +
+      '<div style="font-weight:700;font-size:13px;margin-bottom:6px;color:var(--txt)">' + esc(curve.name) + ' · 目标曲线说明</div>' +
+      '<div style="margin-bottom:5px"><b style="color:var(--txt)">是什么：</b>' + esc(curve.tech) + '</div>' +
+      '<div><b style="color:var(--txt)">适合谁：</b>' + esc(curve.scene) + '</div>' +
+      '</div>' +
+      '<div style="flex:0 0 260px;min-width:220px" class="tc-curve">' +
+      '<div style="font-size:10.5px;color:var(--mut2);margin-bottom:2px">目标曲线示意（手绘近似）</div>' +
+      targetCurveSvg(curve.kind, 78) +
+      '</div>' +
+      '</div>' +
+      '<div style="margin-top:10px;font-size:11.5px;color:var(--mut2);border-top:1px dashed var(--line);padding-top:8px">' +
+      '前级增益：' + p.gainDb + ' dB（独立衰减防削波） · 滤波段数：' + p.bandsCount + ' 段 · 预设：' + esc(p.details || p.id) + '</div>';
     targetInfo.style.display = 'block';
   }
 
@@ -3621,7 +3694,10 @@ function initEqViewLogic() {
       if (!j.ok) { toast(j.error || '应用失败'); return; }
       ADV.opraproduct = pid;
       ADV.oprapreset = eid;
-      if (j.eqPath) ADV.eq = j.eqPath;
+      // 后端 /api/opra/apply 返回字段是 path（见 rtaweb.cpp）；eqPath 仅作兼容。
+      // 这里以前只认 eqPath，导致「应用成功」但 EQ 文件路径根本没写进去（261023-03 第7条实测抓到）。
+      var appliedPath = j.eqPath || j.path;
+      if (appliedPath) ADV.eq = appliedPath;
       if (D('sp_eq')) D('sp_eq').value = ADV.eq;
       saveSettings(true);
       toast('已应用调音预设到 EQ');
@@ -3666,10 +3742,21 @@ function initEqViewLogic() {
     };
   }
 
-  // 初始：若已有选择的型号，则初始化加载；否则保持空状态（0 个型号卡片）
+  // 初始：有已选型号 → 回填「品牌 型号」并加载预设；否则保持空输入（0 张型号卡片）。
+  // 空输入时这里**不发起任何 /api/opra/index 请求**（261023-03 第6条）。
   if (ADV.opraproduct) {
-    sInput.value = ADV.opraproduct;
-    doSearch(ADV.opraproduct);
+    loadOpraIndex(function () {
+      if (S.view !== 'eq') return;
+      var it = null;
+      for (var i = 0; i < (OPRA_INDEX || []).length; ++i) {
+        if (OPRA_INDEX[i][0] === ADV.opraproduct) { it = OPRA_INDEX[i]; break; }
+      }
+      if (it) {
+        sInput.value = it[1] + ' ' + it[2];
+        doSearch(sInput.value);
+        loadProductPresets(it[0], it[1], it[2]);
+      }
+    });
   } else {
     doSearch('');
   }
@@ -3818,8 +3905,6 @@ function collectSettings() {
   if (D('sp_inmon')) ADV.inMonitor = D('sp_inmon').checked ? 1 : 0;
   if (D('sp_inseconds')) ADV.inSeconds = parseFloat(D('sp_inseconds').value) || 0;
   if (D('sp_inout')) ADV.inOut = (D('sp_inout').value || '').trim();
-  if (D('sp_opra_product')) ADV.opraproduct = (D('sp_opra_product').value || '').trim();
-  if (D('sp_opra_preset')) ADV.oprapreset = (D('sp_opra_preset').value || '').trim();
   // 同步回快捷面板
 
   D('sRate').value = D('sp_rate').value;
