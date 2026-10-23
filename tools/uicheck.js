@@ -81,6 +81,14 @@ async function waitFor(expr, ms = 8000) {
   }
   return false;
 }
+// 文件夹页是异步 /api/files 渲染的：点了导航后等 #fPath 出现；偶发慢响应时再点一次（最多 3 次）。
+async function gotoFiles() {
+  for (let i = 0; i < 3; i++) {
+    await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='files').click()");
+    if (await waitFor("!!document.getElementById('fPath') && document.querySelectorAll('#list .row').length > 0", 6000)) return true;
+  }
+  return false;
+}
 
 (async () => {
   const pages = await targets();
@@ -279,9 +287,8 @@ async function waitFor(expr, ms = 8000) {
   const pWorks = await shot('22-work-versions');
 
   // 文件夹
-  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='files').click()");
-  await sleep(700);
-  ck(await evalJs("document.querySelectorAll('.row').length > 0"), '文件夹视图有内容');
+  // 文件夹视图是异步 /api/files 渲染的；慢盘/慢网络下固定 sleep 700 会假失败（本环境实测偶发）。
+  ck(await gotoFiles(), '文件夹视图有内容');
   const p4 = await shot('04-files');
 
   // 设置面板 + 队列面板
@@ -463,7 +470,7 @@ async function waitFor(expr, ms = 8000) {
      '两个开关（自动补全 / AI 增强）存在且已绑定；旧 sp_metasummary 已合并删除', JSON.stringify(metaFix));
 
   // 合并后的 AI 开关：文案必须讲清「DeepSeek + 联网 + 按次计费」
-  const aiLabel = await evalJs("(function(){var e=document.getElementById('sp_metallm');return (e&&e.parentNode)?e.parentNode.textContent.trim():'';})()");
+  const aiLabel = await evalJs("(function(){var e=document.getElementById('sp_metallm');var f=e?e.closest('.sfld'):null;return f?f.textContent.trim():'';})()");
   ck(aiLabel.indexOf('AI 增强') >= 0 && aiLabel.indexOf('DeepSeek') >= 0 && aiLabel.indexOf('按次计费') >= 0,
      '「AI 增强（DeepSeek）」文案包含联网 / 按次计费说明', aiLabel);
 
@@ -569,10 +576,11 @@ async function waitFor(expr, ms = 8000) {
   ck(nGroups >= 6, '设置页分了多组', nGroups + ' 组');
   const nFields = await evalJs("document.querySelectorAll('#setpage select, #setpage input').length");
   ck(nFields >= 15, '设置项数量足够', nFields + ' 个控件');
-  // 261023-03 第6条：EQ 文件 / 房间校正 IR 已从设置页搬到独立「EQ 与房间校正」页，
-  // 设置页只保留跳转入口（bGoEqNav）。所以这里接受「跳转入口」或「旧控件」任一形态，
-  // 但抽头/衰减必须还在高级页 —— 否则就是高级项真的丢了。
-  ck(await evalJs("!!document.getElementById('sp_taps') && !!document.getElementById('sp_atten') && (!!document.getElementById('bGoEqNav') || (!!document.getElementById('sp_ir') && !!document.getElementById('sp_eq')))"), '包含抽头/衰减/卷积/EQ 等高级项（EQ/IR 已独立成页，设置页保留入口）');
+  // 2026-10-23 用户 261023-04 #2：EQ 与房间校正不再是主导航页，而是设置页的「EQ」页签。
+  // 判据：抽头/衰减仍在「高级」页签；EQ 文件 / IR / GPU 卷积在「EQ」页签 —— 都在设置页内，
+  // 且各自归属正确（不能互相串页签，否则又会出现重复 id / 读错控件）。
+  ck(await evalJs("(function(){var page=document.getElementById('setpage');var eq=document.querySelector('#setpage .spane[data-g=eq]');if(!eq)return false;var t=document.getElementById('sp_taps'),a=document.getElementById('sp_atten'),ir=document.getElementById('sp_ir'),e=document.getElementById('sp_eq'),g=document.getElementById('sp_irgpu'),b=document.getElementById('bSaveRoomEq');return !!(t&&a&&page.contains(t)&&page.contains(a)&&ir&&e&&g&&b&&eq.contains(ir)&&eq.contains(e)&&eq.contains(g)&&eq.contains(b));})()"),
+     '抽头/衰减仍在设置页（PCM 页签），EQ 文件/IR/GPU 卷积在「EQ」页签内');
   ck(await evalJs("document.querySelectorAll('#sp_device option').length > 1"), '输出设备下拉有内容', (await evalJs("document.querySelectorAll('#sp_device option').length")) + ' 项');
   // ---- 本轮新增：WASAPI 共享后端（选项存在 / 说明文案 / 能保存；!! 跑完必须还原，
   //      与 taps 同一原则 —— 自检不许改用户的输出后端）----
@@ -772,7 +780,7 @@ async function waitFor(expr, ms = 8000) {
       //            （早期把两类混在一起判，导致把正常控件误报成"未绑定"）
       //  P1.5：元数据源开关是动态的（/api/providers 注册表）—— 在静态清单之外逐源补查
       //  P2：标签写回的预览/执行按钮也是要点了有反应的
-      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_metasummary','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','bGoEqNav','sp_instart','sp_instop','sp_inmon','sp_cast_scan','sp_cast_usecur','sp_cast_start','sp_cast_stop','sp_cast_dop','sp_cast_dev'];
+      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','srcSave','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_instart','sp_instop','sp_inmon','sp_cast_scan','sp_cast_usecur','sp_cast_start','sp_cast_stop','sp_cast_dop','sp_cast_dev'];
       (META_PROVIDERS || []).forEach(function (p) { needBind.push('sp_meta_' + p.id); });
       var valueOnly=['sRate','sFilt','sFiltNx','sShap','sBuf','sDSD','sIsp','s2s','sp_cast_file'];
       var miss=[];
@@ -784,14 +792,14 @@ async function waitFor(expr, ms = 8000) {
 
   // ---- 本轮新增：队列主视图 / 文件夹地址栏 / 正在播放页 / 循环键 / 拖拽遮罩 ----
   await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='queue').click()");
-  await sleep(700);
-  ck(await evalJs("!!document.querySelector('#list .qrow') || !!document.querySelector('#list .empty')"), '播放队列有内容或明确的空状态');
+  // 队列页是异步拉 /api/queue 再渲染的：慢机器上固定 sleep 会假失败（本环境实测偶发），
+  // 改为等条件成立（最多 8s），而不是赌 700ms。
+  ck(await waitFor("!!document.querySelector('#list .qrow') || !!document.querySelector('#list .empty')", 8000),
+     '播放队列有内容或明确的空状态');
   ck(await evalJs("document.getElementById('pth').textContent.indexOf('播放队列') >= 0"), '队列页标题正确');
 
-  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='files').click()");
-  await sleep(700);
-  ck(await evalJs("!!document.getElementById('fPath')"), '文件夹有地址栏输入框');
-  const addr = await evalJs("document.getElementById('fPath').value");
+  ck(await gotoFiles(), '文件夹有地址栏输入框');
+  const addr = await evalJs("(document.getElementById('fPath')||{}).value || ''");
   ck(!!addr, '地址栏显示了当前目录', addr);
 
   await evalJs("document.getElementById('npOpen').click()");
@@ -836,6 +844,70 @@ async function waitFor(expr, ms = 8000) {
   ck(await waitFor("fetch('/api/queue').then(r=>r.json()).then(j=>String(j.repeat)==='" + String(rep0) + "')", 4000), '自检跑完后循环模式恢复后端状态');
 
   ck(await evalJs("!!document.getElementById('dropmask')"), '拖拽提示层已就绪');
+
+  // ---- 261023-04 #8：三主题下 select / option 的对比度（深色主题曾出现「菜单浅字压浅底」）----
+  // 判据不看文案：读 computed style，把 select 的半透明背景按体色合成后算 WCAG 对比度，
+  // 要求 select 本体文字与 option 菜单文字都 ≥ 4.5:1（三套主题各算一次）。
+  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='tracks').click()");
+  await sleep(700);
+  const themeBefore = await evalJs("document.documentElement.dataset.theme");
+  const selContrast = await evalJs(`(function(){
+    // 不用正则：模板字符串里的反斜杠会再被转义一层（本项目实测踩到，p[0] 变成 "(233"）。
+    function parse(c){var i=c.indexOf('('),j=c.indexOf(')');if(i<0||j<0)return null;var p=c.slice(i+1,j).split(',').map(function(x){return parseFloat(x)});return {r:p[0],g:p[1],b:p[2],a:p.length>3?p[3]:1};}
+    function lum(c){var p=parse(c);if(!p)return null;function f(v){v/=255;return v<=0.03928?v/12.92:Math.pow((v+0.055)/1.055,2.4)}return 0.2126*f(p.r)+0.7152*f(p.g)+0.0722*f(p.b)}
+    function ratio(fg,bg){var la=lum(fg),lb=lum(bg);if(la==null||lb==null)return null;return (Math.max(la,lb)+0.05)/(Math.min(la,lb)+0.05)}
+    function composite(c,under){var p=parse(c);if(!p)return c;var u=parse(under);return 'rgb('+Math.round(p.a*p.r+(1-p.a)*u.r)+','+Math.round(p.a*p.g+(1-p.a)*u.g)+','+Math.round(p.a*p.b+(1-p.a)*u.b)+')';}
+    var out = {};
+    ['dark','light','blue'].forEach(function(t){
+      document.documentElement.dataset.theme = t;
+      // 体色要**按当前主题重新取**：半透明的 select 背景要合成到当前主题的页面底色上，
+      // 沿用上一个主题的体色会把浅色算成「深字压深底」（第一版就是这么误报 1.1:1 的）。
+      var pageBg = getComputedStyle(document.body).backgroundColor;
+      var s = document.getElementById('trackSort');
+      if (!s) { out[t] = 'no-select'; return; }
+      var sc = getComputedStyle(s);
+      var o = s.options[2] || s.options[0];
+      var oc = getComputedStyle(o);
+      var effBg = composite(sc.backgroundColor, pageBg);
+      out[t] = {
+        selectRatio: ratio(sc.color, effBg),
+        optionRatio: ratio(oc.color, oc.backgroundColor),
+        optionBgOpaque: parse(oc.backgroundColor) ? parse(oc.backgroundColor).a === 1 : false,
+        optionBg: oc.backgroundColor,
+        selectColor: sc.color
+      };
+    });
+    return out;
+  })()`);
+  await evalJs("document.documentElement.dataset.theme='" + themeBefore + "'");
+  const selThemes = ['dark', 'light', 'blue'];
+  const selBad = selThemes.filter(function(t){
+    var x = selContrast && selContrast[t];
+    return !x || x === 'no-select' || !(x.optionBgOpaque && x.optionRatio >= 4.5 && x.selectRatio >= 4.5);
+  });
+  ck(selBad.length === 0, '三主题下「默认排序」下拉本体与菜单对比度均 ≥ 4.5:1', JSON.stringify(selContrast));
+
+  // ---- 261023-04 #1：底栏几何（1600 与 1024 两档）----
+  // 判据（用户原话）：控制组水平居中（与底栏中心偏差 < 8px）；歌词/信号链/音量任何宽度都可见。
+  const barGeomExpr = `(function(){
+    function vis(id){var e=document.getElementById(id);if(!e)return false;var r=e.getBoundingClientRect();var cs=getComputedStyle(e);return !!(r.width&&r.height)&&cs.display!=='none'&&cs.visibility!=='hidden'&&cs.opacity!=='0';}
+    var bar=document.querySelector('.bar'), keys=document.querySelector('.bar .keys');
+    if(!bar||!keys)return null;
+    var br=bar.getBoundingClientRect(), kr=keys.getBoundingClientRect();
+    return { offset:+Math.abs((kr.left+kr.width/2)-(br.left+br.width/2)).toFixed(1),
+             lyric:vis('bLyric'), chain:vis('bChain'), vol:vis('vol') };
+  })()`;
+  const bg1 = await evalJs(barGeomExpr);
+  await send('Emulation.setDeviceMetricsOverride', { width: 1024, height: 640, deviceScaleFactor: 1, mobile: false });
+  await sleep(500);
+  const bg2 = await evalJs(barGeomExpr);
+  await send('Emulation.clearDeviceMetricsOverride');
+  await sleep(300);
+  ck(bg1 && bg1.offset < 8 && bg1.lyric && bg1.chain && bg1.vol,
+     '宽屏底栏控制组水平居中（偏差 < 8px）且歌词/信号链/音量可见', JSON.stringify(bg1));
+  ck(bg2 && bg2.offset < 8 && bg2.lyric && bg2.chain && bg2.vol,
+     '1024 宽底栏控制组仍水平居中，五键 + 播放链（歌词/信号链/音量）仍可见', JSON.stringify(bg2));
+
 
   // 设计契约：UI 永不出现外部页面 —— 全页面不允许有任何 http(s) 外链锚点
   ck(await evalJs("document.querySelectorAll('a[href^=http]').length === 0"), '全页面无 http 外链（永不跳转外部页面）');
