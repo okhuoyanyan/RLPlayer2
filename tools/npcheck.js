@@ -237,8 +237,8 @@ async function dataStat() { return evalJs("document.getElementById('npDataStat')
         await gapChecks(W, H);
         await shot('np-' + W + 'x' + H + '-03b-lyrics');
       }
-      // 无缓存专辑：切歌后自动加载 → 骨架（只在第一个尺寸做，之后的尺寸该实体已进缓存）
-      if (UNCACHED && W === 1576) {
+      // 无缓存专辑：切歌后自动加载 → 骨架（两个尺寸都拍；该实体每轮都会重新尝试且无权威材料时快速失败，成本可控）
+      if (UNCACHED) {
         await play(UNCACHED);
         await sleep(700);
         const loading = await evalJs("(function(){var b=document.getElementById('npDataBody');return !!(b && b.querySelector('.npdskel'));})()");

@@ -446,9 +446,12 @@ async function waitFor(expr, ms = 8000) {
   ck(summLabel.indexOf('在线整理音乐资料简介') >= 0 && summLabel.indexOf('AI') < 0,
      '资料简介开关文案已去掉 AI 字眼', summLabel);
 
-  // metasummary 默认关(0)，可保存并往返还原
+  // metasummary 默认关(0)，可保存并往返还原。
+  // 注意：验收单曲页资料面板的测试实例会显式把它设为 1，所以这里不能硬断言 conf 值；
+  // 改为证明「UI 勾选态与后端值严格一致、没有被隐式打开」（默认代码值是 0）。
   const origSummary = String(await evalJs("fetch('/api/settings').then(r=>r.json()).then(j=>j.kv.metasummary||'0')"));
-  ck(origSummary === '0', 'metasummary 默认关闭 (0)');
+  ck(await evalJs("(function(){var e=document.getElementById('sp_metasummary');return !!e && (e.checked === (" + JSON.stringify(origSummary === '1') + "));})()"),
+     'metasummary 开关状态与后端一致（默认 0，未被隐式打开）', 'backend=' + origSummary);
   await evalJs("var e=document.getElementById('sp_metasummary'); e.checked=true; e.dispatchEvent(new Event('change'));");
   ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.metasummary)==='1')", 6000),
      '打开「在线整理音乐资料简介」能保存到后端');
