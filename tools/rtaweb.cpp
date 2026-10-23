@@ -4578,6 +4578,21 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             return R"({"ok":false,"error":"不支持的采集模式: )" + jesc(mode) + R"EOF( (仅支持 record/monitor/null)"})EOF";
         }
 
+        // 2026-10-23 真机踩到：传 device=Widget+B（少个 v）被静默忽略 → 回落到默认端点，
+        // 用户会以为"指定了设备却没生效"。这里对已知集合之外的键直接报错，别让它悄悄变默认。
+        {
+            static const char* kKnown[] = { "mode", "src", "dev", "loopback", "seconds", "out", "inject", "inbuf", "monitor" };
+            for (const auto& kv : params) {
+                bool known = false;
+                for (const char* k : kKnown) if (kv.first == k) { known = true; break; }
+                if (known) continue;
+                // 允许 UI 附带的无害键（面板回传），但不允许"看起来像设备名"的键被忽略
+                if (kv.first == "device" || kv.first == "deviceId" || kv.first == "devid") {
+                    return R"({"ok":false,"error":"参数名应为 dev（不是 )" + jesc(kv.first) +
+                           R"()；收到但未生效会静默回落默认设备，已拒绝以免误导"})";
+                }
+            }
+        }
         std::string dev = params.count("dev") ? params["dev"] : "";
         bool loopback = (params.count("loopback") && (params["loopback"] == "1" || params["loopback"] == "true"));
         double seconds = params.count("seconds") ? std::strtod(params["seconds"].c_str(), nullptr) : 0.0;
