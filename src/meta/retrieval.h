@@ -920,7 +920,6 @@ inline KnowledgeMaterial retrieval_fetch_discogs_release(const std::string& name
     }
 
     const int64_t relId = (detailOk && det.id > 0) ? det.id : top.id;
-    m.id = "discogs-release:" + std::to_string(relId);
     m.source = "discogs";
     m.title = detailOk && !det.title.empty() ? det.title : (!top.title.empty() ? top.title : name);
     if (detailOk && !det.url.empty()) {

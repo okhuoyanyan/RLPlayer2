@@ -3692,11 +3692,11 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             }
         }
         j << "}}"
-          << ","summaryAvailable":" << (summaryAvailable ? "true" : "false")
-          << ","summaryCached":" << (summaryCached ? "true" : "false")
-          << ","summaryKind":"" << jesc(summaryKind) << """
-          << ","summaryTarget":"" << jesc(summaryTarget) << """
-          << ","hasLlmKey":" << (hasKeyMeta ? "true" : "false")
+          << ",\"summaryAvailable\":" << (summaryAvailable ? "true" : "false")
+          << ",\"summaryCached\":" << (summaryCached ? "true" : "false")
+          << ",\"summaryKind\":\"" << jesc(summaryKind) << "\""
+          << ",\"summaryTarget\":\"" << jesc(summaryTarget) << "\""
+          << ",\"hasLlmKey\":" << (hasKeyMeta ? "true" : "false")
           << "}";
         return j.str();
     }
