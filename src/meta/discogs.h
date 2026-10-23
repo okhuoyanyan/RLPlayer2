@@ -108,6 +108,7 @@ struct DiscogsReleaseDetail {
     std::vector<std::string> genres; // E-5: 大类流派
     std::vector<std::string> styles; // E-5: 细分风格
     long long fetched_at = 0;
+    std::string notes;               // 专辑发行说明与描述
 };
 
 // ---------------------------------------------------------------------------
@@ -786,6 +787,11 @@ inline bool parse_discogs_release_json(const std::string& text,
     }
     if (det_out.url.empty() && det_out.id > 0) {
         det_out.url = "https://www.discogs.com/release/" + std::to_string(det_out.id);
+    }
+
+    // 提取 release notes / 描述
+    if (j.has("notes") && j["notes"].type == rta::net::Json::Str) {
+        det_out.notes = j["notes"].s();
     }
 
     // E-5: genres / styles 提取（支持 genres/genre, styles/style 数组或单串）

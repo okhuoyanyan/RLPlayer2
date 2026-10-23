@@ -244,6 +244,63 @@ function loadAlbums(q, title) {
   }).catch(function (e) { D('list').innerHTML = '<div class=empty>' + esc(e) + '</div>'; });
 }
 
+function renderSummaryContent(summary) {
+  if (!summary || !summary.ok || !summary.sections || !summary.sections.length) return '';
+  var h = '';
+  h += '<div style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:8px">简介</div>';
+  var citMap = {};
+  (summary.citations || []).forEach(function (c, idx) {
+    citMap[c.id] = { idx: idx + 1, c: c };
+  });
+  summary.sections.forEach(function (sec) {
+    h += '<div style="margin-bottom:10px">';
+    if (sec.heading && sec.heading !== '概述' && sec.heading !== '简介') {
+      h += '<div style="font-size:12.5px;font-weight:600;color:var(--txt);margin:6px 0 4px">' + esc(sec.heading) + '</div>';
+    }
+    (sec.paragraphs || []).forEach(function (p) {
+      var sups = '';
+      (p.citations || []).forEach(function (cid) {
+        var found = citMap[cid];
+        if (found) sups += '<sup style="color:var(--mut);font-size:10px;margin-left:2px">[' + found.idx + ']</sup>';
+      });
+      h += '<div style="font-size:12.5px;line-height:1.7;color:var(--txt);margin-bottom:6px">' + esc(p.text) + sups + '</div>';
+    });
+    h += '</div>';
+  });
+  if (summary.citations && summary.citations.length > 0) {
+    h += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">';
+    summary.citations.forEach(function (c, idx) {
+      var label = '[' + (idx + 1) + '] ' + (c.title || c.source || '来源');
+      h += '<button class="btn chip-copy" data-url="' + esc(c.url) + '" title="复制来源链接" style="font-size:11px;padding:2px 8px">' +
+           '<svg width=11 height=11 viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:3px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
+           esc(label) +
+           '</button>';
+    });
+    h += '</div>';
+  }
+  return h;
+}
+
+function bindCopyChips(container) {
+  if (!container) return;
+  Array.prototype.forEach.call(container.querySelectorAll('.chip-copy'), function (btn) {
+    btn.onclick = function (ev) {
+      ev.stopPropagation();
+      var u = btn.dataset.url;
+      if (!u) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(u).then(function () {
+          toast('已复制来源链接');
+        }).catch(function () {
+          toast('已复制来源链接');
+        });
+      } else {
+        toast('已复制来源链接');
+      }
+    };
+  });
+}
+
 function openAlbum(k) {
   S.view = 'album';
   api('/api/lib/album?k=' + encodeURIComponent(k)).then(function (j) {
@@ -262,6 +319,14 @@ function openAlbum(k) {
             '<button class=btn id=aAdd>加入队列</button> ' +
             '<button class=btn id=aShuf>随机播放</button>' +
             '</div></div>';
+
+    if (META.summary == 1) {
+      h += '<div class="sec-card summary-sec" id="albumSummary" style="margin:16px 0 20px">' +
+           '<div style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:8px">简介</div>' +
+           '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>' +
+           '</div>';
+    }
+
     h += '<div style="padding:4px 0 24px">';
     j.tracks.forEach(function (t, i) {
       h += '<div class=trow data-i=' + i + '>' +
@@ -274,6 +339,25 @@ function openAlbum(k) {
     h += '</div>';
     D('list').innerHTML = h;
     head(j.name, j.tracks.length + ' 首', '');
+
+    if (META.summary == 1) {
+      api('/api/entity/summary?kind=release&name=' + encodeURIComponent(j.name) + '&artist=' + encodeURIComponent(j.artist || '') + '&lang=zh')
+        .then(function (s) {
+          var el = D('albumSummary');
+          if (!el) return;
+          if (s && s.ok && s.sections && s.sections.length > 0) {
+            el.innerHTML = renderSummaryContent(s);
+            bindCopyChips(el);
+          } else {
+            el.remove();
+          }
+        })
+        .catch(function () {
+          var el = D('albumSummary');
+          if (el) el.remove();
+        });
+    }
+
     D('aPlay').onclick = function () { playAlbum(j.k, 0); };
     D('aAdd').onclick = function () { enqueueAlbum(j.k); };
     D('aShuf').onclick = function () { playAlbum(j.k, Math.floor(Math.random() * j.tracks.length)); };
@@ -356,13 +440,25 @@ function openArtistProfile(who, refresh) {
   D('list').innerHTML = '<div class=empty style="padding:60px 0">正在获取权威资料…</div>';
 
   var uKnow = '/api/entity/knowledge?kind=person&name=' + encodeURIComponent(who) + (refresh ? '&refresh=1' : '');
-  var uSumm = '/api/entity/summary?kind=person&name=' + encodeURIComponent(who) + '&lang=zh&refresh=0';
+  var uSumm = '/api/entity/summary?kind=person&name=' + encodeURIComponent(who) + '&lang=zh' + (refresh ? '&refresh=1' : '');
 
-  Promise.all([
-    api(uKnow).catch(function (err) { return { ok: false, error: String(err), materials: [] }; }),
-    api(uSumm).catch(function () { return { ok: false }; })
-  ]).then(function (res) {
-    renderArtistProfile(who, res[0], res[1]);
+  api(uKnow).catch(function (err) { return { ok: false, error: String(err), materials: [] }; }).then(function (res) {
+    renderArtistProfile(who, res, null);
+    if (META.summary == 1) {
+      api(uSumm).then(function (s) {
+        var el = D('artistSummary');
+        if (!el) return;
+        if (s && s.ok && s.sections && s.sections.length > 0) {
+          el.innerHTML = renderSummaryContent(s);
+          bindCopyChips(el);
+        } else {
+          el.remove();
+        }
+      }).catch(function () {
+        var el = D('artistSummary');
+        if (el) el.remove();
+      });
+    }
   });
 }
 
@@ -459,66 +555,18 @@ function renderArtistProfile(who, j, summary) {
       h += '</div></div>';
     }
 
-    // 3) AI 综合小节（P3④b 新增）：有缓存展示 sections/citations/徽章；无缓存展示空态卡+生成按钮
-    var hasSummary = summary && summary.ok && summary.sections && summary.sections.length > 0;
-    h += '<div class="sec-card ai-sec" style="margin-bottom:24px">';
-    h += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">';
-    h += '<span style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2)">AI 综合</span>';
-    if (hasSummary) {
-      h += '<span class="badge ai-badge" style="background:var(--hov);color:var(--txt);font-size:11px;font-weight:600">AI 生成</span>';
-      var sumDate = summary.generated_at ? fmtDate(summary.generated_at) : '';
-      h += '<span class=hint style="font-size:11.5px;color:var(--mut2)">' + esc(summary.disclaimer || '仅依据来源材料综合') + (sumDate ? (' · ' + sumDate + ' 取回') : '') + '</span>';
-      h += '<button class="btn" id=bReGenSummary style="margin-left:auto;font-size:12px;padding:3px 10px">重新生成</button>';
-    }
-    h += '</div>';
-
-    if (hasSummary) {
-      var citMap = {};
-      (summary.citations || []).forEach(function (c, idx) {
-        citMap[c.id] = { idx: idx + 1, c: c };
-      });
-
-      summary.sections.forEach(function (sec) {
-        h += '<div style="margin-bottom:14px">';
-        if (sec.heading) {
-          h += '<div style="font-size:13px;font-weight:600;color:var(--txt);margin:10px 0 6px">' + esc(sec.heading) + '</div>';
-        }
-        (sec.paragraphs || []).forEach(function (p) {
-          var sups = '';
-          (p.citations || []).forEach(function (cid) {
-            var found = citMap[cid];
-            if (found) sups += '<sup style="color:var(--mut);font-size:10px;margin-left:2px">[' + found.idx + ']</sup>';
-          });
-          h += '<div style="font-size:13px;line-height:1.75;color:var(--txt);margin-bottom:8px">' + esc(p.text) + sups + '</div>';
-        });
-        h += '</div>';
-      });
-
-      if (summary.citations && summary.citations.length > 0) {
-        h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">';
-        summary.citations.forEach(function (c, idx) {
-          var label = '[' + (idx + 1) + '] ' + (c.title || c.source || '来源');
-          h += '<button class="btn chip-copy" data-url="' + esc(c.url) + '" title="复制引用来源链接">' +
-               '<svg width=12 height=12 viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:4px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
-               esc(label) +
-               '</button>';
-        });
-        h += '</div>';
-      }
-    } else {
-      var isAllowed = (META.summary == 1);
-      var summErrMsg = (summary && summary.error) ? summary.error : '';
-      h += '<div class="card empty-card" style="padding:22px 18px;text-align:center;background:var(--phbg);border:1px solid var(--line);border-radius:10px">';
-      h += '<div style="font-size:13px;color:var(--txt);margin-bottom:10px">' + (summErrMsg ? esc(summErrMsg) : '暂无 AI 综合简介（默认不自动调用以节省成本）') + '</div>';
-      if (isAllowed) {
-        h += '<button class="btn pri" id=bGenSummary>生成 AI 简介</button>';
+    // 3) 简介小节：设置开启时展示低调的「简介」区块
+    if (META.summary == 1) {
+      var hasSummary = summary && summary.ok && summary.sections && summary.sections.length > 0;
+      h += '<div class="sec-card summary-sec" id="artistSummary" style="margin-bottom:24px">';
+      if (hasSummary) {
+        h += renderSummaryContent(summary);
       } else {
-        h += '<button class="btn" id=bGenSummary disabled style="opacity:0.6;cursor:not-allowed" title="请先在设置页开启允许 AI 资料综合">生成 AI 简介</button>';
-        h += '<div class=hint style="margin-top:6px;font-size:11.5px;color:var(--mut2)">未开启 AI 资料综合（可在 设置 → 元数据 中开启「允许 AI 资料综合」）</div>';
+        h += '<div style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:8px">简介</div>' +
+             '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>';
       }
       h += '</div>';
     }
-    h += '</div>';
 
     // 4) 来源：来源徽章、标题、取回日期、「复制链接」芯片（绝不 window.open / <a target=_blank>）
     h += '<div class="sec-card sources-sec" style="margin-bottom:24px">' +
@@ -577,45 +625,8 @@ function renderArtistProfile(who, j, summary) {
     };
   }
 
-  function triggerSummaryGen() {
-    var btn = D('bGenSummary') || D('bReGenSummary');
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = '正在由 DeepSeek 检索与综合…';
-    }
-    api('/api/entity/summary?kind=person&name=' + encodeURIComponent(who) + '&lang=zh&refresh=1')
-      .then(function (newSumm) {
-        if (newSumm && newSumm.ok) {
-          renderArtistProfile(who, j, newSumm);
-        } else {
-          renderArtistProfile(who, j, { ok: false, error: (newSumm && newSumm.error) || '生成失败，请稍后重试' });
-        }
-      })
-      .catch(function (err) {
-        renderArtistProfile(who, j, { ok: false, error: '请求失败: ' + String(err) });
-      });
-  }
-
-  if (D('bGenSummary')) D('bGenSummary').onclick = triggerSummaryGen;
-  if (D('bReGenSummary')) D('bReGenSummary').onclick = triggerSummaryGen;
-
   // 复制链接芯片：navigator.clipboard.writeText(url) + toast「已复制来源链接」
-  Array.prototype.forEach.call(D('list').querySelectorAll('.chip-copy'), function (btn) {
-    btn.onclick = function (ev) {
-      ev.stopPropagation();
-      var u = btn.dataset.url;
-      if (!u) return;
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(u).then(function () {
-          toast('已复制来源链接');
-        }).catch(function () {
-          toast('已复制来源链接');
-        });
-      } else {
-        toast('已复制来源链接');
-      }
-    };
-  });
+  bindCopyChips(D('list'));
 }
 
 /* ---------------- 古典作品与版本推荐（P3④b Discogs L4） ---------------- */
@@ -1000,6 +1011,7 @@ function buildNpMetaHtml(m) {
 function loadMeta(f) {
   if (!f) return;
   api('/api/meta?file=' + encodeURIComponent(f)).then(function (m) {
+    S.curMeta = m;
     if (m.title) D('npt').textContent = m.title;
     else D('npt').textContent = nam(f);
     var sub = [];
@@ -1009,7 +1021,10 @@ function loadMeta(f) {
     D('cv').style.backgroundImage = m.hasCover ? "url('/api/cover?file=" + encodeURIComponent(f) + "')" : '';
     // 补全芯片：存全局，renderNp 统一填进 #npMeta；整页开着就立刻刷一次（meta 是异步回来的）
     S.npMetaHtml = buildNpMetaHtml(m);
-    if (D('npPage') && D('npPage').classList.contains('on')) renderNp();
+    if (D('npPage') && D('npPage').classList.contains('on')) {
+      renderNp();
+      updateNpSummary(m);
+    }
   }).catch(function () { D('npt').textContent = nam(f); });
 }
 
@@ -3516,6 +3531,66 @@ function openNowPlaying() {
   syncVolUi();
 }
 function closeNowPlaying() { var pg = D('npPage'); if (pg) pg.classList.remove('on'); }
+
+function updateNpSummary(m) {
+  var el = D('npSummary');
+  if (!el) return;
+  if (!META.summary || !m) {
+    el.style.display = 'none';
+    el.innerHTML = '';
+    return;
+  }
+  // 没配 DeepSeek Key 且无本地缓存时不留空白区块
+  if (m.summaryAvailable === false && !m.summaryCached) {
+    el.style.display = 'none';
+    el.innerHTML = '';
+    return;
+  }
+  var targetKind = 'release';
+  var targetName = m.album || '';
+  var targetArtist = m.artist || '';
+  if (!targetName && targetArtist) {
+    targetKind = 'person';
+    targetName = targetArtist;
+    targetArtist = '';
+  }
+  if (!targetName) {
+    el.style.display = 'none';
+    el.innerHTML = '';
+    return;
+  }
+
+  var curKey = targetKind + ':' + targetName + ':' + targetArtist;
+  if (el.dataset.targetKey === curKey && el.dataset.loaded === '1') {
+    el.style.display = 'block';
+    return;
+  }
+  el.dataset.targetKey = curKey;
+  el.dataset.loaded = '0';
+  el.style.display = 'block';
+  el.innerHTML = '<div style="font-size:11.5px;font-weight:600;color:var(--mut2);margin-bottom:6px">简介</div>' +
+                 '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>';
+
+  var u = '/api/entity/summary?kind=' + targetKind + '&name=' + encodeURIComponent(targetName) +
+          (targetArtist ? ('&artist=' + encodeURIComponent(targetArtist)) : '') + '&lang=zh';
+  api(u).then(function (s) {
+    if (el.dataset.targetKey !== curKey) return;
+    if (s && s.ok && s.sections && s.sections.length > 0) {
+      el.dataset.loaded = '1';
+      el.innerHTML = renderSummaryContent(s);
+      bindCopyChips(el);
+    } else {
+      el.style.display = 'none';
+      el.innerHTML = '';
+    }
+  }).catch(function () {
+    if (el.dataset.targetKey === curKey) {
+      el.style.display = 'none';
+      el.innerHTML = '';
+    }
+  });
+}
+
 function renderNp() {
   var pg = D('npPage'); if (!pg || !pg.classList.contains('on')) return;
   D('npTitle').textContent = (D('npt') && D('npt').textContent) || '未播放';
@@ -3524,6 +3599,7 @@ function renderNp() {
   D('npSub').textContent = sub + (st ? '  ·  ' + st : '');
   // 元数据补全芯片（loadMeta 异步回来时也会走到这里刷一次）
   if (D('npMeta')) D('npMeta').innerHTML = S.npMetaHtml || '';
+  updateNpSummary(S.curMeta);
   var bg = (D('cv') && D('cv').style.backgroundImage) || '';
   if (bg && bg.indexOf('url(') === 0) {
     D('npbg').style.backgroundImage = bg;

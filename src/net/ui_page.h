@@ -469,7 +469,8 @@ inline std::string rta_ui_page() {
     // npMeta：元数据补全信息芯片容器（year/genre/albumArtist/已补全），由 ui_script 的 renderNp 填充。
     // 只进整页，底栏不加（避免拥挤）；样式只用布局属性，颜色交给 .badge 自身的 CSS 变量。
     h += "<div class=nptit id=npTitle>未播放</div><div class=npsub id=npSub></div>";
-    h += "<div id=npMeta style='display:flex;flex-wrap:wrap;gap:6px;margin-top:8px'></div></div>";
+    h += "<div id=npMeta style='display:flex;flex-wrap:wrap;gap:6px;margin-top:8px'></div>";
+    h += "<div id=npSummary style='display:none;margin-top:14px;max-height:160px;overflow-y:auto;font-size:12px;line-height:1.6;color:var(--txt)'></div></div>";
     h += "<div class=nplyric id=npLyric><div class=npline>还没有在播放</div></div>";
     h += "</div>";
     // 播放控件：整页也要能操作，否则进来就必须退出

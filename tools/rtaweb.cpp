@@ -3632,6 +3632,39 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         metaOverride("year", fYear);
         metaOverride("genre", fGenre);
         metaOverride("lyrics", fLyrics);
+
+        // 简介可用性标志
+        const MetaSettings msMeta = meta_settings_load();
+        const std::string metabaseDir = path_in_exe_dir("rlplayer-meta");
+        bool hasKeyMeta = false;
+        {
+            rta::meta::LlmConfig cfg = rta::meta::llm_config_load();
+            if (cfg.apiKey.empty()) cfg = rta::meta::llm_config_load("build/rlplayer-llm.conf");
+            hasKeyMeta = !cfg.apiKey.empty();
+        }
+        std::string summaryKind = "";
+        std::string summaryTarget = "";
+        std::string summaryEid = "";
+        bool summaryCached = false;
+        if (!fAlbum.empty()) {
+            summaryKind = "release";
+            summaryTarget = fAlbum;
+            summaryEid = (!fArtist.empty())
+                ? rta::meta::entity_make_id("release", rta::meta::entity_norm(fArtist) + "\x1f" + rta::meta::entity_norm(fAlbum))
+                : rta::meta::entity_id(rta::meta::EntityKind::Release, fAlbum);
+        } else if (!fArtist.empty()) {
+            summaryKind = "person";
+            summaryTarget = fArtist;
+            summaryEid = rta::meta::entity_id(rta::meta::EntityKind::Person, fArtist);
+        }
+        if (!summaryEid.empty()) {
+            rta::meta::SummaryResult srCached;
+            std::string cErr;
+            if (rta::meta::summary_load_cache(metabaseDir, summaryEid, "zh", srCached, &cErr) && srCached.ok && !rta::meta::summary_is_expired(srCached)) {
+                summaryCached = true;
+            }
+        }
+        const bool summaryAvailable = msMeta.summary && (summaryCached || hasKeyMeta);
         std::ostringstream j;
         j << "{\"ok\":true"
           << ",\"title\":\"" << jesc(fTitle) << "\""
@@ -3659,6 +3692,11 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             }
         }
         j << "}}"
+          << ","summaryAvailable":" << (summaryAvailable ? "true" : "false")
+          << ","summaryCached":" << (summaryCached ? "true" : "false")
+          << ","summaryKind":"" << jesc(summaryKind) << """
+          << ","summaryTarget":"" << jesc(summaryTarget) << """
+          << ","hasLlmKey":" << (hasKeyMeta ? "true" : "false")
           << "}";
         return j.str();
     }
@@ -3805,11 +3843,12 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         return j.str();
     }
 
-    // ---------------- 资料层(P3③ AI 检索综合): GET /api/entity/summary ----------------
+    // ---------------- 资料层(P3③ 检索综合): GET /api/entity/summary ----------------
     if (rq.path.rfind("/api/entity/summary", 0) == 0) {
         ct = "application/json; charset=utf-8";
         std::string kindStr = "person";
         std::string name;
+        std::string artist;
         std::string lang = "zh";
         bool refresh = false;
 
@@ -3824,6 +3863,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                 const std::string v = urlDecode(tok.substr(eq + 1));
                 if (k == "kind") kindStr = v;
                 else if (k == "name") name = v;
+                else if (k == "artist") artist = v;
                 else if (k == "refresh") refresh = (v == "1" || v == "true");
                 else if (k == "lang") lang = v;
             }
@@ -3831,6 +3871,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         if (name.empty()) {
             return "{\"ok\":false,\"error\":\"未指定实体名称\"}";
         }
+        if (kindStr == "album") kindStr = "release";
         rta::meta::EntityKind ek = rta::meta::EntityKind::Person;
         if (!rta::meta::entity_kind_from_tag(kindStr, ek)) {
             return "{\"ok\":false,\"error\":\"未知实体类型: " + jesc(kindStr) + "\"}";
@@ -3838,33 +3879,38 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
 
         const MetaSettings ms = meta_settings_load();
         const std::string metabaseDir = path_in_exe_dir("rlplayer-meta");
-        const std::string eid = rta::meta::entity_id(ek, name);
 
-        // 成本策略：默认不自动生成
-        // 1. 若未请求 refresh：优先检查未过期/离线缓存；若无缓存则如实返回 ok:false，绝不静默调 LLM
+        // 统一实体 ID：针对 Release 若带 artist 则纳入归一键，与 retrieval_fetch 保持完全一致
+        const std::string eid = (!artist.empty() && ek == rta::meta::EntityKind::Release)
+            ? rta::meta::entity_make_id("release", rta::meta::entity_norm(artist) + "\x1f" + rta::meta::entity_norm(name))
+            : rta::meta::entity_id(ek, name);
+
+        // 1. 若未开启 metasummary 设置：拒绝调用（设置关闭时不请求、不显示该区块）
+        if (!ms.summary) {
+            return "{\"ok\":false,\"error\":\"未开启资料简介\",\"from_cache\":false,\"offline\":false}";
+        }
+
+        // 2. 自动生成与缓存策略：已生成过的读缓存（TTL 7天）
         if (!refresh) {
             rta::meta::SummaryResult cached;
             std::string cache_err;
-            if (rta::meta::summary_load_cache(metabaseDir, eid, lang, cached, &cache_err) && cached.ok) {
+            if (rta::meta::summary_load_cache(metabaseDir, eid, lang, cached, &cache_err) && cached.ok && !rta::meta::summary_is_expired(cached)) {
                 cached.from_cache = true;
                 return rta::meta::summary_to_json(cached);
             }
-            return "{\"ok\":false,\"error\":\"未生成 AI 简介（请点击「生成 AI 简介」）\",\"from_cache\":false,\"offline\":false}";
         }
 
-        // 2. 显式请求 refresh=1：必须检查设置开关 metasummary
-        if (!ms.summary) {
-            return "{\"ok\":false,\"error\":\"未开启 AI 资料综合（请在设置-元数据页开启）\",\"from_cache\":false,\"offline\":false}";
-        }
-
+        // 3. 无未过期缓存或显式请求 refresh：自动调用 LLM 综合检索并写入缓存
         rta::meta::RetrievalOptions ropts;
         ropts.metabase = metabaseDir;
-        ropts.refresh = true;
+        ropts.artist = artist;
+        ropts.entity_id = eid;
+        ropts.refresh = refresh;
         ropts.timeout_ms = 25000;
 
         const rta::meta::SummaryResult sr = rta::meta::retrieval_fetch(ek, name, lang, ropts);
         if (!sr.ok) {
-            return "{\"ok\":false,\"error\":\"" + jesc(sr.error.empty() ? "AI 检索综合失败" : sr.error) + "\"}";
+            return "{\"ok\":false,\"error\":\"" + jesc(sr.error.empty() ? "资料整理失败" : sr.error) + "\"}";
         }
         return rta::meta::summary_to_json(sr);
     }
@@ -5287,7 +5333,16 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
           // 2026-10-23（用户 261023-02 #1）：status 也带上 bit-perfect 结论，
           // 让底栏徽标不用额外请求 /api/signal 就能显示（轮询已经是 400ms 一次）。
           << ",\"bitPerfect\":\"" << jesc(ps.bpState) << "\""
-          << ",\"bitPerfectWhy\":\"" << jesc(ps.bpWhy) << "\""
+          << ",\"bitPerfectWhy\":\"" << jesc(ps.bpWhy) << "\"";
+        const MetaSettings msStat = meta_settings_load();
+        bool hasKeyStat = false;
+        {
+            rta::meta::LlmConfig cfg = rta::meta::llm_config_load();
+            if (cfg.apiKey.empty()) cfg = rta::meta::llm_config_load("build/rlplayer-llm.conf");
+            hasKeyStat = !cfg.apiKey.empty();
+        }
+        j << ",\"hasLlmKey\":" << (hasKeyStat ? "true" : "false")
+          << ",\"summaryEnabled\":" << (msStat.summary ? "true" : "false")
           << "}";
         return j.str();
     }
