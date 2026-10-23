@@ -1,9 +1,11 @@
 # RLPlayer 交接说明
 
-> **当前状态(2026-10-23 第二十五轮后)**:ROADMAP **P1/P2/P4/P5/P6(性能) 全部落地并合入 main**;
+> **当前状态(2026-10-23 第二十六轮后)**:ROADMAP **P1/P2/P4/P5/P6(性能) 全部落地并合入 main**;**协作者 PR #1(CUDA 后端 + 输出链路/DPI)已选择性集成**;
 > 之前完成的 ROON/元数据 P3 资料层 ②③④、耳机 EQ(OPRA)、基建三项(WebView2 双轨/精简 ffmpeg/裁 Locales)都在 main;
-> 源码树 ctest **58/58**、本机 verify **11/11(Fail 0)**、平台边界 PASS、uicheck 全过。
-> **剩余都是外部/真机条件**:P3(NAA) 受 EULA 授权阻塞;UPnP 投放需真实渲染器;输入/资料层需真机复测;P4/P6 已完成实现。
+> 源码树 ctest **58/58**、本机 verify **11/11(Fail 0)**、平台边界/兼容门禁 PASS、uicheck 全过。
+> **CUDA 说明**:源码/构建脚本/UI/加载路径已就绪,`rtagpu_cuda.dll` 需 NVIDIA 机器 + CUDA 12.x 跑 `tools/build_gpu_cuda.ps1` 构建;
+> 本机(AMD)无 CUDA 工具链,包内不含该 DLL(兼容门禁标 OPTIONAL),缺失时安静回退 AMD/CPU。
+> **剩余都是外部/真机条件**:P3(NAA) 受 EULA 授权阻塞;UPnP 投放需真实渲染器;输入/资料层/CUDA 上机需真机复测。
 > **verify 必须在机器空闲时串行跑**——并行重型构建(出包/全量编译)会让 UI 自检与个别 ctest 出假红(已二次踩到)。
 > **1.1.1 已发布**(P6a 扫描并行 3.18× / P5b 投放 UI / L4 演绎去重 / 已知问题修复):`dist\RLPlayer-1.1.1-win64.zip`,**370.47 MB**,
 > sha256 `3B72561242E4958DC7C0D52A9FB464048E14A2DC33DEF3358E5DEF46FA97BE3C`(GitHub Release v1.1.1);
@@ -13,7 +15,12 @@
 > (全景状态/代码地图/未解决项/工作方法/队列——新会话先读它),历史回合见 STATUS.md 第十三~**二十二**轮。
 > 以下为第十二轮及更早的通用交接内容,架构与坑清单仍然有效。
 >
-> **最近七轮的关键状态变化(接手必读)**:
+> **最近八轮的关键状态变化(接手必读)**:
+> - **第二十六轮(合并协作者 PR #1)**:`feat/cuda-backend`(garaxc)选择性集成——**CUDA 后端源码**(gpu_conv_cuda.cu/gpu_resample_cuda.cu)+
+>   `tools/build_gpu_cuda.ps1`(19 档 fatbin + cuobjdump/dumpbin 双校验)+ 140MB 精简 CUDA 工具链脚本;WASAPI 独占三坑(32 容器/24 有效、
+>   NOT_ALIGNED 重试需重新 Activate、首写 pad==bufferFrames)、共享 −48dB 位深归一化、ASIO preflight 选卡、`fpeak` 遥测、
+>   **高 DPI(PerMonitorV2)**、wasapi_ex_probe/pcm_dump/gpubench 工具;拒绝旧 WebView2Loader 二进制与旧 test_pipeline。
+>   ⚠️ CUDA DLL 未构建(本机无 NVIDIA);`check_compat` 里 CUDA 是 OPTIONAL;**别把「CUDA 不可用」当 bug**。
 > - **第二十五轮(P6 性能 + 投放 UI + L4 演绎 + 已知问题)**:**P6a 库扫描并行化**(固定线程池/背压/结果逐字节一致;653 首 30.16s→9.47s **3.18×**)+
 >   信号链耗时统计;**P5b 投放设置页**(`cast_service.h` + `/api/cast/*` + 「投放（UPnP）」面板);**L4 演绎身份**
 >   (Discogs release 详情 → 指挥/乐团/独奏 + 按 `dedupKey` 去重,`complete=distinct>=5`;Boléro 11/Beethoven 10/Mahler 10);

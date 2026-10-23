@@ -2,6 +2,58 @@
 
 > **接手请先读**：[HANDOVER.md](HANDOVER.md)（架构/构建/已知坑）→ [ROADMAP.md](ROADMAP.md)（待开发与判据）。
 > 本文件按回合记录“做过什么、实测多少”，越往下越旧。
+# 第二十六轮:合并协作者 PR #1——NVIDIA CUDA 后端 + 输出链路三坑/DPI 修复(2026-10-23)
+
+> 用户指令:协作者(garaxc)凌晨在 GitHub 提交了 NVIDIA CUDA 兼容,**合并进主项目,完成后发包**。
+> 本轮结果:PR #1 以**选择性集成**方式合并(main 之后又走了十几轮,不能盲合),保留 main 全部新功能;
+> CUDA 源码/构建脚本/诊断工具/高 DPI/WASAPI 输出链路修复全部进入 main;CUDA 缺失时安静回退 CPU。
+
+## 1. PR #1 概况(garaxc,分支 feat/cuda-backend,c3de461)
+
+- 基线是**旧 commit f445284**(1.0.8 刚发布时),之后 main 已走过第二十一~二十五轮,所以与 main 重叠巨大;
+- 内容:①**CUDA 后端**(gpu_conv_cuda.cu / gpu_resample_cuda.cu 与 HIP 版逐行对应互校;build_gpu_cuda.ps1 19 档 fatbin + cuobjdump/dumpbin 双校验;fetch_cuda_redist.js 140MB 精简工具链);
+  ②**WASAPI 输出链路三坑**(独占格式需 32 位容器+24 位有效、BUFFER_SIZE_NOT_ALIGNED 重试必须 Release 后重新 Activate、首写 pad==bufferFrames 假死锁);
+  ③**共享电平 −48.16 dB**(位深归一化 bug);④ASIO 空 device 时按 preflight 选卡;⑤**高 DPI**(PerMonitorV2→PerMonitor→System + WM_DPICHANGED);
+  ⑥诊断工具(wasapi_ex_probe 静音格式探针、pcm_dump 跨后端 PCM 取证、gpubench_conv)与 CUDA 纪要文档。
+
+## 2. 集成方式(47f6c16 → main 4cb471b)
+
+- 用 `git merge --no-ff` 保留 PR 作者署名;逐文件对比「PR 基于 f445284 的改动」与「main 自 f445284 以来的改动」,**只补 main 缺的,不复旧**;
+- 采纳(新增):CUDA 两个 .cu、build_gpu_cuda.ps1、fetch_cuda_redist.js、gpubench_conv.cpp、wasapi_ex_probe.cpp、pcm_dump.h、docs/GPU-CUDA后端纪要.md、docs/DBX跨平台与精简架构纪要.md、docs/P1-WASAPI-实测纪要.md 增章;
+- 改写合入:`wasapi_out.h`(32 容器/24 有效、DevRel RAII 支持对齐重试、首写 pad 修复、多配方重试、pcm_dump;**保留** main 的 ZeroAttrib 归因/RENDERFAIL/STARVING/channel_mask)、
+  `wasapi_shared.h`(s32_to_f32_bits 位深归一化 + out_peak;保留 write_available_f32)、`asio_out.h`(pcm_dump)、`render_loop.h`(fpeak 遥测,兼容现有 w0/wr/zp/zs/zr/RENDERFAIL)、
+  `launcher.cpp`(高 DPI 三级动态取址 + WM_DPICHANGED + 初始尺寸/边带 dp();**完整保留** WebView2 双轨/边带/托盘)、
+  `ui_script.h`(GPU 后端下拉 NVIDIA(CUDA) + 状态;**保留**全部现有设置项)、`rtaweb.cpp`(ASIO preflight 选卡、独占 20ms 封顶、共享 reqBits 透传、fpeak、/api/gpu cuda 状态;保留全部端点)、
+  `gpu_pref.h`(nvidia/cuda 偏好 + CUDA DLL 候选)、`check_compat.ps1`(工具链灵活定位;rtagpu_cuda.dll 为 **OPTIONAL**,缺失输出「CUDA 后端可选,本包未含」退出 0;去掉强制旧 loader 规则)、
+  `AGENTS.md`(铁律 5 增 CUDA 侧对应:PTX JIT 假象/sticky error/必须 12.x)、`README.md`(GPU 矩阵补 NVIDIA 行)、`.gitignore`(CUDA 产物)、CMakeLists(/-utf8 等);
+- **拒绝/保留 main**:`third_party/webview2/x64/WebView2Loader.dll`(PR 137,112 B 旧版 vs main 官方 165,968 B/1.0.2903.40)、STATUS.md/ROADMAP.md(PR 旧轮次记录,内容已进 docs/GPU-CUDA后端纪要.md)、verify.ps1(保留 main 11 项)、tests/test_pipeline.cpp(PR 版引用已删除的 dsp/shaper.h,保留 main 频域判据版)。
+
+## 3. 验证
+
+- 合并后:build 0 error、ctest **58/58**、平台边界 PASS(exit 0)、check_compat PASS(FAIL 0,CUDA 标 OPTIONAL)、uicheck 全过、本机 verify **11/11(Fail 0)**;
+- **CUDA 缺失回退实测**:无 rtagpu_cuda.dll 时 `test_gpu_bridge` 输出「未找到可执行的 GPU 后端(rtagpu.dll / rtagpu_dx12.dll / rtagpu_cuda.dll),使用 CPU 卷积」并 exit 0;`/api/gpu` 上报 `cuda:false` 不崩;AMD HIP 路径不受影响;
+- 功能标记回归(逐个 grep 确认保留):metasummary / cast / input / entity knowledge+versions / streamdecode / dsd2stage / scanThreads / RLPLAYER_WEBVIEW2_MODE / STARVING / RENDERFAIL / decide_capability_failure / PLAY_ABORT / opra_index / 三个新 CLI。
+
+## 4. ⚠️ 未解决项(铁律 4)
+
+1. **本机无 NVIDIA 显卡与 CUDA Toolkit → rtagpu_cuda.dll 未构建、未上机验证**。需在 NVIDIA 机器上跑
+   `powershell -File tools/build_gpu_cuda.ps1`(19 档 fatbin,双校验)后再实测;因此 **1.3.0 包内不含 rtagpu_cuda.dll**,
+   包内 UI 会如实显示 CUDA 不可用并回退 AMD/CPU(README/兼容门禁都标注为可选)。
+2. 协作者自述未完成项一并保留:跨后端 PCM 比对只落了 ASIO 一份(独占当时写不进去);共享路径 STARVING 未单独归因。
+3. 输出链路修复在协作者机器上验证过(ASIO/WASAPI 独占均出声);**本机因用户正在使用 8899 实例,未做设备级独占复测**,仅代码审查+编译+回退测试。
+
+## 5. 1.3.0 正式包(本轮交付物,2026-10-23)
+
+- 产物:`dist\RLPlayer-1.3.0-win64.zip` = **388,744,332 字节(370.74 MB)**,sha256 `CD4A6A0D591366A9254839ECD47A0473D61B13D04C3F4B87D4EDCA20F35CDBC9`;
+- 包内验证(端口 8910,未起 GUI、未碰 8899):`GET /api/ping` → `{"ok":true,"app":"RLPlayer","version":"1.3.0"}`;
+  `GET /api/gpu` → `{"amd":true,"cuda":false,"hip":true,"available":true,"status":"GPU 卷积可用（rtagpu.dll）"}`(CUDA 缺失回退正常);
+  `/api/input/devices`、`/api/cast/state`、`/api/opra/index` 全 200;
+- 包内 **17 个 tools** 齐全,新增 `wasapi_ex_probe.exe` / `gpubench_conv.exe`;data/opra_index.json + OPRA-NOTICE.txt 在包内;
+- **`rtagpu_cuda.dll` 未入包(预期)**:本机无 NVIDIA 显卡/CUDA 12.x 工具链;兼容门禁标 OPTIONAL;需在 NVIDIA 机器跑 `tools/build_gpu_cuda.ps1` 后另行验证/分发;
+- 审计:Locales 2 pak、ffmpeg/ffprobe 12.18/11.97MB、无 conf/log/profile/sk-、测试残留已清;
+- CI 两个 workflow 对 4cb471b(集成提交)全绿;GitHub Release **v1.3.0** 已建(附件 digest 与本地一致);PR #1 已按「选择性集成」关闭并注明集成 commit。
+
+
 # 第二十五轮:P6a 库扫描并行化 / P5b 投放 UI / L4 演绎去重 / 已知问题清理(2026-10-23)
 
 > 用户指令:无人值守连续开发。Lead 只核验/派单,编码全派 Gemini 3.8 Flash(high)子代理,并行独立 worktree。
