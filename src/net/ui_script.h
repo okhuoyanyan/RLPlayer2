@@ -24,7 +24,9 @@ var ADV = {
   modcut: 0, moddith: -1, ir: '', irgpu: 0, ramp: 0, theme: 'dark',
   eq: '', modorder: 5, modfamily: 'dsd', gpuvendor: 'auto', directsdm: 0, dsdKind: 'fir', dsdConv: 'narrow',
   // 输出后端与多声道
-  backend: 'wasapi', channels: 0, naaHost: '127.0.0.1:43210',
+  // 261024-01 #9/#11：upnpDev = UPnP/DLNA 渲染器（设备描述 URL）；naaHost 自动发现填，
+  // 手动框只是折叠兜底（用户原话：NAA 端点这个选项不应该出现，应该自动获取）。
+  backend: 'wasapi', channels: 0, naaHost: '127.0.0.1:43210', upnpDev: '',
   trim0: 0, trim1: 0, trim2: 0, trim3: 0, trim4: 0, trim5: 0, trim6: 0, trim7: 0,
   // 输入
   inBackend: 'none', inDev: '', inOffset: 0, inBuf: 100, inMonitor: 0, inSeconds: 0, inOut: '',
@@ -124,6 +126,7 @@ function params() {
          '&backend=' + encodeURIComponent(ADV.backend || 'wasapi') +
          '&channels=' + (ADV.channels || 0) +
          '&naahost=' + encodeURIComponent(ADV.naaHost || '') +
+         '&upnpdev=' + encodeURIComponent(ADV.upnpDev || '') +
          '&trim=' + [0, 1, 2, 3, 4, 5, 6, 7].map(function (i) { return ADV['trim' + i] || 0; }).join(',') +
          '&sdmfilt=' + encodeURIComponent(ADV.sdmFilt || '') +
          '&sdmfiltnx=' + encodeURIComponent(ADV.sdmFiltNx || '') +
@@ -1376,6 +1379,7 @@ function saveSettings(immediate) {
         + '&backend=' + encodeURIComponent(ADV.backend || 'wasapi')
         + '&channels=' + (ADV.channels || 0)
         + '&naahost=' + encodeURIComponent(ADV.naaHost || '')
+        + '&upnpdev=' + encodeURIComponent(ADV.upnpDev || '')
         + '&trim=' + [0, 1, 2, 3, 4, 5, 6, 7].map(function (i) { return ADV['trim' + i] || 0; }).join(',')
         + '&inbackend=' + encodeURIComponent(ADV.inBackend || 'none')
         + '&indev=' + encodeURIComponent(ADV.inDev || '')
@@ -1446,6 +1450,7 @@ function loadSettings() {
     if (kv.backend !== undefined) ADV.backend = kv.backend || 'wasapi';
     if (kv.channels !== undefined) ADV.channels = parseInt(kv.channels, 10) || 0;
     if (kv.naahost !== undefined) ADV.naaHost = kv.naahost || '127.0.0.1:43210';
+    if (kv.upnpdev !== undefined) ADV.upnpDev = kv.upnpdev || '';
     if (kv.trim !== undefined) {
       var tv = String(kv.trim).split(',');
       for (var ti = 0; ti < 8; ti++) ADV['trim' + ti] = parseFloat(tv[ti]) || 0;
@@ -2215,8 +2220,22 @@ function backendHint() {
   } else if (bk === 'null') {
     m.textContent = 'Null output：照常跑完整 DSP，数据直接丢弃、不出声，用于离线验证与频谱分析。';
   } else if (bk === 'naa') {
-    m.textContent = 'NAA：把 PCM 按 RTANet 协议推到端点 ' +
-      (((D('sp_naahost') && D('sp_naahost').value) || '')) + '（端点机需运行 rtanet_rx）。';
+    // 261024-01 #11：端点来自自动发现，手动框只是折叠兜底。
+    // 注意：自动发现没找到时**不能**回落到手动框里的历史默认值（127.0.0.1:43210），
+    // 那会让界面宣称"推到 127.0.0.1"而其实根本没发现端点（本轮截图自检抓到）。
+    var epSel = D('sp_naa_dev');
+    var ep = (epSel && epSel.value) || '';
+    // 未发现时的原因已经写在黄色结论行（sp_naa_msg）里，这里不再重复，避免同一屏两遍同样的话。
+    m.textContent = 'NAA：把 PCM 按 RTANet 协议推到 ' + (ep || '端点（尚未发现）') + '（端点机需运行 rtanet_rx）。';
+  } else if (bk === 'upnp') {
+    // 261024-01 #9：后端下拉新增「UPnP / DLNA 投放」。提示用渲染器**名字**，不回显整条描述 URL。
+    var devSel = D('sp_upnp_dev');
+    var devName = '';
+    if (devSel && devSel.selectedIndex >= 0 && devSel.value) {
+      devName = devSel.options[devSel.selectedIndex].textContent || '';
+    }
+    m.textContent = 'UPnP / DLNA 投放：播放 / 切歌 / 暂停 / 拖动进度都会作用到渲染器 ' +
+      (devName || '（未选择渲染器）') + '。按源文件原采样率供源，不经本机 DSP。';
   } else if (bk === 'asio') {
     if (ASIO_DRIVERS === null) m.textContent = 'ASIO：正在检测本机驱动…';
     else if (!ASIO_DRIVERS.length) m.textContent = 'ASIO：本机未检测到 ASIO 驱动。';
@@ -2539,35 +2558,163 @@ function pollCastState() {
   });
 }
 
+// 261024-01 #9：两个渲染器下拉（「输出后端」里的 sp_upnp_dev 与「投放」区块里的
+// sp_cast_dev）共用同一份发现结果与同一个选择。value 一律用设备描述 URL ——
+// 直连描述比按名字匹配可靠（本机 SSDP 被拦时 CastManager 仍可用 http://IP:PORT/ 直连）。
+function castDevLabel(d) {
+  return (d.friendlyName || d.name || d.host || '') + (d.model ? (' · ' + d.model) : '');
+}
+function castDevValue(d) {
+  return d.location || d.friendlyName || d.name || d.host || '';
+}
+function populateCastDevices() {
+  var opts = '';
+  _castDevices.forEach(function (d) {
+    opts += '<option value="' + esc(castDevValue(d)) + '">' + esc(castDevLabel(d)) + '</option>';
+  });
+  if (!opts) opts = '<option value="">（未发现 UPnP 渲染器）</option>';
+  // 已保存的渲染器若这次没扫到（设备关机 / 换网段）也保留一项，别让用户的选择悄悄丢
+  var saved = (ADV.upnpDev || '').trim();
+  var haveSaved = false;
+  if (saved) {
+    for (var i = 0; i < _castDevices.length; i++) {
+      if (castDevValue(_castDevices[i]) === saved) { haveSaved = true; break; }
+    }
+    if (!haveSaved) opts += '<option value="' + esc(saved) + '">（上次选择）' + esc(saved) + '</option>';
+  }
+  ['sp_cast_dev', 'sp_upnp_dev'].forEach(function (id) {
+    var s = D(id);
+    if (!s) return;
+    s.innerHTML = opts;
+    var want = saved;
+    if (!want && _castDevices.length) want = castDevValue(_castDevices[0]);
+    if (!want) return;
+    for (var k = 0; k < s.options.length; k++) {
+      if (s.options[k].value === want) { s.value = want; break; }
+    }
+  });
+  // 第一次发现有设备时自动选中并写回设置（用户不用手填设备地址）
+  if (!saved && _castDevices.length) syncUpnpDev(castDevValue(_castDevices[0]));
+  backendHint();   // 下拉刚填好，后端提示里的渲染器名字要跟着刷新（否则会显示"未选择渲染器"）
+}
+function syncUpnpDev(value) {
+  ADV.upnpDev = value || '';
+  if (D('sp_cast_dev') && D('sp_cast_dev').value !== value) D('sp_cast_dev').value = value;
+  if (D('sp_upnp_dev') && D('sp_upnp_dev').value !== value) D('sp_upnp_dev').value = value;
+  saveSettings();
+}
 function scanCastDevices(force) {
-  var s = D('sp_cast_dev');
   var msg = D('sp_cast_devmsg');
-  var btn = D('sp_cast_scan');
-  if (btn) btn.disabled = true;
+  var msg2 = D('sp_upnp_msg');
+  var btns = [D('sp_cast_scan'), D('sp_upnp_scan')];
+  btns.forEach(function (b) { if (b) b.disabled = true; });
   if (msg) msg.textContent = '正在发现渲染器…';
+  if (msg2) msg2.textContent = '正在发现渲染器…';
 
   var url = '/api/cast/devices' + (force ? '?scan=1' : '');
   api(url).then(function (j) {
-    if (btn) btn.disabled = false;
+    btns.forEach(function (b) { if (b) b.disabled = false; });
     _castDevices = (j && j.devices) || [];
-    if (s) {
-      if (_castDevices.length === 0) {
-        s.innerHTML = '<option value="">（未发现 UPnP 渲染器）</option>';
-        if (msg) msg.textContent = '未发现 UPnP/DLNA 渲染器（可能未开机或不在同一子网）';
-      } else {
-        var h = '';
-        _castDevices.forEach(function (d) {
-          var label = (d.friendlyName || d.name || d.host) + (d.model ? (' · ' + d.model) : '');
-          h += '<option value="' + esc(d.friendlyName || d.name || d.host) + '">' + esc(label) + '</option>';
-        });
-        s.innerHTML = h;
-        if (msg) msg.textContent = '共发现 ' + _castDevices.length + ' 个渲染器';
-      }
+    populateCastDevices();
+    if (msg) {
+      msg.textContent = _castDevices.length
+        ? ('共发现 ' + _castDevices.length + ' 个渲染器')
+        : '未发现 UPnP/DLNA 渲染器（可能未开机、不在同一子网，或 SSDP 组播被代理/防火墙拦截）';
+    }
+    if (msg2) {
+      msg2.textContent = _castDevices.length
+        ? ('共发现 ' + _castDevices.length + ' 个渲染器')
+        : '未发现 UPnP/DLNA 渲染器：确认数播已开启 UPnP/DLNA 且与本机同一子网';
     }
   }).catch(function () {
-    if (btn) btn.disabled = false;
-    if (msg) msg.textContent = '扫描失败';
+    btns.forEach(function (b) { if (b) b.disabled = false; });
+    if (msg) msg.textContent = '扫描失败（/api/cast/devices 无响应）';
+    if (msg2) msg2.textContent = '扫描失败（/api/cast/devices 无响应）';
   });
+}
+
+/* ---------------- NAA 端点自动发现（261024-01 #11） ---------------- */
+var _naaPollTimer = null;
+function renderNaaEndpoints(res) {
+  var s = D('sp_naa_dev');
+  var m = D('sp_naa_msg');
+  var eps = (res && res.endpoints) || [];
+  if (s) {
+    if (!eps.length) {
+      s.innerHTML = '<option value="">（未发现 NAA 端点）</option>';
+    } else {
+      var h = '';
+      eps.forEach(function (e) {
+        var v = e.host + ':' + (e.port || 43210);
+        h += '<option value="' + esc(v) + '">' + esc(v) + '</option>';
+      });
+      s.innerHTML = h;
+      // 自动获取：优先沿用已保存的端点，否则选第一个并写回设置（用户不用再手填）
+      var saved = (ADV.naaHost || '').trim();
+      var hit = false;
+      for (var i = 0; i < s.options.length; i++) {
+        if (s.options[i].value === saved) { s.value = saved; hit = true; break; }
+      }
+      if (!hit) {
+        s.selectedIndex = 0;
+        ADV.naaHost = s.value;
+        if (D('sp_naahost')) D('sp_naahost').value = s.value;
+        saveSettings();
+      }
+    }
+  }
+  if (m) {
+    m.textContent = (res && res.note) || '';
+    m.style.color = eps.length ? 'var(--mut2)' : 'var(--warn, #eab308)';
+  }
+}
+function discoverNaa(force) {
+  var m = D('sp_naa_msg');
+  var btn = D('sp_naa_scan');
+  clearTimeout(_naaPollTimer);
+  if (btn) btn.disabled = true;
+  if (m) {
+    m.textContent = '正在自动发现 NAA 端点（只读扫描本机网段的 TCP 43210）…';
+    m.style.color = 'var(--mut2)';
+  }
+  api('/api/naa/discover' + (force ? '?refresh=1' : '')).then(function (j) {
+    if (j && j.scanning) {
+      _naaPollTimer = setTimeout(function () { discoverNaa(false); }, 700);
+      return;
+    }
+    if (btn) btn.disabled = false;
+    renderNaaEndpoints(j);
+    backendHint();
+  }).catch(function () {
+    if (btn) btn.disabled = false;
+    if (m) { m.textContent = '自动发现失败：/api/naa/discover 无响应'; m.style.color = 'var(--err)'; }
+  });
+}
+
+/* ---------------- 后端相关控件的显隐 / 启用状态（261024-01 #9/#11） ---------------- */
+// 261024-01 #9/#11：后端 = UPnP 时，本机设备 / 采样率 / 位深 / 声道 / 缓冲 / 渐变 / 输出模式 /
+// 声道微调**全都不参与**（投放按源文件原采样率供源，不经本机 DSP）。这些字段直接隐藏，而不是
+// 置灰摆着 —— 用户已反馈设置页控件/文本太多（261024-01 #7），没用就别占地方。
+// 注意：字段仍保留在 DOM 里（display:none），collectSettings / saveSettings 照旧读得到值。
+var _UPNP_IRRELEVANT = ['sp_device', 'sp_rate', 'sp_bits', 'sp_ch', 'sp_buffer', 'sp_ramp', 'sp_outmode'];
+function _setFieldVisible(id, on) {
+  var e = D(id);
+  if (!e) return;
+  var f = e.closest ? e.closest('.sfld') : null;
+  if (f) f.style.display = on ? '' : 'none';
+}
+function applyBackendState() {
+  var bk = (D('sp_backend') && D('sp_backend').value) || 'wasapi';
+  var naaBox = D('sp_naawrap'); if (naaBox) naaBox.style.display = (bk === 'naa') ? '' : 'none';
+  var upnpBox = D('sp_upnpwrap'); if (upnpBox) upnpBox.style.display = (bk === 'upnp') ? '' : 'none';
+  _UPNP_IRRELEVANT.forEach(function (id) { _setFieldVisible(id, bk !== 'upnp'); });
+  // NAA 下"输出设备"没有意义（声音走 RTANet），但采样率/位深/声道/缓冲仍影响 DSP 输出，保留。
+  _setFieldVisible('sp_device', bk !== 'naa' && bk !== 'upnp');
+  var tw = D('sp_trimwrap'); if (tw) tw.style.display = (bk === 'upnp') ? 'none' : '';
+  // 「投放」快捷区块：后端 = UPnP 时不再重复一个渲染器下拉（上面已有），只留一句说明
+  var cdw = D('sp_cast_devwrap'); if (cdw) cdw.style.display = (bk === 'upnp') ? 'none' : '';
+  var csr = D('sp_cast_scanrow'); if (csr) csr.style.display = (bk === 'upnp') ? 'none' : '';
+  var cub = D('sp_cast_usebk'); if (cub) cub.style.display = (bk === 'upnp') ? '' : 'none';
 }
 
 function initCastControls() {
@@ -2605,9 +2752,10 @@ function initCastControls() {
   if (btnUseCur) {
     btnUseCur.onclick = function () {
       api('/api/status').then(function (j) {
-        if (j && j.cur) {
+        // /api/status 的字段名是 current（旧代码写成 j.cur，点这个按钮永远提示"没有正在播放的文件"）
+        if (j && j.current) {
           var f = D('sp_cast_file');
-          if (f) f.value = j.cur;
+          if (f) f.value = j.current;
           toast('已填入当前播放文件');
         } else {
           toast('当前没有正在播放的文件');
@@ -2851,10 +2999,35 @@ function renderSettingsPage() {
              opt('wasapi', 'WASAPI（独占 · 事件驱动）', BK) +
              opt('wasapi-shared', 'WASAPI 共享（兼容虚拟机 / 远程桌面）', BK) +
              opt('asio', 'ASIO', BK) +
-             opt('naa', 'NetworkAudioAdapter（NAA / RTANet）', BK) + opt('null', 'Null output（只跑 DSP，不出声）', BK),
+             opt('naa', 'NetworkAudioAdapter（NAA / RTANet）', BK) +
+            opt('upnp', 'UPnP / DLNA 投放（局域网渲染器）', BK) +
+            opt('null', 'Null output（只跑 DSP，不出声）', BK),
              '选到当前不可用的后端时，播放会直接返回原因，不会假装出声')
-       + '<div class=sfld><label>NAA 端点（host:port）</label><input type=text id=sp_naahost value="' +
-           esc(ADV.naaHost || '127.0.0.1:43210') + '"><div class=hint>只在后端选 NAA 时使用</div></div>'
+       // 261024-01 #11：用户原话「NAA 端点（host:port）这个选项不应该出现啊，应该是自动获取的」。
+      // 默认自动发现（下拉列出扫到的端点），手动输入收进折叠的「兜底」里，默认不展开。
+      + '<div class="sfld wide" id=sp_naawrap style="display:none">'
+      + '<label>NAA 端点（自动发现）</label>'
+      + '<div style="display:flex;gap:8px">'
+      + '<select id=sp_naa_dev style="flex:1"><option value="">（正在发现…）</option></select>'
+      + '<button class=btn id=sp_naa_scan style="white-space:nowrap">重新发现</button>'
+      + '</div>'
+      + '<div class=hint id=sp_naa_msg></div>'
+      + '<details style="margin-top:8px">'
+      + '<summary class=hint style="cursor:pointer;color:var(--mut2)">手动指定端点（自动发现不可用时）</summary>'
+      + '<input type=text id=sp_naahost value="' +
+           esc(ADV.naaHost || '127.0.0.1:43210') + '" style="margin-top:6px">'
+      + '<div class=hint>host:port，端口默认 43210；端点机需运行 rtanet_rx（真正的 networkaudiod 协议尚未逆向）</div>'
+      + '</details></div>'
+      // 261024-01 #9：后端下拉新增「UPnP / DLNA 投放」。选中后这里直接选目标渲染器，
+      // 与下方「投放」区块共用同一份发现结果、同一个选择、同一条会话（不出现两套打架的控制）。
+      + '<div class="sfld wide" id=sp_upnpwrap style="display:none">'
+      + '<label>目标渲染器（UPnP / DLNA）</label>'
+      + '<div style="display:flex;gap:8px">'
+      + '<select id=sp_upnp_dev style="flex:1"><option value="">（正在发现…）</option></select>'
+      + '<button class=btn id=sp_upnp_scan style="white-space:nowrap">重新发现</button>'
+      + '</div>'
+      + '<div class=hint id=sp_upnp_msg>播放 / 切歌自动投放到该渲染器（与下方「投放」共用会话）</div>'
+      + '</div>'
        + sel('sp_device', '输出设备', '<option value="">默认设备</option>', '独占模式会接管这个设备；共享模式经系统混音，不接管')
        + sel('sp_outmode', '输出模式',
              opt('pcm', 'PCM', outModeOf()) + opt('dsd', 'DSD（SDM）', outModeOf()),
@@ -2870,16 +3043,18 @@ function renderSettingsPage() {
        + num({ id: 'sp_buffer', label: '缓冲（毫秒）' }, D('sBuf').value, 10, 500, 10, '越小延迟越低，但更容易欠载')
        + num({ id: 'sp_ramp', label: '音量渐变（毫秒）' }, ADV.ramp, 0, 2000, 10, '0 = 立即生效（可能爆音）')
        + '<div class="sfld wide"><div id=sp_backendmsg class=hint></div></div>')
-     + sgroup('声道音量微调', '按声道名标注，0 dB = 不动',
+     + '<div id=sp_trimwrap>' + sgroup('声道音量微调', '按声道名标注，0 dB = 不动',
          '<div class="sfld wide"><div class=trimgrid>'+ trimFields(CH) + '</div>' +
-         '<div class=hint>显示的是「输出声道数」对应的实际声道。2 = 左/右；5.1 = 左/右/中置/低音/左环绕/右环绕；7.1 再加左后/右后</div></div>')
-     + sgroup('投放（UPnP）', '将本地音频流式推送到网络播放器/音箱（DLNA MediaRenderer）',
+         '<div class=hint>显示的是「输出声道数」对应的实际声道。2 = 左/右；5.1 = 左/右/中置/低音/左环绕/右环绕；7.1 再加左后/右后</div></div>') + '</div>'
+     + sgroup('投放（UPnP）', '快捷入口：单独推送某个文件；与「输出后端 = UPnP」共用同一条会话',
          // 2026-10-23 用户 261023-04 #12：渲染器名字常常很长（friendlyName + 型号），
          // 放在 260px 的小格里会被截断得只剩几个字；改成整行、下拉铺满宽度。
-         '<div class="sfld wide"><label>目标渲染器</label>'
+         '<div class="sfld wide" id=sp_cast_devwrap><label>目标渲染器</label>'
        + '<select id=sp_cast_dev style="width:100%"><option value="">（未发现 UPnP 渲染器）</option></select>'
-       + '<div class=hint>选择局域网内的 DLNA/UPnP MediaRenderer 设备</div></div>'
-       + '<div class="sfld" style="display:flex;align-items:flex-end">'
+       + '<div class=hint>与「输出后端」里的目标渲染器同步（同一个选择）</div></div>'
+       // 后端 = UPnP 时上面已有目标渲染器，这里只留一句说明，避免同一页出现两个一模一样的下拉
+       + '<div class="sfld wide" id=sp_cast_usebk style="display:none"><div class=hint>使用上方「输出后端」所选渲染器（同一选择、同一条会话）</div></div>'
+       + '<div class="sfld" id=sp_cast_scanrow style="display:flex;align-items:flex-end">'
        + '<button class=btn id=sp_cast_scan>重新扫描</button>'
        + '<span id=sp_cast_devmsg class=hint style="margin-left:10px;line-height:30px"></span>'
        + '</div>'
@@ -3187,6 +3362,7 @@ function renderSettingsPage() {
   if (D('sp_sdmo1')) D('sp_sdmo1').value = ADV.sdmFilt || '';
   if (D('sp_sdmoNx')) D('sp_sdmoNx').value = ADV.sdmFiltNx || '';
   applyDsdState();
+  applyBackendState();   // 261024-01 #9/#11：NAA / UPnP 选中时只显示各自的目标选择器
 
   // 页签切换（输入 / 输出 / PCM / SDM / 高级）
   Array.prototype.forEach.call(document.querySelectorAll('#setpage .stab'), function (b) {
@@ -3204,7 +3380,9 @@ function renderSettingsPage() {
         loadInputDevices();
         pollInputState();
       } else if (b.dataset.g === 'out') {
-        scanCastDevices(false);
+        applyBackendState();
+        scanCastDevices(false);   // 「投放」区块的渲染器列表（同时同步「输出后端」里的目标渲染器）
+        if (((D('sp_backend') && D('sp_backend').value) || 'wasapi') === 'naa') discoverNaa(false);
         pollCastState();
       }
     };
@@ -3215,9 +3393,24 @@ function renderSettingsPage() {
     ADV.backend = this.value;
     saveSettings();
     backendHint();
+    applyBackendState();
     loadDeviceList();        // ASIO 列驱动，WASAPI 列端点，NAA/Null 没有本地设备
+    // 261024-01 #9/#11：切到 NAA / UPnP 时自动发现目标（用户不用手填端点 / 设备地址）
+    if (this.value === 'naa') discoverNaa(true);
+    else if (this.value === 'upnp') scanCastDevices(true);
   };
-  if (D('sp_naahost')) D('sp_naahost').oninput = function () { ADV.naaHost = this.value; saveSettings(); };
+  if (D('sp_naahost')) D('sp_naahost').oninput = function () { ADV.naaHost = this.value; saveSettings(); backendHint(); };
+  // 261024-01 #11：NAA 端点下拉 = 自动发现结果（手动框只是折叠兜底）
+  if (D('sp_naa_scan')) D('sp_naa_scan').onclick = function () { discoverNaa(true); };
+  if (D('sp_naa_dev')) D('sp_naa_dev').onchange = function () {
+    ADV.naaHost = this.value || '';
+    if (D('sp_naahost')) D('sp_naahost').value = this.value || '';
+    saveSettings();
+    backendHint();
+  };
+  // 261024-01 #9：目标渲染器与「投放」区块同一个选择（不出现两套互相打架的控制）
+  if (D('sp_upnp_scan')) D('sp_upnp_scan').onclick = function () { scanCastDevices(true); };
+  if (D('sp_upnp_dev')) D('sp_upnp_dev').onchange = function () { syncUpnpDev(this.value); backendHint(); };
   D('sp_ch').onchange = function () {
     ADV.channels = parseInt(this.value, 10) || 0;
     saveSettings();
@@ -4002,7 +4195,11 @@ function collectSettings() {
   if (D('sGpu')) D('sGpu').value = ADV.gpuvendor;
   // 输出后端 / 声道 / 每声道微调
   if (D('sp_backend')) ADV.backend = D('sp_backend').value || 'wasapi';
-  if (D('sp_naahost')) ADV.naaHost = (D('sp_naahost').value || '').trim();
+  // 261024-01 #11：NAA 端点优先取自动发现的下拉；手动框（折叠兜底）有值则以它为准
+  if (D('sp_naa_dev') && D('sp_naa_dev').value) ADV.naaHost = D('sp_naa_dev').value;
+  if (D('sp_naahost') && (D('sp_naahost').value || '').trim()) ADV.naaHost = (D('sp_naahost').value || '').trim();
+  // 261024-01 #9：UPnP 目标渲染器（与「投放」区块同一下拉选择）
+  if (D('sp_upnp_dev') && D('sp_upnp_dev').value) ADV.upnpDev = D('sp_upnp_dev').value;
   if (D('sp_ch')) ADV.channels = parseInt(D('sp_ch').value, 10) || 0;
   [0, 1, 2, 3, 4, 5, 6, 7].forEach(function (i) {
     var e = D('sp_trim' + i);
