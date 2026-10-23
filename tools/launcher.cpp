@@ -418,6 +418,55 @@ static bool spawn_server(int port) {
 //（resize / WM_ERASEBKGND / WM_NCPAINT）必须用同一个值，不许各写一个 5。
 static const int kBandInset = 5;
 
+// ---------------- 高 DPI 支持（2026-10-23） ----------------
+// 之前进程是 DPI-UNAWARE：Windows 把整个窗口按 96 DPI 位图拉伸，WebView2 的内容
+// 随之被放大 —— 5K/200% 屏上界面就是糊的（实测 GetProcessDpiAwareness() 返回 0）。
+// 顺序：PerMonitorV2（Win10 1703+）→ PerMonitor（Win8.1+）→ System（Vista+；Win7 走这条）。
+// 一律动态取函数地址：Win7 没有 SetProcessDpiAwarenessContext / GetDpiForWindow。
+static void enable_high_dpi() {
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");
+    if (u32) {
+        typedef BOOL(WINAPI* FnCtx)(HANDLE);
+        auto f = (FnCtx)GetProcAddress(u32, "SetProcessDpiAwarenessContext");
+        if (f && f((HANDLE)(LONG_PTR)-4)) return;    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        if (f && f((HANDLE)(LONG_PTR)-3)) return;    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE
+    }
+    HMODULE sh = LoadLibraryW(L"shcore.dll");
+    if (sh) {
+        typedef HRESULT(WINAPI* FnAw)(int);
+        auto f2 = (FnAw)GetProcAddress(sh, "SetProcessDpiAwareness");
+        if (f2 && SUCCEEDED(f2(2))) return;          // PROCESS_PER_MONITOR_DPI_AWARE
+    }
+    SetProcessDPIAware();                            // Vista+ 兜底
+}
+
+// 某个窗口当前的 DPI（Win10 用 GetDpiForWindow；Win7/8 退回系统 DPI）
+static UINT dpi_of(HWND hwnd) {
+    if (hwnd) {
+        HMODULE u32 = GetModuleHandleW(L"user32.dll");
+        if (u32) {
+            typedef UINT(WINAPI* FnGdw)(HWND);
+            auto f = (FnGdw)GetProcAddress(u32, "GetDpiForWindow");
+            if (f) { const UINT d = f(hwnd); if (d) return d; }
+        }
+    }
+    HDC dc = GetDC(hwnd);
+    const UINT d = dc ? (UINT)GetDeviceCaps(dc, LOGPIXELSX) : 96u;
+    if (dc) ReleaseDC(hwnd, dc);
+    return d ? d : 96u;
+}
+
+// 系统（主屏）DPI —— 用于窗口创建那一刻，那时还没有窗口可问
+static UINT dpi_system() {
+    HDC dc = GetDC(nullptr);
+    const UINT d = dc ? (UINT)GetDeviceCaps(dc, LOGPIXELSX) : 96u;
+    if (dc) ReleaseDC(nullptr, dc);
+    return d ? d : 96u;
+}
+
+// 逻辑像素 → 当前窗口的物理像素（kBandInset、初始窗口尺寸都走它换算）
+static int dp(HWND hwnd, int v) { return (int)(((long long)v * dpi_of(hwnd) + 48) / 96); }
+
 // ---------------- 内置 WebView2 窗口 ----------------
 // 用系统运行库的 WebView2 做界面：没有浏览器外壳、没有扩展、标题栏归我们管，
 // 主题一变直接改 DWM 颜色，不需要重开窗口。
@@ -515,7 +564,7 @@ static void repaint_band(HWND hwnd) {
     if (!dc) return;
     RECT rc{};
     GetClientRect(hwnd, &rc);
-    const int b = kBandInset;
+    const int b = dp(hwnd, kBandInset);
     const RECT topR   { rc.left, rc.top, rc.right, rc.top + b };
     const RECT botR   { rc.left, rc.bottom - b, rc.right, rc.bottom };
     const RECT leftR  { rc.left, rc.top + b, rc.left + b, rc.bottom - b };
@@ -653,7 +702,9 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (hit != HTCLIENT || IsZoomed(hwnd)) return hit;
             POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             RECT rc{}; GetWindowRect(hwnd, &rc);
-            const int b = 6;
+            // 6 是 96 DPI 下的逻辑宽度；200% 屏上若直接用 6 物理像素，
+            // 可拖拽边缘只剩 3 逻辑像素，鼠标很难命中。
+            const int b = dp(hwnd, 6);
             const bool L = pt.x < rc.left + b, R = pt.x >= rc.right - b;
             const bool T = pt.y < rc.top + b,  B = pt.y >= rc.bottom - b;
             if (T && L) return HTTOPLEFT;
@@ -666,8 +717,16 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (B) return HTBOTTOM;
             return HTCLIENT;
         }
+        case WM_DPICHANGED: {
+            // 跨屏拖到不同缩放的显示器：按系统建议矩形重排。边带宽度由 WM_SIZE 里的
+            // dp() 重算，所以只需把窗口几何交给 SetWindowPos。
+            const RECT* r = (const RECT*)lp;
+            SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
         case WM_SIZE:
-            if (g_wvCtl) rta::wv2::resize(g_wvCtl, hwnd, kBandInset);
+            if (g_wvCtl) rta::wv2::resize(g_wvCtl, hwnd, dp(hwnd, kBandInset));
             // 尺寸一变，WebView2 子窗口按新几何重排，边带跟着变宽/变高；WM_SIZE 之后
             // 不保证有 WM_PAINT（实测最大化/还原就可能没有），所以这里主动补一次。
             // 与 WM_NCPAINT/WM_PAINT/WM_ERASEBKGND 共用同一个 repaint_band + kBandInset。
@@ -725,9 +784,36 @@ static bool open_webview_window(int port) {
     // 无边框窗口：标题栏由网页里的 .top 顶栏承担（QQ 音乐式一体化）。
     HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW, kClass, L"RLPlayer",
                                 WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU,
-                                120, 60, 1340, 880, nullptr, nullptr, wc.hInstance, nullptr);
+                                (int)((long long)120 * dpi_system() / 96),
+                                (int)((long long)60 * dpi_system() / 96),
+                                (int)((long long)1340 * dpi_system() / 96),
+                                (int)((long long)880 * dpi_system() / 96),
+                                nullptr, nullptr, wc.hInstance, nullptr);
     if (!hwnd) return false;
     g_mainWnd = hwnd;
+
+    // 初始尺寸按"窗口实际所在显示器"的 DPI 校正（1340×880 是 96 DPI 下的逻辑目标）。
+    // 不能依赖创建时算的 dpi_system()：实测进程刚设 PerMonitorV2 时 GetDC(NULL) 仍报 96，
+    // 等窗口建好才变 192，于是窗口在 5K@200% 屏上只有 670 逻辑像素宽（一半）。
+    // 这里用 GetDpiForWindow（创建后是准的）直接算出目标物理尺寸，与实际值不同就 SetWindowPos。
+    {
+        const UINT d0 = dpi_of(hwnd);
+        if (d0 != 96) {
+            RECT r{};
+            GetWindowRect(hwnd, &r);
+            const int wantW = (int)((long long)1340 * d0 / 96);
+            const int wantH = (int)((long long)880 * d0 / 96);
+            if ((r.right - r.left) != wantW || (r.bottom - r.top) != wantH) {
+                SetWindowPos(hwnd, nullptr, 0, 0, wantW, wantH, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                logf(L"高 DPI：窗口 DPI %u，初始尺寸 %dx%d → %dx%d",
+                     d0, r.right - r.left, r.bottom - r.top, wantW, wantH);
+            } else {
+                logf(L"高 DPI：窗口 DPI %u，初始尺寸已是 %dx%d", d0, wantW, wantH);
+            }
+        } else {
+            logf(L"高 DPI：窗口 DPI 96（100%%），初始尺寸无需校正");
+        }
+    }
 
     const HRESULT ci = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     wchar_t url[64];
@@ -824,6 +910,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
+    // ★ 必须在任何窗口/WebView2 创建之前：决定进程的 DPI 感知级别。
+    // 漏了它，Windows 会把整个窗口按 96 DPI 位图拉伸（界面发糊，见 enable_high_dpi 的注）。
+    enable_high_dpi();
     rta::crash::install();    // 崩溃转储（1.0.5）：dump 落 exe 目录 dumps\，filter 先写日志
     logf(L"=== wWinMain 进入 ===");
     WSADATA w; WSAStartup(MAKEWORD(2, 2), &w);

@@ -41,6 +41,22 @@ inline double s32_to_f32(int32_t v) {
     return (double)v / 2147483648.0;
 }
 
+// ★ 按【源位深】归一化（2026-10-23 现场修复）。
+// 管线的 int32 是按 bits 右对齐的（AudioBuffer::fullScale = 2^(bits-1)，见 src/audio/wav.h:25），
+// 而共享混音引擎要吃 ±1.0 的 float32。旧实现一律 s32_to_f32（÷2^31），于是
+//   24-bit 源 → 1/256 = **−48.16 dB**，16-bit 源 → 1/65536 = −96.3 dB。
+// 症状是"确实没断，但电平极低"——而内部所有判据（peak/clip/isp 都按位深归一化）
+// 全部显示正常，唯有真正送进混音引擎那一步少了位深换算（铁律 3 的教科书案例）。
+// 32-bit 与未知位深保持原路径；结果 clamp 到 ±1.0，防上游 overshoot 溢出 float 域。
+inline double s32_to_f32_bits(int32_t v, int bits) {
+    double x;
+    if (bits <= 0 || bits >= 32) x = (double)v / 2147483648.0;
+    else                        x = (double)v / (double)(1LL << (bits - 1));
+    if (x >  1.0) return  1.0;
+    if (x < -1.0) return -1.0;
+    return x;
+}
+
 // 可写帧数 = 缓冲深度 − 当前积压，再夹到可用数据量之内。
 // 抽出来是为了离线验证钳制逻辑（pad 超过 bufferFrames 时不得下溢）。
 inline size_t shared_writable(UINT32 bufferFrames, UINT32 pad, size_t availFrames) {
@@ -297,6 +313,9 @@ public:
     uint32_t mix_rate() const { return mixRate_; }
     int      mix_channels() const { return mixCh_; }
     bool     is_float() const { return mixFloat_; }
+    // 实际写进混音引擎的最大幅度（float 域，0..1）。与管线侧 peak（位深域）互为对照：
+    // 两者应当一致；不一致就说明换算或位深基准有问题（2026-10-23 现场就是靠它定论的）。
+    double   out_peak() const { return outPeak_; }
     uint32_t req_rate() const { return reqRate_; }
     int      req_channels() const { return reqCh_; }
     const std::string& device_id() const { return deviceId_; }
@@ -343,14 +362,27 @@ private:
     }
 
     // int32 → float32（含实时增益；gain=1 时走纯换算）
+    // 必须用 reqBits_ 归一化：混音引擎的 float32 是 ±1.0 满幅，而管线交来的是
+    // "按源位深右对齐"的 int32（24-bit 源只在 ±2^23 量级）。见 s32_to_f32_bits 的注释。
     void pack(BYTE* dst, const int32_t* src, size_t frames) {
         const size_t n = frames * (size_t)mixCh_;
         float* p = (float*)dst;
+        const int b = (int)reqBits_;
+        double pk = outPeak_;
         if (gain_ != 1.0) {
-            for (size_t i = 0; i < n; ++i) p[i] = (float)(s32_to_f32(src[i]) * gain_);
+            for (size_t i = 0; i < n; ++i) {
+                const double v = s32_to_f32_bits(src[i], b) * gain_;
+                if (std::fabs(v) > pk) pk = std::fabs(v);
+                p[i] = (float)v;
+            }
         } else {
-            for (size_t i = 0; i < n; ++i) p[i] = (float)s32_to_f32(src[i]);
+            for (size_t i = 0; i < n; ++i) {
+                const double v = s32_to_f32_bits(src[i], b);
+                if (std::fabs(v) > pk) pk = std::fabs(v);
+                p[i] = (float)v;
+            }
         }
+        outPeak_ = pk;   // 真实写出峰值（float 域），供 /api/status 的 fpeak 读
     }
 
     bool comInit_ = false, running_ = false;
@@ -364,6 +396,7 @@ private:
     std::string deviceId_;
     size_t written_ = 0;
     double gain_ = 1.0;
+    double outPeak_ = 0.0;      // 实际写进混音引擎的最大幅度（float 域），见 out_peak()
     long long lastPad_ = -1, lastGbHr_ = -999;
     long long qpcFreq_ = 1, qpcStart_ = 0;
     std::string lastErr_;

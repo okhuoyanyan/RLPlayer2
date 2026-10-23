@@ -219,7 +219,7 @@ node tools\uicheck.js http://127.0.0.1:8911/ build\uicheck_out   # 界面自检 
 - **UPnP/DLNA 投放**：只做发现，不做推送
 - **DSD 域重采样**：同速率 DirectSDM 逐位直通已可用；**速率不同时的 DSD→DSD 重采样未做**
 - **Native DSD（ASIO）**：需驱动支持 ASIODSD* 通道类型
-- **NVIDIA/CUDA 后端**：只有加载路径，仓库内无 CUDA 源码
+- **NVIDIA（CUDA）**：需自备 rtagpu_cuda.dll（用 tools/build_gpu_cuda.ps1 在 NVIDIA 机器上构建）
 - **NAA 协议兼容**：已探测到标准 NAA 5.x，卡在未公开的 16 字节握手
 - **7 阶 1-bit 调制器**：只在 DSD128 以上稳定
 

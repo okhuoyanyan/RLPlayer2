@@ -25,6 +25,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "pcm_dump.h"
 #include <stdexcept>
 
 namespace rta::audio {
@@ -176,14 +177,20 @@ public:
                     static const uint32_t cand[] = { 44100, 48000, 88200, 96000, 176400, 192000,
                                                      352800, 384000, 705600, 768000, 1536000 };
                     WAVEFORMATEXTENSIBLE wfx{};
+                    // ★ 2026-10-23 实测（wasapi_ex_probe 矩阵）：UltraLite-mk5 的独占只接受
+                    // 「32 位容器 + 24 位有效」（wBitsPerSample=32 / wValidBitsPerSample=24 /
+                    // blockAlign=ch*4）。紧凑 24 位（blockAlign=ch*3）会被 IsFormatSupported
+                    // 判成 AUDCLNT_E_UNSUPPORTED_FORMAT —— 这就是"独占全位深都不支持"的真因。
+                    const int cont = (bits <= 16) ? 2 : 4;          // 每样本容器字节
+                    const int valid = bits;                          // 有效位深
                     wfx.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
                     wfx.Format.nChannels = (WORD)channels;
                     wfx.Format.nSamplesPerSec = 48000;
-                    wfx.Format.wBitsPerSample = (WORD)bits;
-                    wfx.Format.nBlockAlign = (WORD)(channels * bits / 8);
+                    wfx.Format.wBitsPerSample = (WORD)(cont * 8);
+                    wfx.Format.nBlockAlign = (WORD)(channels * cont);
                     wfx.Format.nAvgBytesPerSec = wfx.Format.nSamplesPerSec * wfx.Format.nBlockAlign;
                     wfx.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-                    wfx.Samples.wValidBitsPerSample = (WORD)bits;
+                    wfx.Samples.wValidBitsPerSample = (WORD)valid;
                     wfx.dwChannelMask = channel_mask_for(channels);
                     wfx.SubFormat = (bits == 32) ? KSDATAFORMAT_SUBTYPE_IEEE_FLOAT : KSDATAFORMAT_SUBTYPE_PCM;
                     for (uint32_t r : cand) {
@@ -330,8 +337,10 @@ public:
             lastErr_ = "打开端点失败"; fillFail(hb); return false;
         }
 
+        // 用 RAII 持有设备指针：对齐重试（配方 5）需要拿 dev 重新 Activate 一个新 client，
+        // 所以不能在 Activate 之后立刻 Release（原实现在这里就释放了，导致那条分支永远无法真正重试）。
+        struct DevRel { IMMDevice* d; ~DevRel() { if (d) d->Release(); } } devRel{ dev };
         hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ac_);
-        dev->Release();
         if (FAILED(hr) || !ac_) {
             char hb[64]; std::snprintf(hb, sizeof(hb), "0x%08lX %s(Activate)",
                                        (unsigned long)(unsigned)hr, hr_name(hr));
@@ -339,39 +348,78 @@ public:
         }
 
         // 构造 WAVEFORMATEXTENSIBLE
+        // ★ 2026-10-23：容器宽度与有效位深分开。UltraLite-mk5 独占只认「32 位容器 + 24 位有效」
+        //（实测：紧凑 24 → AUDCLNT_E_UNSUPPORTED_FORMAT；32/24 → IsFormatSupported OK 且
+        // Initialize 只返回 BUFFER_SIZE_NOT_ALIGNED，即可按对齐重试成功）。
         static const GUID SUB_PCM = {0x00000001,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
+        const int contBytes = (bits <= 16) ? 2 : 4;   // 每样本容器字节数
         std::memset(&wfx_, 0, sizeof(wfx_));
         wfx_.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
         wfx_.Format.nChannels       = (WORD)channels;
         wfx_.Format.nSamplesPerSec  = rate;
-        wfx_.Format.wBitsPerSample  = (WORD)bits;
-        wfx_.Format.nBlockAlign     = (WORD)(channels * bits / 8);
+        wfx_.Format.wBitsPerSample  = (WORD)(contBytes * 8);
+        wfx_.Format.nBlockAlign     = (WORD)(channels * contBytes);
         wfx_.Format.nAvgBytesPerSec = rate * wfx_.Format.nBlockAlign;
         wfx_.Format.cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-        wfx_.Samples.wValidBitsPerSample = (WORD)bits;
+        wfx_.Samples.wValidBitsPerSample = (WORD)bits;   // 有效位深（16 或 24）
         wfx_.dwChannelMask          = channel_mask_for(channels);
         wfx_.SubFormat              = SUB_PCM;
 
+        // 多配方尝试（2026-10-23）：不同驱动对「独占 + 事件驱动」的参数组合脾气不同，
+        // 单一配方失败就判死会把可用的设备挡在外面（现场：同机别的播放器独占正常）。
+        // 每个配方都记 HRESULT，失败时整串带进 lastErr_，从此不用猜。
         ev_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-
-        // 配方 1：periodicity == bufferDuration
         REFERENCE_TIME dur = (REFERENCE_TIME)(bufferMs * 10000.0);
-        hr = ac_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                             dur, dur, (WAVEFORMATEX*)&wfx_, nullptr);
-        if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {           // 配方 5
-            UINT32 aligned = 0;
-            if (SUCCEEDED(ac_->GetBufferSize(&aligned)) && aligned) {
-                dur = (REFERENCE_TIME)(10000.0 * 1000.0 * (double)aligned / (double)rate + 0.5);
-                hr = ac_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                     dur, dur, (WAVEFORMATEX*)&wfx_, nullptr);
-                realigned_ = true;
+        struct Try { REFERENCE_TIME buf; REFERENCE_TIME per; DWORD flags; const char* why; };
+        const Try tries[] = {
+            { dur, dur,       AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=period=100ms,event" },
+            { dur, 0,         AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=100ms,period=驱动默认,event" },
+            { 0,   0,         AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer/period 全默认,event" },
+            { dur, 0,         0,                                 "buffer=100ms,period默认,轮询" },
+            { 0,   0,         0,                                 "全默认,轮询" },
+        };
+        std::string trialLog;
+        hr = E_FAIL;
+        for (const auto& t : tries) {
+            hr = ac_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, t.flags, t.buf, t.per,
+                                 (WAVEFORMATEX*)&wfx_, nullptr);
+            {
+                char b[160];
+                std::snprintf(b, sizeof(b), "[%s -> 0x%08lX %s] ",
+                              t.why, (unsigned long)(unsigned)hr, hr_name(hr));
+                trialLog += b;
             }
+            if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {        // 配方 5：按实际缓冲对齐后重试
+                // ★ 必须换一个**新的** IAudioClient：微软文档要求 Release 后重新 Activate，
+                // 复用同一个 client 重试只会得到 AUDCLNT_E_BUFFER_SIZE_ERROR（0x88890016）。
+                // 2026-10-23 实测：对齐后 periodicity 仍取对齐时长（不是 0），返回 S_OK。
+                UINT32 aligned = 0;
+                if (SUCCEEDED(ac_->GetBufferSize(&aligned)) && aligned) {
+                    const REFERENCE_TIME d2 =
+                        (REFERENCE_TIME)(10000.0 * 1000.0 * (double)aligned / (double)rate + 0.5);
+                    ac_->Release();
+                    ac_ = nullptr;
+                    HRESULT hr2 = E_FAIL;
+                    if (SUCCEEDED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ac_)) && ac_) {
+                        hr2 = ac_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, t.flags, d2, d2,
+                                              (WAVEFORMATEX*)&wfx_, nullptr);
+                    }
+                    {
+                        char b[160];
+                        std::snprintf(b, sizeof(b), "[对齐 %u 帧(%lldus),新client -> 0x%08lX %s] ",
+                                      (unsigned)aligned, (long long)d2,
+                                      (unsigned long)(unsigned)hr2, hr_name(hr2));
+                        trialLog += b;
+                    }
+                    if (hr2 == S_OK) { realigned_ = true; hr = S_OK; break; }
+                    hr = hr2;
+                }
+            }
+            if (hr == S_OK) break;
         }
         if (hr != S_OK) {
-            char hb[64]; std::snprintf(hb, sizeof(hb), "0x%08lX %s",
-                                       (unsigned long)(unsigned)hr, hr_name(hr));
-            lastErr_ = std::string("Initialize 失败: ") + hr_name(hr);
-            fillFail(hb);   // HF-01：把请求格式与该位深的实际独占支持列表带出去
+            lastErr_ = std::string("Initialize 失败（全部配方）：") + trialLog;
+            fillFail(trialLog.c_str());   // HF-01：把请求格式与该位深的实际独占支持列表带出去
             close(); return false;
         }
 
@@ -510,6 +558,11 @@ public:
         lastPad_ = (long long)pad;
         if (pad > bufferFrames_) pad = bufferFrames_;
         size_t toWrite = (size_t)bufferFrames_ - (size_t)pad;
+        // ★ 2026-10-23 真 bug 修复：某些驱动（MOTU）在 Start 之后会报告 pad == bufferFrames，
+        // 此时按 pad 算可用空间恒为 0 → 永远不写 → 流饿死（现场表现：wr 不涨、4 秒后
+        // RENDERFAIL、最后回退共享）。首次写入时直接试满缓冲：GetBuffer 若真的没空间
+        // 就会失败并返回 0，对正常路径无害。
+        if (toWrite == 0 && written_ == 0) toWrite = (size_t)bufferFrames_;
         const size_t room = toWrite;          // 设备侧可用空间（量化之前）
         if (toWrite > availFrames) toWrite = availFrames;
         // 独占模式的 GetBuffer 要求周期整数倍；向下取整，宁可少写也不报错。
@@ -603,20 +656,16 @@ private:
     }
 
     void pack(BYTE* dst, const int32_t* src, size_t frames) {
+        detail::pcm_dump("wasapi-ex", src, frames * (size_t)channels_, bits_);   // 取证（默认关闭）
         const size_t n = frames * (size_t)channels_;
         if (gain_ != 1.0) {
             // 慢路径：只用于用户拖动音量滑块的场合
             if (bits_ == 16) {
                 auto* p = (int16_t*)dst;
                 for (size_t i = 0; i < n; ++i) p[i] = (int16_t)scaled(src[i]);
-            } else if (bits_ == 24) {
-                for (size_t i = 0; i < n; ++i) {
-                    const uint32_t v = (uint32_t)scaled(src[i]);
-                    dst[i * 3 + 0] = (BYTE)(v & 0xFF);
-                    dst[i * 3 + 1] = (BYTE)((v >> 8) & 0xFF);
-                    dst[i * 3 + 2] = (BYTE)((v >> 16) & 0xFF);
-                }
             } else {
+                // 24 位也走 32 位容器（wBitsPerSample=32 / valid=24）：把 ±2^23 的值直接放
+                // int32 低位。驱动实测只认这个容器宽度（紧凑 3 字节会被判 UNSUPPORTED_FORMAT）。
                 auto* p = (int32_t*)dst;
                 for (size_t i = 0; i < n; ++i) p[i] = scaled(src[i]);
             }
@@ -625,14 +674,8 @@ private:
         if (bits_ == 16) {
             auto* p = (int16_t*)dst;
             for (size_t i = 0; i < n; ++i) p[i] = (int16_t)src[i];
-        } else if (bits_ == 24) {
-            for (size_t i = 0; i < n; ++i) {
-                const uint32_t v = (uint32_t)src[i];
-                dst[i * 3 + 0] = (BYTE)(v & 0xFF);
-                dst[i * 3 + 1] = (BYTE)((v >> 8) & 0xFF);
-                dst[i * 3 + 2] = (BYTE)((v >> 16) & 0xFF);
-            }
         } else {
+            // 同上：24 位 = 32 位容器 + 24 位有效，写 int32
             auto* p = (int32_t*)dst;
             for (size_t i = 0; i < n; ++i) p[i] = src[i];
         }

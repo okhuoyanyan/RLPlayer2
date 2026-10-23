@@ -7,6 +7,16 @@
 #   1) no VC++ runtime DLL imports (static CRT only)
 #   2) PE subsystem version <= 6.1 (Windows 7 loader accepts it)
 #   3) no AVX-512 instructions (zmm registers / EVEX masking)
+#   4) no Windows 8+ / WinRT imports (Windows 7 PE audit)
+#
+# Rule 4 is adapted from DBX (Apache-2.0). The usual culprit is the WebView2
+# loader: loaders >= 1.0.1054.31 import EventSetInformation, which Windows 7 and
+# Server 2012 R2 do not provide, and the failure surfaces as the misleading
+# "Could not find the WebView2 Runtime". The shippable loader is 1.0.902.49
+# (official NuGet package Microsoft.Web.WebView2 1.0.902.49,
+#  x64 WebView2Loader.dll sha256 fdf978ba706578b05967d7f0181f462147864a5aa74f36016a62cb3d3dbe6909).
+# WebView2Loader.dll is audited even though it is not built here - it is copied
+# in from third_party/webview2/x64, so a plain `ctest` can never catch it.
 #
 # Usage: powershell -File tools/check_compat.ps1 [-Dir build]
 param([string]$Dir = "")
@@ -16,13 +26,31 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $here
 if ($Dir -eq "") { $Dir = Join-Path $root 'build' }
 
-$ro = 'C:\Program Files\AMD\ROCm\7.2\bin\llvm-readobj.exe'
-$od = 'C:\Program Files\AMD\ROCm\7.2\bin\llvm-objdump.exe'
-foreach ($t in @($ro, $od)) {
-    if (-not (Test-Path $t)) { Write-Host "missing LLVM tool: $t"; exit 2 }
+# Locate LLVM binutils without hard-coding one vendor layout:
+# PATH -> LLVM_HOME -> sibling toolchain/clang+llvm-* -> ROCm (the historical path).
+function Find-Binutil([string]$exe) {
+    $onPath = Get-Command $exe -ErrorAction SilentlyContinue
+    if ($onPath) { return $onPath.Source }
+    $cands = @()
+    if ($env:LLVM_HOME) { $cands += (Join-Path $env:LLVM_HOME "bin\$exe") }
+    $tcRoot = Join-Path (Split-Path -Parent $root) 'toolchain'
+    if (Test-Path $tcRoot) {
+        $cands += @(Get-ChildItem $tcRoot -Directory -Filter 'clang+llvm-*' -ErrorAction SilentlyContinue |
+                    ForEach-Object { Join-Path $_.FullName "bin\$exe" })
+    }
+    $cands += "C:\Program Files\AMD\ROCm\7.2\bin\$exe"
+    foreach ($c in $cands) { if ($c -and (Test-Path $c)) { return $c } }
+    return $null
 }
 
-$files = @('RLPlayer.exe', 'rtaweb.exe', 'rtaplay.exe', 'asio_probe.exe', 'rtagpu.dll')
+$ro = Find-Binutil 'llvm-readobj.exe'
+$od = Find-Binutil 'llvm-objdump.exe'
+foreach ($t in @($ro, $od)) {
+    if (-not $t) { Write-Host "missing LLVM tool (llvm-readobj/llvm-objdump); install LLVM or ROCm, or set LLVM_HOME"; exit 2 }
+}
+
+# rtagpu_cuda.dll is optional (built on NVIDIA machines with CUDA toolchain).
+$files = @('RLPlayer.exe', 'rtaweb.exe', 'rtaplay.exe', 'asio_probe.exe', 'rtagpu.dll', 'rtagpu_cuda.dll')
 $badRuntime = 'VCRUNTIME|MSVCP|api-ms-win-crt|ucrtbase'
 $rows = @()
 
@@ -30,7 +58,11 @@ Write-Host "=== RLPlayer distribution compatibility check: $Dir ==="
 foreach ($name in $files) {
     $f = Join-Path $Dir $name
     if (-not (Test-Path $f)) {
-        $rows += [pscustomobject]@{ File = $name; Result = 'SKIP'; Detail = 'not found' }
+        if ($name -eq 'rtagpu_cuda.dll') {
+            $rows += [pscustomobject]@{ File = $name; Result = 'OPTIONAL'; Detail = 'CUDA 后端可选，本包未含' }
+        } else {
+            $rows += [pscustomobject]@{ File = $name; Result = 'SKIP'; Detail = 'not found' }
+        }
         continue
     }
     $imp = ((& $ro --coff-imports $f 2>&1) -join "`n")
