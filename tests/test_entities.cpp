@@ -1183,6 +1183,123 @@ int main() {
         }
     }
 
+    // =====================================================================
+    // [16] 多碟盒装三层下钻支持（Season/Vol/CD 结构 + 负例保护）
+    // =====================================================================
+    std::printf("[16] 多碟盒装三层下钻（Box/Season1/CD1,CD2 + Box2/Vol.1/Disc1 + 负例保护）\n");
+    {
+        std::error_code ec;
+        const fs::path root3 = fs::temp_directory_path() / "rta_test_entities_3layer";
+        // 1. 三层盒装 1：Box/Season1/CD1, CD2
+        const fs::path box1 = root3 / "Box";
+        fs::create_directories(box1 / "Season1" / "CD1", ec);
+        fs::create_directories(box1 / "Season1" / "CD2", ec);
+        { std::ofstream o(box1 / "Season1" / "CD1" / "01.flac", std::ios::binary); o << "x"; }
+        { std::ofstream o(box1 / "Season1" / "CD1" / "02.flac", std::ios::binary); o << "x"; }
+        { std::ofstream o(box1 / "Season1" / "CD2" / "01.flac", std::ios::binary); o << "x"; }
+
+        // 2. 三层盒装 2：Box2/Vol.1/Disc1
+        const fs::path box2 = root3 / "Box2";
+        fs::create_directories(box2 / "Vol.1" / "Disc1", ec);
+        { std::ofstream o(box2 / "Vol.1" / "Disc1" / "01.flac", std::ios::binary); o << "x"; }
+
+        // 3. 普通专辑：NormalAlbum
+        const fs::path normAlb = root3 / "NormalAlbum";
+        fs::create_directories(normAlb, ec);
+        { std::ofstream o(normAlb / "01.flac", std::ios::binary); o << "x"; }
+
+        // 4. 负例：SomeCategory 下包含 NotASeasonAlbum/CD1 以及 AdjacentAlbum
+        // 中间层是普通专辑名（不是 Season/Vol 等），严禁上钻把 SomeCategory 当成盒装！
+        const fs::path catDir = root3 / "SomeCategory";
+        const fs::path midAlbum = catDir / "NotASeasonAlbum";
+        const fs::path adjAlbum = catDir / "AdjacentAlbum";
+        fs::create_directories(midAlbum / "CD1", ec);
+        fs::create_directories(adjAlbum, ec);
+        { std::ofstream o(midAlbum / "CD1" / "01.flac", std::ios::binary); o << "x"; }
+        { std::ofstream o(adjAlbum / "01.flac", std::ios::binary); o << "x"; }
+
+        // 结构函数级别断言
+        int d1 = 0, d2 = 0, dNorm = 0, dMid = 0;
+        const fsx::path pBox1Track = box1 / "Season1" / "CD1" / "01.flac";
+        const fsx::path ad1 = entity_find_album_dir_for_track(pBox1Track, &d1);
+        ck(ad1 == box1, "Box/Season1/CD1 向上钻取收敛到盒装根 Box", u8s(ad1.u8string()));
+        ck(d1 == 1, "Box 碟号取最终级碟片编号 (1)", std::to_string(d1));
+
+        const fsx::path pBox2Track = box2 / "Vol.1" / "Disc1" / "01.flac";
+        const fsx::path ad2 = entity_find_album_dir_for_track(pBox2Track, &d2);
+        ck(ad2 == box2, "Box2/Vol.1/Disc1 向上钻取收敛到盒装根 Box2", u8s(ad2.u8string()));
+        ck(d2 == 1, "Box2 碟号取最终级碟片编号 (1)", std::to_string(d2));
+
+        const fsx::path pNormTrack = normAlb / "01.flac";
+        const fsx::path adNorm = entity_find_album_dir_for_track(pNormTrack, &dNorm);
+        ck(adNorm == normAlb, "普通专辑 NormalAlbum 定位自身", u8s(adNorm.u8string()));
+
+        // 负例断言：中间层不是季节/卷而是普通专辑名，只定位到中间层，不上钻到 SomeCategory
+        const fsx::path pMidTrack = midAlbum / "CD1" / "01.flac";
+        const fsx::path adMid = entity_find_album_dir_for_track(pMidTrack, &dMid);
+        ck(adMid == midAlbum, "★ 负例：中间层为普通专辑名 NotASeasonAlbum 时不上钻到 SomeCategory",
+           u8s(adMid.u8string()));
+        ck(dMid == 1, "NotASeasonAlbum 碟号为 1", std::to_string(dMid));
+
+        ck(!entity_dir_is_boxset(catDir), "SomeCategory 不是盒装目录");
+        ck(entity_dir_is_boxset(box1), "三层盒装 Box 判定为 boxset");
+        ck(entity_dir_is_boxset(box2), "三层盒装 Box2 判定为 boxset");
+
+        // 批量入口断言
+        std::vector<std::string> all3Files;
+        for (const auto& de : fs::recursive_directory_iterator(root3, ec)) {
+            if (!de.is_regular_file(ec)) continue;
+            if (entity_audio_ext_ok(u8s(de.path().extension().u8string()))) {
+                all3Files.push_back(u8s(de.path().u8string()));
+            }
+        }
+        std::sort(all3Files.begin(), all3Files.end());
+        ck(all3Files.size() == 7, "三层盒装测试共 7 个音频文件 (3 + 1 + 1 + 1 + 1)", std::to_string(all3Files.size()));
+
+        const EntityGraph g3 = entity_batch_from_paths(all3Files, 13100);
+
+        // 验证 Release 数量与实体
+        // 应该聚合为 5 个 Release: Box, Box2, NormalAlbum, NotASeasonAlbum, AdjacentAlbum
+        const size_t relCount3 = g3.count(EntityKind::Release);
+        ck(relCount3 == 5, "★ 批量入口严格收敛为 5 个 Release 实体（不误吞相邻专辑）", std::to_string(relCount3));
+
+        auto find_release_named = [&](const std::string& name) -> const Entity* {
+            for (const auto& kv : g3.entities) {
+                if (kv.second.kind == EntityKind::Release && kv.second.name == name) {
+                    return &kv.second;
+                }
+            }
+            return nullptr;
+        };
+
+        const Entity* rBox1 = find_release_named("Box");
+        ck(rBox1 != nullptr, "三层盒装 1 聚合为单个 Release 实体 (Box)");
+        if (rBox1) {
+            const size_t dc = entity_release_disc_count(g3, rBox1->id);
+            ck(dc == 2, "★ Box 碟数正确 (2 碟)", std::to_string(dc));
+        }
+
+        const Entity* rBox2 = find_release_named("Box2");
+        ck(rBox2 != nullptr, "三层盒装 2 聚合为单个 Release 实体 (Box2)");
+        if (rBox2) {
+            const size_t dc = entity_release_disc_count(g3, rBox2->id);
+            ck(dc == 1, "★ Box2 碟数正确 (1 碟)", std::to_string(dc));
+        }
+
+        const Entity* rNorm = find_release_named("NormalAlbum");
+        ck(rNorm != nullptr, "普通专辑 Release 实体存在 (NormalAlbum)");
+
+        const Entity* rMid = find_release_named("NotASeasonAlbum");
+        ck(rMid != nullptr, "负例普通专辑 Release 实体独立存在 (NotASeasonAlbum)");
+
+        const Entity* rAdj = find_release_named("AdjacentAlbum");
+        ck(rAdj != nullptr, "相邻普通专辑 Release 实体独立存在 (AdjacentAlbum)");
+
+        ck(find_release_named("SomeCategory") == nullptr, "分类目录 SomeCategory 未被错误创建为 Release");
+
+        fs::remove_all(root3, ec);
+    }
+
     std::printf("\n结果：%s  （通过 %s，失败 %d，跳过 %d）\n",
                 g_fail == 0 ? "ALL PASS" : "FAILED",
                 g_fail == 0 ? "全部" : "见上方 [FAIL]",
