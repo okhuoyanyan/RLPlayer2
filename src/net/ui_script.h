@@ -755,11 +755,15 @@ function renderArtistProfile(who, j, summary) {
 }
 
 /* ---------------- 古典作品与版本推荐（P3④b Discogs L4 / 261023-03 第4条） ---------------- */
-function loadWorksView(initialTitle, initialComposer) {
+function loadWorksView(initialTitle, initialComposer, fromNp) {
   S.view = 'works';
+  S.worksFrom = fromNp ? 'np' : '';
   setView('works');
   S.view = 'works';
-  head('古典作品 · 演绎版本', '按作品名查不同指挥/乐团/年代的录音版本', '');
+  // 用户 261023-04 #9：左导航不再有「古典作品」入口，作品页只从单曲页「作品」tab 进入；
+  // 从单曲页进来时给一个明确的返回路径（回到正在播放页），不是无路可退。
+  head('古典作品 · 演绎版本', '按作品名查不同指挥/乐团/年代的录音版本',
+       (fromNp && S.lastCur) ? '<button class=btn id=wBackNp title="返回单曲播放页">← 返回正在播放</button>' : '');
 
   var defaultTitle = initialTitle || 'Boléro';
   var defaultComposer = (initialComposer !== undefined) ? initialComposer : 'Maurice Ravel';
@@ -800,6 +804,7 @@ function loadWorksView(initialTitle, initialComposer) {
   h += '</div>';
 
   D('list').innerHTML = h;
+  if (D('wBackNp')) D('wBackNp').onclick = function () { openNowPlaying(); };
 
   function doQuery(refresh) {
     var t = D('wTitle') ? D('wTitle').value.trim() : '';
@@ -1434,6 +1439,9 @@ function loadSettings() {
     var t = null;
     try { t = localStorage.getItem('rta-theme'); } catch (e) { }
     setTheme(t || kv.theme || 'dark', false);
+    // 用户 261023-04 #4：EQ/IR 芯片读的是上面刚填好的 ADV.eq / ADV.ir ——
+    // 设置页保存后立刻重绘单曲页（清空 EQ 后芯片要马上消失，不用重开页面）。
+    if (D('npPage') && D('npPage').classList.contains('on')) renderNp();
   }).catch(function () { });
 }
 
@@ -1667,8 +1675,9 @@ function saveSrc() {
 /* ---------------- 视图切换 ---------------- */
 function setView(v) {
   S.view = v;
+  if (v !== 'works') S.worksFrom = '';
   Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
-    e.classList.toggle('on', e.dataset.v === v || (v === 'artist' && e.dataset.v === 'artists') || (v === 'work' && e.dataset.v === 'works') || (v === 'eq' && e.dataset.v === 'eq'));
+    e.classList.toggle('on', e.dataset.v === v || (v === 'artist' && e.dataset.v === 'artists') || (v === 'eq' && e.dataset.v === 'eq'));
   });
   var isSet = (v === 'settings');
   // 设置页占满整屏：右栏（队列/歌词）在这里没有意义，直接藏掉。
@@ -1695,7 +1704,6 @@ Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
     setView(v);
     if (v === 'albums') loadAlbums('');
     else if (v === 'artists') loadArtists();
-    else if (v === 'works') loadWorksView();
     else if (v === 'tracks') loadTracks('');
     else if (v === 'files') loadFiles(S.dir || '');
     else if (v === 'remote') loadRemote('');
@@ -4071,60 +4079,285 @@ function openNowPlaying() {
 }
 function closeNowPlaying() { var pg = D('npPage'); if (pg) pg.classList.remove('on'); }
 
-var NP_SUMM_INFLIGHT = '';   // 单曲整页简介的在途请求键（防同一实体重复发请求）
-function updateNpSummary(m) {
-  var el = D('npSummary');
-  if (!el) return;
-  function hide() { el.style.display = 'none'; el.innerHTML = ''; }
-  // 开关关 / 无元数据 / 没配 key 且无本地缓存 → 不显示、不留空白区块（用户 261023-03 #2/#4）。
-  // 单曲播放页显示的是【所属专辑】的简介（kind=release + artist），不是每首歌各调一次（用户 261023-03 #3）。
-  var canSumm = m && (m.summaryAvailable || m.summaryCached || m.summaryCacheOk || m.hasLlmKey === true || META.hasLlmKey === true);
-  if (!META.summary || !m || !canSumm) { el.dataset.targetKey = ''; el.dataset.loaded = '0'; hide(); return; }
-  var targetKind = m.summaryKind || 'release';
-  var targetName = m.summaryTarget || '';
-  var targetArtist = '';
-  if (targetKind === 'release') {
-    if (!targetName) targetName = m.album || '';
-    // 与后端 /api/meta 计算实体 ID 时用同一个 artist（albumArtist 优先），否则同一专辑会算出两个缓存键 → 重复付费
-    targetArtist = m.summaryArtist || m.albumArtist || m.artist || '';
-  } else if (!targetName) {
-    targetName = m.artist || '';
-  }
-  if (!targetName) { el.dataset.targetKey = ''; el.dataset.loaded = '0'; hide(); return; }
+/* ---------------- 单曲页「资料」面板（用户 261023-04 #7/#9） ----------------
+   数据：GET /api/entity/summary?kind=track|release|person&name=..&artist=..&lang=zh
+     - 未命中时后端返回 {pending:true}，用 fetchSummary 的 2s 轮询等结果；
+     - 命中：{ok:true, sections, citations, summaryKind, summaryCached, unverified?}
+   行为（费用纪律）：
+     - 打开单曲页自动加载「专辑 + 艺术家」（有缓存则秒回，不闪加载行）；
+     - 「歌曲」只在首次切到该 tab 时请求（按曲目缓存，不随每首歌自动烧钱）；
+     - 「作品」只在判定为古典时出现，走 /api/entity/versions（Discogs 版本推荐），
+       并提供进入「古典作品」整页的入口（左导航已按 #9 移除）。
+   状态机：idle → loading（骨架）→ ok / error；切歌/关页丢弃过期回调。 */
+var NP_DATA = { key: '', active: '', tabs: [], cache: {}, inflight: {}, req: 0 };
 
-  var curKey = targetKind + ':' + targetName + ':' + targetArtist;
-  if (el.dataset.targetKey === curKey && el.dataset.loaded === '1') { el.style.display = ''; return; }
-  if (el.dataset.targetKey !== curKey) {
-    el.dataset.targetKey = curKey;
-    el.dataset.loaded = '0';
-    el.innerHTML = '';
+function npFileName(p) {
+  var s = String(p || '').replace(/\\/g, '/');
+  var i = s.lastIndexOf('/');
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+function npPlayingKindText(m) {
+  var t = '正在播放';
+  if (!m) return t;
+  var b = [];
+  if (m.codec) b.push(String(m.codec).toUpperCase());
+  if (m.sampleRate) b.push((m.sampleRate / 1000).toFixed(m.sampleRate % 1000 ? 1 : 0) + ' kHz');
+  if (m.bits) b.push(m.bits + ' bit');
+  return t + (b.length ? '  ·  ' + b.join(' / ') : '');
+}
+// 古典判定：后端若回 composer 字段则直接算；否则用 genre/专辑名/曲名特征兜底。
+// 只有特征命中才出现「作品」tab，避免给流行专辑无端加一个会发 Discogs 请求的入口。
+function npIsClassical(m) {
+  if (!m) return false;
+  if (m.composer && String(m.composer).trim()) return true;
+  var g = String(m.genre || ''), a = String(m.album || ''), t = String(m.title || '');
+  if (/classical|古典|classique|baroque|巴洛克|opera|オペラ/i.test(g)) return true;
+  if (/古典/.test(a)) return true;
+  var s = a + ' ' + t;
+  return /(symphon|concerto|sonata|caprice|capriccio|nocturne|prelude|overture|string quartet|requiem|mass in|opus\s*\d|op\.\s*\d+|kv\.?\s*\d+|bwv\s*\d+|symphonie|konzert|奏鸣曲|交响|协奏|练习曲|夜曲|前奏曲|序曲|组曲|安魂曲|作品\s*\d+)/i.test(s);
+}
+// 作曲家猜测（后端暂未回 composer 时的兜底）：曲名末尾括号（(Tchaikovsky)）、
+// 专辑名冒号前缀（Paganini: ...）。猜不到就留空（/api/entity/versions 的 composer 是可选的）。
+function npGuessComposer(m) {
+  if (!m) return '';
+  if (m.composer) return String(m.composer);
+  var a = String(m.album || ''), t = String(m.title || '');
+  var pm = t.match(/\(([A-Z][A-Za-z\u00c0-\u024f.' -]{2,40})\)\s*$/);
+  if (pm) return pm[1].trim();
+  var i = a.indexOf(':');
+  if (i > 1) {
+    var pre = a.slice(0, i).trim();
+    if (pre && pre.split(/\s+/).length <= 3 && /^[A-Za-z\u00c0-\u024f.' -]+$/.test(pre)) return pre;
   }
-
-  // 只有真要现场整理（有 key 且无缓存）才显示那一行灰字；命中缓存时等本地接口直接出内容，
-  // 避免「一闪而过的加载文案」。没 key 时后端只会回缓存或失败，也不需要加载行。
-  if (!m.summaryCached && m.hasLlmKey === true) {
-    el.style.display = '';
-    el.innerHTML = '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>';
-  } else {
-    hide();
+  return '';
+}
+function npWorkTarget(m) {
+  if (!m) return { title: '', composer: '' };
+  return { title: String(m.title || ''), composer: npGuessComposer(m) };
+}
+// 当前 EQ / IR 芯片（用户 261023-04 #4）：读 /api/settings 的 eq/ir（loadSettings 填进 ADV），
+// 有值才出现；点击跳「EQ 与房间校正」页；tooltip 显示当前文件。
+function npEqChipsHtml() {
+  var h = '';
+  var eq = ADV.eq || '', ir = ADV.ir || '';
+  if (eq) {
+    h += '<button class=chip id=npEqChip title="' + esc('当前 EQ：' + npFileName(eq) + '（点击打开 EQ 与房间校正）') + '">' +
+         '<svg width=11 height=11 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 style="vertical-align:-1px"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>EQ</button>';
   }
-
-  var u = '/api/entity/summary?kind=' + targetKind + '&name=' + encodeURIComponent(targetName) +
-          (targetArtist ? ('&artist=' + encodeURIComponent(targetArtist)) : '') + '&lang=zh';
-  if (NP_SUMM_INFLIGHT === curKey) return;   // 同一实体在途 → 不重复发（每次切歌只发 1 个请求）
-  NP_SUMM_INFLIGHT = curKey;
-  fetchSummary(u, function (s) {
-    if (NP_SUMM_INFLIGHT === curKey) NP_SUMM_INFLIGHT = '';
-    if (!D('npSummary') || el.dataset.targetKey !== curKey) return;
-    if (s && s.ok && s.sections && s.sections.length > 0) {
-      el.dataset.loaded = '1';
-      el.style.display = '';
-      el.innerHTML = renderSummaryContent(s, '简介');
-      bindCopyChips(el);
-    } else {
-      hide();
-    }
+  if (ir) {
+    h += '<button class=chip id=npIrChip title="' + esc('当前 IR：' + npFileName(ir) + '（点击打开 EQ 与房间校正）') + '">' +
+         '<svg width=11 height=11 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 style="vertical-align:-1px"><path d="M3 12h3l2-6 3 12 2-8 2 4h6"/></svg>IR</button>';
+  }
+  return h;
+}
+function npBindEqChips() {
+  var eq = D('npEqChip'), ir = D('npIrChip');
+  if (eq) eq.onclick = function () { closeNowPlaying(); setView('eq'); loadEqView(); };
+  if (ir) ir.onclick = function () { closeNowPlaying(); setView('eq'); loadEqView(); };
+}
+function npDataReset() {
+  NP_DATA = { key: '', active: '', tabs: [], cache: {}, inflight: {}, req: 0 };
+  var b = D('npDataBody'); if (b) b.innerHTML = '';
+  var t = D('npTabs'); if (t) t.innerHTML = '';
+  var s = D('npDataStat'); if (s) s.textContent = '';
+}
+function npDataTargets(m) {
+  var out = [];
+  var title = String((m && m.title) || '') || ((D('npt') && D('npt').textContent) || '');
+  var album = String((m && m.album) || '');
+  var albumArtist = String((m && m.albumArtist) || '');
+  var artist = String((m && m.artist) || '');
+  if (title) out.push({ k: 'track', label: '歌曲', name: title, artist: artist });
+  if (album && album !== title) {
+    var relArtist = (m && m.summaryArtist) || albumArtist || artist;
+    out.push({ k: 'release', label: '专辑', name: album, artist: relArtist });
+  }
+  var personName = albumArtist || artist;
+  if (personName) out.push({ k: 'person', label: '艺术家', name: personName, artist: '' });
+  if (npIsClassical(m)) {
+    var w = npWorkTarget(m);
+    if (w.title) out.push({ k: 'work', label: '作品', name: w.title, artist: '', composer: w.composer });
+  }
+  return out;
+}
+function npDataCan(m) {
+  return !!(META.summary && m && (m.summaryAvailable || m.summaryCached || m.summaryCacheOk || META.hasLlmKey === true));
+}
+function npDataTab(kind) {
+  var tabs = NP_DATA.tabs || [];
+  for (var i = 0; i < tabs.length; ++i) if (tabs[i].k === kind) return tabs[i];
+  return null;
+}
+function npDataRenderTabs() {
+  var el = D('npTabs'); if (!el) return;
+  var h = '';
+  (NP_DATA.tabs || []).forEach(function (t) {
+    h += '<button class="npdtab' + (NP_DATA.active === t.k ? ' on' : '') + '" data-k="' + esc(t.k) + '">' + esc(t.label) + '</button>';
   });
+  el.innerHTML = h;
+  Array.prototype.forEach.call(el.querySelectorAll('.npdtab'), function (b) {
+    b.onclick = function () { npDataActivate(b.dataset.k); };
+  });
+}
+function npDataStatHtml(kind, st) {
+  if (st.state === 'idle' || st.state === 'loading') return '整理中…';
+  if (st.state === 'error') return '暂无资料';
+  var d = st.data || {};
+  if (kind === 'work') {
+    var n = (d.performances || []).length;
+    return (d.from_cache ? '缓存' : 'Discogs 实时') + (n ? ' · ' + n + ' 个版本' : '');
+  }
+  return (d.summaryCached ? '已缓存' : '刚刚整理') + (d.unverified ? ' · 未核对' : '');
+}
+function npDataSkeleton() {
+  return '<div class=npdskel><i style="width:92%"></i><i style="width:76%"></i><i style="width:84%"></i></div>' +
+         '<div class=npdhint>正在整理资料…</div>';
+}
+function npDataSummaryBody(d) {
+  var h = '';
+  var citMap = {};
+  (d.citations || []).forEach(function (c, idx) { citMap[c.id] = idx + 1; });
+  (d.sections || []).forEach(function (sec) {
+    h += '<div class=npdsec>';
+    if (sec.heading && sec.heading !== '概述' && sec.heading !== '简介') h += '<h4>' + esc(sec.heading) + '</h4>';
+    (sec.paragraphs || []).forEach(function (p) {
+      var sups = '';
+      (p.citations || []).forEach(function (cid) {
+        if (citMap[cid]) sups += '<sup style="color:var(--mut2);font-size:10px;margin-left:1px">[' + citMap[cid] + ']</sup>';
+      });
+      h += '<p>' + esc(p.text) + sups + '</p>';
+    });
+    h += '</div>';
+  });
+  if ((d.citations || []).length) {
+    h += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 6px">';
+    (d.citations || []).forEach(function (c, idx) {
+      h += '<button class="btn chip-copy" data-url="' + esc(c.url) + '" title="复制来源链接" style="font-size:10.5px;padding:1px 7px">[' + (idx + 1) + '] ' + esc(c.title || c.source || '来源') + '</button>';
+    });
+    h += '</div>';
+  }
+  h += '<div class=npdhint>' + (d.unverified ? '未核对 · ' : '') +
+       (d.summaryCached ? '缓存结果 · ' : '实时整理 · ') + '依据来源整理，可能不完整，请以来源为准</div>';
+  return h;
+}
+function npDataWorkBody(d) {
+  var perfs = (d && d.performances) || [];
+  var w = npDataTab('work') || { name: '', composer: '' };
+  if (!d || !d.ok || !perfs.length) {
+    return '<div class=npdhint>未在 Discogs 检索到该作品的演绎版本（可能网络不可达或作品名不匹配）。</div>' +
+           '<div class=npdhint style="margin-top:6px">作品：' + esc(w.name) + (w.composer ? (' · ' + esc(w.composer)) : '') + '</div>' +
+           '<div style="margin-top:8px"><button class=btn id=npWorkRetry>重试查询</button></div>';
+  }
+  var sub = (d.from_cache ? ('缓存 · ' + (d.generated_at ? fmtDate(d.generated_at) : '')) : 'Discogs 实时') +
+            ' · 不同演绎 ' + (typeof d.distinctCount === 'number' ? d.distinctCount : perfs.length) +
+            ' / 发行版本 ' + (typeof d.releaseCount === 'number' ? d.releaseCount : perfs.length);
+  var h = '<div class=npdhint style="margin-bottom:6px">' + esc(sub) + '</div>';
+  perfs.forEach(function (p) {
+    var ens = p.ensemble || p.orchestra || '';
+    var meta = [p.conductor, ens, p.label, p.format].filter(function (x) { return !!x; }).join(' · ');
+    h += '<div class=npdwork>' +
+         '<span class=wy>' + (p.year > 0 ? p.year : '—') + '</span>' +
+         '<span class=wt title="' + esc(p.title) + '">' + esc(p.title || '—') + '</span>' +
+         '<span class=wp title="' + esc(meta) + '">' + esc(meta || '—') + '</span>' +
+         '<button class="btn chip-copy" data-url="' + esc(p.url) + '" title="复制版本链接" style="font-size:10px;padding:1px 6px;flex:none">复制</button>' +
+         '</div>';
+  });
+  h += '<div style="margin-top:10px"><button class="btn pri" id=npWorkOpen>查看 Discogs 版本推荐 →</button></div>';
+  return h;
+}
+function npDataRenderBody() {
+  var body = D('npDataBody'), stat = D('npDataStat');
+  if (!body) return;
+  var kind = NP_DATA.active;
+  if (!kind) { body.innerHTML = ''; if (stat) stat.textContent = ''; return; }
+  var st = NP_DATA.cache[kind] || { state: 'idle' };
+  if (stat) stat.textContent = npDataStatHtml(kind, st);
+  if (st.state === 'idle' || st.state === 'loading') { body.innerHTML = npDataSkeleton(); return; }
+  if (st.state === 'error') {
+    body.innerHTML = '<div class=npdhint>暂无该实体的资料。' + (st.error ? ('（' + esc(st.error) + '）') : '') + '</div>' +
+      '<div style="margin-top:8px"><button class=btn id=npDataRetry>重试</button></div>';
+    var rb = D('npDataRetry');
+    if (rb) rb.onclick = function () { npDataEnsure(kind, true); };
+    return;
+  }
+  if (kind === 'work') {
+    body.innerHTML = npDataWorkBody(st.data);
+    bindCopyChips(body);
+    var wo = D('npWorkOpen'); if (wo) wo.onclick = npOpenWorks;
+    var wr = D('npWorkRetry'); if (wr) wr.onclick = function () { npDataEnsure('work', true); };
+    return;
+  }
+  body.innerHTML = npDataSummaryBody(st.data);
+  bindCopyChips(body);
+}
+function npDataEnsure(kind, force) {
+  var t = npDataTab(kind); if (!t) return;
+  var st = NP_DATA.cache[kind];
+  if (!force && st && (st.state === 'loading' || st.state === 'ok')) return;
+  var fp = kind + '|' + t.name + '|' + (t.artist || '') + '|' + (t.composer || '');
+  if (!force && NP_DATA.inflight[fp]) return;
+  NP_DATA.inflight[fp] = 1;
+  var req = NP_DATA.req;
+  NP_DATA.cache[kind] = { state: 'loading' };
+  if (NP_DATA.active === kind) npDataRenderBody();
+
+  function done(data, err) {
+    delete NP_DATA.inflight[fp];
+    if (NP_DATA.req !== req) return;               // 已切歌 → 丢弃过期结果
+    if (!D('npPage') || !D('npPage').classList.contains('on')) return;
+    if (data) NP_DATA.cache[kind] = { state: 'ok', data: data };
+    else NP_DATA.cache[kind] = { state: 'error', error: err || '' };
+    if (NP_DATA.active === kind) npDataRenderBody();
+  }
+  if (kind === 'work') {
+    api('/api/entity/versions?kind=work&name=' + encodeURIComponent(t.name) +
+        (t.composer ? ('&composer=' + encodeURIComponent(t.composer)) : '') + (force ? '&refresh=1' : ''))
+      .then(function (j) { done((j && j.ok && (j.performances || []).length) ? j : null, j && j.error); })
+      .catch(function (e) { done(null, String(e)); });
+    return;
+  }
+  var u = '/api/entity/summary?kind=' + kind + '&name=' + encodeURIComponent(t.name) +
+          (t.artist ? ('&artist=' + encodeURIComponent(t.artist)) : '') + '&lang=zh' + (force ? '&refresh=1' : '');
+  fetchSummary(u, function (s) {
+    if (s && s.ok && s.sections && s.sections.length > 0) done(s, '');
+    else done(null, (s && s.error) || '');
+  });
+}
+function npDataActivate(kind) {
+  NP_DATA.active = kind;
+  npDataRenderTabs();
+  npDataEnsure(kind, false);
+  npDataRenderBody();
+}
+// 打开「古典作品 · 演绎版本」整页（左导航已移除，这是唯一入口；返回按钮见 loadWorksView）
+function npOpenWorks() {
+  var w = npWorkTarget(S.curMeta);
+  closeNowPlaying();
+  loadWorksView(w.title || '', w.composer || '', true);
+}
+function updateNpData(m) {
+  var sec = D('npData'), grid = D('npGrid');
+  if (!sec) return;
+  var key = S.lastCur || '';
+  if (NP_DATA.key !== key) { npDataReset(); NP_DATA.key = key; NP_DATA.req++; }
+  var can = npDataCan(m);
+  var tabs = can ? npDataTargets(m) : [];
+  if (!can || !tabs.length) {
+    sec.classList.remove('on');
+    if (grid) grid.classList.remove('withdata');
+    return;
+  }
+  sec.classList.add('on');
+  if (grid) grid.classList.add('withdata');
+  NP_DATA.tabs = tabs;
+  function has(k) { return tabs.some(function (t) { return t.k === k; }); }
+  if (!NP_DATA.active || !has(NP_DATA.active)) {
+    NP_DATA.active = has('release') ? 'release' : (has('person') ? 'person' : (has('track') ? 'track' : 'work'));
+  }
+  npDataRenderTabs();
+  // 自动预取「专辑 + 艺术家」；「歌曲」「作品」必须用户点 tab 才请求（费用纪律）
+  ['release', 'person'].forEach(function (k) { if (has(k) && !NP_DATA.cache[k]) npDataEnsure(k, false); });
+  npDataRenderBody();
 }
 
 // 单曲整页无内嵌封面时的占位图（内联 SVG，暗色黑胶；不引外部资源）
@@ -4143,10 +4376,14 @@ function renderNp() {
   var sub = (D('npart') && D('npart').textContent) || '';
   var st = (D('nps') && D('nps').textContent) || '';
   D('npSub').textContent = sub + (st ? '  ·  ' + st : '');
-  // 元数据补全芯片（loadMeta 异步回来时也会走到这里刷一次）
-  if (D('npMeta')) D('npMeta').innerHTML = S.npMetaHtml || '';
+  if (D('npKind')) D('npKind').textContent = npPlayingKindText(S.curMeta);
+  // 元数据补全芯片 + 当前 EQ/IR 芯片（loadMeta / loadSettings 异步回来时也会走到这里刷一次）
+  if (D('npMeta')) {
+    D('npMeta').innerHTML = (S.npMetaHtml || '') + npEqChipsHtml();
+    npBindEqChips();
+  }
   updateFavUi();
-  updateNpSummary(S.curMeta);
+  updateNpData(S.curMeta);
   var bg = (D('cv') && D('cv').style.backgroundImage) || '';
   if (bg && bg.indexOf('url(') === 0) {
     D('npbg').style.backgroundImage = bg;

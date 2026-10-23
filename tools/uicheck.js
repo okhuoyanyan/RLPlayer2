@@ -120,14 +120,14 @@ async function waitFor(expr, ms = 8000) {
   ck(await evalJs("!document.querySelector('#list .empty')"), '主内容区没有落到空状态');
   const p1 = await shot('01-albums');
 
-  // ---- 验收 1：导航里有「古典作品」「EQ 与房间校正」 ----
+  // ---- 验收 1：导航里有「EQ 与房间校正」；「古典作品」已按 261023-04 #9 移出导航 ----
   const navOk = await evalJs(`(function(){
     var navs = Array.from(document.querySelectorAll('.nav')).map(e => e.textContent.trim());
     var hasClassical = navs.some(t => t.indexOf('古典作品') >= 0);
     var hasEq = navs.some(t => t.indexOf('EQ 与房间校正') >= 0);
-    return { ok: hasClassical && hasEq, hasClassical: hasClassical, hasEq: hasEq, navs: navs };
+    return { ok: !hasClassical && hasEq, hasClassical: hasClassical, hasEq: hasEq, navs: navs };
   })()`);
-  ck(navOk.ok, '导航里有「古典作品」「EQ 与房间校正」', JSON.stringify(navOk));
+  ck(navOk.ok, '导航里没有「古典作品」、仍有「EQ 与房间校正」', JSON.stringify(navOk));
   await shot('01-nav-classical-eq', true);
 
   // 点第一张专辑
@@ -251,10 +251,10 @@ async function waitFor(expr, ms = 8000) {
   await evalJs("document.getElementById('bBackArtists').click()");
   await sleep(500);
 
-  // ---- P3④b：作品与 Discogs 版本推荐页 ----
-  await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='works').click()");
+  // ---- P3④b：作品与 Discogs 版本推荐页（261023-04 #9：已无导航入口，从单曲页「作品」tab 进入）----
+  await evalJs("loadWorksView()");
   await sleep(600);
-  ck(await evalJs("S.view === 'works'"), '作品导航可进入且当前视图为 works');
+  ck(await evalJs("S.view === 'works' && !!document.getElementById('wTitle')"), '作品页仍可进入（入口已移到单曲页「作品」tab）');
   ck(await evalJs("!!document.getElementById('wTitle') && !!document.getElementById('wComposer') && !!document.getElementById('bSearchVersions')"),
      '作品页搜索控件完整（作品名、作曲家输入框与查询按钮存在）');
   ck(await evalJs("document.querySelectorAll('.chip-work').length >= 3"),
@@ -740,9 +740,15 @@ async function waitFor(expr, ms = 8000) {
   await sleep(400);
   ck(await evalJs("document.getElementById('npPage').classList.contains('on')"), '点封面可以打开正在播放页');
   ck(await evalJs("!!document.getElementById('npMeta') && document.getElementById('npMeta').closest('#npPage') !== null"), '正在播放页有 #npMeta 芯片容器');
-  ck(await evalJs("!!document.getElementById('npSummary') && document.getElementById('npSummary').closest('#npPage') !== null"), '正在播放页有 #npSummary 简介容器');
-  ck(await evalJs("getComputedStyle(document.getElementById('npSummary')).display === 'none'"),
-     '开关关闭时正在播放页不显示简介板块（不留空白块）');
+  // 261023-04 #7：单曲页资料区改为多实体分区面板（歌曲/专辑/艺术家/作品），#npSummary 已移除
+  ck(await evalJs("!!document.getElementById('npData') && document.getElementById('npData').closest('#npPage') !== null"), '正在播放页有 #npData 资料面板容器');
+  ck(await evalJs("!!document.getElementById('npTabs') && !!document.getElementById('npDataBody')"), '资料面板有 tab 条与内容区');
+  ck(await evalJs("!document.getElementById('npSummary')"), '旧的单一 #npSummary 简介容器已移除');
+  // #6 几何回归：歌词区与进度条在任何窗口尺寸下不得重叠（1024x640 曾压在一起）
+  ck(await evalJs("(function(){var a=document.getElementById('npLyric').getBoundingClientRect(),b=document.getElementById('npSeek').getBoundingClientRect();return a.bottom<=b.top && b.top-a.bottom>=12;})()"),
+     '歌词区与进度条不重叠且间距 >= 12px');
+  ck(await evalJs("(function(){var a=document.getElementById('npData').getBoundingClientRect(),b=document.getElementById('npSeek').getBoundingClientRect();return a.bottom<=b.top;})()"),
+     '资料区与进度条不重叠');
   // 空态文案要用「清掉歌词后的 renderNpLyric」来验：实例上可能正停着一首带在线歌词的曲子
   // （LY.lines 非空 → 显示的是歌词而不是空态），那是正常业务态，不是文案缺失。
   ck(await evalJs("(function(){var keep=LY.lines;LY.lines=[];renderNpLyric();var ok=document.getElementById('npLyric').innerHTML.indexOf('在线补全')>=0;LY.lines=keep;var b=document.getElementById('npLyric');if(b){b.dataset.n='';}renderNpLyric();return ok;})()"), '歌词空态提示「播放时自动在线补全」');
