@@ -413,11 +413,26 @@ private:
         }
 
         // 3) 启动本地 HTTP 供源服务
-        uint16_t servePort = p.port ? p.port : 8912;
+        // 2026-10-24（261024-02 #5 实测）：8912 可能被别的程序占用（本机 Clash/verge-mihomo 就长期监听
+        // 0.0.0.0:8912）⟹ 投放直接失败。改为在 8912..8921 里挑第一个能绑上的端口，
+        // 实际端口写回 state_.servePort（UI 与取流 URL 都以 state 为准，不假设 8912）。
+        const uint16_t wantPort = p.port ? p.port : 8912;
         UpnpHttpServer server;
-        if (!server.start(servePort, "0.0.0.0")) {
-            fail("无法在 0.0.0.0:" + std::to_string(servePort) + " 启动 HTTP 供源服务（端口可能被占用）");
+        uint16_t servePort = wantPort;
+        bool bound = false;
+        for (uint16_t i = 0; i < 10; ++i) {
+            servePort = (uint16_t)(wantPort + i);
+            if (server.start(servePort, "0.0.0.0")) { bound = true; break; }
+            if (stopReq_.load()) break;
+        }
+        if (!bound) {
+            fail("无法在 0.0.0.0:" + std::to_string(wantPort) + "–" + std::to_string((int)wantPort + 9) +
+                 " 启动 HTTP 供源服务（端口全被占用）");
             return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            state_.servePort = servePort;
         }
 
         std::string localIp = upnp_local_ip_for(targetDev.host, (uint16_t)targetDev.port);
