@@ -185,6 +185,9 @@ struct Bench {
         h.dop = false;
         h.onShared = false;
         h.starveEnabled = false;     // 本文件只测 C2/C3；STARVING 由 test_renderfail 覆盖
+        // 本文件的 mock 时钟只在 wait_event 里推进（旧时序模型），用来确定性表达 dry 语义；
+        // 新时序（先写后等）另有 TestFastFeed 覆盖，那里 mock 按「写入帧数」推进时钟。
+        h.fastFeed = false;
         h.statPeriodSec = 1.0;       // 虚拟时钟下 1 秒一条 STAT，便于断言字段
         return h;
     }
@@ -200,6 +203,57 @@ struct Bench {
         }
         rq.done = true;
     }
+};
+
+// ---- mock：按采样率连续消耗的设备（新时序模型）----
+// pad = 已写入 − 已渲染，渲染量由虚拟时钟决定 ⟹「等待多久」直接决定排空多少，
+// 新旧补料时序的差别才会体现在 dry 上（对应真机 546 vs 10）。
+struct DrainingSink : OutSink {
+    DrainingSink(double* clk, long long bf, long long per, double rate)
+        : clk_(clk), bf_(bf), per_(per), rate_(rate) {}
+    bool open(const SinkOpenOpts&, uint32_t, int, int) override { return true; }
+    bool start() override { return true; }
+    size_t buffer_frames() const override { return (size_t)bf_; }
+    long long device_period_frames() const override { return per_; }
+    bool wait_event(int ms) override {
+        *clk_ += (double)ms / 1000.0;
+        // 块传输模型：这两台 USB 设备实际是「整块取走」——真机日志里 pad 只在
+        // full(bf) 与 0 之间跳，看不到中间值。所以一次等待期间设备把缓冲取空。
+        // 新时序的价值就在于：它在等之前先看一眼、能写就先写，不把「已经空了」这件事
+        // 拖到下一个轮询周期才发现。
+        written_ = (long long)(*clk_ * rate_);
+        return true;
+    }
+    size_t write_one_period(const int32_t* p, size_t n) override { return write_available(p, n); }
+    size_t write_available(const int32_t*, size_t n) override {
+        if (n == 0) return 0;
+        const long long room = bf_ - current_pad();
+        if (room <= 0) { ++padFull_; return 0; }
+        size_t w = (size_t)(room < (long long)n ? room : (long long)n);
+        if (per_ > 1) w = (w / (size_t)per_) * (size_t)per_;
+        if (w == 0) return 0;
+        written_ += (long long)w;
+        return w;
+    }
+    long long last_pad() const override { return current_pad(); }
+    const std::string& last_error() const override { return e_; }
+    long long zero_pad_full() const override { return padFull_; }
+    long long zero_starved() const override { return 0; }
+    std::string zero_reason() const override { return "-"; }
+
+    long long current_pad() const {
+        const long long rendered = (long long)(*clk_ * rate_);
+        long long pad = written_ - rendered;
+        if (pad < 0) pad = 0;
+        if (pad > bf_) pad = bf_;
+        return pad;
+    }
+    double* clk_;
+    long long bf_, per_;
+    double rate_;
+    long long written_ = 0;
+    long long padFull_ = 0;
+    std::string e_;
 };
 
 int main() {
@@ -368,6 +422,44 @@ int main() {
         for (const auto& s : b.logs)
             if (s.rfind("BUFPOLICY l2_degraded", 0) == 0) sawNote = true;
         ck(sawNote, "日志留下 BUFPOLICY l2_degraded 归因");
+    }
+
+    // ---- 6. 补料时序（P0）：同一台「连续消耗」的设备，新旧时序的 dry 对比 ----
+    // 2026-10-24 真机（iBasso DC-Elite，48k/100ms/55s）实测：旧时序 dry=546；
+    // 新时序 dry=10、dryms=0。这里用连续消耗模型（pad = 已写入 − 已渲染）重现该结论。
+    {
+        std::printf("[补料时序 fastFeed]\n");
+        auto run = [](bool fast, long long* dryOut, long long* dryMsOut, bool* statSeen) {
+            Bench b;
+            b.feed_frames(96000u * 8u);
+            auto h = b.make(96000);
+            h.fastFeed = fast;
+            // 新时序一轮只推进约 5ms 虚拟时钟（等待上限 per/2），整段跑完不足 1 秒，
+            // 用默认 1s STAT 周期会一条都打不出来 —— 本用例要断言 STAT，故压到 0.1s。
+            h.statPeriodSec = 0.1;
+            DrainingSink sink(&b.clock, /*bf=*/9600, /*per=*/960, /*rate=*/96000.0);
+            rta::render::render_loop(sink, h);
+            *dryOut = b.dry.load();
+            *dryMsOut = b.dryMs.load();
+            *statSeen = !last_stat(b.logs).empty();
+        };
+        long long dryFast = 0, dryMsFast = 0, drySlow = 0, dryMsSlow = 0;
+        bool statFast = false, statSlow = false;
+        run(true,  &dryFast, &dryMsFast, &statFast);
+        run(false, &drySlow, &dryMsSlow, &statSlow);
+
+        ck(statFast && statSlow, "两种时序下 STAT 都有输出");
+        // 关掉新时序（旧顺序 wait(20ms)→写）会让设备先空转 20ms 才补：
+        // dry 明显高于新时序。这是真机 546 vs 10 的 mock 版本。
+        ck(drySlow > dryFast,
+           "旧时序 dry 明显高于新时序（先写后等消除补料迟到）",
+           "slow=" + std::to_string(drySlow) + " fast=" + std::to_string(dryFast));
+        ck(dryFast * 10 <= drySlow,
+           "新时序 dry ≤ 旧时序的 1/10",
+           "slow=" + std::to_string(drySlow) + " fast=" + std::to_string(dryFast));
+        ck(dryMsFast < dryMsSlow,
+           "新时序 dryms 低于旧时序",
+           "slow=" + std::to_string(dryMsSlow) + "ms fast=" + std::to_string(dryMsFast) + "ms");
     }
 
     std::printf("\n%s（失败 %d 项）\n", g_fail == 0 ? "render_loop_dry 全部通过" : "存在失败", g_fail);

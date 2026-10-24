@@ -221,6 +221,9 @@ struct Bench {
         rta::render::RenderHost h = make(/*fallbackOk=*/true, /*dop=*/false);
         h.deviceRate = rate;
         h.nowSec = [this]() { return clock; };
+        // 本组用例的 mock 时钟只在 wait_event 里推进（旧时序模型）；它们测的是 STARVING
+        // 判据本身，不是补料时序 ⟹ 显式关掉新时序，避免时钟不推进时打转。
+        h.fastFeed = false;
         h.starveEnabled = true;
         h.starveWindowSec = 1.0;
         h.starveRatio = 0.90;

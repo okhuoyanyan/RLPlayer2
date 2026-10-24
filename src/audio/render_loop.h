@@ -183,6 +183,14 @@ struct RenderHost {
     double starveSecs      = 3.0;        // 连续不足累计达此秒数 ⟹ STARVING 归因
     bool   starveEnabled   = true;       // 供测试/特殊后端关闭
 
+    // ---- P0：补料时序（2026-10-24 DC-Elite 真机 A/B）----
+    // true（默认）=「先按可用空间补写 → 写不进去才等事件」，等待上限 per/2；
+    // false = 旧时序「wait_event(20) → 写」。
+    // 为什么是 flag 而不是环境变量：真机实测已经证明默认必须走新时序，而既有 dry 用例
+    // 的 mock 时钟只在 wait_event 里推进（旧时序模型），它们需要显式关掉这个 flag
+    // 才能继续表达「dry 语义」这件事；新时序另有专门用例覆盖。
+    bool   fastFeed        = true;
+
     // ---- C1 L2 起播看门狗（2026-10-24 N300 欠载 / 方案 §5.2）----
     // Start 之后 800 ms 内【手里已有数据】却一个字节都没写进去（MOTU 形态：Initialize
     // 接受但流不推进）⟹ 调 l2Degrade 重开 20 ms。返回 true = 降级并已重新 Start，
@@ -240,12 +248,6 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
     // ---------------- C2 遥测状态（2026-10-24 N300 欠载；纯观测）----------------
     // 全部是本地计数：不加锁、不分配（evRing 固定 64 槽），不改变写入/调度/DSP。
     const double loopStartT = nowSec();   // 起播时刻（dry 的 500ms 门槛、WFAIL 的 t= 都相对它）
-    // ★ P0-1/P0-2 开关（2026-10-24）：RTA_FAST_FEED=1 时改成「先写后等 + 等待上限 per/2」。
-    // 默认关闭 ⟹ 生产路径与既有回归测试逐字不变；真机 A/B 验证有效后再转正为默认。
-    static const bool g_fastFeed = [] {
-        const char* v = std::getenv("RTA_FAST_FEED");
-        return v && v[0] == '1';
-    }();
     long long dryN      = 0;      // dry：设备缓冲空 + 手里有数据 + 我们一个字节也写不进去
     double    dryAccMs  = 0.0;    // 已结算的 dry 墙钟毫秒
     double    dryEnterT = 0.0;    // 当前 dry 片段起点
@@ -452,13 +454,21 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
         // 每次 19.6ms —— 与 20ms 轮询上限完全吻合，即「每次都在下一个轮询才发现缓冲空了」。
         // 新顺序：① 先按当前可用空间补写（不睡）；② 写不进去才阻塞等事件，
         // 等待上限取 per/2（per=480@48k ⟹ 5ms），不再固定 20ms。
-        // 先做成 RTA_FAST_FEED=1 的开关：默认路径逐字不变，这样既有回归测试仍然有效，
-        // 真机验证通过后再转正并同步更新 mock 测试（铁律 3：先证明再改判据）。
+        // 2026-10-24 真机转正为默认（h.fastFeed=true）；旧时序仅在 h.fastFeed=false 时保留，
+        // 供既有 dry 用例继续用「时钟只在 wait_event 推进」的旧 mock 模型表达 dry 语义。
         const size_t pendBefore = pendFrames;
         size_t w = 0;
         long long padBefore = 0;
-        if (g_fastFeed) {
-            w = sink.write_available(pend.data(), pendFrames);
+        // 每次 write_available 调用都记一次 w0/wr（而不是每轮一次）：
+        // 新时序下一轮最多调用两次，若仍按轮计，zp（按调用）会大于 w0，M4 的
+        // 「zp+zs+zo == w0」就不成立（真机现场 19925 vs 9693 就是这么来的）。
+        auto attemptWrite = [&]() -> size_t {
+            const size_t got = sink.write_available(pend.data(), pendFrames);
+            if (got > 0) h.dbgWr->fetch_add(1); else h.dbgW0->fetch_add(1);
+            return got;
+        };
+        if (h.fastFeed) {
+            w = attemptWrite();
             padBefore = sink.last_pad();            // 本次轮询的水位（写之前）
             if (w == 0) {
                 const long long perF = sink.device_period_frames();
@@ -477,7 +487,7 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                     }
                     evLastT = evT;
                 }
-                w = sink.write_available(pend.data(), pendFrames);
+                w = attemptWrite();
             }
         } else {
             const bool waited = sink.wait_event(20);
@@ -492,11 +502,10 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                 evLastT = evT;
             }
             padBefore = sink.last_pad();
-            w = sink.write_available(pend.data(), pendFrames);
+            w = attemptWrite();
         }
         h.dbgPad->store(padBefore);
         const double tAfter = nowSec();
-        if (w > 0) h.dbgWr->fetch_add(1); else h.dbgW0->fetch_add(1);
 
         // ---- C2 dry 计数（纯观测，方案 §6.3）----
         // 定义（与方案一致）：起播 500 ms 后，设备缓冲在本次写入前已经触底（pad==0）且
