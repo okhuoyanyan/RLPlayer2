@@ -131,7 +131,13 @@ struct ZeroAttrib {
 //   room 不足一个周期（如 room=4800、per=9600）⟹ 返回 0，这一轮什么也没写，
 //   ZeroAttrib 归因为 other —— 不是 padFull（设备缓冲并没有满）。
 inline size_t quantize_period_write(size_t toWrite, size_t per, size_t bufferFrames) {
-    if (per > 1 && per <= bufferFrames && (toWrite % per) != 0) toWrite = (toWrite / per) * per;
+    // ★ P0-3（2026-10-24，1.3.15 真机日志驱动）：只有「≥ 一个周期」时才向下取整到周期倍数。
+    // 不足一个周期的余量以前被归零 ⟹ DC-Elite 现场 w0=471 里 387 次（82%）都是这种余量，
+    // 白等到缓冲再次变空才写，直接表现为每 100 ms 一次的断音。
+    // 独占模式的 GetBuffer 只要求「不超过可用空间」；周期整数倍是 Initialize 缓冲时长的约束，
+    // 不是单次 GetBuffer 的约束（个别驱动会拒绝非整周期，write_available 里有失败回退）。
+    if (per > 1 && per <= bufferFrames && toWrite >= per && (toWrite % per) != 0)
+        toWrite = (toWrite / per) * per;
     return toWrite;
 }
 
@@ -674,7 +680,17 @@ public:
         const HRESULT gb = rc_->GetBuffer((UINT32)toWrite, &data);
         lastGbHr_ = (long long)gb;
         detail_.gbHr = (long long)gb;
-        if (FAILED(gb) || !data) return 0;
+        if (FAILED(gb) || !data) {
+            // P0-3 回退：上面允许了「不足一个周期」的写入，个别独占驱动会拒绝非整周期。
+            // 此时退回周期整数倍再试一次；本次仍失败则照旧返回 0（不改变错误语义）。
+            const size_t q = quantize_period_write(toWrite, per, bufferFrames_);
+            if (q == 0 || q == toWrite) return 0;
+            const HRESULT gb2 = rc_->GetBuffer((UINT32)q, &data);
+            lastGbHr_ = (long long)gb2;
+            detail_.gbHr = (long long)gb2;
+            if (FAILED(gb2) || !data) return 0;
+            toWrite = q;
+        }
         pack(data, src, toWrite);
         if (FAILED(rc_->ReleaseBuffer((UINT32)toWrite, 0))) return 0;
         written_ += toWrite;

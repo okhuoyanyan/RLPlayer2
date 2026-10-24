@@ -513,6 +513,9 @@ public:
     // 命名映射：wasapi_out.h 叫 last_zero_reason()，OutSink 叫 zero_reason()。
     long long zero_pad_full() const override { return ao_.zero_pad_full(); }
     long long zero_starved()  const override { return ao_.zero_starved(); }
+    // ③ other（含「有空间但不足一个周期 ⟹ 量化归零」）。不转发会让 STAT 的 zp/zs
+    // 与 w0 对不上：2026-10-24 DC-Elite 现场 w0=471 / zp=84 / zs=0，差 387 次全在这里。
+    long long zero_other()    const override { return ao_.zero_other(); }
     std::string zero_reason() const override { return ao_.last_zero_reason(); }
 
     // ---- C2 遥测转发（per / initRecipe / realigned / WFAIL 明细）----

@@ -69,6 +69,10 @@ struct OutSink {
     // 分不清「设备缓冲恒满」和「我们喂不上」。默认返回 -1 = 后端不支持该统计。
     virtual long long zero_pad_full() const { return -1; }   // ① 设备缓冲满
     virtual long long zero_starved()  const { return -1; }   // ② 供料不足一个周期
+    // ③ 其它（含「有空间但不足一个周期 → 整周期量化归零」）。
+    // 1.3.15 真机日志里 DC-Elite 的 w0=471 而 zp=84、zs=0，差的 387 次全在这个桶里，
+    // 但 STAT 从来没打印它 —— 看起来像「未归因」。补上它，zp+zs+zo 才能闭合到 w0。
+    virtual long long zero_other()    const { return -1; }
     virtual std::string zero_reason() const { return "-"; }  // 最近一次成因
 
     // ---------------- C2 遥测（2026-10-24 N300 欠载；纯观测，全部带默认值）----------------
@@ -414,8 +418,13 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                 //   zp=设备缓冲满（pad 满）  zs=供料不足一个周期（我们喂不上）
                 //   实测只要 zs>0 就说明瓶颈在【轮询粒度/供料】，不在设备。
                 const long long zp = sink.zero_pad_full(), zs = sink.zero_starved();
+                const long long zo = sink.zero_other();
+                // ★ 归因闭合（2026-10-24）：旧 STAT 只打 zp/zs，DC-Elite 现场
+                // w0=471 / zp=84 / zs=0 时「差 387 次」看似未归因，实际全在 ③ other
+                //（有空间但不足一个周期 ⟹ 量化归零）。三项必须同时打印才闭合。
                 if (zp >= 0 || zs >= 0)
-                    ls << " zp=" << zp << " zs=" << zs << " zr=" << sink.zero_reason();
+                    ls << " zp=" << zp << " zs=" << zs << " zo=" << zo
+                       << " zr=" << sink.zero_reason();
                 // ---- C2（2026-10-24 N300 欠载）：把「设备触底」数字化 ----
                 // per = 设备周期帧数（-1 = 该后端不报）；bf = 本循环用的缓冲帧数；
                 // dry/dryms = 轮询时设备缓冲已触底（pad==0）的次数与处于该状态的累计毫秒；

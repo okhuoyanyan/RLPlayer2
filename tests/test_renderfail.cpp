@@ -477,34 +477,45 @@ int main() {
     // 判据本体是 wasapi_out.h 的 quantize_period_write —— write_available 生产路径用的同一份。
     {
         using rta::audio::quantize_period_write;
-        ck(quantize_period_write(4800, 9600, 9600) == 0,
-           "room=4800 per=9600 ⟹ 量化归零（这一拍写不进去）");
-        ck(quantize_period_write(500, 960, 9600) == 0,
-           "avail=500 per=960 ⟹ 量化归零");
+        // ★ 2026-10-24 判据翻转（铁律 3）：旧断言把「不足一个周期 ⟹ 归零」写成了正确行为，
+        // 而 1.3.15 真机日志证明它是放大器：DC-Elite 现场 w0=471 里 387 次（82%）都是
+        // 「有空间但不足一个周期」。归零让这一拍什么都不写，缓冲随即触底 ⟹ 每 100ms 一次断音。
+        // 新契约：≥ 一个周期才对齐到周期倍数；不足一个周期的余量照写。
+        ck(quantize_period_write(4800, 9600, 9600) == 4800,
+           "room=4800 per=9600 ⟹ 照写 4800（旧行为归零，真机 82% 的 w0 就是它）");
+        ck(quantize_period_write(500, 960, 9600) == 500,
+           "avail=500 per=960 ⟹ 照写 500（余量不再丢弃）");
         ck(quantize_period_write(5760, 960, 9600) == 5760,
            "avail=5760 per=960 ⟹ 保持整周期");
         ck(quantize_period_write(1000, 960, 9600) == 960,
            "avail=1000 per=960 ⟹ 向下取整到 960（宁可少写也不报错）");
         ck(quantize_period_write(1000, 0, 9600) == 1000,
            "per 未知（0）⟹ 不量化");
-        // 旧内联条件是 per>1 && per<=buffer：per == 缓冲时【仍然】量化。这正好是
-        // 「独占 period==buffer」的常见形态（96k/20ms：per=1920=bf）—— avail 不足一个
-        // 周期就整拍归零，是我们喂不上时的一个真实放大器。
-        ck(quantize_period_write(1000, 9600, 9600) == 0,
-           "per == 缓冲 ⟹ 仍然量化（旧内联条件如此，实机常踩）");
+        // per == 缓冲（独占 period==buffer 的常见形态，96k/20ms：per=1920=bf）：
+        // 旧内联条件在这里把不足一个周期的余量也归零，是「喂不上」的真实放大器。
+        ck(quantize_period_write(1000, 9600, 9600) == 1000,
+           "per == 缓冲 ⟹ 不足一个周期也照写（不再归零）");
         ck(quantize_period_write(1000, 19200, 9600) == 1000,
-           "per > 缓冲 ⟹ 不量化（旧内联条件的边界保护）");
+           "per > 缓冲 ⟹ 不量化（边界保护不变）");
     }
 
     // ---- 13. C4：归因闭合 —— 每次「写不进去」必须恰好落进一类 ----
     // 现场用 zp+zs+other == w0 判断归因是否漏计（M4）。这里用同一份 classify/quantize
     // 跑一张小表：三行写不进去、一行成功，成功的行不许让任何计数增长。
     {
+        // classify 的三类契约不变（纯函数，后端可直接驱动）。
+        rta::audio::ZeroAttrib zc;
+        zc.classify(0, 0,    9600, 9600);   // ① 设备缓冲满
+        zc.classify(0, 9600, 500,  9600);   // ② 手里不足一个周期
+        zc.classify(0, 9600, 9600, 9600);   // ③ 其它
+        ck(zc.padFull == 1 && zc.starved == 1 && zc.other == 1,
+           "classify 三类契约不变（纯函数）");
+
         struct Row { size_t toWrite, room, avail, per; };
         const Row rows[] = {
             {0,     0,    9600, 9600},   // ① 设备缓冲满 ⟹ padFull
             {0,     9600, 4096, 9600},   // ② 手里不足一个周期 ⟹ starved
-            {4800,  4800, 9600, 9600},   // ③ 量化归零（room 不足一个周期）⟹ other
+            {4800,  4800, 9600, 9600},   // 旧行为：量化归零 ⟹ other；新行为：照写 4800
             {9600,  9600, 9600, 9600},   // 写成功 ⟹ 不计数
         };
         rta::audio::ZeroAttrib z;
@@ -518,8 +529,10 @@ int main() {
            "zp+zs+other == 写不进去的次数（归因闭合，无漏计/重复计）",
            "zp=" + std::to_string(z.padFull) + " zs=" + std::to_string(z.starved) +
            " other=" + std::to_string(z.other) + " zeroRows=" + std::to_string(zeroRows));
-        ck(z.padFull == 1 && z.starved == 1 && z.other == 1,
-           "三类成因各计一次（量化归零算 other，不算 pad=full）");
+        // P0-3 的直接效果：量化不再制造 other 桶（余量照写），这样 STAT 里
+        // w0 - zp - zs 只剩 genuine 的 other，不再是「看起来未归因」的 387 次。
+        ck(z.other == 0, "量化不再制造 other（余量照写）",
+           "other=" + std::to_string(z.other));
     }
 
     std::printf("\n%s（失败 %d 项）\n", g_fail == 0 ? "renderfail 全部通过" : "存在失败", g_fail);
