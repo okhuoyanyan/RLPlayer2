@@ -1737,6 +1737,10 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             // Step 3: ds_fetch 取前几页正文（每实体最多 4 次 fetch；官方 fetch 返回正文质量好）。
             // 2026-10-24（261024-02 #1 速度）：4 次 fetch 串行要 4×RTT，改并行（限频器内部仍有 220ms 间隔，
             // 不会打爆 QPS），顺序只影响结果合并顺序、不影响内容。
+            // 2026-10-25（并发记账 P0）：这 4 路并行 fetch 每路都会进 ds_fetch → llm_record_usage，
+            // 也就是 4 条线程同时做「读用量 JSON → +1 → 写回」。记账侧已在 src/meta/llm.h 里加了
+            // 进程内互斥锁 + 唯一 tmp 名 + .bak 回退（旧实现无锁且共用固定 .tmp 名，会丢更新/写坏文件），
+            // 所以本处可以继续并行，无需在这一层串行化或自行加锁。
             const size_t fetch_count = std::min(valid_hits.size(),
                 (size_t)std::max(1, std::min(opts.max_fetch_pages, 4)));
             const auto t_fetch0 = std::chrono::steady_clock::now();

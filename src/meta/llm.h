@@ -31,6 +31,17 @@
 #include <functional>
 #include <ctime>
 #include <chrono>
+// 2026-10-25（并发记账 P0）：用量统计的读写需要进程内互斥 + 唯一 tmp 名 + 写失败重试
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <random>
+#include <set>
+#if defined(_WIN32)
+#include <process.h>   // _getpid()
+#else
+#include <unistd.h>    // getpid()
+#endif
 
 namespace rta::meta {
 
@@ -323,11 +334,18 @@ inline std::string llm_usage_path(const std::string& customPath = "") {
     return "rlplayer-llm-usage.json";
 }
 
+// 2026-10-25（并发记账 P0）：std::localtime 返回的是**进程级静态缓冲**，多线程同时调用会
+// 读到别的线程刚覆盖的结构（甚至撕裂）—— 4 路并行 fetch 每路都要取一次当前月份。
+// 改用线程安全的 localtime_s（Windows）/ localtime_r（其它）。
 inline std::string llm_format_month(std::time_t t) {
-    std::tm* m = std::localtime(&t);
-    if (!m) return "197001";
+    std::tm tm{};
+#if defined(_WIN32)
+    if (localtime_s(&tm, &t) != 0) return "197001";
+#else
+    if (!localtime_r(&t, &tm)) return "197001";
+#endif
     char buf[16];
-    std::snprintf(buf, sizeof(buf), "%04d%02d", m->tm_year + 1900, m->tm_mon + 1);
+    std::snprintf(buf, sizeof(buf), "%04d%02d", tm.tm_year + 1900, tm.tm_mon + 1);
     return std::string(buf);
 }
 
@@ -335,63 +353,276 @@ inline std::string llm_current_month() {
     return llm_format_month(std::time(nullptr));
 }
 
-inline LlmMonthlyUsage llm_get_usage(const std::string& month, const std::string& customPath = "") {
-    LlmMonthlyUsage u;
-    const std::string p = llm_usage_path(customPath);
+// ---------------------------------------------------------------------------
+// 并发安全（2026-10-25 外部评审 P0 修复）
+//
+// 旧实现是「读文件 → ++ → 写固定 p+".tmp" → rename」的无锁 read-modify-write。
+// retrieval.h 的 4 路并行 ds_fetch 每条都记一次 fetch 用量，于是同时发生：
+//   ① 丢更新：A/B 都读到 total=7，各自 +1 写回 8，实际两次调用只加 1；
+//   ② 互踩 tmp：两条线共用一个 "<p>.tmp"，A 写出后 B 截断重写，rename 出去的
+//      可能是别人写了一半的内容 → 半写文件；
+//   ③ 半写文件下次 json_parse 得到"非对象"或残缺对象，被静默当成 0 ——
+//      用量与月度配额（llm_check_cap）一起失真，用户永远不会知道。
+//
+// 现在：整段读改写持一把进程内互斥锁；tmp 名带 pid/线程/序号/随机盐；
+// 写失败退避重试；上一份 good 留成 "<p>.bak"，损坏时回退并打 WARN（不再静默按 0）。
+// ---------------------------------------------------------------------------
+
+// 进程内唯一锁：inline 函数里的函数级 static，跨 TU 也只有一个实例。
+// 只保护用量文件的读改写（几毫秒），不参与网络 I/O，属于"静音锁"。
+inline std::mutex& llm_usage_lock() {
+    static std::mutex m;
+    return m;
+}
+
+inline unsigned long long llm_process_id() {
+#if defined(_WIN32)
+    return (unsigned long long)_getpid();
+#else
+    return (unsigned long long)getpid();
+#endif
+}
+
+// 唯一临时文件名：<path>.<tag>.<pid>.<线程/随机><序号>.tmp
+inline std::string llm_unique_tmp_path(const std::string& path, const char* tag) {
+    static std::atomic<unsigned long long> seq{0};
+    static const unsigned long long salt = (unsigned long long)std::random_device{}();
+    const unsigned long long th =
+        (unsigned long long)std::hash<std::thread::id>{}(std::this_thread::get_id());
+    char b[160];
+    std::snprintf(b, sizeof(b), ".%s.%llu.%06llx.%llu.tmp",
+                  tag, llm_process_id(), (th ^ salt) & 0xFFFFFFull, seq.fetch_add(1));
+    return path + b;
+}
+
+// 原子写：写唯一 tmp → 关闭句柄 → rename 覆盖。失败退避重试（attempts 次）。
+// 任何失败路径都不留 .tmp 垃圾。
+inline bool llm_write_file_atomic(const std::string& path, const std::string& data,
+                                  int attempts, const char* tag) {
+    if (attempts < 1) attempts = 1;
+    for (int i = 0; i < attempts; ++i) {
+        const std::string tmp = llm_unique_tmp_path(path, tag);
+        bool written = false;
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            if (f) {
+                f.write(data.data(), (std::streamsize)data.size());
+                f.flush();
+                written = f.good();
+            }
+        }   // 句柄必须先关：Windows 上目标被打开时 rename 会失败（这也是要重试的原因）
+        if (written) {
+            std::error_code rec;
+            std::filesystem::rename(tmp, path, rec);
+            if (!rec) return true;
+        }
+        std::error_code rec2;
+        std::filesystem::remove(tmp, rec2);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2 * (i + 1)));
+    }
+    return false;
+}
+
+inline std::atomic<unsigned>& llm_usage_warn_counter() {
+    static std::atomic<unsigned> n{0};
+    return n;
+}
+
+// WARN 落盘：<usage>.warn.log（64 KB 上限，超限重开保留最近的）。
+// 为什么必须落盘：rtaweb 是 GUI 进程，stderr 往往被启动器丢弃 —— 只打 stderr 等于
+// "用户永远不会知道"。这条路径只在异常时发生，正常记账不产生任何额外 IO。
+inline void llm_usage_warn_log_locked(const std::string& usagePath, const std::string& msg) {
+    const std::string lp = usagePath + ".warn.log";
+    std::error_code sz;
+    const auto n = std::filesystem::file_size(lp, sz);
+    const bool rotate = (!sz && n > 64 * 1024);      // 超限重开，只留最近 64 KB
+    std::ofstream f(lp, std::ios::binary | (rotate ? std::ios::trunc : std::ios::app));
+    if (!f) return;
+    std::time_t now = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    const bool tmOk = localtime_s(&tm, &now) == 0;
+#else
+    const bool tmOk = localtime_r(&now, &tm) != nullptr;
+#endif
+    char ts[24] = {0};
+    if (tmOk) {
+        std::snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d",
+                      tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                      tm.tm_hour, tm.tm_min, tm.tm_sec);
+    }
+    std::string line = std::string(ts) + " [WARN] " + msg + "\n";
+    f.write(line.data(), (std::streamsize)line.size());
+    f.flush();
+}
+
+// WARN 文本 + 计数（测试用 llm_usage_warn_count() 断言"确实报过"）。
+// 同一条消息每进程只打一次，避免文件长期损坏时每次调用都刷日志。
+// 调用方必须持 llm_usage_lock()。
+inline void llm_usage_warn_locked(const std::string& usagePath, const std::string& msg) {
+    static std::set<std::string> seen;
+    if (seen.size() < 64 && !seen.insert(usagePath + "|" + msg).second) return;
+    llm_usage_warn_counter().fetch_add(1, std::memory_order_relaxed);
+    std::fprintf(stderr, "[WARN] llm-usage: %s\n", msg.c_str());
+    std::fflush(stderr);
+    llm_usage_warn_log_locked(usagePath, msg);
+}
+
+inline unsigned llm_usage_warn_count() {
+    return llm_usage_warn_counter().load(std::memory_order_relaxed);
+}
+
+inline std::string llm_usage_backup_path(const std::string& p) { return p + ".bak"; }
+
+inline bool llm_read_text_file(const std::string& p, std::string& out) {
     std::ifstream f(p, std::ios::binary);
-    if (!f) return u;
-    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (!f) return false;
+    out.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return true;
+}
+
+// 结构完整性：括号/引号配平，且顶层值结束后没有残留垃圾。
+// 注意与文件后半段 llm_json_looks_complete()（流式 SSE 用）区分：那个只判"配平 +
+// 末字符是 }/]"；这里额外要求**顶层值闭合后不再有任何残留**，因为"两个文档拼接"
+// 恰恰是并发互踩 tmp 的典型产物，而它和合法 JSON 一样配平。
+// 为什么需要它：net/json.h 的解析器很宽容，"{\"202611\":{\"total\":" 这种半写文件
+// 也会返回 Obj，只看 type 根本判不出损坏（这正是旧代码静默按 0 的原因）。
+inline bool llm_usage_json_complete(const std::string& t) {
+    int depth = 0;
+    bool inStr = false, esc = false, topClosed = false;
+    for (const char c : t) {
+        if (inStr) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') inStr = false;
+            continue;
+        }
+        if (topClosed) {
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+            return false;                      // 顶层结束后还有东西 → 拼接/踩踏痕迹
+        }
+        if (c == '"') inStr = true;
+        else if (c == '{' || c == '[') ++depth;
+        else if (c == '}' || c == ']') {
+            --depth;
+            if (depth < 0) return false;
+            if (depth == 0) topClosed = true;
+        }
+    }
+    return !inStr && !esc && depth == 0 && topClosed;
+}
+
+// 严格解析用量 JSON（结构 + 分桶字段类型）。失败时 err 给出人可读原因。
+inline bool llm_usage_parse_strict(const std::string& text,
+                                   std::map<std::string, LlmMonthlyUsage>& out,
+                                   std::string* err) {
+    if (!llm_usage_json_complete(text)) {
+        if (err) *err = "结构不完整（括号/引号不配平，疑似半写或并发踩踏）";
+        return false;
+    }
     const rta::net::Json j = rta::net::json_parse(text);
-    if (j.type != rta::net::Json::Obj || !j.has(month)) return u;
-    const auto& m = j[month];
-    if (m.type != rta::net::Json::Obj) return u;
-    if (m.has("total"))  u.total  = (int)m["total"].n();
-    if (m.has("chat"))   u.chat   = (int)m["chat"].n();
-    if (m.has("search")) u.search = (int)m["search"].n();
-    if (m.has("fetch"))  u.fetch  = (int)m["fetch"].n();
-    return u;
+    if (j.type != rta::net::Json::Obj) {
+        if (err) *err = "顶层不是 JSON 对象";
+        return false;
+    }
+    std::map<std::string, LlmMonthlyUsage> tmp;
+    for (const auto& [mKey, mVal] : j.obj) {
+        if (mVal.type != rta::net::Json::Obj) {
+            if (err) *err = "分桶 \"" + mKey + "\" 不是对象";
+            return false;
+        }
+        for (const char* f : {"total", "chat", "search", "fetch"}) {
+            if (mVal.has(f) && mVal[f].type != rta::net::Json::Num) {
+                if (err) *err = "分桶 \"" + mKey + "\" 的 " + f + " 不是数字";
+                return false;
+            }
+        }
+        LlmMonthlyUsage u;
+        if (mVal.has("total"))  u.total  = (int)mVal["total"].n();
+        if (mVal.has("chat"))   u.chat   = (int)mVal["chat"].n();
+        if (mVal.has("search")) u.search = (int)mVal["search"].n();
+        if (mVal.has("fetch"))  u.fetch  = (int)mVal["fetch"].n();
+        tmp[mKey] = u;
+    }
+    out.swap(tmp);
+    return true;
+}
+
+// 读盘结果（内部用）
+struct LlmUsageLoad {
+    bool ok = false;          // 有可用数据（主文件或 .bak；主文件不存在且无 .bak 时为 false=全新账本）
+    bool corrupt = false;     // 主文件存在但不可解析
+    bool fromBackup = false;  // 实际数据来自 .bak
+    std::string error;        // 人可读错误（正常读成功时为空）
+    std::string raw;          // 主文件原文（仅当主文件本身可解析时非空 → 可写进 .bak）
+    std::map<std::string, LlmMonthlyUsage> all;
+};
+
+// 读 + 校验 + 回退 .bak。调用方必须持 llm_usage_lock()。
+inline LlmUsageLoad llm_load_usage_locked(const std::string& p) {
+    LlmUsageLoad r;
+    std::string mainText;
+    const bool hasMain = llm_read_text_file(p, mainText);
+    if (hasMain && mainText.empty()) { r.ok = true; return r; }   // 0 字节：全新账本，不算损坏
+    std::string err;
+    if (hasMain && llm_usage_parse_strict(mainText, r.all, &err)) {
+        r.ok = true;
+        r.raw = mainText;
+        return r;
+    }
+    if (hasMain) {
+        r.corrupt = true;
+        r.error = "用量文件损坏：" + (err.empty() ? std::string("无法解析") : err);
+        llm_usage_warn_locked(p, r.error);
+    }
+    // 回退上一份 good
+    std::string bakText, berr;
+    if (llm_read_text_file(llm_usage_backup_path(p), bakText) &&
+        llm_usage_parse_strict(bakText, r.all, &berr)) {
+        r.ok = true;
+        r.fromBackup = true;
+        r.error += (r.error.empty() ? "" : "；") + std::string("已回退 .bak");
+        llm_usage_warn_locked(p, "已回退备份 " + llm_usage_backup_path(p) +
+                                (r.corrupt ? "（主文件损坏）" : "（主文件缺失）"));
+        return r;
+    }
+    if (r.corrupt) {
+        r.error += "；.bak 不可用";
+        llm_usage_warn_locked(p, "主文件与 .bak 均不可用，本次按 0 计");
+    }
+    r.all.clear();
+    return r;
+}
+
+// 读取侧诊断：损坏时不再静默 —— 调用方（以及测试）能拿到"为什么读不出来"。
+struct LlmUsageRead {
+    bool ok = true;          // 读到的数据可用（主文件或 .bak）
+    bool corrupt = false;    // 主文件损坏
+    bool fromBackup = false; // 数据来自 .bak
+    std::string error;       // 人可读错误说明
+};
+
+inline LlmMonthlyUsage llm_get_usage(const std::string& month, const std::string& customPath = "",
+                                     LlmUsageRead* outDiag = nullptr) {
+    const std::string p = llm_usage_path(customPath);
+    std::lock_guard<std::mutex> lk(llm_usage_lock());
+    const LlmUsageLoad ld = llm_load_usage_locked(p);
+    if (outDiag) {
+        outDiag->ok = ld.ok;
+        outDiag->corrupt = ld.corrupt;
+        outDiag->fromBackup = ld.fromBackup;
+        outDiag->error = ld.error;
+    }
+    const auto it = ld.all.find(month);
+    return it == ld.all.end() ? LlmMonthlyUsage{} : it->second;
 }
 
 inline int llm_get_monthly_count(const std::string& month, const std::string& customPath = "") {
     return llm_get_usage(month, customPath).total;
 }
 
-// 记录调用次数（原子写盘 tmp+rename；格式纯 JSON，绝不记录 key 等敏感信息）
-inline bool llm_record_usage(const std::string& month, const std::string& callType, const std::string& customPath = "") {
-    const std::string p = llm_usage_path(customPath);
-    std::error_code ec;
-    const auto parent = std::filesystem::path(p).parent_path();
-    if (!parent.empty()) {
-        std::filesystem::create_directories(parent, ec);
-    }
-
-    std::map<std::string, LlmMonthlyUsage> all;
-    {
-        std::ifstream f(p, std::ios::binary);
-        if (f) {
-            const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-            const rta::net::Json j = rta::net::json_parse(text);
-            if (j.type == rta::net::Json::Obj) {
-                for (const auto& [mKey, mVal] : j.obj) {
-                    if (mVal.type == rta::net::Json::Obj) {
-                        LlmMonthlyUsage u;
-                        if (mVal.has("total"))  u.total  = (int)mVal["total"].n();
-                        if (mVal.has("chat"))   u.chat   = (int)mVal["chat"].n();
-                        if (mVal.has("search")) u.search = (int)mVal["search"].n();
-                        if (mVal.has("fetch"))  u.fetch  = (int)mVal["fetch"].n();
-                        all[mKey] = u;
-                    }
-                }
-            }
-        }
-    }
-
-    LlmMonthlyUsage& cur = all[month];
-    cur.total++;
-    if (callType == "chat") cur.chat++;
-    else if (callType == "search") cur.search++;
-    else if (callType == "fetch") cur.fetch++;
-
+// 用量 JSON 序列化（纯函数，便于测试；顺序固定 = 月键字典序，便于 diff）
+inline std::string llm_format_usage_json(const std::map<std::string, LlmMonthlyUsage>& all) {
     std::ostringstream o;
     o << "{\n";
     bool firstMonth = true;
@@ -406,17 +637,51 @@ inline bool llm_record_usage(const std::string& month, const std::string& callTy
           << "  }";
     }
     o << "\n}\n";
+    return o.str();
+}
 
-    const std::string tmp = p + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f) return false;
-        const std::string s = o.str();
-        f.write(s.data(), (std::streamsize)s.size());
-        if (!f.good()) return false;
+// 记录调用次数。
+//
+// ★ 线程安全（2026-10-25 P0）：整段「读 → 累加 → 备份 → 原子写」都在 llm_usage_lock() 里，
+//   8 线程 × 100 次并发记账后 total 必须精确等于 800（不许丢更新）。
+// ★ 落盘：唯一 tmp 名 + rename；失败退避重试 5 次；上一份 good 另存 "<p>.bak"。
+// ★ 损坏：读不出来不再静默按 0 —— 打 WARN、回退 .bak、并以 .bak 为基准继续累加
+//   （这样一次半写事故不会把整月用量清零）。
+// ★ 格式纯 JSON，绝不记录 key 等敏感信息。
+inline bool llm_record_usage(const std::string& month, const std::string& callType, const std::string& customPath = "") {
+    const std::string p = llm_usage_path(customPath);
+    std::error_code ec;
+    const auto parent = std::filesystem::path(p).parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
     }
-    std::filesystem::rename(tmp, p, ec);
-    return !ec;
+
+    std::lock_guard<std::mutex> lk(llm_usage_lock());
+
+    const LlmUsageLoad ld = llm_load_usage_locked(p);   // 已含校验 + .bak 回退 + WARN
+    std::map<std::string, LlmMonthlyUsage> all = ld.all;
+
+    LlmMonthlyUsage& cur = all[month];
+    cur.total++;
+    if (callType == "chat") cur.chat++;
+    else if (callType == "search") cur.search++;
+    else if (callType == "fetch") cur.fetch++;
+
+    const std::string s = llm_format_usage_json(all);
+
+    // 先把"上一份 good"落成 .bak，再覆盖主文件。主文件本身损坏时（ld.raw 为空）
+    // 绝不拿坏内容覆盖 .bak —— 否则唯一能救的数据就没了。
+    if (!ld.raw.empty()) {
+        if (!llm_write_file_atomic(llm_usage_backup_path(p), ld.raw, 2, "bak")) {
+            llm_usage_warn_locked(p, "备份 .bak 写入失败（主账本不受影响）：" + llm_usage_backup_path(p));
+        }
+    }
+
+    if (!llm_write_file_atomic(p, s, 5, "usage")) {
+        llm_usage_warn_locked(p, "用量写盘失败（已重试 5 次，本次计数丢失）");
+        return false;
+    }
+    return true;
 }
 
 // 检查是否已达月度调用上限（cfg.monthlyCap == 0 为不限，默认 0）

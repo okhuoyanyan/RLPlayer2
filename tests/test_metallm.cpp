@@ -14,8 +14,13 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <map>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <thread>     // 7/8) 并发记账
+#include <atomic>     // 7) 写成功计数
+#include <ctime>      // 10) 月份格式化
 
 namespace fs = std::filesystem;
 using namespace rta::meta;
@@ -443,6 +448,286 @@ int main() {
         ck(llm_config_save_merge(capCfg, "cap_test.conf"), "save_merge 带 llmmonthlycap");
         LlmConfig loadedCap = llm_config_load("cap_test.conf");
         ck(loadedCap.monthlyCap == 500, "load 读回 llmmonthlycap=500", std::to_string(loadedCap.monthlyCap));
+    }
+
+    // ---------------- 7) 并发记账：8 线程 × 100 次，总量必须 800（不许丢更新） ----------------
+    // 判据（铁律 3）：为什么要这条断言 —— 旧实现是「读 JSON → +1 → 写固定 .tmp → rename」的
+    // 无锁 read-modify-write。两条线程只要读到同一个旧值，最终值就必然 < 800，且无法"运气凑回"。
+    // 因此 total==800 对无锁实现是致命判据，对加锁实现是充分判据。
+    std::printf("-- 7) 并发记账 8 线程 × 100 次 --\n");
+    {
+        const std::string racePath = (tmp / "race-usage.json").string();
+        const std::string month = "202612";
+        std::error_code rec;
+        fs::remove(racePath, rec);
+        fs::remove(racePath + ".bak", rec);
+        ck(llm_get_monthly_count(month, racePath) == 0, "并发测试起点计数为 0");
+
+        const int kThreads = 8, kPer = 100;
+        std::atomic<int> okWrites{0}, badWrites{0};
+        std::vector<std::thread> ths;
+        ths.reserve((size_t)kThreads);
+        for (int t = 0; t < kThreads; ++t) {
+            ths.emplace_back([&, t]() {
+                static const char* kTypes[3] = {"chat", "search", "fetch"};
+                for (int i = 0; i < kPer; ++i) {
+                    const char* ty = kTypes[(t + i) % 3];
+                    if (llm_record_usage(month, ty, racePath)) okWrites.fetch_add(1);
+                    else badWrites.fetch_add(1);
+                }
+            });
+        }
+        for (auto& th : ths) th.join();
+
+        ck(okWrites.load() == kThreads * kPer, "800 次 record 全部返回成功",
+           std::to_string(okWrites.load()));
+        ck(badWrites.load() == 0, "0 次写失败（写失败会自动重试 5 次）", std::to_string(badWrites.load()));
+
+        LlmUsageRead d7;
+        const LlmMonthlyUsage u7 = llm_get_usage(month, racePath, &d7);
+        ck(u7.total == 800, "★ 8×100 并发记账后 total == 800（丢更新会 <800）",
+           std::to_string(u7.total));
+        ck(u7.chat == 267 && u7.search == 267 && u7.fetch == 266,
+           "分类型计数精确 267/267/266（按 (线程+序号) mod 3 轮转的期望值）",
+           std::to_string(u7.chat) + "/" + std::to_string(u7.search) + "/" + std::to_string(u7.fetch));
+        ck(u7.chat + u7.search + u7.fetch == u7.total, "chat+search+fetch == total（无类别漏计）");
+        ck(!d7.corrupt && !d7.fromBackup && d7.error.empty(),
+           "并发写后主文件干净（未触发 .bak 回退）", d7.error);
+
+        // 文件层面（不经 API）：固定 tmp 名互踩的表现就是这里读到半截文档
+        std::string raw;
+        bool hasRaw = false;
+        {
+            std::ifstream f(racePath, std::ios::binary);
+            if (f) { raw.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()); hasRaw = true; }
+        }
+        ck(hasRaw && llm_usage_json_complete(raw), "并发 800 次后主文件结构完整（括号/引号配平）",
+           hasRaw ? (raw.size() > 80 ? raw.substr(0, 60) + "..." : raw) : std::string("<missing>"));
+        std::map<std::string, LlmMonthlyUsage> parsed7;
+        std::string perr7;
+        ck(llm_usage_parse_strict(raw, parsed7, &perr7) &&
+           parsed7.count(month) == 1 && parsed7[month].total == 800,
+           "严格解析：JSON 可解析且 total==800", perr7);
+
+        int leftover = 0;
+        for (const auto& de : fs::directory_iterator(tmp)) {
+            const std::string nm = de.path().filename().string();
+            if (nm.rfind("race-usage.json", 0) == 0 && nm.size() > 4 &&
+                nm.compare(nm.size() - 4, 4, ".tmp") == 0) ++leftover;
+        }
+        ck(leftover == 0, "无残留 .tmp（唯一 tmp 名 + 失败清理）", std::to_string(leftover));
+        ck(fs::exists(racePath + ".bak"), ".bak 已生成（上一份 good 备份）");
+    }
+
+    // ---------------- 7b) 4 路并行 ds_fetch：retrieval.h:1748 的真实调用形状 ----------------
+    // 上面的单元断言之外，再走一遍真实链路（mock transport，不联网）：
+    // 4 线程 → ds_fetch → llm_check_cap / llm_record_usage，正是外部评审点名的并发形状。
+    std::printf("-- 7b) 4 路并行 ds_fetch（retrieval.h 并行 fetch 的真实形状）--\n");
+    {
+        const std::string p4 = (tmp / "parallel-fetch-usage.json").string();
+        const std::string m4 = "202614";
+        std::error_code rec;
+        fs::remove(p4, rec);
+        fs::remove(p4 + ".bak", rec);
+
+        std::atomic<int> hits{0};
+        LlmConfig cfg4;
+        cfg4.apiKey = "sk-mock-parallel";
+        cfg4.baseUrl = "https://api.deepseek.mock";
+        cfg4.model = "deepseek-flash";
+        cfg4.monthlyCap = 0;          // 本用例只测记账，不测熔断
+        cfg4.monthOverride = m4;
+        cfg4.usagePath = p4;
+        cfg4.transport = [&hits](const std::string&, const std::string&,
+                                 const std::vector<std::string>&) -> rta::net::HttpResponse {
+            hits.fetch_add(1);
+            rta::net::HttpResponse resp;
+            resp.status = 200;
+            const std::string body = "{\"title\":\"T\",\"content\":\"正文\"}";
+            resp.body.assign(body.begin(), body.end());
+            return resp;
+        };
+
+        std::atomic<int> oks{0};
+        std::vector<std::thread> ths;
+        for (int t = 0; t < 4; ++t)
+            ths.emplace_back([&cfg4, &oks, t]() {
+                if (ds_fetch(cfg4, "https://example.com/p" + std::to_string(t)).ok) oks.fetch_add(1);
+            });
+        for (auto& th : ths) th.join();
+
+        ck(hits.load() == 4, "4 个 fetch 都真实发起（mock transport 计数=4）", std::to_string(hits.load()));
+        ck(oks.load() == 4, "4 个 fetch 都返回成功", std::to_string(oks.load()));
+        const LlmMonthlyUsage u4 = llm_get_usage(m4, p4);
+        ck(u4.total == 4 && u4.fetch == 4,
+           "★ 4 路并行 fetch 记满 4 次（旧实现会 <4，丢的那次配额就白给了）",
+           std::to_string(u4.total) + " total / " + std::to_string(u4.fetch) + " fetch");
+    }
+
+    // ---------------- 8) 并发写 200 次后 JSON 仍可解析 ----------------
+    std::printf("-- 8) 并发写 200 次后 JSON 仍可解析 --\n");
+    {
+        const std::string p8 = (tmp / "burst-usage.json").string();
+        const std::string m8 = "202613";
+        std::error_code rec;
+        fs::remove(p8, rec);
+        fs::remove(p8 + ".bak", rec);
+
+        std::vector<std::thread> ths;
+        for (int t = 0; t < 8; ++t)
+            ths.emplace_back([&p8, &m8]() {
+                for (int i = 0; i < 25; ++i) llm_record_usage(m8, "fetch", p8);
+            });
+        for (auto& th : ths) th.join();
+
+        std::string raw;
+        bool has = false;
+        {
+            std::ifstream f(p8, std::ios::binary);
+            if (f) { raw.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()); has = true; }
+        }
+        ck(has && llm_usage_json_complete(raw),
+           "200 次并发写后磁盘上仍是一个完整 JSON 文档（无拼接/截断/半写）");
+        std::map<std::string, LlmMonthlyUsage> parsed8;
+        std::string perr8;
+        ck(llm_usage_parse_strict(raw, parsed8, &perr8), "严格解析通过（可被读取侧接受）", perr8);
+        ck(parsed8.count(m8) == 1 && parsed8[m8].total == 200,
+           "total == 200（8 线程 × 25 次，一次不漏）",
+           parsed8.count(m8) ? std::to_string(parsed8[m8].total) : std::string("missing"));
+        ck(parsed8.count(m8) == 1 && parsed8[m8].fetch == 200, "fetch == 200",
+           parsed8.count(m8) ? std::to_string(parsed8[m8].fetch) : std::string("missing"));
+    }
+
+    // ---------------- 9) 半写坏文件：报可读错误 + 自动回退 .bak ----------------
+    // 判据：不能只断言"能读出来"——必须同时满足
+    //   ① 读取侧明确报错（corrupt/error 非空，且 WARN 计数增加）② 数据不是 0 而是 .bak 的值
+    //   ③ 后续记账以 .bak 为基准继续累加（不是从 0 重来）④ 坏内容没有覆盖 .bak
+    std::printf("-- 9) 半写坏文件：可读错误 + .bak 回退 --\n");
+    {
+        const std::string p9 = (tmp / "corrupt-usage.json").string();
+        const std::string m9 = "202610";
+        std::error_code rec;
+        fs::remove(p9, rec);
+        fs::remove(p9 + ".bak", rec);
+
+        for (int i = 0; i < 5; ++i) llm_record_usage(m9, "chat", p9);
+        ck(llm_get_monthly_count(m9, p9) == 5, "正常记账 5 次后 total=5");
+        ck(fs::exists(p9 + ".bak"), ".bak 已存在");
+        ck(llm_get_monthly_count(m9, p9 + ".bak") == 4, ".bak 是上一份 good（total=4）",
+           std::to_string(llm_get_monthly_count(m9, p9 + ".bak")));
+
+        // 模拟半写：只落了前半截字节（并发踩 tmp / 断电都长这样）
+        {
+            std::ofstream f(p9, std::ios::binary | std::ios::trunc);
+            const std::string half =
+                "{\n  \"202610\": {\n    \"total\": 5,\n    \"chat\": 5,\n"
+                "    \"search\": 0,\n    \"fetch\": 0";
+            f.write(half.data(), (std::streamsize)half.size());
+        }
+        const unsigned warnBefore = llm_usage_warn_count();
+        LlmUsageRead d9;
+        const LlmMonthlyUsage u9 = llm_get_usage(m9, p9, &d9);
+        ck(d9.corrupt, "★ 半写文件被判为损坏（旧实现会静默按 0）", d9.error);
+        ck(!d9.error.empty(), "报出可读错误文本", d9.error);
+        ck(d9.ok && d9.fromBackup, "自动回退到 .bak", d9.error);
+        ck(u9.total == 4, "回退后读到的是 .bak 的 total=4（不是 0）", std::to_string(u9.total));
+        ck(llm_usage_warn_count() > warnBefore, "损坏时确实留下 WARN（计数增加）",
+           std::to_string(llm_usage_warn_count() - warnBefore));
+        // 只打 stderr 在 GUI 里等于没打（启动器丢弃），WARN 必须同时落盘
+        const std::string warnLog = p9 + ".warn.log";
+        std::string wl;
+        {
+            std::ifstream f(warnLog, std::ios::binary);
+            if (f) wl.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        }
+        ck(fs::exists(warnLog) && wl.find("[WARN]") != std::string::npos &&
+           wl.find("损坏") != std::string::npos,
+           "WARN 已落盘 <usage>.warn.log（GUI 丢弃 stderr 也留痕）",
+           wl.size() > 100 ? wl.substr(0, 100) : wl);
+
+        // 继续记账 → 以 .bak(4) 为基准 +1 = 5；若"按 0 重算"这里会是 1
+        ck(llm_record_usage(m9, "chat", p9), "损坏后继续记账成功");
+        const LlmMonthlyUsage u9b = llm_get_usage(m9, p9);
+        ck(u9b.total == 5, "★ 恢复：total = .bak(4)+1 = 5（按 0 重算会是 1）", std::to_string(u9b.total));
+        ck(u9b.chat == 5, "chat 一并恢复为 5", std::to_string(u9b.chat));
+        ck(fs::exists(p9 + ".bak") && llm_get_monthly_count(m9, p9 + ".bak") == 4,
+           "坏内容没有覆盖 .bak（仍可读回 4）");
+
+        // 另一种损坏形态：两个文档拼接（并发互踩 tmp 的典型产物）
+        {
+            std::ofstream f(p9, std::ios::binary | std::ios::trunc);
+            f << "{\"202610\": {\"total\": 5, \"chat\": 5, \"search\": 0, \"fetch\": 0}}\n"
+              << "{\"202610\": {\"total\": 7, \"chat\": 7, \"search\": 0, \"fetch\": 0}}\n";
+        }
+        ck(!llm_usage_json_complete("{\"a\":1}{\"b\":2}"), "结构校验：拼接文档判为不完整");
+        LlmUsageRead d9c;
+        const LlmMonthlyUsage u9c = llm_get_usage(m9, p9, &d9c);
+        ck(d9c.corrupt && d9c.fromBackup && u9c.total == 4,
+           "拼接损坏同样走 .bak 回退（total=4）", d9c.error);
+
+        // 0 字节文件（rename 前崩溃的残留）不是损坏，是"全新账本"
+        const std::string pz = (tmp / "empty-usage.json").string();
+        { std::ofstream f(pz, std::ios::binary | std::ios::trunc); }
+        LlmUsageRead dz;
+        const LlmMonthlyUsage uz = llm_get_usage("202610", pz, &dz);
+        ck(uz.total == 0 && !dz.corrupt && dz.error.empty(), "0 字节文件按全新账本处理（不误报损坏）",
+           dz.error);
+    }
+
+    // ---------------- 10) 月份格式化线程安全（std::localtime 静态缓冲 → localtime_s） ----------------
+    std::printf("-- 10) 月份格式化 8 线程并发 --\n");
+    {
+        const std::time_t fixed = (std::time_t)1790000000;   // 固定时间戳 = 单线程基准
+        const std::string expect = llm_format_month(fixed);
+        std::atomic<int> bad{0};
+        std::vector<std::thread> ths;
+        for (int t = 0; t < 8; ++t)
+            ths.emplace_back([&]() {
+                for (int i = 0; i < 2000; ++i) {
+                    if (llm_format_month(fixed) != expect) bad.fetch_add(1);
+                }
+            });
+        for (auto& th : ths) th.join();
+        ck(bad.load() == 0, "8 线程 × 2000 次格式化：零撕裂（localtime_s）",
+           std::to_string(bad.load()));
+        bool digits = expect.size() == 6;
+        for (const char c : expect) if (c < '0' || c > '9') digits = false;
+        ck(digits, "月份格式为 6 位 YYYYMM", expect);
+    }
+
+    // ---------------- 11) 写失败重试与清理：目标被独占打开 → rename 必然失败 ----------------
+    // 判据：失败必须"诚实"（返回 false、不假装成功）、必须留 WARN、必须不留 .tmp 垃圾；
+    // 并且句柄释放后能立刻恢复正常记账。这条路径不测就等于没写重试逻辑。
+    std::printf("-- 11) 写失败重试与 .tmp 清理（目标被独占）--\n");
+    {
+        const std::string p11 = (tmp / "locked-usage.json").string();
+        std::error_code rec;
+        fs::remove(p11, rec);
+        fs::remove(p11 + ".bak", rec);
+        ck(llm_record_usage("202610", "chat", p11), "首次记账成功（建出文件）");
+
+        HANDLE h = CreateFileW(fs::path(p11).c_str(), GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+        ck(h != INVALID_HANDLE_VALUE, "以不给 FILE_SHARE_DELETE 的方式独占打开目标文件");
+        const unsigned warnBefore11 = llm_usage_warn_count();
+        const bool ok11 = llm_record_usage("202610", "chat", p11);
+        ck(!ok11, "★ 目标不可替换时返回 false（不假装记账成功）", ok11 ? "true" : "false");
+        ck(llm_usage_warn_count() > warnBefore11, "写失败留 WARN",
+           std::to_string(llm_usage_warn_count() - warnBefore11));
+        int tmpLeft = 0;
+        for (const auto& de : fs::directory_iterator(tmp)) {
+            const std::string nm = de.path().filename().string();
+            if (nm.rfind("locked-usage.json", 0) == 0 && nm.size() > 4 &&
+                nm.compare(nm.size() - 4, 4, ".tmp") == 0) ++tmpLeft;
+        }
+        ck(tmpLeft == 0, "5 次重试全部失败后没有残留 .tmp", std::to_string(tmpLeft));
+        ck(llm_get_monthly_count("202610", p11) == 1, "磁盘上的账本没有被写坏（仍为 1）",
+           std::to_string(llm_get_monthly_count("202610", p11)));
+
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        ck(llm_record_usage("202610", "chat", p11), "句柄释放后恢复正常记账");
+        ck(llm_get_monthly_count("202610", p11) == 2, "恢复后计数 1→2", 
+           std::to_string(llm_get_monthly_count("202610", p11)));
     }
 
     fs::current_path(oldCwd, ec);
