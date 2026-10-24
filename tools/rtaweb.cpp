@@ -358,8 +358,42 @@ static std::string utf8_sanitize(const std::string& s) {
 }
 
 // 解析 "k=v&k=v"
+// 261024-05 安全修复：/api/play 没带 backend= 时，**沿用已保存的后端设置**。
+// 为什么必须修：PlayParams.backend 的结构体默认值是 "wasapi"，于是任何不带 backend 的
+// API/脚本调用都会直接接管本机声卡、并按当时的音量真出声（今晚做 GPU 端到端验证时就踩到：
+// 本想用 null 后端，结果一首曲子以 0 dB 播到了用户的录音接口上）。
+static std::string path_in_exe_dir(const char* name);   // 定义在后面（见文件中部）
+static std::string saved_backend_setting() {
+    std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("backend=", 0) == 0) {
+            std::string v = line.substr(8);
+            if (!v.empty()) return v;
+        }
+    }
+    return std::string();
+}
+
+// 同上的 vol 版：不带 volume= 时用已保存的音量；连保存的都没有则按铁律 1 取 -60 dB（不可闻）。
+static double saved_volume_setting() {
+    std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("volume=", 0) == 0) {
+            const std::string v = line.substr(7);
+            if (!v.empty()) { try { return std::stod(v); } catch (...) { break; } }
+        }
+    }
+    return -60.0;
+}
+
 static PlayParams parseForm(const std::string& body) {
     PlayParams p;
+    bool sawBackend = false;
+    bool sawVolume  = false;
     std::istringstream is(body);
     std::string tok;
     while (std::getline(is, tok, '&')) {
@@ -372,7 +406,7 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "filterNx") p.filterNx = v;
         else if (k == "shaper")   p.shaper = v;
         else if (k == "rate")     p.rate = v;
-        else if (k == "volume")   p.volume = atof(v.c_str());
+        else if (k == "volume")   { p.volume = atof(v.c_str()); sawVolume = true; }
         else if (k == "gpu")      p.gpu = (v == "1");
         else if (k == "isp")      p.isp = (v == "1");
         else if (k == "twostage") p.twoStage = (v == "1");
@@ -403,7 +437,7 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "ramp")     p.volRamp = atof(v.c_str());
         else if (k == "sdmfilt")   p.sdmFilter = v;
         else if (k == "sdmfiltnx") p.sdmFilterNx = v;
-        else if (k == "backend") p.backend = v;
+        else if (k == "backend") { p.backend = v; sawBackend = true; }
         // naahost：NAA 已删除，老配置里的这一行忽略（不报错，避免用户配置迁移失败）
         else if (k == "upnpdev")  p.upnpDev = v;
         else if (k == "channels") p.outChannels = atoi(v.c_str());
@@ -422,6 +456,14 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "rsuffix") p.remoteSuffix = v;
         else if (k == "rtitle")  p.remoteTitle = v;
     }
+    // 没写 backend= ⟹ 用已保存的设置（见上面的注释）。保存的也没有才退回 wasapi。
+    if (!sawBackend) {
+        const std::string sb = saved_backend_setting();
+        p.backend = sb.empty() ? std::string("wasapi") : sb;
+    }
+    // 不带 volume= ⟹ 用已保存音量；没有保存的则 -60 dB（铁律 1：默认不可闻）。
+    // 这条和上面那条是同一个事故的两个面：脚本漏参数 ≠ 用户想以 0 dB 出声。
+    if (!sawVolume) p.volume = saved_volume_setting();
     return p;
 }
 
