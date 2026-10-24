@@ -53,6 +53,7 @@ using rta::render::SinkOpenOpts;
 #include "dsp/filter_families.h"
 #include "dsp/oversample_peak.h"
 #include "dsp/eq_text.h"
+#include "dsp/peq.h"               // 261024-02 #6：20 段参数均衡（RBJ 双二阶，float64 系数 / float32 处理）
 #include "dsp/opra.h"
 #include "dsp/dop.h"
 #include "dsp/modulator.h"
@@ -209,6 +210,9 @@ struct PlayerState {
     }
 };
 static PlayerState g_ps;
+
+// 20 段参数均衡 PEQ（261024-02 #6）：全局单例。播放线程处理音频，HTTP 线程改参数（热更新）。
+static std::shared_ptr<rta::dsp::PeqEngine> g_peq;
 static std::atomic<bool> g_exitReq{false};
 // 播放线程诊断计数（出问题时第一手证据，比猜快得多）
 static std::atomic<long long> g_dbgW0{0}, g_dbgPulls{0}, g_dbgWf{0}, g_dbgWr{0}, g_dbgPer{0};
@@ -1861,6 +1865,14 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             }
         }
 
+        // ---- 20 段参数均衡 PEQ（261024-02 #6）----
+        // 在【输入采样率】、现有文件 EQ 之前处理；挂在管线上，UI 改参数时引擎内部热更新。
+        // prepare() 会按本次音源采样率重建全部系数（切歌/切率），最多支持 7.1（8 声道）。
+        if (g_peq) {
+            g_peq->prepare((double)in.rate, 8);
+            cfg.peq = g_peq;
+        }
+
         // ---- 卷积 / 房间校正：IR 是 WAV，按输出声道数铺开 ----
         bool convLoaded = false;
         if (!p.convIr.empty()) {
@@ -2345,6 +2357,150 @@ static std::string path_in_exe_dir(const char* name) {
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, o.data(), n, nullptr, nullptr);
     if (!o.empty() && o.back() == 0) o.pop_back();
     return o;
+}
+
+// ---------------- 20 段参数均衡 PEQ（261024-02 #6）----------------
+// 全局单例：HTTP 线程改参数（热更新），播放线程处理音频；引擎内部互斥 + 128 样本交叉淡入。
+// （g_peq 本体声明在文件靠前的 g_ps 附近 —— 播放线程代码在它之前就要用。）
+
+static std::string peq_current_path()  { return path_in_exe_dir("rlplayer-peq.txt"); }
+static std::string peq_presets_path()  { return path_in_exe_dir("rlplayer-peq-presets.txt"); }
+
+// 用户预设文件格式：每个预设一段
+//   [预设名]
+//   preamp=...
+//   band=1,PK,20,0.0,1.41
+static bool peq_load_presets_file(std::map<std::string, rta::dsp::PeqSettings>& out) {
+    std::ifstream f(peq_presets_path());
+    if (!f) return false;
+    std::string line, cur, body;
+    auto flush = [&]() {
+        if (cur.empty() || body.empty()) return;
+        rta::dsp::PeqSettings s;
+        std::string err;
+        if (rta::dsp::peq_from_text(body, s, &err)) { s.presetName = cur; out[cur] = s; }
+        body.clear();
+    };
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.size() >= 2 && line.front() == '[' && line.back() == ']') {
+            flush();
+            cur = line.substr(1, line.size() - 2);
+        } else {
+            body += line; body += '\n';
+        }
+    }
+    flush();
+    return true;
+}
+
+static bool peq_save_presets_file(const std::map<std::string, rta::dsp::PeqSettings>& presets) {
+    std::ofstream f(peq_presets_path(), std::ios::trunc);
+    if (!f) return false;
+    f << "# rlplayer PEQ presets v1\n";
+    for (const auto& kv : presets) {
+        rta::dsp::PeqSettings s = kv.second;
+        s.presetName = kv.first;
+        f << "[" << kv.first << "]\n" << rta::dsp::peq_to_text(s);
+    }
+    return true;
+}
+
+static std::vector<std::string> peq_all_preset_names() {
+    std::vector<std::string> names = rta::dsp::peq_builtin_preset_names();
+    std::map<std::string, rta::dsp::PeqSettings> user;
+    peq_load_presets_file(user);
+    for (const auto& kv : user) {
+        bool dup = false;
+        for (const auto& n : names) if (n == kv.first) dup = true;
+        if (!dup) names.push_back(kv.first);
+    }
+    return names;
+}
+
+static void peq_load_current() {
+    if (!g_peq) g_peq = std::make_shared<rta::dsp::PeqEngine>();
+    rta::dsp::PeqSettings s = rta::dsp::peq_flat_settings();
+    std::ifstream f(peq_current_path());
+    if (f) {
+        std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        rta::dsp::PeqSettings parsed;
+        std::string err;
+        if (rta::dsp::peq_from_text(text, parsed, &err)) s = parsed;
+    }
+    g_peq->set_settings(s);
+}
+
+static bool peq_save_current(const rta::dsp::PeqSettings& s) {
+    std::ofstream f(peq_current_path(), std::ios::trunc);
+    if (!f) return false;
+    f << rta::dsp::peq_to_text(s);
+    return true;
+}
+
+// 解析 UI 提交的 bands= 紧凑串：序号,类型,频率,增益,Q[,off];...
+static bool peq_parse_bands_param(const std::string& val, std::vector<rta::dsp::PeqBand>& out) {
+    out.clear();
+    std::istringstream is(val);
+    std::string item;
+    while (std::getline(is, item, ';')) {
+        if (item.empty()) continue;
+        rta::dsp::PeqBand b;
+        char type[8] = {0};
+        double f = 1000.0, g = 0.0, q = 1.41;
+        char tail[16] = {0};
+        const int n = std::sscanf(item.c_str(), "%*d,%7[^,],%lf,%lf,%lf,%15s", type, &f, &g, &q, tail);
+        if (n < 4) return false;
+        rta::dsp::PeqBandType t;
+        if (!rta::dsp::peq_band_type_from_name(type, t)) t = rta::dsp::PeqBandType::Peak;
+        b.type = t;
+        b.freq = std::min(std::max(f, 10.0), 20000.0);
+        b.gainDb = std::min(std::max(g, -24.0), 24.0);
+        b.q = std::min(std::max(q, 0.1), 20.0);
+        b.enabled = !(std::string(tail).find("off") != std::string::npos);
+        out.push_back(b);
+    }
+    return !out.empty();
+}
+
+// 当前 PEQ 状态 JSON（含预设名列表；withCurve 时附带 20Hz~20kHz 对数 160 点频响）
+static std::string peq_state_json(bool withCurve) {
+    if (!g_peq) peq_load_current();
+    const rta::dsp::PeqSettings s = g_peq->settings();
+    const double fs = g_peq->sample_rate();
+    std::ostringstream j;
+    j << "{\"ok\":true,\"bypass\":" << (s.bypass ? 1 : 0)
+      << ",\"preamp\":" << s.preampDb
+      << ",\"name\":\"" << jesc(s.presetName) << "\""
+      << ",\"fs\":" << fs
+      << ",\"bands\":[";
+    for (size_t i = 0; i < s.bands.size(); ++i) {
+        const auto& b = s.bands[i];
+        if (i) j << ",";
+        j << "{\"i\":" << (i + 1) << ",\"on\":" << (b.enabled ? 1 : 0)
+          << ",\"type\":\"" << rta::dsp::peq_band_type_name(b.type) << "\""
+          << ",\"freq\":" << b.freq << ",\"gain\":" << b.gainDb << ",\"q\":" << b.q << "}";
+    }
+    j << "],\"presets\":[";
+    const auto names = peq_all_preset_names();
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (i) j << ",";
+        j << "\"" << jesc(names[i]) << "\"";
+    }
+    j << "]";
+    if (withCurve) {
+        const int N = 160;
+        j << ",\"points\":[";
+        for (int i = 0; i < N; ++i) {
+            const double t = (double)i / (double)(N - 1);
+            const double f = 20.0 * std::pow(1000.0, t);   // 20Hz → 20kHz
+            if (i) j << ",";
+            j << "[" << f << "," << rta::dsp::peq_response_db(s, fs, f) << "]";
+        }
+        j << "]";
+    }
+    j << "}";
+    return j.str();
 }
 
 // ---------------- 采集 / 直通监听状态与后台线程 (ROADMAP P4b) ----------------
@@ -4846,6 +5002,96 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         return out;
     }
 
+    // ---------------- 20 段参数均衡 PEQ（261024-02 #6）----------------
+    // GET  /api/peq            → 当前状态 + 预设列表 + 频响曲线
+    // POST /api/peq            → 更新 bypass/preamp/bands（热更新 + 落盘），返回同样结构
+    // POST /api/peq/preset     → action=save|load|delete|reset & name=...
+    if (rq.path.rfind("/api/peq", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        if (!g_peq) peq_load_current();
+
+        if (rq.path.rfind("/api/peq/preset", 0) == 0) {
+            std::map<std::string, std::string> f;
+            std::istringstream is(rq.body);
+            std::string tok;
+            while (std::getline(is, tok, '&')) {
+                const size_t e = tok.find('=');
+                if (e == std::string::npos) continue;
+                f[urlDecode(tok.substr(0, e))] = urlDecode(tok.substr(e + 1));
+            }
+            const std::string action = f.count("action") ? f["action"] : "";
+            const std::string name   = f.count("name") ? f["name"] : "";
+            if (action == "reset") {
+                rta::dsp::PeqSettings s = rta::dsp::peq_flat_settings();
+                g_peq->set_settings(s);
+                peq_save_current(s);
+                return peq_state_json(true);
+            }
+            if (action == "save") {
+                if (name.empty()) return "{\"ok\":false,\"error\":\"缺少预设名\"}";
+                if (name.size() > 64) return "{\"ok\":false,\"error\":\"预设名太长（最多 64 字节）\"}";
+                rta::dsp::PeqSettings s = g_peq->settings();
+                s.presetName = name;
+                std::map<std::string, rta::dsp::PeqSettings> user;
+                peq_load_presets_file(user);
+                user[name] = s;
+                if (!peq_save_presets_file(user)) return "{\"ok\":false,\"error\":\"写预设文件失败\"}";
+                g_peq->set_settings(s);
+                peq_save_current(s);
+                return peq_state_json(true);
+            }
+            if (action == "load") {
+                rta::dsp::PeqSettings s;
+                bool ok = false;
+                if (rta::dsp::peq_builtin_preset(name, s)) {
+                    ok = true;
+                } else {
+                    std::map<std::string, rta::dsp::PeqSettings> user;
+                    peq_load_presets_file(user);
+                    auto it = user.find(name);
+                    if (it != user.end()) { s = it->second; s.presetName = name; ok = true; }
+                }
+                if (!ok) return "{\"ok\":false,\"error\":\"没有这个预设\"}";
+                g_peq->set_settings(s);
+                peq_save_current(s);
+                return peq_state_json(true);
+            }
+            if (action == "delete") {
+                std::map<std::string, rta::dsp::PeqSettings> user;
+                peq_load_presets_file(user);
+                if (user.erase(name) == 0) return "{\"ok\":false,\"error\":\"没有这个用户预设（内置预设不能删除）\"}";
+                if (!peq_save_presets_file(user)) return "{\"ok\":false,\"error\":\"写预设文件失败\"}";
+                return peq_state_json(true);
+            }
+            return "{\"ok\":false,\"error\":\"未知 action\"}";
+        }
+
+        if (rq.method == "POST") {
+            std::map<std::string, std::string> f;
+            std::istringstream is(rq.body);
+            std::string tok;
+            while (std::getline(is, tok, '&')) {
+                const size_t e = tok.find('=');
+                if (e == std::string::npos) continue;
+                f[urlDecode(tok.substr(0, e))] = urlDecode(tok.substr(e + 1));
+            }
+            rta::dsp::PeqSettings s = g_peq->settings();
+            if (f.count("bypass")) s.bypass = (f["bypass"] == "1" || f["bypass"] == "true");
+            if (f.count("preamp")) s.preampDb = std::min(std::max(std::atof(f["preamp"].c_str()), -24.0), 24.0);
+            if (f.count("name") && !f["name"].empty()) s.presetName = f["name"];
+            if (f.count("bands")) {
+                std::vector<rta::dsp::PeqBand> bands;
+                if (!peq_parse_bands_param(f["bands"], bands))
+                    return "{\"ok\":false,\"error\":\"bands 参数格式不对（应为 序号,类型,频率,增益,Q;...）\"}";
+                s.bands = bands;
+            }
+            g_peq->set_settings(s);
+            if (!peq_save_current(s)) return "{\"ok\":false,\"error\":\"写 rlplayer-peq.txt 失败\"}";
+            return peq_state_json(true);
+        }
+        return peq_state_json(true);
+    }
+
     // ---------------- 耳机 EQ（OPRA 预设管理）----------------
     if (rq.path.rfind("/api/opra/index", 0) == 0) {
         ct = "application/json; charset=utf-8";
@@ -6148,6 +6394,8 @@ int main(int argc, char** argv) {
         rta::meta::EntityStore::instance().setBaseDir(metaBase);
     }
     rta::dsp::OpraService::instance().init(path_in_exe_dir("data\\opra_index.json"), path_in_exe_dir(""));
+    // 20 段参数均衡 PEQ（261024-02 #6）：开机载入用户当前设置；文件不存在 = Flat（20 段 0dB）
+    peq_load_current();
     {
         std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
         std::string line;

@@ -793,6 +793,50 @@ async function gotoFiles() {
   ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=eq] a[href^=http]').length === 0"), 'EQ 页签无外链');
   ck(await evalJs("!!document.getElementById('sp_opra_copychip') && document.getElementById('sp_opra_copychip').classList.contains('chip')"), '存在复制官网链接芯片');
 
+  // ---- 261024-02 #6：20 段参数均衡 PEQ ----
+  const peqRows = await evalJs("document.querySelectorAll('#peqRows tbody tr').length");
+  ck(peqRows === 20, 'PEQ 编辑区 20 段', 'rows=' + peqRows);
+  ck(await evalJs("!!document.getElementById('peqCurve') && document.querySelectorAll('#peqCurve svg polyline').length === 1"),
+     'PEQ 频响曲线（SVG）已渲染');
+  ck(await evalJs("document.querySelectorAll('#peqPreset option').length >= 2"),
+     'PEQ 预设下拉含 Flat + 示例', 'opts=' + (await evalJs("document.querySelectorAll('#peqPreset option').length")));
+  ck(await evalJs("(function(){var ids=['peqBypass','peqPreamp','peqLoad','peqSave','peqDelete','peqReset'];for(var i=0;i<ids.length;i++){var e=document.getElementById(ids[i]);if(!e)return false;if(ids[i]==='peqBypass'||ids[i]==='peqPreamp'){if(!e.onchange&&!e.oninput)return false;}else{if(!e.onclick)return false;}}return true;})()"),
+     'PEQ 控件齐全且已绑定事件（bypass/前级/加载/保存/删除/重置）');
+
+  // 改第 11 段（1kHz）+6dB：前端 -> 后端 -> 曲线，全链路实测
+  const peqEdit = await evalJs(`(async function(){
+    var rows = document.querySelectorAll('#peqRows tbody tr');
+    var tr = rows[10];
+    if (!tr) return { ok:false, msg:'没有第 11 行' };
+    var f = tr.querySelector('.peqF'), g = tr.querySelector('.peqG');
+    f.value = 1000; f.dispatchEvent(new Event('input'));
+    g.value = 6.0; g.dispatchEvent(new Event('input'));
+    await new Promise(r => setTimeout(r, 1200));
+    var j = await fetch('/api/peq').then(r => r.json());
+    var b = j.bands[10];
+    var near = j.points.reduce((a, x) => Math.abs(Math.log(x[0]/1000)) < Math.abs(Math.log(a[0]/1000)) ? x : a);
+    return { ok:true, gain:b.gain, freq:b.freq, db:near[1], nearF:near[0], fs:j.fs, allGains:j.bands.map(x=>x.gain) };
+  })()`);
+  ck(peqEdit.ok && Math.abs(peqEdit.gain - 6.0) < 1e-6, 'UI 改第 11 段 +6dB 已生效并落库', JSON.stringify(peqEdit));
+  ck(peqEdit.ok && Math.abs(peqEdit.db - 6.0) <= 0.4, '曲线在 1kHz 附近 ≈ +6dB', 'db=' + (peqEdit.db || 0).toFixed(3));
+  await shot('06-peq-20band', true);
+
+  // 预设加载（内置示例）走 UI：选中 + 点「加载」
+  await evalJs("(function(){var s=document.getElementById('peqPreset');var opt=Array.from(s.options).find(o=>o.value.indexOf('Harman')>=0);if(opt)s.value=opt.value;document.getElementById('peqLoad').click();})()");
+  await sleep(1200);
+  const peqPresetOk = await evalJs(`(async function(){
+    var j = await fetch('/api/peq').then(r => r.json());
+    return { ok:true, name:j.name, nonzero:j.bands.filter(b=>Math.abs(b.gain)>0.5).length, preamp:j.preamp };
+  })()`);
+  ck(peqPresetOk.nonzero > 0, 'UI 加载内置预设（Harman 示例）生效', JSON.stringify(peqPresetOk));
+
+  // 复原 Flat（直接调 API，避免 confirm 弹窗卡住 headless）
+  await evalJs("fetch('/api/peq/preset',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'action=reset&name=Flat'}).then(r=>r.json()).then(()=>peqLoadState())");
+  await sleep(900);
+  ck(await evalJs("fetch('/api/peq').then(r=>r.json()).then(j=>j.bands.every(b=>Math.abs(b.gain)<1e-9))"), 'PEQ 测试后已复原 Flat');
+
+
+
   // EQ 自检在设置页里做，后续「右栏标签页 / 歌词 / 信号链」需要回到普通浏览视图（右栏才可见）。
   await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='tracks').click()");
   await sleep(600);

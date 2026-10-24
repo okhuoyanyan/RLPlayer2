@@ -22,6 +22,7 @@
 #include "dsp/volume.h"
 #include "dsp/gpu_bridge.h"
 #include "dsp/loudness.h"
+#include "dsp/peq.h"          // 261024-02 #6：20 段参数均衡（输入采样率、现有文件 EQ 之前）
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -72,6 +73,10 @@ struct PipelineConfig {
     std::vector<ChannelProcess>   channel;     // 按【输出】声道索引
     size_t   convBlock = 1024;                 // 卷积分块大小（2 的幂）
 
+    // 20 段参数均衡（261024-02 #6）。在【输入采样率】、现有文件 EQ 之前处理；
+    // 由 rtaweb 持有同一个 shared_ptr，UI 改参数时热更新（引擎内部交叉淡入）。
+    std::shared_ptr<dsp::PeqEngine> peq;
+
     // ---- 音量 ----
     bool     volumeEnabled = false;   // 默认关闭，保证直通可证
     double   volumeDb      = 0.0;
@@ -92,7 +97,7 @@ struct PipelineStats {
     int      tapsPerPhase = 0;
     double   latencyInSamples = 0.0;
     // 各阶段是否实际生效
-    bool     usedMatrix = false, usedEq = false, usedDelay = false;
+    bool     usedMatrix = false, usedEq = false, usedDelay = false, usedPeq = false;
     bool     usedConvolution = false, usedResample = false, usedVolume = false;
     bool     usedGpuConvolution = false;   // 本次是否真的走了 GPU
     bool     usedChannelGain = false;      // 是否用了每声道增益
@@ -114,6 +119,7 @@ public:
         for (const auto& c : cfg_.channel) {
             if (!c.eq.empty() || c.delaySamples != 0 || !c.ir.empty() || c.gainDb != 0.0) return true;
         }
+        if (cfg_.peq && cfg_.peq->has_effect()) return true;   // PEQ 全 0dB / bypass 不影响直通
         return false;
     }
 
@@ -228,6 +234,14 @@ public:
         } else {
             // 单位路由（声道数不变时才允许）
             for (int c = 0; c < outCh && c < inCh; ++c) work[(size_t)c] = planes[(size_t)c];
+        }
+
+        // ---- 阶段 3 前置：20 段 PEQ（输入采样率，现有文件 EQ 之前）----
+        // 独立于 cfg_.channel（即使没有任何通道配置也要生效）；全 0dB/bypass 时快速路径直通。
+        if (cfg_.peq && cfg_.peq->has_effect()) {
+            for (int c = 0; c < outCh && c < (int)work.size(); ++c)
+                cfg_.peq->process((size_t)c, work[(size_t)c].data(), work[(size_t)c].size());
+            st.usedPeq = true;
         }
 
         // ---- 阶段 3+4：每输出声道 EQ / 延迟 / 卷积 ----
