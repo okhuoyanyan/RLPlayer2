@@ -240,7 +240,13 @@ int main() {
         for (const auto& c : cases) {
             SdmConfig cfg;
             cfg.fs = c.fs; cfg.order = c.order; cfg.levels = 2;
-            cfg.cutoffHz = 100000.0; cfg.ditherLsb = 0.0005;   // 播放器的新默认值
+            // 2026-10-25：抖动注入点修复（进比较器、不进误差反馈）后，环路不再有
+            // 泄漏白噪的"意外镇定"。DSD64 下 fc=100k 的传统设计 H∞=1.43，处于
+            // 稳态边缘触轨区（0.62 幅度下瞬态后仍偶发轨饱和，实测 7 次/RMS 已恢复）；
+            // probe8 实测 H∞≤1.35 为零触轨区 ⟹ DSD64 子例把 corner 降到 80k
+            // （H∞≈1.3），其余速率维持 100k 不变。
+            cfg.cutoffHz = (c.fs < 3.0e6) ? 80000.0 : 100000.0;
+            cfg.ditherLsb = 0.0005;   // 播放器的新默认值
             SdmModulator m(cfg);
             const long long total = (long long)(c.fs * 2.5);
             const long long ev0 = (long long)(c.fs * 1.0);
