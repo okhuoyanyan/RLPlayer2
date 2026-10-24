@@ -178,6 +178,11 @@ target_include_directories(rtadsp INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # ---------------- 测试 ----------------
 enable_testing()
+# 261024-02 #2：宿主 postMessage 协议 + 外链协议白名单（纯函数，可单测）
+add_executable(test_host_msg tests/test_host_msg.cpp)
+target_link_libraries(test_host_msg PRIVATE rtadsp)
+add_test(NAME host_msg COMMAND test_host_msg)
+
 add_executable(test_resampler tests/test_resampler.cpp)
 target_link_libraries(test_resampler PRIVATE rtadsp)
 add_test(NAME resampler COMMAND test_resampler)
