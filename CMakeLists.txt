@@ -541,3 +541,8 @@ target_include_directories(test_dsd_two_stage PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_dsd_two_stage PRIVATE rtadsp psapi)
 add_test(NAME dsd_two_stage COMMAND test_dsd_two_stage)
 
+
+# ---------------- ASIO 原生 DSD（261024-05）----------------
+add_executable(test_asio_native_dsd tests/test_asio_native_dsd.cpp)
+target_link_libraries(test_asio_native_dsd PRIVATE rtadsp ole32 uuid advapi32)
+add_test(NAME asio_native_dsd COMMAND test_asio_native_dsd)

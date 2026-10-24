@@ -10,6 +10,8 @@
 #include "audio/wav.h"
 #include "audio/audio_loader.h"
 #include "audio/wasapi_out.h"
+#include "audio/asio_out.h"      // ASIO 后端 + 原生 DSD（ASIO 2.3 IoFormat）
+#include "audio/dsd_reader.h"    // DirectSDM：.dsf/.dff 原始 1-bit 直通
 #include "net/rtanet_stream.h"
 #include "net/clock_loop.h"
 #include "net/rtanet_status.h"
@@ -87,8 +89,350 @@ static int gen_tone(const std::string& path, double seconds, uint32_t rate, int 
     return 0;
 }
 
+// ================= ASIO 原生 DSD =================
+// 取证/实现依据（ASIO SDK 2.3）：
+//   * 切 DSD 用 ASIOFuture(kAsioSetIoFormat, {kASIODSDFormat})，成功返回 ASE_SUCCESS(0x3f4847a0)，
+//     ASE_OK(0) 不算成功；驱动不支持时会把 formatType 改成 -1。
+//   * 切完之后驱动 getChannelInfo 报 ASIOSTDSDInt8LSB1(32) / MSB1(33)。
+//   * ★ bufferSize 的单位是"样本"，而 DSD 的样本只有 1 bit ⟹ 每次回调能写的字节 = bufferSize / 8。
+//     本机 AudioByte 实测：报 32768，双缓冲只有 4096 字节；按 32768 写立刻 AV（别人的 heap corruption 同因）。
+
+static bool asio_resolve_driver(const std::string& sel, AsioDriverEntry& out, std::string& err) {
+    const auto list = asio_enum_drivers();
+    if (list.empty()) { err = "本机没有 ASIO 驱动（HKLM\\SOFTWARE\\ASIO 为空）"; return false; }
+    bool allDigits = !sel.empty();
+    for (char c : sel) if (!isdigit((unsigned char)c)) allDigits = false;
+    if (allDigits) {
+        const int idx = atoi(sel.c_str());
+        if (idx >= 0 && idx < (int)list.size()) { out = list[(size_t)idx]; return true; }
+        err = "序号越界: " + sel + "（共 " + std::to_string(list.size()) + " 个驱动）";
+        return false;
+    }
+    std::string lower = sel;
+    for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
+    if (lower.size() > 2 && lower.front() == '{') {
+        for (const auto& e : list) {
+            std::string lc = e.clsid;
+            for (auto& c : lc) c = (char)std::tolower((unsigned char)c);
+            if (lc == lower) { out = e; return true; }
+        }
+        err = "找不到 CLSID: " + sel;
+        return false;
+    }
+    std::vector<std::string> cands;
+    for (const auto& e : list) {
+        std::string ln = e.name;
+        for (auto& c : ln) c = (char)std::tolower((unsigned char)c);
+        if (ln == lower) { out = e; return true; }
+        if (ln.find(lower) != std::string::npos) cands.push_back(e.name);
+    }
+    if (cands.size() == 1) {
+        for (const auto& e : list) if (e.name == cands[0]) { out = e; return true; }
+    }
+    if (cands.empty()) err = "找不到 ASIO 驱动「" + sel + "」；用 --asio-list 看全部";
+    else {
+        err = "「" + sel + "」匹配到多个驱动：";
+        for (const auto& n : cands) err += n + " | ";
+    }
+    return false;
+}
+
+static int asio_list_drivers() {
+    const auto list = asio_enum_drivers();
+    printf("注册表里的 ASIO 驱动 %zu 个：\n", list.size());
+    for (size_t i = 0; i < list.size(); ++i)
+        printf("  [%zu] %-32s CLSID %s\n", i, list[i].name.c_str(), list[i].clsid.c_str());
+    printf("（只读枚举：不打开驱动、不创建缓冲、不发声）\n");
+    return 0;
+}
+
+// DSD 电平估计（安全横幅用，不做抽取 → 不引入滤波器延迟/量化）。
+// 原理：1-bit 流的局部"1 的密度"就是瞬时电平；密度 0.5 = 0，密度 1 = +满幅。
+// 先减去整段流的直流密度再取窗口峰值 —— 否则全零流（恒定 -1）会被误判成 0 dBFS。
+// 实现放在 asio_out.h（asio_dsd_level_planes），这里只做 DsdStream → 平面指针的适配，
+// 这样 tests/test_asio_native_dsd.cpp 测的就是播放器真正在用的那份代码（铁律 3）。
+using DsdLevel = AsioDsdLevel;
+static DsdLevel dsd_level(const DsdStream& s) {
+    std::vector<const uint8_t*> planes;
+    size_t bytes = 0;
+    for (const auto& v : s.data) { planes.push_back(v.empty() ? nullptr : v.data()); bytes = std::max(bytes, v.size()); }
+    return asio_dsd_level_planes(planes, bytes);
+}
+
+// DoP 回落的打包器：实现在 asio_out.h（asio_dop_pack_planes），这里只做适配。
+static void dop_pack_bits(const DsdStream& s, size_t bitStart, size_t bits,
+                          std::vector<int32_t>& out, std::vector<char>& phaseA) {
+    std::vector<const uint8_t*> planes;
+    for (const auto& v : s.data) planes.push_back(v.empty() ? nullptr : v.data());
+    asio_dop_pack_planes(planes, bitStart, bits, out, phaseA);
+}
+
+static void print_play_banner(const char* backend, const std::string& dev, double sec,
+                              double peakDbfs, const char* extra) {
+    printf("\n╔══════════════════════════════════════════════════════════════════════╗\n");
+    printf("║ 即将播放：ASIO 独占会接管音频设备并静音系统其他声音                    ║\n");
+    printf("╚══════════════════════════════════════════════════════════════════════╝\n");
+    printf("  后端   : %s\n", backend);
+    printf("  设备   : %s\n", dev.c_str());
+    printf("  时长   : %.1f 秒\n", sec);
+    printf("  电平   : 峰值约 %.1f dBFS%s\n", peakDbfs,
+           peakDbfs <= -60.0 ? "（远低于可闻，铁律 1：≤ -60 dBFS）"
+                             : (peakDbfs <= -20.0 ? "（不可闻档）" : "（!! 可闻档，将被拒绝）"));
+    if (extra && *extra) printf("  说明   : %s\n", extra);
+    fflush(stdout);
+}
+
+// DoP 回落播放（从 1-bit 流直接打 24-bit 承载样本）。返回 0 成功 / 5 失败。
+static int play_asio_dop_dsd(const AsioDriverEntry& e, const DsdStream& s, double playSec,
+                             const char* why) {
+    const int ch = s.channels;
+    AsioDriver dop;
+    std::string derr;
+    const uint32_t carrier = s.rate / 16u;
+    printf("  DoP 回落原因：%s\n", why ? why : "");
+    if (!dop.open(e.clsid, (double)carrier, ch, 24, derr)) {
+        printf("❌ DoP 回落也失败：%s\n", derr.c_str());
+        return 5;
+    }
+    printf("  DoP: %s，缓冲 %ld 帧，%u Hz / 24-bit\n", dop.name().c_str(), dop.buffer_size(), carrier);
+    if (!dop.start(derr)) { printf("❌ DoP ASIOStart 失败：%s\n", derr.c_str()); return 5; }
+    const size_t periodFrames = (size_t)dop.buffer_size();
+    const size_t totalBits = (size_t)std::min<double>((double)s.bits, playSec * (double)s.rate);
+    std::vector<char> phase;
+    std::vector<int32_t> pcm;
+    size_t bitsDone = 0, framesPushed = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (bitsDone < totalBits) {
+        const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (el >= playSec) break;
+        if (dop.free_frames() < periodFrames) { Sleep(1); continue; }
+        const size_t chunkBits = std::min<size_t>(periodFrames * 16, totalBits - bitsDone);
+        dop_pack_bits(s, bitsDone, chunkBits, pcm, phase);
+        const size_t w = dop.push(pcm.data(), pcm.size() / (size_t)ch);
+        if (w == 0) { Sleep(1); continue; }
+        bitsDone += w * 16;
+        framesPushed += w;
+    }
+    Sleep(150);
+    dop.stop();
+    const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    printf("\nDoP 回落统计：写入 %zu 帧（%zu 个 DSD 样本/声道），墙钟 %.2f 秒，回调 %llu 次，欠载 %llu 次\n",
+           framesPushed, bitsDone, wall, dop.callbacks(), dop.underruns());
+    printf("  是否走了原生 DSD : 否（DoP 承载 %u Hz）\n", carrier);
+    dop.close();
+    return 0;
+}
+
+// 原生 DSD 播放。返回 0 成功；4 = 启动失败且 DoP 也失败；5 = DoP 回落失败；6 = 电平超限。
+static int play_asio_native_dsd(const AsioDriverEntry& e, const DsdStream& s, double limitSec,
+                                bool forceDop) {
+    const int ch = s.channels;
+    if (ch <= 0 || s.data.empty()) { printf("!! DSD 流为空\n"); return 4; }
+    const double srcSec = s.seconds();
+    const double playSec = (limitSec > 0.0 && limitSec < srcSec) ? limitSec : srcSec;
+    const DsdLevel lv = dsd_level(s);
+
+    print_play_banner("ASIO 原生 DSD", e.name, playSec, lv.peakDbfs,
+                      lv.allZero ? "全零 DSD = 恒定电平 = 数字静音" : "");
+    printf("  源     : %u Hz（DSD%u），%d 声道，%.1f 秒，每声道 %zu 字节\n",
+           s.rate, s.rate / 44100u, ch, srcSec, s.bytesPerChannel());
+    // 铁律 1：≥ -20 dBFS 一律拒绝（DSD 侧同样适用）
+    if (lv.peakDbfs > -20.0) {
+        printf("\n❌ 拒绝播放：估计峰值 %.1f dBFS > -20 dBFS（铁律 1：开发验证不得向用户设备播放可闻声音）\n",
+               lv.peakDbfs);
+        return 6;
+    }
+
+    AsioDriver drv;
+    std::string err;
+    bool nativeOk = !forceDop;
+    if (forceDop) err = "（诊断开关 --force-dop-fallback：人为跳过原生 DSD）";
+    else nativeOk = drv.open_dsd(e.clsid, (double)s.rate, ch, err);
+    if (!nativeOk) {
+        printf("\n❌ 原生 DSD 打开失败（驱动「%s」）：\n   %s\n", e.name.c_str(), err.c_str());
+        printf("   ⟹ 显式回落 DoP（承载 %u Hz / 24-bit），不是静默降级\n", s.rate / 16u);
+        fflush(stdout);
+        return play_asio_dop_dsd(e, s, playSec, "原生 DSD 打开失败");
+    }
+
+    const auto& di = drv.dsd_info();
+    printf("\n  协商原始数据：\n");
+    printf("    kAsioCanDoIoFormat(DSD) -> 0x%08lx (formatType=%ld)\n",
+           (unsigned long)di.canDoIo, di.canDoTypeAfter);
+    printf("    kAsioSetIoFormat(DSD)   -> 0x%08lx (formatType=%ld)   ASE_SUCCESS 应为 0x%08lx\n",
+           (unsigned long)di.setIo, di.setIoTypeAfter, (unsigned long)ASE_SUCCESS);
+    printf("    kAsioGetIoFormat        -> 0x%08lx (formatType=%ld)\n",
+           (unsigned long)di.getIo, di.getIoType);
+    printf("    canSampleRate(%.0f)=0x%08lx  setSampleRate=0x%08lx  getSampleRate=%.0f\n",
+           (double)s.rate, (unsigned long)di.canRate, (unsigned long)di.setRate, di.rateReadback);
+    printf("    getChannelInfo type=%ld（%s）  ASIOCreateBuffers=0x%08lx\n",
+           (long)di.type, asio_sample_type_name(di.type), (unsigned long)di.createBuffers);
+    printf("    getBufferSize=%ld（单位=1-bit 样本）⟹ 每回调写 %ld 字节/声道（%.2f ms）\n",
+           di.bufferBytes, di.writeBytes,
+           (double)di.writeBytes * 8.0 * 1000.0 / (double)s.rate);
+
+    // 本机 AudioByte 实测：DSD 会话的 start() 会间歇性失败（同一份参数前一次成功、后一次
+    // "驱动拒绝启动"）。这不是我们传的参数问题（createBuffers 已经 ASE_OK），所以按
+    // 3 次、递增间隔重试；三次都失败才回落 DoP —— 回落要写明原因，不许静默。
+    bool started = false;
+    for (int attempt = 1; attempt <= 3 && !started; ++attempt) {
+        started = drv.start(err);
+        if (!started) {
+            printf("  ASIOStart 第 %d/3 次失败：%s\n", attempt, err.c_str());
+            if (attempt < 3) Sleep(400 * attempt);
+        }
+    }
+    if (!started) {
+        printf("❌ 原生 DSD 启动失败（重试 3 次）：%s\n", err.c_str());
+        printf("   ⟹ 显式回落 DoP（承载 %u Hz / 24-bit）\n", s.rate / 16u);
+        drv.close();
+        return play_asio_dop_dsd(e, s, playSec, "原生 DSD 启动失败");
+    }
+
+    const size_t period = (size_t)drv.dsd_buffer_bytes();
+    const size_t bytesTotal = s.bytesPerChannel();
+    const size_t bytesLimit = std::min<size_t>(bytesTotal,
+        (size_t)(playSec * (double)s.rate / 8.0));
+    std::vector<uint8_t> inter(period * (size_t)ch);
+
+    unsigned long long pos0 = 0, pos1 = 0;
+    const bool havePos0 = drv.sample_position(pos0);
+
+    // 先灌满环（≈0.18 秒领先量），再让驱动真正开始吃 —— 避免开播第一块就欠载
+    size_t cursor = 0;
+    auto fill_chunk = [&](size_t n) -> size_t {
+        for (size_t i = 0; i < n; ++i) {
+            const size_t byteIdx = cursor + i;
+            for (int c = 0; c < ch; ++c)
+                inter[i * (size_t)ch + (size_t)c] = s.data[(size_t)c][byteIdx];
+        }
+        return n;
+    };
+    while (cursor < bytesLimit && drv.free_frames() >= period) {
+        const size_t n = fill_chunk(std::min(period, bytesLimit - cursor));
+        const size_t w = drv.push_dsd(inter.data(), n);
+        if (w == 0) break;
+        cursor += w;
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t pushed = cursor;
+    while (cursor < bytesLimit) {
+        const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (el >= playSec) break;
+        if (drv.free_frames() < period) { Sleep(1); continue; }
+        const size_t n = fill_chunk(std::min(period, bytesLimit - cursor));
+        const size_t w = drv.push_dsd(inter.data(), n);
+        if (w == 0) { Sleep(1); continue; }
+        cursor += w;
+        pushed += w;
+    }
+    // 收尾：环里还压着约 0.18 秒数据。直接 stop 会让最后几个回调拿不到数据，
+    // 在统计里变成"假欠载"。正确做法是继续按实时节奏喂【全零字节】把尾巴冲干净。
+    const size_t tailBytes = drv.buffered();
+    const double tailMs = (double)tailBytes * 8.0 * 1000.0 / (double)s.rate;
+    if (tailMs > 0.0 && tailMs < 1000.0) {
+        std::vector<uint8_t> zeros(period * (size_t)ch, 0);
+        const auto tTail = std::chrono::steady_clock::now();
+        while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tTail).count()
+               < tailMs + 20.0) {
+            const size_t w = drv.push_dsd(zeros.data(), period);
+            (void)w;
+            Sleep(1);
+        }
+    }
+    const bool havePos1 = drv.sample_position(pos1);
+    drv.stop();
+    const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    const double nominal = (double)s.rate;
+    const double measured = wall > 0.0 ? (double)pushed * 8.0 / wall : 0.0;
+    const double errPct = nominal > 0.0 ? (measured - nominal) / nominal * 100.0 : 0.0;
+    const bool okType = asio_is_dsd_1bit(di.type);
+    const bool okRate = std::fabs(di.rateReadback - (double)s.rate) < 1.0;
+    const bool okCb = drv.callbacks() > 0;
+    const bool okSpeed = std::fabs(errPct) < 10.0;
+
+    printf("\n原生 DSD 播放统计：\n");
+    printf("  写入 %zu 字节/声道（= %zu 个 DSD 样本），墙钟 %.2f 秒\n", pushed, pushed * 8, wall);
+    printf("  实测码率 %.0f bit/s（标称 %.0f，误差 %+.1f%%）\n", measured, nominal, errPct);
+    printf("  驱动回调 %llu 次，欠载 %llu 次，缓冲 %ld 字节/声道\n",
+           drv.callbacks(), drv.underruns(), di.writeBytes);
+    if (havePos0 && havePos1 && pos1 > pos0)
+        printf("  getSamplePosition %llu -> %llu（Δ=%llu，每秒 %.0f；本驱动按 1/4 位率计数，"
+               "%.0f/4=%.0f ⟹ 一致）\n",
+               pos0, pos1, pos1 - pos0, wall > 0 ? (double)(pos1 - pos0) / wall : 0.0,
+               nominal, nominal / 4.0);
+    else
+        printf("  getSamplePosition 不可用（err 或驱动在 DSD 停止后归零），码率由写入字节/墙钟独立算出\n");
+    printf("  判据逐项：类型是 DSD=%d（type=%ld） 采样率读回=%.0f(%d) 有回调=%d 码率误差<10%%=%d\n",
+           (int)okType, (long)di.type, di.rateReadback, (int)okRate, (int)okCb, (int)okSpeed);
+    printf("  是否真的走了原生 DSD : %s\n",
+           (okType && okRate && okCb && okSpeed) ? "是" : "否（见上面逐项数据）");
+    drv.close();
+    return (okType && okRate && okCb && okSpeed) ? 0 : 4;
+}
+
+// 生成 DSD 素材（--gen-dsd）：--silent = 全零字节（恒定电平 = 数字静音，验证链路用）
+static int gen_dsd(const std::string& path, double seconds, int multiple, bool silent,
+                   double ampDb, double toneHz, int order) {
+    if (multiple < 64) multiple = 64;
+    if (seconds <= 0.0 || seconds > 300.0) seconds = 10.0;
+    const uint32_t rate = 44100u * (uint32_t)multiple;
+    const size_t nBits = (size_t)std::llround(seconds * (double)rate);
+    DsdStream s;
+    s.rate = rate;
+    s.channels = 2;
+    s.bits = nBits;
+    s.container = "dsf";
+    s.data.assign(2, std::vector<uint8_t>((nBits + 7) / 8, 0));
+    s.channelIds = {"SLFT", "SRGT"};
+    if (silent) {
+        printf("生成全零 DSD：%zu 位/声道（全零字节 = 恒定电平 = 数字静音）\n", nBits);
+    } else {
+        const double amp = std::pow(10.0, ampDb / 20.0);
+        if (ampDb > -20.0) {
+            printf("❌ 拒绝生成 %.1f dBFS 的素材：铁律 1 要求 ≤ -60 dBFS（可闻素材需用户明确要求）\n", ampDb);
+            return 6;
+        }
+        rta::dsp::SdmConfig mc;
+        mc.fs = (double)rate;
+        mc.order = order;
+        mc.cutoffHz = 100000.0;
+        mc.levels = 2;
+        for (int c = 0; c < 2; ++c) {
+            rta::dsp::SdmModulator m(mc);
+            for (size_t n = 0; n < nBits; ++n) {
+                const double x = amp * std::sin(2.0 * 3.141592653589793 * toneHz * (double)n / (double)rate);
+                if (m.process(x) > 0.0) s.setBit((size_t)c, n, true);
+            }
+        }
+        printf("生成 DSD 测试音：%.1f Hz，%.1f dBFS，%d 阶调制器\n", toneHz, ampDb, order);
+    }
+    try { rta::audio::write_dsf(path, s, 4096); }
+    catch (const std::exception& ex) { printf("!! 写出失败：%s\n", ex.what()); return 1; }
+    // 立刻读回比对（不信任自己的写出器）
+    try {
+        DsdStream back = rta::audio::read_dsd(path);
+        if (back.bits != s.bits || back.rate != s.rate) { printf("!! 读回长度/速率不一致\n"); return 1; }
+        uint64_t diff = 0;
+        for (size_t c = 0; c < 2; ++c)
+            for (uint64_t n = 0; n < nBits; ++n)
+                if (s.bit(c, n) != back.bit(c, n)) ++diff;
+        const DsdLevel lv = dsd_level(back);
+        printf("  写出 %s：%u Hz，%d ch，%llu 位/声道，读回%s，峰值估计 %.1f dBFS\n",
+               path.c_str(), back.rate, back.channels, (unsigned long long)back.bits,
+               diff ? "有位差(!!)" : "逐位一致", lv.peakDbfs);
+    } catch (const std::exception& ex) { printf("!! 读回失败：%s\n", ex.what()); return 1; }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
+    // ASIO 驱动是 COM 进程内服务器：不开 COM 直接 CoCreateInstance 会得到 0x800401f0
+    // （CO_E_NOTINITIALIZED）。以前 rtaplay 不开设备走 COM，所以没这行；原生 DSD 必须加。
+    const HRESULT comInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    (void)comInit;
     if (argc < 2) {
         printf("用法:\n");
         printf("  rtaplay --list\n");
@@ -102,6 +446,9 @@ int main(int argc, char** argv) {
         printf("  --volume <dB>     音量                   --gpu       卷积优先用 GPU\n");
         printf("  --net <host:port> 走 RTANet 网络输出     --analyze   只跑管线不开设备\n");
         printf("  --buffer <ms> 独占缓冲   --seconds N 限时   --device <ID>   --loop\n");
+        printf("  --asio-list       列出 ASIO 驱动（只读，不打开设备）\n");
+        printf("  --asio-device <名|序号|CLSID>  走 ASIO 输出；配 --native-dsd 走原生 DSD（失败显式回落 DoP）\n");
+        printf("  --gen-dsd <out.dsf> [--seconds N] [--rate 64] [--silent|--amp -60]  生成 DSD 素材\n");
         printf("  --list-filters    列出全部命名滤波器（不需要输入文件）\n");
         printf("  --list-modulators 列出全部调制器族（不需要输入文件）\n");
         return 1;
@@ -135,6 +482,22 @@ int main(int argc, char** argv) {
                    p.forNx ? "  [Nx专用]" : "");
         return 0;
     }
+    if (first == "--asio-list") return asio_list_drivers();
+    if (first == "--gen-dsd") {
+        if (argc < 3) { printf("--gen-dsd 需要输出文件名\n"); return 1; }
+        bool silent = false; double sec = 10.0, ampDb = -60.0, tone = 1000.0; int mult = 64, order = 5;
+        for (int i = 3; i < argc; ++i) {
+            const std::string k = argv[i];
+            auto nx = [&](const char* d) -> std::string { return (i + 1 < argc) ? std::string(argv[++i]) : std::string(d); };
+            if (k == "--seconds") sec = atof(nx("10").c_str());
+            else if (k == "--rate") mult = atoi(nx("64").c_str());
+            else if (k == "--amp") ampDb = atof(nx("-60").c_str());
+            else if (k == "--tone") tone = atof(nx("1000").c_str());
+            else if (k == "--order") order = atoi(nx("5").c_str());
+            else if (k == "--silent") silent = true;
+        }
+        return gen_dsd(argv[2], sec, mult, silent, ampDb, tone, order);
+    }
     if (first == "--gen") {
         if (argc < 3) { printf("--gen 需要输出文件名\n"); return 1; }
         const double sec = (argc > 3) ? atof(argv[3]) : 5.0;
@@ -165,6 +528,9 @@ int main(int argc, char** argv) {
     int  ahmBits = 8;                // AHM 多电平位深 (6~8 bit)
     std::string filterName;      // 命名滤波器（手册 4.6）
     bool listFilters = false;
+    std::string asioDevice;      // 非空 = 走 ASIO 输出（名字 / 序号 / CLSID）
+    bool nativeDsd = false;      // 原生 DSD（ASIO IoFormat），失败显式回落 DoP
+    bool forceDop = false;       // 诊断：强制走 DoP 回落路径（验证"回落真的能出声/静音"）
 
     for (int i = 2; i < argc; ++i) {
         std::string k = argv[i];
@@ -208,6 +574,9 @@ int main(int argc, char** argv) {
         else if (k == "--oob-gain")    oobGain = atof(next("5.0").c_str());
         else if (k == "--ahm-bits")    ahmBits = atoi(next("8").c_str());
         else if (k == "--dsd")         { dsdMultiple = atoi(next("64").c_str()); cfg.outRate = rta::dsp::dop_carrier_rate(dsdMultiple) * 16; }
+        else if (k == "--asio-device")  asioDevice = next("");
+        else if (k == "--native-dsd")   nativeDsd = true;
+        else if (k == "--force-dop-fallback") forceDop = true;
         else if (k == "--filter")       filterName = next("");
         else if (k == "--list-filters") listFilters = true;
         else if (k == "--loudness")     cfg.loudnessEnabled = true;
@@ -235,6 +604,37 @@ int main(int argc, char** argv) {
                    p.twoStage ? "  [两段式]" : "",
                    p.forNx ? "  [Nx专用]" : "");
         return 0;
+    }
+
+    // ================= DirectSDM：DSD 文件 → ASIO 原生 DSD（不经过 PCM） =================
+    // 为什么必须在 read_any 之前拦截：read_any 会把 .dsf 抽成 PCM（多一层量化、
+    // 丢掉原始 1-bit 流），那样就谈不上"原生 DSD"了。
+    if (nativeDsd && asioDevice.empty()) {
+        printf("!! --native-dsd 需要配合 --asio-device（原生 DSD 只走 ASIO）\n");
+        return 1;
+    }
+    if (nativeDsd) {
+        std::string ext;
+        const size_t dot = inPath.find_last_of('.');
+        if (dot != std::string::npos) {
+            ext = inPath.substr(dot);
+            for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+        }
+        if (ext == ".dsf" || ext == ".dff") {
+            AsioDriverEntry dev;
+            std::string derr;
+            if (!asio_resolve_driver(asioDevice, dev, derr)) { printf("!! %s\n", derr.c_str()); return 1; }
+            DsdStream ds;
+            try { ds = rta::audio::read_dsd(inPath); }
+            catch (const std::exception& ex) { printf("!! 读取 DSD 失败：%s\n", ex.what()); return 1; }
+            printf("DirectSDM 源: %s（%s，%u Hz，%d ch，%llu 位/声道，%.2f 秒）\n",
+                   inPath.c_str(), ds.container.c_str(), ds.rate, ds.channels,
+                   (unsigned long long)ds.bits, ds.seconds());
+            if (dsdMultiple > 0 && rta::dsp::dsd_rate(dsdMultiple) != ds.rate)
+                printf("  注意：文件是 DSD%u，--dsd %d 被忽略（DirectSDM 按源位率直通，不重调制）\n",
+                       ds.rate / 44100u, dsdMultiple);
+            return play_asio_native_dsd(dev, ds, limitSec, forceDop);
+        }
     }
 
     AudioBuffer in;
@@ -535,8 +935,8 @@ int main(int argc, char** argv) {
 
     // ---- DSD 输出（DoP 封装）：调制 -> 打包 -> 写文件 ----
     if (dsdMultiple > 0) {
-        if (outFile.empty() && netTarget.empty()) {
-            printf("!! --dsd 需要配合 --out（离线写出）或 --net（经 RTANet 流式发送）\n");
+        if (outFile.empty() && netTarget.empty() && asioDevice.empty()) {
+            printf("!! --dsd 需要配合 --out（离线写出）/ --net（RTANet）/ --asio-device（ASIO 输出）\n");
             return 1;
         }
         const uint32_t dsdRate = rta::dsp::dsd_rate(dsdMultiple);
@@ -576,6 +976,24 @@ int main(int argc, char** argv) {
                    out.channels, out.frames(), audioSec, ms,
                    ms > 0 ? audioSec * 1000.0 / ms : 0.0,
                    rta::dsp::hardware_threads());
+        }
+        // ---- PCM → DSD 调制完成后，两条出口：原生 DSD（ASIO）或 DoP ----
+        if (nativeDsd) {
+            AsioDriverEntry dev;
+            std::string derr;
+            if (!asio_resolve_driver(asioDevice, dev, derr)) { printf("!! %s\n", derr.c_str()); return 1; }
+            DsdStream ds;
+            ds.rate = dsdRate;
+            ds.channels = out.channels;
+            ds.bits = out.frames();
+            ds.container = "mod";
+            ds.data.assign((size_t)out.channels, std::vector<uint8_t>((out.frames() + 7) / 8, 0));
+            for (int c = 0; c < out.channels; ++c)
+                for (size_t n = 0; n < out.frames(); ++n)
+                    if (sdm[(size_t)c][n] > 0.0) ds.setBit((size_t)c, n, true);
+            printf("已把调制结果打包成 1-bit 流（%llu 位/声道），交给 ASIO 原生 DSD\n",
+                   (unsigned long long)ds.bits);
+            return play_asio_native_dsd(dev, ds, limitSec, forceDop);
         }
         std::vector<const double*> ip;
         for (auto& v : sdm) ip.push_back(v.data());

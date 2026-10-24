@@ -5,10 +5,11 @@
 // 生成后立刻读回逐位比对；--verify 再抽取成 PCM，给出 THD+N 的明确数值。
 //
 // 用法：
-//   make_dsd --out test.dsf [--rate 64|128|256] [--tone 1000] [--amp -6]
+//   make_dsd --out test.dsf [--rate 64|128|256] [--tone 1000] [--amp -60]
 //            [--seconds 3] [--order 5] [--channels 2] [--kind dsf|dff]
 //            [--block 4096] [--verify]
-// 说明：--amp 是 dBFS，默认 -6；本工具只写文件，不打开任何音频设备（不发声）。
+// 说明：--amp 是 dBFS，**默认 -60（不可闻，铁律 1）**；需要更响必须显式传 --amp，且要知道自己在做什么。
+//       本工具只写文件，不打开任何音频设备（不发声）。
 #include "audio/dsd_reader.h"
 #include "dsp/dsd_integrator.h"
 #include "dsp/fft.h"
@@ -105,7 +106,7 @@ int main(int argc, char** argv) {
 
     std::string out, kind = "dsf";
     int multiple = 64, channels = 2, order = 5;
-    double tone = 1000.0, ampDb = -6.0, seconds = 3.0;
+    double tone = 1000.0, ampDb = -60.0, seconds = 3.0;
     uint32_t block = 4096;
     bool verify = false;
 
@@ -115,7 +116,7 @@ int main(int argc, char** argv) {
         if (k == "--out") out = next("");
         else if (k == "--rate") multiple = std::atoi(next("64").c_str());
         else if (k == "--tone") tone = std::atof(next("1000").c_str());
-        else if (k == "--amp") ampDb = std::atof(next("-6").c_str());
+        else if (k == "--amp") ampDb = std::atof(next("-60").c_str());
         else if (k == "--seconds") seconds = std::atof(next("3").c_str());
         else if (k == "--order") order = std::atoi(next("5").c_str());
         else if (k == "--channels") channels = std::atoi(next("2").c_str());
@@ -123,7 +124,7 @@ int main(int argc, char** argv) {
         else if (k == "--block") block = (uint32_t)std::atoi(next("4096").c_str());
         else if (k == "--verify") verify = true;
         else if (k == "-h" || k == "--help") {
-            printf("用法: make_dsd --out file.dsf [--rate 64|128|256] [--tone 1000] [--amp -6]\n"
+            printf("用法: make_dsd --out file.dsf [--rate 64|128|256] [--tone 1000] [--amp -60]\n"
                    "               [--seconds 3] [--order 5] [--channels 2] [--kind dsf|dff]\n"
                    "               [--block 4096] [--verify]\n");
             return 0;
