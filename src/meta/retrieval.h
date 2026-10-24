@@ -111,6 +111,7 @@ struct SummaryResult {
     std::vector<std::pair<std::string, std::string>> fields;
     // 2026-10-24（261024-02 #1/#7）：分阶段耗时诊断（search/fetch/llm 各多少 ms），只用于日志与 A/B。
     std::string diag;
+    int cache_ver = 0;   // 从磁盘缓存加载时的格式版本（0 = 不是从缓存来的 / 旧格式）
 };
 
 // ---------------------------------------------------------------------------
@@ -757,7 +758,7 @@ inline std::string summary_to_json(const SummaryResult& sr) {
     o << "{\n"
       // 2026-10-24（261024-01 #4）：缓存格式版本。v2 起才有结构化 fields；旧缓存（无 v 或 v<2）
       // 在读取时直接判过期，让下次请求重新生成 —— 否则升级后老用户永远看不到标签网格。
-      << "  \"v\": 2,\n"
+      << "  \"v\": 3,\n"
       << "  \"ok\": " << (sr.ok ? "true" : "false") << ",\n"
       << "  \"ai\": " << (sr.ai ? "true" : "false") << ",\n"
       << "  \"model\": \"" << meta_jesc(sr.model) << "\",\n"
@@ -841,7 +842,11 @@ inline bool summary_from_json(const std::string& text,
     }
     // 2026-10-24（261024-01 #4）：v2 之前的缓存没有结构化标签 → 视为已过期，重新生成一次
     //（否则升级后老用户永远看不到标签网格）。
-    if ((int)j["v"].n() < 2) sr_out.expires_at = 0;
+    sr_out.cache_ver = (int)j["v"].n();
+    // v3：消歧义过滤 + 400 降级链 + 输出精简（旧内容可能质量差/来自误判，统一重生成一次）
+    // 注意用 1（1970 年）而不是 0：summary_is_expired 对 expires_at<=0 会回退到 generated_at+7d，
+    // 设 0 等于"永不过期"（2026-10-24 实测：缓存 v2 文件一直 cache-hit，v3 失效没生效）。
+    if ((int)j["v"].n() < 3) sr_out.expires_at = 1;
     sr_out.disclaimer = j["disclaimer"].s();
     if (j.has("from_cache")) sr_out.from_cache = j["from_cache"].b;
     if (j.has("offline")) sr_out.offline = j["offline"].b;
@@ -1488,6 +1493,15 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         kr = knowledge_fetch(kind, name, kopts);
     }
 
+    // 2026-10-24（261024-02 #1）：消歧义页不是资料。
+    // 实测艺术家 "Irotas" 命中维基消歧义页，正文只有"Iroha (ILLIT)、IRAS 17163-3907、IOTA…"候选列表，
+    // 喂给模型就产出"XX 的页面目前仅显示多个候选标题…"这种垃圾（用户看到的"艺术家资料质量极差"）。
+    // 这里直接丢弃消歧义材料：剩下的走检索/搜索，什么都没有就走 AI 整理兜底。
+    kr.materials.erase(
+        std::remove_if(kr.materials.begin(), kr.materials.end(),
+                       [](const KnowledgeMaterial& m) { return m.kind == "disambiguation"; }),
+        kr.materials.end());
+
     // 4. Step 2: (可选) ds_search「创作背景/评价/版本点评」检索（每实体最多 1 次）
     std::vector<SearchHit> valid_hits;
     std::vector<SearchHit> fetched_hits;
@@ -1590,7 +1604,8 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     //   现改为：有旧缓存先用缓存；否则若配了 key，退到 AI 自有知识整理（unverified=true，UI 必须标注），
     //   结果写缓存 7 天，第二次打开不再调用。有材料时仍走严格引用路径，不受影响。
     if (kr.materials.empty() && fetched_hits.empty()) {
-        if (have_cache && cached.ok) {
+        // 2026-10-24（261024-02 #1）：同样只回退 v3+ 缓存（旧缓存可能是消歧义垃圾，见下方说明）
+        if (have_cache && cached.ok && cached.cache_ver >= 3) {
             cached.from_cache = true;
             cached.offline = true;
             cached.error = "未检索到任何权威材料，已回退至本地缓存";
@@ -1669,8 +1684,9 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         last_err = "综合结果校验失败: " + parsed.error;
     }
     if (!parsed.ok) {
-        // 有旧缓存 → 离线回退；否则 AI 自有知识兜底（诚实标注「AI 整理」，不冒充有来源）
-        if (have_cache && cached.ok) {
+        // 2026-10-24（261024-02 #1）：只回退 **v3+** 的缓存。旧格式缓存内容可能是消歧义垃圾
+        //（实测 Irotas：v2 缓存里是"页面仅显示多个候选标题…"），拿它当兜底等于把坏内容永久固化。
+        if (have_cache && cached.ok && cached.cache_ver >= 3) {
             cached.from_cache = true;
             cached.offline = true;
             cached.error = "综合校验失败 (" + last_err + ")，已回退至本地缓存";
