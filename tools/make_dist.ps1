@@ -168,7 +168,11 @@ foreach ($f in $tools) {
     else { Write-Host "WARN: tool not built: $f" }
 }
 
-$readme = Get-Content (Join-Path $dist 'README-template.txt') -Raw -Encoding UTF8
+# 2026-10-24：模板改放 tools\（dist\ 被 .gitignore 忽略，模板不进仓库的话别人 clone 后打不了包）；
+# 旧位置 dist\README-template.txt 保留为兜底。
+$tpl = Join-Path $root 'tools\README-template.txt'
+if (-not (Test-Path $tpl)) { $tpl = Join-Path $dist 'README-template.txt' }
+$readme = Get-Content $tpl -Raw -Encoding UTF8
 $readme = $readme -replace '@VERSION@', $Version
 Set-Content -Path (Join-Path $out 'README.txt') -Value $readme -Encoding UTF8
 
