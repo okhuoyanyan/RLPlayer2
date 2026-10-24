@@ -240,6 +240,12 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
     // ---------------- C2 遥测状态（2026-10-24 N300 欠载；纯观测）----------------
     // 全部是本地计数：不加锁、不分配（evRing 固定 64 槽），不改变写入/调度/DSP。
     const double loopStartT = nowSec();   // 起播时刻（dry 的 500ms 门槛、WFAIL 的 t= 都相对它）
+    // ★ P0-1/P0-2 开关（2026-10-24）：RTA_FAST_FEED=1 时改成「先写后等 + 等待上限 per/2」。
+    // 默认关闭 ⟹ 生产路径与既有回归测试逐字不变；真机 A/B 验证有效后再转正为默认。
+    static const bool g_fastFeed = [] {
+        const char* v = std::getenv("RTA_FAST_FEED");
+        return v && v[0] == '1';
+    }();
     long long dryN      = 0;      // dry：设备缓冲空 + 手里有数据 + 我们一个字节也写不进去
     double    dryAccMs  = 0.0;    // 已结算的 dry 墙钟毫秒
     double    dryEnterT = 0.0;    // 当前 dry 片段起点
@@ -440,19 +446,55 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                 publish(nowT);
             }
         }
-        const bool waited = sink.wait_event(20);
-        const double evT = nowSec();
-        if (waited) {
-            ++evN;
-            if (evLastT >= 0.0) {
-                evRing[evRingPos] = (evT - evLastT) * 1000.0;
-                evRingPos = (evRingPos + 1) % 64;
-                if (evRingN < 64) ++evRingN;
+        // ★ P0-1/P0-2（2026-10-24 真机 A/B 定案）：旧顺序是「wait_event(20) → 写」，
+        // 于是每一次补料都要先等到事件或 20ms 超时；而设备事件实测 100~105ms 才来一次
+        //（evint），靠它唤醒等于每 100ms 才补一次。现场 DC-Elite 60s 实测 dry=547、
+        // 每次 19.6ms —— 与 20ms 轮询上限完全吻合，即「每次都在下一个轮询才发现缓冲空了」。
+        // 新顺序：① 先按当前可用空间补写（不睡）；② 写不进去才阻塞等事件，
+        // 等待上限取 per/2（per=480@48k ⟹ 5ms），不再固定 20ms。
+        // 先做成 RTA_FAST_FEED=1 的开关：默认路径逐字不变，这样既有回归测试仍然有效，
+        // 真机验证通过后再转正并同步更新 mock 测试（铁律 3：先证明再改判据）。
+        const size_t pendBefore = pendFrames;
+        size_t w = 0;
+        long long padBefore = 0;
+        if (g_fastFeed) {
+            w = sink.write_available(pend.data(), pendFrames);
+            padBefore = sink.last_pad();            // 本次轮询的水位（写之前）
+            if (w == 0) {
+                const long long perF = sink.device_period_frames();
+                const int waitMs = (perF > 0 && h.deviceRate > 0)
+                    ? std::max(1, std::min(20,
+                          (int)((double)perF * 1000.0 / (double)h.deviceRate / 2.0)))
+                    : 20;
+                const bool woke = sink.wait_event(waitMs);
+                const double evT = nowSec();
+                if (woke) {
+                    ++evN;
+                    if (evLastT >= 0.0) {
+                        evRing[evRingPos] = (evT - evLastT) * 1000.0;
+                        evRingPos = (evRingPos + 1) % 64;
+                        if (evRingN < 64) ++evRingN;
+                    }
+                    evLastT = evT;
+                }
+                w = sink.write_available(pend.data(), pendFrames);
             }
-            evLastT = evT;
+        } else {
+            const bool waited = sink.wait_event(20);
+            const double evT = nowSec();
+            if (waited) {
+                ++evN;
+                if (evLastT >= 0.0) {
+                    evRing[evRingPos] = (evT - evLastT) * 1000.0;
+                    evRingPos = (evRingPos + 1) % 64;
+                    if (evRingN < 64) ++evRingN;
+                }
+                evLastT = evT;
+            }
+            padBefore = sink.last_pad();
+            w = sink.write_available(pend.data(), pendFrames);
         }
-        h.dbgPad->store(sink.last_pad());
-        const size_t w = sink.write_available(pend.data(), pendFrames);
+        h.dbgPad->store(padBefore);
         const double tAfter = nowSec();
         if (w > 0) h.dbgWr->fetch_add(1); else h.dbgW0->fetch_add(1);
 
@@ -466,7 +508,7 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
         // 反而会漏掉（pad 触底但补上了）—— 那是把判据改成「看不见」。
         // 只对能报告真实设备周期的后端计数（per<0 的 Null/NAA/共享后端没有 padding 概念）。
         const bool padTouched = (sink.device_period_frames() >= 0 &&
-                                 sink.last_pad() == 0 && pendFrames > 0);
+                                 padBefore == 0 && pendBefore > 0);
         if (padTouched) {
             if (tAfter - loopStartT >= 0.5) {
                 ++dryN;
