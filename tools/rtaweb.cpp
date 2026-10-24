@@ -3284,8 +3284,14 @@ static void queue_thread(PlayParams p, size_t start) {
         const bool done = play_one(cur, p, buf);
         const double endPos = (ps.outRate > 0 ? (double)ps.played.load() / (double)ps.outRate : 0.0);
         const size_t endPlayed = ps.played.load();
-        const std::string endErr = ps.error;
+        std::string endErr = ps.error;
         const std::string endCur = cur;
+        // 261024-05（PLAY_ABORT 归因）：被"新的播放请求/停止"打断的播放以前会写成
+        // END pos=0 error=""，只能靠下一条 START 前面那行 PLAY_ABORT 反推。
+        // 现在直接在 END 里给出原因：只有"一帧都没播 + 没有其它错误 + stop 标志被置起"才归因，
+        // 正常播完（played>0）或真失败（error 非空）都不会被误标。
+        const bool endAborted = (endPlayed == 0 && endErr.empty() && ps.stop.load());
+        if (endAborted) endErr = "PLAY_ABORT 播放被新的播放/停止请求打断（未播出一帧）";
         {
             std::ostringstream es;
             es << "END pos=" << endPos
