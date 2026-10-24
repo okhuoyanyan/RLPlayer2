@@ -310,8 +310,13 @@ async function installMock() {
       const d0 = await drawerState();
       ck(!d0.on, '默认不打开资料抽屉（资料默认隐藏）' + tag, 'on=' + d0.on);
       ck(d0.l >= (W - 2) || d0.l >= W, '抽屉关闭时完全移出视口（不占版面）' + tag, 'drawer.l=' + d0.l + ' W=' + W);
-      const req0 = await evalJs("(window.__reqs||[]).length");
-      ck(req0 === 0, '默认不预取任何实体（不点标签 = 不产生 AI 请求）' + tag, 'reqs=' + req0);
+      // 261024-02 追加（Lead 指定）：允许**后台预取 1 次「专辑」资料**改善首次等待体感；
+      // 歌曲/艺术家仍然不预取（点标签才请求）。抽屉必须保持关闭（预取不改变 UI 状态）。
+      const reqAll = await evalJs("(window.__reqs||[]).slice()");
+      const relN = reqAll.filter(function (s) { return /[?&]kind=release/.test(s); }).length;
+      const othN = reqAll.filter(function (s) { return !/[?&]kind=release/.test(s); }).length;
+      ck(relN <= 1, '默认最多后台预取 1 次「专辑」资料（不点标签也只有这一条请求）' + tag, 'release=' + relN);
+      ck(othN === 0, '默认不预取歌曲/艺术家资料（点标签才请求）' + tag, reqAll.slice(0, 4));
       const r = await gapChecks(W, H);
       await shot('np-' + W + 'x' + H + '-01-default');
       // ---- 点「专辑」标签：才请求 kind=release，抽屉滑出且不遮住控制区 ----

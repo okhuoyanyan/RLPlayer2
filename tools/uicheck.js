@@ -348,7 +348,9 @@ async function gotoFiles() {
     var a=document.querySelector('#setpage .spane[data-g=adv]');
     if(!s||!a) return 'missing-pane';
     var need=['sp_src_add','sp_src_list','sp_src_form','sp_src_name','sp_src_kind','sp_src_base',
-              'sp_src_user','sp_src_pass','sp_src_save','sp_src_cancel','sp_src_testform','sp_upnp','sp_upnpmsg'];
+              'sp_src_user','sp_src_pass','sp_src_save','sp_src_cancel','sp_src_testform',
+              // 261024-02 #5：DLNA 只发现按钮升级为完整「推送到设备」区块
+              'sp_cast_dev','sp_cast_scan','sp_cast_push','sp_cast_stop','sp_cast_stat_phase'];
     var miss=[]; need.forEach(function(id){var e=document.getElementById(id);if(!e||!s.contains(e))miss.push(id)});
     return {miss:miss,
             oldStream:a.textContent.indexOf('流媒体服务器')>=0,
@@ -358,7 +360,7 @@ async function gotoFiles() {
   })()`);
   ck(streamSec && Array.isArray(streamSec.miss) && streamSec.miss.length===0 && !streamSec.oldStream &&
      !streamSec.oldName && streamSec.newName && !streamSec.upnpInAdv,
-     '流媒体页控件齐全；高级页改名「本地音乐库」、无流媒体服务器组/DLNA 按钮', JSON.stringify(streamSec));
+     '流媒体页控件齐全（含推送区块）；高级页改名「本地音乐库」、无流媒体服务器组/DLNA 按钮', JSON.stringify(streamSec));
 
   // #12 SDM 比特率 / 封装始终可选（根因：旧 applyDsdState 只在输出 DSD 时启用，默认 PCM ⟹ 全灰）
   const sdmEnabled = await evalJs(`(function(){var r={};['sp_dsdrate','sp_dsdpk'].forEach(function(id){var e=document.getElementById(id);r[id]=e?e.disabled:null});r.note=!!document.getElementById('sp_dsdmodenote');return r;})()`);
@@ -667,93 +669,64 @@ async function gotoFiles() {
   ck(await waitFor("fetch('/api/settings').then(r=>r.json()).then(j=>String(j.kv.filterNx||'')==='" + before.nx + "')", 6000), 'Nx 还原');
   const p10 = await shot('19-settings-page');
 
-  // ---- P5b：设置页投放（UPnP）小节自检（控件绑定/渲染器下拉/DoP说明/状态渲染/无外链）----
+  // ---- 261024-02 #5：投放 UI 重构后的自检 ----
+  // 用户原话：「输出栏位下的 UPNP 投放功能多余」⟹ 输出页整块删除；投放入口统一到
+  // 单曲页「推送到设备」按钮 + 设置→流媒体页的「推送到设备」区块（三处共用 /api/cast/state）。
   await evalJs("document.querySelector('.stab[data-g=out]').click()");
   await sleep(400);
   ck(await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=out]');return !!p && p.classList.contains('on');})()"),
      '输出页签处于激活状态');
+  const outCastGone = await evalJs(`(function(){
+    var p = document.querySelector('#setpage .spane[data-g=out]');
+    var ids = ['sp_cast_start','sp_cast_file','sp_cast_dop','sp_cast_usecur','sp_cast_scan','sp_cast_stop','sp_cast_stat_phase'];
+    var left = [];
+    ids.forEach(function(id){ var e = document.getElementById(id); if (e && p.contains(e)) left.push(id); });
+    var bk = [].map.call(document.querySelectorAll('#sp_backend option'), function(o){ return o.value; });
+    return { left: left, hasUpnp: bk.indexOf('upnp') >= 0,
+             castText: (p.textContent.indexOf('投放（UPnP）') >= 0 || p.textContent.indexOf('投放实时状态') >= 0) };
+  })()`);
+  ck(outCastGone && outCastGone.left.length === 0 && !outCastGone.castText,
+     '输出页已无投放控件与「投放（UPnP）/投放实时状态」区块（261024-02 #5）', JSON.stringify(outCastGone));
+  ck(outCastGone && outCastGone.hasUpnp, '输出后端下拉仍保留「UPnP / DLNA 投放」选项');
 
-  const castControlsOk = await evalJs(`(function(){
-    var ids = ['sp_cast_dev', 'sp_cast_scan', 'sp_cast_file', 'sp_cast_usecur', 'sp_cast_dop', 'sp_cast_start', 'sp_cast_stop'];
-    var pane = document.querySelector('#setpage .spane[data-g=out]');
-    var miss = [];
-    ids.forEach(function(id) {
+  await evalJs("document.querySelector('.stab[data-g=stream]').click()");
+  await sleep(700);
+  const streamCast = await evalJs(`(function(){
+    var p = document.querySelector('#setpage .spane[data-g=stream]');
+    if (!p) return 'missing-pane';
+    var need = ['sp_cast_dev','sp_cast_scan','sp_cast_push','sp_cast_stop','sp_cast_devmsg',
+                'sp_cast_stat_phase','sp_cast_stat_dev','sp_cast_stat_pos','sp_cast_stat_transport',
+                'sp_cast_stat_bytes','sp_cast_stat_reqs','sp_cast_stat_port','sp_cast_stat_ratematch'];
+    var miss = [], unbound = [];
+    need.forEach(function(id){
       var e = document.getElementById(id);
-      if (!e || !pane.contains(e)) miss.push(id + ':缺失');
-      else if (!e.onclick && !e.onchange && !e.oninput) miss.push(id + ':未绑定事件');
+      if (!e || !p.contains(e)) { miss.push(id); return; }
+      if ((id === 'sp_cast_scan' || id === 'sp_cast_push' || id === 'sp_cast_stop' || id === 'sp_cast_dev') && !e.onclick && !e.onchange) unbound.push(id);
     });
-    return miss;
-  })()`);
-  ck(Array.isArray(castControlsOk) && castControlsOk.length === 0, '投放小节控件全部存在且已绑定事件', JSON.stringify(castControlsOk));
-
-  const castDevState = await evalJs(`(function(){
-    var s = document.getElementById('sp_cast_dev');
-    if (!s) return 'no-select';
-    var opts = s.querySelectorAll('option');
-    var msg = (document.getElementById('sp_cast_devmsg') || {}).textContent || '';
-    // 2026-10-23 修判据：旧判据要求 opts.length > 1，隐含"发现设备至少两台" —— 实际只有 1 台时
-    // （用户环境就是 1 台 N1000_UPNP）会误判 FAIL。改为：只要下拉里有真实设备（非占位）+ 文案说共发现 N 个，就算通过。
-    if (opts.length > 1) return 'has-options:' + opts.length;
-    if (opts.length === 1 && msg.indexOf('共发现') >= 0) return 'has-options:' + opts.length;
-    if (opts.length === 1 && (opts[0].value === '' || msg.indexOf('未发现') >= 0 || opts[0].textContent.indexOf('未发现') >= 0)) return 'empty-state';
-    return 'opts=' + opts.length + ' msg=' + msg;
-  })()`);
-  ck(castDevState.indexOf('has-options') === 0 || castDevState === 'empty-state',
-     '渲染器下拉有内容或明确空态（无渲染器时）', castDevState);
-
-  const castBtnState = await evalJs(`(function(){
-    var start = document.getElementById('sp_cast_start');
-    var stop = document.getElementById('sp_cast_stop');
-    if (!start || !stop) return null;
-    return { startDisabled: start.disabled, stopDisabled: stop.disabled };
-  })()`);
-  ck(castBtnState && castBtnState.startDisabled === false && castBtnState.stopDisabled === true,
-     '投放空闲时开始按钮可用且停止按钮禁用', JSON.stringify(castBtnState));
-
-  const dopTextOk = await evalJs(`(function(){
-    var dop = document.getElementById('sp_cast_dop');
-    if (!dop) return false;
-    var parent = dop.closest('.sfld') || dop.parentElement;
-    var txt = parent ? parent.textContent : '';
-    // #7 之后说明在 (?) 的 data-tip 里：可见文字 + 提示一起看
-    var tips = parent ? parent.querySelectorAll('[data-tip]') : [];
-    for (var i = 0; i < tips.length; i++) txt += ' ' + tips[i].getAttribute('data-tip');
-    return txt.indexOf('DoP') >= 0 && (txt.indexOf('DSD') >= 0 || txt.indexOf('拒绝') >= 0);
-  })()`);
-  ck(dopTextOk, 'DoP 开关有说明文案（DSD 源说明与拒绝提示）');
-
-  const castStatOk = await evalJs(`(function(){
-    var pane = document.querySelector('#setpage .spane[data-g=out]');
-    var ids = ['sp_cast_stat_phase', 'sp_cast_stat_dev', 'sp_cast_stat_pos', 'sp_cast_stat_transport', 'sp_cast_stat_bytes', 'sp_cast_stat_reqs', 'sp_cast_stat_port', 'sp_cast_stat_ratematch'];
-    var miss = [];
-    ids.forEach(function(id) {
-      var e = document.getElementById(id);
-      if (!e || !pane.contains(e)) miss.push(id);
-    });
-    return miss;
-  })()`);
-  ck(Array.isArray(castStatOk) && castStatOk.length === 0,
-     '状态面板字段完整渲染（phase/渲染器/位置/传输状态/供源字节/请求数/采样率等）', JSON.stringify(castStatOk));
-  // 2026-10-23 用户 261023-04 #12：投放状态同样是横向卡片网格；目标渲染器整行显示。
-  const castStatGeom = await evalJs(`(function(){
-    var grid = document.querySelector('#setpage .spane[data-g=out] .in-stat-grid');
-    if (!grid) return null;
-    var items = Array.prototype.slice.call(grid.querySelectorAll('.in-stat-item'));
+    var push = document.getElementById('sp_cast_push'), stop = document.getElementById('sp_cast_stop');
+    var grid = p.querySelector('.in-stat-grid');
+    var items = grid ? grid.querySelectorAll('.in-stat-item') : [];
     var rows = {};
-    items.forEach(function(e){ var k = Math.round(e.getBoundingClientRect().top); rows[k] = (rows[k]||0)+1; });
+    Array.prototype.forEach.call(items, function(e){ var k = Math.round(e.getBoundingClientRect().top); rows[k] = (rows[k] || 0) + 1; });
     var maxRow = 0; Object.keys(rows).forEach(function(k){ maxRow = Math.max(maxRow, rows[k]); });
     var sel = document.getElementById('sp_cast_dev');
     var fld = sel ? sel.closest('.sfld') : null;
-    return { count: items.length, maxRow: maxRow,
-             devWidth: fld ? Math.round(fld.getBoundingClientRect().width) : 0 };
+    return { miss: miss, unbound: unbound,
+             pushDisabled: push ? push.disabled : null, stopDisabled: stop ? stop.disabled : null,
+             items: items.length, maxRow: maxRow,
+             devWidth: fld ? Math.round(fld.getBoundingClientRect().width) : 0,
+             hasTitle: p.textContent.indexOf('推送到设备') >= 0 };
   })()`);
-  ck(castStatGeom && castStatGeom.count >= 6 && castStatGeom.maxRow >= 4,
-     '「投放实时状态」是横向统计卡网格（宽屏一行 ≥4 个）', JSON.stringify(castStatGeom));
-  ck(castStatGeom && castStatGeom.devWidth >= 400,
-     '目标渲染器整行显示（长设备名可读）', JSON.stringify(castStatGeom));
-
-  ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=out] a[href^=http]').length === 0"),
-     '投放小节与输出页签无 http 外链');
+  ck(streamCast && typeof streamCast === 'object' && streamCast.miss.length === 0 && streamCast.unbound.length === 0,
+     '流媒体页「推送到设备」区块控件齐全且已绑定事件', JSON.stringify(streamCast));
+  ck(streamCast && streamCast.pushDisabled === false && streamCast.stopDisabled === true,
+     '推送空闲时「推送当前曲」可用、「停止投放」禁用', JSON.stringify({ push: streamCast && streamCast.pushDisabled, stop: streamCast && streamCast.stopDisabled }));
+  ck(streamCast && streamCast.items >= 6 && streamCast.maxRow >= 4,
+     '投放实时状态是横向统计卡网格（一行 ≥4 个）', JSON.stringify({ items: streamCast && streamCast.items, maxRow: streamCast && streamCast.maxRow }));
+  ck(streamCast && streamCast.devWidth >= 400, '目标设备下拉整行显示（长设备名可读）', streamCast && streamCast.devWidth);
+  ck(streamCast && streamCast.hasTitle, '流媒体页有「推送到设备」标题');
+  ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=stream] a[href^=http]').length === 0"),
+     '流媒体页无 http 外链');
 
   // ---- 高级页：EQ 跳转按钮已删除（261023-04 #2：EQ 已在设置页内，不再需要跳转）----
   await evalJs("document.querySelector('.stab[data-g=adv]').click()");
@@ -843,9 +816,9 @@ async function gotoFiles() {
       //  P1.5：元数据源开关是动态的（/api/providers 注册表）—— 在静态清单之外逐源补查
       //  P2：标签写回的预览/执行按钮也是要点了有反应的
       // 2026-10-24 #5：旧的单服务器表单 srcSave 已删除，改为流媒体页的多服务器控件。
-      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_instart','sp_instop','sp_inmon','sp_cast_scan','sp_cast_usecur','sp_cast_start','sp_cast_stop','sp_cast_dop','sp_cast_dev','sp_src_add','sp_src_save','sp_src_cancel','sp_src_testform','sp_upnp'];
+      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_instart','sp_instop','sp_inmon','sp_cast_scan','sp_cast_push','sp_cast_stop','sp_cast_dev','sp_src_add','sp_src_save','sp_src_cancel','sp_src_testform'];
       (META_PROVIDERS || []).forEach(function (p) { needBind.push('sp_meta_' + p.id); });
-      var valueOnly=['sRate','sFilt','sFiltNx','sShap','sBuf','sDSD','sIsp','s2s','sp_cast_file'];
+      var valueOnly=['sRate','sFilt','sFiltNx','sShap','sBuf','sDSD','sIsp','s2s'];
       var miss=[];
       needBind.forEach(function(i){ var e=document.getElementById(i); if(!e) miss.push(i+':缺失'); else if(!e.onclick && !e.onchange && !e.oninput) miss.push(i+':未绑定'); });
       valueOnly.forEach(function(i){ if(!document.getElementById(i)) miss.push(i+':缺失'); });
@@ -883,6 +856,9 @@ async function gotoFiles() {
      '资料标签栏在歌词右侧同一行（左右排列，不是上下堆叠；本实例未配 AI 时标签栏本就不显示）');
   ck(await evalJs("(function(){var v=document.getElementById('npVol'),p=document.getElementById('npPlay');if(!v||!p)return false;var a=v.getBoundingClientRect(),b=p.getBoundingClientRect();return Math.abs((a.top+a.height/2)-(b.top+b.height/2))<=10;})()"),
      '音量与播放键同一行（不再单独占底部一行）');
+  // 261024-02 #5：单曲页有「推送到设备」按钮（与流媒体页推送区块、底栏徽标同源）
+  ck(await evalJs("(function(){var b=document.getElementById('npCastBtn');return !!b && b.textContent.indexOf('推送')>=0 && !!b.onclick;})()"),
+     '单曲页有「推送到设备」按钮且已绑定');
   // 空态文案要用「清掉歌词后的 renderNpLyric」来验：实例上可能正停着一首带在线歌词的曲子
   // （LY.lines 非空 → 显示的是歌词而不是空态），那是正常业务态，不是文案缺失。
   ck(await evalJs("(function(){var keep=LY.lines;LY.lines=[];renderNpLyric();var ok=document.getElementById('npLyric').innerHTML.indexOf('在线补全')>=0;LY.lines=keep;var b=document.getElementById('npLyric');if(b){b.dataset.n='';}renderNpLyric();return ok;})()"), '歌词空态提示「播放时自动在线补全」');
