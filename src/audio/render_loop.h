@@ -179,6 +179,43 @@ struct RenderHost {
     double starveSecs      = 3.0;        // 连续不足累计达此秒数 ⟹ STARVING 归因
     bool   starveEnabled   = true;       // 供测试/特殊后端关闭
 
+    // ---- 开播自检：设备实时能力（2026-10-24 用户真机 EDIFIER N300 96k/24 独占）----
+    // 现场证据（rtaplay 跑的就是本循环）：标称 96000 Hz，墙钟 29.767s 里写循环写进
+    // 1689600 帧（=176 次整周期写入），而设备只消费 1680000 帧 ⟹ 实测 56437.7 Hz
+    // （标称的 59%），第 29 秒设备直接从 USB 上消失，必须重新插拔才回来；同一设备
+    // 48k 正常，5 秒短测里它又能跑 91.4k（95%）——「能不能跑满」会漂，所以
+    // IsFormatSupported / 驱动声明的能力都不可信，只能实测。
+    //
+    // 判据：流真正启动（第一次成功写入）后 rateCheckSec 秒，用
+    //     实测速率 = (已写入帧数 - 设备缓冲水位 pad) / 墙钟
+    // 算设备真实速率（起播时缓冲为空，这个式子就是「设备这一窗口消费了多少帧」；
+    // 与现场推算 1680000 = 1689600 - 9600 的口径完全一致）。
+    //   ≥ rateMinRatio × 标称 ⟹ 正常继续（实测值进 STAT 的 devrate= 与 RATECHECK 日志）；
+    //   <  rateMinRatio × 标称 ⟹ 【立刻停止】不再写：设备根本追不上这个率，继续写只会
+    //   让它长时间跑在带不动的工作点上；真机实测的下场就是设备掉线（比报错严重得多）。
+    //
+    // 只对能报出设备周期的后端生效（device_period_frames() >= 0）。不报周期的
+    // Null/NAA/ASIO/mock 分不清「设备跑不动」与「我们喂不上」，硬套会把健康后端判死；
+    // WASAPI 独占（WasapiSink 转发 WasapiOutput::period_frames）是唯一会掉 USB 的路径。
+    // deviceGuardEnabled=false 可整体回滚到旧行为（供不可信 pad 的 mock 使用）。
+    bool   deviceGuardEnabled = true;   // 开播自检 + 超时熔断的总开关
+    double rateCheckSec     = 1.75;     // 自检时刻（任务要求 1.5~2.0s；取中后段降量化误差）
+    double rateMinRatio     = 0.97;     // < 标称 97% ⟹ 判「跑不动」
+    bool   rateTooSlow      = false;    // true = 自检判跑不动并已停止（上层可据此回退 rateAuto）
+    double rateMeasured     = -1.0;     // 实测设备速率（Hz；-1 = 未测/该后端不适用）
+    double rateMeasuredPct  = -1.0;     // 实测 / 标称（%）
+
+    // ---- 超时熔断：设备停止响应（不发事件、也不消费帧）----
+    // 旧判据要连续 200 次（≈4 秒）才报 RENDERFAIL。现场 29 秒里只有 21 次超时，
+    // 说明「21 次」已经是坏消息；而真正死掉的流再空转 200 次只会拖长
+    // 「设备已被系统踢掉」的窗口，日志里也只有一堆 WFAIL。
+    // 判据：连续 hangTimeouts 次写超时（有数据却写不进去）且期间设备消费帧数【零增长】
+    //       ⟹ 立即停止并报「设备停止响应」。消费有增长（设备还在放，只是慢）不归这条管，
+    //       那是开播自检 / STARVING 的职责。hangMaxSec 是预算上限：超过 2 秒也不再空转。
+    int    hangTimeouts     = 8;        // 连续写超时次数阈值（任务建议 8）
+    double hangMaxSec       = 2.0;      // 熔断预算（秒）
+    bool   deviceHang       = false;    // true = 熔断触发（与 deviceLost 区分：端点可能还在枚举里）
+
     // ---- C1 L2 起播看门狗（2026-10-24 N300 欠载 / 方案 §5.2）----
     // Start 之后 800 ms 内【手里已有数据】却一个字节都没写进去（MOTU 形态：Initialize
     // 接受但流不推进）⟹ 调 l2Degrade 重开 20 ms。返回 true = 降级并已重新 Start，
@@ -261,6 +298,17 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
     bool padded = false;   // 末尾不足一个周期时只补一次静音（防共享模式无限尾音）
     uint64_t myEpoch = RQ.epoch.load();
 
+    // ---- 开播自检 / 超时熔断状态（2026-10-24 N300 96k 掉 USB）----
+    // 全部是本地量：不分配、不加锁、不改变写入调度；只在判罚时提前 break。
+    bool      rateArmed   = false;   // 测量窗口已开始计时（= 第一次成功写入之后）
+    bool      rateDone    = false;   // 已给出结论（通过/不适用），不再重复测
+    double    rateT0      = 0.0;     // 窗口起点（第一次成功写入的时刻）
+    long long rateBase    = 0;       // 窗口起点的「设备已消费帧数」基线
+    bool      rateSupplyLimited = false;  // 窗口内出现「我们没数据可写」⟹ 放弃判罚
+    long long hangN       = 0;       // 连续「写超时且设备零消费」次数
+    double    hangT0      = 0.0;     // 这一串的起点
+    long long hangConsumed0 = 0;     // 这一串起点的设备消费帧数
+
     // ---- C2 小工具（只读/只累加本地计数）----
     auto flushDry = [&](double t) {          // 结算当前 dry 片段
         if (!inDry) return;
@@ -338,6 +386,9 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                 // 会被判成「设备不接受数据」（假的 STARVING）。
                 winStart = nowSec(); lastTick = winStart;
                 winWritten = 0; winShould = 0.0; starveAcc = 0.0; winFirst = true;
+                // 暂停期间设备不消费：实测速率窗口与超时串都必须重开，否则恢复瞬间
+                // 会把「暂停那段时间」算成设备跑不动（假的 RATE_TOO_SLOW）。
+                rateArmed = false; rateDone = false; rateSupplyLimited = false; hangN = 0;
             }
         }
         if (pausedNow) { Sleep(30); continue; }
@@ -358,6 +409,8 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
             // 跳转会清空待写缓冲，窗口必须重开（否则 0 写入被算成设备饥饿）
             winStart = nowSec(); lastTick = winStart;
             winWritten = 0; winShould = 0.0; starveAcc = 0.0; winFirst = true;
+            // 跳转后从新位置重新开测（实测速率窗口与超时串都重来）
+            rateArmed = false; rateDone = false; rateSupplyLimited = false; hangN = 0;
             continue;
         }
         if (RQ.gpu.load() && !*h.gpuOut) *h.gpuOut = true;
@@ -404,6 +457,11 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                 std::ostringstream ls;
                 ls << "STAT pos=" << (double)played / (double)h.deviceRate
                    << " rate=" << h.deviceRate << " bits=" << h.outBits
+                   // devrate = 开播自检实测到的设备速率（Hz；-1 = 未测/该后端不报）。
+                   // 与标称 rate= 并列：两者差得远就是「设备跑不动」
+                   //（N300 96k 现场：rate=96000 而 devrate≈56438）。
+                   << " devrate=" << (h.rateMeasured > 0.0
+                                        ? (long long)(h.rateMeasured + 0.5) : -1LL)
                    << " pad=" << h.dbgPad->load()
                    << " peak=" << h.dbgPeak->load() << " clip=" << h.dbgClip->load()
                    // fpeak = 后端实际写出的峰值（float 域）。与 peak（位深域）并列，
@@ -442,7 +500,14 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
             }
             evLastT = evT;
         }
-        h.dbgPad->store(sink.last_pad());
+        // 设备已消费帧数 = 已写入 - 设备缓冲里还没播的（pad）。起播时设备缓冲是空的，
+        // 所以这个式子在开播窗口内就是「设备真正消费了多少帧」——与 N300 现场
+        // 推算 1680000 帧（1689600 写入 - 9600 水位）的口径完全一致。
+        // ★ 必须与 writtenTotal 同一时刻取：写在 write 之前，writtenTotal 也取 write 之前的
+        //   累计值，否则会把这一拍刚写进去的帧当成「已被消费」（1 个周期 ≈ 5% @1.75s）。
+        const long long padNow      = sink.last_pad();
+        const long long consumedNow = (long long)writtenTotal - padNow;
+        h.dbgPad->store(padNow);
         const size_t w = sink.write_available(pend.data(), pendFrames);
         const double tAfter = nowSec();
         if (w > 0) h.dbgWr->fetch_add(1); else h.dbgW0->fetch_add(1);
@@ -491,6 +556,7 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
             writtenTotal += w;
             h.played->store(played);
             timeouts = 0;
+            hangN = 0;          // 写进去了 ⟹ 「停止响应」串清零
             winWritten += w;
         } else if (pendFrames >= period) {
             // ---- C3 端点消失（N300 96k 掉 USB）：如实报错，不静默欠载/回退 ----
@@ -558,6 +624,161 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                 if (h.log) h.log(h.failMsg);
                 break;
             }
+
+            // ---- 超时熔断：设备停止响应（2026-10-24 N300 96k 掉 USB）----
+            // 旧判据要连续 200 次（≈4 秒）才报 RENDERFAIL；真正死掉的流再空转 200 次，
+            // 只会拖长「设备已被系统踢掉」的窗口，日志里也只有一堆 WFAIL。
+            // 判据：连续 hangTimeouts 次写超时（有数据却写不进去）且期间设备消费帧数
+            // 【零增长】⟹ 设备已停止响应（不发事件、不消费），立即停止。
+            //   · 消费有增长（设备还在放，只是慢）⟹ 归开播自检/STARVING 管，这里只重置计数；
+            //   · L2 看门狗优先：起播阶段「流不推进」先让 L2 重开 20ms（MOTU 形态），
+            //     L2 试过仍无响应才判死，免得把本来能救回来的流直接掐掉。
+            // 只对能报设备周期的后端生效：不报周期的后端无法区分「没消费」与「不报数」。
+            if (h.deviceGuardEnabled && h.hangTimeouts > 0 &&
+                sink.device_period_frames() >= 0 && !(h.l2Degrade && !l2Tried)) {
+                if (hangN == 0) { hangT0 = tAfter; hangConsumed0 = consumedNow; }
+                ++hangN;
+                if (consumedNow > hangConsumed0) {   // 设备还在消费：不是「停止响应」
+                    hangN = 1;
+                    hangT0 = tAfter;
+                    hangConsumed0 = consumedNow;
+                }
+                const double hangElapsed = tAfter - hangT0;
+                if (hangN >= h.hangTimeouts ||
+                    (hangN >= 2 && hangElapsed >= h.hangMaxSec)) {
+                    std::ostringstream fs;
+                    fs.setf(std::ios::fixed); fs.precision(3);
+                    // 文案是现场取证的锚点：设备名 / 标称 / 连续超时 / 消费帧数 / 已写帧数。
+                    fs << "RENDERFAIL 设备停止响应（连续 " << hangN << " 次超时、无消费）"
+                          "—— 设备没有消费任何一帧、写循环也再拿不到可写空间，已停止播放"
+                          "（不再空转等 200 次：继续等只会让设备被系统踢下线；"
+                          "ev= 是该窗口内 wait_event 命中次数，可核对事件是否还在来）。"
+                       << " device=\"" << h.deviceLabel << "\""
+                       << " id=" << (h.deviceIdDesc.empty() ? "(默认)" : h.deviceIdDesc)
+                       << " rate=" << h.deviceRate << " bits=" << h.outBits
+                       << " 连续超时=" << hangN
+                       << " 累计=" << hangElapsed << "s"
+                       << " 消费=" << (consumedNow - hangConsumed0) << "帧"
+                       << " 已写=" << writtenTotal << "帧"
+                       << " 超时总次数=" << timeouts
+                       << " ev=" << evN
+                       << " w0=" << h.dbgW0->load() << " wr=" << h.dbgWr->load()
+                       << " last_pad=" << padNow
+                       << " 缓冲=" << period << "帧"
+                       << " GetBuffer HRESULT=" << sink.last_gb_hr();
+                    if (h.fallbackEligible)
+                        fs << "。设备独占流已停止响应,已按既有策略自动回退 WASAPI 共享模式(非 bit-perfect)。";
+                    else if (h.dop)
+                        fs << "。DoP/DSD 不能回退共享模式(共享会重采样破坏 DoP 载波),请重新连接设备或改用独占可用的设备。";
+                    else if (h.onShared)
+                        fs << "。共享模式也未接受数据(设备/系统混音异常),请检查音频设备状态,或在设置中改用 ASIO/独占。";
+                    else
+                        fs << "。请重新连接设备（USB 掉线后需重新插拔）再重播,或在设置中改用 ASIO/共享。";
+                    h.failMsg = fs.str();
+                    h.deviceHang = true;
+                    h.renderFail = true;
+                    if (h.log) h.log(h.failMsg);
+                    flushDry(tAfter);
+                    publish(tAfter);
+                    break;
+                }
+            }
+        }
+
+        // ---- 开播自检：设备实时能力（2026-10-24 用户真机 EDIFIER N300 96k/24 独占）----
+        // 现场：标称 96000 Hz，29.767s 里写入 1689600 帧、设备只消费 1680000 帧
+        //（实测 56437.7 Hz = 59%），第 29 秒设备从 USB 上消失；同一设备 48k 正常，
+        // 5 秒短测又能跑 91.4k（95%）—— 能力会漂，不能只看 IsFormatSupported。
+        // 判据：第一次成功写入后 rateCheckSec 秒，用「设备已消费帧数 / 墙钟」算实测速率；
+        //   ≥ rateMinRatio × 标称 ⟹ 继续（实测值进 RATECHECK 日志与 STAT 的 devrate=）；
+        //   <  rateMinRatio × 标称 ⟹ 立刻停止，不再写（继续写 = 设备掉线）。
+        // 只对能报设备周期的后端生效（不报周期的后端分不清「设备慢」与「我们喂不上」）。
+        if (h.deviceGuardEnabled && !rateDone && h.deviceRate > 0 &&
+            sink.device_period_frames() >= 0) {
+            if (!rateArmed) {
+                if (w > 0) {   // 流真正开始推进（而不是「Start 返回成功」）才算窗口起点
+                    rateArmed = true;
+                    rateT0    = tAfter;
+                    rateBase  = consumedNow;
+                    rateSupplyLimited = false;
+                }
+            } else {
+                // 「我们没数据可写 + 设备缓冲已空」= 供料不足 ⟹ 不能赖设备
+                //（那是 STARVING 的职责；这里若判罚，慢解码/慢网络会被误杀）。
+                if (!rateSupplyLimited && pendFrames < period && padNow == 0 && !eos)
+                    rateSupplyLimited = true;
+                const double rateElapsed = tAfter - rateT0;
+                if (rateElapsed >= h.rateCheckSec) {
+                    rateDone = true;
+                    const double consumed = (double)(consumedNow - rateBase);
+                    const double measured = (consumed > 0.0 && rateElapsed > 0.0)
+                                          ? consumed / rateElapsed : 0.0;
+                    const double pct = h.deviceRate
+                                     ? 100.0 * measured / (double)h.deviceRate : 0.0;
+                    h.rateMeasured    = measured;
+                    h.rateMeasuredPct = pct;
+                    const bool tooSlow = !rateSupplyLimited &&
+                                         measured < h.rateMinRatio * (double)h.deviceRate;
+                    if (h.log) {   // 无论通过与否都留证据（现场下次要能一眼看出实测值）
+                        std::ostringstream ls;
+                        ls.setf(std::ios::fixed); ls.precision(1);
+                        ls << "RATECHECK "
+                           << (rateSupplyLimited ? "skip=supply" : (tooSlow ? "ok=0" : "ok=1"))
+                           << " device=\"" << h.deviceLabel << "\""
+                           << " rate=" << h.deviceRate << " bits=" << h.outBits
+                           << " devrate=" << (long long)(measured + 0.5)
+                           << " pct=" << pct << "%"
+                           << " 窗口=" << rateElapsed << "s"
+                           << " 消费=" << (long long)(consumed > 0.0 ? consumed + 0.5 : 0.0) << "帧"
+                           << " 已写=" << writtenTotal << "帧"
+                           << " w0=" << h.dbgW0->load() << " wr=" << h.dbgWr->load()
+                           << " 超时=" << timeouts
+                           << " last_pad=" << padNow
+                           << " 缓冲=" << period << "帧"
+                           << (rateSupplyLimited ? " 说明=供料不足,不判设备" : "");
+                        h.log(ls.str());
+                    }
+                    if (tooSlow) {
+                        std::ostringstream fs;
+                        fs.setf(std::ios::fixed); fs.precision(1);
+                        // ★ 这句是任务要求的固定文案，改动前先看 tests/test_renderfail.cpp 的断言。
+                        fs << "RATE_TOO_SLOW 设备无法实时运行 " << h.deviceRate << " Hz（实测 "
+                           << pct << "%，已停止：继续播放会触发设备掉线）"
+                           << " —— 设备实测只能跑 " << (long long)(measured + 0.5) << " Hz"
+                           << "（自检 " << rateElapsed << " 秒内只消费 "
+                           << (long long)(consumed + 0.5) << " 帧，标称应消费 "
+                           << (long long)((double)h.deviceRate * rateElapsed + 0.5)
+                           << " 帧）；设备追不上这个率，继续写只会让它长时间跑在带不动的"
+                              "工作点上；真机实测（EDIFIER N300，96k/24 独占）第 29 秒设备直接从 USB 上消失。"
+                           << " device=\"" << h.deviceLabel << "\""
+                           << " id=" << (h.deviceIdDesc.empty() ? "(默认)" : h.deviceIdDesc)
+                           << " rate=" << h.deviceRate << " bits=" << h.outBits
+                           << " devrate=" << (long long)(measured + 0.5)
+                           << " pct=" << pct << "%"
+                           << " 窗口=" << rateElapsed << "s"
+                           << " 消费=" << (long long)(consumed + 0.5) << "帧"
+                           << " 已写=" << writtenTotal << "帧"
+                           << " w0=" << h.dbgW0->load() << " wr=" << h.dbgWr->load()
+                           << " 超时=" << timeouts
+                           << " last_pad=" << padNow
+                           << " 缓冲=" << period << "帧";
+                        if (h.fallbackEligible)
+                            fs << "。已按既有策略自动回退 WASAPI 共享模式(非 bit-perfect)；"
+                                  "若已开 rateAuto（max/follow），上层也可按 devrate 回退到设备真正跑得动的率。";
+                        else if (h.dop)
+                            fs << "。DoP/DSD 不能回退共享模式,请把采样率改成设备真正跑得动的率（或改用 ASIO）。";
+                        else
+                            fs << "。请在设置里把采样率改成设备真正跑得动的率（或改成「跟随源/最大」让系统按能力挑）。";
+                        h.failMsg = fs.str();
+                        h.rateTooSlow = true;
+                        h.renderFail = true;
+                        if (h.log) h.log(h.failMsg);
+                        flushDry(tAfter);
+                        publish(tAfter);
+                        break;
+                    }
+                }
+            }
         }
 
         // ---- C1 L2 起播看门狗（方案 §5.2）----
@@ -574,6 +795,8 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                 timeouts = 0;
                 winStart = tAfter; lastTick = tAfter;
                 winWritten = 0; winShould = 0.0; starveAcc = 0.0; winFirst = true;
+                // 重开流 = 新的设备缓冲/周期：实测窗口与超时串都必须重来
+                rateArmed = false; rateDone = false; rateSupplyLimited = false; hangN = 0;
                 flushDry(tAfter);
                 if (h.log) {
                     std::ostringstream ls;

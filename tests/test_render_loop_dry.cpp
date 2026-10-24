@@ -185,6 +185,11 @@ struct Bench {
         h.dop = false;
         h.onShared = false;
         h.starveEnabled = false;     // 本文件只测 C2/C3；STARVING 由 test_renderfail 覆盖
+        // 2026-10-24 新增的「开播自检 / 超时熔断」也在这里关掉：本文件的 mock 把
+        // last_pad() 写成脚本常量（4800/9600/0），不是真实水位 ——「已写入 - pad」
+        // 算不出设备消费，硬套会把「脚本里 pad 不下降」误判成设备跑不动。
+        // 新守卫由 test_renderfail 的 FakeRateSink/FakeHangSink（真实水位 + 虚拟时钟）覆盖。
+        h.deviceGuardEnabled = false;
         h.statPeriodSec = 1.0;       // 虚拟时钟下 1 秒一条 STAT，便于断言字段
         return h;
     }

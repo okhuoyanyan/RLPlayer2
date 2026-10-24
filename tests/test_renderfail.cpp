@@ -15,11 +15,23 @@
 //   5. wasapi_out 的「写不进去」归因分类（ZeroAttrib）与循环侧 zp/zs/zr 输出
 //      （2026-10-22 反馈 20261022-02：w0 混着「缓冲满」与「喂不上一个周期」两种成因）。
 //
+//   6. ★ 开播自检（2026-10-24 用户真机 EDIFIER N300 96k/24 独占掉 USB）：第一次成功
+//      写入后 1.75s，用「设备已消费帧数（= 已写入 - pad）/ 墙钟」实测设备速率；
+//      < 97% 标称 ⟹ 2 秒内停止，文案「设备无法实时运行 <rate> Hz（实测 <pct>%，
+//      已停止：继续播放会触发设备掉线）」，实测值同时进 RATECHECK 日志与 STAT devrate=。
+//   7. ★ 超时熔断：连续 8 次写超时且期间设备消费零增长 ⟹ 立即报
+//      「设备停止响应（连续 8 次超时、无消费）」，不再空转 200 次；旧的 200 次
+//      RENDERFAIL 路径对「不报设备周期」的后端逐字保留（回归用例 1~3、11 仍走旧路）。
+//   8. 反向用例（铁律 3）：设备 100% 实时 ⟹ normalEnd，新判据不误杀。
+//
 // 说明（如实）：测试对象是渲染循环本体与 failMsg 文本；ps.error = failMsg 的赋值点
 // 在 rtaweb.cpp play_one_impl（一行原样传递），不在本测试可达范围。
 // ⚠️ 未覆盖（铁律 4）：WasapiOutput 的 GetCurrentPadding→ZeroAttrib 接线必须真开设备，
 // 本测试不覆盖（铁律 1：不接管听音设备）；另 rtaweb 的 WasapiSink 尚未转发这 4 个接口，
 // 详见 反馈和开发\debug\20261022-02\分析.md「未完成项」。
+// ⚠️ 真机未复测：新增的 6/7 两条只证明「给定消费模型下会停 / 不会误杀」。N300 真机上
+// 的实测比例、pad 量化粒度、以及「提前停止是否真的保住了设备不掉 USB」必须由用户
+// 重新插拔设备后重跑 rtaplay --rate 96000 --bits 24 取证（本测试不开任何设备）。
 #include "audio/render_loop.h"
 #include "audio/wasapi_out.h"   // ZeroAttrib：「写不进去」的归因分类（真机接线不在本文件）
 #include <cstdio>
@@ -181,6 +193,62 @@ struct FakeCountedDeadSink : rta::render::OutSink {
     std::string e_;
 };
 
+// ---- mock：设备只能实时跑 ratio × 标称（N300 96k 实测 59% 的离线复刻）----
+// 与 FakeHealthySink/FakeIntermittentSink 的关键区别：这里的 last_pad() 是【真实水位】——
+// 每拍按设备消费量下降、写入时上升。只有真实水位才能验证 render_loop 的
+// 「已写入 - pad = 设备已消费帧数」算式（旧 mock 的 pad 是脚本常量，算不出消费）。
+// 虚拟时钟：每次 wait_event 推进 20ms，设备在这一拍消费 ratio × 20ms 的音频。
+// ratio=0.60 → 57600 Hz（标称 96k 的 60%）；ratio=1.0 → 96000 Hz（健康设备反向用例）。
+// ⚠️ 未覆盖（铁律 4）：真实 WASAPI 的 pad 量化粒度（周期整数倍）与驱动延迟；
+//    本 mock 按帧连续消费，属理想化 —— 真机复测需要用户重新插拔 N300 后再跑。
+struct FakeRateSink : rta::render::OutSink {
+    FakeRateSink(double* clock, double ratio, uint32_t rate, size_t bf = 9600)
+        : clock_(clock), ratio_(ratio), rate_(rate), bf_(bf) {}
+    bool open(const SinkOpenOpts&, uint32_t, int, int) override { return true; }
+    bool start() override { return true; }
+    size_t buffer_frames() const override { return bf_; }
+    long long device_period_frames() const override { return 960; }   // 10ms @96k
+    bool wait_event(int) override {
+        *clock_ += 0.020;
+        const long long drain = (long long)((double)rate_ * 0.020 * ratio_ + 0.5);
+        level_ -= drain;
+        if (level_ < 0) level_ = 0;
+        return true;
+    }
+    size_t write_one_period(const int32_t* p, size_t n) override { return write_available(p, n); }
+    size_t write_available(const int32_t*, size_t n) override {
+        const size_t free = bf_ - (size_t)level_;
+        const size_t k = n < free ? n : free;
+        level_ += (long long)k;
+        return k;
+    }
+    long long last_pad() const override { return level_; }
+    long long last_gb_hr() const override { return 0; }
+    const std::string& last_error() const override { return e_; }
+    double* clock_;
+    double ratio_;
+    uint32_t rate_;
+    size_t bf_;
+    long long level_ = 0;
+    std::string e_;
+};
+
+// ---- mock：完全不消费 + 事件一直不来（设备停止响应，N300 掉 USB 前的最后一态）----
+struct FakeHangSink : rta::render::OutSink {
+    explicit FakeHangSink(double* clock) : clock_(clock) {}
+    bool open(const SinkOpenOpts&, uint32_t, int, int) override { return true; }
+    bool start() override { return true; }
+    size_t buffer_frames() const override { return 9600; }
+    long long device_period_frames() const override { return 960; }
+    bool wait_event(int) override { *clock_ += 0.020; return false; }   // 事件从不出现
+    size_t write_one_period(const int32_t*, size_t) override { return 0; }
+    size_t write_available(const int32_t*, size_t) override { return 0; }  // 一帧都不收
+    long long last_pad() const override { return 9600; }
+    const std::string& last_error() const override { return e_; }
+    double* clock_;
+    std::string e_;
+};
+
 struct Bench {
     // PlayerState 子集
     std::atomic<bool> stop{false}, pauseReq{false}, paused{false};
@@ -225,6 +293,16 @@ struct Bench {
         h.starveWindowSec = 1.0;
         h.starveRatio = 0.90;
         h.starveSecs = 3.0;
+        return h;
+    }
+    // 开播自检 / 超时熔断用例专用：虚拟时钟（每 tick 20ms）+ 96k，STARVING 关掉，
+    // 避免两套判据互相干扰（本组只验证新守卫本身）。
+    rta::render::RenderHost make_guard(uint32_t rate) {
+        rta::render::RenderHost h = make(/*fallbackOk=*/true, /*dop=*/false);
+        h.deviceRate = rate;
+        h.nowSec = [this]() { return clock; };
+        h.starveEnabled = false;
+        h.statPeriodSec = 1.0;   // 虚拟时钟下 1 秒一条 STAT，便于断言 devrate 字段
         return h;
     }
     // 灌足够多的真实数据：判据要跑 >4 秒×96k ≈ 38.4 万帧，4096 帧/块
@@ -520,6 +598,97 @@ int main() {
            " other=" + std::to_string(z.other) + " zeroRows=" + std::to_string(zeroRows));
         ck(z.padFull == 1 && z.starved == 1 && z.other == 1,
            "三类成因各计一次（量化归零算 other，不算 pad=full）");
+    }
+
+    // ---- 14. ★ 开播自检：设备只能跑 60% 标称（N300 96k 现场 59%）⟹ 2 秒内停止 ----
+    // 真机事故：写循环硬撑 29.767 秒（21 次超时），第 29 秒设备从 USB 上消失。
+    // 判据必须在这之前就停：第一次成功写入后 1.75s 用「设备已消费帧数 / 墙钟」实测，
+    // < 97% 标称 ⟹ 立即 break，错误文案带实测比例，且写入次数有界（绝不写满 30 秒）。
+    {
+        Bench b;
+        b.feed_frames(96000u * 3u);
+        auto h = b.make_guard(96000);
+        FakeRateSink sink(&b.clock, /*ratio=*/0.60, 96000);
+        rta::render::render_loop(sink, h);
+        ck(h.renderFail && !h.normalEnd, "只消费 60% 的设备触发 renderFail（不是正常结束）",
+           "renderFail=" + std::to_string(h.renderFail));
+        ck(h.rateTooSlow, "rateTooSlow 置位（上层可据此触发 rateAuto 回退）");
+        ck(h.rateMeasuredPct > 55.0 && h.rateMeasuredPct < 65.0,
+           "实测比例 ≈60%（用 设备消费帧/墙钟 算，不是写入次数比）",
+           "pct=" + std::to_string(h.rateMeasuredPct));
+        char want[192];
+        std::snprintf(want, sizeof(want),
+                      "设备无法实时运行 96000 Hz（实测 %.1f%%，已停止：继续播放会触发设备掉线）",
+                      h.rateMeasuredPct);
+        ck(contains(h.failMsg, want),
+           "错误文案 = 设备无法实时运行 96000 Hz（实测 xx.x%，已停止：继续播放会触发设备掉线）",
+           h.failMsg);
+        ck(contains(h.failMsg, "devrate=") && contains(h.failMsg, "消费=") &&
+           contains(h.failMsg, "超时=") && contains(h.failMsg, "High Definition Audio Device"),
+           "错误文案带设备名/标称/实测/超时/消费帧数（现场取证用）", h.failMsg);
+        ck(b.clock <= 2.0, "2 秒内停止（不再硬撑 29.767 秒）",
+           "clock=" + std::to_string(b.clock));
+        ck(b.wr.load() <= 120, "写入次数有界（≤120 次；30 秒 @20ms 会是 1500 次）",
+           "wr=" + std::to_string(b.wr.load()));
+        ck(b.played.load() < 96000u * 2u, "写入帧数 < 2 秒（没有写满 30 秒）",
+           "played=" + std::to_string(b.played.load()));
+        bool check = false;
+        for (const auto& s : b.logs)
+            if (s.rfind("RATECHECK ok=0", 0) == 0) check = true;
+        ck(check, "play_log 留 RATECHECK ok=0 证据（设备名/标称/实测/超时/消费）");
+        std::printf("  [数字] 60%% sink: clock=%.3fs pct=%.1f%% devrate=%.0f wr=%lld played=%zu\n",
+                    b.clock, h.rateMeasuredPct, h.rateMeasured,
+                    (long long)b.wr.load(), (size_t)h.played->load());
+        std::printf("  样例 RATE_TOO_SLOW: %s\n", h.failMsg.c_str());
+    }
+
+    // ---- 15. ★ 超时熔断：完全不消费 + 事件一直不来 ⟹ 8 次内停（不再空转 200 次）----
+    {
+        Bench b;
+        b.feed_frames(96000u * 3u);
+        auto h = b.make_guard(96000);
+        FakeHangSink sink(&b.clock);
+        rta::render::render_loop(sink, h);
+        ck(h.renderFail && !h.normalEnd, "设备停止响应 ⟹ renderFail");
+        ck(h.deviceHang, "deviceHang 置位（与端点消失 deviceLost 区分）");
+        ck(contains(h.failMsg, "设备停止响应（连续 8 次超时、无消费）"),
+           "错误文案 = 设备停止响应（连续 8 次超时、无消费）", h.failMsg);
+        ck(!contains(h.failMsg, "秒未接受数据"),
+           "走熔断快路径，不是 200 次超时的旧 RENDERFAIL", h.failMsg);
+        ck(b.w0.load() <= 10, "超时次数 ≤10（旧判据要 201 次）",
+           "w0=" + std::to_string(b.w0.load()));
+        ck(b.clock <= 2.0, "2 秒内停止", "clock=" + std::to_string(b.clock));
+        ck(contains(h.failMsg, "已写=0") && contains(h.failMsg, "消费=0"),
+           "错误文案带「零写入/无消费」现场数字", h.failMsg);
+        ck(contains(h.failMsg, "High Definition Audio Device"), "错误文案带设备名", h.failMsg);
+        std::printf("  [数字] hang sink: clock=%.3fs w0=%lld 已写=%lld\n",
+                    b.clock, (long long)b.w0.load(), (long long)h.played->load());
+        std::printf("  样例 设备停止响应: %s\n", h.failMsg.c_str());
+    }
+
+    // ---- 16. 反向用例（铁律 3）：100% 实时 ⟹ 正常跑完，不误杀 ----
+    {
+        Bench b;
+        b.feed_frames(96000u * 6u);
+        auto h = b.make_guard(96000);
+        FakeRateSink sink(&b.clock, /*ratio=*/1.0, 96000);
+        rta::render::render_loop(sink, h);
+        ck(!h.renderFail, "100% 实时的设备不被新判据误杀", h.failMsg);
+        ck(h.failMsg.empty(), "健康设备没有 failMsg");
+        ck(h.normalEnd, "健康设备正常播完（normalEnd）");
+        ck(h.rateMeasuredPct >= 97.0, "实测 ≥97% 标称 ⟹ 放行",
+           "pct=" + std::to_string(h.rateMeasuredPct));
+        bool check = false;
+        for (const auto& s : b.logs)
+            if (s.rfind("RATECHECK ok=1", 0) == 0) check = true;
+        ck(check, "RATECHECK ok=1 进日志（实测值有据可查）");
+        bool stat = false;
+        for (const auto& s : b.logs)
+            if (s.rfind("STAT ", 0) == 0 && s.find(" devrate=96000") != std::string::npos)
+                stat = true;
+        ck(stat, "STAT 打印 devrate=96000（标称 rate= 与实测 devrate= 并列）");
+        std::printf("  [数字] 100%% sink: clock=%.3fs pct=%.1f%% devrate=%.0f wr=%lld\n",
+                    b.clock, h.rateMeasuredPct, h.rateMeasured, (long long)b.wr.load());
     }
 
     std::printf("\n%s（失败 %d 项）\n", g_fail == 0 ? "renderfail 全部通过" : "存在失败", g_fail);
