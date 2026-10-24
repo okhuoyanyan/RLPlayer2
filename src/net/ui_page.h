@@ -116,7 +116,9 @@ inline std::string rta_ui_page() {
     h += "html.webview2 #rzHot{position:fixed;inset:0;z-index:2147483000;pointer-events:none}";
     h += "html.webview2 #rzHot i{position:fixed;display:block;pointer-events:auto;background:transparent}";
     h += "html.webview2 #rzHot .rz-l{left:0;top:0;bottom:0;width:5px;cursor:ew-resize}";
-    h += "html.webview2 #rzHot .rz-r{right:0;top:0;bottom:0;width:5px;cursor:ew-resize}";
+    // 261024-05：右边缘热区收窄到 3px —— 窄窗（<1240px）时主区滚动条贴右边，5px 会吃掉它最外 5px；
+    // 3px 与 Win32 原生边框同量级，仍拖得动（已用拖动探针实测右边缘）。
+    h += "html.webview2 #rzHot .rz-r{right:0;top:0;bottom:0;width:3px;cursor:ew-resize}";
     h += "html.webview2 #rzHot .rz-t{left:0;right:0;top:0;height:5px;cursor:ns-resize}";
     h += "html.webview2 #rzHot .rz-b{left:0;right:0;bottom:0;height:5px;cursor:ns-resize}";
     h += "html.webview2 #rzHot .rz-tl{left:0;top:0;width:10px;height:10px;cursor:nwse-resize}";
@@ -176,7 +178,7 @@ inline std::string rta_ui_page() {
     h += ".ahead .cv{position:relative;overflow:hidden}";
     h += ".ahead .cv .ph{position:absolute;inset:0;display:grid;place-items:center;font-size:46px;font-weight:800;color:var(--ph-txt);background:var(--phbg)}";
     h += ".ahead .kind{font-size:10px;letter-spacing:1.4px;color:var(--mut2);font-weight:600}";
-    h += ".ahead h1{font-size:26px;line-height:1.2;font-weight:750;letter-spacing:-.4px;margin:5px 0 7px;word-break:break-word}";
+    h += ".ahead h1{font-size:26px;line-height:1.2;font-weight:750;letter-spacing:-.4px;margin:5px 0 7px;word-break:break-word;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}";
         h += ".ahead .sub{font-size:12.5px;color:var(--mut);margin-bottom:13px}";
     h += ".bio-box{font-size:13px;line-height:1.75;color:var(--txt2);white-space:pre-wrap;word-break:break-word}";
     h += ".bio-box.collapsed{max-height:140px;overflow:hidden;-webkit-mask-image:linear-gradient(180deg,#000 65%,transparent)}";
@@ -420,6 +422,11 @@ h += "#npPage .npedge{display:none}";
     h += ".npdsec{margin-bottom:8px}";
     h += ".npdsec h4{font-size:12px;color:var(--txt);margin:0 0 4px;font-weight:650}";
     h += ".npdbody p{margin:0 0 5px}";
+    h += ".npdstream-wrap{display:flex;flex-direction:column;min-height:100%}";
+    h += ".npdstream-stat{font-size:12px;color:var(--txt2);font-variant-numeric:tabular-nums;font-weight:600;margin-bottom:8px}";
+    h += ".npdstream-text{flex:1;min-height:0;overflow:auto;white-space:pre-wrap;word-break:break-word;font-size:12.5px;line-height:1.7;color:var(--txt2);padding-bottom:12px;scrollbar-width:thin}";
+    h += ".npdstream-text::-webkit-scrollbar{width:6px}";
+    h += ".npdstream-text::-webkit-scrollbar-thumb{background:var(--line);border-radius:3px}";
     // 标签值网格（261024-01 #4）：label 小字灰、value 主色；长文本（简介/曲目列表/制作人员…）独占整行。
     // 三处复用：单曲页抽屉 / 专辑页简介 / 艺术家页资料 —— 一致性靠同一份样式。
     h += ".efields{display:grid;grid-template-columns:repeat(auto-fill,minmax(178px,1fr));gap:13px 22px}";

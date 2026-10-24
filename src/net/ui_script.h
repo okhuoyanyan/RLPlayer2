@@ -289,7 +289,9 @@ function fmtTag(sr, bits) {
 /* ---------------- 顶栏 / 工具区 ---------------- */
 function head(title, subtitle, toolsHtml) {
   D('pth').textContent = title;
+  D('pth').title = title;
   D('cnt').textContent = subtitle || '';
+  D('cnt').title = subtitle || '';
   D('tools').innerHTML = toolsHtml || '';
 }
 
@@ -577,14 +579,17 @@ function renderSummaryContent(summary, title, kind, opts) {
 // 261024-05 #T2：加 isWanted() —— 切歌/离开专辑页后**下一次轮询不再发出**，已发出的回来也丢弃
 // （旧实现会把旧 key 的 pending 每 2s 继续打 60 次，正是"旧专辑任务带到下一张"的一部分）。
 var SUMM_ABORT = { aborted: true };
-function fetchSummary(url, onDone, tries, isWanted) {
+function fetchSummary(url, onDone, tries, isWanted, onProg) {
   tries = tries || 0;
   if (isWanted && !isWanted()) { onDone(SUMM_ABORT); return; }
   api(url).then(function (j) {
     if (isWanted && !isWanted()) { onDone(SUMM_ABORT); return; }
     if (j && j.pending) {
+      if (j.progress && onProg) {
+        try { onProg(j.progress); } catch (e) { }
+      }
       if (tries >= 60) { onDone({ ok: false, error: '资料整理超时' }); return; }
-      setTimeout(function () { fetchSummary(url, onDone, tries + 1, isWanted); }, 2000);
+      setTimeout(function () { fetchSummary(url, onDone, tries + 1, isWanted, onProg); }, 2000);
       return;
     }
     onDone(j);
@@ -609,7 +614,7 @@ function summHas(s) {
 function summaryCached(url) {
   return Object.prototype.hasOwnProperty.call(SUMC.cache, url) ? SUMC.cache[url] : null;
 }
-function summaryOnce(url, cb, refresh, isWanted) {
+function summaryOnce(url, cb, refresh, isWanted, onProg) {
   cb = cb || function () { };
   if (refresh) delete SUMC.cache[url];
   else if (Object.prototype.hasOwnProperty.call(SUMC.cache, url)) {
@@ -618,8 +623,19 @@ function summaryOnce(url, cb, refresh, isWanted) {
     return;
   }
   var q = SUMC.inflight[url];
-  if (q) { q.push({ fn: cb, want: isWanted }); return; }
-  q = SUMC.inflight[url] = [{ fn: cb, want: isWanted }];
+  if (q) {
+    q.push({ fn: cb, want: isWanted, prog: onProg });
+    if (q.lastProgress && onProg) {
+      var p0 = q.lastProgress;
+      setTimeout(function () {
+        if (!isWanted || isWanted()) {
+          try { onProg(p0); } catch (e) { }
+        }
+      }, 0);
+    }
+    return;
+  }
+  q = SUMC.inflight[url] = [{ fn: cb, want: isWanted, prog: onProg }];
   // 261024-05 #T2：同一实体可能有多个等待者（抽屉 + 预取）。只要还有一个想要，轮询就继续；
   // 全部取消 → 立刻停（下一次 2s 轮询不再发出），结果也不进缓存。
   function stillWanted() {
@@ -628,13 +644,22 @@ function summaryOnce(url, cb, refresh, isWanted) {
   }
   fetchSummary(url, function (s) {
     delete SUMC.inflight[url];
+    try { albPrefPump(); } catch (e) { }
     if (s === SUMM_ABORT) return;
     SUMC.cache[url] = s;
     for (var i = 0; i < q.length; ++i) {
       if (q[i].want && !q[i].want()) continue;
       try { q[i].fn(s); } catch (e) { }
     }
-  }, 0, stillWanted);
+  }, 0, stillWanted, function (prog) {
+    q.lastProgress = prog;
+    for (var i = 0; i < q.length; ++i) {
+      if (q[i].want && !q[i].want()) continue;
+      if (q[i].prog) {
+        try { q[i].prog(prog); } catch (e) { }
+      }
+    }
+  });
 }
 
 // 261024-02 #2：引用 chip 拆成两个动作 —— 点 chip 本体 = 用系统浏览器打开；点右侧「复制」= 复制链接。
@@ -673,6 +698,25 @@ function bindCopyChips(container) {
   });
 }
 
+function syncAlbPlayAllBtn() {
+  var b = D('albPlayAll');
+  if (!b || S.view !== 'album' || !S.album) return;
+  var alb = S.album;
+  var playing = (S.playing || S.paused) && S.lastCur && (alb.tracks || []).some(function (t) { return t.path === S.lastCur; });
+  if (playing) {
+    if (S.playing && !S.paused) {
+      b.textContent = '❚❚ 暂停';
+      b.title = '暂停播放';
+    } else {
+      b.textContent = '▶ 继续播放';
+      b.title = '继续播放专辑';
+    }
+  } else {
+    b.textContent = '▶ 播放整张';
+    b.title = '播放整张专辑';
+  }
+}
+
 function openAlbum(k) {
   // 261024-05 #T2：打开另一张专辑 = 离开上一张 → 先停掉它的曲目预取队列（含在飞轮询）
   albPrefStop();
@@ -692,10 +736,13 @@ function openAlbum(k) {
     if (!localTotal) localTotal = j.dur || 0;
     sub.push(j.tracks.length + ' 首');
     sub.push(fmtDurLong(localTotal));
+    var isThisPlaying = (S.playing || S.paused) && S.lastCur && (j.tracks || []).some(function (t) { return t.path === S.lastCur; });
+    var albPlayText = isThisPlaying ? (S.paused ? '▶ 继续播放' : '❚❚ 暂停') : '▶ 播放整张';
+    var albPlayTitle = isThisPlaying ? (S.paused ? '继续播放专辑' : '暂停播放') : '播放整张专辑';
     var h = '<div class=ahead><div class=cv style="' + cv + '"></div><div class=info>' +
-            '<div class=kind>ALBUM</div><h1>' + esc(j.name) + '</h1>' +
+            '<div class=kind>ALBUM</div><h1 title="' + esc(j.name) + '">' + esc(j.name) + '</h1>' +
             '<div class=sub>' + sub.join(' \u00b7 ') + '</div>' +
-            '<button class="btn pri" id=aPlay>播放</button> ' +
+            '<button class="btn pri" id=albPlayAll aria-label="播放整张专辑" title="' + albPlayTitle + '">' + albPlayText + '</button> ' +
             '<button class=btn id=aAdd>加入队列</button> ' +
             '<button class=btn id=aShuf>随机播放</button>' +
             '</div></div>';
@@ -731,7 +778,8 @@ function openAlbum(k) {
            '</div>';
     }
     D('list').innerHTML = h;
-    head(j.name, j.tracks.length + ' 首', '');
+    head(j.name, j.tracks.length + ' 首', '<button class=btn id=bBackAlbums title="返回专辑列表" aria-label="返回专辑列表">← 返回专辑</button>');
+    if (D('bBackAlbums')) D('bBackAlbums').onclick = function () { loadAlbums(); };
 
     if (META.summary == 1) {
       var albK = String(j.k);
@@ -758,14 +806,31 @@ function openAlbum(k) {
         }
       };
       // 261024-05 #T2：离开这张专辑页后不再轮询它的 release 摘要（旧 key 的请求不再发出）
-      summaryOnce(albUrl, renderAlbumSummary, false, function () {
+      summaryOnce(albUrl, function (s) {
+        renderAlbumSummary(s);
+        albPrefPump();
+      }, false, function () {
         return S.view === 'album' && !!S.album && String(S.album.k) === albK;
       });
       // 261024-04 #7：整张专辑 = 专辑本身（上面）+ 每首曲目（后台，并发 ≤2）
       albumTrackPrefetch(j);
     }
 
-    D('aPlay').onclick = function () { playAlbum(j.k, 0); };
+    var albBtn = D('albPlayAll');
+    if (albBtn) {
+      albBtn.onclick = function () {
+        var playing = (S.playing || S.paused) && S.lastCur && (j.tracks || []).some(function (t) { return t.path === S.lastCur; });
+        if (playing) {
+          playOrPause();
+          syncAlbPlayAllBtn();
+        } else {
+          playAlbum(j.k, 0);
+          albBtn.textContent = '❚❚ 暂停';
+          albBtn.title = '暂停播放';
+        }
+      };
+    }
+    if (D('aPlay')) D('aPlay').onclick = function () { playAlbum(j.k, 0); };
     D('aAdd').onclick = function () { enqueueAlbum(j.k); };
     D('aShuf').onclick = function () { playAlbum(j.k, Math.floor(Math.random() * j.tracks.length)); };
     Array.prototype.forEach.call(D('list').querySelectorAll('.fav-btn'), function (btn) {
@@ -786,10 +851,10 @@ function openAlbum(k) {
 /* ---------------- 261024-04 #7：专辑页后台整理（曲目级 summary 预取） ----------------
    规则（用户原话）：「只要打开了 AI 整理……如果是一整张专辑，则自动整理整个专辑」。
      * 进入专辑页立即自动整理：专辑本身（release，见 openAlbum）+ **专辑内每一首**（track）；
-     * 曲目级是纯后台：并发 ≤2、不阻塞渲染、不弹错；顶部一条 2px 细进度条 + 一行小字，完成即消失；
+     * 曲目级是纯后台：并发 ≤2、最多 40 首；超过 40 首只整理前 40 首并提示「已整理 40/N（其余可按需点开）」；
      * 同一实体只请求一次（summaryOnce 的缓存 + 单飞）；同一张专辑只排一次队；
      * 失败也计入进度（不是一直转），不留错误提示（曲目级本来就没人盯着看）。 */
-var ALBPREF = { key: '', gen: 0, total: 0, done: 0, active: 0, queue: [], timer: 0, live: { v: 0 } };
+var ALBPREF = { key: '', gen: 0, total: 0, allTotal: 0, done: 0, active: 0, queue: [], timer: 0, live: { v: 0 } };
 function albPrefKey(a) { return String((a && a.k) || '') + '|' + String((a && a.name) || ''); }
 // 曲目级 URL 的拼法与单曲页抽屉（npDataEnsure）保持一致，才能命中同一份缓存
 function albumTrackUrl(t, alb) {
@@ -803,7 +868,7 @@ function albumTrackUrl(t, alb) {
 function albPrefStop() {
   ALBPREF.live.v = 0;                    // 在飞请求的轮询/回调全部失效
   ALBPREF.gen++;
-  ALBPREF.key = ''; ALBPREF.total = 0; ALBPREF.done = 0; ALBPREF.active = 0;
+  ALBPREF.key = ''; ALBPREF.total = 0; ALBPREF.allTotal = 0; ALBPREF.done = 0; ALBPREF.active = 0;
   ALBPREF.queue = [];
   if (ALBPREF.timer) { clearTimeout(ALBPREF.timer); ALBPREF.timer = 0; }
   ALBPREF.live = { v: 0 };               // 给下一次预取一个全新的令牌
@@ -819,15 +884,18 @@ function albPrefRender() {
   if (!box) return;
   if (!ALBPREF.total) { box.innerHTML = ''; return; }
   var pct = ALBPREF.total ? Math.round(ALBPREF.done / ALBPREF.total * 100) : 0;
+  var isOver = ALBPREF.allTotal > ALBPREF.total;
   var txt = (ALBPREF.done >= ALBPREF.total)
-    ? ('曲目资料已后台整理 ' + ALBPREF.total + ' 首')
+    ? (isOver ? ('已整理 ' + ALBPREF.done + '/' + ALBPREF.allTotal + '（其余可按需点开）')
+              : ('曲目资料已后台整理 ' + ALBPREF.total + ' 首'))
     : ('正在后台整理曲目资料 ' + ALBPREF.done + ' / ' + ALBPREF.total);
   box.innerHTML = '<div class="albprog"><span class=t>' + esc(txt) + '</span>' +
                   '<span class=bar><i style="width:' + pct + '%"></i></span></div>';
 }
 function albPrefPump() {
   var gen = ALBPREF.gen;
-  while (ALBPREF.active < 2 && ALBPREF.queue.length) {
+  // 并发 ≤2，且与在飞 summary 请求共享上限，保证 summary 并发峰值 ≤ 2
+  while (ALBPREF.active < 2 && Object.keys(SUMC.inflight).length < 2 && ALBPREF.queue.length) {
     if (!albPrefAlive(gen)) return;      // 已切页/换专辑：队列里剩下的一条也不再发
     var it = ALBPREF.queue.shift();
     ALBPREF.active++;
@@ -853,11 +921,17 @@ function albumTrackPrefetch(alb) {
   var key = albPrefKey(alb);
   if (ALBPREF.key === key && ALBPREF.live.v === 1) return;   // 同一张专辑只排一次
   var tracks = (alb && alb.tracks) || [];
+  var allCount = tracks.length;
   var q = [];
-  tracks.forEach(function (t) { if (t && t.title) q.push({ url: albumTrackUrl(t, alb) }); });
+  // 最多 40 首；超过 40 首只整理前 40 首
+  tracks.forEach(function (t) {
+    if (t && t.title) {
+      if (q.length < 40) q.push({ url: albumTrackUrl(t, alb) });
+    }
+  });
   if (!q.length) return;
   var gen = ALBPREF.gen + 1;
-  ALBPREF = { key: key, gen: gen, total: q.length, done: 0, active: 0, queue: q, timer: 0, live: { v: 1 } };
+  ALBPREF = { key: key, gen: gen, total: q.length, allTotal: allCount, done: 0, active: 0, queue: q, timer: 0, live: { v: 1 } };
   albPrefRender();
   albPrefPump();
 }
@@ -1692,19 +1766,26 @@ function loadMeta(f) {
   if (!f) return;
   api('/api/meta?file=' + encodeURIComponent(f)).then(function (m) {
     S.curMeta = m;
-    if (m.title) D('npt').textContent = m.title;
-    else D('npt').textContent = nam(f);
+    var tName = m.title || nam(f);
+    D('npt').textContent = tName;
+    D('npt').title = tName;
     var sub = [];
     if (m.artist) sub.push(m.artist);
     if (m.album) sub.push(m.album);
-    D('npart').textContent = sub.join(' \u00b7 ');
+    var subStr = sub.join(' \u00b7 ');
+    D('npart').textContent = subStr;
+    D('npart').title = subStr;
     D('cv').style.backgroundImage = m.hasCover ? "url('/api/cover?file=" + encodeURIComponent(f) + "')" : '';
     // 补全芯片：存全局，renderNp 统一填进 #npMeta；整页开着就立刻刷一次（meta 是异步回来的）
     S.npMetaHtml = buildNpMetaHtml(m);
     if (D('npPage') && D('npPage').classList.contains('on')) {
       renderNp();   // renderNp 内部已调 updateNpSummary(S.curMeta)，不再重复请求
     }
-  }).catch(function () { D('npt').textContent = nam(f); });
+  }).catch(function () {
+    var tName = nam(f);
+    D('npt').textContent = tName;
+    D('npt').title = tName;
+  });
 }
 
 /* ---------------- 状态 ---------------- */
@@ -1782,6 +1863,7 @@ function tick() {
       D('bpBadge').title = S.bpWhy || '';
     }
     if (j.error) D('nps').textContent = j.error;
+    syncAlbPlayAllBtn();
   }).catch(function () { });
 }
 
@@ -2838,12 +2920,24 @@ function showChain() {
       if (p.conv) eqParts.push('FIR 卷积' + (ADV.ir ? (' ' + nam(ADV.ir)) : ''));
       nodes.push({ k: 'EQ / 卷积', v: eqParts.join('  \u00b7  ') + '  \u00b7  ' + (convGpu ? 'GPU 计算' : 'CPU 计算'), gpu: convGpu });
     }
-    if (p.dsd) {
+    // 2026-10-24（原生 DSD 接入）：ASIO 原生 DSD 既不调制也不装 DoP 载波 —— 单独一环。
+    // 字段由 rtaweb 的 play_one_native_dsd() 写进 /api/signal：
+    //   dsdNative=true / dsdNativeType=MSB1|LSB1 / dsdNativeTypeCode=33|32 / dsdNativeRate=DSD 位率
+    //   （注意是 2822400 这类位率，不是 DoP 的 176400 载波率）
+    if (p.dsdNative) {
+      nodes.push({ k: '原生 DSD', v: '类型 ' + (p.dsdNativeType || '?') +
+        (p.dsdNativeTypeCode ? '（' + p.dsdNativeTypeCode + '）' : '') +
+        '  \u00b7  ' + (p.dsdNativeRate || p.outRate) + ' Hz  \u00b7  1-bit 直送驱动（不经 PCM / DoP）' });
+    } else if (p.dsd) {
       nodes.push({ k: 'DSD 调制', v: 'DSD' + p.dsd + '（' + (p.dsdRate / 1000000).toFixed(4) + ' MHz）\u00b7 1-bit \u00b7 ' + (p.modOrder || 5) + ' 阶 SDM' });
-      nodes.push({ k: 'DoP 封装', v: '24-bit 载波 ' + p.outRate + ' Hz \u00b7 标记 0x05/0xFA 交替' });
+      // 载波率必须用 p.carrier：DirectSDM / 回落的信号链里 outRate 记的是 DSD 位率（2822400），
+      // DoP 真正开给设备的率是 carrier（DSD64 -> 176400）。旧写法会把 2822400 说成"24-bit 载波"。
+      nodes.push({ k: 'DoP 封装', v: '24-bit 载波 ' + (p.carrier || p.outRate) + ' Hz \u00b7 标记 0x05/0xFA 交替' });
     } else {
       nodes.push({ k: '抖动 / 噪声整形', v: (p.shaper && p.shaper !== 'none') ? p.shaper : '无（逐位）' });
     }
+    // 原生 DSD 失败回落 DoP：原因原样显示，绝不让用户以为这一曲是原生 DSD
+    if (p.dsdFallback) nodes.push({ k: 'DoP 回落', v: p.dsdFallback });
     if (p.preAtten && p.preAtten < 0) {
       nodes.push({ k: '峰值保护', v: '检测到过采样峰值 ' + (p.ispPeak * 100).toFixed(1) + '%（' + p.ispOver +
         ' 个点超出满幅）→ 预衰减 ' + p.preAtten.toFixed(1) + ' dB' });
@@ -3832,7 +3926,9 @@ function renderSettingsPage() {
        + sel('sp_dsdpk', '封装',
              opt('dop', 'DoP（WASAPI / ASIO 均可）', dsdPackOf()) +
              opt('nat', 'Native（仅 ASIO）', dsdPackOf()),
-             '两者数值等价，差别只在传输方式；Native 只能走 ASIO')
+             '两者数值等价，差别只在传输方式；Native 走 ASIO 原生 DSD（1-bit 直送驱动）。' +
+             '前提：后端 ASIO、源为 DSD、音量 0 dB、无 EQ / 卷积 / 升频，否则会明确报错；' +
+             '驱动拒绝原生 DSD 时自动回落 DoP，并在信号链里标出')
        // 2026-10-24（用户 261024-01 #12）：这两个控件不再灰掉（见 applyDsdState）。
        // 当前输出是 PCM 时，改这里会自动把输出模式联动到 DSD —— 一句常驻说明交代清楚。
        + '<div class="sfld wide" id=sp_dsdmodenote style="display:none"><div class=hint>' +
@@ -4312,9 +4408,11 @@ function renderSettingsPage() {
     backendHint();
     var m = D('sp_asiomsg'); if (!m) return;
     // 2026-10-24 #7：驱动清单收进 title，页面只留结论。
+    // 2026-10-24（原生 DSD 接入）：Native DSD 已接通 ASIO 原生通道，这里只交代前提。
+    // 判据与后端 native_dsd_precheck() 一致（后端 ASIO / 源 DSD / 音量 0 dB / 无 PCM 处理 / 不升频）。
     m.textContent = d.length
-      ? ('本机 ASIO 驱动 ' + d.length + ' 个 · Native DSD 尚未实现（选 Native 不会出声）')
-      : '本机未检测到 ASIO 驱动 · Native DSD 不可用';
+      ? ('本机 ASIO 驱动 ' + d.length + ' 个 · Native DSD 可用（需后端 ASIO、源为 DSD、音量 0 dB、无 EQ / 卷积、采样率跟随源；驱动拒绝时回落 DoP）')
+      : '本机未检测到 ASIO 驱动 · Native DSD 不可用（DoP 仍可用）';
     m.title = d.length ? d.join('、') : '';
   }).catch(function () { });
   if (ADV.inBackend === 'wasapi') loadInputDevices();
@@ -5493,21 +5591,56 @@ function applySettings() {
 
 /* ---------------- 键盘快捷键 ---------------- */
 document.addEventListener('keydown', function (e) {
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F')) {
+    e.preventDefault();
+    var q = D('q');
+    if (q) { q.focus(); q.select(); }
+    return;
+  }
   var t = e.target || {};
-  if (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA') return;
+  if (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA') {
+    if (e.key === 'Escape' && t.id === 'q') {
+      t.blur();
+    }
+    return;
+  }
   if (e.key === ' ') { e.preventDefault(); D('bPause').click(); }
-  else if (e.key === 'ArrowRight') { e.preventDefault(); seekRel(5); }
-  else if (e.key === 'ArrowLeft') { e.preventDefault(); seekRel(-5); }
+  else if (e.key === 'ArrowRight') {
+    e.preventDefault();
+    if (e.shiftKey) seekRel(5);
+    else D('bNext').click();
+  }
+  else if (e.key === 'ArrowLeft') {
+    e.preventDefault();
+    if (e.shiftKey) seekRel(-5);
+    else D('bPrev').click();
+  }
   else if (e.key === 'ArrowUp') { e.preventDefault(); setVol(Math.min(0, S.vol + 1)); }
   else if (e.key === 'ArrowDown') { e.preventDefault(); setVol(Math.max(-60, S.vol - 1)); }
   else if (e.key === 'n') D('bNext').click();
   else if (e.key === 'p') D('bPrev').click();
   else if (e.key === 's') D('bStop').click();
   else if (e.key === 'l') D('bLyric').click();
-  // Esc：资料抽屉开着先收抽屉（不把整页一起关掉），再按一次才退出单曲页
-  else if (e.key === 'Escape' && D('npPage') && D('npPage').classList.contains('on')) {
-    if (npDrawerIsOpen()) { npDrawerClose(); npDataRenderBody(); }
-    else closeNowPlaying();
+  // Esc：层级返回（抽屉 -> 单曲页 -> 弹窗 -> 设置页 -> 专辑/艺术家详情页）与返回按钮行为一致
+  else if (e.key === 'Escape') {
+    if (D('npPage') && D('npPage').classList.contains('on')) {
+      if (typeof npDrawerIsOpen === 'function' && npDrawerIsOpen()) {
+        npDrawerClose(); npDataRenderBody();
+      } else {
+        closeNowPlaying();
+      }
+    } else if (D('modal') && D('modal').classList.contains('on')) {
+      D('modal').classList.remove('on');
+    } else if (D('setpage') && D('setpage').classList.contains('on')) {
+      setView('albums');
+    } else if (S.view === 'album') {
+      loadAlbums();
+    } else if (S.view === 'artist') {
+      loadArtists();
+    } else if (S.view === 'works') {
+      if (S.worksFrom === 'np' || (D('wBackNp') && S.lastCur)) openNowPlaying();
+      else loadAlbums();
+    }
   }
   else if (e.key === 'i') showChain();
 });
@@ -5784,6 +5917,123 @@ function npDataStatHtml(kind, st) {
   // 261024-01 #2：只标注来源状态（已缓存 / 刚刚整理），不再叠「未核对」这类长尾文案。
   return d.summaryCached ? '已缓存' : '刚刚整理';
 }
+function sanitizeStreamText(raw) {
+  if (raw === null || raw === undefined) return '';
+  var s = String(raw);
+  return s.replace(/[\uFFFD\uD800-\uDBFF]+$/, '');
+}
+
+function npDataRenderProgress(st, kind) {
+  var body = D('npDataBody');
+  if (!body) return;
+  var prog = (st && st.progress) || {};
+  var rawText = (st && typeof st.streamText === 'string') ? st.streamText : sanitizeStreamText(prog.text);
+  var cleanText = sanitizeStreamText(rawText);
+  var isJson = /^\s*\{/.test(cleanText);
+  var hasText = !!cleanText && !isJson;
+
+  var chars = (typeof prog.chars === 'number') ? prog.chars : (cleanText ? cleanText.length : 0);
+  var sec = (typeof prog.elapsedMs === 'number' && prog.elapsedMs >= 0)
+    ? (prog.elapsedMs / 1000).toFixed(1) + 's' : '';
+  var statTxt = (chars > 0 || sec)
+    ? ('已生成 ' + chars + ' 字' + (sec ? (' · ' + sec) : ''))
+    : '';
+  var phaseTxt = prog.phase || '正在整理资料…';
+
+  var curAttempt = (typeof prog.attempt === 'number') ? prog.attempt : 1;
+  var attemptChanged = (st && st.lastAttempt !== undefined && st.lastAttempt !== curAttempt);
+  if (st) st.lastAttempt = curAttempt;
+  if (attemptChanged) {
+    cleanText = '';
+    hasText = false;
+    if (st) st.streamText = '';
+  }
+
+  var wrap = D('npdStreamWrap');
+  if (!wrap || wrap.dataset.kind !== kind) {
+    body.innerHTML =
+      '<div id=npdStreamWrap data-kind="' + esc(kind) + '" class="npdstream-wrap">' +
+      '<div id=npdStreamPhase class=npdhint style="margin-bottom:8px"></div>' +
+      '<div id=npdStreamStat class="npdhint npdstream-stat"></div>' +
+      '<div id=npdStreamText class=npdstream-text></div>' +
+      '</div>';
+    NP_DATA.bodyKey = kind + '|streaming';
+    wrap = D('npdStreamWrap');
+  }
+
+  var phaseEl = D('npdStreamPhase');
+  var statEl = D('npdStreamStat');
+  var textEl = D('npdStreamText');
+
+  if (hasText) {
+    if (phaseEl) phaseEl.style.display = 'none';
+    if (statEl) {
+      statEl.style.display = '';
+      statEl.textContent = statTxt || ('已生成 ' + chars + ' 字');
+    }
+    if (textEl) {
+      textEl.style.display = '';
+      textEl.textContent = cleanText;
+      textEl.scrollTop = textEl.scrollHeight;
+    }
+    body.scrollTop = body.scrollHeight;
+  } else if (isJson) {
+    if (phaseEl) {
+      phaseEl.style.display = '';
+      phaseEl.textContent = phaseTxt;
+    }
+    if (statEl) {
+      statEl.style.display = '';
+      statEl.textContent = statTxt || ('已生成 ' + chars + ' 字');
+    }
+    if (textEl) {
+      textEl.style.display = 'none';
+      textEl.textContent = '';
+    }
+  } else {
+    if (phaseEl) {
+      phaseEl.style.display = '';
+      phaseEl.textContent = phaseTxt + (sec ? (' · ' + sec) : '');
+    }
+    if (statEl) {
+      if (chars > 0 || sec) {
+        statEl.style.display = '';
+        statEl.textContent = statTxt;
+      } else {
+        statEl.style.display = 'none';
+        statEl.textContent = '';
+      }
+    }
+    if (textEl) {
+      textEl.style.display = 'none';
+      textEl.textContent = '';
+    }
+  }
+}
+
+function npDataOnProgress(kind, prog) {
+  if (!prog) return;
+  var st = NP_DATA.cache[kind];
+  if (!st) st = NP_DATA.cache[kind] = { state: 'loading' };
+  if (st.state !== 'loading' && st.state !== 'idle' && st.state !== 'local') return;
+
+  var curAttempt = (typeof prog.attempt === 'number') ? prog.attempt : 1;
+  var prevAttempt = st.lastAttempt;
+  st.lastAttempt = curAttempt;
+  st.progress = prog;
+
+  var clean = sanitizeStreamText(prog.text);
+  if (prevAttempt !== undefined && curAttempt !== prevAttempt) {
+    st.streamText = '';
+  } else {
+    st.streamText = clean;
+  }
+
+  if (NP_DATA.active === kind) {
+    npDataRenderProgress(st, kind);
+  }
+}
+
 function npDataSkeleton() {
   return '<div class=npdskel><i style="width:92%"></i><i style="width:76%"></i><i style="width:84%"></i></div>' +
          '<div class=npdhint>正在整理资料…</div>';
@@ -5854,7 +6104,8 @@ function npDataRenderBody(force) {
   // renderNp 400ms 一次：内容没变就不重绘（否则抽屉里的滚动位置会被反复重置）
   // 261024-05 A12：本地专辑到达 / 曲目数变化也必须触发重绘，否则"先本地后 AI"只生效一半。
   var lsig = st.local ? ('L' + ((st.local.tracks || []).length)) : (st.localState || '-');
-  var sig = kind + '|' + st.state + '|' + lsig + '|' +
+  var psig = st.progress ? ('|P' + (st.progress.attempt || 1) + '|' + (st.progress.chars || 0) + '|' + (st.streamText || '').length) : '';
+  var sig = kind + '|' + st.state + '|' + lsig + psig + '|' +
             (st.data ? (st.data.generated_at || (st.data.summaryCached ? 'c' : 'f')) : (st.error || ''));
   var need = (sig !== NP_DATA.bodyKey);
   if (!need && !force) return;
@@ -5870,7 +6121,14 @@ function npDataRenderBody(force) {
     if (rfb) rfb.onclick = function () { npDataEnsure('release', true); };
     return;
   }
-  if (st.state === 'idle' || st.state === 'loading') { body.innerHTML = npDataSkeleton(); return; }
+  if (st.state === 'idle' || st.state === 'loading') {
+    if (st.progress) {
+      npDataRenderProgress(st, kind);
+    } else {
+      body.innerHTML = npDataSkeleton();
+    }
+    return;
+  }
   if (st.state === 'error') {
     body.innerHTML = '<div class=npdhint>暂无该实体的资料。' + (st.error ? ('（' + esc(st.error) + '）') : '') + '</div>' +
       '<div style="margin-top:10px"><button class=btn id=npDataRetry>重试</button></div>';
@@ -5938,7 +6196,28 @@ function npReleaseBody(st) {
   var ai = (st.state === 'ok') ? st.data : null;
   var h = '';
   if (ai) h = renderSummaryContent(ai, '', 'release', opts);
-  if (!h) h = renderFieldGrid({}, 'release', opts);      // AI 不在/失败：静默只显示本地资料字段
+  if (!h && st.progress) {
+    var prog = st.progress;
+    var rawText = (typeof st.streamText === 'string') ? st.streamText : sanitizeStreamText(prog.text);
+    var cleanText = sanitizeStreamText(rawText);
+    var isJson = /^\s*\{/.test(cleanText);
+    var chars = (typeof prog.chars === 'number') ? prog.chars : (cleanText ? cleanText.length : 0);
+    var sec = (typeof prog.elapsedMs === 'number' && prog.elapsedMs >= 0)
+      ? (prog.elapsedMs / 1000).toFixed(1) + 's' : '';
+    var statTxt = (chars > 0 || sec) ? ('已生成 ' + chars + ' 字' + (sec ? (' · ' + sec) : '')) : '';
+    h += '<div id=npdStreamWrap data-kind="release" style="margin-bottom:12px;padding:10px 12px;border-radius:8px;background:var(--hov);border:1px solid var(--line)">';
+    if (!cleanText && !isJson) {
+      h += '<div class=npdhint id=npdStreamPhase>' + esc(prog.phase || '正在整理…') + (sec ? (' · ' + sec) : '') + '</div>';
+    } else {
+      h += '<div class="npdhint npdstream-stat" id=npdStreamStat style="color:var(--txt2);font-weight:600;margin-bottom:6px">' + esc(statTxt) + '</div>';
+      if (cleanText && !isJson) {
+        h += '<div class=npdstream-text id=npdStreamText style="max-height:160px;overflow:auto;white-space:pre-wrap;font-size:12px;color:var(--txt2)">' + esc(cleanText) + '</div>';
+      }
+    }
+    h += '</div>';
+  } else if (!h) {
+    h = renderFieldGrid({}, 'release', opts);      // AI 不在/失败：静默只显示本地资料字段
+  }
   if (alb) h += efTracklistHtml(alb.tracks || []);
   if (!alb) {
     if (st.state === 'loading' || st.state === 'idle' || st.localState === 'loading') {
@@ -5948,7 +6227,7 @@ function npReleaseBody(st) {
     }
   }
   if (ai) {
-    h += '<div style="margin-top:16px"><button class="btn" id=npDataRefresh" ' +
+    h += '<div style="margin-top:16px"><button class="btn" id=npDataRefresh ' +
          'style="font-size:11px;padding:3px 10px" title="重新请求 AI 整理（会消耗一次模型调用）">重新整理</button></div>';
   }
   return h || '<div class=npdhint>暂无该专辑的资料。</div>';
@@ -6004,6 +6283,7 @@ function npPrefetchRelease() {
   var live = { v: 1 };
   NPPREF = { key: key, live: live };
   var u = npSummUrl('release', rel);
+  var req = NP_DATA.req;
   summaryOnce(u, function (s) {
     if (!live.v || NPPREF.live !== live) return;                     // 已切歌/已取消 → 丢弃
     if ((S.lastCur || '') !== myTrack) return;
@@ -6019,7 +6299,10 @@ function npPrefetchRelease() {
       if (NP_DATA.active === 'release') npDataRenderBody();
     };
     npLocalAlbum(rel.name, rel.artist || '', function (alb) { if (alb) s.__album = alb; finish(); });
-  }, false, function () { return live.v === 1 && NPPREF.live === live; });
+  }, false, function () { return live.v === 1 && NPPREF.live === live; }, function (prog) {
+    if (NP_DATA.req !== req) return;
+    npDataOnProgress('release', prog);
+  });
 }
 /* 261024-04 #7：打开 AI 整理后，**进入单曲页就自动加载**这首歌的 summary（用户原话：不再需要点击）。
    纪律：
@@ -6077,7 +6360,10 @@ function npDataEnsure(kind, force) {
   var prev = NP_DATA.cache[kind] || {};   // 换态时保留本地专辑（先本地、后 AI）
   NP_DATA.cache[kind] = { state: 'loading', local: prev.local || null,
                           localState: prev.localState || '', localKey: prev.localKey || '',
-                          aiFailed: prev.aiFailed || 0 };
+                          aiFailed: prev.aiFailed || 0,
+                          progress: force ? null : (prev.progress || null),
+                          streamText: force ? '' : (prev.streamText || ''),
+                          lastAttempt: force ? undefined : prev.lastAttempt };
   if (NP_DATA.active === kind) npDataRenderBody();
 
   function done(data, err) {
@@ -6118,7 +6404,10 @@ function npDataEnsure(kind, force) {
     } else {
       done(s, '');
     }
-  }, false, function () { return live.v === 1 && NP_DATA.live === live; });
+  }, false, function () { return live.v === 1 && NP_DATA.live === live; }, function (prog) {
+    if (NP_DATA.req !== req) return;
+    npDataOnProgress(kind, prog);
+  });
 }
 function npDataActivate(kind) {
   NP_DATA.active = kind;
