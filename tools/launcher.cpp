@@ -657,6 +657,76 @@ static std::string g_resizeDir;   // 页面发来的 resize 方向（WM_APP+2 �
 static HWND g_mainWnd = nullptr;
 static ::ICoreWebView2Controller* g_wvCtl = nullptr;
 static ::ICoreWebView2* g_wv = nullptr;
+
+// ---------------- 启动首帧白闪（2026-10-24，根因修复） ----------------
+// 逐帧证据（build-verify/analysis/white_flash_peak_frame_0030.png）：窗口出现后第 30 帧
+// 整张 1340x880 是纯白（R=G=B=255），约 1 秒后才变成深色界面。
+//
+// 真因是【顺序】不是【配色】：create() 返回时只是"控制器建好 + 已发起 Navigate"，
+// Chromium 还没有任何内容帧；这一瞬间 ShowWindow，DWM 合成到的就是它的空白表面
+// （WebView2 默认底色 = 白）。所以修法是：窗口从 CreateWindow 起一直隐藏，
+// 等到页面回执"已经画出一帧"才第一次 ShowWindow（探针：文档创建即注入的 rAF×2 脚本；
+// NavigationCompleted 后的 rAF 作为二道保险）。
+//
+// 兜底（两条都做）：WebView2 默认底色 = 主题色（wv2::set_default_background），
+// 窗口类背景刷 = 主题色。即使等待超时、或别的路径提前显示，看到的也是深色而不是白。
+static bool  g_navDone = false;      // 已收到 NavigationCompleted
+static bool  g_navOk = false;        // 该次导航是否成功
+static bool  g_paintDone = false;    // 页面回执：已画出一帧（rAF×2 之后 postMessage）
+static DWORD g_tCreate = 0;          // CreateWindowExW 返回时刻
+static DWORD g_tCtlReady = 0;        // WebView2 控制器 + Navigate 完成时刻
+static DWORD g_tNav = 0;             // 导航完成时刻
+static DWORD g_tPaint = 0;           // 首帧回执时刻
+static DWORD g_tShow = 0;            // ShowWindow 调用时刻
+
+// 首帧等待上限（判据："不能让启动变慢超过约 300ms"）。
+// 这段等待是【额外】加在"控制器建好 + 已发起 Navigate"之后的：热启动实测 110 ms
+// 就收到回执；冷启动页面要 450~500 ms 才画出第一帧，会走到上限 —— 这时靠兜底底色
+// （WebView2 默认底色 = 主题色）保证不闪白，而不是让用户多等半秒空白窗口。
+// 300 ms 预算里留 50 ms 余量给 ShowWindow/UpdateWindow 与调度抖动，所以上限取 250。
+// RLPLAYER_FIRSTFRAME_CAP_MS 可覆盖（0~5000）—— 取证时用它证明"门确实会等到真首帧"，
+// 而不是永远走超时兜底。
+static DWORD first_frame_cap_ms() {
+    static DWORD v = 0xFFFFFFFFu;
+    if (v == 0xFFFFFFFFu) {
+        wchar_t b[16] = {0};
+        v = 250;
+        if (GetEnvironmentVariableW(L"RLPLAYER_FIRSTFRAME_CAP_MS", b, 16) > 0) {
+            const long n = wcstol(b, nullptr, 10);
+            if (n >= 0 && n <= 5000) v = (DWORD)n;
+        }
+    }
+    return v;
+}
+
+// RLPLAYER_HOLD_FIRSTFRAME=0 关闭"等首帧再显示"（A/B 取证用；默认开启）。
+static bool hold_first_frame() {
+    static int v = -1;
+    if (v < 0) {
+        wchar_t b[8] = {0};
+        v = (GetEnvironmentVariableW(L"RLPLAYER_HOLD_FIRSTFRAME", b, 8) > 0 && b[0] == L'0') ? 0 : 1;
+    }
+    return v == 1;
+}
+
+// 等页面回执"已画出一帧"，期间正常泵消息（主题消息、定时器都照常跑）。
+// 返回 true = 收到回执；false = 超时。
+static bool wait_first_frame(DWORD capMs) {
+    const DWORD t0 = GetTickCount();
+    MSG msg;
+    for (;;) {
+        if (g_paintDone) return true;
+        const DWORD el = GetTickCount() - t0;
+        if ((int)el >= (int)capMs) return false;
+        const DWORD left = capMs - el;
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, left < 5 ? left : 5, QS_ALLINPUT);
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) return g_paintDone;   // 退出请求：别把消息吞掉
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
 static bool g_captionDark = true;
 static bool g_captionBlue = false;   // 三套主题里"浅蓝"单独一档（--bg #e9f2ff 与浅色 #f4f6f9 不同色）
 static DWORD g_lastDwmApply = 0;     // WM_WINDOWPOSCHANGED 里重设 DWM 属性的限流时间戳
@@ -1053,10 +1123,18 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 static bool open_webview_window(int port) {
     static const wchar_t* kClass = L"RLPlayerMain";
+    // 主题必须在【注册窗口类之前】读出来：类背景刷要直接是主题色（兜底二的最后一层，
+    // 任何 DefWindowProc 擦除都只会填主题色，永远不会填系统的白/灰）。
+    theme_flags(g_captionDark, g_captionBlue);
+    // 窗口类活着期间不能删，故意常驻；运行期换主题由 WM_ERASEBKGND/repaint_band 负责，
+    // 类背景刷只兜"任何走 DefWindowProc 擦除"的路径。
+    static HBRUSH s_classBrush = nullptr;
+    if (!s_classBrush) s_classBrush = CreateSolidBrush(theme_bg(g_captionDark, g_captionBlue));
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = main_wnd_proc;
+    wc.hbrBackground = s_classBrush;        // 兜底二：类背景刷 = 主题 --bg
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), L"IDI_APPICON", IMAGE_ICON,
@@ -1075,6 +1153,8 @@ static bool open_webview_window(int port) {
                                 nullptr, nullptr, wc.hInstance, nullptr);
     if (!hwnd) return false;
     g_mainWnd = hwnd;
+    g_tCreate = GetTickCount();   // 窗口可见耗时的起点：CreateWindow 返回
+    g_navDone = g_paintDone = false;
 
     // 初始尺寸按"窗口实际所在显示器"的 DPI 校正（1340×880 是 96 DPI 下的逻辑目标）。
     // 不能依赖创建时算的 dpi_system()：实测进程刚设 PerMonitorV2 时 GetDC(NULL) 仍报 96，
@@ -1097,12 +1177,25 @@ static bool open_webview_window(int port) {
         }
     }
 
+    const DWORD tDpi = GetTickCount();   // DPI 校准结束（窗口可见耗时的分段点）
     const HRESULT ci = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     wchar_t url[64];
     swprintf_s(url, L"http://127.0.0.1:%d/", port);
     std::string err;
     const std::wstring userData = exe_dir() + L"\\webview2";
     auto onMessage = [hwnd](const std::wstring& m) {
+        // 首帧回执（onNav 注入的 rAF 脚本发出）：只回答"现在可以显示了吗"，
+        // 不进协议解析 —— 否则会被当成未知动作。
+        if (m == L"host:firstpaint") {
+            if (!g_paintDone) {
+                g_paintDone = true;
+                g_tPaint = GetTickCount();
+                // 显示之后才到的回执也要记：它证明"门没等到"只是页面慢，不是探针坏了
+                logf(L"首帧回执: @%lu ms（CreateWindow 起算，%s）", g_tPaint - g_tCreate,
+                     g_tShow ? L"显示之后" : L"显示之前");
+            }
+            return;
+        }
         logf(L"wvmsg: %s", m.c_str());
         // 261024-02 #2：协议解析抽到 platform/host_msg.h（纯函数、可单测），这里只负责"动作"。
         const auto hm = rta::platform::parse_host_message(wide_to_utf8(m));
@@ -1145,29 +1238,81 @@ static bool open_webview_window(int port) {
         default: break;
         }
     };
-    if (!rta::wv2::create(hwnd, userData, url, &g_wvCtl, &g_wv, err, onMessage, kBandInset)) {
+    // 导航完成的处理（首帧判据的第二步）：先记事件，再让页面在下一帧（rAF×2）回执一次。
+    // 为什么不直接"导航完成就显示"：NavigationCompleted 只说明文档已经加载完，
+    // Chromium 把这一帧真正合成出来还要一个帧周期；用页面自己的下一帧当判据，
+    // 才等价于"真的画出来了"。回执走 postMessage，onMessage 里先于协议解析拦下。
+    auto onNav = [](bool ok) {
+        g_navDone = true;
+        g_navOk = ok;
+        g_tNav = GetTickCount();
+        logf(L"导航完成: ok=%d @%lu ms（CreateWindow 起算）", (int)ok, g_tNav - g_tCreate);
+        if (!g_wv) return;
+        g_wv->ExecuteScript(
+            L"(function(){var n=0;function f(){if(++n>=2){try{window.chrome.webview.postMessage('host:firstpaint');}catch(e){}}else{requestAnimationFrame(f);}}requestAnimationFrame(f);})();",
+            nullptr);
+    };
+    // 首帧探针（比 NavigationCompleted 早得多）：文档一创建就注入，rAF×2 后回执。
+    // 跳过非 http(s) 文档 —— 初始的 about:blank 不算"界面画出来了"。
+    // 探针细节：文档创建时 chrome.webview 还没注入是常态，所以回执失败要重试，
+    // 不能"试一次失败就永远没有信号"（第一版就是这样，日志里回执永远是 -1）。
+    static const wchar_t* kFirstPaintProbe =
+        L"(function(){try{var p=location.protocol;if(p!=='http:'&&p!=='https:')return;"
+        L"var n=0,tries=0;"
+        L"function send(){try{if(window.chrome&&window.chrome.webview&&window.chrome.webview.postMessage){"
+        L"window.chrome.webview.postMessage('host:firstpaint');return;}}catch(e){}"
+        L"if(++tries<300)setTimeout(send,16);}"
+        L"function f(){if(++n>=2){send();}else{requestAnimationFrame(f);}}"
+        L"requestAnimationFrame(f);}catch(e){}})();";
+    if (!rta::wv2::create(hwnd, userData, url, &g_wvCtl, &g_wv, err, onMessage, kBandInset, onNav,
+                          std::wstring(kFirstPaintProbe))) {
         logf(L"WebView2 启动失败（%S），退回 Edge", err.c_str());
         DestroyWindow(hwnd);
         g_mainWnd = nullptr;
         return false;
     }
+    g_tCtlReady = GetTickCount();
+    // 兜底二（主体）：WebView2 自己的空白表面也刷成主题色。Chromium 默认是白，
+    // 必须在 ShowWindow 之前设 —— 显示之后再改，用户已经看到过那一帧白了。
+    if (!rta::wv2::set_default_background(g_wvCtl, theme_bg(g_captionDark, g_captionBlue)))
+        logf(L"首帧兜底: ICoreWebView2Controller2 不可用，WebView2 空白表面仍是默认白");
     install_wv_edge_hittest(hwnd);   // 满幅模式：让 WebView2 子窗口把边缘命中交还父窗口
     // 满幅兜底：WebView2 创建期间若窗口被 DPI 校正/系统调整过，这里按最新客户区再摆一次，
     // 不依赖"之后会来一条 WM_SIZE"（2026-10-24 根因就是启动路径上根本没有 WM_SIZE）。
     rta::wv2::resize(g_wvCtl, hwnd, kBandInset);
-    theme_flags(g_captionDark, g_captionBlue);
+    // 网页若已在隐藏期间发过 theme:xxx，这里不能再拿 conf 覆盖它（首帧门把这段窗口拉长了，
+    // 页面消息赶在 apply_caption 之前的概率从"几乎不可能"变成"很可能"）。
+    if (!g_themeFromPage) theme_flags(g_captionDark, g_captionBlue);
     apply_caption(hwnd, g_captionDark, g_captionBlue);
     SetTimer(hwnd, 1, 1500, nullptr);   // 主题跟随（conf 兜底）
     // 边带自愈看门狗：250ms 抽查一次像素，只在真的不对时补刷（见 verify_band 注）。
     // 之所以要定时器而不是只靠消息：实测"页面加载完成后的合成"会覆盖掉我们的填充，
     // 而那之后不再有 WM_PAINT/WM_NCPAINT 送进来。
     SetTimer(hwnd, 2, 250, nullptr);
-    // 首帧兜底：窗口类没有 hbrBackground，ShowWindow 之前先把客户区擦成主题色，
-    // 避免 DWM 第一帧取到未初始化表面（历史上就是"1px 白 + 3px 灰"垃圾像素）。
+    // 首帧兜底（第三条，但仍是"显示前"）：窗口此刻还是隐藏的，先把客户区擦成主题色，
+    // 避免显示瞬间 DWM 取到未初始化表面（历史上就是"1px 白 + 3px 灰"垃圾像素）。
     // 注意 WM_ERASEBKGND 的 wParam 可能是 -1，main_wnd_proc 里已处理成自取 DC。
     RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    // ★ 首帧门（白闪根因修复）：窗口从 CreateWindow 起一直隐藏（窗口类无 WS_VISIBLE，
+    //   全程没有 ShowWindow），只有在这里才第一次显示。判据 = 页面回执"已画出一帧"。
+    //   这段等待期间 DPI 校准 / DWM 属性 / 标题栏颜色 / 类背景刷 / WebView2 默认底色
+    //   全部已经设好（都在上面完成），所以显示出来就是最终样子，不存在"先白后改色"。
+    const DWORD tWait0 = GetTickCount();
+    const bool gate = hold_first_frame();
+    bool painted = g_paintDone;
+    if (!painted && gate) painted = wait_first_frame(first_frame_cap_ms());
+    const DWORD tWait = GetTickCount() - tWait0;
+    g_tShow = GetTickCount();
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
+    const DWORD tVis = GetTickCount();
+    // 墙钟必须写进日志（判据："不能因此让启动变慢超过约 300ms"要靠它逐次核对）
+    const long navMs   = g_navDone   ? (long)(g_tNav   - g_tCreate) : -1;
+    const long paintMs = g_paintDone ? (long)(g_tPaint - g_tCreate) : -1;
+    logf(L"启动首帧: CreateWindow -> ShowWindow %lu ms | 窗口创建/DPI %lu ms | WebView2 控制器+Navigate %lu ms"
+         L" | 首帧等待 %lu ms | 导航完成 @%ld ms | 页面回执 @%ld ms | 判据=%s | 显示门=%s | ShowWindow->UpdateWindow %lu ms",
+         g_tShow - g_tCreate, tDpi - g_tCreate, g_tCtlReady - tDpi, tWait, navMs, paintMs,
+         painted ? L"page-first-paint" : L"timeout-fallback", gate ? L"on" : L"off(env)", tVis - g_tShow);
     logf(L"已用内置 WebView2 打开界面（无浏览器外壳）");
     return true;
 }

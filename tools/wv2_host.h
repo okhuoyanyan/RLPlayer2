@@ -77,6 +77,95 @@ private:
     LONG ref_ = 1;
 };
 
+// 导航完成回调（启动首帧判据）。
+//
+// 2026-10-24 首帧白闪（build-verify 逐帧证据：窗出现后第 30 帧整张 1340x880 = FFFFFF）：
+// 启动路径上 launcher 建完控制器、刚 Navigate 就 ShowWindow，此时 Chromium 还没有任何
+// 内容帧，DWM 合成到的是它的空白表面（白）。根因是"先显示、后绘制"，不是配色。
+// 所以把"导航已完成"这个确定性事件交给调用方：调用方据此再等一次页面回执（rAF），
+// 才允许 ShowWindow —— 见 launcher.cpp 的 wait_first_frame()。
+class NavCompletedHandler : public ICoreWebView2NavigationCompletedEventHandler {
+public:
+    explicit NavCompletedHandler(std::function<void(bool)> cb) : cb_(std::move(cb)) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_ICoreWebView2NavigationCompletedEventHandler) {
+            *ppv = static_cast<ICoreWebView2NavigationCompletedEventHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&ref_); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG r = InterlockedDecrement(&ref_);
+        if (r == 0) delete this;
+        return (ULONG)r;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2*,
+                                     ICoreWebView2NavigationCompletedEventArgs* args) override {
+        BOOL ok = FALSE;
+        if (args) args->get_IsSuccess(&ok);
+        if (cb_) cb_(ok != FALSE);
+        return S_OK;
+    }
+private:
+    LONG ref_ = 1;
+    std::function<void(bool)> cb_;
+};
+
+// 文档创建即注入脚本的回调（只关心"注入被接受"，脚本本身的回报走 postMessage）。
+//
+// 为什么需要它（2026-10-24 首帧判据第二轮）：NavigationCompleted 要等整页 load 完，
+// 实测冷启动页面首帧回执 @781 ms、NavigationCompleted @812 ms —— 单靠后者会白等这几十毫秒，
+// 而且"load 完"并不等于"画出来了"。AddScriptToExecuteOnDocumentCreated 在【新文档创建时】
+// 就执行脚本，脚本里的 rAF 从文档自己的第一帧开始计，判据与"真的画出来了"直接对应。
+class AddScriptHandler : public ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler {
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown ||
+            riid == IID_ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler) {
+            *ppv = static_cast<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&ref_); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG r = InterlockedDecrement(&ref_);
+        if (r == 0) delete this;
+        return (ULONG)r;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT, LPCWSTR) override { return S_OK; }
+private:
+    LONG ref_ = 1;
+};
+
+// WebView2 空白表面的默认底色（ICoreWebView2Controller2::put_DefaultBackgroundColor）。
+//
+// 首帧白闪的兜底：即使窗口被提前显示（或首帧等待超时），Chromium 铺的也是主题色而不是
+// A4 白。必须在 ShowWindow 之前调用 —— 显示之后改，用户已经看到过那一帧白了。
+// 旧运行库没有 Controller2 时返回 false（调用方记日志，不静默吞掉）。
+inline bool set_default_background(ICoreWebView2Controller* ctl, COLORREF rgb) {
+    if (!ctl) return false;
+    ICoreWebView2Controller2* c2 = nullptr;
+    if (FAILED(ctl->QueryInterface(IID_ICoreWebView2Controller2,
+                                   reinterpret_cast<void**>(&c2))) || !c2)
+        return false;
+    COREWEBVIEW2_COLOR c{};
+    c.A = 255;
+    c.R = GetRValue(rgb);
+    c.G = GetGValue(rgb);
+    c.B = GetBValue(rgb);
+    const HRESULT hr = c2->put_DefaultBackgroundColor(c);
+    c2->Release();
+    return SUCCEEDED(hr);
+}
+
 // 网页 → 宿主的窗口控制消息（min / max / close / drag / theme:*）
 class MessageHandler : public ICoreWebView2WebMessageReceivedEventHandler {
 public:
@@ -472,7 +561,9 @@ inline std::vector<Track> plan_tracks(const std::wstring& mode, const RuntimeInf
 
 inline bool create(HWND parent, const std::wstring& userDataDir, const std::wstring& url,
                    ICoreWebView2Controller** outCtl, ICoreWebView2** outWv, std::string& err,
-                   std::function<void(const std::wstring&)> onMessage = nullptr, int inset = 0) {
+                   std::function<void(const std::wstring&)> onMessage = nullptr, int inset = 0,
+                   std::function<void(bool)> onNavigationCompleted = nullptr,
+                   const std::wstring& initScript = std::wstring()) {
     // Loader 与 exe 同目录（发布包里也带着它）
     HMODULE loader = LoadLibraryW(L"WebView2Loader.dll");
     if (!loader) { err = "找不到 WebView2Loader.dll"; return false; }
@@ -593,6 +684,21 @@ inline bool create(HWND parent, const std::wstring& userDataDir, const std::wstr
     ctl->put_IsVisible(TRUE);
     // 满幅：创建完立刻按 inset 摆放（默认 0）。调用方还会在 ShowWindow 前再 resize 一次兜底。
     resize(ctl, parent, inset);
+    // 首帧判据的入口（一）：文档创建即注入的探针脚本。必须在 Navigate 之前注册，
+    // 否则漏掉第一次文档创建 —— 那样就只能退回 NavigationCompleted（更晚）。
+    if (!initScript.empty()) {
+        auto* sh = new AddScriptHandler();
+        wv->AddScriptToExecuteOnDocumentCreated(initScript.c_str(), sh);
+        sh->Release();          // WebView2 持有引用
+    }
+    // 首帧判据的入口（二）：导航完成 → 调用方注入 rAF 回执（作为探针没跑到时的二道保险）。
+    // 必须在 Navigate 之前注册，否则本地服务很快时可能漏掉第一次导航。
+    if (onNavigationCompleted) {
+        auto* nh = new NavCompletedHandler(std::move(onNavigationCompleted));
+        EventRegistrationToken ntok{};
+        wv->add_NavigationCompleted(nh, &ntok);
+        nh->Release();          // WebView2 持有引用
+    }
     wv->Navigate(url.c_str());
     *outCtl = ctl;
     *outWv = wv;
