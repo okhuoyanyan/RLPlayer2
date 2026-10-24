@@ -254,6 +254,11 @@ inline std::string rta_ui_page() {
     h += ".qi.on{background:var(--acc-weak);border-left-color:var(--acc);color:var(--acc-text)}";
     h += ".qi .n{color:var(--mut2);width:20px;flex:none;text-align:right;font-variant-numeric:tabular-nums;font-size:11px}";
     h += ".qi .t{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
+    h += ".qi .qdel{width:20px;height:20px;border-radius:4px;color:var(--mut2);opacity:0;transition:.12s;background:none;border:none;cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center;flex:none}";
+    h += ".qi:hover .qdel{opacity:1}.qi .qdel:hover{background:var(--hov2);color:var(--danger)}";
+    h += ".ctx-menu{position:fixed;z-index:9999;background:var(--bg2);border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 24px var(--shadow);padding:4px 0;min-width:130px;user-select:none}";
+    h += ".ctx-item{padding:7px 14px;cursor:pointer;font-size:12.5px;color:var(--txt);display:flex;align-items:center;gap:8px;transition:background .1s}";
+    h += ".ctx-item:hover{background:var(--hov)}.ctx-item.danger:hover{color:var(--danger);background:var(--hov2)}";
     // 右栏快速设置
     h += ".set{padding:14px;display:none}.set.on{display:block}.fld{margin-bottom:14px}";
     h += ".fld label{display:block;font-size:11px;color:var(--mut);margin-bottom:5px;font-weight:500}";

@@ -114,9 +114,49 @@ function nam(p) {
 }
 function base(p) { return String(p || '').replace(/[/\\]+$/, ''); }
 function join(a, b) { return base(a) + SEP + b; }
-function api(u, body) {
+window.addEventListener('unhandledrejection', function (ev) {
+  if (ev && ev.preventDefault) ev.preventDefault();
+});
+
+function apiRaw(u, body) {
   var opt = body === undefined ? {} : { method: 'POST', body: body };
-  return fetch(u, opt).then(function (r) { return r.json(); });
+  var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  if (ctrl) opt.signal = ctrl.signal;
+  var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 8000);
+  return fetch(u, opt).then(function (r) {
+    clearTimeout(timer);
+    if (!r.ok) {
+      var err = new Error('HTTP ' + r.status);
+      err.status = r.status;
+      throw err;
+    }
+    return r.json();
+  }, function (e) {
+    clearTimeout(timer);
+    throw e;
+  });
+}
+
+function api(u, body) {
+  return apiRaw(u, body).catch(function () {
+    return new Promise(function (res) { setTimeout(res, 200); }).then(function () {
+      return apiRaw(u, body);
+    });
+  });
+}
+
+function renderPanelError(viewName, retryFn, err) {
+  if (S.view !== viewName) return;
+  var h = '<div class="card" style="max-width:480px;width:100%;margin:clamp(24px,10vh,90px) auto 0;padding:24px 26px;background:var(--phbg);border:1px solid var(--line);border-radius:12px;text-align:center">' +
+          '<div style="font-size:14px;font-weight:650;margin-bottom:6px">加载失败</div>' +
+          '<div style="color:var(--mut);font-size:12.5px;line-height:1.6;margin-bottom:14px">网络异常或服务响应超时，点击下方按钮重试</div>' +
+          '<button class="btn pri" id=panelRetryBtn>点击重试</button></div>';
+  D('list').innerHTML = h;
+  if (D('panelRetryBtn')) {
+    D('panelRetryBtn').onclick = function () {
+      if (typeof retryFn === 'function') retryFn();
+    };
+  }
 }
 function params() {
   var dv = D('sDSD').value;              // 0 | dop64 | dop128 | dop256 | nat64 | nat128 | nat256
@@ -465,7 +505,9 @@ function loadAlbums(q, title) {
       };
       e.oncontextmenu = function (ev) { ev.preventDefault(); enqueueAlbum(a.k); };
     });
-  }).catch(function (e) { D('list').innerHTML = '<div class=empty>' + esc(e) + '</div>'; });
+  }).catch(function (e) {
+    renderPanelError('albums', function () { loadAlbums(q, title); }, e);
+  });
 }
 
 /* ---------------- 收藏（心形喜好标记 / 261023-03 第5条） ---------------- */
@@ -972,6 +1014,8 @@ function openAlbum(k) {
         playAlbum(j.k, +e.dataset.i);
       };
     });
+  }).catch(function (e) {
+    renderPanelError('album', function () { openAlbum(k); }, e);
   });
 }
 
@@ -1110,6 +1154,8 @@ function loadArtists() {
         openArtistProfile(who);
       };
     });
+  }).catch(function (e) {
+    renderPanelError('artists', function () { loadArtists(); }, e);
   });
 }
 function renderAlbumSubset(who) {
@@ -1648,15 +1694,37 @@ function loadTracks(q) {
     var t = j.tracks || [];
     S.currentTracks = t;
     renderTracksView();
+  }).catch(function (e) {
+    renderPanelError('tracks', function () { loadTracks(q); }, e);
   });
+}
+
+function bindTrackRow(e, sorted) {
+  var favBtn = e.querySelector('.fav-btn');
+  if (favBtn) {
+    favBtn.onclick = function (ev) {
+      ev.stopPropagation();
+      toggleFav(favBtn.dataset.file, ev);
+    };
+  }
+  e.onclick = function (ev) {
+    if (ev.target.closest && ev.target.closest('.fav-btn')) return;
+    playPath(sorted[+e.dataset.i].path);
+  };
+  e.oncontextmenu = function (ev) {
+    ev.preventDefault();
+    addPath(sorted[+e.dataset.i].path);
+  };
 }
 
 function renderTracksView() {
   if (S.view !== 'tracks') return;
+  var t0 = performance.now();
   var t = S.currentTracks || [];
   var q = S.tracksQuery || '';
-  head(q ? ('搜索：' + q) : '曲目', t.length + ' 首', '');
-  if (!t.length) { D('list').innerHTML = '<div class=empty>没有匹配的曲目</div>'; return; }
+  var totalCount = t.length;
+  head(q ? ('搜索：' + q) : '曲目', totalCount + ' 首', '');
+  if (!totalCount) { D('list').innerHTML = '<div class=empty>没有匹配的曲目</div>'; return; }
 
   var sortMode = S.trackSort || 'default';
   var sorted = t.slice();
@@ -1692,18 +1760,7 @@ function renderTracksView() {
           '<option value=fav' + (sortMode === 'fav' ? ' selected' : '') + '>收藏优先</option>' +
           '</select></div>';
 
-  h += '<div style="padding:4px 0 24px">';
-  sorted.forEach(function (x, i) {
-    var isFav = FAV_SET.has(x.path);
-    h += '<div class="trow trow-track" data-i=' + i + ' style="grid-template-columns:28px 24px minmax(120px,1.6fr) minmax(0,1fr) 92px 58px;gap:8px">' +
-         '<div class=n>' + (i + 1) + '</div>' +
-         favIconHtml(x.path, isFav) +
-         '<div class=tt title="' + esc(x.title) + '">' + esc(x.title) + '</div>' +
-         '<div class=ar title="' + esc(x.artist + ' \u2014 ' + x.album) + '">' + esc(x.artist) + ' \u2014 ' + esc(x.album) + '</div>' +
-         '<div class=bd>' + fmtTag(x.sr, x.bits) + '</div>' +
-         '<div class=du>' + fmt(x.dur) + '</div></div>';
-  });
-  h += '</div>';
+  h += '<div id=trackListRows style="padding:4px 0 24px"></div>';
   D('list').innerHTML = h;
 
   if (D('trackSort')) {
@@ -1713,23 +1770,50 @@ function renderTracksView() {
     };
   }
 
-  Array.prototype.forEach.call(D('list').querySelectorAll('.fav-btn'), function (btn) {
-    btn.onclick = function (ev) {
-      ev.stopPropagation();
-      toggleFav(btn.dataset.file, ev);
-    };
-  });
+  var BATCH = 300;
+  var rendered = 0;
+  var rowsContainer = D('trackListRows');
 
-  Array.prototype.forEach.call(D('list').querySelectorAll('.trow'), function (e) {
-    e.onclick = function (ev) {
-      if (ev.target.closest && ev.target.closest('.fav-btn')) return;
-      playPath(sorted[+e.dataset.i].path);
+  function appendNextBatch() {
+    if (!rowsContainer || S.view !== 'tracks') return;
+    if (rendered >= sorted.length) return;
+    var next = Math.min(rendered + BATCH, sorted.length);
+    var chunkHtml = '';
+    for (var i = rendered; i < next; i++) {
+      var x = sorted[i];
+      var isFav = FAV_SET.has(x.path);
+      chunkHtml += '<div class="trow trow-track" data-i=' + i + ' style="grid-template-columns:28px 24px minmax(120px,1.6fr) minmax(0,1fr) 92px 58px;gap:8px">' +
+                   '<div class=n>' + (i + 1) + '</div>' +
+                   favIconHtml(x.path, isFav) +
+                   '<div class=tt title="' + esc(x.title) + '">' + esc(x.title) + '</div>' +
+                   '<div class=ar title="' + esc(x.artist + ' \u2014 ' + x.album) + '">' + esc(x.artist) + ' \u2014 ' + esc(x.album) + '</div>' +
+                   '<div class=bd>' + fmtTag(x.sr, x.bits) + '</div>' +
+                   '<div class=du>' + fmt(x.dur) + '</div></div>';
+    }
+    var temp = document.createElement('div');
+    temp.innerHTML = chunkHtml;
+    while (temp.firstChild) {
+      var node = temp.firstChild;
+      bindTrackRow(node, sorted);
+      rowsContainer.appendChild(node);
+    }
+    rendered = next;
+    var sub = sorted.length > BATCH ? (sorted.length + ' 首 · 已显示 ' + rendered + ' 首') : (sorted.length + ' 首');
+    head(q ? ('搜索：' + q) : '曲目', sub, '');
+  }
+
+  appendNextBatch();
+  window._trackFirstRenderMs = performance.now() - t0;
+
+  var mainEl = document.querySelector('.main');
+  if (mainEl) {
+    mainEl.onscroll = function () {
+      if (S.view !== 'tracks' || rendered >= sorted.length) return;
+      if (mainEl.scrollTop + mainEl.clientHeight >= mainEl.scrollHeight - 600) {
+        appendNextBatch();
+      }
     };
-    e.oncontextmenu = function (ev) {
-      ev.preventDefault();
-      addPath(sorted[+e.dataset.i].path);
-    };
-  });
+  }
 }
 
 /* ---------------- 文件夹 ---------------- */
@@ -1793,7 +1877,9 @@ function loadFiles(d) {
       };
       e.oncontextmenu = function (ev) { if (r.k === 'file') { ev.preventDefault(); addPath(join(S.dir, r.n)); } };
     });
-  }).catch(function (e) { D('list').innerHTML = '<div class=empty>' + esc(e) + '</div>'; });
+  }).catch(function (e) {
+    renderPanelError('files', function () { loadFiles(d); }, e);
+  });
 }
 
 /* ---------------- 最近播放 ---------------- */
@@ -1817,7 +1903,9 @@ function loadRecent() {
       e.onclick = function () { playPath(it[+e.dataset.i].path); };
       e.oncontextmenu = function (ev) { ev.preventDefault(); addPath(it[+e.dataset.i].path); };
     });
-  }).catch(function () { D('list').innerHTML = '<div class=empty>读取失败</div>'; });
+  }).catch(function (e) {
+    renderPanelError('recent', loadRecent, e);
+  });
 }
 
 /* ---------------- 播放控制 ---------------- */
@@ -1835,6 +1923,50 @@ function playRemote(it) {
     .then(function (j) { if (!j.ok) toast(j.error || '播放失败'); else loadQ(); });
 }
 
+/* ---------------- 队列右键菜单 ---------------- */
+var _activeCtxMenu = null;
+function hideContextMenu() {
+  if (_activeCtxMenu && _activeCtxMenu.parentNode) {
+    _activeCtxMenu.parentNode.removeChild(_activeCtxMenu);
+  }
+  _activeCtxMenu = null;
+}
+document.addEventListener('click', hideContextMenu);
+document.addEventListener('contextmenu', function (ev) {
+  if (!ev.target.closest || !ev.target.closest('.qi')) hideContextMenu();
+});
+
+function showQueueContextMenu(x, y, idx) {
+  hideContextMenu();
+  var menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  menu.style.left = Math.min(x, window.innerWidth - 150) + 'px';
+  menu.style.top = Math.min(y, window.innerHeight - 100) + 'px';
+
+  var itemPlay = document.createElement('div');
+  itemPlay.className = 'ctx-item';
+  itemPlay.innerHTML = '<span>\u25b6</span><span>立即播放</span>';
+  itemPlay.onclick = function (ev) {
+    ev.stopPropagation();
+    hideContextMenu();
+    if (S.q && S.q.items && S.q.items[idx]) playPath(S.q.items[idx]);
+  };
+
+  var itemDel = document.createElement('div');
+  itemDel.className = 'ctx-item danger';
+  itemDel.innerHTML = '<span>\u00d7</span><span>从队列移除</span>';
+  itemDel.onclick = function (ev) {
+    ev.stopPropagation();
+    hideContextMenu();
+    api('/api/qdel?i=' + idx, '').then(function () { toast('已移除'); loadQ(); });
+  };
+
+  menu.appendChild(itemPlay);
+  menu.appendChild(itemDel);
+  document.body.appendChild(menu);
+  _activeCtxMenu = menu;
+}
+
 /* ---------------- 队列 ---------------- */
 function loadQ() {
   api('/api/queue').then(function (j) {
@@ -1849,15 +1981,25 @@ function loadQ() {
     var h = '';
     S.q.items.forEach(function (f, i) {
       h += '<div class="qi' + (i === S.q.index ? ' on' : '') + '" data-i=' + i + ' draggable=true>' +
-           '<span class=n>' + (i + 1) + '</span><span class=t title="' + esc(f) + '">' + esc(nam(f)) + '</span></div>';
+           '<span class=n>' + (i + 1) + '</span><span class=t title="' + esc(f) + '">' + esc(nam(f)) + '</span>' +
+           '<button class=qdel data-i=' + i + ' title="从队列移除">\u00d7</button></div>';
     });
     D('qlist').innerHTML = h;
     Array.prototype.forEach.call(D('qlist').children, function (e) {
       if (e.dataset.i === undefined) return;
-      e.onclick = function () { playPath(S.q.items[+e.dataset.i]); };
-      e.oncontextmenu = function (ev) {          // 右键从队列移除
+      var i = +e.dataset.i;
+      e.onclick = function (ev) {
+        if (ev.target.classList.contains('qdel')) return;
+        playPath(S.q.items[i]);
+      };
+      e.oncontextmenu = function (ev) {
         ev.preventDefault();
-        api('/api/qdel?i=' + e.dataset.i, '').then(function () { toast('已移除'); loadQ(); });
+        showQueueContextMenu(ev.clientX, ev.clientY, i);
+      };
+      var d = e.querySelector('.qdel');
+      if (d) d.onclick = function (ev) {
+        ev.stopPropagation();
+        api('/api/qdel?i=' + i, '').then(function () { toast('已移除'); loadQ(); });
       };
       e.ondragstart = function (ev) { ev.dataTransfer.setData('text/plain', e.dataset.i); };
       e.ondragover = function (ev) { ev.preventDefault(); };
@@ -4564,8 +4706,12 @@ function renderSettingsPage() {
   D('sp_addroot').onclick = function () {
     var d = (D('sp_root').value || '').trim();
     if (!d) { toast('请填目录'); return; }
+    D('sp_root').value = '';
     api('/api/lib/roots', 'add=' + encodeURIComponent(d)).then(function (j) {
       if (!j.ok) { toast(j.error || '添加失败'); return; }
+      if (!S.roots) S.roots = [];
+      if (S.roots.indexOf(d) < 0) S.roots.push(d);
+      drawRoots();
       toast('已添加，正在扫描'); loadLibStats(); api('/api/lib/scan', '');
     });
   };
@@ -5645,7 +5791,13 @@ function drawRoots() {
   box.innerHTML = h || '<div style="font-size:11.5px;color:var(--mut2)">还没有添加目录</div>';
   Array.prototype.forEach.call(box.querySelectorAll('button'), function (b) {
     b.onclick = function () {
-      api('/api/lib/roots', 'remove=' + encodeURIComponent(b.dataset.r)).then(function () { loadLibStats(); toast('已移除'); });
+      var r = b.dataset.r;
+      S.roots = (S.roots || []).filter(function (x) { return x !== r; });
+      drawRoots();
+      api('/api/lib/roots', 'remove=' + encodeURIComponent(r)).then(function () {
+        loadLibStats();
+        toast('已移除');
+      });
     };
   });
 }
@@ -5817,7 +5969,7 @@ function renderQueuePage() {
     if (D('qClrAll')) D('qClrAll').onclick = function () {
       api('/api/clear', '').then(function () { toast('队列已清空'); renderQueuePage(); loadQ(); });
     };
-  }).catch(function () { });
+  }).catch(function (e) { renderPanelError('queue', renderQueuePage, e); });
 }
 
 /* ---------------- 正在播放整页 ---------------- */
