@@ -767,7 +767,9 @@ async function gotoFiles() {
   ck(await evalJs("!!document.getElementById('sp_opra_copychip') && document.getElementById('sp_opra_copychip').classList.contains('chip')"), '存在复制官网链接芯片');
 
   // ---- 261024-02 #6：20 段参数均衡 PEQ ----
-  const peqRows = await evalJs("document.querySelectorAll('#peqRows tbody tr').length");
+  // 2026-10-24（1.3.14 起）：PEQ 编辑区从 <table> 改成 CSS grid 的 div 行（#peqRows > .peqhd + .peqr），
+  // 判据必须跟着换选择器，否则测的是"表"存在与否而不是"20 段可编辑"—— 旧写法 tbody tr 会恒为 0。
+  const peqRows = await evalJs("document.querySelectorAll('#peqRows .peqr').length");
   ck(peqRows === 20, 'PEQ 编辑区 20 段', 'rows=' + peqRows);
   ck(await evalJs("!!document.getElementById('peqCurve') && document.querySelectorAll('#peqCurve svg polyline').length === 1"),
      'PEQ 频响曲线（SVG）已渲染');
@@ -778,7 +780,7 @@ async function gotoFiles() {
 
   // 改第 11 段（1kHz）+6dB：前端 -> 后端 -> 曲线，全链路实测
   const peqEdit = await evalJs(`(async function(){
-    var rows = document.querySelectorAll('#peqRows tbody tr');
+    var rows = document.querySelectorAll('#peqRows .peqr');
     var tr = rows[10];
     if (!tr) return { ok:false, msg:'没有第 11 行' };
     var f = tr.querySelector('.peqF'), g = tr.querySelector('.peqG');

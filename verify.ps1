@@ -8,6 +8,10 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $B = Join-Path $Root 'build'
 $rows = @()
 function Step($n, $ok, $d) { $script:rows += [pscustomobject]@{ Item=$n; Result=$(if($ok){'PASS'}else{'FAIL'}); Detail=$d } }
+# 2026-10-24：端口一律动态取（下面自检会起 rtaweb / rtanet_rx）。
+# 为什么：固定 8907/8908/45902 时，上一次自检残留的进程会让新实例 bind 失败并悄悄退出，
+# 自检于是报「FAIL」——实际被测对象是健康的（1.3.15 就这么误报过一次 DirectSDM e2e）。
+function Get-FreePort { $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start(); $p = $l.LocalEndpoint.Port; $l.Stop(); return $p }
 Write-Host '=== RLPlayer self-check (silent: no audio device opened) ==='
 
 # 1 build
@@ -84,18 +88,20 @@ if (Test-Path $grt) {
 $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
 if ($nodeCmd -and (Test-Path (Join-Path $Root 'tools\uicheck.js'))) {
   $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = Join-Path $B 'rtaweb.exe'; $psi.Arguments = '--port 8907'
+  $uiPort = Get-FreePort
+  $psi.FileName = Join-Path $B 'rtaweb.exe'; $psi.Arguments = "--port $uiPort"
   $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
   $wp = New-Object System.Diagnostics.Process; $wp.StartInfo = $psi; $null = $wp.Start()
   $up = $false
   for ($i = 0; $i -lt 60; $i++) { Start-Sleep -Milliseconds 200
-    try { $t = New-Object Net.Sockets.TcpClient; $t.Connect('127.0.0.1', 8907); $t.Close(); $up = $true; break } catch {} }
+    try { $t = New-Object Net.Sockets.TcpClient; $t.Connect('127.0.0.1', $uiPort); $t.Close(); $up = $true; break } catch {}
+    if ($wp.HasExited) { break } }
   if ($up) {
-    $uo = (& node (Join-Path $Root 'tools\uicheck.js') 'http://127.0.0.1:8907/' (Join-Path $env:TEMP 'rta_uicheck_vfy') 2>&1 | Out-String)
+    $uo = (& node (Join-Path $Root 'tools\uicheck.js') "http://127.0.0.1:$uiPort/" (Join-Path $env:TEMP 'rta_uicheck_vfy') 2>&1 | Out-String)
     $uiExit = $LASTEXITCODE
     $ul = ((($uo -split ([char]10)) | Select-String '全部通过|项失败' | Select-Object -First 1) -join ' ').Trim()
     Step 'Web UI self-check' ($uiExit -eq 0) $ul
-  } else { Step 'Web UI self-check' $false 'rtaweb did not start' }
+  } else { Step 'Web UI self-check' $false ('rtaweb did not start on port ' + $uiPort + $(if ($wp.HasExited) { '（进程已退出，可能端口被占用或启动即崩）' } else { '（30s 内未监听）' })) }
   Stop-Process -Id $wp.Id -Force -ErrorAction SilentlyContinue
 } else { Step 'Web UI self-check' $false 'node or uicheck.js missing' }
 
@@ -121,14 +127,18 @@ if ((Test-Path $mk) -and (Test-Path $dc) -and (Test-Path (Join-Path $B 'rtanet_r
   Remove-Item $recvW -ErrorAction SilentlyContinue
   $null = & $mk --out $dsf2 --seconds 1 2>&1
   $null = & $dc --in $dsf2 --direct --out $refW 2>&1
-  $rxJob = Start-Process -FilePath (Join-Path $B 'rtanet_rx.exe') -ArgumentList @('--sink','file','--out',$recvW,'--ctrl-port','45902','--seconds','8') -PassThru -WindowStyle Hidden
-  $webP = Start-Process -FilePath (Join-Path $B 'rtaweb.exe') -ArgumentList @('--port','8908') -PassThru -WindowStyle Hidden
+  # 端口动态取：固定端口会被上次残留的实例占住（见文件头 Get-FreePort 的注）
+  $dmPort = Get-FreePort
+  $dmCtrl = Get-FreePort
+  $rxJob = Start-Process -FilePath (Join-Path $B 'rtanet_rx.exe') -ArgumentList @('--sink','file','--out',$recvW,'--ctrl-port',"$dmCtrl",'--seconds','8') -PassThru -WindowStyle Hidden
+  $webP = Start-Process -FilePath (Join-Path $B 'rtaweb.exe') -ArgumentList @('--port',"$dmPort") -PassThru -WindowStyle Hidden
   $ready = $false
   for ($i = 0; $i -lt 50; $i++) { Start-Sleep -Milliseconds 200
-    try { $t = New-Object Net.Sockets.TcpClient; $t.Connect('127.0.0.1', 8908); $t.Close(); $ready = $true; break } catch {} }
+    try { $t = New-Object Net.Sockets.TcpClient; $t.Connect('127.0.0.1', $dmPort); $t.Close(); $ready = $true; break } catch {}
+    if ($webP.HasExited) { break } }
   if ($ready) {
-    $body = 'file=' + [uri]::EscapeDataString($dsf2) + '&backend=naa&naahost=127.0.0.1%3A45902&dsd=64&volume=0&directsdm=1'
-    try { $null = Invoke-WebRequest -Uri 'http://127.0.0.1:8908/api/play' -Method Post -Body $body -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -TimeoutSec 10 } catch {}
+    $body = 'file=' + [uri]::EscapeDataString($dsf2) + '&backend=naa&naahost=127.0.0.1%3A' + $dmCtrl + '&dsd=64&volume=0&directsdm=1'
+    try { $null = Invoke-WebRequest -Uri ("http://127.0.0.1:$dmPort/api/play") -Method Post -Body $body -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -TimeoutSec 10 } catch {}
     try { Wait-Process -Id $rxJob.Id -Timeout 20 -ErrorAction SilentlyContinue } catch {}
   }
   # 只停自己启动的两个进程，且校验映像名（铁律 2）
@@ -138,7 +148,9 @@ if ((Test-Path $mk) -and (Test-Path $dc) -and (Test-Path (Join-Path $B 'rtanet_r
   }
   $cmpOut = ''
   if (Test-Path $recvW) { $cmpOut = (& (Join-Path $B 'wavcmp.exe') $refW $recvW --prefix 2>&1 | Out-String); $cmpExit = $LASTEXITCODE } else { $cmpExit = 1 }
-  Step 'DirectSDM e2e (NAA -> file)' ($ready -and ($cmpExit -eq 0)) ((($cmpOut -split ([char]10)) | Select-String '帧|前缀|不一致') -join ' ').Trim()
+  $dmDetail = ((($cmpOut -split ([char]10)) | Select-String '帧|前缀|不一致|逐位') -join ' ').Trim()
+  if (-not $ready) { $dmDetail = 'rtaweb 未在端口 ' + $dmPort + ' 监听' + $(if ($webP.HasExited) { '（进程已退出）' } else { '' }) }
+  Step 'DirectSDM e2e (NAA -> file)' ($ready -and ($cmpExit -eq 0)) $dmDetail
 } else { Step 'DirectSDM e2e (NAA -> file)' $false 'exe missing' }
 
 
