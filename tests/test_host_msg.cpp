@@ -89,6 +89,22 @@ int main() {
            "合法外链：allowed=true 且 URL 原样传递（不截断、不改写）", m.arg);
     }
 
+    std::printf("=== 5) 261024-04 #1：窗口边缘 resize 协议 ===\n");
+    {
+        const char* const dirs[] = {"left", "right", "top", "bottom",
+                                    "topleft", "topright", "bottomleft", "bottomright"};
+        for (const char* d : dirs) {
+            const auto m = parse_host_message(std::string("resize:") + d);
+            ck(m.action == HostAction::Resize && m.arg == d, "resize:<方向> → Resize 且 arg 原样",
+               std::string("dir=") + d + " arg=" + m.arg);
+        }
+        // 拼错/越界/注入一律不动作（不留后门）
+        for (const char* bad : {"resize:", "resize:LEFT", "resize:left;rm", "resize:center", "resize:left "}) {
+            const auto m = parse_host_message(bad);
+            ck(m.action == HostAction::None, "非法 resize → None（不接受）", std::string(bad) + " " + m.reason);
+        }
+    }
+
     std::printf("\n%s（%d 项失败）\n", g_fail == 0 ? "host_msg 全部通过" : "host_msg 有失败", g_fail);
     return g_fail == 0 ? 0 : 1;
 }

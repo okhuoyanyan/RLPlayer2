@@ -2028,3 +2028,16 @@ DSD 源的 Integrator（IIR/FIR/CIC）与 Conversion（wide/narrow/XFi）、Dire
 - **N300 欠载（debug/20261024-01）**：C1 删除独占缓冲无条件 20ms 封顶 + L1 放大预检 + L2 起播看门狗（0.8s 零写入）+ 学习缓存 + RTA_BUF_RESPECT 回滚；C2 STAT 增 per/bf/dry/dryms/ev/evint/prod、新增 PLAYBUF/WFAIL；C3 端点消失报 DEVICE_LOST（不回退共享/不重播）；C4 test_buffer_policy(49) + test_render_loop_dry(45)。⚠️ 仅 mock，未真机复测。
 - **门禁**：build 0 error / ctest **63/63** / bordercheck 45（1.3.14 复核 33 PASS + 1 项防火墙提示窗干扰）/ lyr_dpr 17+22 / peqcheck 22 / t25check 73/77（4 项为既有夹具，1.3.13 基线同样失败）。
 - **发布**：dist/RLPlayer-1.3.14-win64.zip（389,417,671 B，sha256 08B42B8924B49E3AC280B29729AFB1ABA4F5F8F0FB79000005DAA7FB9BD5F35C）；程序版本资源 1.0.4.0 → 1.3.14.0。
+
+## 第三十六轮（2026-10-24）1.3.15 —— 261024-04 全部 8 条
+
+- **#1 边缘拉伸（1.3.14 回归）**：真因 = 满幅后 WebView2 的 3 个子窗口**属于别的进程**（跨进程无法 subclass），鼠标全落在它们身上返回 HTCLIENT，父窗口 WM_NCHITTEST 正确返回 HTLEFT 但收不到。修法 = 页面 8 条 5px 热区 + document 捕获判定 → postMessage('resize:<dir>') → 宿主接管鼠标跟手 SetWindowPos（8 方向/最小尺寸/最大化先还原）；协议进 host_msg.h 并有单测。实测拖左 −60px：(120,60 1340x880)→(60,60 1400x880)。
+- **#2** 「切到 bit-perfect 直通」挪到「输出后端」右侧同一行（中心 y 差 −1px，间距 10px）。
+- **#3** PEQ 旁路：默认 bypass=0（生效）；文案「旁路（勾选 = PEQ 不生效，直通）」+ 常驻状态行（已旁路 / 生效·全 0 dB / 生效·有非 0 dB 段）。
+- **#4** 专辑页：`.sec-card` 此前无 CSS（正文 0px 贴边）→ padding 14/18 + margin，正文距卡片 19px；检索 Step1 与 Step2+3 并行（关键路径 max(knowledge, search+fetch)），摘要第二次 0 次 LLM、≤300ms（test_metacache）。
+- **#5** 艺术家页：先渲染基础页，只有资料区块显示「正在获取资料…」；「权威」全清；切走回来 knowledge 1→1；后台整理不中断。
+- **#6** 单曲页「艺术家」与艺术家页同为 kind=person 实体 ⟹ 共用缓存（第二次 chat/search/fetch 计数不变）；kind=track 是另一个实体（设计如此）。
+- **#7** AI 自动整理：单曲页 4ms 自动请求；专辑页 60ms 自动请求 release + 并发≤2 后台预取全部曲目（顶部细进度条）；同实体只一次；未开启时 0 请求。
+- **#8 GPU 徽标**：真因 = ps.gpu 从不按曲复位（只有 DirectSDM 分支复位）⟹ 一首走过 GPU 后所有曲目都亮；拆成 gpu/gpuUsed/gpuResample/gpuConv（事实源 src/meta/statusflags.h），每曲 PLAY 复位；UI 只在 gpuUsed 时亮，信号链按实测字段标绿 + 新增 EQ/卷积节点。
+- **门禁**：build 0 err / ctest **65/65**（新增 test_metacache、test_playback_gpu）/ resize E2E / UI CDP 61/61。
+- **发布**：dist/RLPlayer-1.3.15-win64.zip；版本资源 1.3.15.0。

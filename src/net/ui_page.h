@@ -106,6 +106,23 @@ inline std::string rta_ui_page() {
     h += ".wbtn:hover{background:var(--hov);color:var(--txt)}";
     h += ".wbtn.close:hover{background:#e81123;color:#fff}";
     h += ".wbtn svg{width:12px;height:12px}";
+    // ---------- 261024-04 #1：窗口边缘拉伸热区（页面发起 resize） ----------
+    // 背景：WebView2 的 3 个子窗口属于别的进程，宿主无法 subclass，鼠标事件全被它们吃掉 ⟹
+    // 原生的边缘 hit-test 收不到鼠标。改成「页面发起 resize」：页面在最外 5px 铺 8 条不可见热区，
+    // mousedown 时 postMessage('resize:<方向>')，宿主（launcher.cpp）据此走 WM_NCLBUTTONDOWN。
+    // 这里只负责**光标形状**与命中区域；真正的判定在 ui_script 的 document 捕获阶段按坐标做
+    //（这样 CDP 的合成 mousedown 派给 document 也能触发，与真实鼠标行为一致）。
+    // z-index 取最大：必须盖在弹层 / 单曲页 / 设置页之上，否则在那些页面上又拖不动窗口。
+    h += "html.webview2 #rzHot{position:fixed;inset:0;z-index:2147483000;pointer-events:none}";
+    h += "html.webview2 #rzHot i{position:fixed;display:block;pointer-events:auto;background:transparent}";
+    h += "html.webview2 #rzHot .rz-l{left:0;top:0;bottom:0;width:5px;cursor:ew-resize}";
+    h += "html.webview2 #rzHot .rz-r{right:0;top:0;bottom:0;width:5px;cursor:ew-resize}";
+    h += "html.webview2 #rzHot .rz-t{left:0;right:0;top:0;height:5px;cursor:ns-resize}";
+    h += "html.webview2 #rzHot .rz-b{left:0;right:0;bottom:0;height:5px;cursor:ns-resize}";
+    h += "html.webview2 #rzHot .rz-tl{left:0;top:0;width:10px;height:10px;cursor:nwse-resize}";
+    h += "html.webview2 #rzHot .rz-tr{right:0;top:0;width:10px;height:10px;cursor:nesw-resize}";
+    h += "html.webview2 #rzHot .rz-bl{left:0;bottom:0;width:10px;height:10px;cursor:nesw-resize}";
+    h += "html.webview2 #rzHot .rz-br{right:0;bottom:0;width:10px;height:10px;cursor:nwse-resize}";
     h += ".logo{width:27px;height:27px;border-radius:8px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:grid;place-items:center;font-weight:800;font-size:13px;color:#fff;box-shadow:0 2px 14px var(--acc-weak);flex:none}";
     h += ".ttl{font-weight:650;letter-spacing:.2px;flex:none}.ttl small{display:block;font-size:9px;font-weight:500;color:var(--mut2);letter-spacing:1.3px;margin-top:-3px}";
     h += ".search{flex:1;max-width:460px;margin-left:14px;position:relative}";
@@ -163,6 +180,19 @@ inline std::string rta_ui_page() {
         h += ".ahead .sub{font-size:12.5px;color:var(--mut);margin-bottom:13px}";
     h += ".bio-box{font-size:13px;line-height:1.75;color:var(--txt2);white-space:pre-wrap;word-break:break-word}";
     h += ".bio-box.collapsed{max-height:140px;overflow:hidden;-webkit-mask-image:linear-gradient(180deg,#000 65%,transparent)}";
+    // 261024-04 #4b：资料块（AI 整理 / 简介 / 风格 / 来源）原来**没有任何 CSS**（.sec-card 只在标记里出现），
+    // 于是专辑页的正文左边界几乎贴到卡片边（实测 0px）。这里补齐卡片外观 + 与设置页 .sgbody 同量级的内边距
+    // （设置页卡片 = .sgroup 边框 + .sgbody padding 14px 16px）。左内边距取 18px，判据要求 ≥16px。
+    h += ".sec-card{padding:14px 18px;border:1px solid var(--line);border-radius:12px;background:var(--bg2);min-width:0}";
+    h += ".sec-card .sec-title{font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:8px}";
+    // 资料整理失败：只留一行「可点击重试」，绝不 toast（261024-04 #7）
+    h += ".summ-retry{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--mut);cursor:pointer;padding:3px 0}";
+    h += ".summ-retry:hover{color:var(--acc-text)}";
+    // 专辑页顶部「后台整理曲目资料」的细进度条（不打扰：2px 线 + 一行小字，完成后自己消失）
+    h += ".albprog{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:10px;padding:6px 22px;background:var(--bg);border-bottom:1px solid var(--line)}";
+    h += ".albprog .t{font-size:11px;color:var(--mut2);white-space:nowrap}";
+    h += ".albprog .bar{flex:1;height:2px;border-radius:2px;background:var(--track);overflow:hidden}";
+    h += ".albprog .bar i{display:block;height:100%;width:0;background:var(--acc);transition:width .25s ease}";
     h += ".chip-copy{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;padding:4px 10px;border-radius:6px;background:var(--hov);border:1px solid var(--line);color:var(--txt2);cursor:pointer;transition:.14s;white-space:nowrap}";
     h += ".chip-copy:hover{background:var(--hov2);color:var(--txt)}";
     // 曲目行
@@ -298,6 +328,11 @@ h += "#npPage .npedge{display:none}";
     h += ".castpick-row:hover{border-color:var(--acc);background:var(--hov)}";
     h += ".castpick-row .cpn{font-size:13px;font-weight:600;color:var(--txt)}";
     h += ".castpick-row .cph{font-size:11px;color:var(--mut2)}";
+    // 261024-04 #7：自动加载的一行状态（后台整理中 / 失败可点击重试）
+    h += ".nprailhint{font-size:10.5px;line-height:1.5;color:var(--mut2);padding:3px 2px 0}";
+    h += ".nprailhint .nprailerr{color:var(--warn);cursor:pointer}";
+    h += ".nprailhint .nprailerr:hover{text-decoration:underline}";
+    h += ".nprailhint .nprailbusy{color:var(--mut2)}";
     h += ".npchip .dot{width:5px;height:5px;border-radius:50%;background:currentColor;opacity:.4;flex:none;transition:.2s}";
     h += ".npchip.ok .dot{background:var(--ok);opacity:1}";
     h += ".npchip.busy .dot{animation:npdot 1.1s ease-in-out infinite}";
@@ -526,6 +561,13 @@ h += "#npPage .npedge{display:none}";
     h += ".peqtip.on{opacity:1}";
     h += ".peqlegend{display:flex;gap:14px;flex-wrap:wrap;font-size:10.5px;color:var(--mut2);padding:5px 2px 0}";
     h += ".peqlegend b{color:var(--txt2);font-weight:600}";
+    // 261024-04 #3：PEQ 旁路的语义必须一眼看懂 —— 组标题下常驻一行「PEQ 当前：生效 / 已旁路」。
+    // 生效用正文色（不是绿色：绿色在本项目里已经专指 bit-perfect / GPU），旁路用弱化色。
+    h += ".peqstat{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--txt)}";
+    h += ".peqstat .tag{font-size:10.5px;font-weight:700;letter-spacing:.3px;padding:2px 8px;border-radius:9px;border:1px solid var(--line);background:var(--hov);color:var(--txt2);flex:none}";
+    h += ".peqstat.bypass{color:var(--mut)}";
+    h += ".peqstat.bypass .tag{color:var(--mut2);border-style:dashed}";
+    h += ".peqstat .sub{font-size:11px;color:var(--mut2)}";
 
     // 2026-10-24（用户 261024-01 #5）：「密码框跟其他框样式不一样」的根因 ——
     // 旧选择器只列了 text/number，password 完全没命中任何一条规则 ⟹ 落到浏览器默认样式
@@ -774,7 +816,9 @@ h += "#npPage .npedge{display:none}";
     h += "<div class=npbody id=npBody>";
     h += "<div class=nplyric2 id=npLyric><div class=npline>还没有在播放</div></div>";
     h += "<aside class=nprail id=npRail><div class=nprailcard><div class=nprailcap>AI 整理</div>";
-    h += "<div class=npchipwrap id=npTabs></div></div></aside>";
+    h += "<div class=npchipwrap id=npTabs></div>";
+    // 261024-04 #7：自动加载的状态/失败重试行（正常态 display:none，不打扰版面）
+    h += "<div id=npSummHint class=nprailhint style='display:none'></div></div></aside>";
     h += "</div>";
     // 行3：控制区（整页也要能操作，否则进来就必须退出）
     h += "<div class=npctl2>";

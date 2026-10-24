@@ -32,7 +32,9 @@ var S = {
   view: 'albums', albums: [], album: null, files: [], remote: [],
   q: { items: [], index: 0 }, cur: '', playing: false, paused: false,
   vol: 0, loud: false, lastCur: '', roots: [], scanning: false, dur: 0, pos: 0,
-  volDb: 0, startDb: 0, theme: 'dark', queueHidden: false
+  volDb: 0, startDb: 0, theme: 'dark', queueHidden: false,
+  // 261024-04 #8：GUP 相关的两个运行时状态（gpuOn = 有 GPU；gpuUsed = 本次播放真的用了 GPU）
+  gpuOn: false, gpuUsed: false
 };
 // 高级参数（设置页里改，params() 统一带上）。默认值与后端一致。
 var ADV = {
@@ -222,6 +224,61 @@ Array.prototype.forEach.call(document.querySelectorAll('.sw'), function (e) {
   if (D('wMin')) D('wMin').onclick = function () { wcmd('min'); };
   if (D('wMax')) D('wMax').onclick = function () { wcmd('max'); };
   if (D('wClose')) D('wClose').onclick = function () { wcmd('close'); };
+})();
+
+/* ---------------- 261024-04 #1：窗口边缘拉伸（页面发起 resize） ----------------
+   为什么是页面发起：WebView2 的 3 个子窗口属于别的进程，宿主无法 subclass，鼠标事件全被它们吃掉，
+   原生边缘 hit-test 收不到鼠标（10 轮都没修好）。所以改成：页面在窗口最外 5px 铺 8 条不可见热区，
+   mousedown（左键）时 postMessage('resize:<方向>')，宿主走 WM_NCLBUTTONDOWN / HTLEFT 等。
+   消息格式必须**逐字**一致（launcher.cpp 按前缀匹配）：
+     resize:left | resize:right | resize:top | resize:bottom |
+     resize:topleft | resize:topright | resize:bottomleft | resize:bottomright
+   实现要点：
+     ① 8 条 <i> 只负责光标形状与命中区域，判定统一在 document 的**捕获阶段**按坐标做——
+        这样 CDP 里 dispatchEvent(new MouseEvent('mousedown',{clientX,clientY,bubbles:true}))（派给
+        document，不经过元素命中）也能触发，与真实鼠标一致；
+     ② 只在 html.webview2 下创建（浏览器直开时没有 chrome.webview，也不该有窗口边缘）；
+     ③ 角落 10x10 优先于边（四条边各 5px），区域永远只在最外 5px ⟹ 顶栏按钮/单曲页控件不受影响；
+     ④ stopPropagation：否则顶栏的拖拽处理（bindWindowChrome 的 'drag'）会跟着发一条，宿主会收到两条命令。 */
+var RZ_EDGES = [
+  ['topleft', 'rz-tl'], ['topright', 'rz-tr'], ['bottomleft', 'rz-bl'], ['bottomright', 'rz-br'],
+  ['left', 'rz-l'], ['right', 'rz-r'], ['top', 'rz-t'], ['bottom', 'rz-b']
+];
+function rzDirAt(x, y) {
+  var W = window.innerWidth || document.documentElement.clientWidth || 0;
+  var H = window.innerHeight || document.documentElement.clientHeight || 0;
+  if (!W || !H) return '';
+  var E = 5, C = 10;                       // 边 5px、角落 10x10
+  var CL = x <= C, CR = x >= W - C, CT = y <= C, CB = y >= H - C;
+  if (CT && CL) return 'topleft';
+  if (CT && CR) return 'topright';
+  if (CB && CL) return 'bottomleft';
+  if (CB && CR) return 'bottomright';
+  if (x <= E) return 'left';
+  if (x >= W - E) return 'right';
+  if (y <= E) return 'top';
+  if (y >= H - E) return 'bottom';
+  return '';
+}
+(function bindResizeHotspots() {
+  if (!WV) return;
+  var box = document.createElement('div');
+  box.id = 'rzHot';
+  RZ_EDGES.forEach(function (d) {
+    var i = document.createElement('i');
+    i.className = d[1];
+    i.setAttribute('data-rz', d[0]);
+    box.appendChild(i);
+  });
+  document.body.appendChild(box);
+  document.addEventListener('mousedown', function (e) {
+    if (!e || (e.button !== 0 && e.button !== undefined && e.button !== null)) return;
+    var d = rzDirAt(e.clientX, e.clientY);
+    if (!d) return;
+    wcmd('resize:' + d);      // ← 逐字格式，宿主按 'resize:' 前缀 + 方向解析
+    e.preventDefault();       // 热区内不做拖拽 / 文本选择
+    e.stopPropagation();      // 别让顶栏再发一条 'drag'
+  }, true);
 })();
 
 function fmtTag(sr, bits) {
@@ -525,6 +582,39 @@ function fetchSummary(url, onDone, tries) {
   }).catch(function (e) { onDone({ ok: false, error: String(e) }); });
 }
 
+/* ---------------- 261024-04 #7：summary 的页面级缓存 + 单飞去重 ----------------
+   用户原话：「只要打开了 AI 整理，进入页面就自动加载整理，不再需要点击」。
+   要做到"自动"又不烧钱，必须保证**同一实体在页面生命周期内只请求一次**：
+     * 同一 URL（kind + name + artist + lang）命中缓存 → 直接回调（异步回调，避免调用方在同步栈里重入）；
+     * 正在飞行 → 挂到同一批回调上（不重复发请求）；
+     * 成功/失败都缓存（失败不弹错，由调用方决定是否留一行"点击重试"）；
+     * refresh=true 绕过缓存重新请求（用户明确点"重试/刷新"时才用）。 */
+var SUMC = { cache: {}, inflight: {} };
+function summHas(s) {
+  return !!(s && ((s.fields && Object.keys(s.fields).length > 0) ||
+                  (s.ok && s.sections && s.sections.length > 0)));
+}
+function summaryCached(url) {
+  return Object.prototype.hasOwnProperty.call(SUMC.cache, url) ? SUMC.cache[url] : null;
+}
+function summaryOnce(url, cb, refresh) {
+  cb = cb || function () { };
+  if (refresh) delete SUMC.cache[url];
+  else if (Object.prototype.hasOwnProperty.call(SUMC.cache, url)) {
+    var hit = SUMC.cache[url];
+    setTimeout(function () { cb(hit); }, 0);
+    return;
+  }
+  var q = SUMC.inflight[url];
+  if (q) { q.push(cb); return; }
+  q = SUMC.inflight[url] = [cb];
+  fetchSummary(url, function (s) {
+    delete SUMC.inflight[url];
+    SUMC.cache[url] = s;
+    for (var i = 0; i < q.length; ++i) { try { q[i](s); } catch (e) { } }
+  });
+}
+
 // 261024-02 #2：引用 chip 拆成两个动作 —— 点 chip 本体 = 用系统浏览器打开；点右侧「复制」= 复制链接。
 function citationChipHtml(url, label, small) {
   var fs = small ? 'font-size:10.5px;padding:1px 7px' : 'font-size:11px;padding:2px 8px';
@@ -590,7 +680,10 @@ function openAlbum(k) {
     // 排在曲目之前，1024 下用户一首歌都看不到。现在先曲目、后简介。
     // 261024-02 #3：这张表就是**本地曲库的曲目列表**（行数 = 本地曲目数、逐行「曲名 + 时长」），
     // 加一行表头把"几首 / 总时长"讲清楚，避免和 AI 资料里的「时长」打架。
-    h += '<div style="padding:4px 0 24px">';
+    // 261024-04 #7：专辑页顶部的「后台整理曲目资料」细进度条（不打扰；没开 AI 整理时是空 div）
+    h += '<div id=albProgWrap></div>';
+    // 261024-04 #4b：曲目列表左右各 22px，与 .ahead 对齐（以前 0 ⟹ 表头「曲目列表」贴着卡片左边）
+    h += '<div style="padding:4px 22px 24px">';
     h += '<div class="trlist-head"><span class=lb>曲目列表</span><span class=sp></span>' +
          '<span class=sum>' + j.tracks.length + ' 首 · 总时长 ' + fmtDurLong(localTotal) + '</span></div>';
     j.tracks.forEach(function (t, i) {
@@ -604,12 +697,13 @@ function openAlbum(k) {
            '</div>';
     });
     h += '</div>';
-    // 简介放在曲目之后（评审 #2）；加载态只一行灰字，无 key 又无缓存时先隐藏
+    // 简介放在曲目之后（评审 #2）。
+    // 261024-04 #4b：资料块左右各 22px（与 .ahead 对齐），正文内边距由 .sec-card（18px）提供。
+    // 261024-04 #7：打开 AI 整理后**进入即自动加载**，不再需要点任何按钮。
     if (META.summary == 1) {
-      var albumSummLoading = (META.hasLlmKey === true);
       h += '<div class="sec-card summary-sec" id="albumSummary" data-k="' + esc(j.k) + '"' +
-           ' style="margin:8px 0 24px' + (albumSummLoading ? '' : ';display:none') + '">' +
-           (albumSummLoading ? '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>' : '') +
+           ' style="margin:8px 22px 24px">' +
+           '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>' +
            '</div>';
     }
     D('list').innerHTML = h;
@@ -617,22 +711,31 @@ function openAlbum(k) {
 
     if (META.summary == 1) {
       var albK = String(j.k);
-      fetchSummary('/api/entity/summary?kind=release&name=' + encodeURIComponent(j.name) +
-          '&artist=' + encodeURIComponent(j.artist || '') + '&lang=zh', function (s) {
-          var el = D('albumSummary');
-          if (!el || el.dataset.k !== albK) return;   // 异步回来时已切到别的专辑 → 丢弃
-          // 261024-01 #4：后端现在回结构化 fields（可能没有 sections）⟹ 判据用"能渲染出东西"
-          // #3：本地曲库是时长的唯一真相源；AI 的「时长」「曲目列表」一律不采信
-          var albOpts = { local: { '时长': fmtDurLong(localTotal) }, drop: { '曲目列表': 1 } };
-          var albHtml = s ? renderSummaryContent(s, 'AI 整理', 'release', albOpts) : '';
-          if (albHtml) {
-            el.style.display = '';
-            el.innerHTML = albHtml;
-            bindCopyChips(el);
-          } else {
-            el.remove();   // 无资料/无 key 又无缓存 → 干脆不显示
-          }
-        });
+      // 261024-01 #4：后端现在回结构化 fields（可能没有 sections）⟹ 判据用"能渲染出东西"
+      // #3：本地曲库是时长的唯一真相源；AI 的「时长」「曲目列表」一律不采信
+      var albOpts = { local: { '时长': fmtDurLong(localTotal) }, drop: { '曲目列表': 1 } };
+      var albUrl = '/api/entity/summary?kind=release&name=' + encodeURIComponent(j.name) +
+                   '&artist=' + encodeURIComponent(j.artist || '') + '&lang=zh';
+      var renderAlbumSummary = function (s) {
+        var el = D('albumSummary');
+        if (!el || el.dataset.k !== albK) return;   // 异步回来时已切到别的专辑 → 丢弃
+        var albHtml = summHas(s) ? renderSummaryContent(s, 'AI 整理', 'release', albOpts) : '';
+        if (albHtml) {
+          el.innerHTML = albHtml;
+          bindCopyChips(el);
+        } else if (s && (s.error || s.pending)) {
+          // 261024-04 #7：失败不弹错，只留一行可点击重试
+          el.innerHTML = '<div class="summ-retry" id=albumSummRetry role=button tabindex=0>' +
+                         '资料整理失败（' + esc(s.error || '超时') + '）· 点击重试</div>';
+          var rb = D('albumSummRetry');
+          if (rb) rb.onclick = function () { summaryOnce(albUrl, renderAlbumSummary, true); };
+        } else {
+          el.remove();   // 无资料 / 无 key 又无缓存 → 干脆不显示
+        }
+      };
+      summaryOnce(albUrl, renderAlbumSummary);
+      // 261024-04 #7：整张专辑 = 专辑本身（上面）+ 每首曲目（后台，并发 ≤2）
+      albumTrackPrefetch(j);
     }
 
     D('aPlay').onclick = function () { playAlbum(j.k, 0); };
@@ -651,6 +754,64 @@ function openAlbum(k) {
       };
     });
   });
+}
+
+/* ---------------- 261024-04 #7：专辑页后台整理（曲目级 summary 预取） ----------------
+   规则（用户原话）：「只要打开了 AI 整理……如果是一整张专辑，则自动整理整个专辑」。
+     * 进入专辑页立即自动整理：专辑本身（release，见 openAlbum）+ **专辑内每一首**（track）；
+     * 曲目级是纯后台：并发 ≤2、不阻塞渲染、不弹错；顶部一条 2px 细进度条 + 一行小字，完成即消失；
+     * 同一实体只请求一次（summaryOnce 的缓存 + 单飞）；同一张专辑只排一次队；
+     * 失败也计入进度（不是一直转），不留错误提示（曲目级本来就没人盯着看）。 */
+var ALBPREF = { key: '', total: 0, done: 0, active: 0, queue: [], timer: 0 };
+function albPrefKey(a) { return String((a && a.k) || '') + '|' + String((a && a.name) || ''); }
+// 曲目级 URL 的拼法与单曲页抽屉（npDataEnsure）保持一致，才能命中同一份缓存
+function albumTrackUrl(t, alb) {
+  var ar = (t && t.artist) || (alb && alb.artist) || '';
+  return '/api/entity/summary?kind=track&name=' + encodeURIComponent((t && t.title) || '') +
+         (ar ? ('&artist=' + encodeURIComponent(ar)) : '') + '&lang=zh';
+}
+function albPrefRender() {
+  var box = D('albProgWrap');
+  if (!box) return;
+  if (!ALBPREF.total) { box.innerHTML = ''; return; }
+  var pct = ALBPREF.total ? Math.round(ALBPREF.done / ALBPREF.total * 100) : 0;
+  var txt = (ALBPREF.done >= ALBPREF.total)
+    ? ('曲目资料已后台整理 ' + ALBPREF.total + ' 首')
+    : ('正在后台整理曲目资料 ' + ALBPREF.done + ' / ' + ALBPREF.total);
+  box.innerHTML = '<div class="albprog"><span class=t>' + esc(txt) + '</span>' +
+                  '<span class=bar><i style="width:' + pct + '%"></i></span></div>';
+}
+function albPrefPump() {
+  while (ALBPREF.active < 2 && ALBPREF.queue.length) {
+    var it = ALBPREF.queue.shift();
+    ALBPREF.active++;
+    summaryOnce(it.url, function () {
+      ALBPREF.active--;
+      ALBPREF.done++;
+      albPrefRender();
+      if (ALBPREF.done >= ALBPREF.total) {
+        clearTimeout(ALBPREF.timer);
+        ALBPREF.timer = setTimeout(function () {
+          var b = D('albProgWrap');
+          if (b && ALBPREF.done >= ALBPREF.total) b.innerHTML = '';
+        }, 2600);
+      }
+      albPrefPump();
+    });
+  }
+}
+function albumTrackPrefetch(alb) {
+  if (META.summary != 1) return;
+  if (META.hasLlmKey !== true && META.summaryEnabled !== true) return;
+  var key = albPrefKey(alb);
+  if (ALBPREF.key === key) return;      // 同一张专辑只排一次
+  var tracks = (alb && alb.tracks) || [];
+  var q = [];
+  tracks.forEach(function (t) { if (t && t.title) q.push({ url: albumTrackUrl(t, alb) }); });
+  if (!q.length) return;
+  ALBPREF = { key: key, total: q.length, done: 0, active: 0, queue: q, timer: 0 };
+  albPrefRender();
+  albPrefPump();
 }
 
 function playAlbum(k, i) {
@@ -719,51 +880,139 @@ function renderAlbumSubset(who) {
   });
 }
 
-/* ---------------- 艺术家资料页（P3④a/④b） ---------------- */
+/* ---------------- 艺术家资料页（P3④a/④b） ----------------
+   261024-04 #5：以前 openArtistProfile 先把整页写成「正在获取权威资料…」，等 /api/entity/knowledge
+   回来才渲染 ⟹ 慢网下整页空白好几秒。现在：
+     ① **立刻**渲染基础页（名字 + 返回按钮 + 头像 + 资料区块），「正在获取资料…」只出现在**资料区块**里；
+     ② 资料回来后只重绘这几块；③ 切走再回来：同 who 的请求 in-flight ⟹ 挂回调复用，
+        已有结果 ⟹ 直接渲染，绝不重复请求（费用纪律）。 */
+var ARTIST_KNOW = {};    // who -> { state: 'loading'|'done', res, waiters: [] }
+function artistCoverKey(who) {
+  if (!(S.albums && S.albums.length)) return '';
+  for (var i = 0; i < S.albums.length; i++) {
+    if ((S.albums[i].artist || '') === who && S.albums[i].cv) return S.albums[i].k;
+  }
+  return '';
+}
+function artistHeroHtml(who, subText) {
+  var cvKey = artistCoverKey(who);
+  var cvStyle = cvKey ? ("background-image:url('/api/lib/cover?k=" + cvKey + "')") : '';
+  return '<div class="ahead artist-head">' +
+       '<div class=cv style="border-radius:50%;' + cvStyle + '">' +
+       (cvKey ? '' : '<div class=ph style="border-radius:50%">' + esc(String(who).slice(0, 1).toUpperCase()) + '</div>') +
+       '</div>' +
+       '<div class=info>' +
+       '<div class=kind>ARTIST · 艺术家资料</div>' +
+       '<h1>' + esc(who) + '</h1>' +
+       '<div class=sub>' + esc(subText || '') + '</div>' +
+       '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">' +
+       '<button class=btn id=bArtistAlbums>查看专辑</button> ' +
+       '<button class=btn id=bArtistRefresh>刷新资料</button> ' +
+       '<button class=btn id=bBackArtists>返回列表</button>' +
+       '</div></div></div>';
+}
+// 基础页（骨架）：hero + 资料区块。「正在获取资料…」**只出现在资料区块里**
+//（用户 261024-04 #5 的要求），hero 与返回按钮立刻可点、副标题留空不占位。
+function artistBaseHtml(who) {
+  var h = artistHeroHtml(who, '');
+  h += '<div class=artist-body style="padding:0 22px 30px">';
+  if (META.summary == 1) {
+    h += '<div class="sec-card summary-sec" id=artistSummary style="margin-bottom:20px">' +
+         '<div style="font-size:12px;color:var(--mut2)">正在获取资料…</div></div>';
+  }
+  h += '<div class="sec-card" id=artistKnowCard style="margin-bottom:24px">' +
+       '<div style="font-size:12.5px;color:var(--mut)">正在获取资料…</div></div>';
+  h += '</div>';
+  return h;
+}
+function bindArtistButtons(who) {
+  if (D('bArtistAlbums')) {
+    D('bArtistAlbums').onclick = function () {
+      api('/api/lib/albums').then(function (jj) {
+        S.albums = (jj.albums || []).filter(function (a) { return (a.artist || '未知艺术家') === who; });
+        renderAlbumSubset(who);
+      });
+    };
+  }
+  if (D('bArtistRefresh')) D('bArtistRefresh').onclick = function () { openArtistProfile(who, true); };
+  if (D('bBackArtists')) D('bBackArtists').onclick = function () { loadArtists(); };
+  if (D('bRetryKnowledge')) D('bRetryKnowledge').onclick = function () { openArtistProfile(who, true); };
+  if (D('bBioToggle')) {
+    D('bBioToggle').onclick = function () {
+      var box = D('bioBox');
+      if (!box) return;
+      var isCol = box.classList.toggle('collapsed');
+      this.textContent = isCol ? '展开全部' : '收起简介';
+    };
+  }
+}
 function openArtistProfile(who, refresh) {
   S.view = 'artist';
   setView('artists');
   S.view = 'artist';
   S.artistWho = who;
-  head(who, '正在获取权威资料…', '<button class=btn id=bBackArtistsTop>返回艺术家列表</button>');
+  head(who, '', '<button class=btn id=bBackArtistsTop>返回艺术家列表</button>');
   if (D('bBackArtistsTop')) D('bBackArtistsTop').onclick = function () { loadArtists(); };
-  D('list').innerHTML = '<div class=empty style="padding:60px 0">正在获取权威资料…</div>';
+  // ① 立刻出基础页（绝不整页空白等接口；加载文案只进资料区块）
+  D('list').innerHTML = artistBaseHtml(who);
+  bindArtistButtons(who);
 
-  var uKnow = '/api/entity/knowledge?kind=person&name=' + encodeURIComponent(who) + (refresh ? '&refresh=1' : '');
-  var uSumm = '/api/entity/summary?kind=person&name=' + encodeURIComponent(who) + '&lang=zh' + (refresh ? '&refresh=1' : '');
-
-  // 2026-10-23（用户 261023-03 #2/#3）：权威资料与简介并行请求，谁先到都不丢；
-  // 简介板块在 renderArtistProfile 里先渲染「正在整理资料…」（仅配了 key 时），回来再填。
   var wantSumm = (META.summary == 1);
-  var summState = { done: false, res: null, enabled: wantSumm };
+  var summState = { done: false, res: null, enabled: wantSumm, skipBio: false };
+  var uSumm = '/api/entity/summary?kind=person&name=' + encodeURIComponent(who) + '&lang=zh' +
+              (refresh ? '&refresh=1' : '');
+  var onSumm = function (s) {
+    summState.done = true; summState.res = s;
+    applyArtistSummary();
+  };
   function applyArtistSummary() {
     if (!wantSumm) return;
     if (S.view !== 'artist' || S.artistWho !== who) return;    // 已切走 → 丢弃
     var el = D('artistSummary');
-    if (!el) return;
-    if (!summState.done) return;
+    if (!el || !summState.done) return;
     var ss = summState.res;
     // 261024-01 #4：AI 资料优先按后端结构化 fields 渲染成标签值网格；旧缓存只有 sections 也能显示。
-    var hasBody = ss && ((ss.fields && Object.keys(ss.fields).length > 0) ||
-                         (ss.ok && ss.sections && ss.sections.length > 0));
-    if (hasBody) {
+    if (summHas(ss)) {
       el.style.display = '';
       el.innerHTML = renderSummaryContent(ss, 'AI 整理', 'person', { skip: (summState.skipBio ? { '简介': 1 } : {}) });
       bindCopyChips(el);
+    } else if (ss && (ss.error || ss.pending)) {
+      // 261024-04 #7：失败不弹错，只留一行可点击重试
+      el.style.display = '';
+      el.innerHTML = '<div class="summ-retry" id=artistSummRetry role=button tabindex=0>' +
+                     '资料整理失败（' + esc(ss.error || '超时') + '）· 点击重试</div>';
+      var rb = D('artistSummRetry');
+      if (rb) rb.onclick = function () { summaryOnce(uSumm, onSumm, true); };
     } else {
-      el.remove();   // 无资料/失败/无 key 又无缓存 → 不留空白板块
+      el.remove();   // 无资料 / 无 key 又无缓存 → 不留空白板块
     }
   }
-
-  api(uKnow).catch(function (err) { return { ok: false, error: String(err), materials: [] }; }).then(function (res) {
+  function paintKnow(res) {
+    if (S.view !== 'artist' || S.artistWho !== who) return;
     renderArtistProfile(who, res, summState);
     applyArtistSummary();
-  });
-  if (wantSumm) {
-    fetchSummary(uSumm, function (s) {
-      summState.done = true; summState.res = s; applyArtistSummary();
-    });
+    bindArtistButtons(who);
   }
+
+  // ② 知识/资料：同 who 的在飞请求复用，已有结果直接渲染（不重复请求）
+  var kc = ARTIST_KNOW[who];
+  if (!refresh && kc && kc.state === 'done') {
+    paintKnow(kc.res);
+  } else if (!refresh && kc && kc.state === 'loading') {
+    kc.waiters.push(paintKnow);
+  } else {
+    var rec = ARTIST_KNOW[who] = { state: 'loading', res: null, waiters: [paintKnow] };
+    var uKnow = '/api/entity/knowledge?kind=person&name=' + encodeURIComponent(who) + (refresh ? '&refresh=1' : '');
+    api(uKnow).catch(function (err) { return { ok: false, error: String(err), materials: [] }; })
+      .then(function (res) {
+        rec.state = 'done'; rec.res = res;
+        var ws = rec.waiters; rec.waiters = [];
+        ws.forEach(function (f) { try { f(res); } catch (e) { } });
+      });
+  }
+
+  // ③ 简介（AI 整理）：与知识并行，谁先到都不丢；summaryOnce 保证同一实体只请求一次
+  if (wantSumm) summaryOnce(uSumm, onSumm, refresh);
 }
 
 function renderArtistProfile(who, j, summary) {
@@ -771,17 +1020,9 @@ function renderArtistProfile(who, j, summary) {
   setView('artists');
   S.view = 'artist';
 
-  var cvKey = '';
-  if (S.albums && S.albums.length) {
-    for (var i = 0; i < S.albums.length; i++) {
-      if ((S.albums[i].artist || '') === who && S.albums[i].cv) { cvKey = S.albums[i].k; break; }
-    }
-  }
-  var cvStyle = cvKey ? ("background-image:url('/api/lib/cover?k=" + cvKey + "')") : '';
-
   var mats = (j && j.materials) || [];
   var isOk = j && j.ok && mats.length > 0;
-  // 权威材料解析提前到这里：AI 资料网格要知道"简介"是否已由权威词条给出（避免同一页两段简介）。
+  // 资料解析提前到这里：AI 资料网格要知道"简介"是否已由词条给出（避免同一页两段简介）。
   var bioMat = null;
   var stylesMats = [];
   mats.forEach(function (m) {
@@ -796,55 +1037,43 @@ function renderArtistProfile(who, j, summary) {
     if (j.from_cache) {
       subText = '缓存 · ' + (firstDate || '近期') + ' 取回' + (j.offline ? ' · 离线' : '');
     } else {
-      subText = '权威资料' + (firstDate ? (' · ' + firstDate + ' 取回') : '');
+      // 261024-04 #5：去掉「权威」二字（用户要求全文案不再出现「权威资料 / 权威词条」）
+      subText = '资料' + (firstDate ? (' · ' + firstDate + ' 取回') : '');
     }
   }
-  // 261024-01 #3a：无权威资料时**不显示**「权威资料暂缺」这类状态小字 —— 顶部只留名字，
+  // 261024-01 #3a：没有资料时**不显示**「资料暂缺」这类状态小字 —— 顶部只留名字，
   // 下方安静地给 AI 整理资料；没有资料就什么都不显示（用户原话：那句说明"纯粹多余"）。
 
   head(who, subText, '<button class=btn id=bTopBack>返回艺术家列表</button>');
   if (D('bTopBack')) D('bTopBack').onclick = function () { loadArtists(); };
 
   var h = '';
-  // 头像/名称
-  h += '<div class="ahead artist-head">' +
-       '<div class=cv style="border-radius:50%;' + cvStyle + '">' +
-       (cvKey ? '' : '<div class=ph style="border-radius:50%">' + esc(who.slice(0, 1).toUpperCase()) + '</div>') +
-       '</div>' +
-       '<div class=info>' +
-       '<div class=kind>ARTIST · 艺术家资料</div>' +
-       '<h1>' + esc(who) + '</h1>' +
-       '<div class=sub>' + esc(subText) + '</div>' +
-       '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">' +
-       '<button class=btn id=bArtistAlbums>查看专辑</button> ' +
-       '<button class=btn id=bArtistRefresh>刷新资料</button> ' +
-       '<button class=btn id=bBackArtists>返回列表</button>' +
-       '</div></div></div>';
+  // 头像/名称（261024-04 #5：与基础骨架共用同一份 markup，避免两处漂移）
+  h += artistHeroHtml(who, subText);
 
   h += '<div class=artist-body style="padding:0 22px 30px">';
 
   // AI 整理资料（261024-01 #3a/#4）：这是本页**主内容**，紧跟 hero 之后；
-  //   无权威词条时不再有任何"权威词条暂缺 / 维基百科没有匹配条目…"的解释卡（用户：那句纯粹多余）。
+  //   词条资料缺失时不再有任何"资料暂缺 / 维基百科没有匹配条目…"的解释卡（用户：那句纯粹多余）。
   //   结构化 fields → 标签值网格；旧缓存只有 sections → 段落兜底；两者都没有就整卡不渲染。
   var summHtml = '';
   if (META.summary == 1) {
     var sumObj = (summary && summary.enabled && summary.done) ? summary.res : null;
-    var hasSummary = sumObj && ((sumObj.fields && Object.keys(sumObj.fields).length > 0) ||
-                                (sumObj.ok && sumObj.sections && sumObj.sections.length > 0));
+    var hasSummary = summHas(sumObj);
     var sumLoading = (META.hasLlmKey === true && !hasSummary);
-    if (summary) summary.skipBio = !!bioText;   // 权威简介已在下面展示 → AI 网格里不重复「简介」
+    if (summary) summary.skipBio = !!bioText;   // 词条简介已在下面展示 → AI 网格里不重复「简介」
     summHtml = '<div class="sec-card summary-sec" id="artistSummary" style="margin-bottom:20px' + (sumLoading ? '' : ';display:none') + '">';
     if (hasSummary) {
       summHtml += renderSummaryContent(sumObj, 'AI 整理', 'person', { skip: (bioText ? { '简介': 1 } : {}) });
     } else if (sumLoading) {
-      summHtml += '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>';
+      summHtml += '<div style="font-size:12px;color:var(--mut2)">正在获取资料…</div>';
     }
     summHtml += '</div>';
   }
   h += summHtml;
 
   if (!isOk) {
-    // 261024-01 #3a：**删除整个「权威词条暂缺」说明块**。没有权威资料 → 上面 AI 资料安静显示，这里什么都不放。
+    // 261024-01 #3a：**删除整个「资料暂缺」说明块**。没有词条资料 → 上面 AI 资料安静显示，这里什么都不放。
     // 只有"在线整理也没开"这种确实无内容可显示的情况，才给一行极简空态 + 重试（绝不写一大段解释）。
     if (META.summary != 1) {
       h += '<div class="card empty-card" style="padding:22px 20px;text-align:center;background:var(--phbg);border:1px solid var(--line);border-radius:12px;margin-top:14px">' +
@@ -853,11 +1082,11 @@ function renderArtistProfile(who, j, summary) {
            '</div>';
     }
   } else {
-    // 1) 权威简介（L2 原文，长文折叠「展开」）—— 排在 AI 资料之后，是"佐证"而不是主内容
+    // 1) 词条简介（原文，长文折叠「展开」）—— 排在 AI 资料之后，是"佐证"而不是主内容
     var isLong = bioText.length > 280 || (bioText.split('\n').length > 5);
 
     h += '<div class="sec-card bio-sec" style="margin-bottom:24px">' +
-         '<div style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:10px">权威简介</div>' +
+         '<div class="sec-title" style="font-size:12px;font-weight:600;letter-spacing:1px;color:var(--mut2);margin-bottom:10px">简介</div>' +
          '<div class="bio-box ' + (isLong ? 'collapsed' : '') + '" id=bioBox>' +
          esc(bioText || '暂无详细文字介绍') +
          '</div>' +
@@ -881,7 +1110,7 @@ function renderArtistProfile(who, j, summary) {
          '<div style="display:flex;flex-direction:column;gap:8px">';
 
     mats.forEach(function (m) {
-      var srcName = '权威来源';
+      var srcName = '来源';
       if (m.source.indexOf('wikipedia') >= 0) srcName = '维基百科';
       else if (m.source.indexOf('moegirl') >= 0) srcName = '萌娘百科';
       else if (m.source.indexOf('discogs') >= 0) srcName = 'Discogs';
@@ -902,32 +1131,8 @@ function renderArtistProfile(who, j, summary) {
   h += '</div>';
   D('list').innerHTML = h;
 
-  // 绑定事件
-  if (D('bArtistAlbums')) {
-    D('bArtistAlbums').onclick = function () {
-      api('/api/lib/albums').then(function (jj) {
-        S.albums = (jj.albums || []).filter(function (a) { return (a.artist || '未知艺术家') === who; });
-        renderAlbumSubset(who);
-      });
-    };
-  }
-  if (D('bArtistRefresh')) {
-    D('bArtistRefresh').onclick = function () { openArtistProfile(who, true); };
-  }
-  if (D('bBackArtists')) {
-    D('bBackArtists').onclick = function () { loadArtists(); };
-  }
-  if (D('bRetryKnowledge')) {
-    D('bRetryKnowledge').onclick = function () { openArtistProfile(who, true); };
-  }
-  if (D('bBioToggle')) {
-    D('bBioToggle').onclick = function () {
-      var box = D('bioBox');
-      if (!box) return;
-      var isCol = box.classList.toggle('collapsed');
-      this.textContent = isCol ? '展开全部' : '收起简介';
-    };
-  }
+  // 绑定事件（261024-04 #5：与基础骨架共用 bindArtistButtons，两处不再各写一遍）
+  bindArtistButtons(who);
 
   // 复制链接芯片：navigator.clipboard.writeText(url) + toast「已复制来源链接」
   bindCopyChips(D('list'));
@@ -1485,8 +1690,17 @@ function tick() {
       D('nps').textContent = (j.playing ? (j.paused ? '已暂停' : '播放中') : '已停止') +
         (j.outRate ? ' \u00b7 ' + j.outRate + ' Hz / ' + j.outBits + ' bit' : '');
       D('fmt').textContent = j.outRate ? (Math.round(j.outRate / 100) / 10) + 'k/' + j.outBits : '--';
-      D('gpub').style.display = j.gpu ? '' : 'none';
+      // 261024-04 #8：底栏 GPU 徽标只表示「GPU **真的参与**了本次播放」。
+      // 后端新字段 gpuUsed（本次播放 GPU 是否实际参与）；字段还没上线时回退旧的 gpu 字段。
+      // 选择"不参与就不亮"而不是"显示灰色 GPU 可用·未参与"：底栏右侧本来就挤，
+      // 常驻一个灰 chip 会把"绿点 = GPU 参与"这个唯一的强信号稀释掉；可用性在设置→高级与信号链里能查到。
+      S.gpuUsed = (typeof j.gpuUsed === 'boolean') ? j.gpuUsed : !!j.gpu;
+      S.gpuOn = !!j.gpu;
+      D('gpub').style.display = S.gpuUsed ? '' : 'none';
+      D('gpub').title = S.gpuUsed ? 'GPU 参与本次播放'
+        : (S.gpuOn ? 'GPU 可用 · 本次未参与（信号链里绿色节点才会亮）' : 'GPU 未参与本次播放');
     } else {
+      S.gpuUsed = false; S.gpuOn = false;
       D('fmt').textContent = '--';
       D('gpub').style.display = 'none';
       if (S.lastCur) { S.lastCur = ''; D('npt').textContent = '未播放'; D('npart').textContent = ''; D('nps').textContent = '选择一个专辑开始'; D('cv').style.backgroundImage = ''; S.npMetaHtml = ''; if (D('npMeta')) D('npMeta').innerHTML = ''; }
@@ -2538,8 +2752,23 @@ function showChain() {
     }());
     nodes.push({ k: '源文件', v: nam(p.src) + (p.codec ? '  \u00b7  ' + p.codec.toUpperCase() : '') });
     nodes.push({ k: '解码', v: (p.note || '原生无损解码') + '  \u00b7  ' + p.inRate + ' Hz / ' + p.inBits + ' bit / ' + p.inCh + ' ch' });
-    if (p.resample) nodes.push({ k: '采样率转换', v: (p.filter || 'Kaiser sinc') + '  \u00b7  ' + p.phase + '  \u00b7  ' + p.taps + ' 抽头' + (p.twoStage ? '  \u00b7  两段式' : '') + '  \u2192  ' + p.outRate + ' Hz', gpu: true });
+    // 261024-04 #8：绿色节点 = 本次**真的**由 GPU 参与计算的那一环。
+    // 旧实现给「采样率转换」无条件加 gpu:true ⟹ 只要开了升频，信号链就永远有一个绿色节点，
+    // 用户看到的"GPU"其实和本次播放是否用 GPU 无关。
+    // 后端字段：/api/signal 的 p.gpuUsed（本次播放 GPU 是否参与）/ p.convGpu（卷积是否走 GPU）。
+    // ⚠️ 未解决项：这两个字段后端还没加进 JSON（现在卷积开关叫 irGpu），所以先用
+    //    p.convGpu ?? p.irGpu 兜底；后端加好后本兜底自动失效（新字段优先），到时候可以删掉兜底。
+    var convGpu = (typeof p.convGpu === 'boolean') ? p.convGpu : (p.irGpu === true);
+    var sigGpuUsed = (typeof p.gpuUsed === 'boolean') ? p.gpuUsed : !!S.gpuUsed;
+    if (p.resample) nodes.push({ k: '采样率转换', v: (p.filter || 'Kaiser sinc') + '  \u00b7  ' + p.phase + '  \u00b7  ' + p.taps + ' 抽头' + (p.twoStage ? '  \u00b7  两段式' : '') + '  \u2192  ' + p.outRate + ' Hz' + (sigGpuUsed ? '  \u00b7  GPU' : ''), gpu: !!sigGpuUsed });
     else nodes.push({ k: '采样率转换', v: '旁路（源采样率与输出一致，逐位直通）' });
+    // 261024-04 #8：EQ / 卷积单独成一环，并且**只有卷积真的走 GPU 时**才标绿（后端 convGpu 字段）
+    if (p.eq || p.conv) {
+      var eqParts = [];
+      if (p.eq) eqParts.push('参数 EQ' + (ADV.eq ? (' ' + nam(ADV.eq)) : ''));
+      if (p.conv) eqParts.push('FIR 卷积' + (ADV.ir ? (' ' + nam(ADV.ir)) : ''));
+      nodes.push({ k: 'EQ / 卷积', v: eqParts.join('  \u00b7  ') + '  \u00b7  ' + (convGpu ? 'GPU 计算' : 'CPU 计算'), gpu: convGpu });
+    }
     if (p.dsd) {
       nodes.push({ k: 'DSD 调制', v: 'DSD' + p.dsd + '（' + (p.dsdRate / 1000000).toFixed(4) + ' MHz）\u00b7 1-bit \u00b7 ' + (p.modOrder || 5) + ' 阶 SDM' });
       nodes.push({ k: 'DoP 封装', v: '24-bit 载波 ' + p.outRate + ' Hz \u00b7 标记 0x05/0xFA 交替' });
@@ -2595,7 +2824,7 @@ function showChain() {
       if (i !== nodes.length - 1) h += '<div class=cline></div>';
     });
     h += '</div>';
-    h += '<div style="margin-top:14px;font-size:11px;color:#5b6478;line-height:1.7">绿色节点表示由 GPU 参与计算。<br>只要每一环都不做多余处理，输出就是逐位（bit-perfect）的。</div>';
+    h += '<div style="margin-top:14px;font-size:11px;color:#5b6478;line-height:1.7">绿色节点表示该环节本次由 GPU 实际参与计算（没参与就不标绿）。<br>只要每一环都不做多余处理，输出就是逐位（bit-perfect）的。</div>';
     D('mbody').innerHTML = h;
   }).catch(function () { D('mbody').innerHTML = '<div class=empty>读取失败</div>'; });
 }
@@ -3492,14 +3721,23 @@ function renderSettingsPage() {
   // ---------- 输出 ----------
   h += '<div class="spane" data-g=out>'
      + sgroup('输出后端', '独占 = bit-perfect；共享 = 兼容性最好（虚拟机 / 远程桌面）',
-         sel('sp_backend', '后端',
-             opt('wasapi', 'WASAPI（独占 · 事件驱动）', BK) +
-             opt('wasapi-shared', 'WASAPI 共享（兼容虚拟机 / 远程桌面）', BK) +
-             opt('asio', 'ASIO', BK) +
-             opt('naa', 'NetworkAudioAdapter（NAA / RTANet）', BK) +
-            opt('upnp', 'UPnP / DLNA 投放（局域网渲染器）', BK) +
-            opt('null', 'Null output（只跑 DSP，不出声）', BK),
-             '选到当前不可用的后端时，播放会直接返回原因，不会假装出声')
+         // 261024-04 #2：用户要求「放在后端那个选项的右边」—— bit-perfect 直通按钮从独立一行挪进
+         // 「后端」下拉的同一行（flex 行，底对齐；下拉可缩、按钮 nowrap，窄窗也不换行）。
+         // 原来铺在页面上的一长串判据收进按钮的 tooltip，行内只留一个按钮。
+         '<div class="sfld wide" style="display:flex;align-items:flex-end;gap:10px;flex-wrap:nowrap">'
+       + '<div style="flex:1 1 auto;min-width:180px">'
+       + '<label>后端' + tip('选到当前不可用的后端时，播放会直接返回原因，不会假装出声') + '</label>'
+       + '<select id=sp_backend>'
+       +   opt('wasapi', 'WASAPI（独占 · 事件驱动）', BK)
+       +   opt('wasapi-shared', 'WASAPI 共享（兼容虚拟机 / 远程桌面）', BK)
+       +   opt('asio', 'ASIO', BK)
+       +   opt('naa', 'NetworkAudioAdapter（NAA / RTANet）', BK)
+       +   opt('upnp', 'UPnP / DLNA 投放（局域网渲染器）', BK)
+       +   opt('null', 'Null output（只跑 DSP，不出声）', BK)
+       + '</select></div>'
+       + '<button class="btn pri" id=sp_bpfix style="flex:none;white-space:nowrap" ' +
+         'title="判据：输出采样率 = 源 / 抖动 = none / 音量 0 dB / 无 EQ·IR / 独占 WASAPI">切到 bit-perfect 直通</button>'
+       + '</div>'
        // 261024-01 #11：用户原话「NAA 端点（host:port）这个选项不应该出现啊，应该是自动获取的」。
       // 默认自动发现（下拉列出扫到的端点），手动输入收进折叠的「兜底」里，默认不展开。
       + '<div class="sfld wide" id=sp_naawrap style="display:none">'
@@ -3525,12 +3763,8 @@ function renderSettingsPage() {
       + '</div>'
       + '<div class=hint id=sp_upnp_msg>播放 / 切歌自动投放到该渲染器（与下方「投放」共用会话）</div>'
       + '</div>'
-       // 2026-10-24（261024-02 #8）：用户看到"非 bit-perfect"不知道原因/怎么改。
-       // 给一个一键直通预设：源采样率 + 无抖动 + 0 dB + 无 EQ/IR + 独占，并把判据写在提示里。
-       + '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
-       + '<button class="btn pri" id=sp_bpfix>切到 bit-perfect 直通</button>'
-       + '<span class=hint style="margin:0">判据：输出采样率=源 / 抖动=none / 音量 0 dB / 无 EQ·IR / 独占 WASAPI</span>'
-       + '</div>'
+       // 2026-10-24（261024-02 #8）：一键直通预设（源采样率 + 无抖动 + 0 dB + 无 EQ/IR + 独占）。
+       // 261024-04 #2：按钮已挪到「后端」下拉右侧的同一行（见上），这里不再占一行。
        + sel('sp_device', '输出设备', '<option value="">默认设备</option>', '独占模式会接管这个设备；共享模式经系统混音，不接管')
        + sel('sp_outmode', '输出模式',
              opt('pcm', 'PCM', outModeOf()) + opt('dsd', 'DSD（SDM）', outModeOf()),
@@ -4323,8 +4557,15 @@ function eqSettingsHtml() {
   // 0. 20 段参数均衡 PEQ（261024-02 #6）—— 新增，放在 EQ 页最上面
   h += sgroup('参数均衡 PEQ（20 段 · HIFI）',
       'RBJ 双二阶 · 20 段 ISO 1/3 倍频程中心频率（20Hz~20kHz）· 采样率相关重建 · 参数热更新交叉淡入',
-      '<div class="sfld wide" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">'
-    + '<label class=chk style="margin:0"><input type=checkbox id=peqBypass> 旁路（bypass）</label>'
+      // 261024-04 #3：用户问「旁路是什么意思？当前是不是默认就启动 PEQ？只有勾选旁路才不生效？」——
+      // 组标题下常驻一行状态（生效 / 已旁路），复选框文案直接写明勾选的含义，
+      // 并说清「默认生效，但 20 段全 0 dB = 不改变声音」（后端 src/dsp/peq.h: bypass 默认 false，20 段默认 0 dB）。
+      '<div class="sfld wide"><div class="peqstat" id=peqStat><span class=tag>状态</span>' +
+        '<span id=peqStatTxt>PEQ 当前：读取中…</span></div>' +
+        '<div class=hint id=peqByPassHint>旁路 = 绕过 PEQ（20 段全部不参与计算，信号直通）。默认<strong>生效</strong>；' +
+        '出厂 20 段全为 0 dB、前级 0 dB，所以即使生效也不改变声音（等同直通）。</div></div>'
+    + '<div class="sfld wide" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">'
+    + '<label class=chk style="margin:0" title="勾选 = PEQ 不生效（直通）；不勾选 = PEQ 生效"><input type=checkbox id=peqBypass> 旁路（勾选 = PEQ 不生效，直通）</label>'
     + '<label style="font-size:12px;color:var(--mut2)">前级增益 <input type=number id=peqPreamp step=0.1 min=-24 max=24 value=0 style="width:74px;height:26px"> dB</label>'
     // 261024-03 #5：按曲线峰值一键设前级，防削波（只在前端算，DSP 不动）
     + '<button class="btn" id=peqAutoPre type=button title="把前级设为 -ceil(当前曲线峰值增益)，给 EQ 提升留出余量，避免数字削波">自动前级（防削波）</button>'
@@ -4724,6 +4965,7 @@ function peqRender(j) {
   PEQ_STATE = j;
   if (D('peqBypass')) D('peqBypass').checked = !!j.bypass;
   if (D('peqPreamp')) D('peqPreamp').value = j.preamp;
+  peqStatusRender(j);   // 261024-04 #3：状态行跟着后端的真值走
   var sel = D('peqPreset');
   if (sel) {
     var cur = j.name || 'Flat';
@@ -4737,6 +4979,37 @@ function peqRender(j) {
   peqDrawCurve(j.points);
 }
 function peqMsg(t) { var e = D('peqMsg'); if (e) e.textContent = t || ''; }
+// 261024-04 #3：把「旁路 / 生效」的**语义**写成一行常驻状态，而不是只留一个 checkbox 让用户猜。
+// 判据：勾选/取消勾选后这一行文字必须立刻跟着变（不依赖后端往返）。
+// 文案分三态：
+//   ① 已旁路         → PEQ 完全不算，信号直通；
+//   ② 生效但全 0 dB  → 严格说"生效"，但 20 段全 0 dB + 前级 0 dB ⟹ 不改变声音（下载默认就是这一档）；
+//   ③ 生效且有非 0 dB 段 → 输出确实被 EQ 改变。
+function peqStatusRender(j) {
+  var el = D('peqStat'), tx = D('peqStatTxt');
+  if (!el || !tx) return;
+  j = j || PEQ_STATE || {};
+  var bands = j.bands || [];
+  var active = 0, total = 0;
+  for (var i = 0; i < bands.length; ++i) {
+    total++;
+    if (bands[i].on && Math.abs(+bands[i].gain || 0) > 0.001) active++;
+  }
+  var pre = (typeof j.preamp === 'number') ? j.preamp : 0;
+  var bypass = !!j.bypass;
+  el.className = 'peqstat' + (bypass ? ' bypass' : '');
+  var txt;
+  if (bypass) {
+    txt = 'PEQ 当前：已旁路（PEQ 不生效，信号直通）';
+  } else if (active === 0 && Math.abs(pre) < 0.001) {
+    txt = 'PEQ 当前：生效 · ' + (total || 20) + ' 段全为 0 dB、前级 0 dB（不改变声音）';
+  } else {
+    txt = 'PEQ 当前：生效 · ' + active + ' / ' + (total || 20) + ' 段非 0 dB' +
+          (Math.abs(pre) >= 0.001 ? ('、前级 ' + pre.toFixed(1) + ' dB') : '') + '（输出已被 EQ 改变）';
+  }
+  tx.textContent = txt;
+  el.title = txt;
+}
 // 节流：文字输入 260ms；拖拽/滚轮/键盘 100ms（拖拽时不许每次 pointermove 都打后端）
 function peqScheduleApply(ms) {
   clearTimeout(PEQ_TIMER);
@@ -4751,6 +5024,7 @@ function peqApply() {
     if (!j || !j.ok) { peqMsg('失败：' + ((j && j.error) || '未知错误')); return; }
     PEQ_STATE = j;
     peqDrawCurve(j.points);   // 只刷新曲线，不重建输入框（避免打断正在输入的光标）
+    peqStatusRender(j);       // 261024-04 #3：状态行刷新（以后端返回值为准）
     peqMsg('已应用（' + (j.bypass ? '旁路' : '生效') + ' · 采样率 ' + Math.round(j.fs) + ' Hz）');
   }).catch(function (e) { peqMsg('失败：' + e); });
 }
@@ -4771,7 +5045,14 @@ function peqPresetAction(action, name) {
 }
 function initPeqControls() {
   if (!D('peqBypass')) return;   // 当前页面没有 PEQ 卡（例如还没渲染设置页）
-  D('peqBypass').onchange = function () { peqScheduleApply(); };
+  // 261024-04 #3：勾选/取消后状态行**立刻**变（先按本地状态刷，不等后端往返）；再节流下发。
+  D('peqBypass').onchange = function () {
+    var st = {};
+    for (var kk in (PEQ_STATE || {})) st[kk] = PEQ_STATE[kk];
+    st.bypass = !!this.checked;
+    peqStatusRender(st);
+    peqScheduleApply();
+  };
   if (D('peqPreamp')) D('peqPreamp').oninput = function () { peqScheduleApply(); };
   if (D('peqAutoPre')) D('peqAutoPre').onclick = peqAutoPreamp;
   if (D('peqLoad')) D('peqLoad').onclick = function () {
@@ -5299,6 +5580,8 @@ function openNowPlaying() {
     if (!S.curMeta) loadMeta(S.lastCur);
   }
   renderNp();
+  // 261024-04 #7：进入单曲页立刻自动加载这首歌的 AI 整理（不必等 400ms 的 renderNp 轮询）
+  npAutoSummary();
   // 整页控件是底栏/设置页的镜像：进来时刷一次，绝不显示与底栏不同的值
   applyRep(D('sRep') ? D('sRep').value : 0);
   syncVolUi();
@@ -5614,6 +5897,12 @@ function npLocalAlbum(name, artist, cb) {
 //   * 只预取 release 这一个实体，一次（同一首歌只发一次）；不打开抽屉、不改变任何 UI 状态；
 //   * 失败静默（不 toast、不留错误态）；切歌后旧结果直接丢弃（key 不匹配）。
 var NPPREF = { key: '' };
+// 单曲页各类资料的 URL 只在这里拼（抽屉 / 预取 / 自动加载共用，才能命中同一份 summaryOnce 缓存）
+function npSummUrl(kind, t, force) {
+  return '/api/entity/summary?kind=' + kind + '&name=' + encodeURIComponent((t && t.name) || '') +
+         ((t && t.artist) ? ('&artist=' + encodeURIComponent(t.artist)) : '') + '&lang=zh' +
+         (force ? '&refresh=1' : '');
+}
 function npPrefetchRelease() {
   if (META.summary != 1) return;
   if (META.hasLlmKey !== true && META.summaryEnabled !== true) return;
@@ -5624,17 +5913,10 @@ function npPrefetchRelease() {
   var key = myTrack + '|' + rel.name + '|' + (rel.artist || '');
   if (NPPREF.key === key) return;
   NPPREF.key = key;
-  var fp = 'release|' + rel.name + '|' + (rel.artist || '') + '|';
-  if (NP_DATA.inflight[fp]) return;
-  NP_DATA.inflight[fp] = 1;
-  var u = '/api/entity/summary?kind=release&name=' + encodeURIComponent(rel.name) +
-          (rel.artist ? ('&artist=' + encodeURIComponent(rel.artist)) : '') + '&lang=zh';
-  fetchSummary(u, function (s) {
-    delete NP_DATA.inflight[fp];
+  var u = npSummUrl('release', rel);
+  summaryOnce(u, function (s) {
     if (NPPREF.key !== key || (S.lastCur || '') !== myTrack) return;   // 切歌 → 丢弃
-    var has = s && ((s.fields && Object.keys(s.fields).length > 0) ||
-                    (s.ok && s.sections && s.sections.length > 0));
-    if (!has) return;                                                  // 失败静默
+    if (!summHas(s)) return;                                          // 失败静默
     var finish = function () {
       if (NP_DATA.cache['release'] && NP_DATA.cache['release'].state === 'ok') return;  // 用户已自己取到
       NP_DATA.cache['release'] = { state: 'ok', data: s };
@@ -5643,6 +5925,40 @@ function npPrefetchRelease() {
     };
     npLocalAlbum(rel.name, rel.artist || '', function (alb) { if (alb) s.__album = alb; finish(); });
   });
+}
+/* 261024-04 #7：打开 AI 整理后，**进入单曲页就自动加载**这首歌的 summary（用户原话：不再需要点击）。
+   纪律：
+     * 只在"开了 AI 整理 + 有 key"时自动发起（否则一次请求都不发，行为与从前一致）；
+     * 已经取到 / 正在取 / 上次失败（error 不自动重试，等用户点重试）⟹ 直接跳过；
+     * 抽屉**不自动打开**（261024-01 #3b ③ 的「资料默认隐藏」是既有验收项），内容就绪后标签点一下即看；
+     * 失败不弹错：右侧标签栏下面留一行可点击的「重试」。 */
+function npAutoSummary() {
+  if (META.summary != 1) return;
+  if (META.hasLlmKey !== true && META.summaryEnabled !== true) return;
+  if (!npDataTab('track')) return;
+  var st = NP_DATA.cache['track'];
+  if (st && (st.state === 'ok' || st.state === 'loading' || st.state === 'error')) { npRailHint(); return; }
+  npDataEnsure('track', false);
+  npRailHint();
+}
+// 右侧标签栏下面那一行状态：后台整理中 / 失败可重试（不打扰：只有这两种情况才出现）
+function npRailHint() {
+  var el = D('npSummHint');
+  if (!el) return;
+  var st = NP_DATA.cache['track'];
+  if (st && st.state === 'error') {
+    el.style.display = '';
+    el.innerHTML = '<span class=nprailerr id=npSummRetry role=button tabindex=0 title="重新请求这首歌的 AI 整理">' +
+                   '歌曲资料未能取到 · 点击重试</span>';
+    var b = D('npSummRetry');
+    if (b) b.onclick = function () { npDataEnsure('track', true); };
+  } else if (st && st.state === 'loading' && !npDrawerIsOpen()) {
+    el.style.display = '';
+    el.innerHTML = '<span class=nprailbusy>正在后台整理歌曲资料…</span>';
+  } else {
+    el.style.display = 'none';
+    el.innerHTML = '';
+  }
 }
 function npDataEnsure(kind, force) {
   var t = npDataTab(kind); if (!t) return;
@@ -5670,13 +5986,11 @@ function npDataEnsure(kind, force) {
       .catch(function (e) { done(null, String(e)); });
     return;
   }
-  var u = '/api/entity/summary?kind=' + kind + '&name=' + encodeURIComponent(t.name) +
-          (t.artist ? ('&artist=' + encodeURIComponent(t.artist)) : '') + '&lang=zh' + (force ? '&refresh=1' : '');
-  fetchSummary(u, function (s) {
+  // 261024-04 #7：走 summaryOnce —— 同一实体只请求一次（专辑页/单曲页/预取共用同一份缓存）
+  var u = npSummUrl(kind, t, force);
+  summaryOnce(u, function (s) {
     // 261024-01 #4：后端新增结构化 fields（可能没有 sections）⟹ 有 fields 也算有资料
-    var hasFields = s && s.fields && Object.keys(s.fields).length > 0;
-    var hasSecs = s && s.ok && s.sections && s.sections.length > 0;
-    if (!(hasFields || hasSecs)) { done(null, (s && s.error) || ''); return; }
+    if (!summHas(s)) { done(null, (s && s.error) || ''); return; }
     // 261024-02 #3：把本地曲库的真实时长/曲目挂到结果上（AI 的时长/曲目列表一律不采信）
     if (kind === 'track') {
       if (S.dur > 0) s.__local = { '时长': fmtDurLong(S.dur) };   // 本地文件真实时长（AI 猜的一律不采信）
@@ -5725,6 +6039,8 @@ function updateNpData(m) {
   // 261024-01 #3b ③「默认隐藏」：抽屉不打开、不占版面；
   // 261024-02 追加：但**专辑资料允许后台预取一次**（Lead 指定，改善"点开要等 10~30s"的体感）。
   npPrefetchRelease();
+  // 261024-04 #7：进入单曲页自动加载**这首歌**的 summary（不需要点标签）
+  npAutoSummary();
   if (NP_DATA.active) npDataEnsure(NP_DATA.active, false);
   npDataRenderBody();
 }

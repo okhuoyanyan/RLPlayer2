@@ -458,6 +458,20 @@ target_include_directories(test_retrieval PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_retrieval PRIVATE winhttp)
 add_test(NAME retrieval COMMAND test_retrieval)
 
+# 2026-10-24（用户 261024-04 #6/#4 后端侧）：实体资料缓存是否**共用**、第二次是否**零 LLM 调用**、
+# 命中是否 ≤300ms。全离线：L2 材料直接写缓存，chat/search/fetch 走计数型 mock transport
+# （LlmConfig::transport 钩子），判据是"调用计数不变"而不是"耗时不抖"。
+add_executable(test_metacache tests/test_metacache.cpp)
+target_include_directories(test_metacache PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_metacache PRIVATE winhttp)
+add_test(NAME metacache COMMAND test_metacache)
+
+# 2026-10-24（用户 261024-04 #8）：/api/status 的 gpu（可用性）与 gpuUsed（本次真的参与）
+# 组合语义真值表。纯函数（src/meta/statusflags.h），不碰 GPU、不开设备。
+add_executable(test_playback_gpu tests/test_playback_gpu.cpp)
+target_include_directories(test_playback_gpu PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME playback_gpu COMMAND test_playback_gpu)
+
 # OPRA 耳机 EQ 适配门禁（离线纯函数 + RTA_NET_TESTS=1 真网 opt-in）
 add_executable(test_opra_eq tests/test_opra_eq.cpp)
 target_include_directories(test_opra_eq PRIVATE ${CMAKE_SOURCE_DIR}/src)

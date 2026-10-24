@@ -50,6 +50,7 @@ using rta::render::SinkOpenOpts;
 #include "meta/knowledge.h"         // P3 资料层直连与缓存(/api/entity/knowledge)
 #include "meta/retrieval.h"         // P3 资料层③ AI 综合检索(/api/entity/summary)
 #include "meta/discogs.h"           // P3 资料层④b Discogs 版本推荐(/api/entity/versions)
+#include "meta/statusflags.h"       // gpu/gpuUsed 组合语义（用户 261024-04 #8，/api/status 与 /api/signal 同源）
 #include "net/rtanet_stream.h"
 #include "dsp/filter_families.h"
 #include "dsp/oversample_peak.h"
@@ -193,7 +194,14 @@ struct PlayerState {
     std::string bpWhy;
     double outRate = 0;
     int    outBits = 0;
-    bool   gpu = false;        // 本次播放是否由 GPU 升频
+    // 2026-10-24（用户 261024-04 #8：bit-perfect 时信号链没绿点、右下角 GPU 图标还亮着）：
+    //   gpu 只有 render_loop 在 RQ.gpu 置位时写 true（见 rtaweb.cpp 的 rl.gpuOut 接线），
+    //   而 **正常播放路径从不复位它** —— 于是一旦本进程里有一首走过 GPU 升频，后面所有曲目
+    //   （包括不重采样的 bit-perfect 直通）都显示"在用 GPU"。现在：每次播放开始都复位，
+    //   并且 /api/status 的 gpu 改成"可用性"、另加 gpuUsed 表达"本次真的参与了"。
+    bool   gpu = false;        // 本次播放是否由 GPU 升频（render_loop 写，PLAY 入口复位）
+    // 本次播放 IR 卷积是否真的跑在 GPU 上（PipelineStats::usedGpuConvolution 写；DLL 缺失/失败= false）
+    std::atomic<bool> gpuConvUsed{false};
     std::atomic<long long> dbgPad{0}, dbgSkips{0};   // 诊断：设备侧水位与欠载跳过次数
     std::atomic<double> volDb{0.0};    // 用户当前请求的音量（拖动滑块即时生效）
     std::atomic<double> startDb{0.0};  // 本次播放起点音量（DSP 里已按它做过抖动量化）
@@ -1205,6 +1213,7 @@ static bool play_one_direct(const std::string& file, const PlayParams& p) {
         ps.startDb.store(0.0);
         ps.volDb.store(0.0);
         ps.gpu = false;
+        ps.gpuConvUsed.store(false);   // 直通路径不会有卷积，显式归零（#8）
 
         // 信号链快照：DirectSDM 只有"源 → DoP → 设备"三环，如实写出来
         {
@@ -2183,6 +2192,12 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             meta_on_play(file);   // 播放触发元数据补全(设置可关;inFlight 去重,后台线程)
             std::lock_guard<std::mutex> lk(ps.mtx);
             ps.signal = sig.str();
+            // 2026-10-24（用户 261024-04 #8）：GPU 标志**每曲复位**。
+            // 旧代码只有 DirectSDM 分支复位过 ps.gpu，普通路径一路沿用上一曲的值 ——
+            // 这就是"bit-perfect 直通时右下角 GPU 图标还亮着"的直接根因。
+            // 必须先复位再起生产者/渲染线程，否则它们会把上一曲的 true 当成本次的事实。
+            ps.gpu = false;
+            ps.gpuConvUsed.store(false);
         }
         ps.startDb.store(p.volume);
         dlog("stage sig-ok");
@@ -2237,7 +2252,12 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                                  in.raw.begin() + (long long)((pos + n) * (size_t)in.channels));
                     pos += n;
                     const auto t_dsp_0 = std::chrono::steady_clock::now();
-                    AudioBuffer o = pl->process(c, nullptr);
+                    // 2026-10-24（用户 261024-04 #8）：把 PipelineStats 收下来，才能回答
+                    // 「本次卷积到底走没走 GPU」—— 旧代码传 nullptr，这个事实被直接丢掉，
+                    // 于是 /api/signal 的 irGpu 只能是"用户勾了开关"（设置项），不是实测。
+                    eng::PipelineStats pst;
+                    AudioBuffer o = pl->process(c, &pst);
+                    if (pst.usedGpuConvolution) ps.gpuConvUsed.store(true);
                     if (!RQ.gpu.load()) RQ.gpu.store(pl->gpuResampleActive());
                     if (skipOut > 0 && !o.raw.empty()) {
                         const size_t d = std::min(skipOut, o.frames());
@@ -6262,6 +6282,14 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                 << ",\"dspTotalMs\":" << totalDspMs
                 << ",\"dspChunkUs\":" << ps.dspChunkUs.load()
                 << ",\"scanMs\":" << Library::instance().lastScanMs()
+                // 2026-10-24（用户 261024-04 #8）：路径上的 GPU 事实（**实测**，不是设置项）。
+                //   convGpu     = 本次 IR 卷积真的走了 GPU（CPU 回落/无 IR/无 DLL ⟹ false）
+                //   gpuResample = 本次升频真的走了 GPU（不重采样 ⟹ false）
+                //   gpuUsed     = 二者之一（旧字段 irGpu 仍是"用户勾了卷积走 GPU"的设置值，
+                //                 两者并存：irGpu=true & convGpu=false 表示勾了但没跑起来）
+                << ",\"convGpu\":" << (ps.gpuConvUsed.load() ? "true" : "false")
+                << ",\"gpuResample\":" << (ps.gpu ? "true" : "false")
+                << ",\"gpuUsed\":" << ((ps.gpu || ps.gpuConvUsed.load()) ? "true" : "false")
                 << "}";
             s += dyn.str();
         }
@@ -6405,6 +6433,18 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         const std::string errStat = castMode ? castSt.error : ps.error;
         const uint32_t rateStat = castMode ? castSt.sampleRate : ps.outRate;
         const int bitsStat = castMode ? castSt.bits : ps.outBits;
+        // 2026-10-24（用户 261024-04 #8）：GPU 语义拆分。组合语义的唯一事实源 =
+        // rta::meta::playback_gpu_flags（src/meta/statusflags.h，带真值表与单测）：
+        //   gpu         = GPU 可用性（与本次播放无关，旧字段名保留）
+        //   gpuUsed     = 本次播放 GPU 真的参与了计算（升频 或 卷积）
+        //   gpuResample / gpuConv = 两条路径各自的实测结果
+        // 投放（UPnP）模式下渲染在远端设备上，本地这两个实测标志必须归零 ——
+        // 否则会拿"上一首本地播放"的残留值冒充本次远程播放的事实。
+        rta::meta::PlaybackGpuInput gpuIn;
+        gpuIn.gpuAvailable = rta::dsp::GpuBridge::instance().available();
+        gpuIn.resampleGpu  = castMode ? false : ps.gpu;
+        gpuIn.convGpu      = castMode ? false : ps.gpuConvUsed.load();
+        const rta::meta::PlaybackGpuFlags gpuF = rta::meta::playback_gpu_flags(gpuIn);
         j << "{\"ok\":true"
           << ",\"playing\":" << (playingStat ? "true" : "false")
           << ",\"current\":\"" << jesc(curStat) << "\""
@@ -6415,7 +6455,10 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
           << ",\"dur\":" << dur
           << ",\"outRate\":" << rateStat
           << ",\"outBits\":" << bitsStat
-          << ",\"gpu\":" << (ps.gpu ? "true" : "false")
+          << ",\"gpu\":" << (gpuF.gpu ? "true" : "false")
+          << ",\"gpuUsed\":" << (gpuF.gpuUsed ? "true" : "false")
+          << ",\"gpuResample\":" << (gpuF.gpuResample ? "true" : "false")
+          << ",\"gpuConv\":" << (gpuF.gpuConv ? "true" : "false")
           << ",\"volDb\":" << ps.volDb.load()
           << ",\"startDb\":" << ps.startDb.load()
           << ",\"pad\":" << ps.dbgPad.load() << ",\"skips\":" << ps.dbgSkips.load()

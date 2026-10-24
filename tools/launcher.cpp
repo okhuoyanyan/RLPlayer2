@@ -513,6 +513,69 @@ static UINT dpi_for_monitor(HWND hwnd) {
 // 逻辑像素 → 当前窗口的物理像素（kBandInset、初始窗口尺寸都走它换算）
 static int dp(HWND hwnd, int v) { return (int)(((long long)v * dpi_of(hwnd) + 48) / 96); }
 
+// 2026-10-24（261024-04 #1）：页面发起的窗口边缘拉伸。
+//
+// 为什么不能再用原生 hit-test：满幅后 WebView2 的**三个子窗口属于另外的进程**
+//（实测 tid=29976 pid=43728、pid=11872），跨进程无法 SetWindowSubclass，鼠标全部落在它们身上、
+// 返回 HTCLIENT，父窗口的 WM_NCHITTEST 永远收不到 —— 实测四边既没有缩放光标也拖不动。
+// 唯一同时满足「页面像素顶到边」+「边缘可拖」的做法：页面在 8 条 5px 热区上 mousedown →
+// postMessage('resize:<dir>') → 宿主在这里接管鼠标、自己跟手改窗口大小。
+// 协议解析在 platform/host_msg.h（有单测：8 个方向放行、拼错/注入一律 None）。
+static void begin_window_resize(HWND h, const std::string& dir) {
+    if (dir.empty()) return;
+    const bool L = dir.find("left") != std::string::npos;
+    const bool R = dir.find("right") != std::string::npos;
+    const bool T = dir.find("top") != std::string::npos;
+    const bool B = dir.find("bottom") != std::string::npos;
+    if (!L && !R && !T && !B) return;
+
+    // 最大化时拉边缘：先还原再跟手（与系统原生一致，否则会把最大化窗口直接改成任意尺寸）
+    if (IsZoomed(h)) ShowWindow(h, SW_RESTORE);
+    POINT p0{};
+    GetCursorPos(&p0);
+    RECT r0{};
+    GetWindowRect(h, &r0);
+    const int minW = 960, minH = 640;   // 与 WM_GETMINMAXINFO 的 ptMinTrackSize 一致
+    logf(L"resize: 开始 dir=%S rect=(%ld,%ld %ldx%ld)", dir.c_str(),
+         r0.left, r0.top, r0.right - r0.left, r0.bottom - r0.top);
+
+    SetCapture(h);
+    bool moved = false;
+    MSG msg;
+    for (;;) {
+        if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) break;   // 松开左键 = 结束
+        if (!IsWindow(h)) break;
+        POINT p{};
+        GetCursorPos(&p);
+        RECT nr = r0;
+        if (L) nr.left += (p.x - p0.x);
+        if (R) nr.right += (p.x - p0.x);
+        if (T) nr.top += (p.y - p0.y);
+        if (B) nr.bottom += (p.y - p0.y);
+        // 最小尺寸（拖过头就夹住，避免窗口被拖成 0 宽）
+        if (nr.right - nr.left < minW) { if (L) nr.left = nr.right - minW; else nr.right = nr.left + minW; }
+        if (nr.bottom - nr.top < minH) { if (T) nr.top = nr.bottom - minH; else nr.bottom = nr.top + minH; }
+        SetWindowPos(h, nullptr, nr.left, nr.top, nr.right - nr.left, nr.bottom - nr.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        moved = true;
+        // 让窗口在拖动过程中真的重绘/重排（嵌套消息泵，效果等同系统拖拽时的模态循环）
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) return;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Sleep(8);
+    }
+    ReleaseCapture();
+    if (moved) {
+        RECT r1{};
+        GetWindowRect(h, &r1);
+        logf(L"resize: 结束 rect=(%ld,%ld %ldx%ld)", r1.left, r1.top, r1.right - r1.left, r1.bottom - r1.top);
+    }
+}
+
+static std::string g_resizeDir;   // 页面发来的 resize 方向（WM_APP+2 用）
+
 // ---------------- 内置 WebView2 窗口 ----------------
 // 用系统运行库的 WebView2 做界面：没有浏览器外壳、没有扩展、标题栏归我们管，
 // 主题一变直接改 DWM 颜色，不需要重开窗口。
@@ -838,8 +901,20 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             repaint_band(hwnd);
             if (g_wv) g_wv->PostWebMessageAsString(IsZoomed(hwnd) ? L"max" : L"normal");
             return 0;
+        case WM_APP + 2:   // 261024-04 #1：页面发起窗口边缘拉伸（见 begin_window_resize）
+            begin_window_resize(hwnd, g_resizeDir);
+            return 0;
         case WM_TIMER:
-            if (wp == 2) { verify_band(hwnd); return 0; }
+            if (wp == 2) {
+                verify_band(hwnd);
+                // 2026-10-24（261024-04 #1 用户实测：窗口四边拖不动）：
+                // WebView2 在导航/首次合成后会**新建**子窗口（实测 4 个 Chrome_WidgetWin + 1 个 IME 窗口），
+                // 而 install_wv_edge_hittest() 只在创建后与 WM_SIZE 时跑 —— 后建出来的子窗口没有 subclass，
+                // 它们返回 HTCLIENT，鼠标就永远到不了父窗口的 WM_NCHITTEST（父窗口其实返回的是 HTLEFT/HTTOP）。
+                // 结果：边缘既没有缩放光标、也拖不动大小。这里 250ms 重挂一次（SetWindowSubclass 同 id 幂等）。
+                install_wv_edge_hittest(hwnd);
+                return 0;
+            }
             if (wp == 1) {
                 // 网页已经报过主题 ⟹ 以网页为准，conf 轮询到此为止（否则会覆盖网页的选择）
                 if (g_themeFromPage) return 0;
@@ -945,6 +1020,12 @@ static bool open_webview_window(int port) {
             apply_caption(hwnd, dark, blue);
             break;
         }
+        case rta::platform::HostAction::Resize:
+            // 不能在 WebView2 的事件回调里直接跑模态拖拽循环（会把 WebView2 的消息泵卡住）。
+            // 记下方向，转成一条自定义窗口消息，在窗口过程里再执行。
+            g_resizeDir = hm.arg;
+            PostMessageW(hwnd, WM_APP + 2, 0, 0);
+            break;
         case rta::platform::HostAction::OpenUrl: {
             // 只放 http/https（白名单在 host_msg.h 里，有单测）。打开失败/被拒都留证据。
             if (!hm.allowed) {

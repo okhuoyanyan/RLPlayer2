@@ -16,7 +16,8 @@ enum class HostAction {
     Close,
     Drag,
     Theme,
-    OpenUrl
+    OpenUrl,
+    Resize        // arg: left/right/top/bottom/topleft/topright/bottomleft/bottomright
 };
 
 struct HostMessage {
@@ -59,6 +60,19 @@ inline HostMessage parse_host_message(const std::string& m) {
     if (m.rfind("theme:", 0) == 0) {
         r.action = HostAction::Theme;
         r.arg = m.substr(6);
+        return r;
+    }
+    // 261024-04 #1：窗口边缘拉伸。WebView2 的 3 个子窗口属于别的进程，原生 subclass 拿不到鼠标，
+    // 所以由页面在 8 条 5px 热区上发起 resize:<dir>，宿主自己跟鼠标改窗口大小。
+    // 方向做白名单，拼错/注入一律按 None（不动作、留 reason 进日志）。
+    if (m.rfind("resize:", 0) == 0) {
+        r.action = HostAction::Resize;
+        r.arg = m.substr(7);
+        static const char* const kDirs[] = {"left", "right", "top", "bottom",
+                                            "topleft", "topright", "bottomleft", "bottomright"};
+        bool ok = false;
+        for (const char* d : kDirs) { if (r.arg == d) { ok = true; break; } }
+        if (!ok) { r.action = HostAction::None; r.reason = "unknown resize dir"; }
         return r;
     }
     if (m.rfind("openurl:", 0) == 0) {

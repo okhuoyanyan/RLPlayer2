@@ -1448,12 +1448,23 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     };
     long long diag_knowledge_ms = 0, diag_search_ms = 0, diag_fetch_ms = 0, diag_llm_ms = 0;
     // 3. Step 1: 拉取 L2 权威材料（Release 整合 Wikipedia 与 Discogs）
+    //
+    // 2026-10-24（用户 261024-04 #4「专辑页面 AI 整理资料非常慢」）：
+    //   Step 1（维基/萌娘/Discogs）与 Step 2/3（官方 search + 逐页 fetch）**互不依赖** ——
+    //   材料只用于最后拼提示词。旧实现严格串行，实测 knowledge=3435ms 完整叠在 search+fetch 之前
+    //   （build/rlplayer-playback.log 09:55:47 与 09:57:56 两行 diag）。
+    //   现在把 Step 1 整段装进 lambda 丢到后台线程，本线程同时跑 Step 2/3，最后统一 join：
+    //   关键路径从 knowledge+search+fetch 变成 max(knowledge, search+fetch)。
+    //   并发纪律：lambda 只写 kr/diag_knowledge_ms；Step 2/3 只写 valid_hits/fetched_hits/
+    //   diag_search_ms/diag_fetch_ms —— 两组变量不重叠，allowed_urls 一律等 join 之后再拼。
+    //   （lambda 体保持原缩进，纯为把改动面压到最小，逻辑与串行版逐行一致。）
+    KnowledgeResult kr;          // Step 1 的产出；只由后台 lambda 写，join 之后本线程才读
+    auto knowledge_stage = [&]() {
     KnowledgeOpts kopts;
     kopts.lang = lang;
     kopts.metabase = opts.metabase;
     kopts.refresh = opts.refresh;
     kopts.timeout_ms = opts.timeout_ms;
-    KnowledgeResult kr;
     // 「有真正正文的材料」：有 url 且不是维基消歧义页（消歧义页正文只有候选标题列表，
     // 以前用 materials.empty() 判断会把它当成成功 → 艺术家消歧回退永远不触发，白付 LLM 费用）。
     auto has_real_material = [](const KnowledgeResult& r) {
@@ -1502,15 +1513,21 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
                        [](const KnowledgeMaterial& m) { return m.kind == "disambiguation"; }),
         kr.materials.end());
 
+        diag_knowledge_ms = ms_since(t_stage0);
+    };   // knowledge_stage —— Step 1 全程在后台线程里跑
+
     // 4. Step 2: (可选) ds_search「创作背景/评价/版本点评」检索（每实体最多 1 次）
+    //    与上面的 Step 1 **并行**（见 knowledge_stage 注释）。
     std::vector<SearchHit> valid_hits;
     std::vector<SearchHit> fetched_hits;
     std::vector<std::string> allowed_urls;
-    for (const auto& m : kr.materials) {
-        if (!m.url.empty()) allowed_urls.push_back(m.url);
+    std::future<void> f_knowledge;
+    try {
+        f_knowledge = std::async(std::launch::async, knowledge_stage);
+    } catch (...) {
+        knowledge_stage();     // 起不了线程（极端资源不足）→ 退回串行，行为与旧版一致
     }
 
-    diag_knowledge_ms = ms_since(t_stage0);
     const auto t_search0 = std::chrono::steady_clock::now();
     if (opts.enable_search) {
         std::string query;
@@ -1593,6 +1610,21 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         }
     }
 
+    // ---- Step 1 / Step 2+3 汇合点（谁慢等谁）----
+    // 旧实现在 Step 2 之前就把材料 URL 塞进 allowed_urls；两段并行后必须等两边都写完再拼，
+    // 否则给 parse_synthesis_reply 的允许集合会缺条（表现是"引用校验失败"，极难查）。
+    if (f_knowledge.valid()) {
+        try {
+            f_knowledge.get();
+        } catch (...) {
+            // 后台线程抛异常：宁可材料为空走 AI 兜底，也不能让任务线程带着未捕获异常退出
+            //（那会让 /api/entity/summary 的 job 永远停在 running，前端一直转圈）。
+            if (diag_knowledge_ms == 0) diag_knowledge_ms = ms_since(t_stage0);
+        }
+    }
+    for (const auto& m : kr.materials) {
+        if (!m.url.empty()) allowed_urls.push_back(m.url);
+    }
     // 将通过白名单与过滤的检索 URL 也纳入允许集合
     for (const auto& h : fetched_hits) {
         if (!h.url.empty()) allowed_urls.push_back(h.url);
@@ -1614,8 +1646,17 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         if (!cfg.apiKey.empty()) {
             const std::string label = !opts.artist.empty() ? (opts.artist + " - " + name) : name;
             const std::string kind_label = (kind == EntityKind::Release) ? "专辑" : "艺术家";
+            // 2026-10-24（261024-04 #4）：这条兜底路径以前**不带 diag**，于是日志里只剩
+            // "unverified=1"、看不出时间花在哪。AI 整理同样是 10~30s 的 LLM 调用，必须计时。
+            const auto t_ai0 = std::chrono::steady_clock::now();
             SummaryResult ai_res = summary_ai_only_generate(label, kind_label, lang, cfg);
+            diag_llm_ms += (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_ai0).count();
             if (ai_res.ok) {
+                ai_res.diag = "knowledge=" + std::to_string(diag_knowledge_ms) + "ms search=" +
+                              std::to_string(diag_search_ms) + "ms fetch=" +
+                              std::to_string(diag_fetch_ms) + "ms llm=" +
+                              std::to_string(diag_llm_ms) + "ms hits=0 fallback=ai_only";
                 summary_save_cache(baseDir, eid, lang, ai_res);
                 return ai_res;
             }
