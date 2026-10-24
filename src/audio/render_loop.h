@@ -69,6 +69,10 @@ struct OutSink {
     // 分不清「设备缓冲恒满」和「我们喂不上」。默认返回 -1 = 后端不支持该统计。
     virtual long long zero_pad_full() const { return -1; }   // ① 设备缓冲满
     virtual long long zero_starved()  const { return -1; }   // ② 供料不足一个周期
+    // ③ 其它（含「有空间但不足一个周期 → 整周期量化归零」）。
+    // 1.3.15 真机日志里 DC-Elite 的 w0=471 而 zp=84、zs=0，差的 387 次全在这个桶里，
+    // 但 STAT 从来没打印它 —— 看起来像「未归因」。补上它，zp+zs+zo 才能闭合到 w0。
+    virtual long long zero_other()    const { return -1; }
     virtual std::string zero_reason() const { return "-"; }  // 最近一次成因
 
     // ---------------- C2 遥测（2026-10-24 N300 欠载；纯观测，全部带默认值）----------------
@@ -216,6 +220,14 @@ struct RenderHost {
     double hangMaxSec       = 2.0;      // 熔断预算（秒）
     bool   deviceHang       = false;    // true = 熔断触发（与 deviceLost 区分：端点可能还在枚举里）
 
+    // ---- P0：补料时序（2026-10-24 DC-Elite 真机 A/B）----
+    // true（默认）=「先按可用空间补写 → 写不进去才等事件」，等待上限 per/2；
+    // false = 旧时序「wait_event(20) → 写」。
+    // 为什么是 flag 而不是环境变量：真机实测已经证明默认必须走新时序，而既有 dry 用例
+    // 的 mock 时钟只在 wait_event 里推进（旧时序模型），它们需要显式关掉这个 flag
+    // 才能继续表达「dry 语义」这件事；新时序另有专门用例覆盖。
+    bool   fastFeed        = true;
+
     // ---- C1 L2 起播看门狗（2026-10-24 N300 欠载 / 方案 §5.2）----
     // Start 之后 800 ms 内【手里已有数据】却一个字节都没写进去（MOTU 形态：Initialize
     // 接受但流不推进）⟹ 调 l2Degrade 重开 20 ms。返回 true = 降级并已重新 Start，
@@ -273,6 +285,10 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
     // ---------------- C2 遥测状态（2026-10-24 N300 欠载；纯观测）----------------
     // 全部是本地计数：不加锁、不分配（evRing 固定 64 槽），不改变写入/调度/DSP。
     const double loopStartT = nowSec();   // 起播时刻（dry 的 500ms 门槛、WFAIL 的 t= 都相对它）
+    // 相邻两轮的最大间隔（ms）。用于证明「渲染线程被抢占」这类 dry 看不见的断音：
+    // 正常一轮 ≤ 等待上限（per/2 ≈ 5ms）；若出现几十毫秒，就是被系统/DPC 夺走了 CPU。
+    double gapMaxMs = 0.0;
+    double lastIterT = loopStartT;
     long long dryN      = 0;      // dry：设备缓冲空 + 手里有数据 + 我们一个字节也写不进去
     double    dryAccMs  = 0.0;    // 已结算的 dry 墙钟毫秒
     double    dryEnterT = 0.0;    // 当前 dry 片段起点
@@ -472,8 +488,13 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                 //   zp=设备缓冲满（pad 满）  zs=供料不足一个周期（我们喂不上）
                 //   实测只要 zs>0 就说明瓶颈在【轮询粒度/供料】，不在设备。
                 const long long zp = sink.zero_pad_full(), zs = sink.zero_starved();
+                const long long zo = sink.zero_other();
+                // ★ 归因闭合（2026-10-24）：旧 STAT 只打 zp/zs，DC-Elite 现场
+                // w0=471 / zp=84 / zs=0 时「差 387 次」看似未归因，实际全在 ③ other
+                //（有空间但不足一个周期 ⟹ 量化归零）。三项必须同时打印才闭合。
                 if (zp >= 0 || zs >= 0)
-                    ls << " zp=" << zp << " zs=" << zs << " zr=" << sink.zero_reason();
+                    ls << " zp=" << zp << " zs=" << zs << " zo=" << zo
+                       << " zr=" << sink.zero_reason();
                 // ---- C2（2026-10-24 N300 欠载）：把「设备触底」数字化 ----
                 // per = 设备周期帧数（-1 = 该后端不报）；bf = 本循环用的缓冲帧数；
                 // dry/dryms = 轮询时设备缓冲已触底（pad==0）的次数与处于该状态的累计毫秒；
@@ -484,33 +505,83 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                    << " dryms=" << dryMsNow(nowT)
                    << " ev=" << evN
                    << " evint=" << evIntMedian()
-                   << " prod=" << prodMaxMs;
+                   << " prod=" << prodMaxMs
+                   << " gap=" << (long long)gapMaxMs;
                 h.log(ls.str());
                 publish(nowT);
             }
         }
-        const bool waited = sink.wait_event(20);
-        const double evT = nowSec();
-        if (waited) {
-            ++evN;
-            if (evLastT >= 0.0) {
-                evRing[evRingPos] = (evT - evLastT) * 1000.0;
-                evRingPos = (evRingPos + 1) % 64;
-                if (evRingN < 64) ++evRingN;
+        // ★ P0-1/P0-2（2026-10-24 真机 A/B 定案）：旧顺序是「wait_event(20) → 写」，
+        // 于是每一次补料都要先等到事件或 20ms 超时；而设备事件实测 100~105ms 才来一次
+        //（evint），靠它唤醒等于每 100ms 才补一次。现场 DC-Elite 60s 实测 dry=547、
+        // 每次 19.6ms —— 与 20ms 轮询上限完全吻合，即「每次都在下一个轮询才发现缓冲空了」。
+        // 新顺序：① 先按当前可用空间补写（不睡）；② 写不进去才阻塞等事件，
+        // 等待上限取 per/2（per=480@48k ⟹ 5ms），不再固定 20ms。
+        // 2026-10-24 真机转正为默认（h.fastFeed=true）；旧时序仅在 h.fastFeed=false 时保留，
+        // 供既有 dry 用例继续用「时钟只在 wait_event 推进」的旧 mock 模型表达 dry 语义。
+        const size_t pendBefore = pendFrames;
+        size_t w = 0;
+        long long padBefore = 0;
+        // 每次 write_available 调用都记一次 w0/wr（而不是每轮一次）：
+        // 新时序下一轮最多调用两次，若仍按轮计，zp（按调用）会大于 w0，M4 的
+        // 「zp+zs+zo == w0」就不成立（真机现场 19925 vs 9693 就是这么来的）。
+        auto attemptWrite = [&]() -> size_t {
+            const size_t got = sink.write_available(pend.data(), pendFrames);
+            if (got > 0) h.dbgWr->fetch_add(1); else h.dbgW0->fetch_add(1);
+            return got;
+        };
+        if (h.fastFeed) {
+            // 水位必须与 writtenTotal 同一时刻取（都在写之前），否则开播自检会把这一拍
+            // 刚写进去的帧当成"已被消费"，1 个周期 ≈ 5% @1.75s 的偏差直接判死健康设备。
+            padBefore = sink.last_pad();            // 本次轮询的水位（写之前）
+            w = attemptWrite();
+            if (w == 0) {
+                const long long perF = sink.device_period_frames();
+                const int waitMs = (perF > 0 && h.deviceRate > 0)
+                    ? std::max(1, std::min(20,
+                          (int)((double)perF * 1000.0 / (double)h.deviceRate / 2.0)))
+                    : 20;
+                const bool woke = sink.wait_event(waitMs);
+                const double evT = nowSec();
+                if (woke) {
+                    ++evN;
+                    if (evLastT >= 0.0) {
+                        evRing[evRingPos] = (evT - evLastT) * 1000.0;
+                        evRingPos = (evRingPos + 1) % 64;
+                        if (evRingN < 64) ++evRingN;
+                    }
+                    evLastT = evT;
+                }
+                w = attemptWrite();
             }
-            evLastT = evT;
+        } else {
+            const bool waited = sink.wait_event(20);
+            const double evT = nowSec();
+            if (waited) {
+                ++evN;
+                if (evLastT >= 0.0) {
+                    evRing[evRingPos] = (evT - evLastT) * 1000.0;
+                    evRingPos = (evRingPos + 1) % 64;
+                    if (evRingN < 64) ++evRingN;
+                }
+                evLastT = evT;
+            }
+            padBefore = sink.last_pad();
+            w = attemptWrite();
         }
         // 设备已消费帧数 = 已写入 - 设备缓冲里还没播的（pad）。起播时设备缓冲是空的，
         // 所以这个式子在开播窗口内就是「设备真正消费了多少帧」——与 N300 现场
         // 推算 1680000 帧（1689600 写入 - 9600 水位）的口径完全一致。
-        // ★ 必须与 writtenTotal 同一时刻取：写在 write 之前，writtenTotal 也取 write 之前的
-        //   累计值，否则会把这一拍刚写进去的帧当成「已被消费」（1 个周期 ≈ 5% @1.75s）。
-        const long long padNow      = sink.last_pad();
+        // ★ 必须与 writtenTotal 同一时刻取（两者都在本轮写之前）。
+        const long long padNow      = padBefore;
         const long long consumedNow = (long long)writtenTotal - padNow;
         h.dbgPad->store(padNow);
-        const size_t w = sink.write_available(pend.data(), pendFrames);
         const double tAfter = nowSec();
-        if (w > 0) h.dbgWr->fetch_add(1); else h.dbgW0->fetch_add(1);
+        {
+            const double g = (tAfter - lastIterT) * 1000.0;
+            if (g > gapMaxMs) gapMaxMs = g;
+            lastIterT = tAfter;
+        }
 
         // ---- C2 dry 计数（纯观测，方案 §6.3）----
         // 定义（与方案一致）：起播 500 ms 后，设备缓冲在本次写入前已经触底（pad==0）且
@@ -522,7 +593,7 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
         // 反而会漏掉（pad 触底但补上了）—— 那是把判据改成「看不见」。
         // 只对能报告真实设备周期的后端计数（per<0 的 Null/NAA/共享后端没有 padding 概念）。
         const bool padTouched = (sink.device_period_frames() >= 0 &&
-                                 sink.last_pad() == 0 && pendFrames > 0);
+                                 padBefore == 0 && pendBefore > 0);
         if (padTouched) {
             if (tAfter - loopStartT >= 0.5) {
                 ++dryN;

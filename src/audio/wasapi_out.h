@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -131,7 +132,13 @@ struct ZeroAttrib {
 //   room 不足一个周期（如 room=4800、per=9600）⟹ 返回 0，这一轮什么也没写，
 //   ZeroAttrib 归因为 other —— 不是 padFull（设备缓冲并没有满）。
 inline size_t quantize_period_write(size_t toWrite, size_t per, size_t bufferFrames) {
-    if (per > 1 && per <= bufferFrames && (toWrite % per) != 0) toWrite = (toWrite / per) * per;
+    // ★ P0-3（2026-10-24，1.3.15 真机日志驱动）：只有「≥ 一个周期」时才向下取整到周期倍数。
+    // 不足一个周期的余量以前被归零 ⟹ DC-Elite 现场 w0=471 里 387 次（82%）都是这种余量，
+    // 白等到缓冲再次变空才写，直接表现为每 100 ms 一次的断音。
+    // 独占模式的 GetBuffer 只要求「不超过可用空间」；周期整数倍是 Initialize 缓冲时长的约束，
+    // 不是单次 GetBuffer 的约束（个别驱动会拒绝非整周期，write_available 里有失败回退）。
+    if (per > 1 && per <= bufferFrames && toWrite >= per && (toWrite % per) != 0)
+        toWrite = (toWrite / per) * per;
     return toWrite;
 }
 
@@ -414,16 +421,47 @@ public:
         ev_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         REFERENCE_TIME dur = (REFERENCE_TIME)(bufferMs * 10000.0);
         struct Try { REFERENCE_TIME buf; REFERENCE_TIME per; DWORD flags; const char* why; };
-        const Try tries[] = {
-            { dur, dur,       AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=period=100ms,event" },
-            { dur, 0,         AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=100ms,period=驱动默认,event" },
-            { 0,   0,         AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer/period 全默认,event" },
-            { dur, 0,         0,                                 "buffer=100ms,period默认,轮询" },
-            { 0,   0,         0,                                 "全默认,轮询" },
+        // ★ 2026-10-24 真机定案（iBasso DC-Elite，用户确认听感）：
+        //   「轮询」优先，「事件回调」降到兜底。理由（全部实测）：
+        //   1) 这个驱动的 EVENTCALLBACK 只在**整个缓冲播完**时才发一次事件
+        //      （evint 恒等于缓冲时长：100ms 缓冲→100ms，500ms→500ms，而不是设备周期 10ms），
+        //      于是每次都必须在缓冲边界整块重填，边界处产生断点 —— 听感「哒哒声」，
+        //      且频率与缓冲大小成反比（用户实听确认：500ms 缓冲时明显变慢）。
+        //   2) 轮询模式下按可用空间细写（实测平均每次 261 帧，而不是 4800），
+        //      缓冲始终不触底（dry=0/dryms=0），用户实听确认「干净了」。
+        //   3) 旧的轮询配方其实**从来没成功过**：SetEventHandle 被无条件下调用，
+        //      没有事件句柄的流必然失败（见下方配方 2 的守卫修复）。
+        // 需要事件模式的场合仍可用：RTA_WASAPI_EVENT=1 时把事件配方提前。
+        static const bool preferEvent = [] {
+            const char* v = std::getenv("RTA_WASAPI_EVENT");
+            return v && v[0] == '1';
+        }();
+        const Try triesEventFirst[] = {
+            { dur, 0,   AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=xxxms,period=驱动默认,event" },
+            { 0,   0,   AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer/period 全默认,event" },
+            { dur, 0,   0,                                 "buffer=xxxms,period默认,轮询" },
+            { 0,   0,   0,                                 "全默认,轮询" },
+            { dur, dur, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=period=xxxms,event（兜底）" },
         };
+        const Try triesPollFirst[] = {
+            { dur, 0,   0,                                 "buffer=xxxms,period默认,轮询" },
+            { 0,   0,   0,                                 "全默认,轮询" },
+            { dur, 0,   AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=xxxms,period=驱动默认,event" },
+            { 0,   0,   AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer/period 全默认,event" },
+            { dur, dur, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=period=xxxms,event（兜底）" },
+        };
+        const Try* tries = preferEvent ? triesEventFirst : triesPollFirst;
+        const int nTries = 5;
         std::string trialLog;
         hr = E_FAIL;
         const char* fmtUsed = "";
+        // ★ 2026-10-24 实验：RTA_FORCE_POLL=1 时跳过事件回调配方，只用轮询。
+        // DC-Elite 实测事件只在「整个缓冲播完」才来一次（evint 恒等于缓冲时长），
+        // 于是每次都必须在边界处整块重填 ⟹ 边界断音。轮询模式下我们自己按余量补写。
+        static const bool forcePoll = [] {
+            const char* v = std::getenv("RTA_FORCE_POLL");
+            return v && v[0] == '1';
+        }();
         for (int fi = 0; fi < nFmt; ++fi) {
           const Fmt& F = fmts[fi];
           std::memset(&wfx_, 0, sizeof(wfx_));
@@ -438,8 +476,9 @@ public:
           wfx_.dwChannelMask          = channel_mask_for(channels);
           wfx_.SubFormat              = F.flt ? SUB_FLOAT : SUB_PCM;
           if (fi > 0) trialLog += std::string("[换格式 ") + F.tag + "] ";
-        for (int ti = 0; ti < (int)(sizeof(tries) / sizeof(tries[0])); ++ti) {
+        for (int ti = 0; ti < nTries; ++ti) {
             const Try& t = tries[ti];
+            if (forcePoll && (t.flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK)) continue;   // 只走轮询
             hr = ac_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, t.flags, t.buf, t.per,
                                  (WAVEFORMATEX*)&wfx_, nullptr);
             {
@@ -497,12 +536,18 @@ public:
         }
 
         // 配方 2：SetEventHandle 在 Initialize 之后
-        hr = ac_->SetEventHandle(ev_);
-        if (FAILED(hr)) {
-            char hb[64]; std::snprintf(hb, sizeof(hb), "0x%08lX %s",
-                                       (unsigned long)(unsigned)hr, hr_name(hr));
-            lastErr_ = std::string("SetEventHandle 失败: ") + hr_name(hr);
-            fillFail(hb); close(); return false;
+        // ★ 2026-10-24 真 bug：只有带 EVENTCALLBACK 的流才有事件句柄。
+        // 以前无条件调用 ⟹ 轮询配方（flags=0）**必然**在这里失败，
+        // 于是「事件模式不可用就退回轮询」这条兜底从来没生效过（实测 DC-Elite：
+        // 报 "SetEventHandle 失败"，然后整条独占路径被判死、回退共享）。
+        if (tries[initRecipeIndex_].flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) {
+            hr = ac_->SetEventHandle(ev_);
+            if (FAILED(hr)) {
+                char hb[64]; std::snprintf(hb, sizeof(hb), "0x%08lX %s",
+                                           (unsigned long)(unsigned)hr, hr_name(hr));
+                lastErr_ = std::string("SetEventHandle 失败: ") + hr_name(hr);
+                fillFail(hb); close(); return false;
+            }
         }
 
         ac_->GetBufferSize(&bufferFrames_);
@@ -674,7 +719,17 @@ public:
         const HRESULT gb = rc_->GetBuffer((UINT32)toWrite, &data);
         lastGbHr_ = (long long)gb;
         detail_.gbHr = (long long)gb;
-        if (FAILED(gb) || !data) return 0;
+        if (FAILED(gb) || !data) {
+            // P0-3 回退：上面允许了「不足一个周期」的写入，个别独占驱动会拒绝非整周期。
+            // 此时退回周期整数倍再试一次；本次仍失败则照旧返回 0（不改变错误语义）。
+            const size_t q = quantize_period_write(toWrite, per, bufferFrames_);
+            if (q == 0 || q == toWrite) return 0;
+            const HRESULT gb2 = rc_->GetBuffer((UINT32)q, &data);
+            lastGbHr_ = (long long)gb2;
+            detail_.gbHr = (long long)gb2;
+            if (FAILED(gb2) || !data) return 0;
+            toWrite = q;
+        }
         pack(data, src, toWrite);
         if (FAILED(rc_->ReleaseBuffer((UINT32)toWrite, 0))) return 0;
         written_ += toWrite;
