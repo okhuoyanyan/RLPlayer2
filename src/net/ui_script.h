@@ -1011,7 +1011,9 @@ function openAlbum(k) {
     Array.prototype.forEach.call(D('list').querySelectorAll('.trow'), function (e) {
       e.onclick = function (ev) {
         if (ev.target.closest && ev.target.closest('.fav-btn')) return;
-        playAlbum(j.k, +e.dataset.i);
+        var ti = +e.dataset.i;
+        var tk = (j.tracks || [])[ti] || {};
+        playAlbum(j.k, ti, tk.cs, tk.ce);      // cue 曲目：把本轨起止秒一起带上
       };
     });
   }).catch(function (e) {
@@ -1107,8 +1109,11 @@ function albumTrackPrefetch(alb) {
   albPrefPump();
 }
 
-function playAlbum(k, i) {
-  api('/api/lib/play', 'k=' + encodeURIComponent(k) + '&i=' + (i || 0) + '&' + params()).then(function (j) {
+/* cs/ce = 被点那一轨的 CUE 区间（来自 /api/lib/album 每首的 cs/ce）。
+   服务端本来就从库里读同一份区间（双保险：索引是旧版时前端这份仍然能把起点带对），
+   两者一致时行为完全相同 —— 判据"点第 2 轨从 0 开始计 pos"两边都成立。 */
+function playAlbum(k, i, cs, ce) {
+  api('/api/lib/play', 'k=' + encodeURIComponent(k) + '&i=' + (i || 0) + cueQuery(cs, ce) + '&' + params()).then(function (j) {
     if (!j.ok) { toast(j.error || '播放失败'); return; }
     toast('开始播放专辑'); loadQ();
   });
@@ -1909,8 +1914,16 @@ function loadRecent() {
 }
 
 /* ---------------- 播放控制 ---------------- */
-function playPath(f) {
-  api('/api/play', 'file=' + encodeURIComponent(f) + '&' + params()).then(function (j) {
+/* CUE 分轨（2026-10-25）：cue 把整轨切成 N 首，这 N 首的 path 完全相同，
+   只有 cue_start/cue_end（秒）能区分。cs < 0 = 整首（旧行为，负向对照就走这条）。
+   为什么不传"时长"：播放侧需要的是起点，只给时长等于少一半信息。 */
+function cueQuery(cs, ce) {
+  if (!(cs >= 0)) return '';
+  return '&cue_start=' + encodeURIComponent(cs) +
+         (ce >= 0 ? ('&cue_end=' + encodeURIComponent(ce)) : '');
+}
+function playPath(f, cs, ce) {
+  api('/api/play', 'file=' + encodeURIComponent(f) + cueQuery(cs, ce) + '&' + params()).then(function (j) {
     if (j && j.ok === false) { toast(j.error || '播放失败'); return; }
     toast('开始播放'); loadQ();
   });
@@ -1949,7 +1962,10 @@ function showQueueContextMenu(x, y, idx) {
   itemPlay.onclick = function (ev) {
     ev.stopPropagation();
     hideContextMenu();
-    if (S.q && S.q.items && S.q.items[idx]) playPath(S.q.items[idx]);
+    if (S.q && S.q.items && S.q.items[idx]) {
+      var c = (S.q.cues || [])[idx] || [-1, -1];
+      playPath(S.q.items[idx], c[0], c[1]);
+    }
   };
 
   var itemDel = document.createElement('div');
@@ -1970,7 +1986,8 @@ function showQueueContextMenu(x, y, idx) {
 /* ---------------- 队列 ---------------- */
 function loadQ() {
   api('/api/queue').then(function (j) {
-    S.q = { items: j.items || [], index: j.index || 0 };
+    // cues 与 items 逐项对齐的 [起,止] 秒数组（后端 /api/queue；[-1,-1] = 整首）
+    S.q = { items: j.items || [], cues: j.cues || [], index: j.index || 0 };
     if (D('sShuf')) D('sShuf').checked = !!j.shuffle;
     if (D('sRep') && j.repeat !== undefined) { D('sRep').value = String(j.repeat); applyRep(j.repeat); }
     D('rcnt').textContent = '共 ' + S.q.items.length + ' 首';
@@ -1990,7 +2007,8 @@ function loadQ() {
       var i = +e.dataset.i;
       e.onclick = function (ev) {
         if (ev.target.classList.contains('qdel')) return;
-        playPath(S.q.items[i]);
+        var c = (S.q.cues || [])[i] || [-1, -1];
+        playPath(S.q.items[i], c[0], c[1]);
       };
       e.oncontextmenu = function (ev) {
         ev.preventDefault();
