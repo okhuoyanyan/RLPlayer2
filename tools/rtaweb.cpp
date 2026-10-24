@@ -233,6 +233,9 @@ static PlayerState g_ps;
 // 20 段参数均衡 PEQ（261024-02 #6）：全局单例。播放线程处理音频，HTTP 线程改参数（热更新）。
 static std::shared_ptr<rta::dsp::PeqEngine> g_peq;
 static std::atomic<bool> g_exitReq{false};
+// 2026-10-25：退出中标志。后台 detached 任务看到它就尽量提前收尾（目前只用于文档与诊断，
+// 真正防崩溃靠 main 末尾的 detach + _Exit，见那里的注释）。
+static std::atomic<bool> g_shutdown{false};
 // 播放线程诊断计数（出问题时第一手证据，比猜快得多）
 static std::atomic<long long> g_dbgW0{0}, g_dbgPulls{0}, g_dbgWf{0}, g_dbgWr{0}, g_dbgPer{0};
 // C2 遥测（2026-10-24 N300 欠载）：dry/dryms/ev/evint/prod 由 render_loop 计数并导出，
@@ -1205,9 +1208,15 @@ static bool native_dsd_precheck(const PlayParams& p, std::string& why) {
         return false;
     }
     // 升频：DSD 源解成 PCM 再升频是 DoP 路径的事；Native 按【源位率】直通，不重调制。
-    if (!(p.rate.empty() || p.rate == "src")) {
+    //
+    // ⚠️ 2026-10-25 修：这里原来只认 "" 和 "src"，而**设置页/conf 里「跟随源」写的是 "follow"**
+    //（ui_script.h:1942 的 sRate 第一项、rtaweb.cpp:2347 的 rateAuto 也都把 follow 当跟随源）。
+    // 后果是 GUI 用户明明选的就是「跟随源」，却被告知「请改成跟随源」——永远用不了原生 DSD。
+    // 现在三种等价写法都接受；"max"（要升频）和具体数字（要换率）仍然明确拒绝。
+    const bool rateFollowsSource = (p.rate.empty() || p.rate == "src" || p.rate == "follow");
+    if (!rateFollowsSource) {
         why = "Native DSD 按源位率直通，不做升频：采样率设置当前是「" + p.rate +
-              "」，请改成「跟随源」（设置 → 输出 → 采样率）。";
+              "」，请改成「跟随源」（设置 → 输出 → 采样率；等价写法 src / follow）。";
         return false;
     }
     return true;
@@ -7872,5 +7881,26 @@ int main(int argc, char** argv) {
     g_ps.stop.store(true);
     g_ps.joinIfDone();
     ui.stop();
-    return 0;
+    // ---- 2026-10-25：退出崩溃（0xC0000409 / __fastfail）取证 + 收尾 ----
+    // 现象：/api/quit 后约 1.9~2.1 秒进程以 0xC0000409 退出（无工作、有工作都一样）。
+    // 该码在 MSVC/CRT 里最常见的来源是 **std::terminate**（例如 joinable 的 std::thread 被析构）。
+    // 这里把「谁还 joinable」写进日志，先把根因坐实，再做收尾（不猜）。
+    {
+        std::ostringstream o;
+        o << "SHUTDOWN joinable: player=" << (g_ps.th.joinable() ? 1 : 0)
+          << " prefetch=" << (g_pre.th.joinable() ? 1 : 0)
+          << " scan=" << (g_wb.th.joinable() ? 1 : 0);
+        play_log(o.str());
+    }
+    g_shutdown = true;                     // 让后台活儿看到"要退了"，别再碰全局
+    // 这两个 std::thread 成员如果还 joinable，就会在静态析构时触发 std::terminate
+    // （MSVC 把它报成 0xC0000409 / __fastfail —— 与本崩溃码完全吻合）。
+    // 它们可能正在解码/扫描（几十秒），所以**不 join**（会卡退出），改成 detach：
+    // 紧接着的 _Exit 会结束整个进程，detached 线程随进程消失，不会再碰已析构的全局。
+    if (g_pre.th.joinable()) g_pre.th.detach();
+    if (g_wb.th.joinable())  g_wb.th.detach();
+    // 其余一次性 detached 任务（summary / knowledge）在 g_shutdown 后自行收尾；
+    // 这里用 _Exit 跳过静态析构 —— 文件与日志都已 flush，继续跑析构只会和 detached 线程抢全局。
+    std::fflush(nullptr);
+    std::_Exit(0);
 }

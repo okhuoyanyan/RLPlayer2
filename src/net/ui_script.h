@@ -281,6 +281,52 @@ function rzDirAt(x, y) {
   }, true);
 })();
 
+/* ---------------- 261025 临时探针：右边缘到底被谁占着（取证用，最终提交前会收进修复逻辑） ----------------
+   要证明三件事：
+     ① 主区是否真的在滚动（scrollHeight > clientHeight）；
+     ② 右边缘那条滚动条多宽（offsetWidth - clientWidth）；
+     ③ 右边缘 (W-2) 处 elementFromPoint 命中谁 —— Chromium 不把滚动条上的鼠标派发给 DOM，
+        所以「热区整条落在滚动条里」这件事必须用页面自己的度量说明，而不是猜。
+   证据落在宿主日志的 'wvmsg: rzdiag: ...' 行（宿主对所有页面消息都会先打一行 wvmsg）。
+   只在几何/视图变化时发，不刷屏。 */
+(function rzDiag() {
+  if (!WV) return;
+  var last = '';
+  function box(el) {
+    if (!el) return '-';
+    var r = el.getBoundingClientRect();
+    return '[' + Math.round(r.left) + ',' + Math.round(r.right) + ',' + (el.offsetWidth - el.clientWidth) +
+           ',' + (el.scrollHeight > el.clientHeight + 1 ? 1 : 0) + ']';
+  }
+  function who() {
+    var W = window.innerWidth, H = window.innerHeight, e = null;
+    try { e = document.elementFromPoint(W - 2, Math.round(H / 2)); } catch (x) { return '-'; }
+    if (!e) return 'null';
+    var cn = (typeof e.className === 'string' && e.className) ? '.' + e.className.split(/\s+/)[0] : '';
+    return e.tagName + (e.id ? '#' + e.id : '') + cn;
+  }
+  function tick() {
+    var W = window.innerWidth, H = window.innerHeight;
+    var app = D('app');
+    var hot = document.querySelector('#rzHot .rz-r');
+    var hr = hot ? (Math.round(hot.getBoundingClientRect().left) + '..' + Math.round(hot.getBoundingClientRect().right)) : '-';
+    var s = 'rzdiag: W=' + W + ' H=' + H + ' dpr=' + (window.devicePixelRatio || 1) +
+            ' view=' + (S.view || '-') + ' noq=' + ((app && app.classList.contains('noq')) ? 1 : 0) +
+            ' main[l,r,sbw,ov]=' + box(document.querySelector('.main')) +
+            ' rbody=' + box(document.querySelector('.rbody')) +
+            ' hotR=' + hr + ' atR2=' + who();
+    if (s === last) return;
+    last = s;
+    wcmd(s);
+  }
+  var tmr = 0;
+  function later() { clearTimeout(tmr); tmr = setTimeout(tick, 260); }
+  window.addEventListener('resize', later);
+  document.addEventListener('click', later, true);
+  setTimeout(tick, 700);
+  setInterval(tick, 1200);
+})();
+
 function fmtTag(sr, bits) {
   if (!sr) return '';
   return (sr % 1000 === 0 ? (sr / 1000) + 'k' : (Math.round(sr / 100) / 10) + 'k') + '/' + bits;
