@@ -42,6 +42,11 @@ struct ResamplerConfig {
     WindowKind window       = WindowKind::Kaiser;   // Kaiser = 原有行为，完全等价
     PhaseKind  phase        = PhaseKind::Linear;
 
+    // ---- 切趾滤波（Apodizing）----
+    bool   apodizing   = false;
+    double apodF1      = 0.0;   // 滚降起始相对输入 Nyquist 比例（例如 18.4k / 22.05k）
+    double apodF2      = 0.0;   // 滚降终止相对输入 Nyquist 比例（例如 21.8k / 22.05k）
+
     // ---- 两段式升频 ----
     // 大比率（如 44.1k -> 705.6k 是 16 倍）单级做时，每输出样本要做 totalTaps/L 次乘加，
     // 而输出样本数是 L 倍 ⟹ 总运算量 ∝ totalTaps × 输出率，非常贵。
@@ -60,6 +65,9 @@ inline void apply_preset(ResamplerConfig& cfg, const FilterPreset& fp) {
     cfg.window     = fp.window;
     cfg.phase      = fp.phase;
     cfg.twoStage   = fp.twoStage;
+    cfg.apodizing  = fp.apodizing;
+    cfg.apodF1     = fp.apodF1;
+    cfg.apodF2     = fp.apodF2;
     if (fp.twoStage && fp.stage2Taps > 0) cfg.stage2Taps = fp.stage2Taps;
 }
 
@@ -129,7 +137,7 @@ public:
         total = T_ * L_;
 
         std::vector<double> proto;
-        if (cfg.window == WindowKind::Kaiser && cfg.phase == PhaseKind::Linear) {
+        if (cfg.window == WindowKind::Kaiser && cfg.phase == PhaseKind::Linear && !cfg.apodizing) {
             // 原有路径：参数化 Kaiser sinc（保持逐位不变）
             LowpassSpec spec;
             spec.taps    = total;
@@ -145,6 +153,12 @@ public:
             fs.cutoff     = cutoff;
             fs.attenDb    = cfg.attenDb;
             fs.window     = cfg.window;
+            fs.apodizing  = cfg.apodizing;
+            if (cfg.apodizing) {
+                // idealCutoff 为输入 Nyquist 在内插域的位置（1.0 / L）
+                fs.apodF1 = cfg.apodF1 * idealCutoff;
+                fs.apodF2 = cfg.apodF2 * idealCutoff;
+            }
             proto = design_fir(fs);
             // 最小相位是独立一步（倒谱法），不是 design_fir 的参数
             if (cfg.phase == PhaseKind::Minimum) {

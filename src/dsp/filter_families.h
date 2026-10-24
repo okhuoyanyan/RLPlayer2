@@ -78,24 +78,49 @@ inline std::vector<double> make_window(WindowKind kind, int n, double attenDb) {
 
 // ---------------- 原型设计（线性相位）----------------
 struct FirSpec {
-    int        taps    = 4095;
-    double     cutoff  = 0.5;      // 归一化：1.0 = Nyquist
-    double     attenDb = 180.0;
-    WindowKind window  = WindowKind::Kaiser;
+    int        taps       = 4095;
+    double     cutoff     = 0.5;      // 归一化：1.0 = Nyquist
+    double     attenDb    = 180.0;
+    WindowKind window     = WindowKind::Kaiser;
+    bool       apodizing  = false;
+    double     apodF1     = 0.0;      // 归一化滚降起点（1.0 = Nyquist）
+    double     apodF2     = 0.0;      // 归一化滚降终点（1.0 = Nyquist）
 };
 
 inline std::vector<double> design_fir(const FirSpec& s) {
     int n = s.taps; if (n < 3) n = 3; if ((n & 1) == 0) ++n;
     const auto w = make_window(s.window, n, s.attenDb);
-    const double fc = s.cutoff * 0.5;
     const double m  = (double)(n - 1) * 0.5;
     std::vector<double> h((size_t)n);
     double sum = 0.0;
-    for (int i = 0; i < n; ++i) {
-        const double x = (double)i - m;
-        const double sc = (x == 0.0) ? 2.0 * fc : std::sin(2.0 * kPi * fc * x) / (kPi * x);
-        h[(size_t)i] = sc * w[(size_t)i];
-        sum += h[(size_t)i];
+    if (!s.apodizing) {
+        const double fc = s.cutoff * 0.5;
+        for (int i = 0; i < n; ++i) {
+            const double x = (double)i - m;
+            const double sc = (x == 0.0) ? 2.0 * fc : std::sin(2.0 * kPi * fc * x) / (kPi * x);
+            h[(size_t)i] = sc * w[(size_t)i];
+            sum += h[(size_t)i];
+        }
+    } else {
+        // Apodizing 切趾：在通带高频加入平滑滚降（Raised-Cosine 频域过渡带），大幅压低 20 kHz 附近的预振铃
+        double f1 = (s.apodF1 > 0.0) ? s.apodF1 : (s.cutoff * 0.85);
+        double f2 = (s.apodF2 > 0.0) ? s.apodF2 : (s.cutoff * 1.05);
+        if (f1 > f2) std::swap(f1, f2);
+        const double fc = 0.5 * (f1 + f2) * 0.5;
+        const double df = 0.5 * (f2 - f1) * 0.5;
+        for (int i = 0; i < n; ++i) {
+            const double x = (double)i - m;
+            const double sinc_val = (x == 0.0) ? 2.0 * fc : std::sin(2.0 * kPi * fc * x) / (kPi * x);
+            const double denom = 1.0 - 16.0 * df * df * x * x;
+            double factor;
+            if (std::abs(denom) < 1e-7) {
+                factor = kPi / 4.0;
+            } else {
+                factor = std::cos(2.0 * kPi * df * x) / denom;
+            }
+            h[(size_t)i] = sinc_val * factor * w[(size_t)i];
+            sum += h[(size_t)i];
+        }
     }
     if (sum != 0.0) for (auto& v : h) v /= sum;
     return h;
@@ -196,6 +221,9 @@ struct FilterPreset {
     bool        forNx       = false; // true = 用于 Nx（高码率）路径
     bool        twoStage    = false; // true = 两段式升频（*-2s）
     int         stage2Taps  = 64;    // 第二级每相位抽头数
+    bool        apodizing   = false; // true = 切趾（通带高频平滑渐进衰减）
+    double      apodF1      = 0.0;   // 滚降起始相对输入 Nyquist 比例（例如 18.4k / 22.05k）
+    double      apodF2      = 0.0;   // 滚降终止相对输入 Nyquist 比例（例如 21.8k / 22.05k）
 };
 
 // 抽头数量级参考手册：short≈4k, medium≈32k, long≈256k, xl≈1M, sinc-M≈1M, 16M≈16M
@@ -261,6 +289,11 @@ inline const std::vector<FilterPreset>& filter_presets() {
         // ---- 7. 最小振铃特殊类型 ----
         { "minringFIR",                 511,    0.28,   90, WindowKind::BlackmanHarris, PhaseKind::Linear,       false, false, 64 },
         { "minringFIR-mp",              511,    0.28,   90, WindowKind::BlackmanHarris, PhaseKind::Minimum,      false, false, 64 },
+
+        // ---- 8. 切趾（Apodizing）家族（通带渐进平滑滚降，压低 20 kHz 预振铃与 MQA/有损编码失真）----
+        { "apod-20k",                  4095,    0.10,  120, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64, true, 18400.0 / 22050.0, 21800.0 / 22050.0 },
+        { "apod-19k-short",            4095,    0.10,  120, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64, true, 18000.0 / 22050.0, 21400.0 / 22050.0 },
+        { "apod-wide",                 4095,    0.10,  120, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64, true, 17800.0 / 22050.0, 21700.0 / 22050.0 },
     };
     return p;
 }
@@ -288,6 +321,12 @@ inline std::vector<double> make_filter(const std::string& name, bool nxPath, int
     const double cutoff = 0.5 * (1.0 - best->transition);
     FirSpec s;
     s.taps = best->taps; s.cutoff = cutoff; s.attenDb = best->attenDb; s.window = best->window;
+    s.apodizing = best->apodizing;
+    if (best->apodizing) {
+        // 在 2x 原型域中，0.5 对应输入 Nyquist（22.05 kHz）
+        s.apodF1 = best->apodF1 * 0.5;
+        s.apodF2 = best->apodF2 * 0.5;
+    }
     auto h = design_fir(s);
     if (best->phase == PhaseKind::Minimum) h = to_minimum_phase(h);
     else if (best->phase == PhaseKind::Intermediate) h = to_intermediate_phase(h);

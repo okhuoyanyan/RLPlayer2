@@ -71,6 +71,11 @@ int main() {
             FirSpec s;
             s.taps = p.taps; s.cutoff = 0.5 * (1.0 - p.transition);
             s.attenDb = p.attenDb; s.window = p.window;
+            s.apodizing = p.apodizing;
+            if (p.apodizing) {
+                s.apodF1 = p.apodF1 * 0.5;
+                s.apodF2 = p.apodF2 * 0.5;
+            }
             auto h = design_fir(s);
             if (p.phase == PhaseKind::Minimum) h = to_minimum_phase(h);
             else if (p.phase == PhaseKind::Intermediate) h = to_intermediate_phase(h);
