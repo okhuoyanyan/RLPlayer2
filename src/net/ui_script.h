@@ -240,6 +240,10 @@ Array.prototype.forEach.call(document.querySelectorAll('.sw'), function (e) {
      ② 只在 html.webview2 下创建（浏览器直开时没有 chrome.webview，也不该有窗口边缘）；
      ③ 角落 10x10 优先于边（四条边各 5px），区域永远只在最外 5px ⟹ 顶栏按钮/单曲页控件不受影响；
      ④ stopPropagation：否则顶栏的拖拽处理（bindWindowChrome 的 'drag'）会跟着发一条，宿主会收到两条命令。 */
+// 边缘热区带宽（逻辑 px）：判定带、光标带、以及"贴右缘滚动容器让出的宽度"必须是同一个值。
+// CSS 侧走 var(--rzband,5px)（ui_page.h 的 #rzHot .rz-r / .rz-edge-inset），JS 启动时把它写到 :root，
+// 这样三处不会再各写一个 5（历史上的 bug 之一就是判定 5px、光标带 3px 不一致）。
+var RZ_BAND = 5;
 var RZ_EDGES = [
   ['topleft', 'rz-tl'], ['topright', 'rz-tr'], ['bottomleft', 'rz-bl'], ['bottomright', 'rz-br'],
   ['left', 'rz-l'], ['right', 'rz-r'], ['top', 'rz-t'], ['bottom', 'rz-b']
@@ -248,7 +252,7 @@ function rzDirAt(x, y) {
   var W = window.innerWidth || document.documentElement.clientWidth || 0;
   var H = window.innerHeight || document.documentElement.clientHeight || 0;
   if (!W || !H) return '';
-  var E = 5, C = 10;                       // 边 5px、角落 10x10
+  var E = RZ_BAND, C = 10;                 // 边 = RZ_BAND（5px）、角落 10x10
   var CL = x <= C, CR = x >= W - C, CT = y <= C, CB = y >= H - C;
   if (CT && CL) return 'topleft';
   if (CT && CR) return 'topright';
@@ -281,22 +285,96 @@ function rzDirAt(x, y) {
   }, true);
 })();
 
-/* ---------------- 261025 临时探针：右边缘到底被谁占着（取证用，最终提交前会收进修复逻辑） ----------------
-   要证明三件事：
-     ① 主区是否真的在滚动（scrollHeight > clientHeight）；
-     ② 右边缘那条滚动条多宽（offsetWidth - clientWidth）；
-     ③ 右边缘 (W-2) 处 elementFromPoint 命中谁 —— Chromium 不把滚动条上的鼠标派发给 DOM，
-        所以「热区整条落在滚动条里」这件事必须用页面自己的度量说明，而不是猜。
-   证据落在宿主日志的 'wvmsg: rzdiag: ...' 行（宿主对所有页面消息都会先打一行 wvmsg）。
-   只在几何/视图变化时发，不刷屏。 */
+/* ---------------- 261025 窗口右边缘：先让滚动条退出最外 5px ----------------
+   为什么需要：右边缘的拉伸热区在最外 5px，而**滚动条也在这 5px 上**。原生滚动条的命中在浏览器
+   内部（Chromium 的滚动条不是 DOM），鼠标落在滚动条上时：轻则"按下先滚一格再改窗口大小"（实测
+   .main / .rbody 都如此），重则在某些运行时（overlay/fluent 滚动条）完全不给页面派发 mousedown ⟹
+   窄窗（<1240px，主区滚动条正好贴右边）右边缘就拖不动，而左/上/下三边正常。
+   修法：只对**贴住窗口右边缘的滚动容器**加 .rz-edge-inset（右侧 5px 透明边框，见 ui_page.h），
+   滚动条整体退到 5px 内侧，最外 5px 永远是页面 ⟹ 永远是热区。不隐藏滚动条、不改外观、
+   不动左/上/下三边（左侧容器的滚动条在自己右缘，不在窗口左缘）。
+   探测口径：
+     * 候选 = 计算样式 overflow-y 为 auto/scroll 的元素（跑一次全量扫描，之后靠 DOM/resize 事件复测）；
+     * "贴右缘" = getBoundingClientRect().right >= innerWidth-1（加的是边框不是 margin，
+       box-sizing:border-box 下外框不动 ⟹ 该判据不会自我反馈、不会抖动）；
+     * 文档序处理（外层先于内层），getBoundingClientRect 强制布局，嵌套滚动容器不会重复加。
+   触发点：加载、window.resize、click（视图切换多由点击驱动）、#app class 变化（noq 开关）。
+   ⚠️ 已知边界：元素若本来就有**可见的**右边框，会被这条规则改成透明（目前贴右缘的只有
+      .main / .rbody，两者都没有右边框；新增带右边框的贴边滚动容器时需要另想办法）。 */
+var rzScrollers = [];                  // 候选滚动容器（扫描结果缓存）
+function rzScanScrollers() {
+  var out = [];
+  var all = document.querySelectorAll('*');
+  for (var i = 0; i < all.length; i++) {
+    var el = all[i];
+    if (el.id === 'rzHot' || (el.parentNode && el.parentNode.id === 'rzHot')) continue;
+    var oy = '';
+    try { oy = getComputedStyle(el).overflowY; } catch (e) { oy = ''; }
+    if (oy !== 'auto' && oy !== 'scroll') continue;
+    out.push(el);
+  }
+  rzScrollers = out;
+}
+function rzApplyEdgeInset() {
+  var W = window.innerWidth || 0;
+  if (!W) return;
+  for (var i = 0; i < rzScrollers.length; i++) {
+    var el = rzScrollers[i];
+    if (!el.isConnected) continue;
+    var r = el.getBoundingClientRect();
+    var on = el.classList.contains('rz-edge-inset');
+    var atEdge = (r.right >= W - 1) && r.width > 8 && r.height > 8;
+    if (atEdge && !on) el.classList.add('rz-edge-inset');
+    else if (!atEdge && on) el.classList.remove('rz-edge-inset');
+  }
+}
+(function rzBindEdgeInset() {
+  if (!WV) return;
+  try { document.documentElement.style.setProperty('--rzband', RZ_BAND + 'px'); } catch (e) { }
+  var tmr = 0;
+  function later(rescan) {
+    clearTimeout(tmr);
+    tmr = setTimeout(function () {
+      if (rescan) rzScanScrollers();
+      rzApplyEdgeInset();
+    }, 160);
+  }
+  window.addEventListener('resize', function () { later(false); });
+  document.addEventListener('click', function () { later(false); }, true);
+  // 结构变化（换视图/重渲染）才重扫候选；纯 class 变化用缓存即可（但 noq 会改变谁贴右缘，所以也复测）
+  if (window.MutationObserver) {
+    var mo = new MutationObserver(function (recs) {
+      var structural = false;
+      for (var i = 0; i < recs.length; i++) { if (recs[i].type !== 'attributes') { structural = true; break; } }
+      later(structural);
+    });
+    mo.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+  }
+  rzScanScrollers();
+  rzApplyEdgeInset();
+  setTimeout(function () { rzScanScrollers(); rzApplyEdgeInset(); }, 300);
+})();
+
+/* ---------------- 261025 右边缘几何诊断（一行/几何变化，走宿主日志） ----------------
+   「窄窗右边缘拖不动」这个 bug 已经错过两轮（261024-05 把热区收窄到 3px 也没用），
+   原因都是**没人能量出滚动条到底占了哪几像素**。所以留下这一行诊断，字段口径：
+     main / rbody = [left, right, offsetWidth-clientWidth, 是否真滚动, scrollTop, sbR]
+       - offsetWidth-clientWidth = 右侧边框 + 竖向滚动条宽度（9px 来自全局 ::-webkit-scrollbar）
+       - sbR = 滚动条自身的右缘（right 减去右边框）⟹ 修复生效时它应当 = 窗口宽 - 5
+     hotR  = 右热区的左右边界（应覆盖 [W-5, W]）
+     atR2  = (W-2, H/2) 处 elementFromPoint 命中谁
+   只在几何/视图变化时发一条（去重），不刷屏；宿主对所有页面消息都会先打一行 'wvmsg: ...'。 */
 (function rzDiag() {
   if (!WV) return;
   var last = '';
   function box(el) {
     if (!el) return '-';
     var r = el.getBoundingClientRect();
+    var bw = 0;
+    try { bw = parseFloat(getComputedStyle(el).borderRightWidth) || 0; } catch (e) { bw = 0; }
     return '[' + Math.round(r.left) + ',' + Math.round(r.right) + ',' + (el.offsetWidth - el.clientWidth) +
-           ',' + (el.scrollHeight > el.clientHeight + 1 ? 1 : 0) + ']';
+           ',' + (el.scrollHeight > el.clientHeight + 1 ? 1 : 0) + ',' + Math.round(el.scrollTop) +
+           ',sbR=' + Math.round(r.right - bw) + ']';
   }
   function who() {
     var W = window.innerWidth, H = window.innerHeight, e = null;
@@ -320,11 +398,14 @@ function rzDirAt(x, y) {
     wcmd(s);
   }
   var tmr = 0;
-  function later() { clearTimeout(tmr); tmr = setTimeout(tick, 260); }
+  // 先套用一次内缩再量：报告里必须是**修复后**的几何（滚动条右缘 = W-5），否则日志会误导后来人
+  function later() {
+    clearTimeout(tmr);
+    tmr = setTimeout(function () { rzApplyEdgeInset(); tick(); }, 260);
+  }
   window.addEventListener('resize', later);
   document.addEventListener('click', later, true);
-  setTimeout(tick, 700);
-  setInterval(tick, 1200);
+  setTimeout(function () { rzApplyEdgeInset(); tick(); }, 700);
 })();
 
 function fmtTag(sr, bits) {

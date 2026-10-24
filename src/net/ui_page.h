@@ -116,15 +116,25 @@ inline std::string rta_ui_page() {
     h += "html.webview2 #rzHot{position:fixed;inset:0;z-index:2147483000;pointer-events:none}";
     h += "html.webview2 #rzHot i{position:fixed;display:block;pointer-events:auto;background:transparent}";
     h += "html.webview2 #rzHot .rz-l{left:0;top:0;bottom:0;width:5px;cursor:ew-resize}";
-    // 261024-05：右边缘热区收窄到 3px —— 窄窗（<1240px）时主区滚动条贴右边，5px 会吃掉它最外 5px；
-    // 3px 与 Win32 原生边框同量级，仍拖得动（已用拖动探针实测右边缘）。
-    h += "html.webview2 #rzHot .rz-r{right:0;top:0;bottom:0;width:3px;cursor:ew-resize}";
+    // 261025（窄窗右边缘拖不动）：右热区回到 5px，与 rzDirAt 的判定带 E=5 一致 ——
+    // 261024-05 曾把它收窄到 3px 想"躲开滚动条"，实测反而造成两个问题：
+    //   ① 判定带 5px、光标带只有 3px，剩下 2px 里光标不是 ew-resize（看着就不像能拖）；
+    //   ② 那 2px 落在原生滚动条上：光标是滚动条，按下时**列表跟着滚一格**再改窗口大小（双重动作）。
+    // 真正的解法不是躲，是让滚动条别贴着窗口右边：右边缘的滚动容器由
+    // ui_script 的 rzBindEdgeInset() 加 .rz-edge-inset（右侧 5px 透明边框），滚动条整体退到 5px 内侧，
+    // 最外 5px 永远属于页面/热区。见下面的 .rz-edge-inset 规则。
+    h += "html.webview2 #rzHot .rz-r{right:0;top:0;bottom:0;width:var(--rzband,5px);cursor:ew-resize}";
     h += "html.webview2 #rzHot .rz-t{left:0;right:0;top:0;height:5px;cursor:ns-resize}";
     h += "html.webview2 #rzHot .rz-b{left:0;right:0;bottom:0;height:5px;cursor:ns-resize}";
     h += "html.webview2 #rzHot .rz-tl{left:0;top:0;width:10px;height:10px;cursor:nwse-resize}";
     h += "html.webview2 #rzHot .rz-tr{right:0;top:0;width:10px;height:10px;cursor:nesw-resize}";
     h += "html.webview2 #rzHot .rz-bl{left:0;bottom:0;width:10px;height:10px;cursor:nesw-resize}";
     h += "html.webview2 #rzHot .rz-br{right:0;bottom:0;width:10px;height:10px;cursor:nwse-resize}";
+    // 261025：贴住窗口右边缘的滚动容器，右侧让出 --rzband（=5px，与上面热区/RZ_BAND 同值）。
+    // 用**透明边框**而不是 margin：box-sizing:border-box ⟹ 外框尺寸/位置不变（不会反馈到探测本身），
+    // 只有 padding box 收 5px，而滚动条画在 padding box 里 ⟹ 滚动条退到 5px 内侧。
+    // 元素没有背景时，透明边框区不画任何东西（父级底色透上来），视觉零变化。
+    h += "html.webview2 .rz-edge-inset{border-right:var(--rzband,5px) solid transparent!important}";
     h += ".logo{width:27px;height:27px;border-radius:8px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:grid;place-items:center;font-weight:800;font-size:13px;color:#fff;box-shadow:0 2px 14px var(--acc-weak);flex:none}";
     h += ".ttl{font-weight:650;letter-spacing:.2px;flex:none}.ttl small{display:block;font-size:9px;font-weight:500;color:var(--mut2);letter-spacing:1.3px;margin-top:-3px}";
     h += ".search{flex:1;max-width:460px;margin-left:14px;position:relative}";
