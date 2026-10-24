@@ -1,206 +1,266 @@
 # RLPlayer 开发路线图
 
-> 写于 2026-10-21。所有条目都按「可测」写：**判据、基线、未解决项**，没有判据的功能不算完成。
-> 当前状态见 `STATUS.md`；接手前先读 `HANDOVER.md`。
+> 写于 2026-10-21，更新于 2026-10-24（1.3.16 版本后）。
+> 所有条目均按「可测」维护：**判据、基线、未解决项**，没有判据的功能不算完成。
+> 阶段全景状态见 `STATUS.md`；交接先读 `HANDOVER.md`；技术债务与审计见 `docs/未完成项清单.md`。
 
 
-## 进度快照(2026-10-23,第二十六轮后)
+## 进度快照（2026-10-24，第三十七轮 / 1.3.16 发布后）
 
 | 阶段 | 状态 | 对应轮次/证据 |
 |---|---|---|
-| P0(DSD 域处理) | ✅ 完成 | 第七/八轮,STATUS 第八轮 |
-| P1(调制器族) | ✅ 完成 | 第 24 轮:`dsd/chebyshev/ec/ahm` 四族,键 `modfamily`;Chebyshev-7 低电平失稳已修复(强制降 5 阶);数值表与过载恢复/长跑判据见 STATUS 第 24 轮 §3 |
-| P2(滤波器变体与命名) | ✅ 完成 | 第 24 轮:16→**47 预设**(真实抽头/过渡带/阻带/相位),对比表 `docs/滤波器变体对比表.md`,`tools/filter_report.exe`;避开「三个坑」判据 |
-| P3(NAA 兼容) | ⏸ 阻塞(外部) | 仍卡 networkaudiod EULA/需要 HQPlayer 会话抓包授权;在此之前 RTANet 作等价方案 |
-| P4(WASAPI 输入采集) | ✅ 完成 | 第 24 轮:`src/audio/wasapi_capture.h` + `rtacapture.exe` + `/api/input/*` + 设置页输入面板;10 分钟 0 溢出、src=null THD+N 154 dB;监听=直通(非 bit-perfect),采集→DSP 未接 |
-| P5(UPnP 投放) | ✅ 控制面+UI 完成(端到端待真机) | 第 24/25 轮:`upnp_control.h` + `UpnpHttpServer`(8912) + `rtacast.exe` + `/api/cast/*` + 设置页投放;本机局域网无渲染器,**端到端重采样未实测** |
-| P6(性能与工程) | ✅ 完成 | 第 25 轮:库扫描并行化(653 首 30.16s→9.47s,**3.18×**,索引 SHA256 逐字节一致)+ 信号链耗时统计;**P6b 流式解码**(免临时 WAV,6 格式 PCM 逐位一致,磁盘写 0 字节);**P6c DSD 两级抽取**(CIC 4×+短 FIR,DSD256 5 分钟 16.2s→7.1s,**2.30×**,THD+N 差 0.001 dB) |
-| P7(分发) | ✅ 持续 | 1.0.9/1.0.10/1.1.0/1.1.1/**1.3.0** 均已发布;1.3.0 = 370.74 MB,包内自包含 + 精简化;**CUDA DLL 可选未含** |
+| P0（DSD 域处理） | ✅ 核心完成 / 待办已列 | 第七/八轮完成 DSF/DFF 读取、素材生成、DirectSDM（逐位一致）、抽取器（FIR/IIR/CIC）、Conversion 三组真预设。**未完成项**：DSD→DSD 速率转换（需多相抽取再调制）、ASIO Native DSD（无硬件端点支持）转入 1.3.17+ 待办。 |
+| P1（调制器族） | ✅ 完成 | 第 24 轮：`dsd/chebyshev/ec/ahm` 四族，配置键 `modfamily`；Chebyshev-7 低电平失稳已修复（强制降 5 阶）；过载恢复与长跑判据见 STATUS 第 24 轮 §3。 |
+| P2（滤波器变体与声学处理） | ✅ 完成并扩展 | 第 24 轮：47 种重采样命名预设（真实抽头/过渡带/阻带/相位）。<br>• **20 段 PEQ**（第 34~36 轮）：RBJ 双二阶、float64、20 点拖拽/自动前级/旁路语义。证据：`src/dsp/peq.h`、`tests/test_peq.cpp`（61 断言）、`tools/peqcheck.js`（22/22）。<br>• **IR 重采样**（第 37 轮）：解决 44.1k IR 载入 96k 管线时基错位 2.18 倍问题，频响差 0.0000 dB、脉冲位移 +0.129 样本。证据：`src/dsp/ir_resample.h`、`tests/test_ir_resample.cpp`。 |
+| P3（网络音频传输） | 🔄 路线重构（NAA 删除 / UPnP 收敛） | • **NAA 彻底删除**（第 37 轮 / 1.3.16）：因 HQPlayer NAA 5.x 握手私有闭源（16 字节挑战无响应）且 EULA 禁止逆向，按用户要求彻底移除 NAA 发现/探测工具与 UI 选项（老配置显式报错）；RTANet 保留用于命令行与单测。证据：`tools/naa_discover.h` / `naa_probe.cpp` / `naa_scan.cpp` 已删、`tests/test_rtanet_e2e.cpp`。<br>• **投放收敛至 UPnP**：见 P5。 |
+| P4（WASAPI 输入采集与输出缓冲） | ✅ 采集可用 / 独占守卫落地 | • **输入采集**（第 24/30/33 轮）：`wasapi_capture.h` + `rtacapture.exe` + `/api/input/*`，Widget B 采集实测通过（rms −64.18 dB）。监听直通（未接 DSP 链）留待办。<br>• **独占缓冲自适应策略**（第 35 轮）：删除 20ms 封顶、L1 放大、L2 启动看门狗、学习缓存。证据：`src/audio/render_loop.h`、`tests/test_buffer_policy.cpp`（49 项）、`tests/test_render_loop_dry.cpp`（45 项）。<br>• **设备速率守卫与超时熔断**（第 37 轮 / 1.3.16）：真机 N300 96k 独占实测 56.4k（标称 59%）掉线复现；开播 1.5~2s 实测速率 <97% 自检熔断，连续超时且零消费干净停播。证据：`src/audio/render_loop.h`、`tests/test_renderfail.cpp`。 |
+| P5（UPnP 投放） | ✅ 全链路落地（控制+流服务+端到端） | 突破早期「只做发现不做投放」限制：<br>• **服务与发现**（第 32/33 轮）：多网卡连发绕开虚拟网卡 TUN 抢组播，实测搜到 N1000_UPNP @ 192.168.50.109；内置 `UpnpHttpServer`（端口 8912~8921 冲突回退），端到端投放 PCM 69.5MB、`rateMatch=match`。<br>• **UI 贯通**（第 34 轮）：单曲页一键推流至数播、流媒体页推送区块、全局推流切换。证据：`tests/test_upnp_control.cpp`、`tests/test_cast_service.cpp`。 |
+| P6（性能、资料层与系统工程） | ✅ 完成并大幅演进 | • **核心性能**（第 25 轮）：库扫描并行化（3.18×）、P6b 内存流式解码、P6c DSD 两级抽取（CIC+FIR，2.30×）。<br>• **AI 资料与自动整理**（第 33~36 轮）：白名单扩容/rerank 0.8/双步并行检索、结构化标签、单曲 4ms/专辑 60ms 自动预取当前专辑（并发≤2）、同实体缓存复用。证据：`src/meta/retrieval.h`、`tests/test_metacache.cpp`。<br>• **GPU 语义拆分**（第 36 轮）：修复 `ps.gpu` 未复位假绿点，拆分为 `gpu/gpuUsed/gpuResample/gpuConv` 事实源，每曲复位。证据：`src/meta/statusflags.h`、`tests/test_playback_gpu.cpp`。<br>• **knowledge 异步化**（第 37 轮 / 1.3.16）：由 accept 阻塞 1477ms 改为后台 job + 700ms 轮询，首响 1325ms→1.3ms。证据：`tools/rtaweb.cpp`、`src/net/ui_script.h:1057`。<br>• **LLM 流式接口与传输**（第 37 轮 / 1.3.16）：`llm_chat_stream`（SSE 逐 delta）+ 平台层 `HttpRequest::onChunk` 真流式 POST，告别整站枯等。证据：`src/meta/llm.h`、`src/platform/http.h`、`tests/test_retrieval.cpp`。 |
+| P7（分发、宿主交互与无边框） | ✅ 持续发布与无边框演进 | • **分发矩阵**：1.0.9 ~ 1.3.16 持续提供 FULL 自包含正式发布版（内置 ffmpeg/rtagpu/amdhip64/WebView2Loader/rtagpu_cuda.dll）。<br>• **无边框结构修复**（第 35 轮）：定位 WebView2 跨进程内缩 5px 结构真因，EnumChildWindows 重合判据。证据：`tools/wv2_host.h`、`tools/bordercheck.ps1`（45/45）。<br>• **窗口四边拉伸**（第 36 轮）：前端 8 边缘 5px 热区 -> postMessage resize -> 宿主跟手 SetWindowPos，绕过 WebView2 子窗口吃掉 WM_NCHITTEST。证据：`src/platform/host_msg.h`、`tests/test_host_msg.cpp`、`tools/launcher.cpp`。<br>• **托盘后台常驻**（第 37 轮 / 1.3.16）：点 X / Alt+F4 隐藏到托盘不中断播放，单双击恢复，右键退出干净释放。证据：`tools/launcher.cpp`、`build-tray/probe-tray.ps1`（26/26）。 |
 
-**其他方向**:ROON/元数据 P3 资料层(②直连层/③检索层/④富页)已完成并验收(STATUS 第 23 轮 + `docs/P3-资料层接口契约.md`);
-耳机 EQ 适配(OPRA)已完成(STATUS 第 23 轮 + `docs/耳机EQ-OPRA调研与设计.md`);
-**NVIDIA CUDA 后端**(协作者 PR #1)已选择性集成(第 26 轮):源码/构建链/加载回退/UI/诊断工具到位,`rtagpu_cuda.dll` 需 NVIDIA 机器 + CUDA 12.x 构建(包内未含,CUDA OPTIONAL);
-**WASAPI 独占三坑/共享 −48dB/ASIO 选卡/高 DPI** 已合入(第 26 轮)。
-
-> 注:P3(NAA)仍受外部授权阻塞;「投放/CUDA/输入/资料层端到端实测」需要真实硬件(渲染器/NVIDIA 卡/麦克风)。
-> 剩余代码级未解决项见 `docs/元数据补全调研与规划.md` §1.6.E / §1.8 与 STATUS 各轮「⚠️ 未解决项」。
+---
 
 ## 排序原则
 
 1. **先有验证对象，再写功能**（没有测试素材就先做素材生成器）。
-2. 每条都必须能用**现有测试框架**回归（ctest / uicheck / verify.ps1）。
-3. 做不到的写清楚「为什么做不到」，不留假开关。
+2. 每条都必须能用**现有测试框架**回归（ctest / uicheck / verify.ps1 / bordercheck / probe-tray）。
+3. 做不到的写清楚「为什么做不到」，不留假开关；拿不准的如实标注「待确认/未验证」。
 
 ---
 
-## P0 · DSD 域处理（第八轮全部完成 5/5）
+## P0 · DSD 域处理
 
-> **第七轮**：读取器 / 素材生成器 / 三种抽取器 / DirectSDM 核心与命令行。
-> **第八轮（2026-10-21）**：DirectSDM 接进播放线程与界面（端到端逐位一致）；Conversion 三组预设与数值表。
-> 实测数字见「STATUS.md」第八轮；新代码在 src/audio/dsd_reader.h、src/dsp/dsd_integrator.h、
-> src/dsp/direct_sdm.h、tools/make_dsd.cpp、tools/dsdconv.cpp、tools/naa_probe.cpp。
+> **第七/八轮**：读取器 / 素材生成器 / 三种抽取器 / DirectSDM 核心与播放线程端到端逐位比对；Conversion 三组预设与数值表。
+> **1.3.16 状态**：DSD 基础处理链全部闭环可用。
 
-**历史现状（第七轮之前）**：DSD 文件（.dsf/.dff）交给 ffmpeg 解成 PCM 再调制，
-没有任何 DSD 域处理，DirectSDM/积分器/转换全部未实现。
-没有任何 DSD 域处理，`DirectSDM`/积分器/转换全部未实现。
+### P0-1 DSF / DFF 读取器（`src/audio/dsd_reader.h`）✅ 已完成（第七轮）
+- DSF（LSB-first、分块交错）与 DFF（MSB-first、连续块、DST 压缩明确拒绝）完整支持。
+- **验收实测**：写→读逐位一致；测试 `test_dsd_reader`。
 
-### P0-1 DSF / DFF 读取器（`src/audio/dsd_reader.h`）✅ 已完成（2026-10-21）
-- DSF：头 28 / fmt 52 / data 按「每声道 blockSize 字节」分块交错；**位序 LSB-first**。
-- DFF：FRM8/`DSD ` → PROP（FS / CHNL / CMPR）→ DSD 块；按声道连续；**MSB-first**；DST 压缩明确拒绝。
-- 内部统一成「每声道 MSB-first 打包」：DoP 打包时每 16 位正好是两个相邻字节。
-- **验收实测**：写→读逐位一致（3 声道分块末块不满、非整字节尾巴、DFF 声道 ID 全测）；
-  另按规范手工计算偏移抽查文件字节，确认块交错与 LSB-first；截断/魔数错/DST/缺数据块都抛具体异常。
-  测试 `test_dsd_reader`；ffprobe 独立识别为 `dsd_lsbf_planar`。
+### P0-2 测试素材生成器（`tools/make_dsd.cpp`）✅ 已完成（第七轮）
+- 5 阶 1-bit 调制器生成 DSD64/128/256 写 DSF/DFF；抽取后 THD+N 99.31 dB。测试 `test_dsd_path`。
 
-### P0-2 测试素材生成器（`tools/make_dsd.cpp`）✅ 已完成（2026-10-21）
-- 用我们的 5 阶 1-bit 调制器生成 DSD64/128/256，写 DSF 或 DFF；写出后立刻读回逐位比对。
-- **意义**：本机原本没有 DSD 文件，现在 DSD 通路有了闭环验证对象。
-- **验收实测**：读回逐位一致；抽取后 THD+N **99.31 dB**（DSD64 / 5 阶 / −6 dBFS / 1 kHz）。
-  测试 `test_dsd_path` 第 5 节 + `make_dsd --verify`。
+### P0-3 DirectSDM（直通）（`src/dsp/direct_sdm.h`）✅ 已完成（第八轮）
+- 目标速率一致且无 PCM 处理/0 dB 时走 `play_one_direct`（16 位切片 → DoP → 输出后端）。
+- **验收实测**：1-bit → DoP → 解包逐位一致；测试 `test_dop`、`test_dop_stream`。
 
-### P0-3 DirectSDM（直通）（`src/dsp/direct_sdm.h`）✅ 已完成（2026-10-21，含播放器接线）
-- 条件：源 DSD 速率 == 目标 DSD 速率，且无 PCM 域处理（EQ/卷积/重采样），音量 0 dB。
-- **验收实测（核心）**：1-bit → DoP → 解包后**逐位一致**；与既有 `dop_pack(double)` 的载波逐样本相同；
-  分块打包 == 一次性打包；3 声道通过；`dsdconv --direct` 写出的载波被 `dopinfo` 判为合法 DoP。
-- **第八轮已完成**：`play_one` 开头用 `probe_dsd` 只读文件头做判定（不载入整曲），满足则走
-  `play_one_direct`（按 16 位切片 → DoP → 输出后端）；不满足则回退普通路径并把原因写进信号链 `directNote`。
-  界面 SDM 页有开关（勾选即压到 0 dB），键名 `directsdm`。
-- **端到端实测**：播放器 → NAA（rtanet_rx 文件收端）收到的 24-bit 载波与 `dsdconv --direct` 参考
-  **1,058,400 字节逐位相同**；`dopinfo` 判合法 DoP；暂停/跳转/进度都验过（跳转不重置标记相位）。
+### P0-4 Integrator（抽取器）：FIR / IIR / CIC（`src/dsp/dsd_integrator.h`）✅ 已完成（第八轮）
+- FIR（163 抽头 Kaiser-sinc）、IIR（Butterworth 10 阶）、CIC（6 级无乘法 + 3 抽头补偿）。
+- **验收实测**：通带最差 0.000025 / 0.019 / 0.031 dB；混叠抑制 144.4 / 156.1 / 108.1 dB。测试 `test_dsd_path`。
 
-### P0-4 Integrator（抽取器）：FIR / IIR / CIC（`src/dsp/dsd_integrator.h`）✅ 已完成（2026-10-21）
-- FIR：Kaiser windowed-sinc，163 抽头；阻带起点 = outRate − passband（保护 0–20 kHz）。
-- IIR：Butterworth 10 阶级联（DF2T），截止由「±0.05 dB 平坦度」反推；相位非线性是固有代价。
-- CIC：6 级无乘法，uint64 回绕（溢出在梳状差分里抵消），后接 3 抽头 `1/sinc^N` 解析补偿。
-- **验收实测**（DSD64 → 176.4 kHz）：通带最差 **0.000025 / 0.019 / 0.031 dB**；
-  156.4 kHz 镜像衰减 **123.6 / 155.9 / 106.9 dB**；实测混叠抑制 **144.4 / 156.1 / 108.1 dB**；
-  THD+N **99.19 / 99.20 / 99.18 dB**（参考 FIR 4001 抽头 99.16 dB，差 < 0.04 dB）。
-- 输出已直接作为现有管线的 PCM 输入：`read_any` 把 .dsf/.dff 解到 DSD/16（上限 705.6 kHz）。
-
-### P0-5 Conversion：wide / narrow / XFi ✅ 已完成（2026-10-21）
-- 映射为抽取器的截止/过渡带/阶数三组预设，**必须是真参数**，不许只改标签。
-- 三组预设是**真参数**：只改通带上限（20/30/40 kHz），阻带起点 = outRate − 通带，
-  过渡带随之 136.4/116.4/96.4 kHz，FIR 抽头 163/191/231。
-- **数值表**（DSD64→176.4k）：带内最差 0.0000 dB；镜像衰减 123.6/122.6/122.6 dB。
-  测试 `test_dsd_path` 第 6 节断言「通带＝设定值 / 平坦度 / 镜像 / 抽头单调 / 过渡带单调」。
-- 入口：`dsdconv --conv`、SDM 页下拉、配置键 `dsdconv`；抽取器种类另有 `dsdkind`（fir/iir/cic）。
-
-**回退策略**：读不了的文件仍走 ffmpeg（已实现并保留），note 里注明「已回退 ffmpeg」。
+### P0-5 Conversion：wide / narrow / XFi ✅ 已完成（第八轮）
+- 真实截止/过渡带/阶数预设（通带上限 20/30/40 kHz，过渡带 136.4/116.4/96.4 kHz）。测试 `test_dsd_path`。
 
 ---
 
 ## P1 · 调制器族
 
-**现状**：5 阶 / 7 阶两种，带拐点与抖动参数；7 阶在 DSD64 会饱和（自动降阶）。
+> **第二十四轮**：已完成全部四族建设。
 
-- 7 阶 Chebyshev NTF（可配带外增益）；
-- EC（误差反馈）变体；
-- 多电平（AHM 风格，2~8 bit）。
-- **验收**：1-bit 带内 SNR（DSD64/128/256）、带外噪声积分、空闲音（无输入时 1 kHz 附近的离散分量）、10 分钟长跑不饱和。
-- **不做**：不复制 HQP 的 ASDM7EC 等专有曲线（系数未公开），只提供**同名分类 + 我们的实现**并在 UI 注明。
+- **四族实现**：`dsd`（标准多阶）、`chebyshev`（Chebyshev NTF 可配带外增益）、`ec`（误差反馈变体）、`ahm`（多电平 2~8 bit）。
+- **稳定性修复**：Chebyshev-7 低电平失稳已修复（强制降 5 阶）。
+- **验收实测**：10 分钟长跑无饱和锁死、过载后恢复判据。测试 `test_modulator`、`test_modulator_families`。
 
 ---
 
-## P2 · 滤波器变体与命名体系
+## P2 · 滤波器变体与声学处理
 
-**现状**：16 个命名预设（poly-sinc-lp/mp、gauss、ext2、xtr、sinc-M、closed-form、minringFIR…）。
+> **第二十四轮**：完成 47 种重采样滤波器体系。
+> **1.3.13~1.3.16 轮次**：新增 20 段 PEQ 参量均衡与 IR 采样率自适应重采样。
 
-- 按 HQP 命名补齐变体：`poly-sinc-gauss-hires*`、`*-2s`、`-xla/-xl`、`hb-*-2s`、`sinc-{S,M,MG,L,LL}`、`closed-form-{fast,16M}`。
-- **每个变体必须给出**：抽头数、过渡带、阻带衰减、相位类型（自动生成对比表 `tools/filter_report`）。
-- **验收**沿用现有判据：通带纹波、阻带最深、前/后振铃能量比、能量重心。
+### P2-1 重采样滤波器预设体系 ✅ 已完成（第二十四轮）
+- 补齐 47 种预设（`poly-sinc-*`、`sinc-{S,M,MG,L,LL}`、`closed-form-*`、`gauss` 等），抽头/过渡带/阻带衰减/相位对比表由 `tools/filter_report.exe` 自动生成。测试 `test_filters`。
 
----
+### P2-2 20 段 PEQ 参量均衡（`src/dsp/peq.h`）✅ 已完成（1.3.13~1.3.15）
+- **算法与结构**：RBJ 双二阶滤波器、float64 精度计算系数、热更新平滑淡入。
+- **界面交互**：SVG 曲线 20 点自由拖拽调节（Shift+拖拽/滚轮调节 Q 值、双击复位）、自动前级防削波计算。
+- **旁路语义**：默认 `bypass=0`（生效，全 0 dB 不变音），勾选旁路（`bypass=1`）直通跳过处理；常驻状态行展示。
+- **验收实测**：`test_peq.cpp` 61 项断言全过；`tools/peqcheck.js` 表头/数据列对齐 22/22 全 0.00px 偏差。
 
-## P3 · NAA 兼容（端点已到位，卡在客户端握手）
-
-**现状（2026-10-21）**：用户提供了真实端点 **192.168.50.109**（Accurate Audio "Wavedream NET"，
-后台只开 HQPlayer NAA；网页后台 /api/services/update 可切服务，但 NAA 与 UPnP 互斥）。
-
-已确认（详见 docs/NAA对接探测纪要.md）：
-
-- TCP 43210 是标准 NAA 5.x：连上后**服务端先发 16 字节随机数**；本机跑官方 networkaudiod 5.19 行为完全一致。
-- 纯 XML（protocol / version_req / getdevices；换行/NUL/长度前缀/回显 token 等 8 种组合）**全部无回应**。
-- 因此客户端必须先按未公开规则处理这 16 字节，之后才是 XML 状态机（元素名已知：
-  initialize / getformats / start / stop / keepalive / netbuftime / pcm4 / sdm4 / pcm5 / sdm5）。
-- 工具：`naa_scan.exe`（发现）、`naa_probe.exe`（只读 TCP 探针，--matrix）。
-
-**卡点**：networkaudiod 的 EULA 明确禁止逆向/反汇编，也禁止「非 HQPlayer 软件推流」。
-要拿到客户端那一侧的报文，需要一次真实的 HQPlayer 会话（抓包）或用户明确授权继续逆向。
-
-**拿到授权后的步骤**：
-1. 用 HQPlayer（或本机 NAA 收端 + HQPlayer 客户端）连一次端点，抓 TCP 控制面完整报文；
-2. 实现只读会话（握手 + getdevices/getformats），再实现发送（pcm5/sdm5 帧）；
-3. **验收**：DoP 载波逐位一致 + 连续 30 分钟无漂移/丢包（端点侧计数为准）。
-
-**风险**：协议随版本变化；EULA 争议。**在此之前保留 RTANet 作为等价方案**（两者并列在输出后端里）。
+### P2-3 IR 脉冲响应重采样（`src/dsp/ir_resample.h`）✅ 已完成（1.3.16 / 第三十七轮）
+- **真因**：此前 IR 样本数组缺乏采样率标识，44.1k 房间测量脉冲放入 96k 工程直接拉长 2.18 倍，导致时基与频响失真。
+- **算法落地**：根据当前播放采样率自适应多相重采样（`ir_resample`）。
+- **验收实测**：脉冲中心误差 +0.129 样本、频响差异 0.0000 dB、同采样率逐位相同。测试 `test_ir_resample`。
 
 ---
 
-## P4 · 输入采集（WASAPI）
+## P3 · 网络音频传输（NAA 彻底删除 / UPnP 替代）
 
-**现状**：只枚举了设备，设置页有输入页签但**采集通路未实现**（UI 已如实标注）。
+> **历史记录**：Accurate Audio 数播硬件实测 HQPlayer NAA 5.x 握手为 16 字节私有挑战，非公开逆向因 EULA 限制受阻。
+> **1.3.16 决议**：用户明确指示彻底放弃并删除 NAA 对接，将数播与局域网网络推流全面统一至 UPnP / DLNA 路线。
 
-- `IAudioCaptureClient` 事件驱动 → 环形缓冲 → 现有分块管线 → 输出；
-- 支持「监听」（采集直接送 DSP）与「录制到文件」；
-- **验收**：采集 1 kHz 正弦，输出 PCM 的样本数/位深正确，THD+N 有数值；长跑 10 分钟无溢出。
-
----
-
-## P5 · UPnP 投放
-
-**现状**：只做发现，不做投放。
-
-- 实现 AVTransport `SetAVTransportURI` + 本地 HTTP 提供 WAV（原始 PCM，不转码）；
-- **风险**：渲染器可能自行重采样。**验收**必须抓渲染器实际采样率，不能只看「播出来了」。
+### P3-1 移除 NAA 专有客户端（1.3.16 / 第三十七轮）
+- 界面删除「NetworkAudioAdapter（NAA / RTANet）」输出选项、端点自动发现及手动输入框。
+- 源码清理：删除 `tools/naa_discover.h`、`tools/naa_probe.cpp`、`tools/naa_scan.cpp`，删除 `/api/naa/discover` 路由。
+- 配置兼容：老配置残留 `backend=naa` 启动时明确报错并提示迁移，杜绝静默异常。
+- 保留项：底层轻量传输协议 RTANet 保留用于命令行与端到端自动化回归测试（`test_rtanet`、`test_rtanet_e2e`）。
 
 ---
 
-## P6 · 性能与工程
+## P4 · WASAPI 输入采集与缓冲安全守卫
 
-- 解码改管道 / 进程内 libavcodec，去掉临时 WAV（起播延迟、磁盘 I/O）；
-- **DSD 源抽取改两级**（CIC 先降 4× 再 FIR）：现在 DSD64 10 秒素材解码 0.26 s，但 DSD256 5 分钟的 PCM 约 700 MB、耗时数十秒；判据沿用 P0-4。
-- 库扫描并行化（现在 1000 首约 30-60 秒）；
-- 信号链里补「解码器/临时文件」耗时统计。
+> **第二十四/三十/三十三轮**：完成 WASAPI 采集与端到端检验。
+> **1.3.14/1.3.16 轮次**：全面重构独占模式缓冲时钟与设备异常保护机制。
 
----
+### P4-1 WASAPI 输入采集（`src/audio/wasapi_capture.h`）✅ 基础功能完成
+- `IAudioCaptureClient` 无锁 SPSC 环形缓冲 + 格式转换；提供 `rtacapture.exe` 诊断与 `/api/input/*` 控制。
+- **实测验证**：Widget B 麦克风采集端到端通过（rms −64.18 dB，生成 1,440,044 B 校验 WAV）。测试 `test_capture`。
+- **未完成项**：监听目前为直通输出，尚未接进完整 DSP 分块处理链（转入 1.3.17+ 待办 A5）。
 
-## P7 · 分发（1.0.1 起有构建门禁）
+### P4-2 独占缓冲自适应策略（`src/audio/render_loop.h`）✅ 已完成（1.3.14 / 第三十五轮）
+- **真因分析**：删除独占模式缓冲区 20ms 硬编码无条件封顶（导致低开销设备周期断流与边播边啵啵啵）。
+- **阶梯退避与缓存**：L1 放大预检 + L2 起播 0.8s 看门狗检测；按设备标识记住稳定缓冲周期（学习缓存）。
+- **观测与恢复**：遥测新增 `PLAYBUF`、`WFAIL`、`DEVICE_LOST` 错误流，端点掉线显式上报。
+- **验收实测**：测试 `test_buffer_policy`（49 项）、`test_render_loop_dry`（45 项）。
 
-**2026-10-21 事故**：1.0.0 用 `-march=znver5` 构建，在无 AVX-512 的 5900X 上 0xC000001D；
-且动态链接 VC++ 运行库，干净系统会 0xC000007B。已修复，见 STATUS 第九轮。
-
-**支持矩阵（README 与发布说明必须一致）**
-
-| 项 | 要求 |
-|---|---|
-| 系统 | Windows 7 SP1 / 8 / 8.1 / 10 / 11，x64 |
-| CPU | SSE4.2 + POPCNT（2009+；官方支持写得保守：**Zen 1 / Intel 6 代**起） |
-| 运行库 | **不需要** VC++ 运行库（CRT 静态链接），Win7 不需要 UCRT 补丁 |
-| 界面 | Win10/11 内置 WebView2；无 WebView2 退回 Edge；再没有用默认浏览器；Win7 只能浏览器（需 Chrome/Edge 109/新版 Firefox） |
-| GPU | 包内内置 `rtagpu.dll`（25 种 AMD 架构）+ `amdhip64_7.dll`；无 AMD 卡/驱动时自动纯 CPU。NVIDIA 仍无 CUDA 后端 |
-
-**构建约束（已落地）**
-
-- `RTA_ARCH` 默认 `x86-64-v2`；**分发版禁止** `native/znver5`（会带 AVX-512）。
-- 静态 CRT：`CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`。
-- `tools/check_compat.ps1`：检查 CRT 导入 / subsystem ≤ 6.1 / 无 zmm+EVEX；接进 `verify.ps1` 第 11 项。
-- `tools/make_dist.ps1`：构建 → 门禁 → 组包 → zip + sha256；门禁失败拒绝出包。
-
-**当前产物（1.0.2 起）**：`dist\RLPlayer-1.0.2-win64.zip`（约 173 MB，**唯一**的
-“正式发布版”/Full 包：ffmpeg + ffprobe、rtagpu.dll、amdhip64_7.dll、WebView2Loader、
-asio_probe、`tools\` CLI 工具；sha256 见 STATUS 第十轮）。
-
-**发布规则（用户 2026-10-21 明确要求）**：
-1. 不再有 Lite/最小发布版，只有 Full，名字叫“正式发布版”；
-2. GPU 加速所需组件（内核 + HIP 运行时）必须内置；
-3. 软件内有的功能必须自包含完整（解码器、工具、运行库齐备）；
-4. 出包前必须过兼容门禁 + GPU 干净 PATH smoke。
+### P4-3 设备速率守卫与超时熔断（`src/audio/render_loop.h`）✅ 已完成（1.3.16 / 第三十七轮）
+- **真机故障复现**：EDIFIER N300 声卡在 96k/24 独占模式下，驱动 `IsFormatSupported` 返回支持但在 29.8s 墙钟内仅消费 17.5s 数据（实测速率 56.4 kHz，仅标称 59%），引发 21 次超时并在第 29s 从 USB 总线掉线。
+- **开播速率自检**：起播 1.5~2.0 秒内统计设备实际消费帧率与墙钟比值，若实测速率 < 97% 立即熔断停播并显式告警「设备无法实时运行目标采样率，已停止」。
+- **超时保护熔断**：连续写超时且设备消费增量为零时触发保护停播，避免设备固件假死崩溃。
+- **验收实测**：测试 `test_renderfail` 全面验证超时熔断与速率不足拦截。
 
 ---
 
-## 明确不做 / 暂缓
+## P5 · UPnP / DLNA 投放
 
-- **复制 HQP 专有调制器曲线**：系数未公开，不做「同名不同声」的假实现。
-- 在线歌词/封面（需要第三方接口与合规评估）。
-- 云音乐平台接入（版权/合规风险）。
-- NAA 兼容在拿到端点之前不动工。
+> **从 1.3.10 起彻底打破「只做发现不做投放」壁垒，实现端到端数播推送。**
+
+### P5-1 UPnP 设备探测与代理绕行 ✅ 已完成（1.3.10 / 第三十二轮）
+- 修复 Clash Verge TUN 等虚拟网卡抢占默认组播路由导致 SSDP 无法送达局域网问题，改为逐物理网卡绑定 `IP_MULTICAST_IF`。
+- **真机验证**：实测精准发现用户数播设备 `N1000_UPNP @ 192.168.50.109`。
+
+### P5-2 UPnP HTTP 音频推流服务 ✅ 已完成（1.3.12~1.3.13）
+- 内置轻量 `UpnpHttpServer`，支持 8912~8921 端口动态冲突回退。
+- 通过 AVTransport 协议控制渲染器播放/暂停/跳转，本地提供原始无损 PCM 流。
+- **真机实测**：数播投放实测通过（servedBytes 69.5 MB，`rateMatch=match`）。测试 `test_upnp_control`、`test_cast_service`。
+
+### P5-3 播放控制与单曲推送集成 ✅ 已完成（1.3.13 / 第三十四轮）
+- 单曲详情页提供一键推流至数播按钮；流媒体页设立推送控制面板；支持全局推流与本地扬声器无缝切换。
+
+---
+
+## P6 · 性能、资料层与系统工程
+
+> **1.3.12~1.3.16 进行了深度的资料层智能化改造与后端异步/流式重构。**
+
+### P6-1 核心处理吞吐与流式解码 ✅ 已完成（第二十五轮）
+- 媒体库扫描多线程并行化（653 首 30.16s → 9.47s，**3.18×**，哈希逐字节一致）。测试 `test_scanpool`。
+- 内存流式解码（去掉中间临时 WAV 文件，磁盘写入 0 字节）。测试 `test_stream_decode`。
+- DSD 两级降采样抽取（CIC 4× 预抽取 + 短 FIR，5 分钟 DSD256 处理 16.2s → 7.1s，**2.30×**）。测试 `test_dsd_two_stage`。
+
+### P6-2 智能元数据与自动整理闭环 ✅ 已完成（1.3.12~1.3.15）
+- 检索白名单扩容（覆盖 20+ 主流音乐站）、rerank 门槛调谐至 0.8、换词归一化与并行抓取（`max(knowledge, search+fetch)`）。
+- 结构化标签系统（schema 校验、7 天长效缓存、命中即秒回）。
+- 自动后台整理：单曲页打开 4ms 自动整理当前曲；专辑页 60ms 自动预取当前专辑曲目（并发≤2）；离开即停；同实体共享缓存。
+- 验收实测：测试 `test_metacache`、`test_retrieval`、`test_entities`。
+
+### P6-3 GPU 状态语义解耦（`src/meta/statusflags.h`）✅ 已完成（1.3.15 / 第三十六轮）
+- **真因**：旧版 `ps.gpu` 缺乏每曲复位机制，一旦单曲触发过 GPU 升频，后续全部曲目错误报绿。
+- **语义拆分**：解耦为 `gpu`（环境可用性）、`gpuUsed`（本次参与实测）、`gpuResample`（重采样参与）、`gpuConv`（卷积参与）。
+- **实测验证**：每次起播复位事实源；界面仅在 `gpuUsed=true` 时亮绿点。测试 `test_playback_gpu`。
+
+### P6-4 Knowledge 直连层异步化改造 ✅ 已完成（1.3.16 / 第三十七轮）
+- **真因**：此前 `/api/entity/knowledge` 在主循环同步执行，耗时超过 1.4 秒导致整站 API 冻结。
+- **异步 Job 模型**：改造为后台异步线程抓取 + `pending` 轮询（前端 700ms 轮询重试）。
+- **实测性能**：首次接口响应耗时 1325ms 骤降至 **1.3ms**，期间主站状态查询延迟由 1532ms 降至 **1.3ms**。
+
+### P6-5 LLM 流式输出与底层 SSE 传输 ✅ 接口与传输完成（1.3.16 / 第三十七轮）
+- 后端新增 `llm_chat_stream`，支持 SSE 增量 delta 回调与断线识别。
+- 网络层新增 `HttpRequest::onChunk` 与 `http_post_stream` 真流式传输。
+- 检索层 `retrieval_fetch` 挂接进度回调。测试 `test_retrieval`。
+- **待办**：前端 UI 逐字流式渲染（排入 1.3.17+ 待办 D2）。
+
+---
+
+## P7 · 分发、宿主交互与无边框架构
+
+> **自 1.0.9 起确立 FULL 独立分发标准，并在 1.3.14~1.3.16 完成无边框与系统托盘深度重构。**
+
+### P7-1 正式发布包规格与自包含策略 ✅ 持续落地
+- **构建矩阵**：Windows 7 SP1 ~ 11，x86-64-v2 兼容架构，静态 MSVC CRT，无额外运行库依赖。
+- **自包含组件**：打包内置 `ffmpeg`、`ffprobe`、`rtagpu.dll`（AMD HIP）、`rtagpu_cuda.dll`（NVIDIA CUDA 12.9）、`amdhip64_7.dll`、`WebView2Loader.dll`。
+- **构建门禁**：`tools/check_compat.ps1` + `tools/make_dist.ps1` 打包前自动执行兼容性与依赖审计。
+
+### P7-2 无边框一体化窗口真因修复 ✅ 已完成（1.3.14 / 第三十五轮）
+- **真因定位**：WebView2 控件创建时相对客户区默认内缩 5px，启动链路缺乏初始 `WM_SIZE` 导致宿主未被覆盖，呈现出 5px 未初始化白框。
+- **修复与判据**：移除内缩并引入结构判据（`EnumChildWindows` 测量 WebView2 必须完全重合客户区）。测试 `tools/bordercheck.ps1` 45/45 全 PASS。
+
+### P7-3 窗口四边自由拖拽拉伸 ✅ 已完成（1.3.15 / 第三十六轮）
+- **真因定位**：由于 WebView2 子窗口运行在跨进程独立渲染管线，系统 `WM_NCHITTEST` 消息被子窗口全部拦截返回 `HTCLIENT`，导致原生窗口边缘拉伸失效。
+- **页面代理拉伸**：在页面 8 个边缘注入 5px 鼠标捕获热区，识别拖拽意图通过 `postMessage('resize:<dir>')` 发往宿主，由宿主代理接管鼠标实现 `SetWindowPos` 跟手缩放。
+- **实测验证**：单测 8 方向协议白名单（`test_host_msg`），端到端拖拽实测通过。
+
+### P7-4 系统托盘后台驻留与安全退出 ✅ 已完成（1.3.16 / 第三十七轮）
+- 点击窗口关闭按钮（X）、Alt+F4 或页面 close 时，窗口平滑隐藏至系统托盘，后台音频与引擎子进程继续稳定运行。
+- 托盘图标左键单击/双击即刻唤醒主窗口至前台焦点。
+- 托盘右键菜单选择「退出」触发优雅退出序列：先行通知 `/api/quit` 释放网络端口与声卡资源。
+- 实测验证：通过 `build-tray/probe-tray.ps1` 26/26 项测试验证隐藏、唤回与退出逻辑。
+
+---
+
+## 2026-10-24 之后的待办（1.3.17+）
+
+> 汇总自 `docs/未完成项清单.md`（A/B/C/D 节）与 1.3.16 验收现场，标注卡点原因与所需前提条件。
+
+### A. 待实现功能（代码级缺口）
+1. **ASIO Native DSD 未实现（A1）**：
+   - *现状与影响*：`src/audio/asio_out.h` 尚无 Native DSD 通路，UI 标注「选 Native 不会出声」；目前仅能走 DoP。
+   - *为什么没做 / 需要什么*：需要物理声卡驱动明确汇报 `ASIOSTDSDInt8*` 采样格式。本机当前 7 个驱动（Portacapture、VB-Matrix 等）均仅汇报 Float32 或 Int32，缺少真机验证对象，需接入兼容硬件后实施。
+2. **DSD→DSD 速率转换（A3）**：
+   - *现状与影响*：非目标速率的 DSD 源文件目前需解成 PCM 后再重新调制，升频存在理论级再量化。
+   - *为什么没做 / 需要什么*：需要 DSD 域多相插值/重抽取算法与严格的带内带外 THD+N 判据，算法复杂度高，需单独立项。
+3. **WASAPI 共享模式非 float32 格式支持（A4）**：
+   - *现状与影响*：`tools/rtaweb.cpp:1918` 遇到系统混音格式设为 16/24-bit 整数时直接抛错拒开。
+   - *为什么没做 / 需要什么*：需要补充 int16/int24 → float32 格式转换器与边界单测。
+4. **输入采集监听直通未接 DSP 链（A5）**：
+   - *现状与影响*：`tools/rtaweb.cpp:5831` 当前采集监听为直通，无法经过 PEQ/卷积/音量控制等处理。
+   - *为什么没做 / 需要什么*：需将采集环形缓冲区输出接入主播放管线的分块 DSP 接口。
+5. **Intel / 其它 GPU 计算后端（A7）**：
+   - *现状与影响*：目前仅支持 AMD HIP 与 NVIDIA CUDA，Intel 核显及 Arc 独显用户只能走纯 CPU。
+   - *为什么没做 / 需要什么*：需立项评估 D3D12 DirectCompute 或 oneAPI 后端，涉及跨厂商驱动兼容矩阵。
+6. **封面写回与畸形保护（A8）**：
+   - *现状与影响*：补全的封面数据仅存在本地元数据库，尚未写回音频文件内标签。
+   - *为什么没做 / 需要什么*：需实现 FLAC PICTURE 块重嵌逻辑，并对已有畸形 PICTURE 块做校验与容错保护。
+
+### B. 已知缺陷与待复现定位
+1. **`END pos=0 error=""` 显式归因（B1）**：
+   - *现状与影响*：偶发切歌打断时上报 pos=0 且无明确原因字符串，目前需靠上下文 START 推断。
+   - *为什么没做 / 需要什么*：需要一份完整的切歌打断现场复现日志以定点增加 `PLAY_ABORT` 显式标识。
+2. **STARVING 触发后回退共享并从头重播（B2）**：
+   - *现状与影响*：独占严重欠载时自适应回退至共享模式，当前逻辑会重头开始播放，带来听感跳变。
+   - *为什么没做 / 需要什么*：属于播放策略权衡，需在真机环境确认「从头播」还是「保持当前 offset 恢复」更符合用户预期。
+3. **实体启发式误判治理（B5）**：
+   - *现状与影响*：`entity_looks_label` 对含单字「社/団/团」的部分同人社团或小众厂牌偶有拆分过细。
+   - *为什么没做 / 需要什么*：属于已知工程权衡（宁可错拆不盲目错并），需扩充词表或结合 LLM 深度校验。
+4. **`/api/enrich` 偶发耗时 > 20s 优化（B6）**：
+   - *现状与影响*：冷启动多源聚合抓取最坏延迟较高。
+   - *为什么没做 / 需要什么*：需进一步对边缘小众站点的抓取实施分级超时与快速熔断。
+5. **首帧微弱白闪测光取证（B7）**：
+   - *现状与影响*：DWM 属性已设黑底，肉眼基本不可见，但缺乏逐帧高速录屏测光判据。
+   - *为什么没做 / 需要什么*：需专用高帧率工具完成物理光度比对。
+
+### C. 做了但需真机/外设长效复测
+1. **N300 速率守卫与真实出声复测（C1）**：
+   - *现状与影响*：1.3.16 已加入自检熔断算法并通过 mock 单测，但 96k 独占真机上因设备掉线需等待用户重插后复测。
+   - *为什么没做 / 需要什么*：需要配合物理 N300 音箱重新插拔 USB 并进行实机开播验证。
+2. **`gpuUsed` / `convGpu` 播放时真实出声端到端验证（C2）**：
+   - *现状与影响*：代码级与 CDP 单测已过，但根据铁律 1，开发过程严禁向真实设备输出未经验证的可听声音。
+   - *为什么没做 / 需要什么*：需用户在场并明确授权听音设备后进行试听验证。
+3. **窄窗右侧 5px 热区与 WebView2 滚动条重叠手感（C4）**：
+   - *现状与影响*：当前在无头 Edge 下滚动条为 overlay（宽 0），真机窄窗下拖拽热区（5px）与滚动条（9px）的层叠手感待用户反馈。
+4. **`rateAuto` 分档策略抽纯函数与边界单测（C6）**：
+   - *现状与影响*：核心逻辑工作正常，但缺乏独立离线单测。
+   - *为什么没做 / 需要什么*：需将 `decide_capability_failure` 抽离为纯计算函数并补全测试用例。
+
+### D. 技术债与体验优化
+1. **LLM 流式 UI 逐字渲染（D2 剩余）**：
+   - *现状与影响*：1.3.16 已完成后端 SSE 流式回调与网络层分块传输，但前端界面仍等待整段生成后一次性刷出。
+   - *为什么没做 / 需要什么*：需在前端界面抽屉和资料卡中接入 SSE 监听并实现打字机平滑渲染效果。
+2. **rtaweb 关停阶段 0xC0000409 崩溃修复（1.3.16 新发现）**：
+   - *现状与影响*：通过 `/api/quit` 退出时，子进程在释放最后资源时偶发 BEX64 崩溃（不影响主控退出，但日志可见）。
+   - *为什么没做 / 需要什么*：需排查全局对象、单例线程池或静态析构顺序。
+3. **打包排除种子 profile（D4）**：
+   - *现状与影响*：`WebView2Runtime\EBWebView` 多占约 24.9 MB 分发包体积。
+   - *为什么没做 / 需要什么*：需在 `tools/make_dist.ps1` 排除列表中增加针对该无用缓存目录的过滤规则。
+4. **Edge 回退路径旧代码规范化（D5）**：
+   - *现状与影响*：`darken_edge_window` 存在一处旧语法，近乎零影响，需在后续例行清理中修整。

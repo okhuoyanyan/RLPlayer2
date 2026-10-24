@@ -410,6 +410,11 @@ add_executable(test_ratepick tests/test_ratepick.cpp)
 target_include_directories(test_ratepick PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME ratepick COMMAND test_ratepick)
 
+# rateAuto（自动换率）策略纯函数单测（元数据文档 1.6.E #10）—— 全离线，不开设备（铁律 1）
+add_executable(test_rate_decision tests/test_rate_decision.cpp)
+target_include_directories(test_rate_decision PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME rate_decision COMMAND test_rate_decision)
+
 # 最小 ZIP（STORE）打包结构（2026-10-22 功能3「导出诊断 = 一个压缩包」）。
 # 纯内存、零外部依赖、不调 PowerShell（理由见 src/net/zipstore.h 头注）。
 add_executable(test_zipstore tests/test_zipstore.cpp)

@@ -2041,3 +2041,16 @@ DSD 源的 Integrator（IIR/FIR/CIC）与 Conversion（wide/narrow/XFi）、Dire
 - **#8 GPU 徽标**：真因 = ps.gpu 从不按曲复位（只有 DirectSDM 分支复位）⟹ 一首走过 GPU 后所有曲目都亮；拆成 gpu/gpuUsed/gpuResample/gpuConv（事实源 src/meta/statusflags.h），每曲 PLAY 复位；UI 只在 gpuUsed 时亮，信号链按实测字段标绿 + 新增 EQ/卷积节点。
 - **门禁**：build 0 err / ctest **65/65**（新增 test_metacache、test_playback_gpu）/ resize E2E / UI CDP 61/61。
 - **发布**：dist/RLPlayer-1.3.15-win64.zip；版本资源 1.3.15.0。
+## 第三十八轮（2026-10-24 深夜）1.3.16 后：子代理三路派遣 + 待办重排
+
+- **三路子代理路由基建（AGENTS §9）**：
+  主控确认三条实测连通通道并确立派单分工原则：
+  1. `agy` / `gemini-3.8-flash-tiered`：主力负责写代码、界面交互、测试用例编写与机械重构（大上下文、高执行速度）；
+  2. `opencode-go` / `deepseek-v4.1-flash`：首选负责疑难定位、深度推理与证据链根因分析（已成功交付 N300 取证、knowledge 异步化、速率守卫等）；
+  3. `workbuddy-cn` / `deepseek-v4.1-flash`：作为复杂推理与繁重分析的分流备用通道。
+  全路由均通过探针测试（连通性与 Git 指令实测 PASS），明确禁止未经实测的目录模型，建立文件所有权单写者纪律。
+- **本轮派遣与交付**：
+  1. 派发本子代理（代码路线 / gemini-3.8-flash-tiered）：将 `ROADMAP.md` 从停滞的第 26 轮全量更新至 1.3.16 真实状态；
+  2. P0~P7 事实对齐：收录 UPnP 端到端投放、20 段 PEQ、AI 自动整理、无边框与四边拉伸、独占自适应缓冲、GPU 语义解耦、NAA 彻底删除、knowledge 异步化、IR 重采样、设备速率自检守卫、LLM 流式接口等 11 项重大演进，逐条核对轮次、文件与测试证据；
+  3. 待办重排与清单收拢：从 `docs/未完成项清单.md`（A/B/C/D）收敛 1.3.17+ 待办，清晰标注未实现原因与外部依赖；
+  4. 排期对齐：确立后续批次核心目标（LLM UI 逐字展示、rtaweb 退出 0xC0000409 排查、共享模式非 float32、rateAuto 纯函数单测等）。
