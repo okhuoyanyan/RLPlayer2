@@ -546,3 +546,8 @@ add_test(NAME dsd_two_stage COMMAND test_dsd_two_stage)
 add_executable(test_asio_native_dsd tests/test_asio_native_dsd.cpp)
 target_link_libraries(test_asio_native_dsd PRIVATE rtadsp ole32 uuid advapi32)
 add_test(NAME asio_native_dsd COMMAND test_asio_native_dsd)
+
+# ---------------- 监听走 DSP（261024-05）----------------
+add_executable(test_monitor_dsp tests/test_monitor_dsp.cpp)
+target_link_libraries(test_monitor_dsp PRIVATE rtadsp ole32 uuid advapi32)
+add_test(NAME monitor_dsp COMMAND test_monitor_dsp)

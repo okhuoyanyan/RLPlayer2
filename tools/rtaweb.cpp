@@ -2675,6 +2675,17 @@ struct InputSessionState {
     double peakDb = -999.0;
     std::string error;
 
+    // ---- 监听走 DSP（monitor=dsp）----
+    // monitor：raw（默认，旧行为：不经 DSP 直送共享输出）| dsp（走现有管线）
+    std::string monitor = "raw";
+    uint32_t    outRate = 0;        // 共享输出端点的混音采样率（= DSP 链输出率）
+    int         outChannels = 0;    // 共享输出端点的混音声道数
+    std::string outFormat;          // 共享输出混音格式名（float32 / int16 / int24…）
+    std::string monitorNote;        // DSP 链的备注（文件 EQ 解析失败等），空 = 无
+    uint64_t    monitorOutFrames = 0;   // 实际写进混音引擎的输出帧
+    uint64_t    monitorDrops = 0;       // 待写队列溢出丢掉的帧（正常恒 0）
+    rta::audio::MonitorLatency latency; // 端到端延迟估计（见 monitor_latency_estimate）
+
     void reap() {
         std::lock_guard<std::mutex> lk(joinMtx);
         if (!running.load() && th.joinable()) {
@@ -2693,6 +2704,38 @@ struct InputSessionState {
 };
 static InputSessionState g_inputSession;
 
+// ---------------- 监听走 DSP：参数来源 ----------------
+// 监听没有"当前音源文件"，所以参数只能来自【设置页保存的那一份】
+// （rlplayer-settings.conf，键名与 /api/play 的 form 一致：volume / eq / trim）。
+// 这样"用户在设置页调的音量 / 文件 EQ / 每声道微调"对监听同样生效 —— 即用户要的"同一套 cfg"。
+struct MonitorSavedSettings {
+    double volumeDb = -60.0;   // 与播放默认一致：没写 volume= 时 −60 dB（铁律 1：默认不可闻）
+    std::string eqFile;
+    double trim[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+};
+
+static MonitorSavedSettings monitor_saved_settings() {
+    MonitorSavedSettings s;
+    s.volumeDb = saved_volume_setting();   // 同一个读取器，保证与播放口径一致
+    std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t e = line.find('=');
+        if (e == std::string::npos) continue;
+        const std::string k = line.substr(0, e);
+        const std::string v = line.substr(e + 1);
+        if (k == "eq") {
+            s.eqFile = v;
+        } else if (k == "trim") {
+            std::istringstream ts(v);
+            std::string tv;
+            for (int i = 0; i < 8 && std::getline(ts, tv, ','); ++i) s.trim[i] = atof(tv.c_str());
+        }
+    }
+    return s;
+}
+
 static std::string default_recording_path() {
     std::string recDir = path_in_exe_dir("recordings");
     std::error_code ec;
@@ -2706,7 +2749,9 @@ static std::string default_recording_path() {
 
 static void input_worker_func(std::shared_ptr<rta::audio::WasapiCapture> cap,
                               std::shared_ptr<rta::audio::WasapiSharedOutput> sharedOut,
+                              std::shared_ptr<rta::audio::MonitorDspChain> dspChain,
                               std::string mode,
+                              std::string monitor,
                               std::string outFile,
                               double maxSeconds) {
     HRESULT ci = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -2724,6 +2769,49 @@ static void input_worker_func(std::shared_ptr<rta::audio::WasapiCapture> cap,
     std::vector<float> chunk(2048 * (size_t)channels);
     size_t recordedFrames = 0;
     auto tStart = std::chrono::steady_clock::now();
+    // ---- 监听走 DSP（monitor=dsp）专用状态 ----
+    // 本线程只负责"取数 + 搬运"：真正的声音处理在 MonitorDspChain
+    // （src/audio/wasapi_capture.h，处理函数已由 tests/test_monitor_dsp.cpp 离线断言）。
+    //   采集块读出来 → chain.process → 待写队列 → 共享输出端点（写不下就留着，下一轮再写）
+    // 旧 raw 路径是"读完就一次性写"，设备一次吃不下就丢尾巴；DSP 路径用待写队列，
+    // 丢样会记进 drops —— 不许静默。
+    const bool dspMonitor = (mode == "monitor" && monitor == "dsp" && dspChain && sharedOut);
+    const int      outCh   = dspMonitor ? sharedOut->mix_channels() : 0;
+    const uint32_t outRate = dspMonitor ? sharedOut->mix_rate() : 0;
+    std::vector<float> dspBlock;      // 本次 DSP 输出（交错 outCh）
+    std::vector<float> pending;       // 还没被设备吃掉的输出帧（交错 outCh）
+    size_t pendingFrames = 0;
+    const size_t pendingCapFrames = (outRate > 0) ? (size_t)outRate * 2 : 0;   // 2 秒上限
+    uint64_t dspWritten = 0;          // 真正写进混音引擎的输出帧
+    uint64_t dspDrops   = 0;          // 待写队列溢出丢掉的帧
+    double   dspBlockMs = 0.0;        // 最近一块 DSP 处理耗时（EMA，实测）
+    bool     dspFailed  = false;      // DSP 链报错（错误信息已写进 state.error，本线程随即收尾）
+    auto flush_monitor = [&]() {
+        if (!dspMonitor || pendingFrames == 0) return;
+        const size_t w = sharedOut->write_available_f32(pending.data(), pendingFrames);
+        if (w == 0) return;
+        const size_t rest = pendingFrames - w;
+        if (rest > 0) {
+            // dst 在 src 之前 ⟹ std::copy 的前向拷贝对重叠区间安全
+            std::copy(pending.begin() + (std::ptrdiff_t)(w * (size_t)outCh), pending.end(), pending.begin());
+        }
+        pending.resize(rest * (size_t)outCh);
+        pendingFrames = rest;
+        dspWritten += w;
+    };
+    // 端到端口径统一由 monitor_latency_estimate 决定（不在这里自己加数字）
+    auto measure_latency = [&]() -> rta::audio::MonitorLatency {
+        if (!dspMonitor) return rta::audio::MonitorLatency{};
+        const double capBufMs = (rate > 0 && cap->device_buffer_frames() > 0)
+                                    ? 1000.0 * (double)cap->device_buffer_frames() / (double)rate : 0.0;
+        const double fifoMs = (rate > 0) ? 1000.0 * (double)cap->buffered_frames() / (double)rate : 0.0;
+        const double resMs  = dspChain->resample_latency_ms();
+        const double fillMs = (outRate > 0)
+                                  ? 1000.0 * ((double)sharedOut->last_pad() + (double)pendingFrames) / (double)outRate : 0.0;
+        const double bufMs  = (outRate > 0)
+                                  ? 1000.0 * (double)sharedOut->buffer_frames() / (double)outRate : 0.0;
+        return rta::audio::monitor_latency_estimate(capBufMs, fifoMs, resMs, dspBlockMs, fillMs, bufMs);
+    };
 
     while (!g_inputSession.stopFlag.load()) {
         if (totalTargetFrames > 0 && recordedFrames >= totalTargetFrames) {
@@ -2733,6 +2821,9 @@ static void input_worker_func(std::shared_ptr<rta::audio::WasapiCapture> cap,
         if (totalTargetFrames > 0 && recordedFrames + want > totalTargetFrames) {
             want = totalTargetFrames - recordedFrames;
         }
+
+        // 先把上一轮没送出去的输出帧尽量送掉（与这一轮有没有新采集无关）
+        if (dspMonitor) flush_monitor();
 
         size_t n = cap->read_available(chunk.data(), want);
         if (n > 0) {
@@ -2754,8 +2845,40 @@ static void input_worker_func(std::shared_ptr<rta::audio::WasapiCapture> cap,
             double rmsDb = (rms > 1e-12) ? 20.0 * std::log10(rms) : -999.0;
             double peakDb = (maxPeak > 1e-12) ? 20.0 * std::log10(maxPeak) : -999.0;
 
-            // 直通监听（如果配置了共享输出）
-            if (sharedOut && sharedOut->is_float()) {
+            // ---- 监听输出 ----
+            if (dspMonitor) {
+                // 采集块（交错 float32，任意源格式）→ 现有 DSP 管线
+                // （PEQ / 文件 EQ / matrix / 重采样 / 音量）→ 输出块 → 待写队列
+                dspBlock.clear();
+                const auto t0 = std::chrono::steady_clock::now();
+                const size_t produced = dspChain->process(chunk.data(), n, dspBlock);
+                const double blockMs = std::chrono::duration<double, std::milli>(
+                                           std::chrono::steady_clock::now() - t0).count();
+                dspBlockMs = (dspBlockMs > 0.0) ? (dspBlockMs * 0.8 + blockMs * 0.2) : blockMs;
+                if (!dspChain->last_error().empty()) {
+                    std::lock_guard<std::mutex> lk(g_inputSession.mtx);
+                    g_inputSession.error = dspChain->last_error();
+                    dspFailed = true;
+                }
+                if (produced > 0 && outCh > 0) {
+                    if (pendingCapFrames > 0 && pendingFrames + produced > pendingCapFrames) {
+                        // 待写队列满 = 设备长期吃不下（正常不该发生）。丢最旧的、保最新的，
+                        // 并记进 drops —— 丢样必须能被看见，绝不允许"悄悄变小声/变慢"。
+                        size_t drop = pendingFrames + produced - pendingCapFrames;
+                        if (drop > pendingFrames) drop = pendingFrames;
+                        std::copy(pending.begin() + (std::ptrdiff_t)(drop * (size_t)outCh),
+                                  pending.end(), pending.begin());
+                        pending.resize((pendingFrames - drop) * (size_t)outCh);
+                        pendingFrames -= drop;
+                        dspDrops += drop;
+                    }
+                    pending.insert(pending.end(), dspBlock.begin(), dspBlock.end());
+                    pendingFrames += produced;
+                }
+                flush_monitor();
+            } else if (sharedOut && sharedOut->is_float()) {
+                // 旧行为（monitor=raw，默认）：直通监听（非 bit-perfect），
+                // 采集缓冲原样（或粗暴线性插值）送去默认共享输出端点，不经过任何 DSP。
                 if (cap->rate() == sharedOut->mix_rate() && cap->channels() == sharedOut->mix_channels()) {
                     sharedOut->write_available_f32(chunk.data(), n);
                 } else if (cap->rate() == sharedOut->mix_rate() && cap->channels() == 1 && sharedOut->mix_channels() == 2) {
@@ -2768,19 +2891,19 @@ static void input_worker_func(std::shared_ptr<rta::audio::WasapiCapture> cap,
                 } else {
                     double ratio = (double)cap->rate() / (double)sharedOut->mix_rate();
                     size_t outFrames = (size_t)((double)n / ratio);
-                    int outCh = sharedOut->mix_channels();
-                    if (outFrames > 0 && outCh > 0) {
-                        std::vector<float> resampled(outFrames * (size_t)outCh);
+                    int outChRaw = sharedOut->mix_channels();
+                    if (outFrames > 0 && outChRaw > 0) {
+                        std::vector<float> resampled(outFrames * (size_t)outChRaw);
                         for (size_t i = 0; i < outFrames; ++i) {
                             double srcIdx = (double)i * ratio;
                             size_t idx0 = (size_t)srcIdx;
                             size_t idx1 = (idx0 + 1 < n) ? idx0 + 1 : idx0;
                             double frac = srcIdx - (double)idx0;
-                            for (int ch = 0; ch < outCh; ++ch) {
+                            for (int ch = 0; ch < outChRaw; ++ch) {
                                 int srcCh = (ch < channels) ? ch : (channels - 1);
                                 float s0 = chunk[idx0 * (size_t)channels + srcCh];
                                 float s1 = chunk[idx1 * (size_t)channels + srcCh];
-                                resampled[i * (size_t)outCh + ch] = (float)((1.0 - frac) * s0 + frac * s1);
+                                resampled[i * (size_t)outChRaw + ch] = (float)((1.0 - frac) * s0 + frac * s1);
                             }
                         }
                         sharedOut->write_available_f32(resampled.data(), outFrames);
@@ -2804,6 +2927,17 @@ static void input_worker_func(std::shared_ptr<rta::audio::WasapiCapture> cap,
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
 
+        // 监听 DSP 的延迟/计数每轮都刷新（不依赖这一轮有没有新采集）：
+        // 延迟是"当前这一刻的端到端估计"，停更就会变成一条陈旧数字。
+        if (dspMonitor) {
+            const rta::audio::MonitorLatency lat = measure_latency();
+            std::lock_guard<std::mutex> lk(g_inputSession.mtx);
+            g_inputSession.monitorOutFrames = dspWritten;
+            g_inputSession.monitorDrops = dspDrops;
+            g_inputSession.latency = lat;
+        }
+        if (dspFailed) break;
+
         if (maxSeconds > 0.0) {
             auto now = std::chrono::steady_clock::now();
             double el = std::chrono::duration<double>(now - tStart).count();
@@ -2812,6 +2946,11 @@ static void input_worker_func(std::shared_ptr<rta::audio::WasapiCapture> cap,
             }
         }
     }
+
+    // 停流前的最后一份延迟快照要在 close() 之前取：close() 会把端点缓冲深度清零，
+    // 之后再看就成了"输出缓冲 0ms"，等于把最坏情况那一项抹掉（状态页会显得比真实更好）。
+    rta::audio::MonitorLatency latFinal;
+    if (dspMonitor) latFinal = measure_latency();
 
     cap->stop();
     if (sharedOut) sharedOut->close();
@@ -2841,6 +2980,11 @@ static void input_worker_func(std::shared_ptr<rta::audio::WasapiCapture> cap,
         g_inputSession.underflow = cap->underflow_count();
         g_inputSession.posClips = cap->positive_clips();
         g_inputSession.negClips = cap->negative_clips();
+        if (dspMonitor) {
+            g_inputSession.monitorOutFrames = dspWritten;
+            g_inputSession.monitorDrops = dspDrops;
+            g_inputSession.latency = latFinal;            // close() 之前取的快照
+        }
     }
 
     if (ownCom) CoUninitialize();
@@ -5873,7 +6017,13 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         return j.str();
     }
 
-    // 实时状态：{running, mode(record|monitor|null), device, rate, channels, seconds, frames, water, overflow, underflow, posClips, negClips, outFile, rmsDb, peakDb, error}
+    // 实时状态：{running, mode(record|monitor|null), device, rate, channels, seconds, frames, water,
+    //            overflow, underflow, posClips, negClips, outFile, rmsDb, peakDb, error,
+    //            monitor(raw|dsp), outRate, outChannels, outFormat, monitorNote,
+    //            latencyMs, latency{capture,fifo,resample,dsp,output,outputBuf,total},
+    //            monitorOutFrames, monitorDrops}
+    // latency* 只在 monitor=dsp 时有意义（其余时刻为 0）；口径见
+    // src/audio/wasapi_capture.h 的 monitor_latency_estimate（total 的唯一真相源）。
     if (rq.path.rfind("/api/input/state", 0) == 0) {
         ct = "application/json; charset=utf-8";
         std::lock_guard<std::mutex> lk(g_inputSession.mtx);
@@ -5894,6 +6044,24 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         j << R"(,"outFile":")" << jesc(g_inputSession.outFile) << R"(")";
         j << R"(,"rmsDb":)" << g_inputSession.rmsDb;
         j << R"(,"peakDb":)" << g_inputSession.peakDb;
+        // ---- 监听路径（monitor=dsp 的核心状态）----
+        const rta::audio::MonitorLatency lat = g_inputSession.latency;
+        j << R"(,"monitor":")" << jesc(g_inputSession.monitor) << R"(")";
+        j << R"(,"outRate":)" << g_inputSession.outRate;
+        j << R"(,"outChannels":)" << g_inputSession.outChannels;
+        j << R"(,"outFormat":")" << jesc(g_inputSession.outFormat) << R"(")";
+        j << R"(,"monitorNote":")" << jesc(g_inputSession.monitorNote) << R"(")";
+        j << R"(,"monitorOutFrames":)" << g_inputSession.monitorOutFrames;
+        j << R"(,"monitorDrops":)" << g_inputSession.monitorDrops;
+        j << R"(,"latencyMs":)" << lat.totalMs;
+        j << R"(,"latency":{"capture":)" << lat.captureBufMs
+          << R"(,"fifo":)" << lat.fifoMs
+          << R"(,"resample":)" << lat.resampleMs
+          << R"(,"dsp":)" << lat.dspMs
+          << R"(,"output":)" << lat.outputFillMs
+          << R"(,"outputBuf":)" << lat.outputBufMs
+          << R"(,"total":)" << lat.totalMs
+          << R"(,"live":)" << lat.liveMs << "}";
         j << R"(,"error":")" << jesc(g_inputSession.error) << R"(")";
         j << "}";
         return j.str();
@@ -5946,6 +6114,19 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         }
         if (mode != "record" && mode != "monitor" && mode != "null") {
             return R"({"ok":false,"error":"不支持的采集模式: )" + jesc(mode) + R"EOF( (仅支持 record/monitor/null)"})EOF";
+        }
+
+        // 监听输出路径：monitor=raw（默认，旧行为：采集缓冲原样送共享输出，不经 DSP）
+        //               monitor=dsp（走现有 DSP 管线：PEQ / 文件 EQ / 音量 / matrix / 重采样）
+        // 默认必须是 raw：老前端/老脚本不传 monitor 时行为一字不变（向后兼容）。
+        std::string monitor = params.count("monitor") ? params["monitor"] : "";
+        if (monitor.empty()) monitor = "raw";
+        if (monitor != "raw" && monitor != "dsp") {
+            return R"({"ok":false,"error":"monitor 只支持 raw|dsp（收到: )" + jesc(monitor) + R"(）"})";
+        }
+        if (monitor == "dsp" && mode != "monitor") {
+            return R"({"ok":false,"error":"monitor=dsp 只能用于 mode=monitor（当前 mode=)" + jesc(mode) +
+                   R"(）；这个参数在其它模式不会生效，故直接拒绝，别让它被静默忽略"})";
         }
 
         // 2026-10-23 真机踩到：传 device=Widget+B（少个 v）被静默忽略 → 回落到默认端点，
@@ -6032,16 +6213,70 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         }
 
         std::shared_ptr<rta::audio::WasapiSharedOutput> sharedOut;
-        if (mode == "monitor" && !cfg.srcNull) {
-            // 直通监听（非 bit-perfect）：送往默认共享输出端点
+        std::shared_ptr<rta::audio::MonitorDspChain> dspChain;
+        std::string monitorNote;
+        if (mode == "monitor" && (!cfg.srcNull || monitor == "dsp")) {
+            // monitor=raw：直通监听（非 bit-perfect），采集缓冲原样送默认共享输出端点。
+            // monitor=dsp ：采集块 → 现有 DSP 管线（PEQ / 文件 EQ / matrix / 重采样 / 音量）→ 同一端点。
+            //                 src=null（模拟源）也允许：那是"不开采集设备也能验 DSP→输出通路"的入口
+            //                （注入幅度由 inject= 决定，默认 −60 dBFS，铁律 1）。
             sharedOut = std::make_shared<rta::audio::WasapiSharedOutput>();
             if (!sharedOut->open("", cap->rate(), cap->channels(), 32)) {
+                const std::string e = sharedOut->last_error();
                 cap->close();
-                return R"({"ok":false,"error":"直通监听打开输出端点失败: )" + jesc(sharedOut->last_error()) + R"("})";
+                return R"({"ok":false,"error":"监听打开共享输出端点失败: )" + jesc(e) + R"("})";
             }
             if (!sharedOut->start()) {
+                const std::string e = sharedOut->last_error();
+                sharedOut->close();
                 cap->close();
-                return R"({"ok":false,"error":"直通监听启动输出失败: )" + jesc(sharedOut->last_error()) + R"("})";
+                return R"({"ok":false,"error":"监听启动共享输出失败: )" + jesc(e) + R"("})";
+            }
+            if (monitor == "dsp") {
+                rta::audio::MonitorDspConfig mc;
+                mc.inRate      = cap->rate();
+                mc.inChannels  = cap->channels();
+                mc.outRate     = sharedOut->mix_rate();      // 采集率与混音率不同 ⟹ 管线里做一次重采样
+                mc.outChannels = sharedOut->mix_channels();
+
+                // ---- 同一套设置：音量 / 文件 EQ / 每声道微调 ----
+                const MonitorSavedSettings ms = monitor_saved_settings();
+                mc.volumeEnabled = true;
+                mc.volumeDb = ms.volumeDb;
+                for (int c = 0; c < 8; ++c) mc.trimDb[c] = ms.trim[c];
+                if (!ms.eqFile.empty()) {
+                    std::ifstream ef(ms.eqFile);
+                    if (!ef) ef.open(path_in_exe_dir(ms.eqFile.c_str()));
+                    if (ef) {
+                        mc.eqText.assign((std::istreambuf_iterator<char>(ef)), std::istreambuf_iterator<char>());
+                        if (mc.eqText.size() > 3 && (unsigned char)mc.eqText[0] == 0xEF &&
+                            (unsigned char)mc.eqText[1] == 0xBB && (unsigned char)mc.eqText[2] == 0xBF) {
+                            mc.eqText.erase(0, 3);              // 去 UTF-8 BOM
+                        }
+                    } else {
+                        monitorNote = "文件 EQ 打不开，已忽略: " + ms.eqFile;
+                    }
+                }
+                // 20 段 PEQ：取 g_peq 的【设置快照】，按采集采样率另建一个引擎。
+                // 为什么不共用 g_peq：播放线程随时会按音源采样率 prepare() 它 —— 两边互相
+                // 重置系数和滤波器状态，只会两个都错。监听读设置、不共用实例。
+                if (g_peq) {
+                    auto peq = std::make_shared<rta::dsp::PeqEngine>();
+                    peq->set_settings(g_peq->settings());
+                    peq->prepare((double)mc.inRate, std::max(2, mc.outChannels));
+                    mc.peq = peq;
+                }
+                auto chain = std::make_shared<rta::audio::MonitorDspChain>();
+                std::string cerr;
+                if (!chain->configure(mc, &cerr)) {
+                    sharedOut->close();
+                    cap->close();
+                    return R"({"ok":false,"error":"监听走 DSP 初始化失败: )" + jesc(cerr) + R"("})";
+                }
+                if (!chain->notes().empty()) {
+                    monitorNote += (monitorNote.empty() ? "" : "；") + chain->notes();
+                }
+                dspChain = chain;
             }
         }
 
@@ -6086,15 +6321,37 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
             g_inputSession.rmsDb = -999.0;
             g_inputSession.peakDb = -999.0;
             g_inputSession.error.clear();
+            // 监听路径：raw | dsp + 输出端点格式 + 延迟（延迟由工作线程每轮刷新）
+            g_inputSession.monitor = (mode == "monitor") ? monitor : "raw";
+            g_inputSession.outRate = sharedOut ? sharedOut->mix_rate() : 0;
+            g_inputSession.outChannels = sharedOut ? sharedOut->mix_channels() : 0;
+            g_inputSession.outFormat = sharedOut ? std::string(sharedOut->mix_format_name()) : std::string();
+            g_inputSession.monitorNote = monitorNote;
+            g_inputSession.monitorOutFrames = 0;
+            g_inputSession.monitorDrops = 0;
+            g_inputSession.latency = rta::audio::MonitorLatency{};
             g_inputSession.stopFlag.store(false);
             g_inputSession.running.store(true);
         }
 
         {
             std::lock_guard<std::mutex> lk(g_inputSession.joinMtx);
-            g_inputSession.th = std::thread(input_worker_func, cap, sharedOut, mode, outFile, seconds);
+            g_inputSession.th = std::thread(input_worker_func, cap, sharedOut, dspChain, mode, monitor,
+                                            outFile, seconds);
         }
-        return R"({"ok":true})";
+        // 启动响应直接回报监听路径的关键事实（前端不用再多问一次 /api/input/state）：
+        // 走的是 raw 还是 dsp、输出端点的真实「混音」采样率/声道/格式。
+        std::string extra;
+        if (mode == "monitor") {
+            extra += ",\"monitor\":\"" + jesc(monitor) + "\"";
+            if (sharedOut) {
+                extra += ",\"outRate\":" + std::to_string(sharedOut->mix_rate());
+                extra += ",\"outChannels\":" + std::to_string(sharedOut->mix_channels());
+                extra += ",\"outFormat\":\"" + std::string(sharedOut->mix_format_name()) + "\"";
+            }
+            if (!monitorNote.empty()) extra += ",\"monitorNote\":\"" + jesc(monitorNote) + "\"";
+        }
+        return R"({"ok":true)" + extra + "}";
     }
 
     // 停止采集：POST /api/input/stop

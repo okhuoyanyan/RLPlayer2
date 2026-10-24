@@ -39,6 +39,8 @@
 #include "wasapi_out.h"
 #include "audio/wav.h"
 #include "dsp/fft.h"
+#include "engine/pipeline.h"   // 监听走 DSP：复用播放同一份 Pipeline（PEQ/EQ/音量/重采样）
+#include "dsp/eq_text.h"       // 文件 EQ（REW/AutoEq 文本）解析 —— pipeline.h 自己不 include 它
 
 namespace rta::audio {
 
@@ -481,6 +483,335 @@ inline void write_capture_wav(const std::string& path, const float* interleaved,
     write_wav(path, ab);
 }
 
+// =====================================================================================
+// 监听走 DSP（monitor=dsp）：采集块 → 现有 DSP 管线 → 共享输出块
+//
+// 背景（2026-10-24）：旧直通监听把采集缓冲**原样**写进默认共享输出端点
+// （tools/rtaweb.cpp 的 input_worker_func），不经过 PEQ / EQ / 音量 / 升频，
+// 用户要求"监听也要能加 EQ/PEQ/音量"。
+//
+// 本段的职责边界：
+//   * 输入 = WasapiCapture 已经归一化好的【交错 float32】（设备是 16/24/32-bit PCM 还是
+//     float 都在 convert_to_float 里变成 float32 了）；输出 = 共享输出端点要的【交错 float32】。
+//   * 中间就是**现有**的 rta::engine::Pipeline：PEQ → 文件 EQ / 每声道增益 → 重采样 → 音量，
+//     与播放走同一份代码、同一套参数来源（rtaweb 侧从设置文件读同一批键）。
+//   * **不碰任何设备**：打开端点 / 写端点都在调用方。正因如此，这一整段可以被
+//     tests/test_monitor_dsp.cpp 完全离线断言（不打开音频设备、不发声，铁律 1 无涉）。
+//
+// 与播放链【刻意】的三处差异（必须留档，别被当成 bug）：
+//   1) 重采样抽头按"每相位 N 抽头"给（monitor_resample_taps），不用播放的 26 万抽头：
+//      监听要的是低延迟与实时余量，不是 -180 dB 阻带。群延迟量级 1~2 ms（见 resample_latency_ms）。
+//   2) 不加载卷积 IR：房间校正 IR 会引入数十~数百 ms 延迟，而用户点名的是
+//      PEQ / EQ / 音量 / matrix 四项。
+//   3) 输出固定 32-bit 整数容器（精度等价 float），不做抖动/噪声整形 ——
+//      后面紧接着就是混音引擎的 float/int16/int24 转换（wasapi_shared.h）。
+// =====================================================================================
+
+// 监听重采样：给定"每相位抽头数"换算成 PipelineConfig::taps（内插域总抽头数）。
+// 为什么不能直接给总抽头数：T = totalTaps / L，而 L = outRate/gcd(inRate,outRate)。
+// 44.1k→48k 的 L=160，若照搬播放的 262144 总抽头，T=1638 —— 每输出样本 1638 次乘加，
+// 2 声道 48k 下就是 1.6 亿次/秒，实时余量会被吃光；反过来 48k→96k 的 L=2，
+// 262144 总抽头 = 每相位 131072 抽头，更荒谬。按相位给就与采样率无关了。
+inline uint32_t monitor_gcd(uint32_t a, uint32_t b) {
+    while (b != 0) {
+        const uint32_t t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+inline int monitor_resample_taps(uint32_t inRate, uint32_t outRate, int tapsPerPhase = 256) {
+    if (inRate == 0 || outRate == 0) return 0;
+    const uint32_t g = monitor_gcd(inRate, outRate);
+    const uint64_t L = (uint64_t)(outRate / (g ? g : 1));
+    if (tapsPerPhase < 8) tapsPerPhase = 8;
+    uint64_t total = L * (uint64_t)tapsPerPhase;
+    if (total < 256) total = 256;            // 抽头太少时阻带会塌（Kaiser 设计需要足够长度）
+    if (total > 262144) total = 262144;      // 上限：与播放同量级，避免病态比率把内存吃光
+    return (int)total;
+}
+
+// 采集声道数 ≠ 输出声道数时的默认路由。
+// 空 = 交给管线走单位路由（前 min(in,out) 个声道一一对应，其余补零），
+// 这正是播放的语义；唯一需要显式展开的是【单声道 → 多声道复制】
+// （旧 raw 直通就是复制到左右两个声道，用户听到的是"两边都有声"，不能因为走 DSP 就变单边）。
+inline std::vector<rta::dsp::MatrixRoute> monitor_default_matrix(int inCh, int outCh) {
+    std::vector<rta::dsp::MatrixRoute> r;
+    if (inCh <= 0 || outCh <= 0 || inCh == outCh) return r;
+    if (inCh == 1) {
+        for (int c = 0; c < outCh; ++c) {
+            rta::dsp::MatrixRoute rt;
+            rt.src = 0; rt.dst = c; rt.gain = 1.0;
+            r.push_back(rt);
+        }
+    }
+    return r;
+}
+
+// 端到端延迟估计（纯数据，无设备）。单位 ms。
+// 口径写死在这里，避免 rtaweb 每次自己拼数字（两处不一致就又是一次"判据错误"）：
+//   totalMs = 采集端点缓冲 + 采集 FIFO 实测积压 + 重采样群延迟 + DSP 块耗时 + 共享输出缓冲深度
+// 用的是【缓冲深度】而不是"当前占用"：待播帧数在运行中会随设备节奏起伏（实测常接近 0），
+// 拿它当端到端延迟会随采样时刻乱跳，也不能回答"最坏情况多少毫秒"。
+// outputFillMs 是【实测待播】（GetCurrentPadding + 我们待写队列），单独回报供现场看真实占用 ——
+// 它不参与 totalMs 求和，否则同一个缓冲会被算两遍。
+// ⚠️ 这是"缓冲深度口径"的估计，不是硬件往返实测：真实声卡还有驱动/引擎内部延迟，
+//    未做环路实测（铁律 4：没测过的就不许写成测过）。
+struct MonitorLatency {
+    double captureBufMs  = 0.0;   // 采集端点缓冲时长（WASAPI 分配的缓冲；null 源为 0）
+    double fifoMs        = 0.0;   // 采集环形缓冲实测积压
+    double resampleMs    = 0.0;   // 重采样线性相位群延迟（无重采样 = 0）
+    double dspMs         = 0.0;   // 一块 DSP 的处理耗时（EMA 实测）
+    double outputFillMs  = 0.0;   // 共享输出端点当前待播（实测，仅供参考）
+    double outputBufMs   = 0.0;   // 共享输出端点缓冲深度
+    double totalMs       = 0.0;   // 缓冲深度口径（最坏情况，见上）
+    // 实测占用口径：把 outputBufMs 换成【当前真的排队着】的 outputFillMs。
+    // 稳态下监听是"来多少写多少"，端点缓冲里往往只有几毫秒 ⟹ liveMs 通常远小于 totalMs。
+    // 两个都给，读者才不会把"最坏情况 300ms"误当成"现在就是 300ms"。
+    double liveMs        = 0.0;
+};
+
+inline MonitorLatency monitor_latency_estimate(double captureBufMs, double fifoMs, double resampleMs,
+                                               double dspMs, double outputFillMs, double outputBufMs) {
+    MonitorLatency l;
+    l.captureBufMs = captureBufMs > 0.0 ? captureBufMs : 0.0;
+    l.fifoMs       = fifoMs > 0.0 ? fifoMs : 0.0;
+    l.resampleMs   = resampleMs > 0.0 ? resampleMs : 0.0;
+    l.dspMs        = dspMs > 0.0 ? dspMs : 0.0;
+    l.outputBufMs  = outputBufMs > 0.0 ? outputBufMs : 0.0;
+    l.outputFillMs = outputFillMs > 0.0 ? outputFillMs : 0.0;
+    if (l.outputFillMs > l.outputBufMs) l.outputFillMs = l.outputBufMs;
+    const double base = l.captureBufMs + l.fifoMs + l.resampleMs + l.dspMs;
+    l.totalMs = base + l.outputBufMs;
+    l.liveMs  = base + l.outputFillMs;
+    return l;
+}
+
+// 监听 DSP 配置：参数来源与播放是同一套设置；重采样参数是监听专用的（见上）。
+struct MonitorDspConfig {
+    uint32_t inRate      = 48000;
+    int      inChannels  = 2;
+    uint32_t outRate     = 48000;
+    int      outChannels = 2;
+
+    bool     volumeEnabled = true;
+    double   volumeDb      = 0.0;
+
+    // 20 段 PEQ：调用方持有引擎（与播放同一个 PeqEngine 类型），已按 inRate prepare。
+    // 传 nullptr = 不用 PEQ（等价于全 0 dB / bypass）。
+    std::shared_ptr<rta::dsp::PeqEngine> peq;
+
+    // 文件 EQ（REW / AutoEq 文本）。解析失败不会静默吞掉：notes() 里留一行说明。
+    std::string eqText;
+
+    // 路由：空 = monitor_default_matrix()
+    std::vector<rta::dsp::MatrixRoute> matrix;
+
+    // 每输出声道微调 dB（与播放的 trim 同语义，0 = 不动）
+    double trimDb[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+
+    int      tapsPerPhase   = 256;    // 监听用短滤波器
+    double   attenDb        = 100.0;  // 阻带目标（不追 -180 dB）
+    double   transition     = 0.05;   // 过渡带占比
+    bool     useGpuResample = false;  // 监听不依赖 rtagpu.dll（CPU 足够，少一次 DLL 探测）
+
+    // 起流前"预跑"的静音长度（ms）。必须 > 管线的 volumeRampMs（本链固定 50ms）。
+    // 作用见 configure() 里的注释：把音量渐变跑完，避免开麦头 50ms 以 0 dB 漏音。
+    // 0 = 不预跑 —— 只给测试做"判据自证"用，生产永远用默认值。
+    double   primeMs = 60.0;
+};
+
+// 采集块 → DSP → 输出块的纯处理单元（不碰设备；跨调用保持滤波器/重采样相位状态）。
+class MonitorDspChain {
+public:
+    MonitorDspChain() = default;
+    MonitorDspChain(const MonitorDspChain&) = delete;
+    MonitorDspChain& operator=(const MonitorDspChain&) = delete;
+
+    bool configure(const MonitorDspConfig& cfg, std::string* err = nullptr) {
+        auto fail = [&](const std::string& m) {
+            lastErr_ = m;
+            if (err) *err = m;
+            return false;
+        };
+        pipe_.reset();
+        cfg_ = cfg;
+        lastErr_.clear();
+        notes_.clear();
+        inFramesTotal_ = 0;
+        outFramesTotal_ = 0;
+        resampleMs_ = 0.0;
+        eqLoaded_ = false;
+        if (cfg_.inRate == 0 || cfg_.outRate == 0) {
+            return fail("监听 DSP 配置非法: 采样率必须 > 0 (采集=" + std::to_string(cfg_.inRate) +
+                        ", 输出=" + std::to_string(cfg_.outRate) + ")");
+        }
+        if (cfg_.inChannels <= 0 || cfg_.inChannels > 32 ||
+            cfg_.outChannels <= 0 || cfg_.outChannels > 32) {
+            return fail("监听 DSP 配置非法: 声道数必须在 1..32 (采集=" + std::to_string(cfg_.inChannels) +
+                        ", 输出=" + std::to_string(cfg_.outChannels) + ")");
+        }
+        if (cfg_.tapsPerPhase <= 0) cfg_.tapsPerPhase = 256;
+
+        rta::engine::PipelineConfig pc;
+        pc.outRate        = cfg_.outRate;
+        pc.outBits        = 32;                     // 输出统一 32-bit 整数容器（精度等价 float）
+        pc.outChannels    = cfg_.outChannels;
+        pc.shaper         = rta::dsp::Shaper::None; // 监听不做噪声整形
+        pc.volumeEnabled  = cfg_.volumeEnabled;
+        pc.volumeDb       = cfg_.volumeDb;
+        pc.volumeRampMs   = 50.0;                   // 监听比播放(200ms)短：调音量要跟手
+        pc.peq            = cfg_.peq;
+        pc.taps           = monitor_resample_taps(cfg_.inRate, cfg_.outRate, cfg_.tapsPerPhase);
+        pc.attenDb        = cfg_.attenDb;
+        pc.transition     = cfg_.transition;
+        pc.twoStage       = false;                  // 监听比率通常不需要两段式
+        pc.gpuResample    = cfg_.useGpuResample;
+        pc.matrix         = cfg_.matrix.empty() ? monitor_default_matrix(cfg_.inChannels, cfg_.outChannels)
+                                                : cfg_.matrix;
+
+        // 文件 EQ：与播放同一条路径（解析器 + 在每个输出声道上同一套双二阶）
+        if (!cfg_.eqText.empty()) {
+            try {
+                const rta::dsp::EqSpec spec = rta::dsp::parse_eq_text(cfg_.eqText);
+                const std::vector<rta::dsp::Biquad> eq = rta::dsp::build_eq_filters(spec, (double)cfg_.inRate);
+                if (!eq.empty() || spec.preampDb != 0.0) {
+                    if (pc.channel.size() < (size_t)cfg_.outChannels) pc.channel.resize((size_t)cfg_.outChannels);
+                    for (auto& cp : pc.channel) {
+                        cp.eq = eq;
+                        if (spec.preampDb != 0.0) cp.gainDb += spec.preampDb;
+                    }
+                    eqLoaded_ = true;
+                } else {
+                    eqLoaded_ = false;
+                    notes_ += (notes_.empty() ? "" : "；") + std::string("文件 EQ 没有有效滤波器（已忽略）");
+                }
+            } catch (...) {
+                eqLoaded_ = false;   // 与播放一致：坏文件当没配，但要留痕
+                notes_ += (notes_.empty() ? "" : "；") + std::string("文件 EQ 解析失败（已忽略）");
+            }
+        }
+
+        // 每声道微调
+        if (pc.channel.size() < (size_t)cfg_.outChannels) pc.channel.resize((size_t)cfg_.outChannels);
+        for (int c = 0; c < cfg_.outChannels && c < 8; ++c) {
+            if (cfg_.trimDb[c] != 0.0) pc.channel[(size_t)c].gainDb += cfg_.trimDb[c];
+        }
+
+        try {
+            pipe_ = std::make_unique<rta::engine::Pipeline>(pc);
+        } catch (const std::exception& e) {
+            return fail(std::string("监听 DSP 管线构造失败: ") + e.what());
+        }
+
+        // ---- 起流防爆音：把音量渐变先跑完 ----
+        // VolumeControl 的 current_ 初值是 1.0（0 dB），set_gain_db() 只会把 target_ 设为
+        // 用户音量并安排一段渐变。监听是"开麦即出声"：若直接开始，头 50ms 会以接近 0 dB
+        // 把采集到的声音送出去 —— 用户听到的是开麦瞬间的一记漏音/爆音。音量设得越低越明显
+        //（增益从 1.0 掉到目标值）。
+        // 这里先喂一段【数字静音】把渐变跑完，输出丢弃：喂的是 0，等价于流从 t=0 开始，
+        // 重采样相位与滤波器历史照常建立，不改变之后的任何样本。
+        if (cfg_.primeMs > 0.0) {
+            const size_t primeFrames =
+                (size_t)std::max(1.0, std::ceil(cfg_.primeMs * (double)cfg_.inRate / 1000.0));
+            std::vector<float> zeros(primeFrames * (size_t)cfg_.inChannels, 0.0f);
+            std::vector<float> sink;
+            process(zeros.data(), primeFrames, sink);
+            inFramesTotal_ = 0;
+            outFramesTotal_ = 0;
+        }
+        if (!lastErr_.empty()) return fail(lastErr_);
+        return true;
+    }
+
+    // 处理一块采集数据：in = 交错 float32（cfg.inChannels），把结果【追加】到
+    // outInterleaved（交错 float32，cfg.outChannels）。返回本次产生的输出帧数。
+    size_t process(const float* in, size_t inFrames, std::vector<float>& outInterleaved) {
+        if (!pipe_ || !in || inFrames == 0 || cfg_.inChannels <= 0) return 0;
+        try {
+            const int inCh = cfg_.inChannels;
+            rta::audio::AudioBuffer ib;
+            ib.rate = cfg_.inRate;
+            ib.channels = inCh;
+            ib.bits = 32;
+            ib.isFloat = false;
+            ib.raw.resize(inFrames * (size_t)inCh);
+            for (size_t f = 0; f < inFrames; ++f) {
+                for (int c = 0; c < inCh; ++c) {
+                    double x = (double)in[f * (size_t)inCh + (size_t)c];
+                    if (!std::isfinite(x)) x = 0.0;     // 上游 bug 不该变成满幅直流/爆音
+                    ib.setSample(f, c, x);              // ±1.0 → 2^31 标度，内部自动钳位
+                }
+            }
+
+            rta::engine::PipelineStats st;
+            rta::audio::AudioBuffer ob = pipe_->process(ib, &st);
+            const size_t nOut = ob.frames();
+            const int    oc   = ob.channels;
+            if (nOut == 0 || oc <= 0) return 0;
+
+            const double fscale = ob.fullScale();       // 32-bit → 2^31
+            const int    outCh  = cfg_.outChannels;
+            const size_t base   = outInterleaved.size();
+            outInterleaved.resize(base + nOut * (size_t)outCh);
+            for (size_t f = 0; f < nOut; ++f) {
+                for (int c = 0; c < outCh; ++c) {
+                    const int sc = (c < oc) ? c : (oc - 1);
+                    const double v = (double)ob.raw[f * (size_t)oc + (size_t)sc] / fscale;
+                    outInterleaved[base + f * (size_t)outCh + (size_t)c] = (float)v;
+                }
+            }
+            resampleMs_ = (st.usedResample && cfg_.inRate > 0)
+                              ? st.latencyInSamples * 1000.0 / (double)cfg_.inRate
+                              : 0.0;
+            bitPerfect_ = st.bitPerfect;
+            usedPeq_   = st.usedPeq;
+            usedEq_    = st.usedEq;
+            usedVol_   = st.usedVolume;
+            usedRs_    = st.usedResample;
+            inFramesTotal_  += inFrames;
+            outFramesTotal_ += nOut;
+            return nOut;
+        } catch (const std::exception& e) {
+            lastErr_ = std::string("监听 DSP 处理失败: ") + e.what();
+            return 0;
+        }
+    }
+
+    // 清滤波器/重采样历史（停流后重新起流用它；正常停流直接重建对象亦可）
+    void reset() { if (pipe_) pipe_->seek_reset(); }
+
+    bool   ready() const { return pipe_ != nullptr; }
+    uint32_t in_rate() const { return cfg_.inRate; }
+    uint32_t out_rate() const { return cfg_.outRate; }
+    int    in_channels() const { return cfg_.inChannels; }
+    int    out_channels() const { return cfg_.outChannels; }
+    int    taps_per_phase() const { return cfg_.tapsPerPhase; }
+    int    taps_total() const { return monitor_resample_taps(cfg_.inRate, cfg_.outRate, cfg_.tapsPerPhase); }
+    double resample_latency_ms() const { return resampleMs_; }
+    uint64_t in_frames_total() const { return inFramesTotal_; }
+    uint64_t out_frames_total() const { return outFramesTotal_; }
+    bool   bit_perfect() const { return bitPerfect_; }
+    bool   used_peq() const { return usedPeq_; }
+    bool   used_eq() const { return usedEq_; }
+    bool   used_volume() const { return usedVol_; }
+    bool   used_resample() const { return usedRs_; }
+    bool   eq_loaded() const { return eqLoaded_; }
+    const std::string& notes() const { return notes_; }
+    const std::string& last_error() const { return lastErr_; }
+
+private:
+    MonitorDspConfig cfg_;
+    std::unique_ptr<rta::engine::Pipeline> pipe_;
+    double   resampleMs_ = 0.0;
+    bool     bitPerfect_ = false, usedPeq_ = false, usedEq_ = false, usedVol_ = false, usedRs_ = false;
+    bool     eqLoaded_ = false;
+    uint64_t inFramesTotal_ = 0, outFramesTotal_ = 0;
+    std::string notes_;
+    std::string lastErr_;
+};
+
 // ---------------- WASAPI 采集设备描述与核心类 ----------------
 
 struct CaptureDeviceInfo {
@@ -788,6 +1119,11 @@ public:
     bool is_null() const { return isNull_; }
     bool is_running() const { return running_; }
     double water_level() const { return fifo_.water_level(); }
+    // 监听走 DSP 的延迟估计要用：FIFO 里现有多少帧、以及采集端点缓冲多少帧。
+    // （水位数是 0..1 的比例，换算成毫秒还得知道容量 —— 直接给帧数更不容易算错。）
+    size_t buffered_frames() const { return fifo_.available_read(); }
+    size_t fifo_capacity_frames() const { return fifo_.capacity(); }
+    size_t device_buffer_frames() const { return (size_t)bufferFrames_; }
     uint64_t overflow_count() const { return fifo_.overflow_count(); }
     uint64_t underflow_count() const { return fifo_.underflow_count(); }
     long long positive_clips() const { return clipStats_.posClips; }
