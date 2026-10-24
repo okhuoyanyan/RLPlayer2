@@ -3426,6 +3426,12 @@ struct SummaryJob {
     std::string body;
     long long started_at = 0;
     long long finished_at = 0;
+    // 261024-05 流式：生成过程中由 ProgressFn 写入，pending 响应带给前端做「逐字/进度」显示。
+    std::string phase;        // "检索中" / "生成中"
+    std::string partial;      // 本次尝试已生成的部分文本（原始 JSON 片段）
+    int attempt = 0;
+    long long chars = 0;
+    long long progress_ms = 0;
 };
 static std::mutex g_summ_mu;
 static std::map<std::string, SummaryJob> g_summ_jobs;
@@ -3462,8 +3468,29 @@ static void summary_job_start_fn(const std::string& key, const std::string& kind
 static void summary_job_start(const std::string& key, rta::meta::EntityKind ek, const std::string& name,
                               const std::string& lang, const std::string& kindStr,
                               const rta::meta::RetrievalOptions& ropts) {
-    summary_job_start_fn(key, kindStr, name, [ek, name, lang, ropts]() {
-        return rta::meta::retrieval_fetch(ek, name, lang, ropts);
+    // 261024-05：把 LLM 流式进度写回任务表（pending 响应据此显示"已生成 N 字"与部分文本）。
+    // 线程纪律：ProgressFn 可能在网络线程被调用 ⟹ 只在这把锁里改 job 的展示字段，读取方也持锁。
+    auto prog = [key](const rta::meta::SummaryProgress& p) {
+        std::lock_guard<std::mutex> lk(g_summ_mu);
+        auto it = g_summ_jobs.find(key);
+        if (it == g_summ_jobs.end()) return;
+        auto& j = it->second;
+        switch (p.phase) {
+        case rta::meta::SummaryPhase::Retrieving: j.phase = "检索中"; break;
+        case rta::meta::SummaryPhase::Generating: j.phase = "生成中"; break;
+        case rta::meta::SummaryPhase::Done:       j.phase = "完成";   break;
+        case rta::meta::SummaryPhase::Failed:     j.phase = "失败";   break;
+        default: break;
+        }
+        j.attempt = p.attempt;
+        j.chars = (long long)p.chars;
+        j.progress_ms = p.elapsed_ms;
+        // 只留尾部 1500 字节：前端只显示尾部，整段 JSON 没必要每 400ms 传一次
+        if (p.partial.size() > 1500) j.partial = p.partial.substr(p.partial.size() - 1500);
+        else j.partial = p.partial;
+    };
+    summary_job_start_fn(key, kindStr, name, [ek, name, lang, ropts, prog]() {
+        return rta::meta::retrieval_fetch(ek, name, lang, ropts, prog);
     });
 }
 
@@ -4901,6 +4928,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         ropts.llm_cfg = rta::meta::llm_config_load(llm_conf_path());   // 与设置页写的 key 同一份
 
         const std::string jobKey = eid + "|" + lang;
+        std::string progJson;
         {
             std::lock_guard<std::mutex> lk(g_summ_mu);
             // 清理 10 分钟前的陈旧任务，避免 map 无限增长（正常前端拿到结果就会取走）
@@ -4924,9 +4952,22 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                 play_log("SUMMARY generate(async) kind=" + kindStr + " name=" + name + " eid=" + eid);
                 summary_job_start(jobKey, ek, name, lang, kindStr, ropts);
             }
+            // 261024-05：把当前进度一起带回（同一把锁，避免读到半更新的字段）
+            auto jt = g_summ_jobs.find(jobKey);
+            if (jt != g_summ_jobs.end()) {
+                const auto& j = jt->second;
+                std::ostringstream po;
+                po << "{\"phase\":\"" << jesc(j.phase.empty() ? std::string("整理中") : j.phase) << "\""
+                   << ",\"attempt\":" << j.attempt
+                   << ",\"chars\":" << j.chars
+                   << ",\"elapsedMs\":" << j.progress_ms
+                   << ",\"text\":\"" << jesc(j.partial) << "\"}";
+                progJson = po.str();
+            }
         }
         return "{\"ok\":false,\"pending\":true,\"error\":\"正在整理资料\",\"summaryKind\":\"" +
-               jesc(kindStr) + "\",\"summaryCached\":false}";
+               jesc(kindStr) + "\",\"summaryCached\":false,\"progress\":" +
+               (progJson.empty() ? std::string("null") : progJson) + "}";
     }
 
     // ---------------- 资料层(P3④b Discogs L4 古典作品版本推荐): GET /api/entity/versions ----------------
