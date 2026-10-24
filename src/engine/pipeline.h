@@ -26,6 +26,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <chrono>
 #include <memory>
 
 namespace rta::engine {
@@ -103,6 +104,10 @@ struct PipelineStats {
     bool     usedChannelGain = false;      // 是否用了每声道增益
     std::string gpuStatus;                 // GPU 桥接状态说明
     int      eqBiquads = 0, maxDelaySamples = 0, maxIrLength = 0;
+    // 流式状态建立（首次 process 调用时的"重活"）耗时与内存：滤波器设计是起播延迟的
+    // 隐藏成本项，必须能实测（大文件卡死排查 2026-10-25）。coeffBytes = 多相系数表字节数。
+    double   prepareMs = 0.0;
+    size_t   coeffBytes = 0;
 };
 
 class Pipeline {
@@ -207,6 +212,8 @@ public:
         // 首次调用（或配置变化）时建立持久流式状态；此后跨调用保持
         if (!ss_.ready || ss_.inRate != in.rate || ss_.inChannels != in.channels)
             prepare_stream(in, outCh);
+        st.prepareMs = ss_.prepareMs;
+        st.coeffBytes = ss_.coeffBytes;
 
         // 解交错
         std::vector<std::vector<double>> planes((size_t)inCh, std::vector<double>(nIn));
@@ -380,10 +387,13 @@ private:
         std::vector<dsp::Quantizer>              quant;
         std::vector<std::unique_ptr<dsp::StreamingConvolver>> conv;   // 每输出声道
         std::vector<std::unique_ptr<dsp::Loudness>> loud;             // 每声道（各自持有滤波状态）
+        double prepareMs = 0.0;      // prepare_stream() 耗时（滤波器设计 + 状态分配）
+        size_t coeffBytes = 0;       // 重采样器系数表字节数（多相 L × 每相抽头 × 8）
     };
     mutable StreamState ss_;
 
     void prepare_stream(const AudioBuffer& in, int outCh) const {
+        const auto t_prep_0 = std::chrono::steady_clock::now();
         ss_ = StreamState{};
         ss_.inRate = in.rate;
         ss_.inChannels = in.channels;
@@ -437,6 +447,16 @@ private:
                 ss_.eqPerCh[(size_t)c] = cfg_.channel[(size_t)c].eq.size();
             }
         }
+        // 多相系数表大小：L 相 × 每相抽头 × 8 字节（两级时第一级另算，量级相同）
+        if (ss_.rs) {
+            const uint32_t a = in.rate, b = outRate;
+            uint32_t g = a, h = b;
+            while (h) { const uint32_t t2 = g % h; g = h; h = t2; }
+            const size_t L = g ? (size_t)(b / g) : 0;
+            ss_.coeffBytes = L * (size_t)ss_.rs->tapsPerPhase() * sizeof(double);
+        }
+        ss_.prepareMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t_prep_0).count();
         ss_.ready = true;
     }
 

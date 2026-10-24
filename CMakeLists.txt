@@ -551,3 +551,8 @@ add_test(NAME asio_native_dsd COMMAND test_asio_native_dsd)
 add_executable(test_monitor_dsp tests/test_monitor_dsp.cpp)
 target_link_libraries(test_monitor_dsp PRIVATE rtadsp ole32 uuid advapi32)
 add_test(NAME monitor_dsp COMMAND test_monitor_dsp)
+
+# ---------------- 大 DSD 流式解码（261024-06 #2）----------------
+add_executable(test_dsd_stream_decode tests/test_dsd_stream_decode.cpp)
+target_link_libraries(test_dsd_stream_decode PRIVATE rtadsp)
+add_test(NAME dsd_stream_decode COMMAND test_dsd_stream_decode)

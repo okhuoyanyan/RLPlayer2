@@ -365,6 +365,357 @@ inline bool read_wav_stream_pipe(HANDLE hPipe, HANDLE hProcess, AudioBuffer& ab,
     return true;
 }
 
+
+// ---------------- DSD 流式解码（大文件；不整曲入内存） ----------------
+//
+// 为什么需要（2026-10-25 用户实测：384 s DSD64 / 271 MB）：
+//   整曲原生解码要同时握住「1-bit 流 + 每声道 double 平面 + int32 缓冲」三层数据 ——
+//   实测解码 4.9 s、缓冲 517 MB、进程峰值 1813 MB，起播前就先卡住、吃掉近 2 GB。
+//   流式解码只保留「一个块」（DSF 默认 4 KB/声道）与抽取器状态：
+//   起播延迟 = 一块的时间，内存 = 常数，与文件长度无关。
+//
+// 逐位一致性：与 read_dsd_native 使用同一个 DsdDecimator、同一组设置、同样的块边界
+// （从第 0 位开始按块连续喂），因此 PCM 输出与整曲解码逐位相同 —— 测试里逐样本比对。
+// 跳转（seek）会重建抽取器状态并从块边界重新开始；调用方按现有惯例预卷 0.5 s 丢弃，
+// 抽取器瞬态因此落在被丢弃的区段里（与整曲缓冲 + seek_reset 的既有行为一致）。
+
+struct DsdFileLayout {
+    bool     isDsf = false;
+    uint32_t rate = 0;                 // 1-bit 采样率
+    int      channels = 0;
+    uint64_t bitsPerChannel = 0;       // 每声道有效位数
+    uint64_t bytesPerChannel = 0;      // 每声道字节数
+    uint64_t dataOffset = 0;           // 数据区在文件内的绝对偏移
+    uint64_t dataSize = 0;             // 数据区总字节
+    uint32_t blockSize = 0;            // DSF：每声道块字节数；DFF：0（内部按 4 KB 读块）
+    bool     paddedLastBlock = true;   // DSF 末块是否按整块补齐
+    std::string container;             // "dsf" / "dff"
+};
+
+// 只读文件头（不载入数据）：给"要不要走流式"的判断与流式解码器用。
+inline DsdFileLayout probe_dsd_layout(const std::string& path) {
+    using namespace dsd_detail;
+    const std::string ext = lowerExt(path);
+    DsdFileLayout L;
+    FILE* f = dsd_fopen(path, L"rb", "rb");
+    if (!f) throw std::runtime_error("无法打开文件: " + path);
+    struct Guard { FILE* f; ~Guard() { if (f) std::fclose(f); } } g{ f };
+    auto rd = [&](uint64_t off, void* buf, size_t n) -> size_t {
+        if (_fseeki64(f, (long long)off, SEEK_SET) != 0) return 0;
+        return std::fread(buf, 1, n, f);
+    };
+
+    if (ext == ".dsf") {
+        uint8_t h[28];
+        if (rd(0, h, 28) != 28 || std::memcmp(h, "DSD ", 4) != 0)
+            throw std::runtime_error("不是 DSF 文件（缺少 \"DSD \" 头）: " + path);
+        if (rdl64(h + 4) != 28) throw std::runtime_error("DSF 头长度异常");
+        uint64_t off = 28;
+        bool haveFmt = false, haveData = false;
+        uint32_t chNum = 0, rate = 0, blockSize = 0;
+        uint64_t sampleCnt = 0;
+        for (int guard = 0; guard < 64 && !haveData; ++guard) {
+            uint8_t ch[12];
+            if (rd(off, ch, 12) != 12) break;
+            const uint64_t sz = rdl64(ch + 4);
+            if (sz < 12) break;
+            if (std::memcmp(ch, "fmt ", 4) == 0) {
+                if (sz < 52) throw std::runtime_error("DSF fmt 块长度异常");
+                std::vector<uint8_t> fb((size_t)sz);
+                if (rd(off + 12, fb.data(), fb.size()) != fb.size())
+                    throw std::runtime_error("DSF fmt 块被截断");
+                const uint32_t fmtId = rdl32(fb.data() + 4);
+                chNum     = rdl32(fb.data() + 12);
+                rate      = rdl32(fb.data() + 16);
+                const uint32_t bps = rdl32(fb.data() + 20);
+                sampleCnt = rdl64(fb.data() + 24);
+                blockSize = rdl32(fb.data() + 32);
+                if (fmtId != 0) throw std::runtime_error("DSF 为 DST 压缩，暂不支持流式解码");
+                if (bps != 1) throw std::runtime_error("DSF bits per sample 非 1");
+                if (chNum < 1 || chNum > 8) throw std::runtime_error("DSF 声道数异常");
+                if (rate < 44100) throw std::runtime_error("DSF 采样率异常");
+                if (blockSize == 0 || blockSize > (1u << 20)) throw std::runtime_error("DSF 块长异常");
+                if (sampleCnt == 0) throw std::runtime_error("DSF 样本数为 0");
+                haveFmt = true;
+            } else if (std::memcmp(ch, "data", 4) == 0) {
+                L.dataOffset = off + 12;
+                L.dataSize   = sz - 12;
+                haveData = true;
+                break;
+            }
+            off += (size_t)sz;
+        }
+        if (!haveFmt) throw std::runtime_error("DSF 缺少 fmt 块");
+        if (!haveData) throw std::runtime_error("DSF 缺少 data 块");
+        const uint64_t needBytes  = (sampleCnt + 7) / 8;
+        const uint64_t fullBlocks = needBytes / blockSize;
+        const uint64_t remBytes   = needBytes % blockSize;
+        const uint64_t needData   = (fullBlocks + (remBytes ? 1 : 0)) * (uint64_t)chNum * blockSize;
+        if (L.dataSize < (uint64_t)chNum * 8) throw std::runtime_error("DSF data 块过短");
+        L.isDsf = true;
+        L.rate = rate; L.channels = (int)chNum;
+        L.bitsPerChannel = sampleCnt;
+        L.bytesPerChannel = needBytes;
+        L.blockSize = blockSize;
+        L.paddedLastBlock = (L.dataSize >= needData);
+        L.container = "dsf";
+        return L;
+    }
+    if (ext == ".dff") {
+        uint8_t h[16];
+        if (rd(0, h, 16) != 16 || std::memcmp(h, "FRM8", 4) != 0)
+            throw std::runtime_error("不是 DFF(DSDIFF) 文件: " + path);
+        if (std::memcmp(h + 12, "DSD ", 4) != 0)
+            throw std::runtime_error("DFF form type 不是 \"DSD \"（DST 不支持）");
+        const uint64_t frm8Size = rdb64(h + 4);
+        const uint64_t end = 12 + frm8Size;
+        uint32_t rate = 0, declaredCh = 0;
+        std::string cmpType;
+        bool haveData = false;
+        for (uint64_t off = 16; off + 12 <= end; ) {
+            uint8_t ch[12];
+            if (rd(off, ch, 12) != 12) break;
+            const uint64_t sz = rdb64(ch + 4);
+            if (sz > (1ull << 62)) break;
+            if (std::memcmp(ch, "PROP", 4) == 0) {
+                std::vector<uint8_t> body((size_t)sz);
+                if (rd(off + 12, body.data(), body.size()) != body.size())
+                    throw std::runtime_error("DFF PROP 块被截断");
+                if (body.size() >= 4 && std::memcmp(body.data(), "SND ", 4) == 0) {
+                    size_t q = 4;
+                    while (q + 12 <= body.size()) {
+                        const uint64_t ss = rdb64(body.data() + q + 4);
+                        const uint8_t* p = body.data() + q + 12;
+                        if (q + 12 + ss > body.size()) break;
+                        if (std::memcmp(body.data() + q, "FS  ", 4) == 0 && ss >= 4) rate = rdb32(p);
+                        else if (std::memcmp(body.data() + q, "CHNL", 4) == 0 && ss >= 2) declaredCh = rdb16(p);
+                        else if (std::memcmp(body.data() + q, "CMPR", 4) == 0 && ss >= 4) cmpType.assign((const char*)p, 4);
+                        q += 12 + (size_t)ss + (size_t)(ss & 1);
+                    }
+                }
+            } else if (std::memcmp(ch, "DSD ", 4) == 0) {
+                L.dataOffset = off + 12;
+                L.dataSize = sz;
+                haveData = true;
+                break;
+            } else if (std::memcmp(ch, "DST ", 4) == 0 || std::memcmp(ch, "DSTI", 4) == 0) {
+                throw std::runtime_error("DFF 使用 DST 压缩，暂不支持流式解码");
+            }
+            off += 12 + sz + (sz & 1);
+        }
+        if (!haveData) throw std::runtime_error("DFF 缺少 DSD 数据块");
+        if (rate == 0) throw std::runtime_error("DFF 缺少 FS");
+        if (!cmpType.empty() && cmpType != "DSD ") throw std::runtime_error("DFF 压缩类型不是 DSD");
+        const uint32_t ch = declaredCh ? declaredCh : 2;
+        if (ch < 1 || ch > 8) throw std::runtime_error("DFF 声道数异常");
+        if (L.dataSize == 0 || L.dataSize % ch != 0) throw std::runtime_error("DFF DSD 数据长度异常");
+        L.isDsf = false;
+        L.rate = rate; L.channels = (int)ch;
+        L.bytesPerChannel = L.dataSize / ch;
+        L.bitsPerChannel = L.bytesPerChannel * 8;
+        L.blockSize = 0;
+        L.paddedLastBlock = true;
+        L.container = "dff";
+        return L;
+    }
+    throw std::runtime_error("不是 DSD 文件（按扩展名判断）: " + path);
+}
+
+
+// 流式 DSD -> PCM 读取器：按「块」读原始 1-bit 流、逐块抽取，内存与文件长度无关。
+// 用法：
+//   DsdPcmStream s; std::string err;
+//   if (!s.open(path, dsd_pcm_settings(), &err)) { /* 回退整曲路径 */ }
+//   AudioBuffer chunk; s.read(0, 4096, chunk);        // 任意位置（顺序读最快）
+class DsdPcmStream {
+public:
+    DsdPcmStream() = default;
+    ~DsdPcmStream() { if (f_) std::fclose(f_); }
+    DsdPcmStream(const DsdPcmStream&) = delete;
+    DsdPcmStream& operator=(const DsdPcmStream&) = delete;
+
+    bool open(const std::string& path, const DsdPcmSettings& st, std::string* errOut = nullptr) {
+        close();
+        try {
+            layout_ = probe_dsd_layout(path);
+        } catch (const std::exception& e) {
+            if (errOut) *errOut = e.what();
+            return false;
+        }
+        outRate_ = std::min<uint32_t>(layout_.rate / 16u, 705600u);
+        if (outRate_ == 0 || layout_.rate % outRate_ != 0) {
+            if (errOut) *errOut = "DSD 采样率无法整数抽取（" + std::to_string(layout_.rate) + " → " +
+                                  std::to_string(outRate_) + "）";
+            return false;
+        }
+        cfg_ = dsp::conversion_integrator(st.kind, st.conversion, layout_.rate, outRate_, 120.0, st.twoStage);
+        dec_.clear();
+        for (int c = 0; c < layout_.channels; ++c)
+            dec_.push_back(std::make_unique<dsp::DsdDecimator>(cfg_));
+        f_ = dsd_detail::dsd_fopen(path, L"rb", "rb");
+        if (!f_) { if (errOut) *errOut = "无法打开文件: " + path; return false; }
+        ch_ = layout_.channels;
+        M_ = layout_.rate / outRate_;
+        totalFrames_ = (size_t)(layout_.bitsPerChannel / M_);
+        readBlock_ = layout_.isDsf ? layout_.blockSize : 4096u;
+        if (readBlock_ == 0) readBlock_ = 4096u;
+        scratch_.assign(readBlock_, 0);
+        pending_.assign((size_t)ch_, {});
+        reset_to(0);
+        return true;
+    }
+
+    void close() {
+        if (f_) { std::fclose(f_); f_ = nullptr; }
+        dec_.clear();
+        pending_.clear();
+        curBit_ = 0; absFrames_ = 0; totalFrames_ = 0;
+    }
+    bool is_open() const { return f_ != nullptr; }
+    uint32_t rate() const { return outRate_; }
+    int channels() const { return ch_; }
+    size_t totalFrames() const { return totalFrames_; }
+    double seconds() const { return outRate_ ? (double)totalFrames_ / (double)outRate_ : 0.0; }
+    uint64_t streamBytes() const { return layout_.dataSize; }
+    const DsdFileLayout& layout() const { return layout_; }
+
+    // 读取 [pos, pos+n) 帧，写入 out（rate/channels/bits 会被填好）。
+    // 返回实际产出的帧数（到文件末尾会变短）。
+    size_t read(size_t pos, size_t n, AudioBuffer& out) {
+        out.rate = outRate_; out.channels = ch_; out.bits = 32; out.isFloat = false; out.raw.clear();
+        if (!f_ || ch_ <= 0 || n == 0 || pos >= totalFrames_) return 0;
+        if (n > totalFrames_ - pos) n = totalFrames_ - pos;
+        const uint64_t wantEnd = (uint64_t)pos + (uint64_t)n;
+        const uint64_t haveBegin = pendStart_;
+        const uint64_t haveEnd = pendStart_ + (uint64_t)pendCount();
+        // 顺序读命中 → 直接续；向后跳/回头 → 重建状态（块边界对齐）
+        if ((uint64_t)pos < haveBegin || (uint64_t)pos > haveEnd) reset_to((uint64_t)pos * (uint64_t)M_);
+        size_t guard = 0;
+        while (pendStart_ + (uint64_t)pendCount() < wantEnd && guard++ < 1000000u) {
+            if (!feed_next_block()) break;
+        }
+        const uint64_t availEnd = pendStart_ + (uint64_t)pendCount();
+        if (availEnd <= (uint64_t)pos) return 0;
+        const size_t take = (size_t)(std::min<uint64_t>(wantEnd, availEnd) - (uint64_t)pos);
+        const size_t skip = (size_t)((uint64_t)pos - pendStart_);
+        out.raw.resize(take * (size_t)ch_);
+        for (int c = 0; c < ch_; ++c) {
+            const auto& v = pending_[(size_t)c];
+            for (size_t i = 0; i < take; ++i)
+                out.setSample(i, c, v[skip + i]);
+        }
+        // 丢掉已消费的前缀，控制内存（每次最多留下不到一块）
+        const size_t drop = skip + take;
+        for (auto& v : pending_) v.erase(v.begin(), v.begin() + (long long)drop);
+        pendStart_ = (uint64_t)pos + take;
+        return take;
+    }
+
+private:
+    size_t pendCount() const { return pending_.empty() ? 0 : pending_[0].size(); }
+
+    void reset_to(uint64_t bitIndex) {
+        const uint64_t blockBits = (uint64_t)readBlock_ * 8ull;
+        const uint64_t aligned = (bitIndex / blockBits) * blockBits;
+        curBit_ = aligned;
+        absFrames_ = curBit_ / (uint64_t)M_;
+        pendStart_ = absFrames_;
+        for (auto& d : dec_) d->reset();
+        for (auto& v : pending_) v.clear();
+    }
+
+    bool feed_next_block() {
+        if (!f_) return false;
+        const uint64_t blockBytes = readBlock_;
+        if (curBit_ / 8ull >= layout_.bytesPerChannel) return false;
+        const uint64_t b = curBit_ / (blockBytes * 8ull);
+        const uint64_t byteOff = b * blockBytes;
+        if (byteOff >= layout_.bytesPerChannel) return false;
+        const size_t thisBlock = (size_t)std::min<uint64_t>(blockBytes, layout_.bytesPerChannel - byteOff);
+        for (int c = 0; c < ch_; ++c) {
+            uint64_t src = 0;
+            if (layout_.isDsf) {
+                const uint64_t base = layout_.dataOffset + b * (uint64_t)ch_ * (uint64_t)layout_.blockSize;
+                const uint64_t stride = layout_.paddedLastBlock ? (uint64_t)layout_.blockSize : (uint64_t)thisBlock;
+                src = base + (uint64_t)c * stride;
+            } else {
+                src = layout_.dataOffset + (uint64_t)c * layout_.bytesPerChannel + byteOff;
+            }
+            if (scratch_.size() < thisBlock) scratch_.resize(thisBlock, 0);
+            size_t got = 0;
+            if (_fseeki64(f_, (long long)src, SEEK_SET) == 0)
+                got = std::fread(scratch_.data(), 1, thisBlock, f_);
+            if (got < thisBlock) std::memset(scratch_.data() + got, 0, thisBlock - got);
+            if (layout_.isDsf)
+                for (size_t i = 0; i < thisBlock; ++i) scratch_[i] = dsd_detail::reverse_bits8(scratch_[i]);
+            dec_[(size_t)c]->process_bits(scratch_.data(), thisBlock * 8, pending_[(size_t)c]);
+        }
+        curBit_ += (uint64_t)thisBlock * 8ull;
+        absFrames_ = curBit_ / (uint64_t)M_;
+        pendStart_ = absFrames_ - (uint64_t)pendCount();
+        return true;
+    }
+
+    DsdFileLayout layout_;
+    FILE* f_ = nullptr;
+    uint32_t outRate_ = 0;
+    uint32_t M_ = 1;
+    int ch_ = 0;
+    uint32_t readBlock_ = 4096;
+    uint64_t curBit_ = 0;        // 已喂给抽取器的位数（每声道）
+    size_t   absFrames_ = 0;     // 抽取器已产出的帧数
+    size_t   totalFrames_ = 0;
+    uint64_t pendStart_ = 0;     // pending_[c][0] 对应的绝对帧号
+    dsp::IntegratorConfig cfg_;
+    std::vector<std::unique_ptr<dsp::DsdDecimator>> dec_;
+    std::vector<std::vector<double>> pending_;
+    std::vector<uint8_t> scratch_;
+};
+
+
+// ---------------- 大文件流式播放策略（阈值可配置） ----------------
+// 「解码后大小」超过阈值的 DSD 文件不再整曲预解码，改走 DsdPcmStream 流式解码。
+// 为什么用解码后大小而不是文件大小：DSD64 的 271 MB 文件解成 PCM 是 517 MB，
+// 而 DSD128/256 的文件更小、解码后更大 —— 判据必须落在真正会占内存的量上。
+struct BigFileStreamSettings {
+    bool    enabled = true;
+    double  thresholdMb = 200.0;    // 解码后 > 200 MB 走流式（默认值来自实测：517 MB 的文件会卡 5 s）
+    double  ispPrescanSec = 20.0;   // 流式播放的过采样峰值只扫开头这么长（整曲扫描要再解一遍）
+};
+inline BigFileStreamSettings& big_file_stream_settings() { static BigFileStreamSettings s; return s; }
+
+// 该文件能否流式解码（只读文件头，不加载数据）。decodedBytes 返回解码后的 PCM 字节数。
+inline bool dsd_streamable(const std::string& path, double* decodedMb = nullptr, std::string* why = nullptr) {
+    try {
+        const DsdFileLayout L = probe_dsd_layout(path);
+        const uint32_t outRate = std::min<uint32_t>(L.rate / 16u, 705600u);
+        if (outRate == 0 || L.rate % outRate != 0) {
+            if (why) *why = "DSD 采样率无法整数抽取";
+            return false;
+        }
+        const size_t frames = (size_t)(L.bitsPerChannel / (uint64_t)(L.rate / outRate));
+        if (decodedMb) *decodedMb = (double)frames * (double)L.channels * 4.0 / (1024.0 * 1024.0);
+        return true;
+    } catch (const std::exception& e) {
+        if (why) *why = e.what();
+        return false;
+    }
+}
+
+// 是否应该对这次播放走流式（只看文件头）：DSD 且解码后超过阈值 且 开关打开。
+inline bool should_stream_decode(const std::string& path, double* decodedMb = nullptr, std::string* why = nullptr) {
+    const std::string ext = lowerExt(path);
+    if (ext != ".dsf" && ext != ".dff") { if (why) *why = "非 DSD 文件"; return false; }
+    const BigFileStreamSettings& s = big_file_stream_settings();
+    if (!s.enabled) { if (why) *why = "流式播放已关闭(stream_threshold_mb=0)"; return false; }
+    double mb = 0.0;
+    std::string whyLocal;
+    if (!dsd_streamable(path, &mb, &whyLocal)) { if (why) *why = whyLocal; return false; }
+    if (decodedMb) *decodedMb = mb;
+    if (mb <= s.thresholdMb) { if (why) *why = "解码后 " + std::to_string((long long)mb) + " MB 低于阈值"; return false; }
+    return true;
+}
+
 // DSD 源：原生读取 + 我们的抽取器（ROADMAP P0-1/P0-4/P0-5）
 //
 // 以前 .dsf/.dff 走 ffmpeg 解成 PCM：多一层量化、拿不到 1-bit 流、DirectSDM 无从谈起。

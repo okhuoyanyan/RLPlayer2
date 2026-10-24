@@ -65,6 +65,8 @@ using rta::render::SinkOpenOpts;
 #include "crash_dump.h"            // 崩溃转储 + OS/CPU/tester 诊断（1.0.5 可观测性）
 // 261024-05：naa_discover.h 已删除（用户「NAA 放弃，彻底删除这一功能」）
 #include <cstdio>
+#include <windows.h>               // 进程内存遥测（GetProcessMemoryInfo 走 K32，无需额外库）
+#include <psapi.h>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -128,7 +130,10 @@ struct PlayParams {
     double oobGain = 5.0;              // Chebyshev 带外增益 dB
     int    ahmBits = 8;                // AHM 多电平位深 (6~8 bit)
     std::string gpuVendor = "auto";   // auto | amd | nvidia | off
-    bool   dsdNative = false;         // true = 走 ASIO 原生 DSD（当前后端未实现，会明确报错）
+    // true = 走 ASIO 原生 DSD（ASIO 2.3 IoFormat，1-bit 直送驱动，不经 PCM / DoP）。
+    // 前提由 native_dsd_precheck() 统一把关：后端必须是 ASIO、源必须是 DSD、音量 0 dB、无 PCM 处理、不升频。
+    // 前提不满足 ⟹ 明确报错（不静默退回 DoP）；驱动拒绝 DSD ⟹ 显式回落 DoP 并在信号链写原因。
+    bool   dsdNative = false;
     bool   directSdm = false;         // true = DirectSDM：源 DSD 与目标同速率时逐位直通（要求 0 dB、无 PCM 处理）
     int    bufferMs = 100;
 
@@ -241,6 +246,32 @@ static void dlog(const std::string& s) {
     g_log.push_back(s);
 }
 static PlayParams  g_params;      // 最近一次播放参数，跳曲时沿用
+
+// ---------------- 进程内存遥测（2026-10-25 大 DSD 文件"卡死"取证） ----------------
+// 为什么必须自己量：外部按秒采样会漏掉解码阶段的瞬时峰值（整曲解成 double 平面只在几秒内存在），
+// 而"峰值内存"正是本次事故的核心判据之一。这里既给 /api/status 用，也写进 MEM 日志行。
+struct ProcMemInfo { double wsMb = 0.0; double peakMb = 0.0; };
+static ProcMemInfo proc_mem() {
+    static std::mutex m;
+    static double peak = 0.0;
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    double ws = 0.0;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc)))
+        ws = (double)pmc.WorkingSetSize / (1024.0 * 1024.0);
+    std::lock_guard<std::mutex> lk(m);
+    if (ws > peak) peak = ws;
+    ProcMemInfo r; r.wsMb = ws; r.peakMb = peak;
+    return r;
+}
+// MEM 行：播放各阶段的内存快照。格式固定，便于 grep / 出报告。
+static std::string mem_line(const std::string& stage, const std::string& extra = std::string()) {
+    const ProcMemInfo m = proc_mem();
+    char b[320];
+    std::snprintf(b, sizeof(b), "MEM stage=%s ws=%.1fMB peak=%.1fMB", stage.c_str(), m.wsMb, m.peakMb);
+    std::string s = b;
+    if (!extra.empty()) s += " " + extra;
+    return s;
+}
 
 // ---------------- 可观测性（1.0.5）：运行时长 / 构建时间 ----------------
 static const std::chrono::steady_clock::time_point g_startTp = std::chrono::steady_clock::now();
@@ -1119,10 +1150,67 @@ static std::string naa_discover_json(bool force) {
 }
 #endif  // 261024-05 NAA 删除
 
+// ---------------- Native DSD（ASIO 2.3 IoFormat）：参数校验 ----------------
+// 为什么要单独一层校验：原生 DSD 是"1-bit 流直送驱动"，中间没有 PCM 环节，所以
+// 音量 / EQ / IR 卷积 / 等响度 / 每声道增益 / 升频 这些设置**物理上无处生效**。
+// 不拦的唯一后果就是"用户拖了音量、开了 EQ，却什么都没发生"——那才是真正的撒谎。
+// 本函数只做参数校验：不打开设备、不读音频数据（只看扩展名），因此 /api/play 可以在
+// HTTP 线程里同步返回明确原因（tests/native_dsd_api_check.ps1 的 4 条断言就是冲它来的）。
+// 返回 true = 可以走原生 DSD；false = why 里写明缺哪一条（必须原样报给用户）。
+static bool native_dsd_precheck(const PlayParams& p, std::string& why) {
+    const std::string be = p.backend.empty() ? std::string("wasapi") : p.backend;
+    if (be != "asio") {
+        why = "Native DSD 只能走 ASIO 后端（ASIO 2.3 的 IoFormat 原生 DSD 通道）：当前后端是「" + be +
+              "」，它只有 PCM 通道，没有 1-bit 承载方式。要用 WASAPI 请把「封装」改回 DoP。";
+        return false;
+    }
+    const std::string ext = rta::audio::lowerExt(p.file);
+    if (ext != ".dsf" && ext != ".dff") {
+        why = "Native DSD 需要 DSD 源（.dsf / .dff）：当前源是「" +
+              (ext.empty() ? std::string("(无扩展名)") : ext) +
+              "」。PCM 源没有 1-bit 码流可直通 —— 想输出 DSD 请用 DoP（它会先调制）。";
+        return false;
+    }
+    if (std::fabs(p.volume) > 1e-9) {
+        char b[200];
+        std::snprintf(b, sizeof(b),
+            "Native DSD 要求音量 0 dB（逐位直通，整条 PCM 链都被跳过）：当前音量 %.1f dB。"
+            "请把音量拖到 0 dB，或改用 DoP（DoP 走 PCM 载波，音量/处理照常生效）。", p.volume);
+        why = b;
+        return false;
+    }
+    std::vector<std::string> proc;
+    if (!p.eqFile.empty())  proc.push_back("EQ");
+    if (!p.convIr.empty())  proc.push_back("IR 卷积");
+    if (p.loudness)         proc.push_back("等响度补偿");
+    for (int i = 0; i < 8; ++i) {
+        if (std::fabs(p.trim[i]) > 1e-9) {
+            char b[96];
+            std::snprintf(b, sizeof(b), "每声道增益(ch%d %.1f dB)", i + 1, p.trim[i]);
+            proc.push_back(b);
+            break;
+        }
+    }
+    if (!proc.empty()) {
+        std::string list;
+        for (size_t i = 0; i < proc.size(); ++i) { if (i) list += "、"; list += proc[i]; }
+        why = "Native DSD 不做任何 PCM 处理（1-bit 流不经过 DSP 链）：请清空 " + list + "，或改用 DoP。";
+        return false;
+    }
+    // 升频：DSD 源解成 PCM 再升频是 DoP 路径的事；Native 按【源位率】直通，不重调制。
+    if (!(p.rate.empty() || p.rate == "src")) {
+        why = "Native DSD 按源位率直通，不做升频：采样率设置当前是「" + p.rate +
+              "」，请改成「跟随源」（设置 → 输出 → 采样率）。";
+        return false;
+    }
+    return true;
+}
+
 // ---------------- DirectSDM：源 DSD 与目标 DSD 同速率时的逐位直通 ----------------
 // 判定必须在解码之前：DSD256 整曲解成 PCM 要几百 MB，先判再决定路径。
 static bool direct_sdm_eligible(const PlayParams& p, const DsdInfo& info, std::string& why) {
-    if (p.dsdNative) { why = "DSD Native 还没实现（它走 ASIO 原生 DSD，不是 DoP）"; return false; }
+    // 2026-10-24（原生 DSD 接入）：dsdnative=1 在 play_one_impl 的**最前面**就被分派走了
+    //（native_dsd_precheck + play_one_native_dsd），走不到这里；这里只管 DoP 直通。
     if (p.dsd < 64) { why = "输出不是 DSD：把 SDM 页的比特率选成 DSD64/128/256（DoP）"; return false; }
     const uint32_t base = (info.rate % 48000u == 0) ? 48000u : 44100u;
     const uint32_t target = rta::dsp::dsd_rate(p.dsd, base);
@@ -1136,7 +1224,18 @@ static bool direct_sdm_eligible(const PlayParams& p, const DsdInfo& info, std::s
 
 // 直接播放 DSD 源：1-bit 流按 16 位整数倍切片 → DoP 24-bit 载波 → 输出后端。
 // 不经过 PCM、不调制、不做音量/抖动 —— 这正是"逐位一致"的前提。
-static bool play_one_direct(const std::string& file, const PlayParams& p) {
+//
+// opts.preloaded / fallbackNote（2026-10-24 原生 DSD 接入）：原生 DSD 失败时由
+// play_one_native_dsd() 把**已经读进内存的 1-bit 流**和失败原因传进来，直接走 DoP 回落 ——
+// 好处是①不再重复读一遍整曲（DSD256 整曲可达几百 MB）②信号链里能写明"为什么没用原生"。
+struct DirectDsdOpts {
+    const DsdStream* preloaded = nullptr;   // 非空 = 复用调用方已读好的流（不重复读盘）
+    std::string fallbackNote;               // 非空 = 本次是"原生 DSD 失败 → DoP 回落"
+    std::string deviceName;                 // ASIO 驱动名；空 = 按 WASAPI 端点取名
+};
+
+static bool play_one_direct(const std::string& file, const PlayParams& p,
+                            const DirectDsdOpts& opts = DirectDsdOpts()) {
     auto& ps = g_ps;
     play_log_rotate();
     g_dbgPeak.store(0.0);
@@ -1150,11 +1249,14 @@ static bool play_one_direct(const std::string& file, const PlayParams& p) {
         ps.dspChunkUs.store(0);
         ps.dspTotalUs.store(0);
         ps.dspChunks.store(0);
+        // 复用调用方已读好的流时不要覆盖 decodeMs（调用方已按自己那次读取计过时）
         const auto t_dsd_0 = std::chrono::steady_clock::now();
-        const DsdStream src = read_dsd(file);
+        DsdStream own;
+        if (!opts.preloaded) own = read_dsd(file);
+        const DsdStream& src = opts.preloaded ? *opts.preloaded : own;
         const auto t_dsd_1 = std::chrono::steady_clock::now();
         const double dsdMs = std::chrono::duration<double, std::milli>(t_dsd_1 - t_dsd_0).count();
-        ps.decodeMs.store((long long)(dsdMs + 0.5));
+        if (!opts.preloaded) ps.decodeMs.store((long long)(dsdMs + 0.5));
         if (src.rate == 0 || src.bits == 0) {
             std::lock_guard<std::mutex> lk(ps.mtx);
             ps.error = "DSD 解码结果为空：" + file;
@@ -1209,8 +1311,9 @@ static bool play_one_direct(const std::string& file, const PlayParams& p) {
         // 信号链快照：DirectSDM 只有"源 → DoP → 设备"三环，如实写出来
         {
             std::string dev = "默认音频设备";
-            if (p.backend == "null") dev = "Null 输出（不出声）";
-            else for (const auto& d : WasapiOutput::enumerate()) if (d.isDefault) dev = d.name;
+            if (!opts.deviceName.empty()) dev = opts.deviceName;   // ASIO DoP 回落：报驱动名，不报 WASAPI 端点
+            else if (p.backend == "null") dev = "Null 输出（不出声）";
+            else if (p.backend != "asio") for (const auto& d : WasapiOutput::enumerate()) if (d.isDefault) dev = d.name;
             std::ostringstream sig;
             sig << "{\"src\":\"" << jesc(file) << "\""
                 << ",\"codec\":\"dsd\""
@@ -1218,7 +1321,9 @@ static bool play_one_direct(const std::string& file, const PlayParams& p) {
                 << ",\"inBits\":1"
                 << ",\"inCh\":" << ch
                 << ",\"dur\":" << (double)src.bits / (double)srcRate
-                << ",\"note\":\"DirectSDM：1-bit 直通，跳过 PCM 与调制\""
+                << ",\"note\":\"" << jesc(opts.fallbackNote.empty()
+                       ? std::string("DirectSDM：1-bit 直通，跳过 PCM 与调制")
+                       : ("DoP 回落：" + opts.fallbackNote + "（1-bit 直通，跳过 PCM 与调制）")) << "\""
                 << ",\"outRate\":" << srcRate
                 << ",\"outBits\":24"
                 << ",\"outCh\":" << ch
@@ -1237,6 +1342,11 @@ static bool play_one_direct(const std::string& file, const PlayParams& p) {
                 << ",\"gpuVendor\":\"\",\"gpuStatus\":\"\""
                 << ",\"volRamp\":0,\"bits\":24,\"eq\":false"
                 << ",\"directSdm\":true"
+                // 原生 DSD 接入（2026-10-24）：这两个字段让界面能把"原生 / DoP 回落"分清楚
+                //（UI：src/net/ui_script.h 的信号链里读 dsdNative / dsdFallback）。
+                << ",\"dsdNative\":false"
+                << ",\"dsdPack\":\"dop\""
+                << ",\"dsdFallback\":\"" << jesc(opts.fallbackNote) << "\""
                 << ",\"decodeMs\":" << dsdMs
                 << ",\"ffmpegMs\":0"
                 << ",\"wavReadMs\":0"
@@ -1247,8 +1357,16 @@ static bool play_one_direct(const std::string& file, const PlayParams& p) {
             meta_on_play(file);   // 播放触发元数据补全(设置可关;inFlight 去重,后台线程)
             std::lock_guard<std::mutex> lk(ps.mtx);
             ps.signal = sig.str();
-            ps.info = "DirectSDM：DSD 源 " + std::to_string(srcRate) + " Hz → DoP " +
+            ps.info = (opts.fallbackNote.empty() ? std::string("DirectSDM：")
+                                                : ("原生 DSD 不可用 ⟹ DoP 回落：" + opts.fallbackNote + "；"))
+                    + "DSD 源 " + std::to_string(srcRate) + " Hz → DoP " +
                       std::to_string(carrier) + " Hz（跳过调制，逐位直通）";
+            // DirectSDM / DoP 回落都是 1-bit 直通：bit-perfect 结论写成 direct，原因随信号链带出。
+            // （旧代码这条路不写 bpState ⟹ 底栏会继续显示上一曲的结论 —— 顺手补齐。）
+            ps.bpState = "direct";
+            ps.bpWhy = opts.fallbackNote.empty()
+                ? std::string("DirectSDM：1-bit 直通，跳过 PCM 与调制")
+                : ("原生 DSD 不可用，已回落 DoP（1-bit 直通，逐位一致）：" + opts.fallbackNote);
         }
 
         auto sink = make_sink(p);
@@ -1407,6 +1525,525 @@ static bool play_one_direct(const std::string& file, const PlayParams& p) {
     return false;
 }
 
+// ---------------- Native DSD：ASIO 2.3 IoFormat 原生 1-bit 输出 ----------------
+// 与 DoP 的区别：1-bit 流不再装进 24-bit 载波，而是按驱动协商出的 ASIOSTDSDInt8* 类型直接写；
+// 采样率是 DSD 位率（DSD64 = 2822400），不是 DoP 载波率（176400）。
+// 用法与 tools/rtaplay.cpp 的 play_asio_native_dsd() 同一套（那份已在 AudioByte ASIO 真机验证：
+// DSD64 / type=33 MSB1 / 10 秒与 20 秒均 0 欠载；纯函数判据见 tests/test_asio_native_dsd.cpp）。
+// 这里多出来的只有 GUI 需要的东西：
+//   · 暂停 / 停止 / 跳转（播放线程要响应界面）；
+//   · 失败 ⟹ **显式回落 DoP**（play_one_direct），原因写进信号链的 dsdFallback，绝不静默降级；
+//   · 收尾按 rtaplay 的做法用全零字节冲尾，否则最后几个回调会被记成"假欠载"。
+static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
+    auto& ps = g_ps;
+    play_log_rotate();
+    g_dbgPeak.store(0.0);
+    g_dbgClip.store(0);
+    ps.dbgPad.store(0);
+    ps.dbgSkips.store(0);
+    RtTune rt = rta::audio::apply_playback_tuning();
+    struct RtGuard { RtTune* t; ~RtGuard() { rta::audio::release_playback_tuning(*t); } } rtg{ &rt };
+
+    // ASIO 驱动是 COM 对象，必须在**本线程**初始化（播放线程 ≠ HTTP 线程）
+    const bool comOk = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+    struct ComGuard { bool ok; ~ComGuard() { if (ok) CoUninitialize(); } } comg{ comOk };
+
+    rta::audio::AsioDriver drv;
+    auto setErr = [&](const std::string& why) {
+        std::lock_guard<std::mutex> lk(ps.mtx);
+        ps.error = why;
+        return false;
+    };
+
+    try {
+        ps.decodeMs.store(0);
+        ps.ffmpegMs.store(0);
+        ps.wavReadMs.store(0);
+        ps.dspChunkUs.store(0);
+        ps.dspTotalUs.store(0);
+        ps.dspChunks.store(0);
+
+        const auto t_dsd_0 = std::chrono::steady_clock::now();
+        DsdStream src = read_dsd(file);
+        const double dsdMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_dsd_0).count();
+        ps.decodeMs.store((long long)(dsdMs + 0.5));
+        if (src.rate == 0 || src.bits == 0 || src.channels <= 0 || src.bytesPerChannel() == 0) {
+            return setErr("DSD 解码结果为空（Native DSD 需要非空 .dsf/.dff）：" + file);
+        }
+        const int      ch         = src.channels;
+        const uint32_t srcRate    = src.rate;
+        const size_t   bytesTotal = src.bytesPerChannel();
+        // 设置里选的 DSD 档位与源位率不同时：Native 按**源**位率直通（不重调制），必须写明，
+        // 否则用户选了"Native 256"却按 64 播放，信号链看起来像"256 没生效"。
+        std::string rateNote;
+        if (p.dsd >= 64) {
+            const uint32_t base = (srcRate % 48000u == 0) ? 48000u : 44100u;
+            const uint32_t want = rta::dsp::dsd_rate(p.dsd, base);
+            if (want != srcRate) {
+                char nb[192];
+                std::snprintf(nb, sizeof(nb),
+                    "（设置选的 DSD%d 与源 DSD%d 不同：Native 按源位率直通，不重调制）",
+                    p.dsd, (int)(srcRate / base));
+                rateNote = nb;
+            }
+        }
+        // HTTP 层只能看扩展名；"声道改动"要拿到源声道数才判得了，所以在这里补这一条。
+        if (p.outChannels > 0 && p.outChannels != ch) {
+            char b[256];
+            std::snprintf(b, sizeof(b),
+                "Native DSD 不做声道改动：源是 %d 声道，设置里要求 %d 声道。"
+                "请把声道数设为「跟随源」，或改用 DoP。", ch, p.outChannels);
+            return setErr(b);
+        }
+
+        // 失败回落：把已读好的 1-bit 流直接交给 DoP 路径（不重复读盘），原因写进信号链。
+        auto dop_fallback = [&](const std::string& reason, const std::string& devName) -> bool {
+            drv.close();
+            play_log("NATIVE_DSD_FALLBACK reason=" + reason);
+            dlog("NATIVE_DSD_FALLBACK " + reason);
+            DirectDsdOpts o;
+            o.preloaded    = &src;
+            o.fallbackNote = reason;
+            o.deviceName   = devName;
+            { std::lock_guard<std::mutex> lk(ps.mtx); ps.info = "原生 DSD 不可用 ⟹ DoP 回落：" + reason; }
+            return play_one_direct(file, p, o);
+        };
+
+        // ---- 选驱动：显式指定就只认它（不能"选错了就换一台设备出声"）----
+        const auto drivers = rta::audio::asio_enum_drivers();
+        if (drivers.empty()) {
+            return setErr("Native DSD 需要 ASIO 驱动，但注册表 HKLM\\SOFTWARE\\ASIO 里一个都没有。"
+                          "请安装 ASIO 驱动，或改用 DoP（WASAPI 也能承载）。");
+        }
+        std::vector<rta::audio::AsioDriverEntry> cands;
+        if (is_asio_clsid(p.device)) {
+            for (const auto& e : drivers) if (e.clsid == p.device) cands.push_back(e);
+            if (cands.empty())
+                return setErr("Native DSD：设置里的设备（" + p.device + "）不在本机 ASIO 驱动列表里。"
+                              "请在设置 → 输出里重新选择 ASIO 驱动。");
+        } else if (!p.device.empty()) {
+            std::string want = p.device;
+            for (auto& c : want) c = (char)std::tolower((unsigned char)c);
+            for (const auto& e : drivers) {
+                std::string n = e.name;
+                for (auto& c : n) c = (char)std::tolower((unsigned char)c);
+                if (n == want) cands.push_back(e);
+            }
+            if (cands.empty())
+                return setErr("Native DSD：设置里的设备「" + p.device + "」不是本机 ASIO 驱动"
+                              "（ASIO 的设备 id 必须是驱动 CLSID 或驱动名）。请重新选择 ASIO 驱动。");
+        } else {
+            cands = drivers;   // 没指定：按注册表顺序逐个试（本机 [0] 可能是未连接的驱动）
+        }
+
+        // 诊断开关（与 rtaplay 的 --force-dop-fallback 同义）：人为跳过原生 DSD，直接走 DoP 回落。
+        // 为什么需要它：断言"驱动拒绝 DSD ⟹ 显式回落 DoP"这条路径，否则只能等驱动真的出故障
+        //（本机 AudioByte 能开原生 DSD，VB-Matrix 又不接受 176400 载波 ⟹ 没法用真实失败点验全程）。
+        // 默认关闭；只有显式设置 RLPLAYER_FORCE_DOP_FALLBACK=1 才生效。
+        {
+            char* fb = nullptr; size_t fbLen = 0;
+            const bool forced = (_dupenv_s(&fb, &fbLen, "RLPLAYER_FORCE_DOP_FALLBACK") == 0 && fb)
+                                ? !(std::string(fb) == "" || std::string(fb) == "0") : false;
+            if (fb) free(fb);
+            if (forced)
+                return dop_fallback("原生 DSD 打开失败（诊断开关 RLPLAYER_FORCE_DOP_FALLBACK=1 强制跳过）",
+                                    cands.empty() ? std::string() : cands.front().name);
+        }
+
+        std::string openErr, lastDrv;
+        bool opened = false;
+        for (const auto& e : cands) {
+            lastDrv = e.name;
+            std::string err;
+            if (drv.open_dsd(e.clsid, (double)srcRate, ch, err)) { opened = true; break; }
+            play_log("NATIVE_DSD_OPEN_FAIL driver=" + e.name + " rate=" + std::to_string(srcRate) +
+                     " ch=" + std::to_string(ch) + " err=" + err);
+            openErr += (openErr.empty() ? std::string() : "；") + e.name + "：" + err;
+        }
+        if (!opened) return dop_fallback("原生 DSD 打开失败（" + openErr + "）", lastDrv);
+        if (drv.channels() != ch) {
+            return dop_fallback("驱动给出 " + std::to_string(drv.channels()) + " 个输出声道，源是 " +
+                                std::to_string(ch) + " 声道（不能丢声道）", drv.name());
+        }
+
+        const auto& di = drv.dsd_info();
+        const std::string drvName = drv.name();
+        const long period = std::max<long>(1, drv.dsd_buffer_bytes());
+        const std::string typeShort = (di.type == ASIOSTDSDInt8LSB1) ? "LSB1"
+                                    : (di.type == ASIOSTDSDInt8MSB1) ? "MSB1" : "?";
+        const uint64_t bitsTotal = std::min<uint64_t>(src.bits, (uint64_t)bytesTotal * 8ull);
+
+        ps.outRate = srcRate;
+        ps.outBits = 1;
+        ps.total.store((size_t)bitsTotal);
+        ps.played.store(0);
+        ps.startDb.store(0.0);
+        ps.volDb.store(0.0);
+        ps.gpu = false;
+        ps.gpuConvUsed.store(false);   // 直通路径没有卷积，显式归零
+
+        // ★ 先灌满环**再** start（比 rtaplay 的原顺序更稳）：驱动一 start() 就立刻开始回调，
+        //   此时环是空的就必然欠载。首轮真机（2026-10-24 23:56）实测 ur=6 —— 差的正是
+        //   start 之后那几毫秒的日志/信号链/元数据补全（文件 I/O）。现在把它们挪到 start 之后。
+        std::vector<uint8_t> inter((size_t)period * (size_t)ch);
+        std::vector<uint8_t> zeros((size_t)period * (size_t)ch, 0);
+        size_t cursor = 0, pushed = 0, padPushed = 0;
+        auto fill = [&](size_t n) {
+            for (size_t i = 0; i < n; ++i) {
+                const size_t b = cursor + i;
+                for (int c = 0; c < ch; ++c)
+                    inter[i * (size_t)ch + (size_t)c] = (b < bytesTotal) ? src.data[(size_t)c][b] : 0;
+            }
+        };
+        while (cursor < bytesTotal && drv.free_frames() >= (size_t)period) {
+            const size_t n = std::min<size_t>((size_t)period, bytesTotal - cursor);
+            fill(n);
+            const size_t w = drv.push_dsd(inter.data(), n);
+            if (!w) break;
+            cursor += w;
+            pushed += w;
+        }
+        ps.played.store(cursor * 8);
+
+        // 本机 AudioByte 实测：DSD 会话的 start() 会间歇性失败（同参数前一次成功、后一次
+        // "驱动拒绝启动"）。createBuffers 已 ASE_OK ⟹ 不是参数问题，3 次递增间隔重试，
+        // 三次都失败才回落 DoP（回落要写明原因，不许静默）。
+        bool started = false;
+        std::string serr;
+        for (int attempt = 1; attempt <= 3 && !started; ++attempt) {
+            started = drv.start(serr);
+            if (!started) {
+                play_log("NATIVE_DSD_START_FAIL attempt=" + std::to_string(attempt) + "/3 driver=" +
+                         drv.name() + " err=" + serr);
+                if (attempt < 3) Sleep((DWORD)(400 * attempt));
+            }
+        }
+        if (!started) return dop_fallback("原生 DSD 启动失败（重试 3 次：" + serr + "）", drv.name());
+        // 进 /api/dbg（界面 DEBUG 面板）—— 真机取证时不用去翻 exe 目录的日志文件
+        dlog("NATIVE_DSD START driver=" + drvName + " type=" + std::to_string((long)di.type) +
+             " dsdRate=" + std::to_string(srcRate) + " writeBytes=" + std::to_string(di.writeBytes));
+
+        // 信号链快照：源 → ASIO 原生 DSD → 设备。字段名与 UI（src/net/ui_script.h）约定：
+        //   dsdNative=true / dsdNativeType=MSB1|LSB1 / dsdNativeRate=DSD 位率 / dsdFallback=""。
+        {
+            std::ostringstream sig;
+            sig << "{\"src\":\"" << jesc(file) << "\""
+                << ",\"codec\":\"dsd\""
+                << ",\"inRate\":" << srcRate
+                << ",\"inBits\":1"
+                << ",\"inCh\":" << ch
+                << ",\"dur\":" << (double)src.bits / (double)srcRate
+                << ",\"note\":\"" << jesc(std::string("Native DSD：1-bit 直送 ASIO（不经 PCM / DoP）") + rateNote) << "\""
+                << ",\"outRate\":" << srcRate
+                << ",\"outBits\":1"
+                << ",\"outCh\":" << ch
+                << ",\"device\":\"ASIO " << jesc(drvName) << "\""
+                << ",\"resample\":false,\"twoStage\":false,\"taps\":0"
+                << ",\"filter\":\"Native DSD\""
+                << ",\"phaseCode\":\"direct\",\"phase\":\"逐位直通\""
+                << ",\"gpuAvailable\":false,\"shaper\":\"none\",\"loudness\":false"
+                << ",\"volume\":0,\"buffer\":" << p.bufferMs
+                << ",\"dsd\":0"                       // 0 = 不经过调制/DoP（UI 据此不画那两环）
+                << ",\"dsdRate\":" << srcRate
+                << ",\"modOrder\":0"
+                << ",\"ispPeak\":0,\"ispOver\":0,\"preAtten\":0"
+                << ",\"atten\":0,\"conv\":false,\"irGpu\":false"
+                << ",\"gpuVendor\":\"\",\"gpuStatus\":\"\""
+                << ",\"volRamp\":0,\"bits\":1,\"eq\":false"
+                << ",\"directSdm\":true"
+                << ",\"dsdNative\":true"
+                << ",\"dsdPack\":\"native\""
+                << ",\"dsdFallback\":\"\""
+                << ",\"dsdNativeType\":\"" << typeShort << "\""
+                << ",\"dsdNativeTypeCode\":" << (long)di.type
+                << ",\"dsdNativeRate\":" << srcRate
+                << ",\"dsdNativeDriver\":\"" << jesc(drvName) << "\""
+                << ",\"dsdNativeCallbackBytes\":" << di.writeBytes
+                << ",\"dsdNativeBufferSize\":" << di.bufferBytes
+                << ",\"decodeMs\":" << dsdMs
+                << ",\"ffmpegMs\":0"
+                << ",\"wavReadMs\":0"
+                << ",\"scanMs\":" << Library::instance().lastScanMs()
+                << "}";
+            recent_add(file, stem_or_self(file), "", "");
+            play_log(std::string("PLAY v") + RLPLAYER_VERSION + " " + sig.str());
+            meta_on_play(file);
+            std::lock_guard<std::mutex> lk(ps.mtx);
+            ps.signal = sig.str();
+            char ib[256];
+            std::snprintf(ib, sizeof(ib), "Native DSD：ASIO 原生 1-bit 直通（%s / %.0f Hz / type=%ld %s）",
+                          drvName.c_str(), (double)srcRate, (long)di.type, typeShort.c_str());
+            ps.info = std::string(ib) + rateNote;
+            ps.bpState = "direct";
+            ps.bpWhy = "Native DSD：1-bit 流直送 ASIO（不经 PCM / DoP 封装），逐位一致";
+        }
+
+        bool pausedNow = false;
+        auto lastProgress = std::chrono::steady_clock::now();
+        auto lastLog = std::chrono::steady_clock::now();
+        const auto tPlay0 = std::chrono::steady_clock::now();
+
+        while (!ps.stop.load() && cursor < bytesTotal) {
+            if (ps.pauseReq.load() != pausedNow) {
+                pausedNow = ps.pauseReq.load();
+                ps.paused.store(pausedNow);
+            }
+            if (pausedNow) {
+                // 暂停时不写数据会让驱动反复欠载，把"0 欠载"的证据变脏。
+                // 喂全零 DSD（恒定电平 = 数字静音）保持时钟，欠载计数才仍是真的。
+                if (drv.free_frames() >= (size_t)period) padPushed += drv.push_dsd(zeros.data(), (size_t)period);
+                lastProgress = std::chrono::steady_clock::now();
+                Sleep(2);
+                continue;
+            }
+            const double sk = ps.seekReq.exchange(-1.0);
+            if (sk >= 0.0) {
+                cursor = std::min<size_t>(bytesTotal, (size_t)(sk * (double)bytesTotal + 0.5));
+                // 环里还压着旧位置的数据：用静音顶出去，否则跳转后会先响约 0.1 秒旧音频
+                size_t ahead = drv.buffered();
+                while (ahead > 0 && !ps.stop.load()) {
+                    if (drv.free_frames() < (size_t)period) { Sleep(1); continue; }
+                    const size_t n = std::min<size_t>((size_t)period, ahead);
+                    const size_t w = drv.push_dsd(zeros.data(), n);
+                    if (!w) { Sleep(1); continue; }
+                    ahead -= std::min(ahead, w);
+                    padPushed += w;
+                }
+                pushed = cursor;
+                ps.played.store(cursor * 8);
+                lastProgress = std::chrono::steady_clock::now();
+                continue;
+            }
+            bool progressed = false;
+            while (cursor < bytesTotal && drv.free_frames() >= (size_t)period) {
+                const size_t n = std::min<size_t>((size_t)period, bytesTotal - cursor);
+                fill(n);
+                const size_t w = drv.push_dsd(inter.data(), n);
+                if (!w) break;
+                cursor += w;
+                pushed += w;
+                progressed = true;
+            }
+            ps.played.store(cursor * 8);
+            if (progressed) lastProgress = std::chrono::steady_clock::now();
+            if (cursor >= bytesTotal) break;
+            // 驱动 4 秒不吃数据 ⟹ 设备侧异常（与 DoP 路径的 RENDERFAIL 同口径，不静默 break）
+            if (std::chrono::duration<double>(std::chrono::steady_clock::now() - lastProgress).count() > 4.0) {
+                char b[384];
+                std::snprintf(b, sizeof(b),
+                    "Native DSD 设备流 4 秒未接受数据（cursor=%zu/%zu 字节，欠载 %llu 次，驱动「%s」）"
+                    "—— 驱动可能已掉线，请检查 ASIO 控制面板或改用 DoP。",
+                    cursor, bytesTotal, (unsigned long long)drv.underruns(), drvName.c_str());
+                play_log(std::string("NATIVE_DSD_STALL ") + b);
+                { std::lock_guard<std::mutex> lk(ps.mtx); ps.error = b; }
+                break;
+            }
+            if (std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(5)) {
+                lastLog = std::chrono::steady_clock::now();
+                std::ostringstream ls;
+                ls << "STAT pos=" << (double)drv.dsd_pushed_bytes() * 8.0 / (double)srcRate
+                   << " rate=" << srcRate << " pad=" << ps.dbgPad.load()
+                   << " peak=0 clip=0 fpeak=0 w0=" << g_dbgW0.load() << " wr=" << g_dbgWr.load();
+                play_log(ls.str());
+            }
+            Sleep(1);
+        }
+
+        // 收尾：环里还压着约 0.18 秒数据。直接 stop 会让最后几个回调拿不到数据，
+        // 统计里就冒出"假欠载"⟹ 按 rtaplay 的做法用全零字节按实时节奏把尾巴冲干净。
+        const size_t tailBytes = (size_t)drv.buffered();
+        const double tailMs = (double)tailBytes * 8.0 * 1000.0 / (double)srcRate;
+        if (tailMs > 0.0 && tailMs < 1000.0) {
+            const auto tTail = std::chrono::steady_clock::now();
+            while (std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - tTail).count() < tailMs + 20.0) {
+                if (drv.free_frames() >= (size_t)period) padPushed += drv.push_dsd(zeros.data(), (size_t)period);
+                Sleep(1);
+            }
+        }
+        const unsigned long long cb = drv.callbacks();
+        const unsigned long long ur = drv.underruns();
+        const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - tPlay0).count();
+        drv.stop();
+        drv.close();
+        ps.paused.store(false);
+
+        const double nominal = (double)srcRate;
+        const double measured = wall > 0.0 ? (double)pushed * 8.0 / wall : 0.0;
+        const double errPct = nominal > 0.0 ? (measured - nominal) / nominal * 100.0 : 0.0;
+        const bool okType = rta::audio::asio_is_dsd_1bit(di.type);
+        // rateReadback<=0 = 驱动没实现 getSampleRate（部分虚拟驱动如此）。这种"查不到"不能
+        // 当成"查错了"：只要查到的值不是源位率才算失败（rtaplay 的判据更严，但它是诊断工具）。
+        const bool okRate = (di.rateReadback <= 0.0) ||
+                            (std::fabs(di.rateReadback - (double)srcRate) < 1.0);
+        {
+            std::ostringstream ls;
+            ls << "NATIVE_DSD OK type=" << (long)di.type << "(" << typeShort << ")"
+               << " rate=" << (unsigned long long)di.rateReadback
+               << " dsdRate=" << srcRate
+               << " bytes=" << pushed << " pad=" << padPushed
+               << " cb=" << cb << " ur=" << ur
+               << " wall=" << wall << " measured=" << (long long)measured
+               << " errPct=" << errPct
+               << " okType=" << (okType ? 1 : 0) << " okRate=" << (okRate ? 1 : 0)
+               << " driver=" << drvName;
+            play_log(ls.str());
+            dlog(ls.str());
+        }
+        // 判据不合格（类型/采样率读回不对）不能当"正常播完"：否则队列会自动续下一曲，
+        // 把设备故障掩盖成正常切歌（与 DoP 路径同一口径）。underruns>0 只记日志，不判失败
+        //（暂停/跳转/系统卡顿都会造成零星欠载，把它当失败会让用户莫名其妙停播）。
+        const bool hwOk = okType && okRate && cb > 0;
+        if (!hwOk) {
+            char b[320];
+            std::snprintf(b, sizeof(b),
+                "Native DSD 硬件判据不满足：type=%ld(%s) 采样率读回=%.0f（期望 %.0f）回调=%llu。"
+                "驱动可能没有真正进入 DSD 模式。", (long)di.type, typeShort.c_str(),
+                di.rateReadback, (double)srcRate, cb);
+            play_log(std::string("NATIVE_DSD_HWCHECK_FAIL ") + b);
+            { std::lock_guard<std::mutex> lk(ps.mtx); ps.error = b; }
+            return false;
+        }
+        return !ps.stop.load() && ps.error.empty();
+    } catch (const std::exception& e) {
+        drv.close();
+        std::lock_guard<std::mutex> lk(ps.mtx);
+        ps.error = std::string("Native DSD 异常: ") + e.what();
+    } catch (...) {
+        drv.close();
+        std::lock_guard<std::mutex> lk(ps.mtx);
+        ps.error = "Native DSD 未知异常";
+    }
+    return false;
+}
+
+
+// ---------------- 大文件流式播放：数据源 + 块级过采样峰值扫描 ----------------
+//
+// 背景（2026-10-25 用户实测 user_ginshoku.dsf，384 s DSD64 / 271 MB）：
+//   整曲预解码 read_dsd_native：4910 ms、PCM 缓冲 517 MB、解码瞬时峰值 1813 MB；
+//   再叠加"整曲过采样峰值扫描"的 double 平面 1034 MB 与 2887 ms 扫描 ⟹ 起播前 8 s 无声音、峰值 2071 MB。
+//   而管线本身的首块只要 18 ms（96k 输出 / GPU 升频）—— 卡的是解码与扫描，不是 DSP。
+//
+// 因此：解码后超过阈值（默认 200 MB，可配置）的 DSD 文件改走流式解码（DsdPcmStream），
+// 峰值扫描改为逐块扫描（只保留一块的平面）；小文件仍走原来的整曲路径（行为不变）。
+struct PlaySource {
+    const AudioBuffer* mem = nullptr;                      // 非空 = 整曲在内存
+    std::unique_ptr<rta::audio::DsdPcmStream> stream;      // 非空 = 流式解码
+    uint32_t rate = 0;
+    int      channels = 0;
+    int      bits = 0;
+    bool     isFloat = false;
+    size_t   frames = 0;
+
+    bool streaming() const { return stream != nullptr; }
+
+    // 读 [pos, pos+n) 帧。整曲路径与原实现逐字节相同；流式路径向 DsdPcmStream 要。
+    size_t read(size_t pos, size_t n, AudioBuffer& out) const {
+        if (stream) return stream->read(pos, n, out);
+        out.rate = mem->rate; out.channels = mem->channels; out.bits = mem->bits; out.isFloat = mem->isFloat;
+        out.raw.clear();
+        if (!mem || pos >= frames || n == 0) return 0;
+        if (n > frames - pos) n = frames - pos;
+        const size_t ch = (size_t)channels;
+        out.raw.assign(mem->raw.begin() + (long long)(pos * ch),
+                       mem->raw.begin() + (long long)((pos + n) * ch));
+        return n;
+    }
+};
+
+// 读 rlplayer-settings.conf 的单键（缺失返回 def）
+static std::string conf_get(const std::string& key, const std::string& def = std::string()) {
+    std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
+    if (!f) return def;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t e = line.find('=');
+        if (e == std::string::npos) continue;
+        if (line.substr(0, e) == key) return line.substr(e + 1);
+    }
+    return def;
+}
+
+// 每次播放开始时把「大文件流式」策略刷成配置值：
+//   stream_threshold_mb  解码后超过多少 MB 走流式（0 = 关闭流式，回到整曲预解码）
+//   isp_prescan_sec      流式播放的峰值预扫窗口（秒）—— 整曲扫描等于再解一遍，不划算
+static void apply_stream_settings() {
+    auto& s = rta::audio::big_file_stream_settings();
+    const double mb = std::atof(conf_get("stream_threshold_mb", "200").c_str());
+    const double win = std::atof(conf_get("isp_prescan_sec", "20").c_str());
+    s.enabled = (mb > 0.0);
+    s.thresholdMb = (mb > 0.0) ? mb : 200.0;
+    s.ispPrescanSec = (win > 0.0) ? win : 20.0;
+    // 每次播放都落一行：出问题时"这次用的是哪套阈值"不该靠猜（阈值可配置，必须能自证）
+    char b[200];
+    std::snprintf(b, sizeof(b), "STREAMCFG enabled=%d threshold_mb=%.0f isp_prescan_sec=%.0f",
+                  (int)s.enabled, s.thresholdMb, s.ispPrescanSec);
+    play_log(b);
+}
+
+// 块级过采样峰值扫描（4 相 × 8 抽头，与 dsp::detect_isp 同一个核、同一套边界规则）。
+// 为什么不用 dsp::detect_isp(整曲 planes)：那要 2 声道 × 8 字节 × 帧数（384 s DSD64 = 1034 MB）。
+// 这里按 256K 帧一块读源，块与块之间带 TAPS/2-1 = 3 帧真样本重叠，因此块内样本的插值
+// 与整曲扫描逐位相同（块边界不用"复制端点"，只有文件首尾才钳位）。
+struct BigIspScan {
+    double peak = 0.0;
+    double srcPeak = 0.0;
+    long long over = 0;
+    size_t scannedFrames = 0;
+    bool   partial = false;
+};
+static BigIspScan scan_isp_blocks(PlaySource& src, size_t limitFrames, bool partial) {
+    BigIspScan r;
+    r.partial = partial;
+    const auto& K = rta::dsp::isp_kernel();
+    const int TAPS = (int)K[0].size();
+    const int half = TAPS / 2 - 1;
+    const int PH = (int)K.size();
+    const size_t BLK = 1u << 18;          // 262144 帧/块
+    const size_t total = src.frames;
+    if (limitFrames == 0 || limitFrames > total) limitFrames = total;
+    for (size_t a = 0; a < limitFrames; a += BLK) {
+        const size_t b = std::min(limitFrames, a + BLK);
+        const size_t lo = (a > (size_t)half) ? a - (size_t)half : 0;
+        const size_t hi = std::min(total, b + (size_t)half);
+        AudioBuffer chunk;
+        const size_t got = src.read(lo, hi - lo, chunk);
+        if (got == 0) break;
+        const int chn = chunk.channels;
+        const size_t n = chunk.frames();
+        std::vector<std::vector<double>> planes((size_t)chn, std::vector<double>(n));
+        for (size_t i = 0; i < n; ++i)
+            for (int c = 0; c < chn; ++c) {
+                const double v = chunk.sample(i, c);
+                planes[(size_t)c][i] = v;
+                if (std::fabs(v) > r.srcPeak) r.srcPeak = std::fabs(v);
+            }
+        const size_t endInChunk = std::min(n, b - lo);
+        for (size_t i = a - lo; i < endInChunk; ++i) {
+            for (int c = 0; c < chn; ++c) {
+                const auto& x = planes[(size_t)c];
+                for (int p = 0; p < PH; ++p) {
+                    double acc = 0.0;
+                    for (int k = 0; k < TAPS; ++k) {
+                        long long idx = (long long)i + k - half;
+                        if (idx < 0) idx = 0;                       // 全局首端钳位（与整曲扫描一致）
+                        if (idx >= (long long)n) idx = (long long)n - 1;
+                        acc += K[(size_t)p][(size_t)k] * x[(size_t)idx];
+                    }
+                    const double v = std::fabs(acc);
+                    if (v > r.peak) r.peak = v;
+                    if (v > 1.0) ++r.over;
+                }
+            }
+        }
+        r.scannedFrames += (b - a);
+    }
+    return r;
+}
+
 // ---------------- 播放单曲 ----------------
 // buf 若已含数据则直接使用（预解码命中），否则现场解码。
 // 返回 true = 正常播完；false = 被打断或出错。
@@ -1421,6 +2058,20 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
     g_dbgPeak.store(0.0);
     g_dbgClip.store(0);
     apply_dsd_src_settings(p);
+    // ---- Native DSD（ASIO 原生 1-bit）：单独一条路径，与 DoP 完全分开 ----
+    // 参数门不满足 ⟹ **明确报错**（绝不静默退回 DoP）：用户选了 Native 却听到 DoP，
+    // 本身就是一条会被误判成"成功"的假链路。
+    if (p.dsdNative) {
+        std::string why;
+        if (!native_dsd_precheck(p, why)) {
+            play_log("PLAY_REJECT dsdnative=1 " + why);
+            dlog(std::string("PLAY_REJECT dsdnative=1 ") + why);
+            std::lock_guard<std::mutex> lk(ps.mtx);
+            ps.error = "Native DSD 参数不满足：" + why;
+            return false;
+        }
+        return play_one_native_dsd(file, p);
+    }
     // ---- DirectSDM 判定：必须在解码之前（DSD256 整曲解成 PCM 要几百 MB）----
     // 不满足条件时把原因带到信号链里（不能只写 ps.info —— 紧接着 read_any 会覆盖它）
     std::string directNote;
@@ -1473,9 +2124,42 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             }
         }
         play_log("START file=" + file);
+        play_log(mem_line("pre-decode"));
+        apply_stream_settings();
         const auto t_dec_0 = std::chrono::steady_clock::now();
-        if (buf.raw.empty()) buf = read_any(file, &note);
-        else note.text = "预解码命中（整曲已在内存）";
+        // 大文件不整曲预解码（2026-10-25 大 DSD 卡死）：先只读文件头，解码后 > 阈值就流式。
+        // 判据是"解码后 PCM 字节数"（DSD64 的 271 MB 文件解出来是 517 MB），见 audio_loader.h。
+        PlaySource src;
+        double streamMb = 0.0;
+        {
+            std::string why;
+            if (buf.raw.empty() && rta::audio::should_stream_decode(file, &streamMb, &why)) {
+                auto st = std::make_unique<rta::audio::DsdPcmStream>();
+                std::string serr;
+                if (st->open(file, rta::audio::dsd_pcm_settings(), &serr)) {
+                    src.rate = st->rate();
+                    src.channels = st->channels();
+                    src.bits = 32;
+                    src.isFloat = false;
+                    src.frames = st->totalFrames();
+                    src.stream = std::move(st);
+                    char b[240];
+                    std::snprintf(b, sizeof(b),
+                                  "流式解码（解码后 %.0f MB > 阈值 %.0f MB）：不整曲预解码，边读边解",
+                                  streamMb, rta::audio::big_file_stream_settings().thresholdMb);
+                    note.text = b;
+                    play_log(std::string("STREAM_BEGIN ") + b + " file=" + file);
+                } else {
+                    play_log("STREAM_SKIP open failed: " + serr + " file=" + file);   // 宁可慢，也不能不出声
+                }
+            } else if (!why.empty()) {
+                play_log("STREAM_NOT_USED " + why + " file=" + file);
+            }
+        }
+        if (!src.stream) {
+            if (buf.raw.empty()) buf = read_any(file, &note);
+            else note.text = "预解码命中（整曲已在内存）";
+        }
         const auto t_dec_1 = std::chrono::steady_clock::now();
         if (note.totalMs <= 0.0) {
             note.totalMs = std::chrono::duration<double, std::milli>(t_dec_1 - t_dec_0).count();
@@ -1483,12 +2167,31 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         ps.decodeMs.store((long long)(note.totalMs + 0.5));
         ps.ffmpegMs.store((long long)(note.ffmpegMs + 0.5));
         ps.wavReadMs.store((long long)(note.wavReadMs + 0.5));
-        AudioBuffer& in = buf;
+        // 流式时 buf 是空的：用只有元数据的 AudioBuffer 顶替 in 的元数据用途（raw 不参与）
+        AudioBuffer inMeta;
+        if (src.stream) {
+            inMeta.rate = src.rate; inMeta.channels = src.channels;
+            inMeta.bits = src.bits; inMeta.isFloat = src.isFloat;
+        } else {
+            src.mem = &buf;
+            src.rate = buf.rate; src.channels = buf.channels; src.bits = buf.bits;
+            src.isFloat = buf.isFloat; src.frames = buf.frames();
+        }
+        const AudioBuffer& in = src.stream ? inMeta : buf;
+        const size_t srcFrames = src.frames;
+        {
+            char b[240];
+            std::snprintf(b, sizeof(b), "stream=%d decodedMb=%.0f inBufMb=%.0f",
+                          (int)src.streaming(),
+                          src.streaming() ? streamMb : (double)buf.raw.size() * 4.0 / (1024.0 * 1024.0),
+                          (double)buf.raw.size() * 4.0 / (1024.0 * 1024.0));
+            play_log(mem_line("decoded", b));
+        }
         if (!note.text.empty()) { std::lock_guard<std::mutex> lk(ps.mtx); ps.info = note.text; }
         if (!directNote.empty()) { std::lock_guard<std::mutex> lk(ps.mtx); ps.info += " ｜ " + directNote; }
         if (ps.stop.load()) return false;
         // 空解码结果不要再往下走到"设备不支持 0 Hz"——那是误导性的错误。
-        if (in.rate == 0 || in.frames() == 0) {
+        if (in.rate == 0 || srcFrames == 0) {
             std::lock_guard<std::mutex> lk(ps.mtx);
             ps.error = "解码结果为空（文件损坏、格式不支持，或 ffmpeg 解码失败）：" + file;
             return false;
@@ -1498,7 +2201,9 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             std::ostringstream ds;
             ds << "DECODE file=" << file
                << " rate=" << in.rate << " ch=" << in.channels << " bits=" << in.bits
-               << " frames=" << in.frames();
+               << " frames=" << srcFrames
+               << " stream=" << (src.streaming() ? 1 : 0)
+               << " decodeMs=" << (long long)(note.totalMs + 0.5);
             if (!note.text.empty()) ds << " note=\"" << note.text << "\"";
             play_log(ds.str());
         }
@@ -1643,30 +2348,37 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                                     : rta::dsp::Shaper::None;
         }
 
-        // 过采样峰值（ISP）检测：一次性扫全曲，插值 4 倍取峰值。
-        // ★ 必须用 in.sample() 而不是直接读 in.raw：float WAV 的 raw 是 float 的
-        //   位模式，按整数解释会得到天文数字的"峰值"（旧代码会因此永远预衰减 3 dB）。
+        // 过采样峰值（ISP）检测：逐块扫描（4 相 × 8 抽头）。
+        // ★ 旧实现把整曲铺成 double 平面（2 声道 × 8 字节 × 帧数）：384 s DSD64 就是 1034 MB，
+        //   而且 detect_isp 全曲扫描要 2887 ms —— 这正是"点播放后 7 秒没声音"的一半原因。
+        //   改为块级扫描后：内存只占一块（256K 帧 ≈ 4 MB），数学与整曲扫描逐位相同。
+        // ★ 必须用 sample() 而不是直接读 raw：float WAV 的 raw 是 float 的位模式。
         double preAtten = 0.0;
         double ispPeak = 0.0;
         double srcPeak = 0.0;
         long long ispOver = 0;
-        std::vector<std::vector<double>> planes;
+        std::string ispScan = "off";
         if (p.isp || p.dsd >= 64) {
-            planes.resize((size_t)in.channels, std::vector<double>(in.frames()));
-            for (size_t n = 0; n < in.frames(); ++n) {
-                for (int c = 0; c < in.channels; ++c) {
-                    const double v = in.sample(n, c);
-                    planes[(size_t)c][n] = v;
-                    if (std::fabs(v) > srcPeak) srcPeak = std::fabs(v);
+            const auto t_isp_0 = std::chrono::steady_clock::now();
+            const double winSec = rta::audio::big_file_stream_settings().ispPrescanSec;
+            const bool partial = src.streaming() && (double)srcFrames > winSec * (double)in.rate;
+            const size_t limit = partial ? (size_t)(winSec * (double)in.rate) : srcFrames;
+            const BigIspScan sc = scan_isp_blocks(src, limit, partial);
+            srcPeak = sc.srcPeak;
+            if (p.isp) {
+                ispPeak = sc.peak; ispOver = sc.over;
+                if (sc.peak > 1.0) {
+                    const double pf = 20.0 * std::log10(sc.peak);
+                    preAtten = std::max(-3.0, -std::ceil(pf * 10.0) / 10.0 - 0.1);
                 }
             }
-        }
-        if (p.isp && !planes.empty()) {
-            const auto rep = rta::dsp::detect_isp(planes);
-            ispPeak = rep.peak; ispOver = rep.overCount;
-            if (rep.peak > 1.0) {
-                preAtten = std::max(-3.0, -std::ceil(rep.peakDb * 10.0) / 10.0 - 0.1);
-            }
+            ispScan = partial ? "partial" : "full";
+            const double ispMs = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - t_isp_0).count();
+            char b[260];
+            std::snprintf(b, sizeof(b), "scan=%s ms=%.0f frames=%zu/%zu peak=%.4f over=%lld srcPeak=%.4f",
+                          ispScan.c_str(), ispMs, sc.scannedFrames, srcFrames, ispPeak, ispOver, srcPeak);
+            play_log(mem_line("isp", b));
         }
         dlog("stage isp-ok");
 
@@ -1676,7 +2388,14 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         // 只要选了 DSD 输出，播到第一个大动态就会"突然变噪音"。
         double modHeadroomDb = 0.0;
         if (p.dsd >= 64) {
-            const double peak = std::max(std::max(srcPeak, ispPeak), 1e-9);
+            double peak = std::max(std::max(srcPeak, ispPeak), 1e-9);
+            // 流式文件的峰值只扫了开头 isp_prescan_sec 秒：若后面出现更大的峰值而余量按前面算，
+            // 1-bit 调制器会过载锁死（0.70 起环路锁死，见 dsd_integrator/modulator 注释）。
+            // 所以流式 + DSD 输出时按满幅保守取值（代价约 -4.4 dB，换来"任何曲目都不会锁死"）。
+            if (src.streaming() && peak < 1.0) {
+                peak = 1.0;
+                play_log("MODHEADROOM stream_partial_peak=1.0（流式峰值预扫只覆盖开头，按满幅保守取值）");
+            }
             const double afterIsp = peak * std::pow(10.0, preAtten / 20.0);
             modHeadroomDb = rta::dsp::sdm_headroom_db(afterIsp);
             if (modHeadroomDb < 0.0) preAtten += modHeadroomDb;
@@ -1685,30 +2404,9 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         cfg.preAttenDb = preAtten;
         cfg.twoStage = p.twoStage;
 
-        // ---- DSD Native（ASIO）：当前没有 ASIO 后端，如实告知而不是假装在放 ----
-        if (p.dsdNative) {
-            std::string drivers;
-            HKEY hk = nullptr;
-            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\ASIO", 0, KEY_READ, &hk) == ERROR_SUCCESS) {
-                for (DWORD i = 0;; ++i) {
-                    wchar_t name[256];
-                    DWORD len = 256;
-                    if (RegEnumKeyExW(hk, i, name, &len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
-                    char buf[512] = {0};
-                    WideCharToMultiByte(CP_UTF8, 0, name, -1, buf, sizeof(buf) - 1, nullptr, nullptr);
-                    if (!drivers.empty()) drivers += "、";
-                    drivers += buf;
-                }
-                RegCloseKey(hk);
-            }
-            std::lock_guard<std::mutex> lk(ps.mtx);
-            ps.error = "DSD Native 还没实现：要把 1-bit 码流按 ASIO 的 DSD 采样类型（ASIOSTDSDInt8*）直接送出，"
-                       "而当前管线输出的是 int32 PCM（DoP 封装）。" +
-                       (drivers.empty() ? std::string("本机也没有 ASIO 驱动。")
-                                        : ("本机 ASIO 驱动：" + drivers + "。")) +
-                       "DoP 走 PCM 通道，ASIO / WASAPI 都能承载。";
-            return false;
-        }
+        // （261024-06 已删除）旧代码在这里拒绝 DSD Native —— 那时没有 ASIO 原生 DSD 路径。
+        // 现在 dsdnative=1 在 play_one_impl 入口就分派给 play_one_native_dsd()，走不到这条
+        // PCM 管线；留着那段"还没实现"的文案只会误导后来的人。
 
         // ---- DSD（DoP）：管线先升到 DSD 速率，再调制 + 打包成 24-bit 载波 ----
         const bool dop = (p.dsd >= 64);
@@ -1740,7 +2438,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 char eb[256];
                 std::snprintf(eb, sizeof(eb),
                               "输出采样率解析为 0（防御，拒绝开流）：inRate=%u frames=%zu rate=%s dsd=%d",
-                              (unsigned)in.rate, in.frames(), p.rate.c_str(), p.dsd);
+                              (unsigned)in.rate, srcFrames, p.rate.c_str(), p.dsd);
                 ps.error = eb;
                 return false;
             }
@@ -2039,7 +2737,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         // 元数据带下来）。解码器容器位深（flac 恒为 32）会把 16bit 源 → 24bit 输出误判成"位深降低"。
         const int srcBitsEff = p.srcBits > 0 ? p.srcBits
                               : ((in.bits > 0 && in.bits <= 24) ? in.bits : 0);
-        const size_t   totalOut = (size_t)((double)in.frames() * (double)deviceRate / (double)in.rate + 0.5);
+        const size_t   totalOut = (size_t)((double)srcFrames * (double)deviceRate / (double)in.rate + 0.5);
         ps.outRate = deviceRate; ps.outBits = outBits;
         ps.total.store(totalOut);
 
@@ -2072,7 +2770,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 << ",\"inRate\":" << in.rate
                 << ",\"inBits\":" << in.bits
                 << ",\"inCh\":" << in.channels
-                << ",\"dur\":" << (double)in.frames() / (double)in.rate
+                << ",\"dur\":" << (double)srcFrames / (double)in.rate
                 << ",\"note\":\"" << jesc(note.text) << "\""
             << ",\"outRate\":" << outRate
             << ",\"outBits\":" << outBits
@@ -2108,6 +2806,11 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                  << ",\"modOrder\":" << (dop ? (p.modOrder > 0 ? p.modOrder : 5) : 0)
                 << ",\"ispPeak\":" << ispPeak
                 << ",\"ispOver\":" << ispOver
+                // ispScan: full（整曲扫描）/ partial（流式文件只扫开头 isp_prescan_sec 秒）/ off
+                << ",\"ispScan\":\"" << ispScan << "\""
+                // stream: 本次是否走流式解码（大文件）；inBufMb = 整曲缓冲大小（流式时为 0）
+                << ",\"stream\":" << (src.streaming() ? "true" : "false")
+                << ",\"inBufMb\":" << ((double)buf.raw.size() * 4.0 / (1024.0 * 1024.0))
                 << ",\"srcPeak\":" << srcPeak
                 << ",\"modHeadroom\":" << modHeadroomDb
                 << ",\"preAtten\":" << preAtten
@@ -2204,7 +2907,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             const size_t kChunk = 4096;
             uint64_t myEpoch = RQ.epoch.load();
             auto pl = std::make_unique<eng::Pipeline>(cfg);
-            size_t pos = 0, skipOut = 0;
+            size_t pos = 0, skipOut = 0, blocksDone = 0;
 
             // ---- DSD：每声道一个调制器（状态必须跨块保持）+ DoP 打包残样 ----
             std::vector<std::unique_ptr<rta::dsp::SdmModulator>> mods;
@@ -2239,19 +2942,27 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                         myEpoch = RQ.epoch.load();
                         RQ.cv.notify_all();
                     }
-                    if (pos >= in.frames()) break;
-                    const size_t n = std::min(kChunk, in.frames() - pos);
+                    if (pos >= srcFrames) break;
+                    const size_t n = std::min(kChunk, srcFrames - pos);
                     AudioBuffer c;
-                    c.rate = in.rate; c.channels = in.channels; c.bits = in.bits; c.isFloat = in.isFloat;
-                    c.raw.assign(in.raw.begin() + (long long)(pos * (size_t)in.channels),
-                                 in.raw.begin() + (long long)((pos + n) * (size_t)in.channels));
-                    pos += n;
+                    // ★ 流式：向源要这一块（整曲路径下与旧代码逐字节相同）
+                    const size_t gotFrames = src.read(pos, n, c);
+                    pos += gotFrames;
+                    if (gotFrames == 0) break;
                     const auto t_dsp_0 = std::chrono::steady_clock::now();
                     // 2026-10-24（用户 261024-04 #8）：把 PipelineStats 收下来，才能回答
                     // 「本次卷积到底走没走 GPU」—— 旧代码传 nullptr，这个事实被直接丢掉，
                     // 于是 /api/signal 的 irGpu 只能是"用户勾了开关"（设置项），不是实测。
                     eng::PipelineStats pst;
                     AudioBuffer o = pl->process(c, &pst);
+                    if (blocksDone++ == 0) {
+                        // 首块成本 = 重采样器设计（26 万抽头）+ 一块 DSP。这是"起播延迟"里
+                        // 除解码/扫描之外的第三项，必须能单独量出来（2026-10-25 大文件卡死取证）。
+                        char b[200];
+                        std::snprintf(b, sizeof(b), "prepareMs=%.0f coeffMb=%.1f outFrames=%zu",
+                                      pst.prepareMs, (double)pst.coeffBytes / (1024.0 * 1024.0), o.frames());
+                        play_log(mem_line("dsp-first-block", b));
+                    }
                     if (pst.usedGpuConvolution) ps.gpuConvUsed.store(true);
                     if (!RQ.gpu.load()) RQ.gpu.store(pl->gpuResampleActive());
                     if (skipOut > 0 && !o.raw.empty()) {
@@ -2386,7 +3097,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         rl.volDb = &ps.volDb; rl.startDb = &ps.startDb; rl.dbgPad = &ps.dbgPad; rl.gpuOut = &ps.gpu;
         rl.rq = &RQ;
         rl.deviceRate = deviceRate; rl.outBits = outBits; rl.outCh = outCh;
-        rl.inRate = in.rate; rl.inFrames = in.frames(); rl.totalOut = totalOut;
+        rl.inRate = in.rate; rl.inFrames = srcFrames; rl.totalOut = totalOut;
         rl.dbgW0 = &g_dbgW0; rl.dbgWr = &g_dbgWr; rl.dbgPulls = &g_dbgPulls;
         rl.dbgClip = &g_dbgClip; rl.dbgPeak = &g_dbgPeak;
         // C2 遥测导出（/api/status 用；STAT 行本身由 render_loop 直接打印）
@@ -3369,6 +4080,15 @@ static PreSlot g_pre;
 
 static void prefetch_start(const std::string& path) {
     if (path.empty() || g_pre.busy.load()) return;
+    // 大文件不预解码（2026-10-25）：这类文件在播放时走流式，预先把整曲塞进内存正好是
+    // 要修的那个病（517 MB + 1 GB 峰值）。判据与播放路径同一个函数，不会出现两套口径。
+    {
+        double mb = 0.0;
+        if (rta::audio::should_stream_decode(path, &mb, nullptr)) {
+            play_log("PREFETCH_SKIP stream file=" + path);
+            return;
+        }
+    }
     if (g_pre.th.joinable()) g_pre.th.join();
     {
         std::lock_guard<std::mutex> lk(g_pre.mtx);
@@ -4274,6 +4994,19 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         // F1：file 会进队列 → 播放线程 recent_add/meta_on_play/fs::u8path 全链消费，
         // 非法字节在这里挡下（播放线程里抛异常没有兜底，等于整进程退出）。
         if (!valid_utf8(p.file)) return utf8_path_reject(p.file);
+        // Native DSD 参数门（HTTP 层同步拒绝，**不开设备**）：4 条断言就在这条线上
+        //（tests/native_dsd_api_check.ps1：非 DSD 源 / 音量非 0 / 后端非 ASIO / 有 EQ）。
+        // 放在起播放线程之前 ⟹ 用户点一下立刻拿到具体原因，而不是"HTTP 说 ok、线程里才失败"。
+        if (p.dsdNative) {
+            std::string why;
+            if (!native_dsd_precheck(p, why)) {
+                // 同时进 /api/dbg 的内存环：界面 DEBUG 面板能直接看到"为什么这次 Native 被拒"，
+                // 也是 tests/native_dsd_api_check.ps1 第 7 条断言的取证来源。
+                play_log("PLAY_REJECT dsdnative=1 file=" + p.file + " " + why);
+                dlog(std::string("PLAY_REJECT dsdnative=1 ") + why);
+                return std::string("{\"ok\":false,\"nativeDsd\":true,\"error\":\"") + jesc(why) + "\"}";
+            }
+        }
         g_params = p;
 
         // 先停掉上一次
@@ -5768,6 +6501,8 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                                            "inbackend", "indev", "inoffset", "inbuf", "inmon",
                                            "inseconds", "inout",
                                            "sdmfilt", "sdmfiltnx", "streamdecode",
+                                           // 大文件流式播放（2026-10-25）：阈值与峰值预扫窗口
+                                           "stream_threshold_mb", "isp_prescan_sec",
                                            // 耳机 EQ (OPRA)
                                            "opraproduct", "oprapreset", "opravendor",
                                            // 元数据补全(P1.5):总开关与 LLM 固定两键;
@@ -5835,6 +6570,8 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         injectKv("metasummary", "0");
         injectKv("llmmonthlycap", "0");
         injectKv("streamdecode", "1");
+        injectKv("stream_threshold_mb", "200");
+        injectKv("isp_prescan_sec", "20");
         for (const rta::meta::ProviderDesc& pd : rta::meta::provider_registry()) {
             const std::string nk = std::string("metasrc_") + pd.id;
             if (seen.count(nk) != 0) continue;
@@ -6907,7 +7644,10 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         gpuIn.resampleGpu  = castMode ? false : ps.gpu;
         gpuIn.convGpu      = castMode ? false : ps.gpuConvUsed.load();
         const rta::meta::PlaybackGpuFlags gpuF = rta::meta::playback_gpu_flags(gpuIn);
+        const ProcMemInfo memNow = proc_mem();   // 内存遥测（大文件卡死判据：峰值内存）
         j << "{\"ok\":true"
+          << ",\"wsMb\":" << memNow.wsMb
+          << ",\"wsPeakMb\":" << memNow.peakMb
           << ",\"playing\":" << (playingStat ? "true" : "false")
           << ",\"current\":\"" << jesc(curStat) << "\""
           << ",\"error\":\"" << jesc(errStat) << "\""
