@@ -210,6 +210,12 @@ add_executable(test_volume_eq tests/test_volume_eq.cpp)
 target_link_libraries(test_volume_eq PRIVATE rtadsp)
 add_test(NAME volume_eq COMMAND test_volume_eq)
 
+# ---------------- 20 段参数均衡 PEQ（261024-02 #6）：0dB 直通 / 6dB@fc / Q 带宽 /
+#                  采样率重建 / 满幅过载恢复 / 热更新交叉淡入（铁律 7）----------------
+add_executable(test_peq tests/test_peq.cpp)
+target_link_libraries(test_peq PRIVATE rtadsp)
+add_test(NAME peq COMMAND test_peq)
+
 add_executable(test_chain tests/test_chain.cpp)
 target_link_libraries(test_chain PRIVATE rtadsp)
 add_test(NAME chain COMMAND test_chain)

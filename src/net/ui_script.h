@@ -4027,6 +4027,24 @@ function eqTabActive() {
    改用设置页统一的分组卡片（sgroup），不再用原来的独立大卡片，保证页签内视觉与其它页一致。 */
 function eqSettingsHtml() {
   var h = '';
+  // 0. 20 段参数均衡 PEQ（261024-02 #6）—— 新增，放在 EQ 页最上面
+  h += sgroup('参数均衡 PEQ（20 段 · HIFI）',
+      'RBJ 双二阶 · 20 段 ISO 1/3 倍频程中心频率（20Hz~20kHz）· 采样率相关重建 · 参数热更新交叉淡入',
+      '<div class="sfld wide" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">'
+    + '<label class=chk style="margin:0"><input type=checkbox id=peqBypass> 旁路（bypass）</label>'
+    + '<label style="font-size:12px;color:var(--mut2)">前级增益 <input type=number id=peqPreamp step=0.1 min=-24 max=24 value=0 style="width:74px;height:26px"> dB</label>'
+    + '<label style="font-size:12px;color:var(--mut2)">预设 <select id=peqPreset style="min-width:160px;height:26px"></select></label>'
+    + '<button class="btn" id=peqLoad type=button>加载</button>'
+    + '<button class="btn" id=peqSave type=button>保存为预设…</button>'
+    + '<button class="btn" id=peqDelete type=button>删除预设</button>'
+    + '<button class="btn" id=peqReset type=button>重置 Flat</button>'
+    + '<span id=peqMsg style="font-size:11.5px;color:var(--mut2)"></span>'
+    + '</div>'
+    + '<div class="sfld wide"><div id=peqCurve style="background:var(--field);border:1px solid var(--line);border-radius:8px;padding:6px 10px 2px"></div></div>'
+    + '<div class="sfld wide"><div id=peqRows style="max-height:330px;overflow:auto;border:1px solid var(--line);border-radius:8px"></div>'
+    + '<div style="font-size:11px;color:var(--mut2);margin-top:4px">增益范围 ±12dB（步进 0.1）；Q 0.1~20；频率 10Hz~20kHz。修改即时生效（热更新，交叉淡入防爆音），并自动保存到 rlplayer-peq.txt。</div></div>');
+
+
   // 1. 耳机 EQ（OPRA）
   h += sgroup('耳机 EQ（OPRA 校准预设）', '收录 6,230 款耳机专业校准滤波 · CC BY-SA 4.0',
       '<div class="sfld wide" style="display:flex;align-items:center;gap:10px">'
@@ -4070,7 +4088,159 @@ function eqSettingsHtml() {
     );
   return h;
 }
+/* ---------------- 20 段参数均衡 PEQ（261024-02 #6） ---------------- */
+var PEQ_STATE = null;
+var PEQ_TIMER = 0;
+
+function peqCollectBands() {
+  var bands = [];
+  var rows = document.querySelectorAll('#peqRows tbody tr');
+  Array.prototype.forEach.call(rows, function (tr, i) {
+    var f = tr.querySelector('.peqF'), g = tr.querySelector('.peqG'), q = tr.querySelector('.peqQ');
+    var t = tr.querySelector('.peqT'), on = tr.querySelector('.peqOn');
+    if (!f || !g || !q || !t || !on) return;
+    bands.push({ i: i + 1, type: t.value, freq: parseFloat(f.value) || 0,
+                 gain: parseFloat(g.value) || 0, q: parseFloat(q.value) || 1.41, on: on.checked });
+  });
+  return bands;
+}
+function peqBandsParam() {
+  return peqCollectBands().map(function (b) {
+    return b.i + ',' + b.type + ',' + b.freq + ',' + b.gain + ',' + b.q + (b.on ? '' : ',off');
+  }).join(';');
+}
+// 频响曲线：后端 /api/peq 直接给 [频率, dB] 点（与 C++ 设计公式同源，前端不抄第二份）
+function peqDrawCurve(points) {
+  var box = D('peqCurve'); if (!box) return;
+  if (!points || !points.length) {
+    box.innerHTML = '<div style="font-size:11.5px;color:var(--mut2);padding:12px 0">频响曲线（等待数据…）</div>';
+    return;
+  }
+  var W = 640, H = 132, PADL = 36, PADR = 8, PADT = 8, PADB = 16;
+  var maxDb = 6, minDb = -6;
+  points.forEach(function (p) { maxDb = Math.max(maxDb, p[1]); minDb = Math.min(minDb, p[1]); });
+  maxDb = Math.ceil(maxDb / 3) * 3; minDb = Math.floor(minDb / 3) * 3;
+  function px(f) { return PADL + (Math.log(f / 20) / Math.log(1000)) * (W - PADL - PADR); }
+  function py(db) { return PADT + (maxDb - db) / (maxDb - minDb) * (H - PADT - PADB); }
+  var pts = points.map(function (p) { return px(p[0]).toFixed(1) + ',' + py(p[1]).toFixed(1); }).join(' ');
+  var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="display:block;width:100%;height:auto">';
+  for (var d = Math.ceil(minDb / 6) * 6; d <= maxDb; d += 6) {
+    svg += '<line x1="' + PADL + '" y1="' + py(d).toFixed(1) + '" x2="' + (W - PADR) + '" y2="' + py(d).toFixed(1) +
+           '" stroke="var(--line)" stroke-width="1" stroke-dasharray="' + (d === 0 ? '4 3' : '2 4') + '" opacity="' + (d === 0 ? '0.9' : '0.5') + '"/>';
+    svg += '<text x="2" y="' + (py(d) + 3).toFixed(1) + '" font-size="9" fill="var(--mut2)">' + d + 'dB</text>';
+  }
+  [[20, '20'], [100, '100'], [1000, '1k'], [10000, '10k'], [20000, '20k']].forEach(function (fk) {
+    var x = px(fk[0]);
+    svg += '<line x1="' + x.toFixed(1) + '" y1="' + PADT + '" x2="' + x.toFixed(1) + '" y2="' + (H - PADB) + '" stroke="var(--line)" stroke-width="1" stroke-dasharray="2 4" opacity=".45"/>';
+    svg += '<text x="' + (x - 8).toFixed(1) + '" y="' + (H - 4) + '" font-size="9" fill="var(--mut2)">' + fk[1] + '</text>';
+  });
+  svg += '<polyline points="' + pts + '" fill="none" stroke="var(--acc)" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>';
+  svg += '</svg>';
+  box.innerHTML = svg;
+}
+function peqRenderRows(j) {
+  var box = D('peqRows'); if (!box) return;
+  var h = '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+        + '<thead><tr style="position:sticky;top:0;background:var(--field);z-index:1;font-size:11px;color:var(--mut2)">'
+        + '<th style="width:40px;padding:5px 6px;text-align:left">段</th>'
+        + '<th style="padding:5px 6px;text-align:left">频率 (Hz)</th>'
+        + '<th style="padding:5px 6px;text-align:left">增益 (dB)</th>'
+        + '<th style="padding:5px 6px;text-align:left">Q</th>'
+        + '<th style="width:78px;padding:5px 6px;text-align:left">类型</th>'
+        + '<th style="width:48px;padding:5px 6px;text-align:center">启用</th></tr></thead><tbody>';
+  (j.bands || []).forEach(function (b, i) {
+    var sel = '<select class=peqT style="width:70px;height:24px;background:var(--field);border:1px solid var(--line);border-radius:5px;color:var(--txt);font-size:11.5px">'
+      + '<option value=PK' + (b.type === 'PK' ? ' selected' : '') + '>峰值</option>'
+      + '<option value=LS' + (b.type === 'LS' ? ' selected' : '') + '>低架</option>'
+      + '<option value=HS' + (b.type === 'HS' ? ' selected' : '') + '>高架</option></select>';
+    var inp = ' style="width:86px;height:24px;background:var(--field);border:1px solid var(--line);border-radius:5px;color:var(--txt);font-size:11.5px;padding:0 6px"';
+    h += '<tr style="border-top:1px solid var(--line)">'
+       + '<td style="padding:3px 6px;color:var(--mut2);font-family:monospace">' + (i + 1) + '</td>'
+       + '<td style="padding:3px 6px"><input class=peqF type=number min=10 max=20000 step=1 value="' + b.freq + '"' + inp + '></td>'
+       + '<td style="padding:3px 6px"><input class=peqG type=number min=-12 max=12 step=0.1 value="' + b.gain + '"' + inp + '></td>'
+       + '<td style="padding:3px 6px"><input class=peqQ type=number min=0.1 max=20 step=0.01 value="' + b.q + '"' + inp + '></td>'
+       + '<td style="padding:3px 6px">' + sel + '</td>'
+       + '<td style="padding:3px 6px;text-align:center"><input class=peqOn type=checkbox' + (b.on ? ' checked' : '') + '></td>'
+       + '</tr>';
+  });
+  h += '</tbody></table>';
+  box.innerHTML = h;
+  Array.prototype.forEach.call(box.querySelectorAll('input,select'), function (el) {
+    el.onchange = function () { peqScheduleApply(); };
+    el.oninput = function () { peqScheduleApply(); };
+  });
+}
+function peqRender(j) {
+  PEQ_STATE = j;
+  if (D('peqBypass')) D('peqBypass').checked = !!j.bypass;
+  if (D('peqPreamp')) D('peqPreamp').value = j.preamp;
+  var sel = D('peqPreset');
+  if (sel) {
+    var cur = j.name || 'Flat';
+    var h = '';
+    (j.presets || []).forEach(function (n) {
+      h += '<option value="' + esc(n) + '"' + (n === cur ? ' selected' : '') + '>' + esc(n) + '</option>';
+    });
+    sel.innerHTML = h;
+  }
+  peqRenderRows(j);
+  peqDrawCurve(j.points);
+}
+function peqMsg(t) { var e = D('peqMsg'); if (e) e.textContent = t || ''; }
+function peqScheduleApply() {
+  clearTimeout(PEQ_TIMER);
+  PEQ_TIMER = setTimeout(peqApply, 260);
+}
+function peqApply() {
+  var body = 'bypass=' + ((D('peqBypass') && D('peqBypass').checked) ? 1 : 0)
+    + '&preamp=' + encodeURIComponent((D('peqPreamp') ? D('peqPreamp').value : 0) || 0)
+    + '&bands=' + encodeURIComponent(peqBandsParam());
+  peqMsg('应用中…');
+  api('/api/peq', body).then(function (j) {
+    if (!j || !j.ok) { peqMsg('失败：' + ((j && j.error) || '未知错误')); return; }
+    PEQ_STATE = j;
+    peqDrawCurve(j.points);   // 只刷新曲线，不重建输入框（避免打断正在输入的光标）
+    peqMsg('已应用（' + (j.bypass ? '旁路' : '生效') + ' · 采样率 ' + Math.round(j.fs) + ' Hz）');
+  }).catch(function (e) { peqMsg('失败：' + e); });
+}
+function peqLoadState() {
+  return api('/api/peq').then(function (j) {
+    if (j && j.ok) peqRender(j);
+  }).catch(function () { });
+}
+function peqPresetAction(action, name) {
+  api('/api/peq/preset', 'action=' + encodeURIComponent(action) + '&name=' + encodeURIComponent(name || '')).then(function (j) {
+    if (!j || !j.ok) { toast('预设操作失败：' + ((j && j.error) || '未知错误')); return; }
+    peqRender(j);
+    if (action === 'load') toast('已加载预设：' + name);
+    else if (action === 'save') toast('已保存预设：' + name);
+    else if (action === 'reset') toast('已重置为 Flat');
+    else toast('已删除预设');
+  }).catch(function (e) { toast('预设操作失败：' + e); });
+}
+function initPeqControls() {
+  if (!D('peqBypass')) return;   // 当前页面没有 PEQ 卡（例如还没渲染设置页）
+  D('peqBypass').onchange = peqScheduleApply;
+  if (D('peqPreamp')) D('peqPreamp').oninput = peqScheduleApply;
+  if (D('peqLoad')) D('peqLoad').onclick = function () {
+    var sel = D('peqPreset'); if (sel) peqPresetAction('load', sel.value);
+  };
+  if (D('peqSave')) D('peqSave').onclick = function () {
+    var n = prompt('预设名（保存到 rlplayer-peq-presets.txt）：', (PEQ_STATE && PEQ_STATE.name) || '我的 PEQ');
+    if (n && n.trim()) peqPresetAction('save', n.trim());
+  };
+  if (D('peqDelete')) D('peqDelete').onclick = function () {
+    var sel = D('peqPreset'); if (!sel) return;
+    if (confirm('删除用户预设「' + sel.value + '」？（内置预设不能删除）')) peqPresetAction('delete', sel.value);
+  };
+  if (D('peqReset')) D('peqReset').onclick = function () {
+    if (confirm('重置为 Flat（20 段全部 0dB）？')) peqPresetAction('reset', 'Flat');
+  };
+  peqLoadState();
+}
+
 function initEqViewLogic() {
+  initPeqControls();
   var sInput = D('sp_opra_search');
   var guide = D('eqSearchGuide');
   var hint = D('sp_opra_searchhint');
