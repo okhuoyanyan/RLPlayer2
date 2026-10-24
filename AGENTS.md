@@ -163,45 +163,59 @@ CUDA 不会像 HIP 那样"arch 写错就静默不执行"，但它**一样会骗�
 ## 9. 子代理派遣（DSH 路由，2026-10-24 实测）
 
 主控不一个人写：按**文件所有权**把工作包切给子代理，主控只做把关、跑门禁、出包。
-可用的 LLM 路由用工具 `list_subagent_models` 查（provider → model → reasoning effort）。
+可用的路由用工具 `list_subagent_models` 查（provider → model → reasoning effort）。
 
-### 9.1 已实测可用的路由
+### 9.1 可用的三条路由（用户 2026-10-24 钦定，均已实测连通）
 
-| provider | model | 说明 |
-|---|---|---|
-| `agy` | `gemini-3.8-flash-tiered` | **Gemini 3.8 Flash（Antigravity）**。2026-10-24 探针实测：能读仓库、能跑命令、能 send_message 汇报；`reasoning_effort` 支持 low / medium / high |
-| `agy` | `claude-opus-4-6-thinking` | Claude Opus 4.6（Thinking） |
-| `opencode-go` | `deepseek-v4.1-flash` | DeepSeek V4.1 Flash（快、便宜；1.3.15/1.3.16 的绝大多数工作包用的它） |
-| `deepseek-official` | `deepseek-flash` | DeepSeek-V4.1-Flash |
-| `workbuddy-cn` | `deepseek-v4.1-flash` / `step-5-preview` | 备用 |
+| provider | model | 能力 | 实测依据 |
+|---|---|---|---|
+| `agy` | `gemini-3.8-flash-tiered` | **Gemini 3.8 Flash**（Antigravity） | 2026-10-24 探针：读仓库 + 跑命令 + send_message 回报 `PROBE-OK`；`reasoning_effort` 支持 low / medium / high |
+| `opencode-go` | `deepseek-v4.1-flash` | **DeepSeek V4.1 Flash**（opencode） | 1.3.15 / 1.3.16 十余个工作包全程使用（UI、后端、测试、打包） |
+| `workbuddy-cn` | `deepseek-v4.1-flash` | **DeepSeek V4.1 Flash**（WorkBuddy） | 2026-10-24 探针：`git describe`/`rev-parse` 输出正确，回报 `PROBE-OK` |
 
-> ⚠️ 目录是"广告"，不是白名单：适配器可能接受目录里没列的 model id；但**没实测过的不要写进这张表**。
+> ⚠️ 目录里还看得到 `agy/claude-opus-4-6-thinking`、`workbuddy-cn/step-5-preview`、
+> `deepseek-official/deepseek-flash` 等，但**用户明确只有上面三条可用**：
+> `claude-opus-4-6-thinking` 版本较老、用户不确定其水平 ⟹ **默认不派**，除非用户当次明确要求。
+> "目录是广告，不是白名单"——没实测过的模型不要写进这张表，也不要默认拿来派单。
 
-### 9.2 调用方式
+### 9.2 派单策略（用户指定，2026-10-24）
+
+- **写代码 / 界面 / 测试 / 机械改造 → `agy` + `gemini-3.8-flash-tiered`**
+  （快、上下文大，适合大段改文件、按既有风格补代码、跑 CDP/脚本验收）。
+- **debug / 疑难 / 复杂推理 / 需要读大量证据定位根因 → `deepseek-v4.1-flash`**
+  （`opencode-go` 首选；`workbuddy-cn` 作分流或备用。今晚 N300 96k 取证、knowledge 异步化、
+  设备速率守卫这类都是它做的）。
+- 一个工作包一个子代理；**同一文件同一时间只能有一个写者**（并行时按文件切分）。
+- 大任务先拆成可验证小块，每块带**可执行的判据**（铁律 3）。
+
+### 9.3 调用方式
 
 ```ts
 const s = await tools.subagent({
   description: "三段式短标题",              // 3-5 个词，给人看
   prompt: `……完整任务书（自包含）……`,       // 子代理**看不到**本会话上下文
-  provider: "agy",                          // 见 9.1
-  model: "gemini-3.8-flash-tiered",
-  reasoning_effort: "medium",               // 可选 low/medium/high
+  provider: "agy",                          // 代码类：agy / debug 类：opencode-go
+  model: "gemini-3.8-flash-tiered",         // 或 deepseek-v4.1-flash
+  reasoning_effort: "medium",               // 可选 low/medium/high（gemini）
 });
 // s.subagentId：后续 send_message 追问 / interrupt_agent 打断；完成时它会 send_message 回报
 ```
 
 - 需要**继承本会话上下文**时用 `subagent_fork`（不传 provider/model，沿用父会话路由）。
-- 一个工作包一个子代理；**同一文件同一时间只能有一个写者**（并行时按文件切分）。
+- 并行多个工作包时**一条消息里同时发**（见工具说明：独立派遣要在同一 block）。
 
-### 9.3 任务书硬要求（写不好就等着返工）
+### 9.4 任务书硬要求（写不好就等着返工）
 
-1. 明确**允许改哪些文件**（以及明确禁止碰哪些）；
+1. 明确**允许改哪些文件**（并列出禁止碰的文件）；
 2. 用**独立构建目录** `build-xxx/`，不要共用 `build/`；
 3. 复述纪律：不 commit、不开音频设备、不按映像名杀进程（铁律 1/2）；
 4. 要求它**自己跑判据并给数字**；没实测就写"未验证"（铁律 3/4）；
 5. 回报走 `send_message`，≤150 行，含"改了哪些行 + 实测数字 + 未验证项"。
 
-### 9.4 实测记录
+### 9.5 实测记录
 
-- `agy` / `gemini-3.8-flash-tiered`：2026-10-24 21:56 连通性探针通过 —— 正确执行 `git log -1`（`bdcdd61`）与
-  `git describe --tags --abbrev=0`（`v1.3.16`），回报 `PROBE-OK`。
+- `agy` / `gemini-3.8-flash-tiered`：2026-10-24 21:56 探针 —— `git log -1` → `bdcdd61`、
+  `git describe --tags --abbrev=0` → `v1.3.16`，回报 `PROBE-OK`。
+- `workbuddy-cn` / `deepseek-v4.1-flash`：2026-10-24 22:01 探针 —— `git describe` → `v1.3.16`、
+  `rev-parse --short HEAD` → `c090de7`，回报 `PROBE-OK`。
+- `opencode-go` / `deepseek-v4.1-flash`：1.3.15 / 1.3.16 两轮共 10+ 个工作包，全部完成并带实测数字。
