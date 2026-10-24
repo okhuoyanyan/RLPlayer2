@@ -12,6 +12,22 @@ var D = function (i) { return document.getElementById(i); };
 var WV = (window.chrome && window.chrome.webview) ? window.chrome.webview : null;
 if (WV) document.documentElement.classList.add('webview2');
 function wcmd(c) { try { if (WV) WV.postMessage(c); } catch (e) { } }
+// 261024-02 #2：资料里的 URL 一律交给**系统浏览器**打开（绝不把 WebView 自己导航走）。
+// 协议白名单只放 http/https（file: / javascript: / data: 一律拒绝，避免本机文件被页面打开）。
+// 宿主（launcher）收到 'openurl:<url>' 后 ShellExecuteW 打开；浏览器直开（没有 WebView2）时 window.open 兜底。
+function extUrlAllowed(u) {
+  return /^https?:\/\/[^\s]+$/i.test(String(u || ''));
+}
+function openExternal(u) {
+  u = String(u || '').trim();
+  if (!extUrlAllowed(u)) { toast('不支持的链接（只允许 http / https）'); return false; }
+  if (WV) { wcmd('openurl:' + u); toast('已在系统浏览器打开'); }
+  else {
+    try { window.open(u, '_blank', 'noopener'); toast('已在浏览器新标签打开'); }
+    catch (e) { toast('打开失败：' + u); }
+  }
+  return true;
+}
 var S = {
   view: 'albums', albums: [], album: null, files: [], remote: [],
   q: { items: [], index: 0 }, cur: '', playing: false, paused: false,
@@ -55,6 +71,14 @@ function toast(m) {
   var t = D('toast'); if (!t) return;
   t.textContent = m; t.classList.add('on');
   clearTimeout(window._tt); window._tt = setTimeout(function () { t.classList.remove('on'); }, 2000);
+}
+// 261024-02 #3：长时长格式（专辑总时长用 1:05:24，单曲用 4:24；都用本地曲库真实数据，不用 AI 猜）
+function fmtDurLong(x) {
+  x = Math.max(0, Math.round(x || 0));
+  var h = Math.floor(x / 3600), m = Math.floor((x % 3600) / 60), s = x % 60;
+  var ss = (s < 10 ? '0' : '') + s;
+  if (h > 0) return h + ':' + (m < 10 ? '0' : '') + m + ':' + ss;
+  return m + ':' + ss;
 }
 function fmt(x) {
   x = Math.max(0, Math.floor(x || 0));
@@ -361,25 +385,73 @@ function efValueText(v) {
   }
   try { return JSON.stringify(v); } catch (e) { return ''; }
 }
+// 261024-02 #3：本地曲库真实数据优先 —— opts.local = {标签: 值}（本地有就用本地的），
+// opts.drop = {标签:1}（本地数据在页面上已经有专门的展示位置时，AI 那一项直接不渲染）。
+// 值里的 http/https 自动变成可点链接（261024-02 #2：「关联」字段里的网址以前完全点不动）
+function linkifyEscaped(v) {
+  v = String(v == null ? '' : v);
+  var re = /https?:\/\/[^\s<>"'）)】]+/g, out = '', last = 0, m;
+  while ((m = re.exec(v))) {
+    out += esc(v.slice(last, m.index));
+    out += '<span class=eflink data-url="' + esc(m[0]) + '" role=link tabindex=0>' + esc(m[0]) + '</span>';
+    last = m.index + m[0].length;
+  }
+  out += esc(v.slice(last));
+  return out;
+}
+// 外链点击（事件委托，重绘后不需要重新绑定）
+document.addEventListener('click', function (ev) {
+  var t = ev.target;
+  while (t && t !== document) {
+    if (t.classList && t.classList.contains('eflink')) { ev.preventDefault(); openExternal(t.dataset.url); return; }
+    t = t.parentNode;
+  }
+});
 function renderFieldGrid(fields, kind, opts) {
   if (!fields || typeof fields !== 'object') return '';
-  var skip = (opts && opts.skip) || {};
+  var skip = {};
+  var sk = (opts && opts.skip) || {}, dr = (opts && opts.drop) || {};
+  Object.keys(sk).forEach(function (k) { skip[k] = 1; });
+  Object.keys(dr).forEach(function (k) { skip[k] = 1; });
+  var local = (opts && opts.local) || {};
   var labels = [], seen = {};
   var order = EF_ORDER[kind] || [];
+  function hasVal(lb) {
+    if (local[lb] !== undefined && local[lb] !== null && local[lb] !== '') return true;
+    return fields[lb] !== undefined && fields[lb] !== null;
+  }
   order.forEach(function (lb) {
-    if (fields[lb] !== undefined && fields[lb] !== null && !skip[lb]) { labels.push(lb); seen[lb] = 1; }
+    if (hasVal(lb) && !skip[lb]) { labels.push(lb); seen[lb] = 1; }
   });
   Object.keys(fields).forEach(function (lb) {   // 契约外的标签也照渲染（前端不许丢后端给的内容）
+    if (!seen[lb] && !skip[lb] && labels.indexOf(lb) < 0) labels.push(lb);
+  });
+  Object.keys(local).forEach(function (lb) {    // 本地独有（AI 没给的）标签也要出现
     if (!seen[lb] && !skip[lb] && labels.indexOf(lb) < 0) labels.push(lb);
   });
   var rows = '';
   labels.forEach(function (lb) {
     var v = efValueText(fields[lb]);
+    if (local[lb] !== undefined && local[lb] !== null && local[lb] !== '') v = efValueText(local[lb]);
     if (!v) return;                              // 空值 = 后端不知道 ⟹ 不占位
     var wide = !!EF_WIDE[lb] || v.length > 46 || v.indexOf('\n') >= 0;
     rows += '<div class="efrow' + (wide ? ' wide' : '') + '">' +
-            '<div class=lb>' + esc(lb) + '</div><div class=vl>' + esc(v) + '</div></div>';
+            '<div class=lb>' + esc(lb) + '</div><div class=vl>' + linkifyEscaped(v) + '</div></div>';
   });
+  // 261024-02 #3：曲目列表用本地曲库逐行渲染（序号 / 曲名 / 时长三列对齐），不再用 AI 的一行文本。
+  // 只有调用方真的传了本地曲目（opts.tracklist）才渲染；否则保留 AI 的文本版（并在末尾标注 AI 推测）。
+  var tl = (opts && opts.tracklist) || null;
+  if (tl && tl.length) {
+    var tlh = '<div class="efrow wide"><div class=lb>曲目列表</div><div class=vl><div class=ef-tracklist>';
+    tl.forEach(function (t, i) {
+      var n = (typeof t.n === 'number' && t.n > 0) ? t.n : (i + 1);
+      tlh += '<div class=eft-row><span class=eft-n>' + (n < 10 ? '0' : '') + n + '</span>' +
+             '<span class=eft-t title="' + esc(t.title || '') + '">' + esc(t.title || '') + '</span>' +
+             '<span class=eft-d>' + fmtDurLong(t.dur || 0) + '</span></div>';
+    });
+    tlh += '</div></div></div>';
+    rows += tlh;
+  }
   return rows ? ('<div class=efields>' + rows + '</div>') : '';
 }
 // 简介类区块的统一渲染：优先 fields 网格，兜底 sections 段落。
@@ -418,10 +490,7 @@ function renderSummaryContent(summary, title, kind, opts) {
     h += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">';
     summary.citations.forEach(function (c, idx) {
       var label = '[' + (idx + 1) + '] ' + (c.title || c.source || '来源');
-      h += '<button class="btn chip-copy" data-url="' + esc(c.url) + '" title="复制来源链接" style="font-size:11px;padding:2px 8px">' +
-           '<svg width=11 height=11 viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:3px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
-           esc(label) +
-           '</button>';
+      h += citationChipHtml(c.url, label, false);
     });
     h += '</div>';
   }
@@ -454,8 +523,24 @@ function fetchSummary(url, onDone, tries) {
   }).catch(function (e) { onDone({ ok: false, error: String(e) }); });
 }
 
+// 261024-02 #2：引用 chip 拆成两个动作 —— 点 chip 本体 = 用系统浏览器打开；点右侧「复制」= 复制链接。
+function citationChipHtml(url, label, small) {
+  var fs = small ? 'font-size:10.5px;padding:1px 7px' : 'font-size:11px;padding:2px 8px';
+  return '<span class="cite-chip" style="display:inline-flex;align-items:center;gap:0;' + fs + '">' +
+         '<button class="btn chip-open" data-url="' + esc(url) + '" title="在系统浏览器打开：' + esc(url) + '" ' +
+         'style="' + fs + ';border-top-right-radius:0;border-bottom-right-radius:0">' +
+         '<svg width=11 height=11 viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:4px">' +
+         '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6"/><path d="M10 14L21 3"/></svg>' +
+         esc(label) + '</button>' +
+         '<button class="btn chip-copy" data-url="' + esc(url) + '" title="复制链接" ' +
+         'style="' + fs + ';border-top-left-radius:0;border-bottom-left-radius:0;border-left:0">复制</button>' +
+         '</span>';
+}
 function bindCopyChips(container) {
   if (!container) return;
+  Array.prototype.forEach.call(container.querySelectorAll('.chip-open'), function (btn) {
+    btn.onclick = function (ev) { ev.stopPropagation(); openExternal(btn.dataset.url); };
+  });
   Array.prototype.forEach.call(container.querySelectorAll('.chip-copy'), function (btn) {
     btn.onclick = function (ev) {
       ev.stopPropagation();
@@ -484,8 +569,13 @@ function openAlbum(k) {
     var sub = [];
     if (j.artist) sub.push(esc(j.artist));
     if (j.year) sub.push(j.year);
+    // 261024-02 #3：总时长 = 本地曲目时长之和（后端 /api/lib/album 的 dur 就是 Σ 本地曲目），
+    // 用 1:05:24 形式；AI 不再参与时长计算。
+    var localTotal = 0;
+    (j.tracks || []).forEach(function (t) { localTotal += (t.dur || 0); });
+    if (!localTotal) localTotal = j.dur || 0;
     sub.push(j.tracks.length + ' 首');
-    sub.push(fmt(j.dur));
+    sub.push(fmtDurLong(localTotal));
     var h = '<div class=ahead><div class=cv style="' + cv + '"></div><div class=info>' +
             '<div class=kind>ALBUM</div><h1>' + esc(j.name) + '</h1>' +
             '<div class=sub>' + sub.join(' \u00b7 ') + '</div>' +
@@ -496,7 +586,11 @@ function openAlbum(k) {
 
     // 2026-10-23（UI 评审 #2）：曲目列表必须在首屏可见 —— 以前简介（有时是很长的维基消歧义文）
     // 排在曲目之前，1024 下用户一首歌都看不到。现在先曲目、后简介。
+    // 261024-02 #3：这张表就是**本地曲库的曲目列表**（行数 = 本地曲目数、逐行「曲名 + 时长」），
+    // 加一行表头把"几首 / 总时长"讲清楚，避免和 AI 资料里的「时长」打架。
     h += '<div style="padding:4px 0 24px">';
+    h += '<div class="trlist-head"><span class=lb>曲目列表</span><span class=sp></span>' +
+         '<span class=sum>' + j.tracks.length + ' 首 · 总时长 ' + fmtDurLong(localTotal) + '</span></div>';
     j.tracks.forEach(function (t, i) {
       var isFav = FAV_SET.has(t.path);
       h += '<div class="trow trow-track" data-i=' + i + ' style="grid-template-columns:28px 24px minmax(120px,1fr) minmax(0,1fr) 58px;gap:8px">' +
@@ -504,7 +598,7 @@ function openAlbum(k) {
            favIconHtml(t.path, isFav) +
            '<div class=tt title="' + esc(t.title) + '">' + esc(t.title) + '</div>' +
            '<div class=ar>' + esc(t.artist || j.artist) + '</div>' +
-           '<div class=du>' + fmt(t.dur) + '</div>' +
+           '<div class=du>' + fmtDurLong(t.dur) + '</div>' +
            '</div>';
     });
     h += '</div>';
@@ -526,7 +620,9 @@ function openAlbum(k) {
           var el = D('albumSummary');
           if (!el || el.dataset.k !== albK) return;   // 异步回来时已切到别的专辑 → 丢弃
           // 261024-01 #4：后端现在回结构化 fields（可能没有 sections）⟹ 判据用"能渲染出东西"
-          var albHtml = s ? renderSummaryContent(s, 'AI 整理', 'release') : '';
+          // #3：本地曲库是时长的唯一真相源；AI 的「时长」「曲目列表」一律不采信
+          var albOpts = { local: { '时长': fmtDurLong(localTotal) }, drop: { '曲目列表': 1 } };
+          var albHtml = s ? renderSummaryContent(s, 'AI 整理', 'release', albOpts) : '';
           if (albHtml) {
             el.style.display = '';
             el.innerHTML = albHtml;
@@ -795,10 +891,7 @@ function renderArtistProfile(who, j, summary) {
            '<span class=badge>' + esc(srcName) + '</span>' +
            '<span style="font-weight:600;font-size:12.5px;color:var(--txt)">' + esc(m.title) + '</span>' +
            '<span style="font-size:11.5px;color:var(--mut2);margin-right:auto">' + (fDate ? ('取回于 ' + fDate) : '') + '</span>' +
-           '<button class="btn chip-copy" data-url="' + esc(m.url) + '" title="复制来源链接">' +
-             '<svg width=12 height=12 viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:4px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
-             '复制链接' +
-           '</button>' +
+           citationChipHtml(m.url, '复制链接', false) +
            '</div>';
     });
     h += '</div></div>';
@@ -2082,9 +2175,7 @@ if (D('npVol')) {
 D('npSeek').onclick = function (ev) {
   if (!S.dur) return;
   var r = this.getBoundingClientRect();
-  var f = (ev.clientX - r.left) / Math.max(1, r.width);
-  f = Math.max(0, Math.min(0.9999, f));
-  api('/api/seek?pos=' + f.toFixed(4), '');
+  doSeek((ev.clientX - r.left) / Math.max(1, r.width));
 };
 D('tq').onclick = function () {
   S.queueHidden = !S.queueHidden;
@@ -2155,9 +2246,7 @@ D('mclose').onclick = function () { D('modal').classList.remove('on'); };
 D('modal').onclick = function (e) { if (e.target === D('modal')) D('modal').classList.remove('on'); };
 D('seek').onclick = function (e) {
   var r = this.getBoundingClientRect();
-  var f = (e.clientX - r.left) / r.width;
-  if (f < 0) f = 0; if (f > 1) f = 1;
-  api('/api/seek?pos=' + f.toFixed(4), '');
+  doSeek((e.clientX - r.left) / r.width);
 };
 D('bScan').onclick = function () {
   api('/api/lib/scan', '').then(function () { toast('开始扫描音乐库'); loadLibStats(); });
@@ -2175,11 +2264,18 @@ D('bAddRoot').onclick = function () {
   });
 };
 
+// 261024-02 #4：seek 统一走这里 —— 发完请求立刻清掉歌词的手动滚动保护并重定位，
+// 不等下一次 400ms tick（否则跳转后歌词要"愣一下"才跟上）。
+function doSeek(frac) {
+  var f = Math.max(0, Math.min(0.9999, frac));
+  api('/api/seek?pos=' + f.toFixed(4), '');
+  lyricReposition();
+  if (D('npPage') && D('npPage').classList.contains('on')) renderNpLyric();
+  if (RTAB === 'l') syncLyrics(f * (S.dur || 0));
+}
 function seekRel(d) {
   if (!S.dur || S.dur <= 0) return;
-  var f = (S.pos + d) / S.dur;
-  if (f < 0) f = 0; if (f > 0.9999) f = 0.9999;
-  api('/api/seek?pos=' + f.toFixed(4), '');
+  doSeek((S.pos + d) / S.dur);
 }
 function setVol(v) {
   S.vol = v;
@@ -2209,34 +2305,71 @@ Array.prototype.forEach.call(document.querySelectorAll('.rtab'), function (e) {
 });
 
 /* ---------------- 歌词（LRC）---------------- */
-var LY = { lines: [], at: -1, raw: '' };
+// 261024-02 #4：歌词滚动"全错"的根因有三处，一起重做 ——
+//   ① parseLrc 不支持 [offset:±ms]，且把 [00:44.26] 的百分秒/毫秒换算只做了长度判断；
+//   ② 滚动用 el.offsetTop 计算，但 offsetParent 不是滚动容器（.nplyric2 无 position），
+//      offsetTop 带着整页偏移 ⟹ scrollTop 被算到一个荒唐的位置（这就是"全错"）；
+//   ③ 纯文本歌词（t=-1）也被当成有轴歌词，pos 一到就把高亮钉在最后一行。
+// 现在：时间戳解析走标准 LRC（[mm:ss] / [mm:ss.x] / [mm:ss.xx] / [mm:ss.xxx] / [mm:ss:xx]、一行多时间戳、
+// [offset:±ms]）；滚动一律用 getBoundingClientRect 相对滚动容器算目标位置（与 offsetParent 无关）。
+var LY = { lines: [], at: -1, raw: '', timed: false, lastPos: -1 };
+var LYMAN = { until: 0 };            // 手动滚动保护：这段时间内不自动抢滚动
+function lyricManual() { LYMAN.until = Date.now() + 3000; }
+function lyricTimed() { return !!(LY.lines.length && LY.lines[0].t >= 0); }
 function parseLrc(s) {
   var out = [];
   if (!s) return out;
-  var rows = String(s).split(/\r?\n/);
+  var rows = String(s).replace(/\r/g, '').split('\n');
+  // [offset:±ms]：LRC 规范，正值表示歌词整体**提前**（时间戳减掉）
+  var offsetMs = 0;
   for (var i = 0; i < rows.length; i++) {
-    var m = rows[i].match(/\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]/g);
-    if (!m) continue;
-    var text = rows[i].replace(/\[[^\]]*\]/g, '').trim();
-    if (!text) continue;
-    for (var k = 0; k < m.length; k++) {
-      var t = m[k].match(/\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]/);
-      var mm = parseInt(t[1], 10), ss = parseInt(t[2], 10), xx = t[3] ? parseInt(t[3], 10) : 0;
-      if (t[3] && t[3].length === 2) xx *= 10;
-      if (t[3] && t[3].length === 1) xx *= 100;
-      out.push({ t: mm * 60 + ss + xx / 1000, s: text });
+    var om = rows[i].match(/^\s*\[offset:\s*([+-]?\d+)\s*\]/i);
+    if (om) offsetMs = parseInt(om[1], 10) || 0;
+  }
+  var STAMP = /\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]/g;
+  var timed = false;
+  for (var r = 0; r < rows.length; r++) {
+    var row = rows[r], stamps = [], m;
+    STAMP.lastIndex = 0;
+    while ((m = STAMP.exec(row))) {
+      var mm = parseInt(m[1], 10), ss = parseInt(m[2], 10);
+      var frac = m[3] ? parseInt(m[3], 10) : 0, ms = frac;
+      if (m[3] && m[3].length === 1) ms = frac * 100;        // [mm:ss.x]  → 十分之一秒
+      else if (m[3] && m[3].length === 2) ms = frac * 10;    // [mm:ss.xx] → 百分之一秒
+      // 三位就是毫秒（ms = frac）
+      stamps.push(mm * 60 + ss + ms / 1000);
+    }
+    var text = row.replace(/\[[^\]]*\]/g, '').trim();
+    if (!stamps.length || !text) continue;   // [ti:]/[ar:]/[by:] 元信息行与空行跳过
+    timed = true;
+    for (var k = 0; k < stamps.length; k++) {
+      out.push({ t: Math.max(0, stamps[k] - offsetMs / 1000), s: text });
     }
   }
   out.sort(function (a, b) { return a.t - b.t; });
-  // 纯文本歌词（没有时间轴）也接受
-  if (!out.length) {
-    rows.forEach(function (r) {
-      r = r.trim();
-      if (r && r.charAt(0) !== '[') out.push({ t: -1, s: r });
+  if (!timed) {
+    // 纯文本歌词（没有时间轴）：保留行，但 t=-1 ⟹ 不自动滚动、不高亮（见 renderNpLyric）
+    rows.forEach(function (x) {
+      x = x.trim();
+      if (!x || /^\[[a-z]+:/i.test(x)) return;
+      out.push({ t: -1, s: x });
     });
   }
   return out;
 }
+// 把某一行滚到滚动容器垂直居中（rect 相减，跟 offsetParent 无关；smooth 由浏览器做过渡）
+function lyricScrollTo(box, el, smooth) {
+  if (!box || !el) return;
+  var br = box.getBoundingClientRect(), er = el.getBoundingClientRect();
+  var target = box.scrollTop + (er.top - br.top) - (box.clientHeight - er.height) / 2;
+  var max = Math.max(0, box.scrollHeight - box.clientHeight);
+  target = Math.max(0, Math.min(target, max));
+  if (Math.abs(target - box.scrollTop) < 2) return;
+  try { box.scrollTo({ top: target, behavior: smooth ? 'smooth' : 'auto' }); }
+  catch (e) { box.scrollTop = target; }
+}
+// seek / 切歌：解除手动保护并允许立刻重定位
+function lyricReposition() { LYMAN.until = 0; LY.lastPos = -1; LY.at = -1; }
 // 2026-10-23 用户反馈「歌词要等约 10 秒才出现」：
 // 根因是时序 —— 播放开始时后端才在后台线程触发元数据/歌词补全（meta_on_play），
 // 而这里的 loadLyrics 只请求**一次**：补全还没写回 metabase 时拿到空结果，之后永不重试，
@@ -2253,7 +2386,9 @@ function loadLyrics(file, isRetry) {
   }
   api('/api/lyrics?file=' + encodeURIComponent(file)).then(function (j) {
     LY.lines = j.ok ? parseLrc(j.lrc) : [];
-    LY.at = -1;
+    LY.raw = (j && j.lrc) || '';
+    LY.timed = lyricTimed();
+    LY.at = -1; LY.lastPos = -1; LYMAN.until = 0;   // 换歌：清掉上一首的高亮/手动保护
     D('lyricbox').innerHTML = LY.lines.length
       ? LY.lines.map(function (l, i) {
           return '<div class="ly" data-i="' + i + '">' + esc(l.s) + '</div>';
@@ -2275,28 +2410,28 @@ function loadLyrics(file, isRetry) {
       if (e.dataset.i === undefined) return;
       e.onclick = function () {
         var l = LY.lines[+e.dataset.i];
-        if (l.t >= 0 && S.dur > 0) api('/api/seek?pos=' + (l.t / S.dur).toFixed(4), '');
+        if (l.t >= 0 && S.dur > 0) doSeek(l.t / S.dur);
       };
     });
     syncLyrics(S.pos);
     if (D('npPage') && D('npPage').classList.contains('on')) renderNpLyric();
   }).catch(function () { D('lyricbox').innerHTML = '<div class="ly none">歌词加载失败</div>'; });
 }
+// 右栏歌词（#lyricbox）：与整页歌词共用同一套解析/居中逻辑（261024-02 #4）
 function syncLyrics(pos) {
-  if (!LY.lines.length || LY.lines[0].t < 0) return;
+  if (!lyricTimed()) return;
   var idx = -1;
   for (var i = 0; i < LY.lines.length; i++) { if (LY.lines[i].t <= pos + 0.05) idx = i; else break; }
   if (idx === LY.at) return;
   LY.at = idx;
-  Array.prototype.forEach.call(D('lyricbox').children, function (e, i) {
+  var box = D('lyricbox');
+  if (!box) return;
+  Array.prototype.forEach.call(box.children, function (e, i) {
     if (e.dataset.i === undefined) return;
     e.classList.toggle('on', i === idx);
   });
-  var el = D('lyricbox').children[idx];
-  if (el && RTAB === 'l') {
-    var box = D('lyricbox');
-    box.scrollTop = el.offsetTop - box.clientHeight / 2 + el.clientHeight / 2;
-  }
+  var el = box.children[idx];
+  if (el && RTAB === 'l' && Date.now() >= LYMAN.until) lyricScrollTo(box, el, true);
 }
 
 /* ---------------- 播放列表（UI 已并入播放队列） ---------------- */
@@ -2764,23 +2899,6 @@ function updateCastStateUi(st) {
   }
 }
 
-function pollCastState() {
-  clearTimeout(_castPollTimer);
-  var outPane = document.querySelector('#setpage .spane[data-g=out]');
-  var isTabOn = outPane && outPane.classList.contains('on');
-  var isSetOpen = D('setpage') && D('setpage').classList.contains('on');
-
-  api('/api/cast/state').then(function (st) {
-    updateCastStateUi(st);
-    if ((isSetOpen && isTabOn) || (st && st.running)) {
-      _castPollTimer = setTimeout(pollCastState, 1000);
-    }
-  }).catch(function () {
-    if (isSetOpen && isTabOn) {
-      _castPollTimer = setTimeout(pollCastState, 1500);
-    }
-  });
-}
 
 // 261024-01 #9：两个渲染器下拉（「输出后端」里的 sp_upnp_dev 与「投放」区块里的
 // sp_cast_dev）共用同一份发现结果与同一个选择。value 一律用设备描述 URL ——
@@ -2935,102 +3053,179 @@ function applyBackendState() {
   // NAA 下"输出设备"没有意义（声音走 RTANet），但采样率/位深/声道/缓冲仍影响 DSP 输出，保留。
   _setFieldVisible('sp_device', bk !== 'naa' && bk !== 'upnp');
   var tw = D('sp_trimwrap'); if (tw) tw.style.display = (bk === 'upnp') ? 'none' : '';
-  // 「投放」快捷区块：后端 = UPnP 时不再重复一个渲染器下拉（上面已有），只留一句说明
-  var cdw = D('sp_cast_devwrap'); if (cdw) cdw.style.display = (bk === 'upnp') ? 'none' : '';
-  var csr = D('sp_cast_scanrow'); if (csr) csr.style.display = (bk === 'upnp') ? 'none' : '';
-  var cub = D('sp_cast_usebk'); if (cub) cub.style.display = (bk === 'upnp') ? '' : 'none';
+  // 261024-02 #5：投放区块已整体搬到「流媒体」页（输出页不再有它），这里不再联动隐藏。
 }
 
+// 261024-02 #5：推送区块的控件绑定（旧版"填文件路径 + DoP 勾选 + 开始投放"已按用户要求删掉，
+// 换成 QQ 音乐式的一键推送：选设备 → 推送当前曲 / 停止投放）。
 function initCastControls() {
   var devSel = D('sp_cast_dev');
-  var dopChk = D('sp_cast_dop');
   var btnScan = D('sp_cast_scan');
-  var btnUseCur = D('sp_cast_usecur');
-  var btnStart = D('sp_cast_start');
+  var btnPush = D('sp_cast_push');
   var btnStop = D('sp_cast_stop');
 
   if (devSel) {
     devSel.onchange = function () {
-      var d = _castDevices.find(function(x) { return (x.friendlyName || x.name || x.host) === devSel.value; });
-      if (d) {
-        var msg = D('sp_cast_devmsg');
-        if (msg) msg.textContent = (d.model ? ('型号: ' + d.model + ' · ') : '') + (d.hasAVTransport ? '支持 AVTransport' : '未知传输服务');
+      var v = devSel.value || '';
+      syncUpnpDev(v);
+      var d = null;
+      for (var i = 0; i < _castDevices.length; i++) if (castDevValue(_castDevices[i]) === v) d = _castDevices[i];
+      var msg = D('sp_cast_devmsg');
+      if (msg) {
+        msg.textContent = d ? ((d.model ? ('型号: ' + d.model + ' · ') : '') + (d.hasAVTransport ? '支持 AVTransport' : '未知传输服务'))
+                            : (v ? ('已选择：' + v) : '点「重新发现」扫描局域网里的 MediaRenderer');
       }
     };
   }
-  if (dopChk) {
-    dopChk.onchange = function () {
-      // DoP 开关状态切换
+  if (btnScan) btnScan.onclick = function () { scanCastDevices(true); };
+  if (btnPush) {
+    btnPush.onclick = function () {
+      if (D('sp_cast_msg')) D('sp_cast_msg').textContent = '';
+      // 下拉里选的设备优先（用户可能刚换了一台），否则用已保存的
+      if (devSel && devSel.value && devSel.value !== ADV.upnpDev) syncUpnpDev(devSel.value);
+      castPush(S.lastCur);
     };
   }
-  if (D('sp_cast_file')) {
-    D('sp_cast_file').oninput = function () {
-      // 用户输入音频路径
-    };
-  }
-  if (btnScan) {
-    btnScan.onclick = function () {
-      scanCastDevices(true);
-    };
-  }
-  if (btnUseCur) {
-    btnUseCur.onclick = function () {
-      api('/api/status').then(function (j) {
-        // /api/status 的字段名是 current（旧代码写成 j.cur，点这个按钮永远提示"没有正在播放的文件"）
-        if (j && j.current) {
-          var f = D('sp_cast_file');
-          if (f) f.value = j.current;
-          toast('已填入当前播放文件');
-        } else {
-          toast('当前没有正在播放的文件');
-        }
-      }).catch(function () {
-        toast('获取当前曲目失败');
-      });
-    };
-  }
-  if (btnStart) {
-    btnStart.onclick = function () {
-      var file = D('sp_cast_file') ? D('sp_cast_file').value.trim() : '';
-      if (!file) {
-        toast('请先填入源音频文件路径');
-        return;
-      }
-      var dev = devSel ? devSel.value : '';
-      var dop = (dopChk && dopChk.checked) ? 1 : 0;
-      btnStart.disabled = true;
-      if (D('sp_cast_msg')) D('sp_cast_msg').textContent = '正在启动投放…';
+  if (btnStop) btnStop.onclick = function () { castStop(); };
+}
 
-      var body = 'dev=' + encodeURIComponent(dev) +
-                 '&file=' + encodeURIComponent(file) +
-                 '&port=8912&dop=' + dop;
-      api('/api/cast/start', body).then(function (j) {
-        if (!j.ok) {
-          toast(j.error || '投放启动失败');
-          if (D('sp_cast_msg')) D('sp_cast_msg').textContent = j.error || '投放启动失败';
-          btnStart.disabled = false;
-        } else {
-          toast('投放已启动');
-          if (D('sp_cast_msg')) D('sp_cast_msg').textContent = '';
-          pollCastState();
-        }
-      }).catch(function (e) {
-        toast('请求失败');
-        btnStart.disabled = false;
-      });
-    };
+/* ---------------- 261024-02 #5：一键推送到 UPnP（学 QQ 音乐） ----------------
+   用户原话：「你应该学习的是 QQ 音乐的逻辑，单曲播放页面下有一个将本曲一键推送到 UPNP 的按钮，
+   然后所有播放都走 UPNP。」「输出栏位下的 UPNP 投放功能多余。」
+   设计：
+     * 单一真相源 = /api/cast/state（后端 CastManager）。三处 UI（单曲页按钮 / 底栏徽标 /
+       流媒体页推送区块）全部由 applyCastUi(st) 从同一份状态刷新，不各存一份。
+     * 推送 = ADV.backend='upnp' + ADV.upnpDev=<描述URL> 落盘，然后按新参数重放当前曲目
+       ⟹ 之后的切歌/暂停/seek 全部由后端路由到同一条投放会话（"所有播放都走 UPNP"）。
+     * 再点一次 = 停止投放 + 回到推送前的输出后端（默认 wasapi），并恢复本地播放。
+       （刻意记 prevBackend 而不是硬编码 wasapi：测试实例是 null，硬编码会把安全设置冲掉。） */
+var CAST = { state: null, prevBackend: '' };
+function castRunning() { return !!(CAST.state && CAST.state.running); }
+function castDevNameOf(loc) {
+  loc = String(loc || '');
+  for (var i = 0; i < _castDevices.length; i++) {
+    if (castDevValue(_castDevices[i]) === loc) return castDevLabel(_castDevices[i]);
   }
-  if (btnStop) {
-    btnStop.onclick = function () {
-      btnStop.disabled = true;
-      api('/api/cast/stop', '').then(function (j) {
-        toast('投放已停止');
-        pollCastState();
-      }).catch(function () {
-        btnStop.disabled = false;
-      });
-    };
+  var m = /^https?:\/\/([^/:]+)/i.exec(loc);
+  return m ? m[1] : (loc || '设备');
+}
+function castIconSvg() {
+  return '<svg width=12 height=12 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width="2" ' +
+         'style="vertical-align:-1px;margin-right:4px"><path d="M2 16.1A5 5 0 0 1 5.9 20"/><path d="M2 12.05A9 9 0 0 1 9.95 20"/>' +
+         '<path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><path d="M2 20h.01"/></svg>';
+}
+// 三处 UI 的唯一刷新入口
+function applyCastUi(st) {
+  if (st && typeof st.running === 'boolean') CAST.state = st;
+  st = CAST.state || {};
+  var running = !!st.running;
+  var nm = castDevNameOf(st.device);
+  var nb = D('npCastBtn');
+  if (nb) {
+    nb.innerHTML = castIconSvg() + (running ? ('已推送到 ' + esc(nm)) : '推送到设备');
+    nb.classList.toggle('on', running);
+    nb.title = running ? ('点击停止投放并恢复本机输出（阶段：' + (st.phase || '-') + '）')
+                       : '把当前曲目推送到 UPnP / DLNA 设备，之后所有播放都走它';
   }
+  var badge = D('castBadge');
+  if (badge) {
+    badge.style.display = running ? 'inline-flex' : 'none';
+    badge.title = running ? ('正在投放到 ' + nm) : '';
+  }
+  var push = D('sp_cast_push'), stop = D('sp_cast_stop');
+  if (push) { push.textContent = running ? '重新推送当前曲' : '推送当前曲'; }
+  if (stop) stop.disabled = !running;
+  updateCastStateUi(st);
+}
+function pollCastState(once) {
+  clearTimeout(_castPollTimer);
+  var outPane = document.querySelector('#setpage .spane[data-g=out]');
+  var streamPane = document.querySelector('#setpage .spane[data-g=stream]');
+  var wantLoop = (streamPane && streamPane.classList.contains('on') && D('setpage') && D('setpage').classList.contains('on'))
+              || (outPane && outPane.classList.contains('on') && D('setpage') && D('setpage').classList.contains('on'))
+              || (D('npPage') && D('npPage').classList.contains('on'))
+              || (CAST.state && CAST.state.running);
+  api('/api/cast/state').then(function (st) {
+    applyCastUi(st);
+    if (!once && wantLoop) _castPollTimer = setTimeout(function () { pollCastState(); }, 1000);
+  }).catch(function () {
+    if (!once && wantLoop) _castPollTimer = setTimeout(function () { pollCastState(); }, 1500);
+  });
+}
+function openModal(title, html) {
+  var m = D('modal'); if (!m) return;
+  D('mtitle').textContent = title;
+  D('mbody').innerHTML = html;
+  m.classList.add('on');
+}
+// 未选设备时的设备选择浮层
+function npPickCastDevice(cb) {
+  api('/api/cast/devices?scan=1').then(function (j) {
+    _castDevices = (j && j.devices) || [];
+    populateCastDevices();
+    if (!_castDevices.length) {
+      toast('未发现 UPnP / DLNA 渲染器（确认数播已开启 DLNA 且与本机同网段）');
+      cb(null);
+      return;
+    }
+    var h = '<div class=castpick>';
+    _castDevices.forEach(function (d, i) {
+      h += '<button class=castpick-row data-i=' + i + '>' +
+           '<span class=cpn>' + esc(d.friendlyName || d.name || d.host) + '</span>' +
+           '<span class=cph>' + esc((d.model ? d.model + ' · ' : '') + (d.host || '')) + '</span></button>';
+    });
+    h += '</div><div class=hint style="margin-top:10px">选中后会把当前曲目推送到该设备，之后的切歌/暂停/进度都作用在它上面。</div>';
+    openModal('推送到设备', h);
+    Array.prototype.forEach.call(D('mbody').querySelectorAll('.castpick-row'), function (b) {
+      b.onclick = function () {
+        var d = _castDevices[+b.dataset.i];
+        D('modal').classList.remove('on');
+        cb(castDevValue(d));
+      };
+    });
+  }).catch(function () { toast('设备发现失败（/api/cast/devices 无响应）'); cb(null); });
+}
+// 推送：落盘 backend=upnp + upnpdev，再按新参数重放当前曲
+function castPush(file) {
+  file = file || S.lastCur || '';
+  if (!file) { toast('当前没有可推送的曲目'); return; }
+  if (/^https?:/i.test(file)) { toast('网络曲目暂不支持投放'); return; }
+  var go = function (dev) {
+    if (!dev) return;
+    CAST.prevBackend = (ADV.backend && ADV.backend !== 'upnp') ? ADV.backend : (CAST.prevBackend || 'wasapi');
+    ADV.backend = 'upnp';
+    ADV.upnpDev = dev;
+    saveSettings();
+    playPath(file);
+    toast('已推送到 ' + castDevNameOf(dev));
+    pollCastState(true);
+  };
+  var dev = (ADV.upnpDev || '').trim();
+  if (dev) go(dev);
+  else npPickCastDevice(function (d) { if (d) go(d); });
+}
+// 停止：停会话 → 回到推送前的输出后端 → 恢复本地播放
+function castStop() {
+  api('/api/cast/stop', '').then(function () {
+    var back = CAST.prevBackend || 'wasapi';
+    if (back === 'upnp') back = 'wasapi';
+    ADV.backend = back;
+    saveSettings();
+    toast('已停止投放，输出回到 ' + back);
+    if (S.lastCur) playPath(S.lastCur);
+    pollCastState(true);
+  }).catch(function () { toast('停止投放失败'); });
+}
+function castToggle() {
+  if (castRunning()) castStop();
+  else castPush(S.lastCur);
+}
+function npCastBtnHtml() {
+  var running = castRunning();
+  return '<button class="chip npcast' + (running ? ' on' : '') + '" id=npCastBtn title="' +
+         (running ? '点击停止投放并恢复本机输出' : '把当前曲目推送到 UPnP / DLNA 设备') + '">' +
+         castIconSvg() + (running ? ('已推送到 ' + esc(castDevNameOf((CAST.state || {}).device))) : '推送到设备') +
+         '</button>';
 }
 
 /* ---------------- 输出模式 / DSD 比特率 / 封装 ---------------- */
@@ -3279,50 +3474,10 @@ function renderSettingsPage() {
      + '<div id=sp_trimwrap>' + sgroup('声道音量微调', '按声道名标注，0 dB = 不动',
          '<div class="sfld wide"><div class=trimgrid>'+ trimFields(CH) + '</div>' +
          '<div class=hint>显示的是「输出声道数」对应的实际声道。2 = 左/右；5.1 = 左/右/中置/低音/左环绕/右环绕；7.1 再加左后/右后</div></div>') + '</div>'
-     + sgroup('投放（UPnP）', '快捷入口：单独推送某个文件；与「输出后端 = UPnP」共用同一条会话',
-         // 2026-10-23 用户 261023-04 #12：渲染器名字常常很长（friendlyName + 型号），
-         // 放在 260px 的小格里会被截断得只剩几个字；改成整行、下拉铺满宽度。
-         '<div class="sfld wide" id=sp_cast_devwrap><label>目标渲染器</label>'
-       + '<select id=sp_cast_dev style="width:100%"><option value="">（未发现 UPnP 渲染器）</option></select>'
-       + '<div class=hint>与「输出后端」里的目标渲染器同步（同一个选择）</div></div>'
-       // 后端 = UPnP 时上面已有目标渲染器，这里只留一句说明，避免同一页出现两个一模一样的下拉
-       + '<div class="sfld wide" id=sp_cast_usebk style="display:none"><div class=hint>使用上方「输出后端」所选渲染器（同一选择、同一条会话）</div></div>'
-       + '<div class="sfld" id=sp_cast_scanrow style="display:flex;align-items:flex-end">'
-       + '<button class=btn id=sp_cast_scan>重新扫描</button>'
-       + '<span id=sp_cast_devmsg class=hint style="margin-left:10px;line-height:30px"></span>'
-       + '</div>'
-       + '<div class="sfld wide"><label>源音频文件</label>'
-       + '<div style="display:flex;gap:8px">'
-       + '<input type=text id=sp_cast_file placeholder="输入音频文件绝对路径（如 D:\\Music\\test.wav）" style="flex:1">'
-       + '<button class=btn id=sp_cast_usecur style="white-space:nowrap">用当前播放文件</button>'
-       + '</div>'
-       + '<div class=hint id=sp_cast_filehint>支持 WAV、FLAC、DSF/DFF 等本地音频格式</div>'
-       + '</div>'
-       + chk('sp_cast_dop', 'DoP 打包（DSD 源必须勾选）', false,
-             'DSD 素材（.dsf / .dff）打包为 DoP v1.1 24-bit WAV 供源；若未勾选遇 DSD 源，后端为保证音质将明确拒绝（铁律 3）')
-       + '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;margin-top:6px">'
-       + '<button class="btn pri" id=sp_cast_start>开始投放</button>'
-       + '<button class=btn id=sp_cast_stop disabled>停止投放</button>'
-       + '<span id=sp_cast_msg class=hint style="margin:0"></span>'
-       + '</div>')
-     // 2026-10-23 用户 261023-04 #12：状态网格必须跨满整张卡片（.sfld.wide），
-     // 否则外层 .sgbody 的 auto-fill 网格把它压进单个 260px 单元 → 内层只剩 1 列，指标竖排成长条。
-     + sgroup('投放实时状态', '1 秒自动轮询',
-         '<div class="sfld wide in-stat-grid">'
-       + '<div class=in-stat-item><span class=lbl>运行阶段</span><span class=val id=sp_cast_stat_phase>已停止</span></div>'
-       + '<div class=in-stat-item><span class=lbl>目标渲染器</span><span class="val sm" id=sp_cast_stat_dev>-</span></div>'
-       + '<div class=in-stat-item><span class=lbl>播放进度</span><span class=val id=sp_cast_stat_pos>0:00</span></div>'
-       + '<div class=in-stat-item><span class=lbl>传输状态</span><span class=val id=sp_cast_stat_transport>STOPPED</span></div>'
-       + '<div class=in-stat-item><span class=lbl>供源传输字节</span><span class=val id=sp_cast_stat_bytes>0 B</span></div>'
-       + '<div class=in-stat-item><span class=lbl>供源请求数</span><span class=val id=sp_cast_stat_reqs>0 次</span></div>'
-       + '<div class=in-stat-item><span class=lbl>供源端口</span><span class=val id=sp_cast_stat_port>8912</span></div>'
-       + '<div class=in-stat-item><span class=lbl>采样率取证</span><span class=val id=sp_cast_stat_ratematch>未取证</span></div>'
-       + '<div class=in-stat-item id=sp_cast_stat_warn_box style="grid-column:1/-1;display:none;color:var(--warn, #eab308)">'
-       + '<span class=lbl style="color:var(--warn, #eab308)">采样率告警</span><span class=val id=sp_cast_stat_warn></span></div>'
-       + '<div class=in-stat-item id=sp_cast_stat_err_box style="grid-column:1/-1;display:none;color:var(--err)">'
-       + '<span class=lbl style="color:var(--err)">错误信息</span><span class=val id=sp_cast_stat_err></span></div>'
-       + '</div>')
      + '</div>';
+     // 261024-02 #5：用户明确要求「输出栏位下的 UPnP 投放功能多余」⟹ 整块删除
+     // （原「投放（UPnP）」快捷区 + 「投放实时状态」网格）。投放的入口统一挪到
+     // 单曲页「推送到设备」按钮与设置→流媒体页的「推送到设备」区块，三处共用 /api/cast/state。
 
   // ---------- PCM ----------
   h += '<div class=spane data-g=pcm>'
@@ -3497,10 +3652,32 @@ function renderSettingsPage() {
        + '<button class=btn id=sp_src_cancel>取消</button>'
        + '<span class=hint id=sp_src_fmsg style="margin:0"></span></div>'
        + '</div></div>')
-     + sgroup('DLNA / UPnP 设备发现', '发现局域网里可投放的播放器（MediaRenderer）',
-         '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
-       + '<button class=btn id=sp_upnp>发现 DLNA 设备</button>'
-       + '<span class=hint id=sp_upnpmsg style="margin:0"></span></div>')
+     // 261024-02 #5：用户原话「你现在只有一个发现DLNA设备按钮，但是没有推送上去的按钮，导致无法测试」
+     // ⟹ 这里从"只发现"升级为完整推送区：设备下拉 + 推送当前曲 / 停止投放 + 实时状态。
+     // 状态与单曲页按钮、底栏徽标同源（/api/cast/state，1 秒轮询）。
+     + sgroup('推送到设备（UPnP / DLNA）', '一键把当前曲目推送到局域网渲染器；之后的切歌 / 暂停 / 进度都作用在它上面',
+         '<div class="sfld wide" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">'
+       + '<select id=sp_cast_dev style="flex:1;min-width:220px"><option value="">（未发现 UPnP 渲染器）</option></select>'
+       + '<button class=btn id=sp_cast_scan style="white-space:nowrap">重新发现</button></div>'
+       + '<div class="sfld wide"><div class=hint id=sp_cast_devmsg>点「重新发现」扫描局域网里的 MediaRenderer</div></div>'
+       + '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:2px">'
+       + '<button class="btn pri" id=sp_cast_push>推送当前曲</button>'
+       + '<button class=btn id=sp_cast_stop disabled>停止投放</button>'
+       + '<span id=sp_cast_msg class=hint style="margin:0"></span></div>'
+       + '<div class="sfld wide in-stat-grid" style="margin-top:6px">'
+       + '<div class=in-stat-item><span class=lbl>运行阶段</span><span class=val id=sp_cast_stat_phase>已停止</span></div>'
+       + '<div class=in-stat-item><span class=lbl>目标渲染器</span><span class="val sm" id=sp_cast_stat_dev>-</span></div>'
+       + '<div class=in-stat-item><span class=lbl>播放进度</span><span class=val id=sp_cast_stat_pos>0:00</span></div>'
+       + '<div class=in-stat-item><span class=lbl>传输状态</span><span class=val id=sp_cast_stat_transport>STOPPED</span></div>'
+       + '<div class=in-stat-item><span class=lbl>供源传输字节</span><span class=val id=sp_cast_stat_bytes>0 B</span></div>'
+       + '<div class=in-stat-item><span class=lbl>供源请求数</span><span class=val id=sp_cast_stat_reqs>0 次</span></div>'
+       + '<div class=in-stat-item><span class=lbl>供源端口</span><span class=val id=sp_cast_stat_port>8912</span></div>'
+       + '<div class=in-stat-item><span class=lbl>采样率取证</span><span class=val id=sp_cast_stat_ratematch>未取证</span></div>'
+       + '<div class=in-stat-item id=sp_cast_stat_warn_box style="grid-column:1/-1;display:none;color:var(--warn, #eab308)">'
+       + '<span class=lbl style="color:var(--warn, #eab308)">采样率告警</span><span class=val id=sp_cast_stat_warn></span></div>'
+       + '<div class=in-stat-item id=sp_cast_stat_err_box style="grid-column:1/-1;display:none;color:var(--err)">'
+       + '<span class=lbl style="color:var(--err)">错误信息</span><span class=val id=sp_cast_stat_err></span></div>'
+       + '</div>')
      + '</div>';
 
   // ---------- 诊断（用户 2026-10-22 功能3：独立页签）----------
@@ -3624,11 +3801,13 @@ function renderSettingsPage() {
         pollInputState();
       } else if (b.dataset.g === 'out') {
         applyBackendState();
-        scanCastDevices(false);   // 「投放」区块的渲染器列表（同时同步「输出后端」里的目标渲染器）
+        // 只有"输出后端 = UPnP"时才需要渲染器列表（目标设备下拉在输出页里）
+        if (((D('sp_backend') && D('sp_backend').value) || 'wasapi') === 'upnp') scanCastDevices(false);
         if (((D('sp_backend') && D('sp_backend').value) || 'wasapi') === 'naa') discoverNaa(false);
-        pollCastState();
       } else if (b.dataset.g === 'stream') {
         loadSrcConfig();
+        scanCastDevices(false);   // 推送区块的设备列表
+        pollCastState();          // 推送区块的实时状态（与单曲页按钮同源）
       }
     };
   });
@@ -4580,6 +4759,7 @@ function openNowPlaying() {
   // 整页控件是底栏/设置页的镜像：进来时刷一次，绝不显示与底栏不同的值
   applyRep(D('sRep') ? D('sRep').value : 0);
   syncVolUi();
+  pollCastState(true);   // 261024-02 #5：进来就取一次投放状态（按钮文案/高亮由 applyCastUi 统一刷）
 }
 function closeNowPlaying() { var pg = D('npPage'); if (pg) pg.classList.remove('on'); }
 
@@ -4669,6 +4849,7 @@ function npDataReset() {
   var b = D('npDataBody'); if (b) b.innerHTML = '';
   var t = D('npTabs'); if (t) t.innerHTML = '';
   var s = D('npDataStat'); if (s) s.textContent = '';
+  NPPREF.key = '';    // 切歌：允许下一首重新预取（旧请求的结果由 key 守卫丢弃）
   npDrawerClose();
 }
 // 抽屉开关（#3b ③）：资料默认不占版面，点标签才从右侧滑出
@@ -4777,8 +4958,20 @@ function npDataSkeleton() {
 }
 function npDataSummaryBody(d, kind) {
   // 261024-01 #4：结构化 filters/fields → 标签值网格（renderSummaryContent 内部优先 fields）；
-  // 261024-01 #2：脚注只留「AI 整理」，删掉「未找到权威来源，仅供参考」「未核对 · 依据来源整理…」。
-  var h = renderSummaryContent(d || {}, '', kind || NP_DATA.active);
+  // 261024-01 #2：脚注只留「AI 整理」。
+  // 261024-02 #3：本地曲库数据优先（歌曲=文件真实时长；专辑=Σ本地曲目 + 逐行曲目列表）。
+  kind = kind || NP_DATA.active;
+  var opts = {};
+  if (d && d.__local) opts.local = d.__local;
+  if (kind === 'release' && d && d.__album) {
+    var trs = d.__album.tracks || [], tot = 0;
+    trs.forEach(function (t) { tot += (t.dur || 0); });
+    if (!tot) tot = d.__album.dur || 0;
+    opts.local = { '时长': fmtDurLong(tot) };
+    opts.tracklist = trs;
+    opts.drop = { '曲目列表': 1 };   // 用下面的对齐表格替代 AI 的一行文本
+  }
+  var h = renderSummaryContent(d || {}, '', kind, opts);
   if (!h) h = '<div class=npdhint>该实体暂无可用的 AI 整理资料。</div>';
   return h;
 }
@@ -4854,6 +5047,60 @@ function npDataRenderBody(force) {
   var rf = D('npDataRefresh');
   if (rf) rf.onclick = function () { npDataEnsure(kind, true); };
 }
+// 261024-02 #3：抽屉里的「专辑」标签也要用本地曲库真实曲目/总时长（AI 那份只补简介等文字字段）。
+var NPLIB = { key: '', album: null };
+function npLocalAlbum(name, artist, cb) {
+  var key = String(name || '') + '|' + String(artist || '');
+  if (NPLIB.key === key) { cb(NPLIB.album); return; }
+  api('/api/lib/albums?q=' + encodeURIComponent(name || '')).then(function (j) {
+    var list = (j && j.albums) || [], hit = null, i;
+    for (i = 0; i < list.length; i++) {
+      if (list[i].name === name && (!artist || !list[i].artist || list[i].artist === artist)) { hit = list[i]; break; }
+    }
+    if (!hit) for (i = 0; i < list.length; i++) { if (list[i].name === name) { hit = list[i]; break; } }
+    if (!hit) { NPLIB.key = key; NPLIB.album = null; cb(null); return; }
+    api('/api/lib/album?k=' + encodeURIComponent(hit.k)).then(function (a) {
+      NPLIB.key = key; NPLIB.album = (a && a.ok) ? a : null; cb(NPLIB.album);
+    }).catch(function () { cb(null); });
+  }).catch(function () { cb(null); });
+}
+// 261024-02 追加（Lead 指定，属于 #1 的体感）：打开单曲页 / 切歌时**后台预取当前专辑的 release 资料**。
+// 目的：用户点「专辑」标签时直接命中缓存/已完成的生成任务，不用再等 10~30s 的首次生成。
+// 纪律：
+//   * 只在"用户已开启在线资料整理"时预取（META.summary==1 且 hasLlmKey/summaryEnabled 为真）；
+//   * 只预取 release 这一个实体，一次（同一首歌只发一次）；不打开抽屉、不改变任何 UI 状态；
+//   * 失败静默（不 toast、不留错误态）；切歌后旧结果直接丢弃（key 不匹配）。
+var NPPREF = { key: '' };
+function npPrefetchRelease() {
+  if (META.summary != 1) return;
+  if (META.hasLlmKey !== true && META.summaryEnabled !== true) return;
+  var tabs = NP_DATA.tabs || [], rel = null;
+  for (var i = 0; i < tabs.length; ++i) if (tabs[i].k === 'release') rel = tabs[i];
+  if (!rel) return;
+  var myTrack = S.lastCur || '';
+  var key = myTrack + '|' + rel.name + '|' + (rel.artist || '');
+  if (NPPREF.key === key) return;
+  NPPREF.key = key;
+  var fp = 'release|' + rel.name + '|' + (rel.artist || '') + '|';
+  if (NP_DATA.inflight[fp]) return;
+  NP_DATA.inflight[fp] = 1;
+  var u = '/api/entity/summary?kind=release&name=' + encodeURIComponent(rel.name) +
+          (rel.artist ? ('&artist=' + encodeURIComponent(rel.artist)) : '') + '&lang=zh';
+  fetchSummary(u, function (s) {
+    delete NP_DATA.inflight[fp];
+    if (NPPREF.key !== key || (S.lastCur || '') !== myTrack) return;   // 切歌 → 丢弃
+    var has = s && ((s.fields && Object.keys(s.fields).length > 0) ||
+                    (s.ok && s.sections && s.sections.length > 0));
+    if (!has) return;                                                  // 失败静默
+    var finish = function () {
+      if (NP_DATA.cache['release'] && NP_DATA.cache['release'].state === 'ok') return;  // 用户已自己取到
+      NP_DATA.cache['release'] = { state: 'ok', data: s };
+      npDataRenderTabs();
+      if (NP_DATA.active === 'release') npDataRenderBody();
+    };
+    npLocalAlbum(rel.name, rel.artist || '', function (alb) { if (alb) s.__album = alb; finish(); });
+  });
+}
 function npDataEnsure(kind, force) {
   var t = npDataTab(kind); if (!t) return;
   var st = NP_DATA.cache[kind];
@@ -4886,8 +5133,16 @@ function npDataEnsure(kind, force) {
     // 261024-01 #4：后端新增结构化 fields（可能没有 sections）⟹ 有 fields 也算有资料
     var hasFields = s && s.fields && Object.keys(s.fields).length > 0;
     var hasSecs = s && s.ok && s.sections && s.sections.length > 0;
-    if (hasFields || hasSecs) done(s, '');
-    else done(null, (s && s.error) || '');
+    if (!(hasFields || hasSecs)) { done(null, (s && s.error) || ''); return; }
+    // 261024-02 #3：把本地曲库的真实时长/曲目挂到结果上（AI 的时长/曲目列表一律不采信）
+    if (kind === 'track') {
+      if (S.dur > 0) s.__local = { '时长': fmtDurLong(S.dur) };   // 本地文件真实时长（AI 猜的一律不采信）
+      done(s, '');
+    } else if (kind === 'release') {
+      npLocalAlbum(t.name, t.artist, function (alb) { if (alb) s.__album = alb; done(s, ''); });
+    } else {
+      done(s, '');
+    }
   });
 }
 function npDataActivate(kind) {
@@ -4924,7 +5179,9 @@ function updateNpData(m) {
   for (var i = 0; i < tabs.length; ++i) if (tabs[i].k === NP_DATA.active) activeStill = true;
   if (NP_DATA.active && !activeStill) npDrawerClose();
   npDataRenderTabs();
-  // 261024-01 #3b ③「默认隐藏」⟹ 默认**不预取**任何实体：不点标签 = 不产生任何 AI 调用。
+  // 261024-01 #3b ③「默认隐藏」：抽屉不打开、不占版面；
+  // 261024-02 追加：但**专辑资料允许后台预取一次**（Lead 指定，改善"点开要等 10~30s"的体感）。
+  npPrefetchRelease();
   if (NP_DATA.active) npDataEnsure(NP_DATA.active, false);
   npDataRenderBody();
 }
@@ -4948,8 +5205,11 @@ function renderNp() {
   if (D('npKind')) D('npKind').textContent = npPlayingKindText(S.curMeta);
   // 元数据补全芯片 + 当前 EQ/IR 芯片（loadMeta / loadSettings 异步回来时也会走到这里刷一次）
   if (D('npMeta')) {
-    D('npMeta').innerHTML = (S.npMetaHtml || '') + npEqChipsHtml();
+    // 261024-02 #5：单曲页「推送到设备」按钮（状态来自 /api/cast/state，与流媒体页/底栏同源）
+    D('npMeta').innerHTML = (S.npMetaHtml || '') + npEqChipsHtml() + npCastBtnHtml();
     npBindEqChips();
+    if (D('npCastBtn')) D('npCastBtn').onclick = castToggle;
+    applyCastUi();
   }
   updateFavUi();
   updateNpData(S.curMeta);
@@ -4969,11 +5229,14 @@ function renderNp() {
   }
   renderNpLyric();
 }
+// 整页歌词（261024-02 #4 重做）
+//   * 当前行 .on 由**时间戳**决定（二分不需要，行数最多几百，线性即可）；
+//   * 滚动 = 让 active 行在容器里垂直居中（lyricScrollTo），带平滑过渡，不是按百分比滚；
+//   * 纯文本歌词（无时间戳）⟹ 不高亮、不自动滚（LY.timed=false）；
+//   * 用户手动滚动后 3 秒内不抢滚动；seek / 切歌立刻重定位（lyricReposition 清保护）。
 function renderNpLyric() {
   var box = D('npLyric'); if (!box) return;
   if (box.classList) box.classList.toggle('empty', !LY.lines.length);
-  // 评审 #19：纯音乐没有歌词时，歌词行不该继续占 1fr 高度（中间会留一大片黑）；
-  // 让 .npgrid 收起歌词行，把空间让给资料面板。
   var grid = D('npGrid');
   if (grid) grid.classList.toggle('nolyric', !LY.lines.length);
   if (!LY.lines.length) {
@@ -4986,16 +5249,44 @@ function renderNpLyric() {
     LY.lines.forEach(function (l, i) { h += '<div class=npline data-i=' + i + '>' + esc(l.s) + '</div>'; });
     box.innerHTML = h;
     box.dataset.at = '';
+    LY.at = -1;
   }
+  var timed = lyricTimed();
+  if (!timed) {
+    // 无时间戳：一行都不高亮、也不自动滚（用户可能正在读，别动它）
+    if (box.dataset.plain !== '1') {
+      box.dataset.plain = '1';
+      Array.prototype.forEach.call(box.children, function (e) { e.classList.remove('on'); });
+      box.scrollTop = 0;
+    }
+    return;
+  }
+  if (box.dataset.plain === '1') { box.dataset.plain = '0'; LY.at = -1; }
+  var pos = S.pos || 0;
+  // 进度跳变（seek / 上一首 / 拖动进度条）→ 立刻重定位，不受"手动滚动保护"影响
+  if (LY.lastPos >= 0 && Math.abs(pos - LY.lastPos) > 2.5) { LYMAN.until = 0; LY.at = -1; }
+  LY.lastPos = pos;
   var idx = -1;
-  for (var i = 0; i < LY.lines.length; ++i) if (LY.lines[i].t <= S.pos) idx = i;
-  Array.prototype.forEach.call(box.children, function (e, i) { e.classList.toggle('on', i === idx); });
-  if (idx >= 0 && box.dataset.at !== String(idx)) {
+  for (var i = 0; i < LY.lines.length; ++i) { if (LY.lines[i].t <= pos + 0.05) idx = i; else break; }
+  if (idx < 0) idx = 0;   // 还没到第一句（前奏）：钉在第一行，避免整屏无高亮
+  if (LY.at !== idx) {
+    LY.at = idx;
+    Array.prototype.forEach.call(box.children, function (e, i) { e.classList.toggle('on', i === idx); });
+  }
+  if (box.dataset.at !== String(idx)) {
     box.dataset.at = String(idx);
-    var el = box.children[idx];
-    if (el) box.scrollTop = el.offsetTop - box.clientHeight / 2 + el.clientHeight / 2;
+    if (Date.now() >= LYMAN.until) lyricScrollTo(box, box.children[idx], true);
   }
 }
+// 手动滚动保护（滚轮 / 触摸拖动）：3 秒内自动滚动不跟用户抢
+(function bindLyricManual() {
+  ['npLyric', 'lyricbox'].forEach(function (id) {
+    var el = D(id);
+    if (!el) return;
+    el.addEventListener('wheel', lyricManual, { passive: true });
+    el.addEventListener('touchstart', lyricManual, { passive: true });
+  });
+})();
 
 /* ---------------- 拖拽入队 ---------------- */
 function pathsFromDrop(e) {

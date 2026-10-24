@@ -287,6 +287,17 @@ h += "#npPage .npedge{display:none}";
     h += ".npchip{display:flex;align-items:center;gap:8px;justify-content:space-between;padding:7px 10px;border-radius:9px;font-size:12px;color:var(--mut);background:transparent;border:1px solid transparent;cursor:pointer;transition:.14s;white-space:nowrap;line-height:1.5;text-align:left}";
     h += ".npchip:hover{color:var(--txt);background:rgba(255,255,255,.09)}";
     h += ".npchip.on{color:var(--acc-text);background:var(--acc-weak);border-color:var(--acc-weak);font-weight:600}";
+    // 261024-02 #5：单曲页「推送到设备」按钮（和元数据芯片同一行；投放中高亮）
+    h += ".npcast{display:inline-flex;align-items:center;gap:0;font-size:11.5px;padding:4px 10px;border-radius:12px;background:var(--bg3);color:var(--txt2);border:1px solid var(--line);cursor:pointer;transition:.15s;white-space:nowrap}";
+    h += ".npcast:hover{background:var(--hov);color:var(--txt);border-color:var(--acc)}";
+    h += ".npcast.on{background:var(--ok-bg);color:var(--ok-text);border-color:var(--ok-line);font-weight:600}";
+    h += "#castBadge{display:none;align-items:center;color:var(--ok-text);border-color:var(--ok-line);background:var(--ok-bg);cursor:default}";
+    // 设备选择浮层
+    h += ".castpick{display:flex;flex-direction:column;gap:6px}";
+    h += ".castpick-row{display:flex;flex-direction:column;align-items:flex-start;gap:2px;text-align:left;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--bg3);cursor:pointer;transition:.14s;width:100%}";
+    h += ".castpick-row:hover{border-color:var(--acc);background:var(--hov)}";
+    h += ".castpick-row .cpn{font-size:13px;font-weight:600;color:var(--txt)}";
+    h += ".castpick-row .cph{font-size:11px;color:var(--mut2)}";
     h += ".npchip .dot{width:5px;height:5px;border-radius:50%;background:currentColor;opacity:.4;flex:none;transition:.2s}";
     h += ".npchip.ok .dot{background:var(--ok);opacity:1}";
     h += ".npchip.busy .dot{animation:npdot 1.1s ease-in-out infinite}";
@@ -347,6 +358,9 @@ h += "#npPage .npedge{display:none}";
     // 无歌词/纯音乐时把提示垂直居中，避免大片空白显得像没加载出来
     h += ".nplyric2.empty{display:flex;flex-direction:column;align-items:center;justify-content:center}";
     h += ".nplyric2::-webkit-scrollbar{display:none}";
+    // 261024-02 #4：上下留半屏空白，让**第一行和最后一行也能滚到容器正中**
+    //（否则首行贴顶、末行贴底，"active 行居中"在两端的数学目标不可达）
+    h += ".nplyric2::before,.nplyric2::after{content:'';display:block;height:calc(50% - 22px);pointer-events:none}";
     h += ".npline{font-size:clamp(13px,1.9vh,17px);line-height:2.05;color:var(--mut);transition:.18s}";
     h += ".npline.on{color:var(--txt);font-weight:650;transform:scale(1.03)}";
     // 行3：控制区（261024-01 #3b ①：音量不再是底部独立一行）——
@@ -373,6 +387,21 @@ h += "#npPage .npedge{display:none}";
     h += ".efrow .vl{font-size:12.5px;line-height:1.72;color:var(--txt);word-break:break-word}";
     h += ".efrow.wide .vl{color:var(--txt2);white-space:pre-wrap}";
     h += ".efrow .vl a{color:var(--acc-text)}";
+    // 261024-02 #3：本地曲目列表（序号 / 曲名 / 时长 三列，等宽数字保证时长右对齐）
+    h += ".ef-tracklist{display:flex;flex-direction:column;gap:1px;margin-top:2px}";
+    h += ".eft-row{display:grid;grid-template-columns:26px minmax(0,1fr) auto;gap:10px;align-items:baseline;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.05)}";
+    h += ".eft-row:last-child{border-bottom:0}";
+    h += ".eft-n{font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--mut2);text-align:right}";
+    h += ".eft-t{color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
+    h += ".eft-d{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;color:var(--mut);font-variant-numeric:tabular-nums}";
+    h += ".trlist-head{display:flex;align-items:baseline;gap:8px;padding:2px 4px 8px;border-bottom:1px solid var(--line);margin-bottom:4px}";
+    h += ".trlist-head .lb{font-size:11px;letter-spacing:1px;color:var(--mut2);font-weight:700}";
+    h += ".trlist-head .sp{flex:1}";
+    h += ".trlist-head .sum{font-size:11.5px;color:var(--mut);font-variant-numeric:tabular-nums}";
+    // 261024-02 #2：资料里可点的外链（点击交给宿主用系统浏览器打开）
+    h += ".eflink{color:var(--acc-text);text-decoration:none;border-bottom:1px dashed currentColor;cursor:pointer;word-break:break-all}";
+    h += ".eflink:hover{color:var(--acc)}";
+    h += "html[data-theme=light] .eft-row,html[data-theme=blue] .eft-row{border-bottom-color:var(--line)}";
     h += ".npdskel i{display:block;height:9px;border-radius:5px;margin-bottom:8px;background:linear-gradient(90deg,var(--hov),var(--hov2) 45%,var(--hov));background-size:220% 100%;animation:npskel 1.4s ease-in-out infinite}";
     h += "@keyframes npskel{0%{background-position:0 0}100%{background-position:-220% 0}}";
     h += "@media (prefers-reduced-motion:reduce){.npdskel i{animation:none}}";
@@ -418,7 +447,8 @@ h += "#npPage .npedge{display:none}";
     h += ".rtab:hover{background:var(--hov);color:var(--txt)}";
     h += ".rtab.on{background:var(--acc-weak);color:var(--acc-text);font-weight:600}";
     // 歌词
-    h += "#lyricbox{height:100%;overflow:auto;padding:18px 20px;text-align:center}";
+    h += "#lyricbox{height:100%;overflow:auto;padding:18px 20px;text-align:center;position:relative}";
+    h += "#lyricbox::before,#lyricbox::after{content:'';display:block;height:calc(50% - 18px)}";
     h += ".ly{font-size:13.5px;line-height:2.1;color:var(--mut2);transition:.2s;cursor:pointer;border-radius:6px;padding:1px 6px}";
     h += ".ly:hover{background:var(--hov);color:var(--mut)}";
     h += ".ly.on{color:var(--txt);font-weight:600;font-size:15px}";
@@ -665,6 +695,8 @@ h += "#npPage .npedge{display:none}";
     h += "<button class=ibtn id=bChain title='信号链'><svg width=16 height=16 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=1.8><path d='M9 12a3 3 0 016 0'/><path d='M6 12H3M21 12h-3'/><circle cx=12 cy=12 r=3'/></svg></button>";
     h += "<span id=bpBadge title=''></span>";
     h += "<span class=badge id=fmt>--</span><span class='badge g' id=gpub style='display:none'>GPU</span>";
+    // 261024-02 #5：投放中的底栏徽标（与单曲页按钮、流媒体页推送区块同源 /api/cast/state）
+    h += "<span class=badge id=castBadge style='display:none' title='正在投放'>UPnP</span>";
     h += "<svg width=14 height=14 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2 opacity=.55><path d='M3 10v4h4l5 4V6L7 10H3z'/><path d='M16.5 8.5a5 5 0 010 7'/></svg>";
     h += "<input id=vol type=range min=-60 max=0 step=0.5 value=0></div></div>";
     // ---------- 正在播放（点封面/曲名打开） ----------
