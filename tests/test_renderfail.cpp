@@ -472,6 +472,56 @@ int main() {
         ck(contains(h.failMsg, "zr=pad=full"), "failMsg 带出最近一次成因 zr", h.failMsg);
     }
 
+    // ---- 12. C4：独占周期量化（方案 §3.2 第 3 条根因，2026-10-24 N300 欠载）----
+    // room 不足一个周期时，整周期向下取整会归零 ⟹ 这一拍一个字节也写不进去。
+    // 判据本体是 wasapi_out.h 的 quantize_period_write —— write_available 生产路径用的同一份。
+    {
+        using rta::audio::quantize_period_write;
+        ck(quantize_period_write(4800, 9600, 9600) == 0,
+           "room=4800 per=9600 ⟹ 量化归零（这一拍写不进去）");
+        ck(quantize_period_write(500, 960, 9600) == 0,
+           "avail=500 per=960 ⟹ 量化归零");
+        ck(quantize_period_write(5760, 960, 9600) == 5760,
+           "avail=5760 per=960 ⟹ 保持整周期");
+        ck(quantize_period_write(1000, 960, 9600) == 960,
+           "avail=1000 per=960 ⟹ 向下取整到 960（宁可少写也不报错）");
+        ck(quantize_period_write(1000, 0, 9600) == 1000,
+           "per 未知（0）⟹ 不量化");
+        // 旧内联条件是 per>1 && per<=buffer：per == 缓冲时【仍然】量化。这正好是
+        // 「独占 period==buffer」的常见形态（96k/20ms：per=1920=bf）—— avail 不足一个
+        // 周期就整拍归零，是我们喂不上时的一个真实放大器。
+        ck(quantize_period_write(1000, 9600, 9600) == 0,
+           "per == 缓冲 ⟹ 仍然量化（旧内联条件如此，实机常踩）");
+        ck(quantize_period_write(1000, 19200, 9600) == 1000,
+           "per > 缓冲 ⟹ 不量化（旧内联条件的边界保护）");
+    }
+
+    // ---- 13. C4：归因闭合 —— 每次「写不进去」必须恰好落进一类 ----
+    // 现场用 zp+zs+other == w0 判断归因是否漏计（M4）。这里用同一份 classify/quantize
+    // 跑一张小表：三行写不进去、一行成功，成功的行不许让任何计数增长。
+    {
+        struct Row { size_t toWrite, room, avail, per; };
+        const Row rows[] = {
+            {0,     0,    9600, 9600},   // ① 设备缓冲满 ⟹ padFull
+            {0,     9600, 4096, 9600},   // ② 手里不足一个周期 ⟹ starved
+            {4800,  4800, 9600, 9600},   // ③ 量化归零（room 不足一个周期）⟹ other
+            {9600,  9600, 9600, 9600},   // 写成功 ⟹ 不计数
+        };
+        rta::audio::ZeroAttrib z;
+        int zeroRows = 0;
+        for (const Row& r : rows) {
+            const size_t q = rta::audio::quantize_period_write(r.toWrite, r.per, 9600);
+            z.classify(q, r.room, r.avail, r.per);
+            if (q == 0) ++zeroRows;
+        }
+        ck(z.padFull + z.starved + z.other == zeroRows,
+           "zp+zs+other == 写不进去的次数（归因闭合，无漏计/重复计）",
+           "zp=" + std::to_string(z.padFull) + " zs=" + std::to_string(z.starved) +
+           " other=" + std::to_string(z.other) + " zeroRows=" + std::to_string(zeroRows));
+        ck(z.padFull == 1 && z.starved == 1 && z.other == 1,
+           "三类成因各计一次（量化归零算 other，不算 pad=full）");
+    }
+
     std::printf("\n%s（失败 %d 项）\n", g_fail == 0 ? "renderfail 全部通过" : "存在失败", g_fail);
     return g_fail == 0 ? 0 : 1;
 }

@@ -38,6 +38,7 @@ extern "C" __declspec(dllimport) unsigned int __stdcall timeEndPeriod(unsigned i
 #include "audio/wasapi_shared.h"   // WASAPI 共享后端(VM/独占不可用兜底,2026-10-22 事故热修)
 #include "audio/wasapi_capture.h"  // WASAPI 采集核心 (ROADMAP P4b)
 #include "audio/render_loop.h"     // 渲染主循环(含 RENDERFAIL 遥测;测试与 rtaweb 共用同一份)
+#include "audio/buffer_policy.h"   // C1 独占缓冲策略(尊重设置/学习缓存/L1 预检;测试与生产同一份)
 #include "audio/rate_pick.h"       // 输出采样率选择的纯逻辑(可离线单测;2026-10-22 第二首按 44100 开流事故)
 #include "audio/asio_out.h"
 
@@ -216,6 +217,9 @@ static std::shared_ptr<rta::dsp::PeqEngine> g_peq;
 static std::atomic<bool> g_exitReq{false};
 // 播放线程诊断计数（出问题时第一手证据，比猜快得多）
 static std::atomic<long long> g_dbgW0{0}, g_dbgPulls{0}, g_dbgWf{0}, g_dbgWr{0}, g_dbgPer{0};
+// C2 遥测（2026-10-24 N300 欠载）：dry/dryms/ev/evint/prod 由 render_loop 计数并导出，
+// STAT 行是权威输出，这四个原子量只是让 /api/status 也能读到（诊断页/底栏用）。
+static std::atomic<long long> g_dbgDry{0}, g_dbgDryMs{0}, g_dbgEv{0}, g_dbgEvInt{0}, g_dbgProd{0};
 static std::atomic<double> g_dbgPeak{0.0};    // 最近一个写入周期的峰值（0..1）
 static std::atomic<long long> g_dbgClip{0};   // 本次播放的满幅样本数（诊断削波/噪音）
 static uint16_t g_uiPort = 8899;
@@ -427,16 +431,51 @@ static SinkOpenOpts sink_opts(const PlayParams& p) {
     return o;
 }
 
+// 播放器 exe 目录下的文件路径（定义在本文件后面；WasapiSink 的学习缓存要用，先声明）。
+static std::string path_in_exe_dir(const char* name);
+
 class WasapiSink : public OutSink {
 public:
     bool open(const SinkOpenOpts& o, uint32_t rate, int ch, int bits) override {
         fail_ = OpenFail{};   // 每次打开重置：失败原因只属于最近一次尝试
-        // ★ 2026-10-23：独占缓冲封顶 20ms。设置里的 100ms 在 MOTU 上会被对齐成
-        // **8192 帧（186ms）**，Initialize 虽接受，但 Start 后设备流不推进（现场：
-        // RENDERFAIL「4.02 秒未接受数据」，zp=201 pad=full、wr 只有 76、GetBuffer 从未被调用）。
-        // 20ms（约 882 帧）是这类 USB 声卡独占的常见可用区间。
-        const double ms = (o.bufferMs > 0 && o.bufferMs < 20) ? (double)o.bufferMs : 20.0;
-        ok_ = ao_.open(o.device, rate, ch, bits, ms, &fail_);
+        failRequested_ = OpenFail{};
+        // ================= C1 独占缓冲策略（2026-10-24 N300 欠载）=================
+        // 旧代码（本函数 2026-10-23 版本）无条件封顶 20ms：
+        //     const double ms = (o.bufferMs > 0 && o.bufferMs < 20) ? (double)o.bufferMs : 20.0;
+        // 于是设置里的 100ms 只开得到 20ms（= 2 个驱动周期），render_loop 的 20ms 轮询
+        // 喂不上 ⟹ 设备缓冲反复触底 ⟹ 欠载爆音。MOTU 的 20ms 保护是真实需求，所以不是
+        // 简单删掉封顶，而是改成「尊重设置 + 失败自适应回退」（方案 §5）：
+        //   · 请求 clamp 到 [20,500]；
+        //   · 学习缓存命中 ⟹ 直接用上次学到的值（不再先失败一次）；
+        //   · L1 预检：实际缓冲 > 请求 1.5 倍 ⟹ 关掉重开 20ms 并记住；
+        //   · L2 起播看门狗（0.8s 有数据零写入）由 render_loop 调 reopen_at_20ms()。
+        // RTA_BUF_RESPECT=0 ⟹ 完全回到旧的 20ms 行为（A/B 与回滚）。
+        dev_ = o.device; rate_ = rate; ch_ = ch; bits_ = bits;
+        ok_ = false;
+        learn_.set_path(path_in_exe_dir("rlplayer-buffer-learned.json"));
+        key_ = rta::audio::buffer_key(o.device, rate, bits, o.bufferMs);
+        const double reqMs = rta::audio::buffer_clamp_ms(o.bufferMs);
+        rta::audio::BufferOpener op;
+        op.open = [this, reqMs](double ms, std::string& why) {
+            ok_ = ao_.open(dev_, rate_, ch_, bits_, ms, &fail_);
+            if (!ok_) {
+                why = ao_.last_error();
+                // 保留「按用户请求值打开」那一次的失败归因：若降级重试也失败，
+                // 报给用户的必须是 100ms 的请求，而不是内部的 20ms 重试。
+                if (std::fabs(ms - reqMs) < 0.5) failRequested_ = fail_;
+            }
+            return ok_;
+        };
+        op.frames = [this]() { return (size_t)ao_.buffer_frames(); };
+        op.close  = [this]() { ao_.close(); };
+        rta::audio::BufferRequest req;
+        req.requestedMs = o.bufferMs;
+        req.rate        = rate;
+        req.respect     = rta::audio::buffer_respect_env();
+        req.useLearn    = true;
+        pol_ = rta::audio::buffer_apply(req, op, &learn_, key_, &ok_);
+        if (!ok_ && !failRequested_.request.empty()) fail_ = failRequested_;
+        opened_ = ok_;
         return ok_;
     }
     // HF-01/02：open 失败时的结构化原因（请求格式 / 支持列表 / HRESULT / 端点 id）。
@@ -452,7 +491,7 @@ public:
     }
     size_t buffer_frames() const override { return ao_.buffer_frames() ? (size_t)ao_.buffer_frames() : 9600; }
     void set_live_gain_db(double db) override { ao_.set_live_gain_db(db); }
-    void wait_event(int ms) override { ao_.wait_event(ms); }
+    bool wait_event(int ms) override { return ao_.wait_event(ms); }
     long long last_pad() const override { return ao_.last_pad(); }
     size_t write_one_period(const int32_t* pcm, size_t frames) override { return ao_.write_one_period(pcm, frames); }
     size_t write_available(const int32_t* pcm, size_t frames) override { return ao_.write_available(pcm, frames); }
@@ -462,16 +501,88 @@ public:
     const std::string& last_error() const override { return err_.empty() ? ao_.last_error() : err_; }
     long long last_gb_hr() const override { return ao_.last_gb_hr(); }
     // 2026-10-22 反馈 20261022-02：把 WasapiOutput 的「写不进去」成因计数转发给 OutSink。
-    // 不转发 ⟹ render_loop.h:296 的 if (zp >= 0 || zs >= 0) 闸门永假 ⟹ STAT 永不打印 zp/zs/zr。
+    // 不转发 ⟹ render_loop 的 if (zp >= 0 || zs >= 0) 闸门永假 ⟹ STAT 永不打印 zp/zs/zr。
     // 命名映射：wasapi_out.h 叫 last_zero_reason()，OutSink 叫 zero_reason()。
     long long zero_pad_full() const override { return ao_.zero_pad_full(); }
     long long zero_starved()  const override { return ao_.zero_starved(); }
     std::string zero_reason() const override { return ao_.last_zero_reason(); }
+
+    // ---- C2 遥测转发（per / initRecipe / realigned / WFAIL 明细）----
+    // -1 = 未知（OutSink 的约定；0 会让 STAT 看起来像「周期 0 帧」）。
+    long long device_period_frames() const override {
+        const size_t per = ao_.period_frames();
+        return per ? (long long)per : -1;
+    }
+    std::string init_recipe() const override { return ao_.init_recipe(); }
+    bool realigned() const override { return ao_.realigned(); }
+    bool last_write_attempt(WriteAttempt& out) const override {
+        const auto& d = ao_.last_write_detail();
+        out.pad = d.pad; out.room = d.room; out.per = d.per;
+        out.avail = d.avail; out.toWrite = d.toWrite; out.gbHr = d.gbHr;
+        return true;
+    }
+
+    // ---- C3 端点消失（N300 96k 掉 USB）----
+    // 播放线程每 250ms 最多问一次（这里再自缓存 500ms）：端点是否仍是 ACTIVE。
+    // 端点消失时 EnumAudioEndpoints 可能要几毫秒，绝不能每 tick 都问。
+    bool endpoint_alive() const override {
+        using clock = std::chrono::steady_clock;
+        const auto now = clock::now();
+        if (aliveChecked_ && now - aliveCheckedAt_ < std::chrono::milliseconds(500))
+            return alive_;
+        aliveChecked_ = true;
+        aliveCheckedAt_ = now;
+        alive_ = false;
+        for (const auto& d : rta::audio::WasapiOutput::enumerate()) {
+            const bool hit = dev_.empty() ? d.isDefault : (d.id == dev_);
+            if (hit) { alive_ = (d.state == DEVICE_STATE_ACTIVE); break; }
+        }
+        return alive_;   // 枚举里根本找不到 ⟹ 端点已消失
+    }
+
+    // ---- C1 L2：起播 800ms 零写入 ⟹ 关掉重开 20ms 并 Start ----
+    // 由 render_loop 在「有数据但零写入」时调用一次；返回 true 表示已重新开流。
+    bool reopen_at_20ms() {
+        if (rate_ == 0 || !opened_) return false;
+        ao_.close();
+        ok_ = ao_.open(dev_, rate_, ch_, bits_, rta::audio::kBufferDegradeMs, &fail_);
+        if (!ok_) return false;
+        if (!ao_.start()) { err_ = ao_.last_error(); return false; }
+        pol_.degraded    = true;
+        pol_.policy      = "degraded";
+        pol_.effectiveMs = rta::audio::kBufferDegradeMs;
+        pol_.why         = "Start 后 " + std::to_string((int)rta::audio::kBufferL2DeadlineMs) +
+                           "ms 有数据但零写入（设备流不推进），回退 20ms";
+        remember_policy();
+        return true;
+    }
+    const rta::audio::BufferPolicy& buffer_policy() const { return pol_; }
+    // 学习缓存落盘（L2 成功后调用；L1/打开失败路径由 buffer_apply 自己写）
+    void remember_policy() {
+        rta::audio::BufferLearnEntry e;
+        e.ms  = pol_.effectiveMs;
+        e.why = pol_.why;
+        e.at  = rta::audio::buffer_today();
+        learn_.put(key_, e);
+    }
 private:
     WasapiOutput ao_;
     bool ok_ = false;
+    bool opened_ = false;
     OpenFail fail_;
+    OpenFail failRequested_;   // 按【用户请求值】打开那一次的失败归因（降级重试会覆盖 fail_）
     std::string err_;
+    // C1：设备/格式（L2 重开要用同一套参数）与缓冲决策
+    std::string dev_;
+    uint32_t rate_ = 0;
+    int ch_ = 0, bits_ = 0;
+    std::string key_;
+    rta::audio::BufferPolicy pol_;
+    rta::audio::BufferLearnStore learn_;
+    // C3：端点存活缓存（播放线程专用；mutable 因为查询是逻辑只读）
+    mutable bool alive_ = true;
+    mutable bool aliveChecked_ = false;
+    mutable std::chrono::steady_clock::time_point aliveCheckedAt_{};
 };
 
 // WASAPI 共享模式：经系统混音引擎，独占不可用（VM 板载声卡 / 远程桌面 / 设备被占）时
@@ -507,7 +618,7 @@ public:
     }
     size_t buffer_frames() const override { return so_.buffer_frames() ? so_.buffer_frames() : 9600; }
     void set_live_gain_db(double db) override { so_.set_live_gain_db(db); }
-    void wait_event(int ms) override { so_.wait_event(ms); }
+    bool wait_event(int ms) override { return so_.wait_event(ms); }
     long long last_pad() const override { return so_.last_pad(); }
     size_t write_one_period(const int32_t* pcm, size_t frames) override { return so_.write_available(pcm, frames); }
     size_t write_available(const int32_t* pcm, size_t frames) override { return so_.write_available(pcm, frames); }
@@ -2237,6 +2348,19 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             return false;
         }
 
+        // ---- C1/C2：缓冲策略落定后记录「请求 / 实际 / 配方」（方案 §5.4）----
+        // 为什么不是塞进上面的 PLAY 行：PLAY 在 open 之前就写出去了（信号链要先落盘，
+        // 而设备必须等首块数据就绪才打开），那时还不知道实际缓冲。这里单独一条 PLAYBUF，
+        // 字段名与方案 §5.4 一致，日志检索方便。
+        if (auto* w = dynamic_cast<WasapiSink*>(sink.get())) {
+            const auto& bp = w->buffer_policy();
+            play_log(std::string("PLAYBUF ") +
+                     rta::audio::buffer_playbuf_json(bp, sink->buffer_frames(),
+                                                     w->device_period_frames(),
+                                                     w->init_recipe(), w->realigned()));
+            g_dbgPer.store(w->device_period_frames());
+        }
+
         // ---------------- 渲染主循环（实现在 src/audio/render_loop.h，与回归测试共用）----------------
         // 2026-10-22 事故（VM 上独占流 GetCurrentPadding 恒满 → write_available 恒 0 →
         // 200 次超时静默 break → END pos=0 error=""）之后，循环内的超时 break 带 RENDERFAIL
@@ -2250,6 +2374,13 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         rl.inRate = in.rate; rl.inFrames = in.frames(); rl.totalOut = totalOut;
         rl.dbgW0 = &g_dbgW0; rl.dbgWr = &g_dbgWr; rl.dbgPulls = &g_dbgPulls;
         rl.dbgClip = &g_dbgClip; rl.dbgPeak = &g_dbgPeak;
+        // C2 遥测导出（/api/status 用；STAT 行本身由 render_loop 直接打印）
+        rl.dbgDry = &g_dbgDry; rl.dbgDryMs = &g_dbgDryMs;
+        rl.dbgEv = &g_dbgEv; rl.dbgEvInt = &g_dbgEvInt; rl.dbgProd = &g_dbgProd;
+        // C1 L2 起播看门狗：8 秒太慢、4 秒 RENDERFAIL 会触发「回退共享 + 从头重播」，
+        // 所以 0.8 秒零写入就重开 20ms（只对 WASAPI 独占有意义，其它后端不设这个钩子）。
+        if (auto* w = dynamic_cast<WasapiSink*>(sink.get()))
+            rl.l2Degrade = [w]() { return w->reopen_at_20ms(); };
         rl.log = [](const std::string& s) { play_log(s); };
         rl.dlogFn = [](const std::string& s) { dlog(s); };
         rl.deviceLabel = dev;
@@ -2266,7 +2397,9 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         if (prod.joinable()) prod.join();
         if (rl.renderFail) {
             // 设备持续不接受数据：完整归因原样进 ps.error —— END 不再是 error="" 悬案
-            if (sharedFallback && rl.fallbackEligible) *sharedFallback = true;
+            // C3（N300 掉线）：端点已消失时绝不回退共享、也不从头重播 —— 用户要 bit-perfect，
+            // 静默降级比报错更有害（方案 §7）。ps.error 已在 render_loop 里写成「输出设备已断开」。
+            if (sharedFallback && rl.fallbackEligible && !rl.deviceLost) *sharedFallback = true;
             sink->close();
             { std::lock_guard<std::mutex> lk(ps.mtx); ps.error = rl.failMsg; }
             return false;
@@ -5384,6 +5517,20 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         return j.str();
     }
 
+    // 独占缓冲学习缓存重置（C1，2026-10-24 N300 欠载；方案 §5.3）。
+    // 删除 <exe>\rlplayer-buffer-learned.json：之后每次播放都重新按用户设置尝试（必要时再学）。
+    // 为什么需要它：学习缓存是为了「不每次都先失败一次」，但用户换了线/固件/驱动后，
+    // 旧的 20ms 学习值可能不再必要 —— 不提供重置就只能靠改设置绕。
+    if (rq.path.rfind("/api/buffer/reset", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        rta::audio::BufferLearnStore st(path_in_exe_dir("rlplayer-buffer-learned.json"));
+        const bool okReset = st.reset();
+        std::ostringstream j;
+        j << "{\"ok\":" << (okReset ? "true" : "false")
+          << ",\"path\":\"" << jesc(st.path()) << "\"}";
+        return j.str();
+    }
+
     // 滤波器预设表（含每个预设【自带的相位】）：
     // 用户 2026-10-22 功能2 的诉求是「'跟随预设'到底跟的是什么」说不清。
     // 让后端把真相源交出来，前端只负责显示 —— 避免前端再抄一份相位表（那必然漂移）。
@@ -6276,6 +6423,13 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
           << ",\"peak\":" << g_dbgPeak.load() << ",\"clip\":" << g_dbgClip.load()
           << ",\"wf\":" << g_dbgWf.load() << ",\"pulls\":" << g_dbgPulls.load()
           << ",\"per\":" << g_dbgPer.load()
+          // C2 遥测（2026-10-24 N300 欠载）：dry=设备缓冲空且我们写不进去的次数（≈可闻「啵」），
+          // dryms=累计毫秒，ev/evint=事件次数/间隔中位数，prod=pull_chunk 最长阻塞毫秒。
+          << ",\"dry\":" << g_dbgDry.load()
+          << ",\"dryms\":" << g_dbgDryMs.load()
+          << ",\"ev\":" << g_dbgEv.load()
+          << ",\"evint\":" << g_dbgEvInt.load()
+          << ",\"prod\":" << g_dbgProd.load()
           << ",\"decodeMs\":" << ps.decodeMs.load()
           << ",\"ffmpegMs\":" << ps.ffmpegMs.load()
           << ",\"wavReadMs\":" << ps.wavReadMs.load()

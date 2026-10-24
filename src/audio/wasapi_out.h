@@ -126,6 +126,21 @@ struct ZeroAttrib {
     }
 };
 
+// 独占 GetBuffer 要求周期整数倍：把「想写多少帧」向下取整到周期倍数（方案 §3.2 第 3 条根因）。
+// 抽成纯函数只为可测（tests/test_renderfail.cpp 直接驱动，行为与旧内联代码逐字一致）：
+//   room 不足一个周期（如 room=4800、per=9600）⟹ 返回 0，这一轮什么也没写，
+//   ZeroAttrib 归因为 other —— 不是 padFull（设备缓冲并没有满）。
+inline size_t quantize_period_write(size_t toWrite, size_t per, size_t bufferFrames) {
+    if (per > 1 && per <= bufferFrames && (toWrite % per) != 0) toWrite = (toWrite / per) * per;
+    return toWrite;
+}
+
+// 最近一次 write_available 的现场数字（WFAIL 明细用；只读，不改变行为）。
+struct WriteDetail {
+    long long pad = -1, room = -1, per = -1, avail = -1, toWrite = -1;
+    long long gbHr = -999;   // IAudioRenderClient::GetBuffer 的 HRESULT（-999 = 本次未调用）
+};
+
 class WasapiOutput {
 public:
     WasapiOutput() {
@@ -144,7 +159,10 @@ public:
     static std::vector<uint32_t> exclusive_rates(const std::string& deviceId, int bits = 24, int channels = 2) {
         std::vector<uint32_t> ok;
         HRESULT ci = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        const bool own = SUCCEEDED(ci);
+        // S_FALSE = 本线程已初始化（同一模式），此时并没有增加引用计数：再 CoUninitialize
+        // 会把播放线程的 COM 直接关掉（后续 Initialize 报 CO_E_NOTINITIALIZED）。
+        // 只有 S_OK 才是「本次调用真的初始化了」。
+        const bool own = (ci == S_OK);
         if (FAILED(ci) && ci != RPC_E_CHANGED_MODE) return ok;
 
         IMMDeviceEnumerator* en = nullptr;
@@ -251,7 +269,9 @@ public:
         std::vector<DeviceInfo> out;
         // 静态方法不会走构造函数，必须自己初始化 COM（曾因此列出 0 个端点）
         HRESULT ci = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        const bool own = SUCCEEDED(ci);
+        // 同上：S_FALSE 表示已初始化，不能再 CoUninitialize（否则会把播放线程的 COM 关掉）。
+        // C3 端点消失检测在播放线程里反复调本函数，这个区分因此变成硬要求。
+        const bool own = (ci == S_OK);
         if (FAILED(ci) && ci != RPC_E_CHANGED_MODE) return out;
 
         IMMDeviceEnumerator* en = nullptr;
@@ -309,6 +329,9 @@ public:
     bool open(const std::string& deviceId, uint32_t rate, int channels, int bits, double bufferMs = 100.0,
               OpenFail* fail = nullptr) {
         close();
+        initRecipeIndex_ = -1;
+        initRecipe_.clear();
+        realigned_ = false;   // 对齐重试只描述本次 open，不能从上次打开残留下来
         rate_ = rate; channels_ = channels; bits_ = bits;
 
         auto fillFail = [&](const std::string& hrTxt) {
@@ -415,7 +438,8 @@ public:
           wfx_.dwChannelMask          = channel_mask_for(channels);
           wfx_.SubFormat              = F.flt ? SUB_FLOAT : SUB_PCM;
           if (fi > 0) trialLog += std::string("[换格式 ") + F.tag + "] ";
-        for (const auto& t : tries) {
+        for (int ti = 0; ti < (int)(sizeof(tries) / sizeof(tries[0])); ++ti) {
+            const Try& t = tries[ti];
             hr = ac_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, t.flags, t.buf, t.per,
                                  (WAVEFORMATEX*)&wfx_, nullptr);
             {
@@ -446,11 +470,11 @@ public:
                                       (unsigned long)(unsigned)hr2, hr_name(hr2));
                         trialLog += b;
                     }
-                    if (hr2 == S_OK) { realigned_ = true; hr = S_OK; break; }
+                    if (hr2 == S_OK) { realigned_ = true; initRecipeIndex_ = ti; hr = S_OK; break; }
                     hr = hr2;
                 }
             }
-            if (hr == S_OK) break;
+            if (hr == S_OK) { initRecipeIndex_ = ti; break; }
         }
           if (hr == S_OK) { fmtUsed = F.tag; break; }   // 该格式成功 → 不再试后面的格式
         }
@@ -483,6 +507,19 @@ public:
 
         ac_->GetBufferSize(&bufferFrames_);
         { REFERENCE_TIME p = 0, mp = 0; ac_->GetDevicePeriod(&p, &mp); period_ = p; }
+        // C2：初始化配方必须写【真实毫秒数】。旧实现把配方标签写死成 "buffer=period=100ms"，
+        // 于是请求 20ms 时日志里仍显示 100ms —— 这次欠载排查就被它误导过。
+        {
+            const DWORD fl = (initRecipeIndex_ >= 0) ? tries[initRecipeIndex_].flags : 0u;
+            char rb[200];
+            std::snprintf(rb, sizeof(rb), "buffer=%.1fms(%u帧),period=%.1fms,%s%s",
+                          rate_ ? 1000.0 * (double)bufferFrames_ / (double)rate_ : 0.0,
+                          (unsigned)bufferFrames_,
+                          (double)period_ / 10000.0,
+                          (fl & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) ? "event" : "poll",
+                          realigned_ ? ",realigned" : "");
+            initRecipe_ = rb;
+        }
         if (FAILED(ac_->GetService(__uuidof(IAudioRenderClient), (void**)&rc_)) || !rc_) {
             lastErr_ = "GetService(IAudioRenderClient) 失败"; fillFail(lastErr_); close(); return false;
         }
@@ -616,11 +653,17 @@ public:
         if (toWrite > availFrames) toWrite = availFrames;
         // 独占模式的 GetBuffer 要求周期整数倍；向下取整，宁可少写也不报错。
         size_t per = 0;
-        if (period_ > 0 && rate_ > 0) {
+        if (period_ > 0 && rate_ > 0)
             per = (size_t)((double)period_ * (double)rate_ / 10000000.0 + 0.5);
-            if (per > 1 && per <= bufferFrames_ && (toWrite % per) != 0)
-                toWrite = (toWrite / per) * per;
-        }
+        toWrite = quantize_period_write(toWrite, per, bufferFrames_);
+        // WFAIL 明细（C2）：记录量化【之后】的现场数字。只读，不改变写入决策。
+        detail_ = WriteDetail{};
+        detail_.pad     = (long long)pad;
+        detail_.room    = (long long)room;
+        detail_.per     = (long long)per;
+        detail_.avail   = (long long)availFrames;
+        detail_.toWrite = (long long)toWrite;
+        detail_.gbHr    = lastGbHr_;
         // ---- 归因计数（2026-10-22 用户真机反馈 20261022-02）：只观测，不改变行为 ----
         // 判定本体在 ZeroAttrib::classify（见本文件上方）；这里只把三个观测量喂进去。
         // 独立成结构是为了让 tests/test_renderfail.cpp 能用 mock 输入直接驱动它
@@ -630,6 +673,7 @@ public:
         BYTE* data = nullptr;
         const HRESULT gb = rc_->GetBuffer((UINT32)toWrite, &data);
         lastGbHr_ = (long long)gb;
+        detail_.gbHr = (long long)gb;
         if (FAILED(gb) || !data) return 0;
         pack(data, src, toWrite);
         if (FAILED(rc_->ReleaseBuffer((UINT32)toWrite, 0))) return 0;
@@ -669,6 +713,16 @@ public:
     }
 
     size_t buffer_frames() const { return bufferFrames_; }
+    // C2：设备周期帧数（period_ 以前从未对外暴露，是本次欠载排查的盲点之一）。
+    // 0 = 未知（未打开 / GetDevicePeriod 失败）。
+    size_t period_frames() const {
+        if (period_ <= 0 || rate_ == 0) return 0;
+        return (size_t)((double)period_ * (double)rate_ / 10000000.0 + 0.5);
+    }
+    // 真实初始化配方（"buffer=100.0ms(9600帧),period=10.0ms,event"）；未打开时为空。
+    const std::string& init_recipe() const { return initRecipe_; }
+    int  init_recipe_index() const { return initRecipeIndex_; }
+    const WriteDetail& last_write_detail() const { return detail_; }
     size_t frames_written() const { return written_; }
     double elapsed_seconds() const {
         LARGE_INTEGER t; QueryPerformanceCounter(&t);
@@ -774,6 +828,9 @@ private:
     long long skips_ = 0;
     // 「写不进去」的成因分解（见文件上方的 ZeroAttrib；分类与计数都在该结构里）
     ZeroAttrib zero_;
+    WriteDetail detail_;             // 最近一次 write_available 的现场数字（WFAIL 用）
+    std::string initRecipe_;         // 真实初始化配方（C2）
+    int initRecipeIndex_ = -1;       // 命中的 tries[] 下标（-1 = 未打开）
     long long qpcFreq_ = 1, qpcStart_ = 0;
     std::string lastErr_;
 };

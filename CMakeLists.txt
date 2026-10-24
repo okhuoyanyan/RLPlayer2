@@ -390,6 +390,16 @@ add_executable(test_renderfail tests/test_renderfail.cpp)
 target_include_directories(test_renderfail PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME renderfail COMMAND test_renderfail)
 
+# 2026-10-24（N300 欠载方案 C4）：C1 缓冲策略 + C2/C3 遥测/端点消失，全部 mock 驱动，
+# 绝不打开音频设备（铁律 1）。被测实现：src/audio/buffer_policy.h、src/audio/render_loop.h。
+add_executable(test_buffer_policy tests/test_buffer_policy.cpp)
+target_link_libraries(test_buffer_policy PRIVATE rtadsp)
+add_test(NAME buffer_policy COMMAND test_buffer_policy)
+
+add_executable(test_render_loop_dry tests/test_render_loop_dry.cpp)
+target_link_libraries(test_render_loop_dry PRIVATE rtadsp)
+add_test(NAME render_loop_dry COMMAND test_render_loop_dry)
+
 # 输出采样率选择纯逻辑（2026-10-22 事故：第二首 44.1k 按 44100 开流，因 rate=max 探测瞬时为空
 # 被当成「跟随源率」）—— 全离线，不开设备（铁律 1）
 add_executable(test_ratepick tests/test_ratepick.cpp)

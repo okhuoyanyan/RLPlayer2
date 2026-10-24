@@ -354,13 +354,18 @@ h += "#npPage .npedge{display:none}";
     h += ".npvol .vlab{font-size:11px;min-width:46px;text-align:right;font-variant-numeric:tabular-nums;color:var(--txt2)}";
     // 行3：歌词区（独立滚动，min-height:0 保证网格行真的能压缩 —— 这是 1024x640 下
     // 歌词压到进度条上的根因：旧实现 .nplyric 固定 58vh 且控件绝对定位，二者必然重叠）
-    h += ".nplyric2{min-height:0;overflow:auto;text-align:center;scrollbar-width:none;padding:2px 0;-webkit-mask-image:linear-gradient(180deg,transparent 0,#000 26px,#000 calc(100% - 26px),transparent 100%);mask-image:linear-gradient(180deg,transparent 0,#000 26px,#000 calc(100% - 26px),transparent 100%)}";
+    h += ".nplyric2{--nppad:0px;min-height:0;overflow:auto;text-align:center;scrollbar-width:none;padding:2px 0;-webkit-mask-image:linear-gradient(180deg,transparent 0,#000 26px,#000 calc(100% - 26px),transparent 100%);mask-image:linear-gradient(180deg,transparent 0,#000 26px,#000 calc(100% - 26px),transparent 100%)}";
     // 无歌词/纯音乐时把提示垂直居中，避免大片空白显得像没加载出来
     h += ".nplyric2.empty{display:flex;flex-direction:column;align-items:center;justify-content:center}";
     h += ".nplyric2::-webkit-scrollbar{display:none}";
     // 261024-02 #4：上下留半屏空白，让**第一行和最后一行也能滚到容器正中**
     //（否则首行贴顶、末行贴底，"active 行居中"在两端的数学目标不可达）
-    h += ".nplyric2::before,.nplyric2::after{content:'';display:block;height:calc(50% - 22px);pointer-events:none}";
+    // 261024-03 #3：上下留白改由 JS 按【真实行高】写进 --nppad（= (容器高 - 行高)/2）。
+    // 旧实现写死 calc(50% - 22px)，22px 只是某个字号下的一半行高：893x587 档行高 27px 时
+    // 少留 8.7px ⟹ 首行/末行永远差 8.7/9.4px 才到正中（实测数字见 tools/lyr_dpr.js 输出）。
+    h += ".nplyric2::before,.nplyric2::after{content:'';display:block;height:var(--nppad,0px);pointer-events:none}";
+    // 纯文本歌词（无时间轴）的显式提示：旧版只是"不滚动"，用户看起来像坏了
+    h += ".ly-hint{position:sticky;top:0;z-index:2;font-size:10.5px;letter-spacing:.3px;color:var(--mut2);background:var(--bg);border-bottom:1px solid var(--line);padding:3px 0;margin-bottom:4px;pointer-events:none}";
     h += ".npline{font-size:clamp(13px,1.9vh,17px);line-height:2.05;color:var(--mut);transition:.18s}";
     h += ".npline.on{color:var(--txt);font-weight:650;transform:scale(1.03)}";
     // 行3：控制区（261024-01 #3b ①：音量不再是底部独立一行）——
@@ -447,8 +452,9 @@ h += "#npPage .npedge{display:none}";
     h += ".rtab:hover{background:var(--hov);color:var(--txt)}";
     h += ".rtab.on{background:var(--acc-weak);color:var(--acc-text);font-weight:600}";
     // 歌词
-    h += "#lyricbox{height:100%;overflow:auto;padding:18px 20px;text-align:center;position:relative}";
-    h += "#lyricbox::before,#lyricbox::after{content:'';display:block;height:calc(50% - 18px)}";
+    h += "#lyricbox{--lyrpad:0px;height:100%;overflow:auto;padding:18px 20px;text-align:center;position:relative}";
+    // 同上：留白按真实行高算（旧 calc(50% - 18px) 在行高 34px 时也差 1px，行高变化后误差更大）
+    h += "#lyricbox::before,#lyricbox::after{content:'';display:block;height:var(--lyrpad,0px)}";
     h += ".ly{font-size:13.5px;line-height:2.1;color:var(--mut2);transition:.2s;cursor:pointer;border-radius:6px;padding:1px 6px}";
     h += ".ly:hover{background:var(--hov);color:var(--mut)}";
     h += ".ly.on{color:var(--txt);font-weight:600;font-size:15px}";
@@ -484,6 +490,43 @@ h += "#npPage .npedge{display:none}";
     h += ".sfld{min-width:0}";
     h += ".sfld label{display:block;font-size:11px;color:var(--mut);margin-bottom:5px;font-weight:500}";
     h += ".sfld .hint{font-size:10.5px;color:var(--mut2);margin-top:4px;line-height:1.5}";
+    // ===== 20 段 PEQ（261024-03 #5：文字对齐 + HIFI 交互） =====
+    // 为什么弃 table：th/td 的列宽由内容撑开，表头与输入框天生不同宽（用户看到的"文字没对齐"）。
+    // 现在表头与每一行共用同一个【内容无关】的列模板（px + fr，没有 auto）⟹ 列位置逐像素一致。
+    // 表格与曲线同宽（720px）：列宽不至于被拉成"一大片空白输入框"，也不会跟上面的曲线错位
+    h += ".peqwrap{--peqcols:36px minmax(0,1.3fr) minmax(0,1fr) minmax(0,.9fr) 96px 40px;max-width:720px}";
+    h += ".peqhd,.peqr{display:grid;grid-template-columns:var(--peqcols);gap:0 8px;align-items:center}";
+    // 表头必须跟数据行【同一个滚动容器、同一个内容宽度】：否则滚动条宽度 + 表头自带边框
+    // 会让两边的可用宽度差 8~10px，fr 列随之变宽，逐列中心偏差线性放大到 9px（实测 1.7/4.9/7.7/9.0）。
+    h += ".peqhd{position:sticky;top:0;z-index:3;background:var(--field);border-bottom:1px solid var(--line);padding:7px 8px;font-size:11px;font-weight:600;color:var(--mut2);letter-spacing:.2px}";
+    h += ".peqhd>span{padding:0 6px;white-space:nowrap}";
+    h += ".peqhd>.num,.peqc.num{text-align:right}";
+    h += ".peqhd>.c,.peqc.c{text-align:center}";
+    h += ".peqrows{max-height:340px;overflow:auto;border:1px solid var(--line);border-radius:8px}";
+    h += ".peqr{padding:3px 8px;border-bottom:1px solid rgba(255,255,255,.05)}";
+    h += ".peqr:last-child{border-bottom:0}";
+    h += ".peqr:hover{background:var(--hov)}";
+    h += ".peqr.sel{background:var(--acc-weak);box-shadow:inset 2px 0 0 var(--acc)}";
+    h += ".peqr:focus{outline:0;background:var(--hov)}";
+    h += ".peqn{font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--mut2);font-variant-numeric:tabular-nums;text-align:right;padding:0 6px}";
+    h += ".peqr.sel .peqn{color:var(--acc-text);font-weight:700}";
+    h += ".peqc{padding:0 6px;min-width:0}";
+    // 覆盖 .sfld input 的 31px 高 / 7px 内边距（特异性 0,3,1 > 0,2,1）
+    h += ".peqwrap .peqc input[type=text],.peqwrap .peqc input[type=number],.peqwrap .peqc select{width:100%;height:24px;min-height:24px;box-sizing:border-box;padding:0 6px;border-radius:5px;border:1px solid var(--line);background:var(--field);color:var(--txt);font-size:11.5px;font-family:inherit;line-height:22px;font-variant-numeric:tabular-nums}";
+    h += ".peqwrap .peqc input[type=text],.peqwrap .peqc input[type=number]{text-align:right}";
+    h += ".peqwrap .peqc input:focus,.peqwrap .peqc select:focus{outline:0;border-color:var(--acc);box-shadow:0 0 0 2px var(--acc-weak)}";
+    h += ".peqwrap .peqc input[type=checkbox]{width:14px;height:14px;min-height:0;margin:0;accent-color:var(--acc)}";
+    h += ".peqcv{position:relative;max-width:720px;background:var(--field);border:1px solid var(--line);border-radius:8px;padding:6px 10px 2px;user-select:none}";
+    h += ".peqcv svg.peqsvg{display:block;width:100%;height:auto;touch-action:none}";
+    h += ".peqnode{fill:var(--acc);stroke:var(--bg);stroke-width:1.4;cursor:ns-resize}";
+    h += ".peqnode:hover,.peqnode.on{fill:var(--acc2);stroke-width:2}";
+    h += ".peqnode.off{fill:var(--mut2);opacity:.5}";
+    h += ".peqhit{fill:transparent;cursor:ns-resize}";
+    h += ".peqtip{position:absolute;z-index:6;pointer-events:none;background:var(--toast);border:1px solid var(--line);border-radius:7px;padding:4px 8px;font-size:11px;color:var(--txt);box-shadow:0 6px 18px var(--shadow);white-space:nowrap;opacity:0;transition:opacity .1s}";
+    h += ".peqtip.on{opacity:1}";
+    h += ".peqlegend{display:flex;gap:14px;flex-wrap:wrap;font-size:10.5px;color:var(--mut2);padding:5px 2px 0}";
+    h += ".peqlegend b{color:var(--txt2);font-weight:600}";
+
     // 2026-10-24（用户 261024-01 #5）：「密码框跟其他框样式不一样」的根因 ——
     // 旧选择器只列了 text/number，password 完全没命中任何一条规则 ⟹ 落到浏览器默认样式
     // （无内边距、方角、原生边框、宽度不铺满）。这里把所有文本类 input 一起列全，逐项对齐。

@@ -5,8 +5,8 @@
 IDI_APPICON ICON "rlplayer.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,4,0
- PRODUCTVERSION 1,0,4,0
+ FILEVERSION 1,3,14,0
+ PRODUCTVERSION 1,3,14,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -19,12 +19,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "RLPlayer"
             VALUE "FileDescription", "RLPlayer 高保真音乐播放器"
-            VALUE "FileVersion", "1.0.4.0"
+            VALUE "FileVersion", "1.3.14.0"
             VALUE "InternalName", "RLPlayer"
             VALUE "LegalCopyright", "RLPlayer"
             VALUE "OriginalFilename", "RLPlayer.exe"
             VALUE "ProductName", "RLPlayer"
-            VALUE "ProductVersion", "1.0.4.0"
+            VALUE "ProductVersion", "1.3.14.0"
         END
     END
     BLOCK "VarFileInfo"

@@ -2019,3 +2019,12 @@ DSD 源的 Integrator（IIR/FIR/CIC）与 Conversion（wide/narrow/XFi）、Dire
   对真实设备（Portacapture X8）出声约 50 秒/0 dB。已修产品根因（**POST 改为合并写**）+ 双方加播放硬门禁；详见
   `反馈和开发/develop/261023-04.txt.分析.md` §5.1。
 - **门禁**：build 0 错 / ctest 60/60 / 平台边界 PASS / uicheck「界面检查全部通过」/ npcheck 43/43。
+
+## 第三十五轮（2026-10-24）1.3.14 —— 261024-03 全部 + 协作者 N300 方案落地
+
+- **无边框（261024-03 #1/#2）**：真因 = WebView2 创建时相对客户区内缩 5px（tools/wv2_host.h create 末尾 resize(ctl,parent,5)），而启动路径上**没有任何 WM_SIZE** 把它改回 0 ⟹ 四边永久 5px 宿主带；DWM 激活/失焦/表面重建后重画时，带内只有最外 2px 是主题色，内侧 3px 是未初始化像素（dark 活跃 B4B4B4 / 失焦 F4F7FC；light = F4F6F9 F4F6F9 + B4B4B4x3 = 用户说的白框）。**10 轮没修好的原因**：旧判据是「最外 1..3px == --bg」，带子被刷成主题色时反而 PASS（铁律 3 陷阱）。新增**结构判据**（EnumChildWindows 量 WebView2 子窗口必须与客户区重合）+ tools/bordercheck.ps1（10 状态 x 6 类判据）：修复前 PASS=25 FAIL=20 → 修复后 45/45。顺带修：DWM 圆角切四角、最大化页面被切到屏外 10px、初始窗口尺寸 DPI 竞态（1340x880 vs 2010x1320，后者让界面挤成 893x587）、托盘「打开界面」另开带原生边框的 Edge 窗口、theme_flags 的 L"\r..." 回车符 bug。
+- **歌词（#3）**：三处真因 —— 上下留白写死 calc(50% - 22px)（首/末行差 8.7/9.4px）、scrollTo({behavior:'smooth'}) 在真机 WebView2 停滞（want=120 before=0 反复）、clientHeight=0 静默失败 + dataset.at 闸门。改 rAF 逐帧 + scrollTop 直接赋值 + 按行高写 CSS 变量留白 + 纯文本歌词显式提示。tools/lyr_dpr.js 17/17（893x587）+ 22/22（1340x880），首中末行偏差 ≤0.2px。⚠️ 用户「完全不会滚动」未复现；最可能是数据侧（其曲目无内嵌歌词、/api/lyrics ok=false），属推断。
+- **PEQ（#5）**：对齐根因 = table 表头与数据行宽度不一致（逐列偏差 1.74/4.94/7.70/9.00px）→ 共用内容无关列模板后两档视口全 0.00px；HIFI 化：曲线 20 个可拖拽节点、Shift+拖/滚轮改 Q、双击复位、tooltip、自动前级（防削波）、键盘微调；DSP 未改。tools/peqcheck.js 22/22。
+- **N300 欠载（debug/20261024-01）**：C1 删除独占缓冲无条件 20ms 封顶 + L1 放大预检 + L2 起播看门狗（0.8s 零写入）+ 学习缓存 + RTA_BUF_RESPECT 回滚；C2 STAT 增 per/bf/dry/dryms/ev/evint/prod、新增 PLAYBUF/WFAIL；C3 端点消失报 DEVICE_LOST（不回退共享/不重播）；C4 test_buffer_policy(49) + test_render_loop_dry(45)。⚠️ 仅 mock，未真机复测。
+- **门禁**：build 0 error / ctest **63/63** / bordercheck 45（1.3.14 复核 33 PASS + 1 项防火墙提示窗干扰）/ lyr_dpr 17+22 / peqcheck 22 / t25check 73/77（4 项为既有夹具，1.3.13 基线同样失败）。
+- **发布**：dist/RLPlayer-1.3.14-win64.zip（389,417,671 B，sha256 08B42B8924B49E3AC280B29729AFB1ABA4F5F8F0FB79000005DAA7FB9BD5F35C）；程序版本资源 1.0.4.0 → 1.3.14.0。

@@ -125,7 +125,12 @@ inline bool pump_until(HANDLE h, DWORD timeoutMs) {
     }
 }
 
-// inset：无边框窗口四周留给原生缩放命中的像素（WebView2 不铺满，鼠标才能在边缘拿到 WM_NCHITTEST）
+// inset：WebView2 相对父客户区的内缩像素。默认 0 = 满幅。
+// 2026-10-24 根因：create() 末尾原来写死 resize(ctl, parent, 5)，启动路径上之后没有任何
+// WM_SIZE 再来把它改成 0，于是四边永久留 5px 宿主带。这条带子只有 launcher 的
+// WM_ERASEBKGND/WM_PAINT 上色，DWM 表面重建（激活/失焦/跳转）后就是未初始化像素
+// （实测 active=B4B4B4、inactive=F4F7FC）—— 用户看到的"四边白框"就是它。
+// 边缘缩放不靠这条带子，而是 wv_child_hit_proc 把边缘命中交还父窗口（见 launcher.cpp）。
 inline bool resize(ICoreWebView2Controller* ctl, HWND hwnd, int inset = 0) {
     if (!ctl) return false;
     RECT rc{};
@@ -467,7 +472,7 @@ inline std::vector<Track> plan_tracks(const std::wstring& mode, const RuntimeInf
 
 inline bool create(HWND parent, const std::wstring& userDataDir, const std::wstring& url,
                    ICoreWebView2Controller** outCtl, ICoreWebView2** outWv, std::string& err,
-                   std::function<void(const std::wstring&)> onMessage = nullptr) {
+                   std::function<void(const std::wstring&)> onMessage = nullptr, int inset = 0) {
     // Loader 与 exe 同目录（发布包里也带着它）
     HMODULE loader = LoadLibraryW(L"WebView2Loader.dll");
     if (!loader) { err = "找不到 WebView2Loader.dll"; return false; }
@@ -586,7 +591,8 @@ inline bool create(HWND parent, const std::wstring& userDataDir, const std::wstr
         mh->Release();          // WebView2 持有引用
     }
     ctl->put_IsVisible(TRUE);
-    resize(ctl, parent, 5);
+    // 满幅：创建完立刻按 inset 摆放（默认 0）。调用方还会在 ShowWindow 前再 resize 一次兜底。
+    resize(ctl, parent, inset);
     wv->Navigate(url.c_str());
     *outCtl = ctl;
     *outWv = wv;

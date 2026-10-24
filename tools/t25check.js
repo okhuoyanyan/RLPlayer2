@@ -33,7 +33,7 @@ async function evalJs(e){ const r = await send('Runtime.evaluate',{expression:e,
 async function shot(n){ const r = await send('Page.captureScreenshot',{format:'png'}); fs.writeFileSync(path.join(OUT, n + '.png'), Buffer.from(r.data,'base64')); console.log('  [shot] ' + n); }
 async function waitFor(expr, ms){ const t0=Date.now(); while (Date.now()-t0 < (ms||10000)) { try { if (await evalJs('!!('+expr+')')) return true; } catch(e){} await sleep(150); } return false; }
 function ck(ok, what, detail){ const line='  ' + (ok?'[PASS] ':'[FAIL] ') + what + (detail!==undefined?('  '+JSON.stringify(detail)):''); results.push({ok:!!ok,what}); console.log(line); return ok; }
-async function setSize(W,H){ await send('Emulation.setDeviceMetricsOverride',{width:W,height:H,deviceScaleFactor:1,mobile:false}); await sleep(300); }
+async function setSize(W,H,dsf){ await send('Emulation.setDeviceMetricsOverride',{width:W,height:H,deviceScaleFactor:dsf||1,mobile:false}); await sleep(320); }
 function fmtLike(x) {
   x = Math.max(0, Math.round(x || 0));
   var h = Math.floor(x/3600), m = Math.floor((x%3600)/60), s = x%60;
@@ -128,7 +128,7 @@ const PAGE_MOCK = fs.readFileSync(path.join(__dirname, 'mock_t25.js'), 'utf8')
   }
 
   await evalJs('(function(){ delete window.__freezePos; delete window.__freezeDur; return 1; })()');
-  const manual = await evalJs('(function(){var box=document.getElementById("npLyric");var p=(S.dur||1)*0.2;window.__freezePos=p;S.pos=p;LY.at=-1;renderNpLyric();box.dispatchEvent(new WheelEvent("wheel",{deltaY:300}));var guard=LYMAN.until>Date.now();var before=box.scrollTop;var p2=(S.dur||1)*0.8;window.__freezePos=p2;S.pos=p2;LY.at=-1;renderNpLyric();return {guard:guard,before:Math.round(before),after:Math.round(box.scrollTop)};})()');
+  const manual = await evalJs('(function(){var box=document.getElementById("npLyric");var p=(S.dur||1)*0.2;window.__freezePos=p;S.pos=p;LY.at=-1;renderNpLyric();box.dispatchEvent(new WheelEvent("wheel",{deltaY:300}));var guard=LYMAN.until>Date.now();var before=box.scrollTop;var p2=(S.pos||0)+0.5;window.__freezePos=p2;S.pos=p2;LY.at=-1;renderNpLyric();return {guard:guard,before:Math.round(before),after:Math.round(box.scrollTop)};})()');
   await sleep(400);
   ck(manual.guard === true, '#4 滚轮后进入 3 秒手动保护', manual);
   ck(Math.abs(manual.after - manual.before) <= 4, '#4 保护期内不抢滚动（scrollTop 基本不变）', manual);
@@ -150,6 +150,82 @@ const PAGE_MOCK = fs.readFileSync(path.join(__dirname, 'mock_t25.js'), 'utf8')
   }
   ck(seekChk && seekChk.idx === seekChk.exp && Math.abs(seekChk.off) <= 12, '#4 seek 后高亮行跟到新位置并立刻重定位（居中）', seekChk);
   ck(seekChk.guard === 0, '#4 seek 会清掉手动滚动保护', seekChk.guard);
+
+  // ===== #4b 真机档视口 893x587 / DPR 1.5（261024-03 #3 用户报「完全不会滚动」的就是这一档） =====
+  // 为什么必须单列一档：旧验收只有 1576x908/DPR1（1576 宽 > 1240 ⟹ 右栏可见、行高 34px），
+  // 而真机 WebView2 的 CSS 视口是 893x587（窗口 1340x880 物理 @150%）或 1340x880。
+  // 两档都要过；判据与 tools/lyr_dpr.js 同源。
+  // 夹具：这一档自己注入一份 16 行、铺满全曲的 LRC（拦截 /api/lyrics），
+  //       不依赖被测曲目是否带歌词 —— 曲库里的曲目大多没有 .lrc，用真实歌词会让这一档静默空转。
+  console.log('=== #4b 真机档 893x587 / DPR 1.5 ===');
+  await setSize(893, 587, 1.5);
+  const vp2 = await evalJs('({w:innerWidth,h:innerHeight,dpr:devicePixelRatio})');
+  ck(Math.round(vp2.w) === 893 && Math.round(vp2.h) === 587 && Math.abs(vp2.dpr - 1.5) < 0.01,
+     '#4b 视口 = 893x587 / DPR 1.5', vp2);
+  if (!(await evalJs("document.getElementById('npPage').classList.contains('on')"))) {
+    await evalJs("document.getElementById('npOpen').click()");
+    await waitFor("document.getElementById('npPage').classList.contains('on')", 6000);
+  }
+  // 注入 16 行、时间戳均布于全曲的 LRC（只拦 /api/lyrics；其余请求照旧）
+  await evalJs('(function(){' +
+    'if(!window.__lyMockInstalled){window.__lyMockInstalled=1;var of=window.fetch;' +
+    'window.fetch=function(u,o){var s=String(u);' +
+    'if(s.indexOf("/api/lyrics")===0 && window.__LYMOCK && window.__LYMOCK.on){' +
+    'return Promise.resolve(new Response(JSON.stringify({ok:true,lrc:window.__LYMOCK.lrc}),{status:200,headers:{"Content-Type":"application/json"}}));}' +
+    'return of.apply(this,arguments);};}' +
+    'var dur=S.dur||240,n=16,a=[];for(var i=0;i<n;i++){var t=dur*i/n,m=Math.floor(t/60),q=Math.floor(t%60);' +
+    'a.push("["+(m<10?"0":"")+m+":"+(q<10?"0":"")+q+".00]MOCK 歌词第 "+(i+1)+" 行");}' +
+    'window.__LYMOCK={on:true,lrc:a.join(String.fromCharCode(10))};LYRETRY.file="";loadLyrics(S.lastCur);return 1;})()');
+  await waitFor('LY.lines.length === 16', 12000);
+  const nL2 = await evalJs('LY.lines.length');
+  ck(nL2 === 16 && (await evalJs('LY.timed === true')), '#4b 夹具就位：16 行带时间轴歌词', nL2);
+  const g2 = await evalJs('(function(){var b=document.getElementById("npLyric");return {ch:b.clientHeight,sh:b.scrollHeight};})()');
+  console.log('  #4b 夹具: ' + nL2 + ' 行 / 容器 ' + JSON.stringify(g2));
+  ck(g2.ch > 40 && g2.sh > g2.ch, '#4b 歌词容器有高度且真的可滚（893x587 下不塌陷）', g2);
+
+  // (a) 用【行时间戳】驱动（不依赖这首歌的歌词是否铺满全曲）：首行 / 中间 / 末行
+  const probeRows = [['首行', 0], ['中间', Math.floor(nL2 / 2)], ['末行', nL2 - 1]];
+  const rowGeo = [];
+  for (const [nm, idx] of probeRows) {
+    await evalJs('(function(){var t=LY.lines[' + idx + '].t+0.2; window.__freezePos=t; window.__freezeDur=S.dur||1;' +
+                 'S.pos=t; LYMAN.until=0; LY.at=-1; var b=document.getElementById("npLyric"); b.dataset.at=""; renderNpLyric(); return 1;})()');
+    await sleep(700);
+    const r3 = await evalJs('(function(){var box=document.getElementById("npLyric");var on=box.querySelector(".npline.on");' +
+      'if(!on)return {has:false};var br=box.getBoundingClientRect(),er=on.getBoundingClientRect();' +
+      'return {has:true,st:Math.round(box.scrollTop*100)/100,idx:+on.dataset.i,' +
+      'off:Math.round(((er.top+er.height/2)-(br.top+br.height/2))*100)/100,ch:box.clientHeight,sh:box.scrollHeight};})()');
+    rowGeo.push({ nm, idx, ...r3 });
+    ck(r3.has && r3.idx === idx && Math.abs(r3.off) <= 8,
+       '#4b ' + nm + '（第 ' + (idx + 1) + ' 行）滚到容器正中（|off| <= 8px）', r3);
+  }
+  const stA = rowGeo[0] && rowGeo[0].st, stB = rowGeo[1] && rowGeo[1].st, stC = rowGeo[2] && rowGeo[2].st;
+  ck(stA !== stB || stB !== stC, '#4b scrollTop 随行变化（不是钉死不动）', {st首行: stA, st中: stB, st末: stC});
+  ck(Math.abs(rowGeo[0].off) <= 4 && Math.abs(rowGeo[2].off) <= 4,
+     '#4b 首行/末行也能滚到正中（|off| <= 4px；旧 calc(50% - 22px) 在此档差 8.7/9.4px）',
+     {首行: rowGeo[0].off, 末行: rowGeo[2].off});
+
+  // (b) 30/60/90% 播放进度：居中 + scrollTop 有变化
+  const seq3 = [];
+  for (const pct of [30, 60, 90]) {
+    await evalJs('(function(){var d=S.dur||1;var p=d*' + pct + '/100; window.__freezePos=p; window.__freezeDur=d;' +
+                 'S.pos=p; LYMAN.until=0; LY.at=-1; document.getElementById("npLyric").dataset.at=""; renderNpLyric(); return 1;})()');
+    await sleep(700);
+    const g3 = await evalJs('(function(){var box=document.getElementById("npLyric");var on=box.querySelector(".npline.on");' +
+      'if(!on)return {has:false};var br=box.getBoundingClientRect(),er=on.getBoundingClientRect();' +
+      'return {has:true,st:Math.round(box.scrollTop*100)/100,off:Math.round(((er.top+er.height/2)-(br.top+br.height/2))*100)/100};})()');
+    seq3.push({ pct, ...g3 });
+    ck(g3.has && Math.abs(g3.off) <= 8, '#4b ' + pct + '% 时 active 行居中（|off| <= 8px）', {off:g3.off, st:g3.st});
+  }
+  ck(new Set(seq3.map(x => x.st)).size > 1 || stA !== stC,
+     '#4b 30/60/90% 期间 scrollTop 发生过变化', {seq: seq3.map(x => x.st), 行驱动: [stA, stB, stC]});
+
+  // (c) 893 宽下右栏被 media query 收起 —— 明确记录，不当失败
+  const railHidden = await evalJs("(function(){var r=document.getElementById('right');if(!r)return true;return getComputedStyle(r).display==='none';})()");
+  ck(railHidden === true, '#4b 893 宽下右栏 #right 按 @media(max-width:1240px) 收起（右栏歌词判据由 1576 档覆盖）');
+  await shot('t25-lyrics-dpr893');
+  await evalJs('(function(){delete window.__freezePos; delete window.__freezeDur;' +
+               'if(window.__LYMOCK) window.__LYMOCK.on=false; LYRETRY.file=""; if(S.lastCur) loadLyrics(S.lastCur); return 1;})()');
+  await setSize(1576, 908);
 
   // ================= #3 时长 / 曲目列表 =================
   console.log('=== #3 时长与曲目列表（本地曲库为唯一真相源） ===');

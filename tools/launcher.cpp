@@ -164,7 +164,9 @@ static void theme_flags(bool& dark, bool& blue) {
     blue = false;
     if (dark) return;
     FILE* f = nullptr;
-    const std::wstring path = exe_dir() + L"\rlplayer-settings.conf";
+    // 旧写法 L"\r..." 里的 \r 是回车符（不是目录分隔符）：这条路径永远打不开文件，
+    // 于是 theme:blue 的兜底轮询永远拿不到 blue，浅蓝主题会被刷成浅色 --bg（差一圈颜色）。
+    const std::wstring path = exe_dir() + L"\\rlplayer-settings.conf";
     if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return;
     char buf[4096] = {0};
     const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
@@ -482,6 +484,32 @@ static UINT dpi_system() {
     return d ? d : 96u;
 }
 
+// 窗口所在监视器的有效 DPI。
+// 2026-10-24 实测（主控）：同一份 1.3.13 两次启动的窗口物理尺寸不同（1340x880 vs 2010x1320），
+// 因为创建时用 dpi_system()（GetDC(NULL) 有时仍报 96），而 dpi_of(hwnd) 偶尔也返回 96，
+// 于是"无需校正"的分支被走到 —— 逻辑尺寸在 1340x880 与 893x587 之间漂。
+// 这里改成以 MonitorFromWindow + GetDpiForMonitor(MDT_EFFECTIVE_DPI) 为准，窗口建好后
+// 无条件按它校正到 1340x880 逻辑像素，并把实际 DPI/尺寸写进 launcher.log。
+static UINT dpi_for_monitor(HWND hwnd) {
+    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    HMODULE sh = LoadLibraryW(L"shcore.dll");
+    if (sh) {
+        typedef HRESULT(WINAPI* FnDpi)(HMONITOR, int, UINT*, UINT*);
+        auto f = (FnDpi)GetProcAddress(sh, "GetDpiForMonitor");
+        if (f && mon) {
+            UINT dx = 0, dy = 0;
+            if (SUCCEEDED(f(mon, 0 /*MDT_EFFECTIVE_DPI*/, &dx, &dy)) && dx) {
+                FreeLibrary(sh);
+                return dx;
+            }
+        }
+        FreeLibrary(sh);
+    }
+    const UINT d = dpi_of(hwnd);
+    if (d) return d;
+    return dpi_system();
+}
+
 // 逻辑像素 → 当前窗口的物理像素（kBandInset、初始窗口尺寸都走它换算）
 static int dp(HWND hwnd, int v) { return (int)(((long long)v * dpi_of(hwnd) + 48) / 96); }
 
@@ -493,6 +521,7 @@ static ::ICoreWebView2Controller* g_wvCtl = nullptr;
 static ::ICoreWebView2* g_wv = nullptr;
 static bool g_captionDark = true;
 static bool g_captionBlue = false;   // 三套主题里"浅蓝"单独一档（--bg #e9f2ff 与浅色 #f4f6f9 不同色）
+static DWORD g_lastDwmApply = 0;     // WM_WINDOWPOSCHANGED 里重设 DWM 属性的限流时间戳
 // 运行期主题的唯一真相源是【网页】—— 网页知道真主题（localStorage 里的选择优先于 conf），
 // 用户点主题按钮时它会立刻发 theme:xxx 消息。conf 文件只在"网页还没发消息"时当启动默认值。
 // 不收这个标志的话，1.5 秒轮询会拿 conf 里的旧值把网页刚设的主题覆盖回去：
@@ -516,7 +545,10 @@ static void update_band(COLORREF bg) {
     g_bandBrush = CreateSolidBrush(bg);
 }
 
-static void apply_caption(HWND h, bool dark, bool blue = false) {
+// 只改 DWM 属性、不动窗口几何、不触发重绘 —— 可以在 WM_ACTIVATE/WM_NCACTIVATE/
+// WM_DPICHANGED/WM_WINDOWPOSCHANGED/WM_SETTINGCHANGE 里反复调用。
+// 为什么要能反复调：DWM 在激活/失焦/DPI 变化/表面重建后会重画窗口框，只设一次不保险。
+static void apply_dwm(HWND h, bool dark, bool blue = false) {
     HMODULE dwm = ::LoadLibraryW(L"dwmapi.dll");
     if (!dwm) return;
     typedef HRESULT(WINAPI* PFN_SET)(HWND, DWORD, LPCVOID, DWORD);
@@ -536,10 +568,19 @@ static void apply_caption(HWND h, bool dark, bool blue = false) {
         // 外面画一圈白框(2026-10-22 实测截图定位)。改设与标题栏同色的显式色,
         // 1px 同色边视觉上等于消失,浅色主题同理。
         setAttr(h, 34, &bd, sizeof(bd));     // DWMWA_BORDER_COLOR = 主题同色
-        DWORD corner = 2;                    // DWMWCP_ROUND
+        // 圆角(33=DWMWA_WINDOW_CORNER_PREFERENCE)：2026-10-24 用户要求"完全无边框"。
+        // DWMWCP_ROUND 会把窗口四角切成圆弧、露出窗外的桌面/别的窗口 —— bordercheck
+        // 逐像素实测四角 5x5 色差 spread=200~249（TL 0C0C0C vs 页面 08090C）。
+        // 改 DWMWCP_DONOTROUND(1)：窗口本体是矩形，四角由页面内容铺满。
+        DWORD corner = 1;                    // DWMWCP_DONOTROUND
         setAttr(h, 33, &corner, sizeof(corner));
     }
     FreeLibrary(dwm);
+}
+
+// 改 DWM 属性 + 换边带刷 + 让边框立刻生效（启动 / 主题切换时用）
+static void apply_caption(HWND h, bool dark, bool blue = false) {
+    apply_dwm(h, dark, blue);
     // 边带(WebView2 内缩 5px 露出的宿主区域)同刷主题色:第十二轮起窗口类没有
     // 背景刷也没有 WM_PAINT,这片区域从未绘制,显示成创建时的垃圾像素(1px 白
     // +3px 灰)——这正是 1.0.4 起"UI 最外一圈白框"的真凶(2026-10-22 逐像素
@@ -687,11 +728,27 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_ACTIVATEAPP:
         case WM_SHOWWINDOW:
             repaint_band(hwnd);
+            // 激活/失焦时 DWM 会重画窗口框。属性是幂等的，这里直接重设一遍（不重绘、不递归）。
+            apply_dwm(hwnd, g_captionDark, g_captionBlue);
             break;
         case WM_KILLFOCUS:
         case WM_SETFOCUS:
+            repaint_band(hwnd);
+            break;
         case WM_WINDOWPOSCHANGED:
             repaint_band(hwnd);
+            // 拖动/缩放时这条消息很密：限流 200ms 重设一次即可（属性幂等，代价是几次 API 调用）
+            {
+                const DWORD now = GetTickCount();
+                if (now - g_lastDwmApply > 200) {
+                    g_lastDwmApply = now;
+                    apply_dwm(hwnd, g_captionDark, g_captionBlue);
+                }
+            }
+            break;
+        case WM_SETTINGCHANGE:
+            // 系统主题/强调色/DPI 变化后 DWM 会重画边框，重新应用一次
+            apply_dwm(hwnd, g_captionDark, g_captionBlue);
             break;
         case WM_PAINT: {
             // 兜底：DefWindowProc 的 BeginPaint 不一定带擦除标志。这里自己补一遍边带，
@@ -708,13 +765,36 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         case WM_NCCALCSIZE:
-            // 去掉原生标题栏，但保留 WS_THICKFRAME 的缩放能力。
-            if (wp) return 0;
+            // 去掉原生标题栏，但保留 WS_THICKFRAME 的缩放能力（客户区 = 窗口矩形）。
+            if (wp) {
+                auto* p = reinterpret_cast<NCCALCSIZE_PARAMS*>(lp);
+                // 最大化：系统按"边框厚度"把窗口外扩。2026-10-24 bordercheck 实测
+                //   client = -10,-10 3860x2180，而监视器是 0,0 3840x2160
+                // ⟹ 页面右侧/底部各有 10px 被切到屏外。这里把客户区钉回监视器矩形。
+                if (IsZoomed(hwnd)) {
+                    MONITORINFO mi{};
+                    mi.cbSize = sizeof(mi);
+                    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    if (mon && GetMonitorInfoW(mon, &mi)) p->rgrc[0] = mi.rcMonitor;
+                }
+                return 0;
+            }
             break;
         case WM_GETMINMAXINFO: {
             MINMAXINFO* mmi = (MINMAXINFO*)lp;
             mmi->ptMinTrackSize.x = 960;
             mmi->ptMinTrackSize.y = 640;
+            // 最大化尺寸/位置直接给监视器矩形（工作区原点差），配合 WM_NCCALCSIZE 的修正，
+            // 保证最大化后客户区严格等于屏幕，而不是"屏幕 + 两条边框"。
+            MONITORINFO mi{};
+            mi.cbSize = sizeof(mi);
+            HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if (mon && GetMonitorInfoW(mon, &mi)) {
+                mmi->ptMaxPosition.x = mi.rcMonitor.left - mi.rcWork.left;
+                mmi->ptMaxPosition.y = mi.rcMonitor.top - mi.rcWork.top;
+                mmi->ptMaxSize.x = mi.rcMonitor.right - mi.rcMonitor.left;
+                mmi->ptMaxSize.y = mi.rcMonitor.bottom - mi.rcMonitor.top;
+            }
             return 0;
         }
         case WM_NCHITTEST: {
@@ -743,6 +823,10 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             const RECT* r = (const RECT*)lp;
             SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
+            // DPI 变化 = DWM 重新算窗口框，边框/圆角偏好要重设
+            apply_dwm(hwnd, g_captionDark, g_captionBlue);
+            logf(L"WM_DPICHANGED: 新 DPI %u，窗口 %ldx%ld", LOWORD(wp),
+                 r->right - r->left, r->bottom - r->top);
             return 0;
         }
         case WM_SIZE:
@@ -818,21 +902,19 @@ static bool open_webview_window(int port) {
     // 等窗口建好才变 192，于是窗口在 5K@200% 屏上只有 670 逻辑像素宽（一半）。
     // 这里用 GetDpiForWindow（创建后是准的）直接算出目标物理尺寸，与实际值不同就 SetWindowPos。
     {
-        const UINT d0 = dpi_of(hwnd);
-        if (d0 != 96) {
-            RECT r{};
-            GetWindowRect(hwnd, &r);
-            const int wantW = (int)((long long)1340 * d0 / 96);
-            const int wantH = (int)((long long)880 * d0 / 96);
-            if ((r.right - r.left) != wantW || (r.bottom - r.top) != wantH) {
-                SetWindowPos(hwnd, nullptr, 0, 0, wantW, wantH, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-                logf(L"高 DPI：窗口 DPI %u，初始尺寸 %dx%d → %dx%d",
-                     d0, r.right - r.left, r.bottom - r.top, wantW, wantH);
-            } else {
-                logf(L"高 DPI：窗口 DPI %u，初始尺寸已是 %dx%d", d0, wantW, wantH);
-            }
+        // 无条件按"监视器真实 DPI"校正（不再用 d0 != 96 当条件：那条分支会在
+        // dpi_of() 恰好返回 96 时跳过，导致物理尺寸 1340x880、逻辑只剩 893x587）。
+        const UINT d0 = dpi_for_monitor(hwnd);
+        RECT r{};
+        GetWindowRect(hwnd, &r);
+        const int wantW = MulDiv(1340, (int)d0, 96);
+        const int wantH = MulDiv(880, (int)d0, 96);
+        if ((r.right - r.left) != wantW || (r.bottom - r.top) != wantH) {
+            SetWindowPos(hwnd, nullptr, 0, 0, wantW, wantH, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            logf(L"高 DPI：监视器 DPI %u，初始尺寸 %ldx%ld -> %dx%d（逻辑 1340x880）",
+                 d0, r.right - r.left, r.bottom - r.top, wantW, wantH);
         } else {
-            logf(L"高 DPI：窗口 DPI 96（100%%），初始尺寸无需校正");
+            logf(L"高 DPI：监视器 DPI %u，初始尺寸已是 %dx%d（逻辑 1340x880）", d0, wantW, wantH);
         }
     }
 
@@ -878,13 +960,16 @@ static bool open_webview_window(int port) {
         default: break;
         }
     };
-    if (!rta::wv2::create(hwnd, userData, url, &g_wvCtl, &g_wv, err, onMessage)) {
+    if (!rta::wv2::create(hwnd, userData, url, &g_wvCtl, &g_wv, err, onMessage, kBandInset)) {
         logf(L"WebView2 启动失败（%S），退回 Edge", err.c_str());
         DestroyWindow(hwnd);
         g_mainWnd = nullptr;
         return false;
     }
     install_wv_edge_hittest(hwnd);   // 满幅模式：让 WebView2 子窗口把边缘命中交还父窗口
+    // 满幅兜底：WebView2 创建期间若窗口被 DPI 校正/系统调整过，这里按最新客户区再摆一次，
+    // 不依赖"之后会来一条 WM_SIZE"（2026-10-24 根因就是启动路径上根本没有 WM_SIZE）。
+    rta::wv2::resize(g_wvCtl, hwnd, kBandInset);
     theme_flags(g_captionDark, g_captionBlue);
     apply_caption(hwnd, g_captionDark, g_captionBlue);
     SetTimer(hwnd, 1, 1500, nullptr);   // 主题跟随（conf 兜底）
@@ -892,6 +977,10 @@ static bool open_webview_window(int port) {
     // 之所以要定时器而不是只靠消息：实测"页面加载完成后的合成"会覆盖掉我们的填充，
     // 而那之后不再有 WM_PAINT/WM_NCPAINT 送进来。
     SetTimer(hwnd, 2, 250, nullptr);
+    // 首帧兜底：窗口类没有 hbrBackground，ShowWindow 之前先把客户区擦成主题色，
+    // 避免 DWM 第一帧取到未初始化表面（历史上就是"1px 白 + 3px 灰"垃圾像素）。
+    // 注意 WM_ERASEBKGND 的 wParam 可能是 -1，main_wnd_proc 里已处理成自取 DC。
+    RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
     logf(L"已用内置 WebView2 打开界面（无浏览器外壳）");
@@ -924,6 +1013,27 @@ static void install_wv_edge_hittest(HWND top) {
     if (top) EnumChildWindows(top, subclass_wv_child, 0);
 }
 
+// 托盘"打开播放界面"/双击托盘图标：把【已有的无边框 WebView2 窗口】拉到前台。
+//
+// 2026-10-24：旧实现无条件走 open_browser()，于是每次点托盘都会再开一个 Edge --app 窗口。
+// 那个窗口的边框/标题栏归 Edge 和 DWM 管（不是我们的窗口过程），浅色主题下四边就是
+// 一圈原生边框 —— 用户报的"四边白框"里，凡是"点托盘打开"的截图都可能来自这条路径。
+// 现在只有 WebView2 窗口真的不存在时才退回 Edge（那是 WebView2 运行库缺失的降级路径）。
+static void show_main_window(int port) {
+    HWND h = g_mainWnd;
+    if (h && IsWindow(h)) {
+        if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+        else ShowWindow(h, SW_SHOW);
+        SetForegroundWindow(h);
+        BringWindowToTop(h);
+        apply_dwm(h, g_captionDark, g_captionBlue);
+        logf(L"托盘：已存在的 WebView2 窗口置前 hwnd=0x%p（不再另开 Edge 窗口）", (void*)h);
+        return;
+    }
+    logf(L"托盘：WebView2 窗口不存在，退回 Edge --app（该窗口有原生边框，属降级路径）");
+    open_browser(port);
+}
+
 // ---------------- 窗口过程 ----------------
 static void show_menu(HWND hwnd) {
     HMENU m = CreatePopupMenu();
@@ -944,11 +1054,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_TRAYICON:
             if (LOWORD(lp) == WM_RBUTTONUP) show_menu(hwnd);
-            else if (LOWORD(lp) == WM_LBUTTONDBLCLK) open_browser(g_port);
+            else if (LOWORD(lp) == WM_LBUTTONDBLCLK) show_main_window(g_port);
             return 0;
         case WM_COMMAND:
             switch (LOWORD(wp)) {
-                case ID_TRAY_OPEN: open_browser(g_port); break;
+                case ID_TRAY_OPEN: show_main_window(g_port); break;
                 case ID_TRAY_COPY: copy_address(g_port); break;
                 case ID_TRAY_LAN: {
                     const bool now = !lan_enabled();

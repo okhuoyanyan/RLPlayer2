@@ -2300,7 +2300,12 @@ function applyRTab(forceHide) {
 function setRTab(t) {
   RTAB = t;
   applyRTab(false);
-  if (t === 'l') { loadLyrics(S.lastCur); }
+  if (t === 'l') {
+    // 页签刚显示时容器这一刻才有布局：先按当前进度强制重定位（不等下一次 /api/status 轮询）
+    lyricReposition();
+    syncLyrics(S.pos || 0, true);
+    if (!LY.lines.length) loadLyrics(S.lastCur);
+  }
 }
 Array.prototype.forEach.call(document.querySelectorAll('.rtab'), function (e) {
   e.onclick = function () { setRTab(e.dataset.t); };
@@ -2316,7 +2321,10 @@ Array.prototype.forEach.call(document.querySelectorAll('.rtab'), function (e) {
 // [offset:±ms]）；滚动一律用 getBoundingClientRect 相对滚动容器算目标位置（与 offsetParent 无关）。
 var LY = { lines: [], at: -1, raw: '', timed: false, lastPos: -1 };
 var LYMAN = { until: 0 };            // 手动滚动保护：这段时间内不自动抢滚动
-function lyricManual() { LYMAN.until = Date.now() + 3000; }
+function lyricManual() {
+  LYMAN.until = Date.now() + 3000;
+  if (LYFOLLOW.raf) { cancelAnimationFrame(LYFOLLOW.raf); LYFOLLOW.raf = 0; }
+}
 function lyricTimed() { return !!(LY.lines.length && LY.lines[0].t >= 0); }
 function parseLrc(s) {
   var out = [];
@@ -2359,17 +2367,73 @@ function parseLrc(s) {
   }
   return out;
 }
-// 把某一行滚到滚动容器垂直居中（rect 相减，跟 offsetParent 无关；smooth 由浏览器做过渡）
-function lyricScrollTo(box, el, smooth) {
-  if (!box || !el) return;
-  var br = box.getBoundingClientRect(), er = el.getBoundingClientRect();
-  var target = box.scrollTop + (er.top - br.top) - (box.clientHeight - er.height) / 2;
-  var max = Math.max(0, box.scrollHeight - box.clientHeight);
-  target = Math.max(0, Math.min(target, max));
-  if (Math.abs(target - box.scrollTop) < 2) return;
-  try { box.scrollTo({ top: target, behavior: smooth ? 'smooth' : 'auto' }); }
-  catch (e) { box.scrollTop = target; }
+// ---- 跟随滚动（261024-03 #3 重做） ----
+// 旧实现用 scrollTo({behavior:'smooth'})。真机 WebView2（Chromium 155）实测：smooth 的
+// 滚动动画在容器刚从 display:none 变可见 / 连续改目标时会被合并或停滞 —— 日志里
+//   scrollTo lyricbox want=120 before=0 immediate=0
+//   （1.5s 后）scrollTo lyricbox want=211 before=0 immediate=0
+// 目标写了两次，scrollTop 一动不动；到第三次才动。视口尺寸无关（1340x880 / 893x587 都出现过）。
+// 现在：
+//   * 一律用 scrollTop 直接赋值（同步生效，可验证），完全不依赖 smooth；
+//   * 赋值后下一帧复测，未到位就续跑（最多 1.5s）——覆盖「留白还没生效 / 布局还没稳定」；
+//   * 容器 clientHeight==0（面板隐藏、网格行塌陷）时不再静默失败：在 1.5s 内逐帧重试；
+//   * 行元素一律按 data-i 取，不再用 children 下标（提示条会混进 children）。
+var LYFOLLOW = { raf: 0, deadline: 0 };
+function lyricRows(box) {
+  var out = [];
+  if (!box) return out;
+  for (var i = 0; i < box.children.length; i++) {
+    var e = box.children[i];
+    if (e && e.dataset && e.dataset.i !== undefined) out.push(e);
+  }
+  return out;
 }
+function lyricLinePx(box) {
+  var rows = lyricRows(box);
+  for (var i = 0; i < rows.length; i++) {
+    var h = rows[i].getBoundingClientRect().height;
+    if (h > 0) return h;
+  }
+  return 0;
+}
+// 上下留白 = (容器高 - 行高)/2，写进 CSS 变量（::before/::after 用它）⟹ 首行/末行也能滚到正中
+function lyricPad(box) {
+  if (!box) return;
+  var ch = box.clientHeight, lh = lyricLinePx(box);
+  if (ch <= 0 || lh <= 0) return;
+  var pad = Math.max(0, (ch - lh) / 2);
+  var name = (box.id === 'lyricbox') ? '--lyrpad' : '--nppad';
+  var cur = box.style.getPropertyValue(name);
+  if (cur && Math.abs(parseFloat(cur) - pad) < 0.3) return;
+  box.style.setProperty(name, pad.toFixed(2) + 'px');
+}
+function lyricTarget(box, el) {
+  var br = box.getBoundingClientRect(), er = el.getBoundingClientRect();
+  var t = box.scrollTop + (er.top - br.top) - (box.clientHeight - er.height) / 2;
+  var max = Math.max(0, box.scrollHeight - box.clientHeight);
+  return Math.max(0, Math.min(t, max));
+}
+function lyricScrollTo(box, el) {
+  if (!box || !el) return;
+  lyricPad(box);
+  if (LYFOLLOW.raf) { cancelAnimationFrame(LYFOLLOW.raf); LYFOLLOW.raf = 0; }
+  LYFOLLOW.deadline = Date.now() + 1500;
+  var step = function () {
+    LYFOLLOW.raf = 0;
+    if (!box || !el || !box.isConnected) return;
+    lyricPad(box);
+    if (box.clientHeight <= 0) {                     // 没布局：逐帧重试，别静默放弃
+      if (Date.now() < LYFOLLOW.deadline) LYFOLLOW.raf = requestAnimationFrame(step);
+      return;
+    }
+    var t = lyricTarget(box, el);
+    if (Math.abs(t - box.scrollTop) >= 0.6) box.scrollTop = t;
+    if (Math.abs(t - box.scrollTop) >= 0.6 && Date.now() < LYFOLLOW.deadline)
+      LYFOLLOW.raf = requestAnimationFrame(step);
+  };
+  step();
+}
+
 // seek / 切歌：解除手动保护并允许立刻重定位
 function lyricReposition() { LYMAN.until = 0; LY.lastPos = -1; LY.at = -1; }
 // 2026-10-23 用户反馈「歌词要等约 10 秒才出现」：
@@ -2391,8 +2455,12 @@ function loadLyrics(file, isRetry) {
     LY.raw = (j && j.lrc) || '';
     LY.timed = lyricTimed();
     LY.at = -1; LY.lastPos = -1; LYMAN.until = 0;   // 换歌：清掉上一首的高亮/手动保护
+    // 纯文本歌词：给一条显式提示（否则"不滚"看起来就是坏了 —— 261024-03 #3 用户反馈）
+    var lyHint = (LY.lines.length && !LY.timed)
+      ? '<div class=ly-hint title="这份歌词没有 [mm:ss] 时间轴，无法按播放位置高亮/跟随">纯文本歌词（无时间轴）· 不会自动跟随滚动</div>'
+      : '';
     D('lyricbox').innerHTML = LY.lines.length
-      ? LY.lines.map(function (l, i) {
+      ? lyHint + LY.lines.map(function (l, i) {
           return '<div class="ly" data-i="' + i + '">' + esc(l.s) + '</div>';
         }).join('')
       : '<div class="ly none">没有歌词<br><span style="font-size:11px">同名 .lrc 文件、内嵌歌词，或播放时自动在线补全（可在设置-元数据补全关闭）</span></div>';
@@ -2420,20 +2488,19 @@ function loadLyrics(file, isRetry) {
   }).catch(function () { D('lyricbox').innerHTML = '<div class="ly none">歌词加载失败</div>'; });
 }
 // 右栏歌词（#lyricbox）：与整页歌词共用同一套解析/居中逻辑（261024-02 #4）
-function syncLyrics(pos) {
+function syncLyrics(pos, force) {
   if (!lyricTimed()) return;
   var idx = -1;
   for (var i = 0; i < LY.lines.length; i++) { if (LY.lines[i].t <= pos + 0.05) idx = i; else break; }
-  if (idx === LY.at) return;
-  LY.at = idx;
   var box = D('lyricbox');
   if (!box) return;
-  Array.prototype.forEach.call(box.children, function (e, i) {
-    if (e.dataset.i === undefined) return;
-    e.classList.toggle('on', i === idx);
-  });
-  var el = box.children[idx];
-  if (el && RTAB === 'l' && Date.now() >= LYMAN.until) lyricScrollTo(box, el, true);
+  if (idx === LY.at && !force) return;
+  LY.at = idx;
+  var rows = lyricRows(box);
+  for (var r = 0; r < rows.length; r++) rows[r].classList.toggle('on', +rows[r].dataset.i === idx);
+  var el = rows[idx];
+  // 右栏歌词页签没打开时不要滚（clientHeight=0，滚了也没意义）；切到该页签时会 force 重定位
+  if (el && RTAB === 'l' && Date.now() >= LYMAN.until) lyricScrollTo(box, el);
 }
 
 /* ---------------- 播放列表（UI 已并入播放队列） ---------------- */
@@ -4259,6 +4326,8 @@ function eqSettingsHtml() {
       '<div class="sfld wide" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">'
     + '<label class=chk style="margin:0"><input type=checkbox id=peqBypass> 旁路（bypass）</label>'
     + '<label style="font-size:12px;color:var(--mut2)">前级增益 <input type=number id=peqPreamp step=0.1 min=-24 max=24 value=0 style="width:74px;height:26px"> dB</label>'
+    // 261024-03 #5：按曲线峰值一键设前级，防削波（只在前端算，DSP 不动）
+    + '<button class="btn" id=peqAutoPre type=button title="把前级设为 -ceil(当前曲线峰值增益)，给 EQ 提升留出余量，避免数字削波">自动前级（防削波）</button>'
     + '<label style="font-size:12px;color:var(--mut2)">预设 <select id=peqPreset style="min-width:160px;height:26px"></select></label>'
     + '<button class="btn" id=peqLoad type=button>加载</button>'
     + '<button class="btn" id=peqSave type=button>保存为预设…</button>'
@@ -4266,9 +4335,13 @@ function eqSettingsHtml() {
     + '<button class="btn" id=peqReset type=button>重置 Flat</button>'
     + '<span id=peqMsg style="font-size:11.5px;color:var(--mut2)"></span>'
     + '</div>'
-    + '<div class="sfld wide"><div id=peqCurve style="background:var(--field);border:1px solid var(--line);border-radius:8px;padding:6px 10px 2px"></div></div>'
-    + '<div class="sfld wide"><div id=peqRows style="max-height:330px;overflow:auto;border:1px solid var(--line);border-radius:8px"></div>'
-    + '<div style="font-size:11px;color:var(--mut2);margin-top:4px">增益范围 ±12dB（步进 0.1）；Q 0.1~20；频率 10Hz~20kHz。修改即时生效（热更新，交叉淡入防爆音），并自动保存到 rlplayer-peq.txt。</div></div>');
+    + '<div class="sfld wide"><div class="peqcv" id=peqCurve></div></div>'
+    + '<div class="sfld wide"><div class=peqwrap>'
+    + '<div id=peqRows class=peqrows></div>'
+    + '</div>'
+    + '<div style="font-size:11px;color:var(--mut2);margin-top:5px">增益 ±12 dB（步进 0.1）· Q 0.1~20 · 频率 10 Hz~20 kHz。'
+    + '曲线上 <b>拖拽节点</b>：水平=频率（对数）、垂直=增益；<b>Shift+拖 / 滚轮</b>=改 Q；<b>双击节点</b>=该段复位（0 dB / Q 1.41）。'
+    + '选中行后 <b>↑↓</b>=增益 0.1 dB、<b>←→</b>=频率 ±1%（Shift 加速）。修改即时生效（热更新，交叉淡入防爆音），并自动保存到 rlplayer-peq.txt。</div></div>');
 
 
   // 1. 耳机 EQ（OPRA）
@@ -4318,17 +4391,40 @@ function eqSettingsHtml() {
 var PEQ_STATE = null;
 var PEQ_TIMER = 0;
 
+function peqRowsEl() { return document.querySelectorAll('#peqRows .peqr'); }
+// 频率输入框接受友好写法：'20 Hz' / '1.02 kHz' / '1020' / '1.02k'
+function peqParseFreq(s) {
+  var t = String(s == null ? '' : s).toLowerCase().replace(/\s+/g, '');
+  var m = /^([0-9]*\.?[0-9]+)(k|khz|hz)?$/.exec(t);
+  if (!m) return NaN;
+  var f = parseFloat(m[1]);
+  if (m[2] === 'k' || m[2] === 'khz') f *= 1000;
+  return f;
+}
+// 友好显示：<1 kHz 用 Hz（20 Hz），>=1 kHz 用 kHz（1.02 kHz / 10.0 kHz）
+function peqFreqText(f) {
+  f = +f || 0;
+  if (f >= 10000) return (f / 1000).toFixed(1) + ' kHz';
+  if (f >= 1000) return (f / 1000).toFixed(2) + ' kHz';
+  return Math.round(f) + ' Hz';
+}
+function peqClampFreq(f) { return Math.max(10, Math.min(20000, +f || 1000)); }
+function peqRowBand(tr) {
+  var f = tr.querySelector('.peqF'), g = tr.querySelector('.peqG'), q = tr.querySelector('.peqQ');
+  var t = tr.querySelector('.peqT'), on = tr.querySelector('.peqOn');
+  var fv = peqParseFreq(f.value);
+  if (!isFinite(fv) || fv <= 0) fv = 1000;
+  return {
+    i: +tr.dataset.i, type: t.value, freq: peqClampFreq(fv),
+    gain: Math.max(-12, Math.min(12, parseFloat(g.value) || 0)),
+    q: Math.max(0.1, Math.min(20, parseFloat(q.value) || 1.41)),
+    on: on.checked
+  };
+}
 function peqCollectBands() {
-  var bands = [];
-  var rows = document.querySelectorAll('#peqRows tbody tr');
-  Array.prototype.forEach.call(rows, function (tr, i) {
-    var f = tr.querySelector('.peqF'), g = tr.querySelector('.peqG'), q = tr.querySelector('.peqQ');
-    var t = tr.querySelector('.peqT'), on = tr.querySelector('.peqOn');
-    if (!f || !g || !q || !t || !on) return;
-    bands.push({ i: i + 1, type: t.value, freq: parseFloat(f.value) || 0,
-                 gain: parseFloat(g.value) || 0, q: parseFloat(q.value) || 1.41, on: on.checked });
-  });
-  return bands;
+  var out = [];
+  Array.prototype.forEach.call(peqRowsEl(), function (tr) { out.push(peqRowBand(tr)); });
+  return out;
 }
 function peqBandsParam() {
   return peqCollectBands().map(function (b) {
@@ -4336,65 +4432,293 @@ function peqBandsParam() {
   }).join(';');
 }
 // 频响曲线：后端 /api/peq 直接给 [频率, dB] 点（与 C++ 设计公式同源，前端不抄第二份）
+// 261024-03 #5 HIFI 化：曲线上叠 20 个频段节点（可拖/滚轮/双击），并做增量更新
+//（增量很关键：拖拽时 peqApply 每次回来都重建 SVG 会丢掉 pointer capture，拖到一半就断）
+var PEQ_VIEW = null;      // 曲线坐标映射（拖拽换算要用）
+var PEQ_DRAG = null;      // {i, mode:'g'|'q', y0, q0}
+var PEQ_LASTCLICK = null; // {i, t}：自己判双击（不依赖宿主是否派发 dblclick）
+function peqFreqX(f) {
+  var v = PEQ_VIEW; if (!v) return 0;
+  return v.PADL + (Math.log(Math.max(20, Math.min(20000, f)) / 20) / Math.log(1000)) * (v.W - v.PADL - v.PADR);
+}
+function peqGainY(db) {
+  var v = PEQ_VIEW; if (!v) return 0;
+  return v.PADT + (v.maxDb - db) / (v.maxDb - v.minDb) * (v.H - v.PADT - v.PADB);
+}
+function peqCurveFreqAt(x) {
+  var v = PEQ_VIEW; if (!v) return 1000;
+  var t = (x - v.PADL) / (v.W - v.PADL - v.PADR);
+  return peqClampFreq(20 * Math.pow(1000, Math.max(0, Math.min(1, t))));
+}
+function peqCurveGainAt(y) {
+  var v = PEQ_VIEW; if (!v) return 0;
+  var t = (y - v.PADT) / (v.H - v.PADT - v.PADB);
+  return Math.max(-12, Math.min(12, v.maxDb - Math.max(0, Math.min(1, t)) * (v.maxDb - v.minDb)));
+}
 function peqDrawCurve(points) {
   var box = D('peqCurve'); if (!box) return;
   if (!points || !points.length) {
     box.innerHTML = '<div style="font-size:11.5px;color:var(--mut2);padding:12px 0">频响曲线（等待数据…）</div>';
+    PEQ_VIEW = null;
     return;
   }
-  var W = 640, H = 132, PADL = 36, PADR = 8, PADT = 8, PADB = 16;
+  var W = 640, H = 132, PADL = 36, PADR = 10, PADT = 10, PADB = 18;
   var maxDb = 6, minDb = -6;
   points.forEach(function (p) { maxDb = Math.max(maxDb, p[1]); minDb = Math.min(minDb, p[1]); });
   maxDb = Math.ceil(maxDb / 3) * 3; minDb = Math.floor(minDb / 3) * 3;
-  function px(f) { return PADL + (Math.log(f / 20) / Math.log(1000)) * (W - PADL - PADR); }
-  function py(db) { return PADT + (maxDb - db) / (maxDb - minDb) * (H - PADT - PADB); }
-  var pts = points.map(function (p) { return px(p[0]).toFixed(1) + ',' + py(p[1]).toFixed(1); }).join(' ');
-  var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="display:block;width:100%;height:auto">';
+  PEQ_VIEW = { W: W, H: H, PADL: PADL, PADR: PADR, PADT: PADT, PADB: PADB, maxDb: maxDb, minDb: minDb };
+
+  var g = '';
   for (var d = Math.ceil(minDb / 6) * 6; d <= maxDb; d += 6) {
-    svg += '<line x1="' + PADL + '" y1="' + py(d).toFixed(1) + '" x2="' + (W - PADR) + '" y2="' + py(d).toFixed(1) +
-           '" stroke="var(--line)" stroke-width="1" stroke-dasharray="' + (d === 0 ? '4 3' : '2 4') + '" opacity="' + (d === 0 ? '0.9' : '0.5') + '"/>';
-    svg += '<text x="2" y="' + (py(d) + 3).toFixed(1) + '" font-size="9" fill="var(--mut2)">' + d + 'dB</text>';
+    g += '<line x1="' + PADL + '" y1="' + peqGainY(d).toFixed(1) + '" x2="' + (W - PADR) + '" y2="' + peqGainY(d).toFixed(1) +
+         '" stroke="var(--line)" stroke-width="1" stroke-dasharray="' + (d === 0 ? '4 3' : '2 4') + '" opacity="' + (d === 0 ? '0.9' : '0.5') + '"/>';
+    g += '<text x="2" y="' + (peqGainY(d) + 3).toFixed(1) + '" font-size="9" fill="var(--mut2)">' + d + 'dB</text>';
   }
   [[20, '20'], [100, '100'], [1000, '1k'], [10000, '10k'], [20000, '20k']].forEach(function (fk) {
-    var x = px(fk[0]);
-    svg += '<line x1="' + x.toFixed(1) + '" y1="' + PADT + '" x2="' + x.toFixed(1) + '" y2="' + (H - PADB) + '" stroke="var(--line)" stroke-width="1" stroke-dasharray="2 4" opacity=".45"/>';
-    svg += '<text x="' + (x - 8).toFixed(1) + '" y="' + (H - 4) + '" font-size="9" fill="var(--mut2)">' + fk[1] + '</text>';
+    var x = peqFreqX(fk[0]);
+    g += '<line x1="' + x.toFixed(1) + '" y1="' + PADT + '" x2="' + x.toFixed(1) + '" y2="' + (H - PADB) + '" stroke="var(--line)" stroke-width="1" stroke-dasharray="2 4" opacity=".45"/>';
+    g += '<text x="' + (x - 8).toFixed(1) + '" y="' + (H - 4) + '" font-size="9" fill="var(--mut2)">' + fk[1] + '</text>';
   });
-  svg += '<polyline points="' + pts + '" fill="none" stroke="var(--acc)" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>';
-  svg += '</svg>';
-  box.innerHTML = svg;
+  var pts = points.map(function (p) { return peqFreqX(p[0]).toFixed(1) + ',' + peqGainY(p[1]).toFixed(1); }).join(' ');
+
+  var svg = box.querySelector('svg.peqsvg');
+  if (!svg) {
+    box.innerHTML =
+      '<svg class=peqsvg viewBox="0 0 ' + W + ' ' + H + '">' +
+        '<g class=peqgrid></g>' +
+        '<polyline class=peqline fill=none stroke="var(--acc)" stroke-width=1.8 stroke-linejoin=round stroke-linecap=round points=""/>' +
+        '<g class=peqnodes></g>' +
+      '</svg>' +
+      '<div class=peqlegend><span><b>拖拽节点</b> 水平=频率 · 垂直=增益</span><span><b>Shift+拖 / 滚轮</b> 改 Q</span>' +
+      '<span><b>双击</b> 该段复位</span><span><b>↑↓←→</b> 微调（Shift 加速）</span></div>' +
+      '<div class=peqtip id=peqTip></div>';
+    svg = box.querySelector('svg.peqsvg');
+    peqBindCurve();
+  }
+  svg.querySelector('.peqgrid').innerHTML = g;
+  svg.querySelector('.peqline').setAttribute('points', pts);
+  peqSyncNodes();
+}
+/* ---------------- PEQ：行渲染 / 选中 / 曲线节点交互（261024-03 #5） ---------------- */
+function peqSelectRow(tr) {
+  Array.prototype.forEach.call(peqRowsEl(), function (x) { x.classList.toggle('sel', x === tr); });
+}
+function peqRowTipText(b) {
+  return '<b>' + peqFreqText(b.freq) + '</b> · ' + (b.gain >= 0 ? '+' : '') + b.gain.toFixed(1) +
+         ' dB · Q ' + b.q.toFixed(2) + ' · ' + b.type + (b.on ? '' : '（已关）');
+}
+// tooltip 定位：有事件用鼠标位置；没有（滚轮/键盘）就用节点自身位置
+function peqTipAt(html, ev, node) {
+  var tip = D('peqTip'), box = D('peqCurve');
+  if (!tip || !box) return;
+  var br = box.getBoundingClientRect();
+  var cx, cy;
+  if (ev && typeof ev.clientX === 'number') { cx = ev.clientX; cy = ev.clientY; }
+  else if (node) { var nr = node.getBoundingClientRect(); cx = nr.left + nr.width / 2; cy = nr.top + nr.height / 2; }
+  else { cx = br.left + br.width / 2; cy = br.top + 20; }
+  tip.innerHTML = html;
+  tip.classList.add('on');
+  var x = Math.max(4, Math.min(cx - br.left + 14, br.width - (tip.offsetWidth || 90) - 4));
+  var y = Math.max(4, Math.min(cy - br.top + 8, br.height - (tip.offsetHeight || 24) - 4));
+  tip.style.left = x + 'px'; tip.style.top = y + 'px';
+}
+function peqTipHide() { var t = D('peqTip'); if (t) t.classList.remove('on'); }
+function peqResetBand(i) {
+  var tr = document.querySelector('#peqRows .peqr[data-i="' + i + '"]'); if (!tr) return;
+  tr.querySelector('.peqG').value = '0.0';
+  tr.querySelector('.peqQ').value = '1.41';
+  peqSyncNodes();
+  peqScheduleApply(100);
+  peqMsg('第 ' + i + ' 段已复位（0.0 dB / Q 1.41）');
+}
+function peqSvgPoint(ev) {
+  var box = D('peqCurve');
+  var svg = box && box.querySelector('svg.peqsvg');
+  if (!svg || !PEQ_VIEW) return null;
+  var r = svg.getBoundingClientRect();
+  if (!r.width || !r.height) return null;
+  return { x: (ev.clientX - r.left) / r.width * PEQ_VIEW.W,
+           y: (ev.clientY - r.top) / r.height * PEQ_VIEW.H };
+}
+function peqNodeRow(i) { return document.querySelector('#peqRows .peqr[data-i="' + i + '"]'); }
+function peqBindCurve() {
+  var box = D('peqCurve'); if (!box) return;
+  var svg = box.querySelector('svg.peqsvg'); if (!svg) return;
+  var pick = function (ev) {
+    var t = ev.target;
+    while (t && t !== svg) { if (t.dataset && t.dataset.i) return t; t = t.parentNode; }
+    return null;
+  };
+  svg.addEventListener('pointermove', function (ev) {
+    if (PEQ_DRAG) return;
+    var node = pick(ev);
+    if (node) {
+      var tr = peqNodeRow(node.dataset.i);
+      if (tr) peqTipAt(peqRowTipText(peqRowBand(tr)), ev);
+      return;
+    }
+    var p = peqSvgPoint(ev); if (!p) return;
+    var f = peqCurveFreqAt(p.x), pts = (PEQ_STATE && PEQ_STATE.points) || [], db = null;
+    for (var i = 0; i < pts.length; i++) { if (pts[i][0] >= f) { db = pts[i][1]; break; } }
+    if (db === null && pts.length) db = pts[pts.length - 1][1];
+    peqTipAt('<b>' + peqFreqText(f) + '</b>' + (db === null ? '' : ' · 曲线 ' + (db >= 0 ? '+' : '') + db.toFixed(1) + ' dB'), ev);
+  });
+  svg.addEventListener('pointerleave', function () { if (!PEQ_DRAG) peqTipHide(); });
+  svg.addEventListener('dblclick', function (ev) {
+    var node = pick(ev); if (!node) return;
+    ev.preventDefault();
+    peqResetBand(+node.dataset.i);
+  });
+  svg.addEventListener('wheel', function (ev) {
+    var node = pick(ev); if (!node) return;
+    ev.preventDefault();
+    var tr = peqNodeRow(node.dataset.i); if (!tr) return;
+    var qEl = tr.querySelector('.peqQ'), v = parseFloat(qEl.value) || 1.41;
+    v = Math.max(0.1, Math.min(20, v * Math.pow(1.15, ev.deltaY > 0 ? 1 : -1)));
+    qEl.value = v.toFixed(2);
+    peqSyncNodes();
+    peqTipAt(peqRowTipText(peqRowBand(tr)), null, node);
+    peqScheduleApply(100);
+  }, { passive: false });
+  svg.addEventListener('pointerdown', function (ev) {
+    var node = pick(ev); if (!node) return;
+    ev.preventDefault();
+    var i = +node.dataset.i, tr = peqNodeRow(i); if (!tr) return;
+    peqSelectRow(tr);
+    // 双击 = 该段复位。自己在 pointerdown 里判（350ms 内同一节点），
+    // 因为 pointerdown 里 preventDefault + setPointerCapture 会让宿主的 dblclick 时序不可靠。
+    var now = Date.now();
+    if (PEQ_LASTCLICK && PEQ_LASTCLICK.i === i && now - PEQ_LASTCLICK.t < 350) {
+      PEQ_LASTCLICK = null;
+      peqResetBand(i);
+      PEQ_DRAG = null;
+      return;
+    }
+    PEQ_LASTCLICK = { i: i, t: now };
+    PEQ_DRAG = { i: i, mode: ev.shiftKey ? 'q' : 'g', y0: ev.clientY,
+                 q0: parseFloat(tr.querySelector('.peqQ').value) || 1.41 };
+    try { svg.setPointerCapture(ev.pointerId); } catch (e) { }
+    var c = svg.querySelector('.peqnode[data-i="' + i + '"]'); if (c) c.classList.add('on');
+  });
+  svg.addEventListener('pointermove', function (ev) {
+    if (!PEQ_DRAG) return;
+    var tr = peqNodeRow(PEQ_DRAG.i); if (!tr) return;
+    if (PEQ_DRAG.mode === 'q') {
+      var qv = Math.max(0.1, Math.min(20, PEQ_DRAG.q0 * Math.pow(2, (PEQ_DRAG.y0 - ev.clientY) / 60)));
+      tr.querySelector('.peqQ').value = qv.toFixed(2);
+    } else {
+      var p = peqSvgPoint(ev); if (!p) return;
+      tr.querySelector('.peqF').value = peqFreqText(peqCurveFreqAt(p.x));
+      tr.querySelector('.peqG').value = peqCurveGainAt(p.y).toFixed(1);
+    }
+    peqSyncNodes();
+    var node = svg.querySelector('.peqnode[data-i="' + PEQ_DRAG.i + '"]');
+    peqTipAt(peqRowTipText(peqRowBand(tr)), ev, node);
+    peqScheduleApply(100);           // 拖拽 100ms 节流
+  });
+  var endDrag = function () {
+    if (!PEQ_DRAG) return;
+    var i = PEQ_DRAG.i;
+    PEQ_DRAG = null;
+    var c = svg.querySelector('.peqnode[data-i="' + i + '"]'); if (c) c.classList.remove('on');
+    peqTipHide();
+    clearTimeout(PEQ_TIMER); peqApply();   // 松手立刻落一次，不等节流窗口
+  };
+  svg.addEventListener('pointerup', endDrag);
+  svg.addEventListener('pointercancel', endDrag);
+}
+// 把 20 个节点同步到当前行值（拖拽/键盘/滚轮后立即反映，不等后端）
+function peqSyncNodes() {
+  var box = D('peqCurve');
+  var svg = box && box.querySelector('svg.peqsvg');
+  if (!svg || !PEQ_VIEW) return;
+  var host = svg.querySelector('.peqnodes'); if (!host) return;
+  var bands = peqCollectBands();
+  if (!bands.length && PEQ_STATE && PEQ_STATE.bands) bands = PEQ_STATE.bands;
+  if (host.querySelectorAll('circle.peqhit').length !== bands.length) {
+    var h = '';
+    bands.forEach(function (b, i) {
+      h += '<circle class=peqhit data-i=' + (i + 1) + ' r=13></circle>'
+         + '<circle class="peqnode' + (b.on === false ? ' off' : '') + '" data-i=' + (i + 1) + ' r=4.5></circle>';
+    });
+    host.innerHTML = h;
+  }
+  Array.prototype.forEach.call(host.querySelectorAll('circle.peqnode'), function (c) {
+    var i = +c.dataset.i - 1, b = bands[i];
+    if (!b) return;
+    var cx = peqFreqX(b.freq).toFixed(1), cy = peqGainY(b.gain).toFixed(1);
+    c.setAttribute('cx', cx); c.setAttribute('cy', cy);
+    c.classList.toggle('off', b.on === false);
+    var hit = host.querySelector('circle.peqhit[data-i="' + (i + 1) + '"]');
+    if (hit) { hit.setAttribute('cx', cx); hit.setAttribute('cy', cy); }
+  });
 }
 function peqRenderRows(j) {
   var box = D('peqRows'); if (!box) return;
-  var h = '<table style="width:100%;border-collapse:collapse;font-size:12px">'
-        + '<thead><tr style="position:sticky;top:0;background:var(--field);z-index:1;font-size:11px;color:var(--mut2)">'
-        + '<th style="width:40px;padding:5px 6px;text-align:left">段</th>'
-        + '<th style="padding:5px 6px;text-align:left">频率 (Hz)</th>'
-        + '<th style="padding:5px 6px;text-align:left">增益 (dB)</th>'
-        + '<th style="padding:5px 6px;text-align:left">Q</th>'
-        + '<th style="width:78px;padding:5px 6px;text-align:left">类型</th>'
-        + '<th style="width:48px;padding:5px 6px;text-align:center">启用</th></tr></thead><tbody>';
+  // 表头与数据行同处 #peqRows：同一个内容宽度 ⟹ 同一套列轨道（这是"对齐"的根）
+  var h = '<div class=peqhd><span>段</span><span class=num>频率</span><span class=num>增益 dB</span>'
+        + '<span class=num>Q</span><span>类型</span><span class=c>启用</span></div>';
   (j.bands || []).forEach(function (b, i) {
-    var sel = '<select class=peqT style="width:70px;height:24px;background:var(--field);border:1px solid var(--line);border-radius:5px;color:var(--txt);font-size:11.5px">'
-      + '<option value=PK' + (b.type === 'PK' ? ' selected' : '') + '>峰值</option>'
-      + '<option value=LS' + (b.type === 'LS' ? ' selected' : '') + '>低架</option>'
-      + '<option value=HS' + (b.type === 'HS' ? ' selected' : '') + '>高架</option></select>';
-    var inp = ' style="width:86px;height:24px;background:var(--field);border:1px solid var(--line);border-radius:5px;color:var(--txt);font-size:11.5px;padding:0 6px"';
-    h += '<tr style="border-top:1px solid var(--line)">'
-       + '<td style="padding:3px 6px;color:var(--mut2);font-family:monospace">' + (i + 1) + '</td>'
-       + '<td style="padding:3px 6px"><input class=peqF type=number min=10 max=20000 step=1 value="' + b.freq + '"' + inp + '></td>'
-       + '<td style="padding:3px 6px"><input class=peqG type=number min=-12 max=12 step=0.1 value="' + b.gain + '"' + inp + '></td>'
-       + '<td style="padding:3px 6px"><input class=peqQ type=number min=0.1 max=20 step=0.01 value="' + b.q + '"' + inp + '></td>'
-       + '<td style="padding:3px 6px">' + sel + '</td>'
-       + '<td style="padding:3px 6px;text-align:center"><input class=peqOn type=checkbox' + (b.on ? ' checked' : '') + '></td>'
-       + '</tr>';
+    var sel = '<select class=peqT>'
+      + '<option value=PK' + (b.type === 'PK' ? ' selected' : '') + '>峰值 PK</option>'
+      + '<option value=LS' + (b.type === 'LS' ? ' selected' : '') + '>低架 LS</option>'
+      + '<option value=HS' + (b.type === 'HS' ? ' selected' : '') + '>高架 HS</option></select>';
+    h += '<div class=peqr data-i=' + (i + 1) + ' tabindex=0>'
+       + '<span class=peqn>' + (i + 1 < 10 ? '0' : '') + (i + 1) + '</span>'
+       + '<span class=peqc><input class=peqF type=text spellcheck=false value="' + esc(peqFreqText(b.freq)) + '"></span>'
+       + '<span class="peqc num"><input class=peqG type=number step=0.1 min=-12 max=12 value="' + (+b.gain).toFixed(1) + '"></span>'
+       + '<span class="peqc num"><input class=peqQ type=number step=0.01 min=0.1 max=20 value="' + (+b.q).toFixed(2) + '"></span>'
+       + '<span class=peqc>' + sel + '</span>'
+       + '<span class="peqc c"><input class=peqOn type=checkbox' + (b.on ? ' checked' : '') + '></span>'
+       + '</div>';
   });
-  h += '</tbody></table>';
   box.innerHTML = h;
-  Array.prototype.forEach.call(box.querySelectorAll('input,select'), function (el) {
-    el.onchange = function () { peqScheduleApply(); };
-    el.oninput = function () { peqScheduleApply(); };
+  Array.prototype.forEach.call(box.querySelectorAll('.peqr'), function (tr) {
+    var inputs = tr.querySelectorAll('input,select');
+    Array.prototype.forEach.call(inputs, function (el) {
+      el.addEventListener('change', function () { peqScheduleApply(); });
+      el.addEventListener('input', function () { peqScheduleApply(); });
+      el.addEventListener('focus', function () { peqSelectRow(tr); });
+    });
+    tr.addEventListener('click', function () { peqSelectRow(tr); });
+    tr.addEventListener('focus', function () { peqSelectRow(tr); });
+    // 键盘：↑↓ 增益 0.1 dB（Shift 1 dB）/ ←→ 频率 ±1%（Shift ±5%）
+    tr.addEventListener('keydown', function (ev) {
+      var k = ev.key, g = tr.querySelector('.peqG'), f = tr.querySelector('.peqF');
+      var fast = ev.shiftKey;
+      if (k === 'ArrowUp' || k === 'ArrowDown') {
+        ev.preventDefault();
+        var d = (k === 'ArrowUp' ? 1 : -1) * (fast ? 1 : 0.1);
+        g.value = (Math.max(-12, Math.min(12, (parseFloat(g.value) || 0) + d))).toFixed(1);
+      } else if (k === 'ArrowLeft' || k === 'ArrowRight') {
+        if (ev.target !== tr && ev.target.tagName === 'INPUT' && ev.target.type === 'text') return; // 文本输入框里让光标移动
+        ev.preventDefault();
+        var mul = (k === 'ArrowRight' ? 1 : -1) * (fast ? 0.05 : 0.01);
+        var fv = peqParseFreq(f.value) || 1000;
+        f.value = peqFreqText(peqClampFreq(fv * (1 + mul)));
+      } else return;
+      peqSyncNodes();
+      peqScheduleApply(100);
+    });
   });
+  peqSyncNodes();
+}
+// 自动前级（防削波）：把前级设为 -ceil(曲线峰值)。曲线峰值优先取后端点集（架式/叠加后的真实峰值），
+// 没有点集时退回"各段增益最大值"。
+function peqAutoPreamp() {
+  var maxGain = 0;
+  var pts = (PEQ_STATE && PEQ_STATE.points) || [];
+  if (pts.length) {
+    pts.forEach(function (p) { if (p[1] > maxGain) maxGain = p[1]; });
+  } else {
+    peqCollectBands().forEach(function (b) { if (b.on && b.gain > maxGain) maxGain = b.gain; });
+  }
+  var pre = -Math.max(0, Math.ceil(maxGain));
+  var inp = D('peqPreamp');
+  if (inp) inp.value = pre;
+  peqApply();
+  peqMsg('自动前级：曲线峰值 +' + maxGain.toFixed(1) + ' dB → 前级 ' + pre + ' dB（留出 ' + Math.abs(pre).toFixed(0) + ' dB 余量）');
+  toast('自动前级 ' + pre + ' dB（峰值 +' + maxGain.toFixed(1) + ' dB）');
 }
 function peqRender(j) {
   PEQ_STATE = j;
@@ -4413,9 +4737,10 @@ function peqRender(j) {
   peqDrawCurve(j.points);
 }
 function peqMsg(t) { var e = D('peqMsg'); if (e) e.textContent = t || ''; }
-function peqScheduleApply() {
+// 节流：文字输入 260ms；拖拽/滚轮/键盘 100ms（拖拽时不许每次 pointermove 都打后端）
+function peqScheduleApply(ms) {
   clearTimeout(PEQ_TIMER);
-  PEQ_TIMER = setTimeout(peqApply, 260);
+  PEQ_TIMER = setTimeout(peqApply, ms === undefined ? 260 : ms);
 }
 function peqApply() {
   var body = 'bypass=' + ((D('peqBypass') && D('peqBypass').checked) ? 1 : 0)
@@ -4446,8 +4771,9 @@ function peqPresetAction(action, name) {
 }
 function initPeqControls() {
   if (!D('peqBypass')) return;   // 当前页面没有 PEQ 卡（例如还没渲染设置页）
-  D('peqBypass').onchange = peqScheduleApply;
-  if (D('peqPreamp')) D('peqPreamp').oninput = peqScheduleApply;
+  D('peqBypass').onchange = function () { peqScheduleApply(); };
+  if (D('peqPreamp')) D('peqPreamp').oninput = function () { peqScheduleApply(); };
+  if (D('peqAutoPre')) D('peqAutoPre').onclick = peqAutoPreamp;
   if (D('peqLoad')) D('peqLoad').onclick = function () {
     var sel = D('peqPreset'); if (sel) peqPresetAction('load', sel.value);
   };
@@ -5458,41 +5784,50 @@ function renderNpLyric() {
   if (grid) grid.classList.toggle('nolyric', !LY.lines.length);
   if (!LY.lines.length) {
     box.innerHTML = '<div class=npline>没有歌词<br><span style="font-size:12px;color:var(--mut2)">同名 .lrc 文件、内嵌歌词，或播放时自动在线补全（可在设置-元数据补全关闭）</span></div>';
+    box.dataset.n = ''; box.dataset.at = ''; LY.at = -1;
     return;
   }
-  if (box.dataset.n !== String(LY.lines.length)) {
-    box.dataset.n = String(LY.lines.length);
-    var h = '';
+  var timed = lyricTimed();
+  // 行集合或"带轴/纯文本"状态变化才重建 DOM（否则每 400ms 轮询都重建会把用户正在读的行冲掉）
+  var key = LY.lines.length + ':' + (timed ? 1 : 0);
+  if (box.dataset.n !== key) {
+    box.dataset.n = key;
+    var h = timed ? ''
+      : '<div class=ly-hint title="这份歌词没有 [mm:ss] 时间轴，无法按播放位置高亮/跟随">纯文本歌词（无时间轴）· 不会自动跟随滚动</div>';
     LY.lines.forEach(function (l, i) { h += '<div class=npline data-i=' + i + '>' + esc(l.s) + '</div>'; });
     box.innerHTML = h;
     box.dataset.at = '';
+    // 纯文本：留空让下面的 !timed 分支跑一次（复位 scrollTop + 清高亮），
+    // 否则从"有轴歌词"切过来会停在上一首的滚动位置（实测 st=55 卡住）
+    box.dataset.plain = timed ? '0' : '';
     LY.at = -1;
   }
-  var timed = lyricTimed();
   if (!timed) {
     // 无时间戳：一行都不高亮、也不自动滚（用户可能正在读，别动它）
     if (box.dataset.plain !== '1') {
       box.dataset.plain = '1';
-      Array.prototype.forEach.call(box.children, function (e) { e.classList.remove('on'); });
+      var rows0 = lyricRows(box);
+      for (var z = 0; z < rows0.length; z++) rows0[z].classList.remove('on');
       box.scrollTop = 0;
     }
     return;
   }
-  if (box.dataset.plain === '1') { box.dataset.plain = '0'; LY.at = -1; }
   var pos = S.pos || 0;
   // 进度跳变（seek / 上一首 / 拖动进度条）→ 立刻重定位，不受"手动滚动保护"影响
-  if (LY.lastPos >= 0 && Math.abs(pos - LY.lastPos) > 2.5) { LYMAN.until = 0; LY.at = -1; }
+  // ⚠ 必须同时清 dataset.at：否则"跳到同一行"时 dataset.at 相等，会吞掉这次重定位
+  if (LY.lastPos >= 0 && Math.abs(pos - LY.lastPos) > 2.5) { LYMAN.until = 0; box.dataset.at = ''; }
   LY.lastPos = pos;
   var idx = -1;
   for (var i = 0; i < LY.lines.length; ++i) { if (LY.lines[i].t <= pos + 0.05) idx = i; else break; }
   if (idx < 0) idx = 0;   // 还没到第一句（前奏）：钉在第一行，避免整屏无高亮
+  var rows = lyricRows(box);
   if (LY.at !== idx) {
     LY.at = idx;
-    Array.prototype.forEach.call(box.children, function (e, i) { e.classList.toggle('on', i === idx); });
+    for (var r = 0; r < rows.length; r++) rows[r].classList.toggle('on', +rows[r].dataset.i === idx);
   }
   if (box.dataset.at !== String(idx)) {
     box.dataset.at = String(idx);
-    if (Date.now() >= LYMAN.until) lyricScrollTo(box, box.children[idx], true);
+    if (Date.now() >= LYMAN.until) lyricScrollTo(box, rows[idx]);
   }
 }
 // 手动滚动保护（滚轮 / 触摸拖动）：3 秒内自动滚动不跟用户抢
@@ -5502,6 +5837,15 @@ function renderNpLyric() {
     if (!el) return;
     el.addEventListener('wheel', lyricManual, { passive: true });
     el.addEventListener('touchstart', lyricManual, { passive: true });
+  });
+  // 视口尺寸变了（真机窗口 DPI/尺寸 race、用户拉窗）：留白与目标位置都要重算，
+  // 否则"行高变了但 scrollTop 还是旧值"，看起来就是歌词停在半路。
+  window.addEventListener('resize', function () {
+    LYMAN.until = 0;
+    var b = D('npLyric');
+    if (b) b.dataset.at = '';
+    if (D('npPage') && D('npPage').classList.contains('on')) renderNpLyric();
+    if (RTAB === 'l') { LY.at = -1; syncLyrics(S.pos || 0, true); }
   });
 })();
 
