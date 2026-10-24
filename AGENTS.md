@@ -156,3 +156,52 @@ CUDA 不会像 HIP 那样"arch 写错就静默不执行"，但它**一样会骗�
 新会话读到它就知道大方向；具体实施仍需用户明确立项。
 
 
+
+
+---
+
+## 9. 子代理派遣（DSH 路由，2026-10-24 实测）
+
+主控不一个人写：按**文件所有权**把工作包切给子代理，主控只做把关、跑门禁、出包。
+可用的 LLM 路由用工具 `list_subagent_models` 查（provider → model → reasoning effort）。
+
+### 9.1 已实测可用的路由
+
+| provider | model | 说明 |
+|---|---|---|
+| `agy` | `gemini-3.8-flash-tiered` | **Gemini 3.8 Flash（Antigravity）**。2026-10-24 探针实测：能读仓库、能跑命令、能 send_message 汇报；`reasoning_effort` 支持 low / medium / high |
+| `agy` | `claude-opus-4-6-thinking` | Claude Opus 4.6（Thinking） |
+| `opencode-go` | `deepseek-v4.1-flash` | DeepSeek V4.1 Flash（快、便宜；1.3.15/1.3.16 的绝大多数工作包用的它） |
+| `deepseek-official` | `deepseek-flash` | DeepSeek-V4.1-Flash |
+| `workbuddy-cn` | `deepseek-v4.1-flash` / `step-5-preview` | 备用 |
+
+> ⚠️ 目录是"广告"，不是白名单：适配器可能接受目录里没列的 model id；但**没实测过的不要写进这张表**。
+
+### 9.2 调用方式
+
+```ts
+const s = await tools.subagent({
+  description: "三段式短标题",              // 3-5 个词，给人看
+  prompt: `……完整任务书（自包含）……`,       // 子代理**看不到**本会话上下文
+  provider: "agy",                          // 见 9.1
+  model: "gemini-3.8-flash-tiered",
+  reasoning_effort: "medium",               // 可选 low/medium/high
+});
+// s.subagentId：后续 send_message 追问 / interrupt_agent 打断；完成时它会 send_message 回报
+```
+
+- 需要**继承本会话上下文**时用 `subagent_fork`（不传 provider/model，沿用父会话路由）。
+- 一个工作包一个子代理；**同一文件同一时间只能有一个写者**（并行时按文件切分）。
+
+### 9.3 任务书硬要求（写不好就等着返工）
+
+1. 明确**允许改哪些文件**（以及明确禁止碰哪些）；
+2. 用**独立构建目录** `build-xxx/`，不要共用 `build/`；
+3. 复述纪律：不 commit、不开音频设备、不按映像名杀进程（铁律 1/2）；
+4. 要求它**自己跑判据并给数字**；没实测就写"未验证"（铁律 3/4）；
+5. 回报走 `send_message`，≤150 行，含"改了哪些行 + 实测数字 + 未验证项"。
+
+### 9.4 实测记录
+
+- `agy` / `gemini-3.8-flash-tiered`：2026-10-24 21:56 连通性探针通过 —— 正确执行 `git log -1`（`bdcdd61`）与
+  `git describe --tags --abbrev=0`（`v1.3.16`），回报 `PROBE-OK`。
