@@ -104,7 +104,7 @@ RLPlayer @VERSION@ 正式发布版（Full / 自包含）
 
 九、已知限制（如实）
 --------------------
-  * 标准 NAA（HQPlayer networkaudiod）客户端握手未实现；两机方案请用 RTANet。
+  * NAA 已彻底删除：数播的 NAA 只认 HQPlayer 私有握手（EULA 禁止逆向），本机实测 8 种握手变体全部无回应；
   * WASAPI 输入采集通路未实现（界面已标注）；UPnP 投放已可用。
   * Native DSD（ASIO DSD 通道类型）未实现；DSD 输出走 DoP。
   * 7 阶 1-bit 调制器在 DSD64 上不稳定，程序会自动降为 5 阶并说明原因。
@@ -125,8 +125,6 @@ RLPlayer @VERSION@ 正式发布版（Full / 自包含）
   gpubench_conv.exe  GPU 卷积基准
   wasapi_probe.exe   列出设备独占模式支持的采样率/位深
   wasapi_ex_probe.exe 独占格式阶梯探测（24 紧凑 / float32 / 32int）
-  naa_scan.exe       发现 NAA 端点
-  naa_probe.exe      NAA 控制通道只读探测
   upnp_scan.exe      UPnP/DLNA 设备发现
   aidecode.exe       走统一解码路径并写出 WAV（便于逐位比对）
   rtatag.exe         元数据工具：parse（文件名解析）/ enrich（手动补全）/

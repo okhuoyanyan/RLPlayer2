@@ -53,7 +53,7 @@
 | **WASAPI 共享** | 独占不可用时的兜底（非 bit-perfect，会明确告知） |
 | **ASIO** | 低延迟专业声卡（驱动崩溃用子进程预检隔离） |
 | **UPnP / DLNA** | 一键推送到局域网渲染器（单曲页 / 流媒体页 / 底栏三处同源） |
-| **NAA / RTANet** | 两机网络音频：**RTANet 端到端逐位相同** + 时钟漂移检测；标准 NAA 只做发现 |
+| **RTANet（命令行）** | 两机网络音频：端到端逐位相同 + 时钟漂移检测（`rtaplay --net` + `rtanet_rx.exe`）。**NAA 已删除**：数播只认 HQPlayer 私有握手 |
 | **Null** | 离线/自动化测试，不开任何设备 |
 
 ### 界面
@@ -236,7 +236,7 @@ powershell -File tools\bordercheck.ps1 -Exe dist\RLPlayer-1.3.15-win64\RLPlayer.
 ## 已知限制
 
 - **输入采集**：设备枚举与设置页已有，采集→DSP→输出通路未实现
-- **标准 NAA**：只做发现，握手未实现；两机方案请用 RTANet
+- **NAA 已删除**（数播只认 HQPlayer 私有握手，EULA 禁止逆向）；两机方案用 RTANet（命令行）
 - **DSD 域重采样**：同速率 DirectSDM 逐位直通可用；**速率不同时的 DSD→DSD 重采样未做**
 - **Native DSD（ASIO）**：需驱动支持 ASIODSD* 通道类型；DSD 输出走 DoP
 - **7 阶 1-bit 调制器**：只在 DSD128 以上稳定
