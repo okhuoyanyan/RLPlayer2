@@ -248,6 +248,10 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
     // ---------------- C2 遥测状态（2026-10-24 N300 欠载；纯观测）----------------
     // 全部是本地计数：不加锁、不分配（evRing 固定 64 槽），不改变写入/调度/DSP。
     const double loopStartT = nowSec();   // 起播时刻（dry 的 500ms 门槛、WFAIL 的 t= 都相对它）
+    // 相邻两轮的最大间隔（ms）。用于证明「渲染线程被抢占」这类 dry 看不见的断音：
+    // 正常一轮 ≤ 等待上限（per/2 ≈ 5ms）；若出现几十毫秒，就是被系统/DPC 夺走了 CPU。
+    double gapMaxMs = 0.0;
+    double lastIterT = loopStartT;
     long long dryN      = 0;      // dry：设备缓冲空 + 手里有数据 + 我们一个字节也写不进去
     double    dryAccMs  = 0.0;    // 已结算的 dry 墙钟毫秒
     double    dryEnterT = 0.0;    // 当前 dry 片段起点
@@ -443,7 +447,8 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                    << " dryms=" << dryMsNow(nowT)
                    << " ev=" << evN
                    << " evint=" << evIntMedian()
-                   << " prod=" << prodMaxMs;
+                   << " prod=" << prodMaxMs
+                   << " gap=" << (long long)gapMaxMs;
                 h.log(ls.str());
                 publish(nowT);
             }
@@ -506,6 +511,11 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
         }
         h.dbgPad->store(padBefore);
         const double tAfter = nowSec();
+        {
+            const double g = (tAfter - lastIterT) * 1000.0;
+            if (g > gapMaxMs) gapMaxMs = g;
+            lastIterT = tAfter;
+        }
 
         // ---- C2 dry 计数（纯观测，方案 §6.3）----
         // 定义（与方案一致）：起播 500 ms 后，设备缓冲在本次写入前已经触底（pad==0）且

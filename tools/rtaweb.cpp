@@ -29,6 +29,10 @@ using rta::net::SubEntry;
 // 只声明需要的两个函数，并链接 winmm。
 extern "C" __declspec(dllimport) unsigned int __stdcall timeBeginPeriod(unsigned int);
 extern "C" __declspec(dllimport) unsigned int __stdcall timeEndPeriod(unsigned int);
+// MMCSS（多媒体类调度服务）：独占音频线程必须进「Pro Audio」类，否则被普通任务抢占时
+// 设备缓冲会被抽干。avrt 早已在 CMake 里链接，但此前没有任何地方调用过它。
+#include <avrt.h>
+#pragma comment(lib, "avrt.lib")
 #include "engine/pipeline.h"
 #include "audio/wav.h"
 #include "audio/audio_loader.h"
@@ -3264,6 +3268,23 @@ static AudioBuffer prefetch_take(const std::string& path) {
 
 // ---- 队列播放线程：自动播下一首，并在播当前曲时预解码下一曲 ----
 static void queue_thread(PlayParams p, size_t start) {
+    // ★ 2026-10-24 现场定案：同一台 DC-Elite 用 QQ 音乐独占完全正常，而 RLPlayer 有
+    // 持续「啵」+ 随机闪断；全项目此前没有任何线程优先级代码（avrt 链接了却从未调用）。
+    // 独占模式下的渲染线程必须进 MMCSS「Pro Audio」并提到 TIME_CRITICAL，否则被普通
+    // 任务/驱动 DPC 抢占时设备缓冲会被抽干，而 dry 计数从「醒来发现空」才开始计时，
+    // 看不到被抢占的那段 ⟹ 判据失明、日志干净但耳朵听到断音。
+    {
+        DWORD taskIdx = 0;
+        HANDLE mm = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIdx);
+        if (mm) AvSetMmThreadPriority(mm, AVRT_PRIORITY_CRITICAL);
+        if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)) {
+            play_log("RT_PRIORITY 提权失败（GetLastError=" + std::to_string(GetLastError()) +
+                     "），继续以默认优先级播放");
+        } else {
+            play_log(std::string("RT_PRIORITY mmcss=") + (mm ? "ProAudio" : "none") +
+                     " prio=TIME_CRITICAL");
+        }
+    }
     auto& ps = g_ps;
     size_t idx = start;
     for (;;) {
