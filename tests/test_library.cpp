@@ -335,6 +335,116 @@ int main() {
            "自愈结果已重新落盘（版本头仍是 v3）");
     }
 
+
+    // =======================================================================
+    // [4] 261025-01 一.1/2/3/5/8（大面积扫描 / 中文路径 / 删除清理 / 切标签不重扫）
+    //
+    // 判据（铁律 3）：这一节证明「UTF-8 -> Win32 的路径转换链不抛异常、不误判」以及
+    // 「清理真的同时改内存与落盘」。**不含 HTTP 层**：真实的 /api/lib/scan、
+    // /api/lib/status 延迟、3000 首大库计时在 tests/verify_scan_261025.ps1（端到端唯一判据）。
+    // =======================================================================
+    std::printf("\n== [4] 中文路径 / 大库 / 删除清理 ==\n");
+    // 注意：连测试自己都得小心 —— path / "中文" 走的是同一个 ACP 窄串构造，一样会抛。
+    auto U = [](const char* s) { return fs::u8path(s); };
+    auto p2u = [](const fs::path& p) {
+        const std::u8string u = p.u8string();
+        return std::string((const char*)u.data(), u.size());
+    };
+    // ---- 4.1 纯函数：UTF-8 校验与路径前缀判定 ----
+    {
+        ck(rta::net::lib_valid_utf8("D:\\音乐\\专辑"), "合法 UTF-8 路径通过校验");
+        ck(!rta::net::lib_valid_utf8("D:\\\xC4\xE3\xBA\xC3"), "GBK 字节被拒（否则 fs::u8path 会抛异常）");
+        ck(rta::net::lib_path_under("D:\\mu\\a.flac", "D:\\mu"), "前缀判定：子路径命中");
+        ck(rta::net::lib_path_under("d:\\MU\\a.flac", "D:\\mu"), "前缀判定：大小写不敏感");
+        ck(!rta::net::lib_path_under("D:\\music\\a.flac", "D:\\mu"), "前缀判定：不把 mu 当 music 的前缀");
+    }
+    // ---- 4.2 中文/日文根目录：能加、能扫、能落盘（修前这里会让进程 0xC0000409） ----
+    {
+        const fs::path tmp4 = fs::temp_directory_path() / "rta_lib_utf8";
+        fs::remove_all(tmp4, ec);
+        fs::create_directories(tmp4 / U("lib"), ec);
+        _putenv_s("RLPLAYER_LIBRARY_DIR", p2u(tmp4 / U("lib")).c_str());
+        // 前几节留下的库根必须先清掉，否则这一节会连它们一起扫（本测试踩过一次：11 首）
+        for (auto r : lib.roots()) lib.removeRoot(r);
+        const fs::path zhRoot = tmp4 / U("中文音乐库");
+        fs::create_directories(zhRoot / U("专辑甲"), ec);
+        fs::create_directories(zhRoot / U("日语-アルバム"), ec);
+        auto mk = [&](const char* rel) { std::ofstream f(zhRoot / U(rel), std::ios::binary); f << "fLaC"; };
+        mk("专辑甲/第一首.flac");
+        mk("专辑甲/第二首（全角括号）.flac");
+        mk("日语-アルバム/曲名.flac");
+        const auto ar = lib.addRootEx(p2u(zhRoot));
+        ck(ar.ok, "含中文/日文的根目录能被 addRoot", ar.why);
+        ck(!lib.addRootEx("Z:\\不存在").ok, "不存在的目录仍被拒");
+        lib.load();                       // 清空索引（conf 里已有中文根）
+        lib.startScan(true);
+        lib.joinScan();
+        ck(lib.trackCount() == 3, "中文根下 3 首全部入库", std::to_string(lib.trackCount()));
+        ck(!lib.scanning(), "扫描正常结束（没有 fatal 异常）");
+        ck(lib.scanMsg().find("无法访问") == std::string::npos, "扫描消息里没有坏根告警", lib.scanMsg());
+        auto albums4 = lib.albums();
+        bool hasZh = false, hasJp = false;
+        for (auto& a : albums4) { if (a.name == "专辑甲") hasZh = true; if (a.name == "日语-アルバム") hasJp = true; }
+        ck(hasZh && hasJp, "专辑列表里中文/日文专辑都在", std::to_string(albums4.size()) + " 张");
+        ck(lib.albumCountFast() == albums4.size(), "snapshot 用的专辑数与真实一致");
+        lib.load();
+        ck(lib.trackCount() == 3, "索引落盘后能读回（宽字符文件流）", std::to_string(lib.trackCount()));
+        // ---- 4.3 删除清理：prune / removeUnder / 根目录消失时的保护 ----
+        fs::remove(zhRoot / U("专辑甲") / U("第二首（全角括号）.flac"), ec);
+        const auto pr = lib.pruneMissing();
+        ck(pr.removed == 1 && lib.trackCount() == 2, "pruneMissing 剔除 1 条已删文件的记录",
+           std::to_string(pr.removed) + " / " + std::to_string(lib.trackCount()));
+        lib.load();
+        ck(lib.trackCount() == 2, "prune 的结果已落盘", std::to_string(lib.trackCount()));
+        const auto rm = lib.removeUnder(p2u(zhRoot / U("日语-アルバム")));
+        ck(rm.removed == 1 && lib.trackCount() == 1, "removeUnder 按目录移除 1 条",
+           std::to_string(rm.removed) + " / " + std::to_string(lib.trackCount()));
+        lib.load();
+        ck(lib.trackCount() == 1, "removeUnder 的结果已落盘", std::to_string(lib.trackCount()));
+        fs::rename(zhRoot, tmp4 / U("中文音乐库-OFFLINE"), ec);   // 根忽然不可访问（外接盘拔出）
+        lib.startScan(false);
+        lib.joinScan();
+        ck(lib.trackCount() == 1, "根目录不可访问时保留其下旧记录（旧实现会掉成 0）",
+           std::to_string(lib.trackCount()) + " msg=" + lib.scanMsg());
+        ck(lib.scanMsg().find("无法访问") != std::string::npos, "扫描消息如实报告坏根", lib.scanMsg());
+        fs::rename(tmp4 / U("中文音乐库-OFFLINE"), zhRoot, ec);
+        fs::remove_all(tmp4, ec);
+    }
+    // ---- 4.4 大库专辑整理：3000 首必须快（旧实现在比较器里扫目录，全在锁内） ----
+    {
+        const fs::path tmp5 = fs::temp_directory_path() / "rta_lib_big";
+        fs::remove_all(tmp5, ec);
+        fs::create_directories(tmp5, ec);
+        _putenv_s("RLPLAYER_LIBRARY_DIR", p2u(tmp5).c_str());
+        {
+            std::ofstream f(tmp5 / "rlplayer-index.tsv", std::ios::binary);
+            f << "#libIndexV\t3\n";
+            f << "#path\tmtime\tsize\talbum\talbumArtist\tartist\ttitle\ttrack\tdisc\tyear\tsr\tbits\tch\tdur\thasCover\tgenre\n";
+            for (int d = 0; d < 300; ++d)
+                for (int t = 0; t < 10; ++t) {
+                    char row[512];
+                    std::snprintf(row, sizeof(row),
+                        "D:\\fake\\Album%04d\\t%d.flac\t111\t222\t\t\tArtist%03d\tTitle%d\t%d\t0\t0\t44100\t16\t2\t60.0\t0\tRock\n",
+                        d, t, d, t, t + 1);
+                    f << row;
+                }
+        }
+        lib.load();
+        ck(lib.trackCount() == 3000, "3000 首索引载入", std::to_string(lib.trackCount()));
+        const auto tA = std::chrono::steady_clock::now();
+        auto big = lib.albums();
+        const double msBig = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tA).count();
+        ck(big.size() == 300, "3000 首整理成 300 张专辑", std::to_string(big.size()));
+        ck(msBig < 1000.0, "3000 首专辑整理 < 1000ms（这个数直接进单线程 HTTP 的同步路径）",
+           std::to_string((int)msBig) + " ms");
+        std::printf("  [INFO] 3000 首专辑整理 %.1f ms（旧实现：比较器内目录扫描，实测秒级）\n", msBig);
+        const auto tB = std::chrono::steady_clock::now();
+        lib.albums();
+        const double msCache = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tB).count();
+        ck(msCache < msBig + 5.0, "第二次 albums() 走缓存（不重复整理）", std::to_string((int)msCache) + " ms");
+        fs::remove_all(tmp5, ec);
+    }
+
     fs::remove_all(tmp2, ec);
 
     fs::current_path(oldCwd, ec);

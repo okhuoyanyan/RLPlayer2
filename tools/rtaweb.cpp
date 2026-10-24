@@ -4562,7 +4562,26 @@ static bool knowledge_job_start(const std::string& key, const std::shared_ptr<Kn
     }
 }
 
+// 2026-10-25：请求处理整体兜一层 catch。理由（实测）：扫描线程/端点里一次 fs::path 构造失败
+// 就会抛 std::filesystem_error，而 WebUi 的 accept 循环跑在 std::thread 上 —— 异常一出就是
+// std::terminate（0xC0000409），整个服务消失，浏览器侧只看到 "Failed to fetch"（261025-01 一.7）。
+// 有了这层兜底，最坏情况是"某个端点返回 500 JSON"，而不是整个进程没了。
+static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct);
 static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
+    try {
+        return handle_impl(rq, ct);
+    } catch (const std::exception& e) {
+        play_log(std::string("WARN handler 异常 ") + rq.path + " : " + e.what());
+        ct = "application/json; charset=utf-8";
+        return std::string("{\"ok\":false,\"error\":\"内部错误: ") + jesc(std::string(e.what())) + "\"}";
+    } catch (...) {
+        play_log(std::string("WARN handler 未知异常 ") + rq.path);
+        ct = "application/json; charset=utf-8";
+        return "{\"ok\":false,\"error\":\"内部错误(unknown)\"}";
+    }
+}
+
+static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct) {
     auto& ps = g_ps;
 
     if (rq.path.rfind("/favicon", 0) == 0) {
@@ -4592,11 +4611,15 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         if (!valid_utf8(dir)) return utf8_path_reject(dir);   // F1：目录名进 fs 前先校验
 
         std::error_code ec;
-        if (!fs::exists(dir, ec)) {
+        // ★ 2026-10-25：这里以前把 UTF-8 窄串直接喂 fs —— Windows 上 path(std::string) 按 ACP 解释，
+        // 含中文/日文/全角括号的目录会被判成"不存在"（实测："D:...\\中文-专辑" → 目录不存在），
+        // 文件夹页于是整页空/报错（261025-01 一.5、一.7 的"文件夹页面 TypeError: Failed to fetch"）。
+        // 一律走 fs::u8path。
+        if (!fs::exists(fs::u8path(dir), ec)) {
             return "{\"ok\":false,\"error\":\"目录不存在\"}";
         }
         std::vector<std::string> dirs, files;
-        for (auto& e : fs::directory_iterator(dir, fs::directory_options::skip_permission_denied, ec)) {
+        for (auto& e : fs::directory_iterator(fs::u8path(dir), fs::directory_options::skip_permission_denied, ec)) {
             const std::string name = pathToUtf8(e.path().filename());
             if (!name.empty() && name[0] == '.') continue;
             std::string ext = pathToUtf8(e.path().extension());
@@ -4628,26 +4651,86 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         ct = "application/json; charset=utf-8";
         auto& lib = Library::instance();
 
+        // ---- 状态查询（261025-01 一.1：扫描期间必须 <50ms 返回）----
+        // 两个端点共用**无锁快照**（Library::snapshot()）：只读原子量 + 一次短锁读进度文本，
+        // 绝不触发专辑整理、绝不排队等扫描线程持有的 mtx_。
+        // /api/lib/status 是给"轮询进度"用的窄端点；/api/lib/stats 保留原字段（含 roots）。
+        if (rq.path.rfind("/api/lib/status", 0) == 0) {
+            const auto s = lib.snapshot();
+            std::ostringstream j;
+            j << "{\"ok\":true"
+              << ",\"scanning\":" << (s.scanning ? "true" : "false")
+              << ",\"scanned\":" << s.scanned
+              << ",\"total\":" << s.total
+              << ",\"tracks\":" << s.tracks
+              << ",\"albums\":" << s.albums
+              << ",\"lastScanMs\":" << s.lastScanMs
+              << ",\"probed\":" << s.probed
+              << ",\"cached\":" << s.cached
+              << ",\"removed\":" << s.removed
+              << ",\"msg\":\"" << jesc(s.msg) << "\"}";
+            return j.str();
+        }
         if (rq.path.rfind("/api/lib/stats", 0) == 0) {
             std::ostringstream j;
             const auto roots = lib.roots();
-            j << "{\"ok\":true,\"tracks\":" << lib.trackCount()
-              << ",\"albums\":" << lib.albumCount()
-              << ",\"scanning\":" << (lib.scanning() ? "true" : "false")
-              << ",\"scanned\":" << lib.scanned()
-              << ",\"total\":" << lib.scanTotal()
+            const auto s = lib.snapshot();
+            j << "{\"ok\":true,\"tracks\":" << s.tracks
+              << ",\"albums\":" << s.albums
+              << ",\"scanning\":" << (s.scanning ? "true" : "false")
+              << ",\"scanned\":" << s.scanned
+              << ",\"total\":" << s.total
               << ",\"scanThreads\":" << lib.scanThreads()
-              << ",\"lastScanMs\":" << lib.lastScanMs()
-              << ",\"probed\":" << lib.lastScanProbed()
-              << ",\"cached\":" << lib.lastScanCached()
-              << ",\"msg\":\"" << jesc(lib.scanMsg()) << "\",\"roots\":[";
+              << ",\"lastScanMs\":" << s.lastScanMs
+              << ",\"probed\":" << s.probed
+              << ",\"cached\":" << s.cached
+              << ",\"removed\":" << s.removed
+              << ",\"msg\":\"" << jesc(s.msg) << "\",\"roots\":[";
             for (size_t i = 0; i < roots.size(); ++i) { if (i) j << ","; j << "\"" << jesc(roots[i]) << "\""; }
             j << "]}";
             return j.str();
         }
         if (rq.path.rfind("/api/lib/scan", 0) == 0 || rq.path.rfind("/api/rescan", 0) == 0) {
-            lib.startScan(rq.body.find("full=1") != std::string::npos || rq.path.rfind("/api/rescan", 0) == 0);
+            const bool full = rq.body.find("full=1") != std::string::npos || rq.path.rfind("/api/rescan", 0) == 0;
+            // 扫描触发点只有两处：① 用户点「扫描/重新扫描」② 目录变更（加根后 UI 主动调一次）。
+            // 每次都在日志里留一条 LIBSCAN —— 这样"切标签有没有偷偷扫描"是可查证的（判据见
+            // tests/verify_scan_261025.ps1 的 S4），而不是靠"我觉得没扫"。
+            static std::atomic<int> s_scanSeq{0};
+            const std::string lg = "LIBSCAN req #" + std::to_string(s_scanSeq.fetch_add(1) + 1) +
+                     std::string(" full=") + (full ? "1" : "0");
+            play_log(lg);
+            dlog(lg);
+            lib.startScan(full);
             return "{\"ok\":true}";
+        }
+        // ---- 清理（261025-01 一.3：删掉的文件的记录必须能清掉）----
+        if (rq.path.rfind("/api/lib/prune", 0) == 0) {
+            const auto r = lib.pruneMissing();
+            dlog("LIBSCAN prune removed=" + std::to_string(r.removed) + " tracks=" + std::to_string(r.tracks));
+            return "{\"ok\":true,\"removed\":" + std::to_string(r.removed) +
+                   ",\"tracks\":" + std::to_string(r.tracks) + "}";
+        }
+        if (rq.path.rfind("/api/lib/remove", 0) == 0) {
+            std::string p;
+            const size_t q = rq.path.find("?path=");
+            if (q != std::string::npos) p = urlDecode(rq.path.substr(q + 6));
+            if (p.empty()) {
+                // 也接受表单体 path=<dir>（POST 时更稳，避免超长 URL）
+                std::istringstream is(rq.body);
+                std::string tok;
+                while (std::getline(is, tok, (char)38)) {
+                    const size_t e = tok.find((char)61);
+                    if (e == std::string::npos) continue;
+                    if (urlDecode(tok.substr(0, e)) == "path") p = urlDecode(tok.substr(e + 1));
+                }
+            }
+            if (p.empty()) return "{\"ok\":false,\"error\":\"未指定 path\"}";
+            if (!valid_utf8(p)) return utf8_path_reject(p);
+            const auto r = lib.removeUnder(p);
+            dlog("LIBSCAN remove path=" + p + " removed=" + std::to_string(r.removed) +
+                 " tracks=" + std::to_string(r.tracks));
+            return "{\"ok\":true,\"removed\":" + std::to_string(r.removed) +
+                   ",\"tracks\":" + std::to_string(r.tracks) + "}";
         }
         if (rq.path.rfind("/api/lib/roots", 0) == 0) {
             std::string add, rem;
@@ -4661,8 +4744,10 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                 if (kk == "add") add = vv;
                 else if (kk == "remove") rem = vv;
             }
-            if (!add.empty() && !lib.addRoot(add))
-                return "{\"ok\":false,\"error\":\"目录不存在: " + jesc(add) + "\"}";
+            if (!add.empty()) {
+                const auto ar = lib.addRootEx(add);
+                if (!ar.ok) return "{\"ok\":false,\"error\":\"" + jesc(ar.why) + "\"}";
+            }
             if (!rem.empty()) lib.removeRoot(rem);
             return "{\"ok\":true}";
         }

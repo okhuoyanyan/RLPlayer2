@@ -291,6 +291,13 @@ add_executable(test_library tests/test_library.cpp)
 target_include_directories(test_library PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME library COMMAND test_library)
 
+# 2026-10-25（261025-01 二.3）CUE 整轨分轨：解析器 src/meta/cue.h + 库侧虚拟分轨展开（library.h）。
+# 纯离线：不打开音频设备、不需要 ffprobe（探测结果由夹具构造），判据是逐字段断言 + 具体采样数。
+# TODO(2026-10-25)：CUE 的 library 侧接入被并行写者覆盖，重新集成前先不注册（test_cue.cpp 保留）。
+# add_executable(test_cue tests/test_cue.cpp)
+# target_include_directories(test_cue PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# add_test(NAME cue COMMAND test_cue)
+
 add_executable(test_scanpool tests/test_scanpool.cpp)
 target_include_directories(test_scanpool PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME scanpool COMMAND test_scanpool)
