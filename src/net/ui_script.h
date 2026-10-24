@@ -113,6 +113,8 @@ function params() {
           '&modfamily=' + encodeURIComponent(ADV.modfamily || 'dsd') +
          '&device=' + encodeURIComponent(ADV.device || '') +
          '&bits=' + (ADV.bits || 0) +
+         // 2026-10-24（261024-02 #8）：源文件真实位深（bit-perfect 判据用；解码器容器位深不可靠）
+         '&srcbits=' + ((S.curMeta && S.curMeta.bits) ? S.curMeta.bits : 0) +
          '&taps=' + (ADV.taps || 0) +
          '&atten=' + (ADV.atten || 0) +
          '&transition=' + (ADV.transition || 0) +
@@ -3261,6 +3263,12 @@ function renderSettingsPage() {
       + '</div>'
       + '<div class=hint id=sp_upnp_msg>播放 / 切歌自动投放到该渲染器（与下方「投放」共用会话）</div>'
       + '</div>'
+       // 2026-10-24（261024-02 #8）：用户看到"非 bit-perfect"不知道原因/怎么改。
+       // 给一个一键直通预设：源采样率 + 无抖动 + 0 dB + 无 EQ/IR + 独占，并把判据写在提示里。
+       + '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
+       + '<button class="btn pri" id=sp_bpfix>切到 bit-perfect 直通</button>'
+       + '<span class=hint style="margin:0">判据：输出采样率=源 / 抖动=none / 音量 0 dB / 无 EQ·IR / 独占 WASAPI</span>'
+       + '</div>'
        + sel('sp_device', '输出设备', '<option value="">默认设备</option>', '独占模式会接管这个设备；共享模式经系统混音，不接管')
        + sel('sp_outmode', '输出模式',
              opt('pcm', 'PCM', outModeOf()) + opt('dsd', 'DSD（SDM）', outModeOf()),
@@ -3656,6 +3664,45 @@ function renderSettingsPage() {
   // 261024-01 #9：目标渲染器与「投放」区块同一个选择（不出现两套互相打架的控制）
   if (D('sp_upnp_scan')) D('sp_upnp_scan').onclick = function () { scanCastDevices(true); };
   if (D('sp_upnp_dev')) D('sp_upnp_dev').onchange = function () { syncUpnpDev(this.value); backendHint(); };
+  // 2026-10-24（261024-02 #8）：一键切到 bit-perfect 直通。
+  // 用户只看到"非 bit-perfect"，不知道是哪一环：这里把判定口径对应的控件一次改到位。
+  if (D('sp_bpfix')) D('sp_bpfix').onclick = function () {
+    if (D('sp_backend')) { D('sp_backend').value = 'wasapi'; ADV.backend = 'wasapi'; }
+    if (D('sp_outmode')) D('sp_outmode').value = 'pcm';
+    if (D('sp_rate')) D('sp_rate').value = 'src';
+    if (D('sRate')) D('sRate').value = 'src';
+    if (D('sp_shaper')) D('sp_shaper').value = 'none';
+    if (D('sShap')) D('sShap').value = 'none';
+    if (D('sp_bits')) D('sp_bits').value = '0';
+    // ISP 过采样峰值保护会在峰值超满幅时做预衰减（非逐位一致）→ 直通模式必须关
+    if (D('sp_isp')) D('sp_isp').checked = false;
+    if (D('sIsp')) D('sIsp').checked = false;
+    ADV.isp = false;
+    // 关掉 EQ / IR 卷积（它们都会让输出不再是逐位一致）
+    if (D('sp_eq')) { D('sp_eq').value = ''; ADV.eq = ''; }
+    if (D('sp_ir')) { D('sp_ir').value = ''; ADV.ir = ''; }
+    // 音量：bit-perfect 必须 0 dB（不衰减），但 0 dB = 满幅输出，不能悄悄替用户拉满。
+    // 必须显式确认（铁律 1：向听音设备输出可闻电平要先告知）。
+    var volNow = (typeof S.vol === 'number') ? S.vol : 0;
+    var volSet = false;
+    if (Math.abs(volNow) > 1e-9) {
+      if (window.confirm('bit-perfect 要求音量 0 dB（不衰减、输出满幅）。\n当前音量 ' + volNow.toFixed(1) +
+                         ' dB。\n\n是否同时把音量设到 0 dB？\n（选"取消"则只改采样率/抖动/EQ，仍非 bit-perfect）')) {
+        S.vol = 0;
+        if (D('vol')) D('vol').value = '0';
+        if (D('volDb')) D('volDb').textContent = '0.0 dB';
+        volSet = true;
+      }
+    } else {
+      volSet = true;
+    }
+    saveSettings();
+    backendHint();
+    if (D('sp_backendmsg')) D('sp_backendmsg').textContent = volSet
+      ? '已切到 bit-perfect 直通：源采样率 + 无抖动 + 0 dB + 无 EQ/IR + 独占。下次播放生效。'
+      : '已改采样率/抖动/EQ，但音量仍是 ' + volNow.toFixed(1) + ' dB（非 0）→ 仍非 bit-perfect。';
+    toast(volSet ? '已切到 bit-perfect 直通（下次播放生效）' : '已改采样率/抖动/EQ；音量未动，仍非 bit-perfect');
+  };
   D('sp_ch').onchange = function () {
     ADV.channels = parseInt(this.value, 10) || 0;
     saveSettings();

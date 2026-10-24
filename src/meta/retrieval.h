@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -108,6 +109,8 @@ struct SummaryResult {
     // 2026-10-24（用户 261024-01 #4）：结构化标签。AI 只填"确实知道"的字段，找不到的不出现。
     // 顺序保留（label,value），序列化成 JSON 对象供前端按 标签: 值 渲染。
     std::vector<std::pair<std::string, std::string>> fields;
+    // 2026-10-24（261024-02 #1/#7）：分阶段耗时诊断（search/fetch/llm 各多少 ms），只用于日志与 A/B。
+    std::string diag;
 };
 
 // ---------------------------------------------------------------------------
@@ -412,7 +415,9 @@ inline std::vector<LlmMessage> build_synthesis_prompt(
         "4. 免责声明：disclaimer 固定为：\"仅依据下方来源材料综合整理；可能不完整，请以来源为准\"。\n"
         "5. 行文纪律：**不要提及「材料」「来源」「资料」「条目」「文中」等元话语**，也不要复述检索过程；"
         "直接以陈述句写事实（例：不要写「材料列出的代表歌曲包括…」，直接写「代表歌曲包括…」）。\n"
-        "6. 结构化标签：JSON 还必须包含 \"fields\" 对象（键值都是字符串），用于界面上的「标签: 值」展示。"
+        "6. **简洁优先**：sections 最多 2 段、每段不超过 90 个汉字；标签信息优先放进 fields。"
+        "（用户 261024-02 #1：资料整理太慢；输出越短越快，长文不是目标。）\n"
+        "7. 结构化标签：JSON 还必须包含 \"fields\" 对象（键值都是字符串），用于界面上的「标签: 值」展示。"
         "**只填材料明确支撑的字段；材料没说的键直接不要出现**（禁止写「未知」「暂无」「—」占位）。\n"
         "   本实体可用字段（键名必须原样使用）：" + schema + "\n"
         "   若同一信息既有标签又值得展开叙述，可以在 sections 里写叙述、fields 里放一句结论，但不要整段复制。\n\n"
@@ -1281,6 +1286,9 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
         return err;
     }
 
+    // 2026-10-24（261024-02 #1/#7）：分阶段计时（与专辑/艺术家路径同口径，日志可对比）
+    const auto t_trk0 = std::chrono::steady_clock::now();
+    long long trk_search_ms = 0, trk_fetch_ms = 0, trk_llm_ms = 0;
     // 2026-10-24（261024-01 #1）：歌曲级资料也走**官方 search + fetch**，
     // 而不是只凭模型记忆（用户对"AI 只会瞎编"的批评就来自这里）。
     std::vector<SearchHit> hits;
@@ -1295,6 +1303,8 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
         }
         retrieval_rate_limiter().acquire();
         const DsSearchReply s_rep = ds_search(cfg, query, opts.max_search_hits > 0 ? opts.max_search_hits : 8);
+        trk_search_ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t_trk0).count();
         if (s_rep.ok) {
             std::vector<SearchHit> raw;
             for (const auto& dh : s_rep.hits) {
@@ -1306,14 +1316,25 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
             FilterResult fr = filter_hits(raw, opts.filter_opts);
             hits = std::move(fr.hits);
             const size_t fetch_count = std::min(hits.size(), (size_t)2);
+            const auto t_f0 = std::chrono::steady_clock::now();
+            const LlmConfig cfg_f = cfg;
+            std::vector<std::future<DsFetchReply>> futs;
             for (size_t i = 0; i < fetch_count; ++i) {
-                retrieval_rate_limiter().acquire();
-                const DsFetchReply f_rep = ds_fetch(cfg, hits[i].url);
+                const std::string fu = hits[i].url;
+                futs.push_back(std::async(std::launch::async, [fu, cfg_f]() {
+                    retrieval_rate_limiter().acquire();
+                    return ds_fetch(cfg_f, fu, 10000);
+                }));
+            }
+            for (size_t i = 0; i < fetch_count; ++i) {
+                const DsFetchReply f_rep = futs[i].get();
                 if (f_rep.ok && !f_rep.content.empty()) {
                     hits[i].snippet = f_rep.content.substr(0, 1200);
                     if (!f_rep.title.empty()) hits[i].title = f_rep.title;
                 }
             }
+            trk_fetch_ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_f0).count();
         }
     }
 
@@ -1327,7 +1348,10 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
                     "）。请只输出严格 JSON：{\"fields\":{...},\"sections\":[{\"heading\":\"简介\",\"paragraphs\":[{\"text\":\"…\"}]}]}" });
             }
             retrieval_rate_limiter().acquire();
+            const auto t_l0 = std::chrono::steady_clock::now();
             const LlmReply rep = llm_chat(cfg, msgs, 2200, 0.3f, true);
+            trk_llm_ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_l0).count();
             if (!rep.ok) { last_err = rep.error; continue; }
             sr = parse_ai_only_reply(rep.content);
             if (sr.ok) break;
@@ -1344,6 +1368,8 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
     if (sr.ok) {
         sr.generated_at = (long long)std::time(nullptr);
         sr.expires_at = sr.generated_at + 7 * 86400;
+        sr.diag = "search=" + std::to_string(trk_search_ms) + "ms fetch=" + std::to_string(trk_fetch_ms) +
+                  "ms llm=" + std::to_string(trk_llm_ms) + "ms hits=" + std::to_string(hits.size());
         summary_save_cache(baseDir, eid, lang, sr);
     }
     return sr;
@@ -1409,6 +1435,13 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         return err_res;
     }
 
+    // 2026-10-24（261024-02 #1/#7）：分阶段计时（A/B 与"为什么慢"都靠它，不许拍脑袋）
+    const auto t_stage0 = std::chrono::steady_clock::now();
+    auto ms_since = [](std::chrono::steady_clock::time_point a) {
+        return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - a).count();
+    };
+    long long diag_knowledge_ms = 0, diag_search_ms = 0, diag_fetch_ms = 0, diag_llm_ms = 0;
     // 3. Step 1: 拉取 L2 权威材料（Release 整合 Wikipedia 与 Discogs）
     KnowledgeOpts kopts;
     kopts.lang = lang;
@@ -1463,6 +1496,8 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         if (!m.url.empty()) allowed_urls.push_back(m.url);
     }
 
+    diag_knowledge_ms = ms_since(t_stage0);
+    const auto t_search0 = std::chrono::steady_clock::now();
     if (opts.enable_search) {
         std::string query;
         // 2026-10-24（261024-01 #1）：官方 /v1/tools/search 的召回质量与 query 强相关。
@@ -1492,6 +1527,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
 
         retrieval_rate_limiter().acquire();
         const DsSearchReply s_rep = ds_search(cfg, query, opts.max_search_hits > 0 ? opts.max_search_hits : 5);
+        diag_search_ms = ms_since(t_search0);
         if (s_rep.ok) {
             std::vector<SearchHit> raw_hits;
             raw_hits.reserve(s_rep.hits.size());
@@ -1511,20 +1547,32 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             FilterResult fr = filter_hits(raw_hits, opts.filter_opts);
             valid_hits = std::move(fr.hits);
 
-            // Step 3: ds_fetch 取前几页正文（每实体最多 4 次 fetch；官方 fetch 返回正文质量好，
-            // 262024-01 #1 用户要求对齐官方 search 结果质量）
+            // Step 3: ds_fetch 取前几页正文（每实体最多 4 次 fetch；官方 fetch 返回正文质量好）。
+            // 2026-10-24（261024-02 #1 速度）：4 次 fetch 串行要 4×RTT，改并行（限频器内部仍有 220ms 间隔，
+            // 不会打爆 QPS），顺序只影响结果合并顺序、不影响内容。
             const size_t fetch_count = std::min(valid_hits.size(),
                 (size_t)std::max(1, std::min(opts.max_fetch_pages, 4)));
+            const auto t_fetch0 = std::chrono::steady_clock::now();
+            const LlmConfig cfg_fetch = cfg;
+            std::vector<std::future<DsFetchReply>> fetch_futs;
+            fetch_futs.reserve(fetch_count);
+            for (size_t i = 0; i < fetch_count; ++i) {
+                const std::string fu = valid_hits[i].url;
+                fetch_futs.push_back(std::async(std::launch::async, [fu, cfg_fetch]() {
+                    retrieval_rate_limiter().acquire();
+                    return ds_fetch(cfg_fetch, fu, 12000);   // 12s 超时：慢页不拖累整体
+                }));
+            }
             for (size_t i = 0; i < fetch_count; ++i) {
                 SearchHit fh = valid_hits[i];
-                retrieval_rate_limiter().acquire();
-                const DsFetchReply f_rep = ds_fetch(cfg, fh.url);
+                const DsFetchReply f_rep = fetch_futs[i].get();
                 if (f_rep.ok && !f_rep.content.empty()) {
                     fh.snippet = f_rep.content.substr(0, 1500);
                     if (!f_rep.title.empty()) fh.title = f_rep.title;
                 }
                 fetched_hits.push_back(std::move(fh));
             }
+            diag_fetch_ms = ms_since(t_fetch0);
             for (size_t i = fetch_count; i < valid_hits.size(); ++i) {
                 fetched_hits.push_back(valid_hits[i]);
             }
@@ -1577,32 +1625,66 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         (kind == EntityKind::Release) ? "专辑" : "艺术家");
     SummaryResult parsed;
     std::string last_err;
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        // 第二次不要原样重发（确定性失败会白花一次 4000-token 调用）：追加一条修复提示。
-        std::vector<LlmMessage> attempt_msgs = msgs;
-        if (attempt > 0) {
+    // 2026-10-24（261024-02 #1）：400/非 JSON 的降级链。
+    // 用户实测"艺术家栏永远显示 暂无该实体的资料（HTTP 400: 响应不是合法 JSON）"——
+    // 根因是请求体在个别实体上被服务端判非法（非法 UTF-8/超长），重发原样请求只会再 400。
+    // 降级顺序：①原样（max_tokens 2600）→ ②精简材料重发（每条正文截断、去掉 fetch 长文）
+    //          → ③AI 自有知识兜底（标「AI 整理」，总比"暂无资料"好，且不冒充有来源）。
+    std::vector<SearchHit> reduced_hits = fetched_hits;
+    for (auto& h : reduced_hits) {
+        h.snippet = h.snippet.substr(0, 400);
+        h.summary = h.summary.substr(0, 400);
+    }
+    std::vector<KnowledgeMaterial> reduced_mats = kr.materials;
+    for (auto& m : reduced_mats) m.text = m.text.substr(0, 1500);
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        std::vector<LlmMessage> attempt_msgs;
+        int attempt_tokens = 2600;
+        if (attempt == 0) {
+            attempt_msgs = msgs;
+        } else if (attempt == 1) {
+            attempt_msgs = build_synthesis_prompt(promptEntityName, reduced_mats, reduced_hits, lang,
+                                                  (kind == EntityKind::Release) ? "专辑" : "艺术家");
+            attempt_tokens = 2000;
             attempt_msgs.push_back(LlmMessage{ "user",
-                "上一次输出未通过校验（" + last_err + "）。请只输出严格合法的 JSON 对象："
-                "必须包含 citations 数组（每条含 id/title/url/source，url 必须原样复制自上面材料的链接），"
-                "sections 里每段至少 1 条引用；内容请精简到 3 段以内，不要任何 Markdown 或解释文字。" });
+                "上一次请求失败（" + last_err + "）。请用更短的篇幅输出严格 JSON："
+                "最多 2 个 section、每段 1 条引用；citations 的 url 必须原样复制材料链接。" });
+        } else {
+            break;   // 第三次交给下面的 AI 整理兜底
         }
         retrieval_rate_limiter().acquire();
-        const LlmReply chat_rep = llm_chat(cfg, attempt_msgs, 4000, 0.2f, true);
+        const auto t_llm0 = std::chrono::steady_clock::now();
+        const LlmReply chat_rep = llm_chat(cfg, attempt_msgs, attempt_tokens, 0.2f, true);
+        const long long llm_ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t_llm0).count();
         if (!chat_rep.ok) {
             last_err = "LLM 综合失败: " + chat_rep.error;
+            diag_llm_ms += llm_ms;
             continue;
         }
+        diag_llm_ms += llm_ms;
         parsed = parse_synthesis_reply(chat_rep.content, allowed_urls);
         if (parsed.ok) break;
         last_err = "综合结果校验失败: " + parsed.error;
     }
     if (!parsed.ok) {
-        // 重试仍失败：有旧缓存则离线回退，否则如实报错（不伪造内容）
+        // 有旧缓存 → 离线回退；否则 AI 自有知识兜底（诚实标注「AI 整理」，不冒充有来源）
         if (have_cache && cached.ok) {
             cached.from_cache = true;
             cached.offline = true;
             cached.error = "综合校验失败 (" + last_err + ")，已回退至本地缓存";
             return cached;
+        }
+        SummaryResult ai_fb = summary_ai_only_generate(promptEntityName,
+            (kind == EntityKind::Release) ? "专辑" : "艺术家", lang, cfg);
+        if (ai_fb.ok) {
+            ai_fb.error = "权威综合失败，已用 AI 自有知识整理（" + last_err + "）";
+            ai_fb.diag = "fallback=ai_only; " + last_err;
+            ai_fb.generated_at = now_sec;
+            ai_fb.expires_at = now_sec + 3 * 86400;   // 兜底内容 TTL 短一些，方便恢复后重生成
+            summary_save_cache(baseDir, eid, lang, ai_fb);
+            return ai_fb;
         }
         SummaryResult err_res;
         err_res.ok = false;
@@ -1618,6 +1700,10 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     parsed.offline = false;
     parsed.validation_ok = true;
 
+    parsed.diag = "knowledge=" + std::to_string(diag_knowledge_ms) + "ms search=" +
+                  std::to_string(diag_search_ms) + "ms fetch=" + std::to_string(diag_fetch_ms) +
+                  "ms llm=" + std::to_string(diag_llm_ms) + "ms hits=" +
+                  std::to_string(fetched_hits.size());
     summary_save_cache(baseDir, eid, lang, parsed);
 
     return parsed;

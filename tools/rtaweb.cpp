@@ -162,6 +162,9 @@ struct PlayParams {
     std::string dsdConv = "narrow";  // DSD 源 Conversion 预设：narrow | wide | xfi
     bool        dsd2Stage = true;    // DSD 源两级抽取（CIC 4x + 短 FIR），默认开启
 
+    // 2026-10-24（261024-02 #8）：源文件真实位深（16/24/32）。解码器给的是容器位深（flac 一律 32），
+    // 用容器位深判"位深降低"会误报（16bit 源 → 24bit 输出明明没降低）。
+    int    srcBits = 0;
     std::string remoteId;        // 远程曲目 id（Subsonic）
     std::string remoteSuffix;    // 远程文件后缀，决定缓存文件名
     std::string remoteTitle;
@@ -397,6 +400,7 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "inoffset") p.inOffset = atoi(v.c_str());
         else if (k == "inbuf")    p.inBufferMs = std::max(10, atoi(v.c_str()));
         else if (k == "inmon")    p.inMonitor = (v == "1");
+        else if (k == "srcbits") p.srcBits = atoi(v.c_str());
         else if (k == "rid")     p.remoteId = v;
         else if (k == "rsuffix") p.remoteSuffix = v;
         else if (k == "rtitle")  p.remoteTitle = v;
@@ -1902,6 +1906,10 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             }
         }
         const int      outBits  = cfg.outBits ? cfg.outBits : 24;   // 跟随设置里的输出位深
+        // 2026-10-24（261024-02 #8）：bit-perfect 的"位深降低"必须用**源文件真实位深**（p.srcBits，由界面从
+        // 元数据带下来）。解码器容器位深（flac 恒为 32）会把 16bit 源 → 24bit 输出误判成"位深降低"。
+        const int srcBitsEff = p.srcBits > 0 ? p.srcBits
+                              : ((in.bits > 0 && in.bits <= 24) ? in.bits : 0);
         const size_t   totalOut = (size_t)((double)in.frames() * (double)deviceRate / (double)in.rate + 0.5);
         ps.outRate = deviceRate; ps.outBits = outBits;
         ps.total.store(totalOut);
@@ -1983,20 +1991,25 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 << ",\"gpuStatus\":\"" << jesc(rta::dsp::GpuBridge::instance().status()) << "\""
                 << ",\"volRamp\":" << cfg.volumeRampMs
                 << ",\"bits\":" << outBits
+                << ",\"srcBits\":" << p.srcBits
                 << ",\"eq\":" << (eqLoaded ? "true" : "false")
                 << ",\"directSdm\":false"
                 << ",\"directNote\":\"" << jesc(directNote) << "\""
                 // ---- bit-perfect 权威结论（用户 261023-02 #1）----
                 // 三态：direct（DirectSDM 1-bit 直通，最严格）/ yes / no（附原因）
                 // 口径：①不重采样 ②音量 0 dB ③无抖动/整形 ④无衰减 ⑤无 EQ/IR ⑥非 DoP ⑦位深未降
+                // 2026-10-24（261024-02 #8）：位深判据用"源文件真实位深"（见下方 srcBitsEff 声明）
                 << ",\"bitPerfect\":\"" << ([&] {
                        if (p.directSdm && directNote.empty()) return std::string("direct");
                        if (outRate != in.rate) return std::string("no");
                        if (cfg.volumeEnabled && std::fabs(cfg.volumeDb) > 1e-9) return std::string("no");
                        if (cfg.shaper != rta::dsp::Shaper::None) return std::string("no");
-                       if (cfg.attenDb > 1e-9) return std::string("no");
+                       // 2026-10-24（261024-02 #8）：attenDb 是**滤波器阻带衰减设计值**（如 120 dB），
+                       // 不是信号增益！以前拿它判"衰减"⟹ 只要选了滤波器预设就永远非 bit-perfect（误报）。
+                       // 真正的信号衰减是 preAttenDb（ISP/调制器余量预衰减）。
+                       if (cfg.preAttenDb > 1e-9) return std::string("no");
                        if (eqLoaded || convLoaded || dop) return std::string("no");
-                       if (in.bits > 0 && outBits > 0 && outBits < in.bits) return std::string("no");
+                       if (srcBitsEff > 0 && outBits > 0 && outBits < srcBitsEff) return std::string("no");
                        return std::string("yes");
                    }()) << "\""
                 << ",\"bitPerfectWhy\":\"" << jesc([&] {
@@ -2005,11 +2018,11 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                        if (outRate != in.rate) why.push_back("重采样 " + std::to_string(in.rate) + "→" + std::to_string(outRate) + " Hz");
                        if (cfg.volumeEnabled && std::fabs(cfg.volumeDb) > 1e-9) why.push_back("音量 " + std::to_string((int)std::lround(cfg.volumeDb)) + " dB");
                        if (cfg.shaper != rta::dsp::Shaper::None) why.push_back("抖动/整形");
-                       if (cfg.attenDb > 1e-9) why.push_back("衰减");
+                       if (cfg.preAttenDb > 1e-9) why.push_back("预衰减");
                        if (eqLoaded) why.push_back("EQ");
                        if (convLoaded) why.push_back("IR 卷积");
                        if (dop) why.push_back("DoP 载波");
-                       if (in.bits > 0 && outBits > 0 && outBits < in.bits) why.push_back("位深降低");
+                       if (srcBitsEff > 0 && outBits > 0 && outBits < srcBitsEff) why.push_back("位深降低");
                        if (why.empty()) return std::string("源→解码→输出全程逐位一致");
                        std::string s; for (size_t i = 0; i < why.size(); ++i) { if (i) s += "、"; s += why[i]; }
                        return s;
@@ -2030,11 +2043,11 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                     if (outRate != in.rate) why.push_back("重采样 " + std::to_string(in.rate) + "→" + std::to_string(outRate) + " Hz");
                     if (cfg.volumeEnabled && std::fabs(cfg.volumeDb) > 1e-9) why.push_back("音量 " + std::to_string((int)std::lround(cfg.volumeDb)) + " dB");
                     if (cfg.shaper != rta::dsp::Shaper::None) why.push_back("抖动/整形");
-                    if (cfg.attenDb > 1e-9) why.push_back("衰减");
+                    if (cfg.preAttenDb > 1e-9) why.push_back("预衰减");   // 见上方口径注：attenDb 是滤波设计值
                     if (eqLoaded) why.push_back("EQ");
                     if (convLoaded) why.push_back("IR 卷积");
                     if (dop) why.push_back("DoP 载波");
-                    if (in.bits > 0 && outBits > 0 && outBits < in.bits) why.push_back("位深降低");
+                    if (srcBitsEff > 0 && outBits > 0 && outBits < srcBitsEff) why.push_back("位深降低");
                     if (why.empty()) { bps = "yes"; bpw = "源→解码→输出全程逐位一致"; }
                     else { std::string s; for (size_t i = 0; i < why.size(); ++i) { if (i) s += "、"; s += why[i]; } bpw = s; }
                 }
@@ -3127,7 +3140,9 @@ static void summary_job_start_fn(const std::string& key, const std::string& kind
         } else {
             play_log("SUMMARY generated kind=" + kindStr + " name=" + label + " eid=" + key +
                      " fromCache=" + std::string(sr.from_cache ? "1" : "0") +
-                     " unverified=" + std::string(sr.unverified ? "1" : "0"));
+                     " unverified=" + std::string(sr.unverified ? "1" : "0") +
+                     // 2026-10-24（261024-02 #1/#7）：分阶段耗时（search/fetch/llm），用于回答"为什么慢"
+                     (sr.diag.empty() ? std::string() : (" diag=" + sr.diag)));
             body = summary_json_with_flags(sr, kindStr, sr.from_cache);
         }
         std::lock_guard<std::mutex> lk(g_summ_mu);

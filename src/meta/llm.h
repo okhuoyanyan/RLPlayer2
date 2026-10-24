@@ -26,6 +26,7 @@
 #include <fstream>
 #include <filesystem>
 #include <cstdio>
+#include <cstdlib>   // std::getenv（思考强度 A/B 开关）
 #include <iterator>
 #include <functional>
 #include <ctime>
@@ -45,6 +46,34 @@ inline std::string llm_trim(const std::string& s) {
 
 // JSON 字符串转义。注意：这里按本模块 spec 独立实现（\r 输出 \r 而不是像 rtaweb 的
 // jesc 那样丢弃），中文等 >=0x80 的字节原样透传（UTF-8 本身就是合法 JSON 字符串内容）。
+// 2026-10-24（261024-02 #1）：把非法 UTF-8 字节清成 '?'。
+// 现象：艺术家资料偶发 "HTTP 400: 响应不是合法 JSON" —— 服务端收到非法 UTF-8 的 JSON body
+// 时直接回纯文本 400，我们的解析器只能报"响应不是合法 JSON"。抓到的材料（网页正文）可能带
+// GBK/截断字节，所以发请求前统一清洗一遍。
+inline std::string llm_sanitize_utf8(const std::string& s) {
+    std::string o; o.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = (unsigned char)s[i];
+        size_t len = 0;
+        if (c < 0x80) len = 1;
+        else if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        else { o += '?'; ++i; continue; }
+        if (i + len > s.size()) { o += '?'; ++i; continue; }
+        bool ok = true;
+        for (size_t k = 1; k < len; ++k) {
+            const unsigned char cc = (unsigned char)s[i + k];
+            if ((cc & 0xC0) != 0x80) { ok = false; break; }
+        }
+        if (!ok) { o += '?'; ++i; continue; }
+        o.append(s, i, len);
+        i += len;
+    }
+    return o;
+}
+
 inline std::string llm_esc(const std::string& s) {
     std::string o; o.reserve(s.size() + 8);
     char b[8];
@@ -402,14 +431,22 @@ inline std::string llm_build_chat_body(const std::string& model,
     for (size_t i = 0; i < msgs.size(); ++i) {
         if (i) o << ",";
         o << "{\"role\":\"" << llm_esc(msgs[i].role)
-          << "\",\"content\":\"" << llm_esc(msgs[i].content) << "\"}";
+          << "\",\"content\":\"" << llm_esc(llm_sanitize_utf8(msgs[i].content)) << "\"}";
     }
     o << "],\"max_tokens\":" << maxTokens;
     // 2026-10-24（用户 261024-01 #1）：思考强度设 LOW 以提升速度。
     // DeepSeek 侧接受 reasoning_effort 参数（实测 200；不支持的兼容端点可能 400，
     // 所以只在模型名含 deepseek 时追加，避免影响其它 OpenAI 兼容后端）。
+    // 2026-10-24（261024-02 #7）：思考强度做成可调，便于 A/B 实测（off / low / default）。
+    // RLPLAYER_LLM_REASONING 环境变量优先，其次 conf 里 llm_reasoning 键（rtaweb 会写进 env）。
     const std::string lm = model;
-    if (lm.find("deepseek") != std::string::npos) o << ",\"reasoning_effort\":\"low\"";
+    if (lm.find("deepseek") != std::string::npos) {
+        const char* rv = std::getenv("RLPLAYER_LLM_REASONING");
+        const std::string mode = rv ? std::string(rv) : std::string("low");
+        if (mode == "off") o << ",\"thinking\":{\"type\":\"disabled\"}";
+        else if (mode == "default" || mode == "auto") { /* 不追加参数 */ }
+        else o << ",\"reasoning_effort\":\"low\"";
+    }
     char tb[32];
     std::snprintf(tb, sizeof(tb), "%.2f", (double)temperature);   // 保留 2 位小数
     o << ",\"temperature\":" << tb;
@@ -612,8 +649,10 @@ inline DsSearchReply ds_search(const LlmConfig& cfg, const std::string& query, i
     return r;
 }
 
-// POST {base}/v1/tools/fetch，超时 60s，单次调用不重试
-inline DsFetchReply ds_fetch(const LlmConfig& cfg, const std::string& url) {
+// POST {base}/v1/tools/fetch，单次调用不重试。timeout_ms 默认 60s；
+// 2026-10-24（261024-02 #1 速度）：检索层改成 4 路并行 + 单页 12s 超时，
+// 慢页面不再把整个资料整理拖到 20s+（实测最慢一次 fetch 阶段 10.9s）。
+inline DsFetchReply ds_fetch(const LlmConfig& cfg, const std::string& url, int timeout_ms = 60000) {
     DsFetchReply r;
     if (cfg.apiKey.empty()) { r.error = "未配置 api_key（rlplayer-llm.conf）"; return r; }
 
@@ -632,7 +671,7 @@ inline DsFetchReply ds_fetch(const LlmConfig& cfg, const std::string& url) {
     if (cfg.transport) {
         resp = cfg.transport(reqUrl, body, headers);
     } else {
-        resp = rta::net::http_post(reqUrl, body, headers, "application/json", 60000);
+        resp = rta::net::http_post(reqUrl, body, headers, "application/json", timeout_ms);
     }
 
     if (resp.status == 0) {
