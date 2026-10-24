@@ -1,4 +1,4 @@
-﻿# verify_libtag_dirfill.ps1 - 目录结构判据 -> album/discNo 回填的**真实入口**验证
+# verify_libtag_dirfill.ps1 - 目录结构判据 -> album/discNo 回填的**真实入口**验证
 #
 # 判据（铁律 3）：不看 API「看着对」，而看两处落点：
 #   ① rlplayer-index.tsv（落盘）：BoxSetAlbum 的 4 行 album 列 = BoxSetAlbum、disc 列 = 1/1/2/2
@@ -99,7 +99,9 @@ try {
   $box = @()
   foreach ($r in $rows) {
     $f = $r -split $TAB
-    if ($f.Count -ne 16) { throw "列数不是 16：$($f.Count) -> $r" }
+    # 2026-10-25：v4 索引在 genre 之后追了 4 列 CUE 字段（cue/cueN/cueOff/cueLen），
+    # 老 16 列列名与顺序逐字不变；这里跟着改成 20，避免升级后这条门禁脚本误报。
+    if ($f.Count -ne 20) { throw "列数不是 20（16 老字段 + 4 CUE 字段）：$($f.Count) -> $r" }
     if ($f[0] -like "*BoxSetAlbum*") { $box += ,@($f[0], $f[3], $f[8]) }
   }
   Write-Host "[tsv] BoxSetAlbum 4 行（文件 | album 列 | disc 列）："

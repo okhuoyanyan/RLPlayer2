@@ -569,3 +569,8 @@ add_test(NAME monitor_dsp COMMAND test_monitor_dsp)
 add_executable(test_dsd_stream_decode tests/test_dsd_stream_decode.cpp)
 target_link_libraries(test_dsd_stream_decode PRIVATE rtadsp)
 add_test(NAME dsd_stream_decode COMMAND test_dsd_stream_decode)
+
+# ---------------- 原生标签快速通道（261025-01 一.1/8）----------------
+add_executable(test_tags_native tests/test_tags_native.cpp)
+target_include_directories(test_tags_native PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME tags_native COMMAND test_tags_native)

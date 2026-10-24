@@ -19,6 +19,7 @@
 #include "net/scan_pool.h"
 #include "meta/entities.h"
 #include "meta/cue.h"          // CUE 整轨分轨解析（仅头文件；library 侧把它变成虚拟曲目）
+#include "meta/tags_native.h"   // 原生标签快速通道（FLAC/WAV/MP3/OGG；lib_probe_one 的原生分支）
 #include <memory>
 #include <string>
 #include <vector>
@@ -592,6 +593,34 @@ inline void lib_fill_album_disc_from_dir(LibTrack& t, LibDirAlbumMemo* memo = nu
 inline LibTrack lib_probe_one(const std::string& file, const std::string& ffprobePath = "") {
     LibTrack t;
     t.path = file;
+    // ===================== 原生标签快速通道（调度层，2026-10-25） =====================
+    // 261025-01 一.1/一.8：首次全量扫描 45.9 首/s（3000 首 65.4 s），瓶颈是**每个文件起一次 ffprobe 进程**。
+    // src/meta/tags_native.h 就地解析 FLAC/WAV/MP3/OGG 的头部与标签块，语义与下面 ffprobe 分支逐字段对齐
+    // （见该文件顶部的实测依据：LAME delay/padding、WAV data 截断、OGG 末页 granulepos、bits 的 N/A 口径…）。
+    //
+    // 保底原则：原生通道**只在结构完全说得通时**返回 true；任何解析失败/不支持的变体（ID3v2.2、
+    // unsynchronisation、数字流派引用、Opus、RF64、"id3 " 块…）一律返回 false，原样落到下面的 ffprobe，
+    // 保证「关掉原生通道」与「开着」得到同一份入库结果（tests/verify 与 tests/test_tags_native.cpp 判据）。
+    // 环境变量 RLPLAYER_NATIVE_TAGS=0 可整体关闭（默认开）。
+    if (rta::meta::native::enabled()) {
+        rta::meta::native::TagInfo ni;
+        std::string why;
+        if (rta::meta::native::probe_file(file, &ni, &why)) {
+            t.title = ni.title; t.artist = ni.artist; t.album = ni.album;
+            t.albumArtist = ni.albumArtist; t.genre = ni.genre;
+            t.trackNo = ni.trackNo; t.discNo = ni.discNo; t.year = ni.year;
+            t.sampleRate = ni.sampleRate; t.channels = ni.channels;
+            t.bits = ni.bits; t.duration = ni.duration; t.codec = ni.codec;
+            // 与下面 ffprobe 分支的老口径逐条对齐：
+            //   * ffprobe 的 bits_per_raw_sample 对 16-bit WAV / MP3 / OGG 是 N/A ⟹ 旧代码统一写成 16；
+            //     FLAC/WAV-24bit 则报真值（24）。这里同样是「<=0 就 16」。
+            if (t.bits <= 0) t.bits = 16;
+            // 同目录独立封面（只 stat）与内嵌封面任一成立即算有封面 —— 与下面同一行逻辑。
+            t.hasCover = ni.hasCover ? 1 : 0;
+            if (!t.hasCover && lib_has_cover_file(t.path)) t.hasCover = 1;
+            return t;
+        }
+    }
     const std::string ffprobe = !ffprobePath.empty() ? ffprobePath : rta::audio::find_tool("ffprobe");
     if (ffprobe.empty()) return t;
 
