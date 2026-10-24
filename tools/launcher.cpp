@@ -52,6 +52,17 @@ static HANDLE g_child = nullptr;
 static NOTIFYICONDATAW g_nid{};
 static const char* const g_buildTime = __DATE__ " " __TIME__;   // 启动横幅用
 
+// 261024-05 #1（用户反馈：点 X 别退出，改隐藏到托盘）：
+//   g_exiting      = 已走【正式退出】路径（托盘菜单「退出」/系统关机）。只有它为真时
+//                    WM_CLOSE 才允许 DestroyWindow —— 平时 WM_CLOSE 只隐藏窗口。
+//   g_hideHintShown= "仍在后台播放"的气球只弹一次；每次点 X 都弹就成了骚扰。
+static bool g_exiting = false;
+static bool g_hideHintShown = false;
+// 隐藏期间被跳过的"窗口自查"次数：需求 #6 要求隐藏时不影响 resize/像素逻辑。
+// 计数器只为了在恢复显示时打一行可核查的数字（隐藏时既不刷像素也不进模态拖拽循环）。
+static unsigned g_hiddenWatchdogSkips = 0;
+static unsigned g_hiddenResizeSkips = 0;
+
 // ---------------- 工具 ----------------
 // 非阻塞 connect + select：阻塞式 connect 在没有监听者时可能长期挂住，
 // 会让启动器卡死在「探测端口」这一步（本轮踩到）。
@@ -180,6 +191,7 @@ static void theme_flags(bool& dark, bool& blue) {
 }
 
 static void install_wv_edge_hittest(HWND top);   // 定义在窗口过程之前（WS 边缘命中，见下）
+static void hide_main_window();                 // 261024-05 #1：WM_CLOSE -> 隐藏到托盘（定义在 show_main_window 旁）
 static void open_browser(int port) {
     wchar_t url[64];
     swprintf_s(url, L"http://127.0.0.1:%d/", port);
@@ -426,6 +438,69 @@ static bool spawn_server(int port) {
     CloseHandle(pi.hThread);
     g_child = pi.hProcess;
     return true;
+}
+
+// rtaweb 自己的退出路径：GET /api/quit（见 tools/rtaweb.cpp:6304）把 g_exitReq 置真，
+// 主循环在 50ms 内醒来 → 播放线程 stop+join、WebUi::stop()，正常返回 0。
+// 用最朴素的阻塞 socket：服务就在本机，1.2s 超时足够，不引第三方 HTTP 客户端。
+static bool http_get_quit(int port) {
+    if (port <= 0) return false;
+    SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return false;
+    DWORD to = 1200;
+    ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+    ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons((u_short)port);
+    a.sin_addr.s_addr = inet_addr("127.0.0.1");
+    bool ok = false;
+    if (::connect(s, (sockaddr*)&a, sizeof(a)) == 0) {
+        const char* req = "GET /api/quit HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        if (::send(s, req, (int)strlen(req), 0) > 0) {
+            char buf[512];
+            ok = ::recv(s, buf, sizeof(buf), 0) > 0;   // 预期 "{\"ok\":true}"
+        }
+    }
+    ::closesocket(s);
+    return ok;
+}
+
+// 优雅停止 rtaweb 子进程（261024-05 #1 #4）。
+// 铁律 2：先做只读检查、绝不 taskkill /IM、绝不枚举/杀进程树 —— 只动【本进程
+// CreateProcess 出来的那个句柄】g_child。顺序：
+//   1) 发它自己的退出路径 /api/quit，让它自己收尾（播放线程 join、UI stop）
+//   2) 等最多 5s
+//   3) 只有它真的赖着不走，才对那个句柄 TerminateProcess（最后一道保险，日志留证）
+// 返回 true = 它是自己退出的（优雅），false = 用了兜底或没有子进程。
+static bool stop_server_graceful(int port) {
+    if (!g_child) {
+        logf(L"停服务：g_child 为空（已停过一次，或本进程只是接管了已有实例），不碰任何进程");
+        return true;
+    }
+    if (WaitForSingleObject(g_child, 0) == WAIT_OBJECT_0) {
+        DWORD c = 0; GetExitCodeProcess(g_child, &c);
+        logf(L"停服务：rtaweb 早已退出 code=%lu", c);
+        CloseHandle(g_child); g_child = nullptr;
+        return true;
+    }
+    const DWORD childPid = GetProcessId(g_child);
+    const bool sent = http_get_quit(port);
+    logf(L"停服务：已发 GET /api/quit port=%d 送达=%d （pid=%lu，只等它自己退）",
+         port, (int)sent, (unsigned long)childPid);
+    const DWORD t0 = GetTickCount();
+    if (WaitForSingleObject(g_child, 5000) == WAIT_OBJECT_0) {
+        DWORD c = 0; GetExitCodeProcess(g_child, &c);
+        logf(L"停服务：rtaweb 优雅退出 code=%lu（耗时 %lu ms）", c, GetTickCount() - t0);
+        CloseHandle(g_child); g_child = nullptr;
+        return true;
+    }
+    logf(L"停服务：!! 5s 内未退出（/api/quit 送达=%d），对自家子进程句柄 TerminateProcess 兜底 pid=%lu",
+         (int)sent, (unsigned long)childPid);
+    TerminateProcess(g_child, 0);
+    WaitForSingleObject(g_child, 2000);
+    CloseHandle(g_child); g_child = nullptr;
+    return false;
 }
 
 // WebView2 不铺满窗口、四周留的像素数：留给原生缩放命中的热区（WM_NCHITTEST 要有机会拿到鼠标）。
@@ -708,6 +783,9 @@ static void repaint_band(HWND hwnd) {
 //   我们。既然无法穷举所有提交时机，就用最低成本的办法收口：定时抽查像素，
 //   不对就补一刀。四条 FillRect 的代价可以忽略，且只有真的不对时才画（无闪烁）。
 static void verify_band(HWND hwnd) {
+    // 261024-05 #1：窗口隐藏到托盘时 GetWindowDC/GetPixel 没有意义（表面已不可见），
+    // 直接跳过 —— 只有窗口真的可见才需要"抽查像素、不对就补刷"。
+    if (!IsWindowVisible(hwnd)) return;
     if (dp(hwnd, kBandInset) <= 0) return;   // 满幅模式：边缘就是页面内容，不该按主题色校验
     if (!g_bandBrush) update_band(theme_bg(g_captionDark, g_captionBlue));
     const COLORREF want = theme_bg(g_captionDark, g_captionBlue);
@@ -786,10 +864,20 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         // ---- 表面可能被 DWM 重建的时机：都要补刷一次（本轮 UI1 的修复核心）----
         // 实测这三条是"跳转页面/切换激活状态后白框出现"的实际触发点，
         // 它们之后都没有 WM_PAINT，旧代码于是永远补不上。
+        case WM_SHOWWINDOW:
+            // 261024-05 #1：从托盘恢复显示。隐藏期间 WebView2 的子窗口不保证收到 WM_SIZE，
+            // 恢复后必须补一次几何重排 + 边缘命中重挂，否则四边既没缩放光标、页面也可能
+            // 停在隐藏前的旧尺寸（用户会看到一条没跟上的空白）。
+            repaint_band(hwnd);
+            if (wp) {
+                install_wv_edge_hittest(hwnd);
+                if (g_wvCtl) rta::wv2::resize(g_wvCtl, hwnd, dp(hwnd, kBandInset));
+            }
+            apply_dwm(hwnd, g_captionDark, g_captionBlue);
+            break;
         case WM_ACTIVATE:
         case WM_NCACTIVATE:
         case WM_ACTIVATEAPP:
-        case WM_SHOWWINDOW:
             repaint_band(hwnd);
             // 激活/失焦时 DWM 会重画窗口框。属性是幂等的，这里直接重设一遍（不重绘、不递归）。
             apply_dwm(hwnd, g_captionDark, g_captionBlue);
@@ -902,10 +990,16 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (g_wv) g_wv->PostWebMessageAsString(IsZoomed(hwnd) ? L"max" : L"normal");
             return 0;
         case WM_APP + 2:   // 261024-04 #1：页面发起窗口边缘拉伸（见 begin_window_resize）
+            // 261024-05 #1：隐藏到托盘时不允许进入模态拖拽循环（窗口不可见，SetCapture 也没意义）
+            if (!IsWindowVisible(hwnd)) { ++g_hiddenResizeSkips; return 0; }
             begin_window_resize(hwnd, g_resizeDir);
             return 0;
         case WM_TIMER:
             if (wp == 2) {
+                // 261024-05 #1：隐藏到托盘后这条 250ms 看门狗无事可做（边带不可见、子窗口不需要
+                // 边缘命中）。直接返回，避免在不可见窗口上做 GetPixel/EnumChildWindows 空转 ——
+                // 恢复显示时 WM_SHOWWINDOW 会把这两件事补做一次。
+                if (!IsWindowVisible(hwnd)) { ++g_hiddenWatchdogSkips; return 0; }
                 verify_band(hwnd);
                 // 2026-10-24（261024-04 #1 用户实测：窗口四边拖不动）：
                 // WebView2 在导航/首次合成后会**新建**子窗口（实测 4 个 Chrome_WidgetWin + 1 个 IME 窗口），
@@ -929,11 +1023,21 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             return 0;
         case WM_CLOSE:
-            DestroyWindow(hwnd);
+            // ★ 261024-05 #1（用户反馈第 1 条）：点 X / Alt+F4 / 页面 postMessage('close')
+            //   全部收敛到 WM_CLOSE。旧代码这里 DestroyWindow -> WM_DESTROY -> PostQuitMessage，
+            //   于是点一下 X 整个程序就没了（rtaweb 也被带走，音乐断掉）。
+            //   现在：隐藏到托盘 —— 进程、托盘图标、rtaweb 子进程、音频线程全部保留。
+            //   只有托盘菜单「退出」走 request_exit()（它会先置 g_exiting 再 DestroyWindow）。
+            if (g_exiting) {
+                DestroyWindow(hwnd);   // 正式退出路径：真关窗口（WM_DESTROY 里收尾 WebView2 + PostQuitMessage）
+                return 0;
+            }
+            hide_main_window();
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, 1);
             KillTimer(hwnd, 2);
+            g_mainWnd = nullptr;   // 别把已销毁的句柄留给托盘（show_main_window 靠它判活）
             // 主动关掉 WebView2 控制器：否则进程被结束时，浏览器进程会变成孤儿常驻
             if (g_wvCtl) {
                 g_wvCtl->Close();
@@ -1094,7 +1198,48 @@ static void install_wv_edge_hittest(HWND top) {
     if (top) EnumChildWindows(top, subclass_wv_child, 0);
 }
 
-// 托盘"打开播放界面"/双击托盘图标：把【已有的无边框 WebView2 窗口】拉到前台。
+// 把窗口抢到前台。
+// SetForegroundWindow 受 Windows 的"前台锁"限制：只有当前前台窗口所属线程、或刚收到用户
+// 输入的进程才允许抢前台。托盘左键点击/菜单命令本身算输入，但从【隐藏】状态恢复时仍可能
+// 被拒（窗口不在前台列表里），于是"点了托盘图标却只看到任务栏闪"。
+// 这里退一步借前台线程的输入队列（AttachThreadInput），最后再退一步 FlashWindow。
+static void force_foreground(HWND h) {
+    if (SetForegroundWindow(h)) return;
+    const HWND fg = GetForegroundWindow();
+    const DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    const DWORD myTid = GetCurrentThreadId();
+    bool attached = false;
+    if (fgTid && fgTid != myTid) attached = AttachThreadInput(myTid, fgTid, TRUE) != FALSE;
+    SetForegroundWindow(h);
+    BringWindowToTop(h);
+    if (attached) AttachThreadInput(myTid, fgTid, FALSE);
+    if (!SetForegroundWindow(h)) FlashWindow(h, TRUE);   // 前台锁还是不放行：至少让任务栏闪一下
+}
+
+// ★ 261024-05 #1：点 X = 隐藏到托盘（不退出）。
+//   只做一件事：ShowWindow(SW_HIDE)。刻意【不】碰 WebView2 控制器、不碰 rtaweb、
+//   不碰任何定时器 —— 音频在 rtaweb 里跑，跟窗口可见性完全无关（音乐不断）。
+//   窗口隐藏后 WM_SIZE/WM_WINDOWPOSCHANGED 都不会再来，所以几何状态原样保留，
+//   恢复时不需要重建（隐藏期间的 WM_TIMER 看门狗与页面 resize 请求都被跳过，见下）。
+static void hide_main_window() {
+    HWND h = g_mainWnd;
+    if (!h || !IsWindow(h)) return;
+    if (!IsWindowVisible(h)) {
+        logf(L"WM_CLOSE -> 窗口本来就不可见，忽略");
+        return;
+    }
+    ShowWindow(h, SW_HIDE);
+    logf(L"WM_CLOSE -> 隐藏到托盘（进程/托盘图标/rtaweb 全部保留 child=%s visible=%d iconic=%d）",
+         g_child ? L"有" : L"无", (int)(IsWindowVisible(h) != FALSE), (int)(IsIconic(h) != FALSE));
+    // 首次隐藏提示一次就够（用户下次就记得了；每次点 X 都弹 = 骚扰）
+    if (!g_hideHintShown) {
+        g_hideHintShown = true;
+        tray_balloon(kAppName, L"仍在后台播放，右键托盘图标退出");
+        logf(L"WM_CLOSE -> 首次隐藏，已弹气球提示（仅一次）");
+    }
+}
+
+// 托盘"打开播放界面"/单击/双击托盘图标：把【已有的无边框 WebView2 窗口】拉到前台。
 //
 // 2026-10-24：旧实现无条件走 open_browser()，于是每次点托盘都会再开一个 Edge --app 窗口。
 // 那个窗口的边框/标题栏归 Edge 和 DWM 管（不是我们的窗口过程），浅色主题下四边就是
@@ -1103,16 +1248,46 @@ static void install_wv_edge_hittest(HWND top) {
 static void show_main_window(int port) {
     HWND h = g_mainWnd;
     if (h && IsWindow(h)) {
+        const bool wasVisible = IsWindowVisible(h) != FALSE;
         if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
-        else ShowWindow(h, SW_SHOW);
-        SetForegroundWindow(h);
-        BringWindowToTop(h);
+        if (!IsWindowVisible(h)) ShowWindow(h, SW_SHOW);   // 隐藏到托盘后的恢复
+        force_foreground(h);
+        // 隐藏期间 WebView2 子窗口不保证收到过 WM_SIZE：恢复时补一次几何 + 边缘命中，
+        // 否则四边没有缩放光标、页面也可能停在隐藏前的旧尺寸。
+        install_wv_edge_hittest(h);
+        if (g_wvCtl) rta::wv2::resize(g_wvCtl, h, dp(h, kBandInset));
         apply_dwm(h, g_captionDark, g_captionBlue);
-        logf(L"托盘：已存在的 WebView2 窗口置前 hwnd=0x%p（不再另开 Edge 窗口）", (void*)h);
+        logf(L"托盘：窗口置前 hwnd=0x%p 之前可见=%d 现在可见=%d（不再另开 Edge 窗口）",
+             (void*)h, (int)wasVisible, (int)(IsWindowVisible(h) != FALSE));
+        if (g_hiddenWatchdogSkips || g_hiddenResizeSkips) {
+            logf(L"托盘：隐藏期间跳过 边带看门狗=%u 次 / 页面 resize 请求=%u 次（都没有在不可见窗口上执行）",
+                 g_hiddenWatchdogSkips, g_hiddenResizeSkips);
+            g_hiddenWatchdogSkips = 0;
+            g_hiddenResizeSkips = 0;
+        }
         return;
     }
     logf(L"托盘：WebView2 窗口不存在，退回 Edge --app（该窗口有原生边框，属降级路径）");
     open_browser(port);
+}
+
+// ★ 261024-05 #1 #4：全程序【唯一】的正式退出路径（托盘菜单「退出」）。
+//   顺序：摘托盘图标 -> 优雅停 rtaweb（/api/quit，见 stop_server_graceful）-> 关主窗口
+//   （WM_DESTROY 里 Close/Release WebView2 控制器并 PostQuitMessage）。
+//   注意：这里绝不按映像名杀进程、绝不杀进程树（铁律 2）；rtaweb 是"请它自己走"。
+static void request_exit(const wchar_t* why) {
+    if (g_exiting) return;
+    g_exiting = true;
+    logf(L"退出：%s", why);
+    // 先摘图标，避免留下点了没反应的僵尸图标；结果写日志，探针用它证明"隐藏期间图标没被摘掉"
+    const BOOL delOk = Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    logf(L"退出：托盘图标 NIM_DELETE=%d", (int)delOk);
+    stop_server_graceful(g_port);
+    if (g_mainWnd && IsWindow(g_mainWnd)) {
+        DestroyWindow(g_mainWnd);   // -> WM_DESTROY：收尾 WebView2 + PostQuitMessage
+    } else {
+        PostQuitMessage(0);
+    }
 }
 
 // ---------------- 窗口过程 ----------------
@@ -1134,8 +1309,9 @@ static void show_menu(HWND hwnd) {
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_TRAYICON:
-            if (LOWORD(lp) == WM_RBUTTONUP) show_menu(hwnd);
-            else if (LOWORD(lp) == WM_LBUTTONDBLCLK) show_main_window(g_port);
+            // 261024-05 #1 #2：左键单击【或】双击都恢复窗口（旧版只认双击，用户单击没反应）
+            if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK) show_main_window(g_port);
+            else if (LOWORD(lp) == WM_RBUTTONUP) show_menu(hwnd);
             return 0;
         case WM_COMMAND:
             switch (LOWORD(wp)) {
@@ -1145,8 +1321,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     const bool now = !lan_enabled();
                     set_lan(now);
                     logf(L"  局域网访问 -> %d", (int)now);
-                    // 重启子进程让 --lan 生效（只杀自己启动的那个子进程）
-                    if (g_child) { TerminateProcess(g_child, 0); CloseHandle(g_child); g_child = nullptr; }
+                    // 重启子进程让 --lan 生效：同样走优雅路径（/api/quit），不 taskkill /IM
+                    stop_server_graceful(g_port);
                     for (int i = 0; i < 40 && port_open(g_port); ++i) Sleep(50);
                     spawn_server(g_port);
                     for (int i = 0; i < 100; ++i) { Sleep(50); if (port_open(g_port)) break; }
@@ -1154,11 +1330,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 }
                 case ID_TRAY_EXIT:
-                    if (g_child) { TerminateProcess(g_child, 0); CloseHandle(g_child); g_child = nullptr; }
-                    Shell_NotifyIconW(NIM_DELETE, &g_nid);
-                    PostQuitMessage(0);
+                    // 261024-05 #1 #3 #4：菜单里的「退出」才是真正的关闭
+                    request_exit(L"托盘菜单「退出」");
                     break;
             }
+            return 0;
+        case WM_CLOSE:
+            // 托盘宿主窗口不能被"关掉"：它一没了就再也收不到托盘消息（图标变僵尸）
             return 0;
         case WM_DESTROY:
             PostQuitMessage(0);
@@ -1242,7 +1420,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         logf(L"%s", msg);
     }
 
-    // 隐藏的窗口，仅用于接收托盘消息
+    // 隐藏的窗口，仅用于接收托盘消息。
+    // 261024-05 #1：从 HWND_MESSAGE 改成【从不显示的普通顶层窗口】。
+    // 消息窗口不可枚举（FindWindow/EnumWindows 都找不到），排查"托盘点了没反应"时
+    // 连窗口句柄都摸不到；普通顶层窗口不显示就没有任务栏/Alt+Tab 条目，行为等价。
     const wchar_t* kClass = L"RLPlayerTray";
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -1250,9 +1431,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     wc.hInstance = hInst;
     wc.lpszClassName = kClass;
     RegisterClassExW(&wc);
-    HWND hwnd = CreateWindowExW(0, kClass, kAppName, 0, 0, 0, 0, 0,
-                                HWND_MESSAGE, nullptr, hInst, nullptr);
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kClass, L"RLPlayerTray", WS_POPUP,
+                                0, 0, 0, 0, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 1;
+    logf(L"托盘宿主窗口已创建 hwnd=0x%p class=%s（隐藏，不显示）", (void*)hwnd, kClass);
 
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = hwnd;
@@ -1263,8 +1445,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     g_nid.hIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), L"IDI_APPICON", IMAGE_ICON,
                                     16, 16, LR_DEFAULTCOLOR);
     if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    wcscpy_s(g_nid.szTip, L"RLPlayer —— 右键菜单 / 双击打开界面");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    wcscpy_s(g_nid.szTip, L"RLPlayer —— 右键菜单 / 单击或双击打开界面");
+    // 261024-05 #1：把注册结果写进日志 —— 托盘图标"还在不在"是这条需求的核心断言之一，
+    // 探针可以直接对日志，但断言仍以 Shell_NotifyIconGetRect / 进程状态为准（见探针）。
+    logf(L"托盘图标注册 NIM_ADD=%d hwnd=0x%p uID=%d", (int)Shell_NotifyIconW(NIM_ADD, &g_nid),
+         (void*)hwnd, kTrayId);
 
     wchar_t msg[160];
     swprintf_s(msg, L"已在 http://127.0.0.1:%d/ 启动，浏览器已打开。\n托盘图标可再次打开或退出。", g_port);
@@ -1285,7 +1470,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         DispatchMessageW(&m);
     }
 
-    if (g_child) { TerminateProcess(g_child, 0); CloseHandle(g_child); }
+    // 261024-05 #1 #4：消息循环结束（托盘「退出」或系统关机）—— 优雅停 rtaweb，
+    // 不再用 TerminateProcess 抢跑（那条路径现在只作为 stop_server_graceful 里的兜底）。
+    stop_server_graceful(g_port);
     WSACleanup();
     return 0;
 }

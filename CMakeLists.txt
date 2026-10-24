@@ -142,14 +142,13 @@ add_executable(rtaweb tools/rtaweb.cpp)
 # iphlpapi: /api/naa/discover 通过 tools/naa_discover.h 枚举本机网卡（自动选网段）
 target_link_libraries(rtaweb PRIVATE rtadsp ws2_32 winmm avrt dbghelp iphlpapi)
 
-# ---------------- NAA 端点发现 ----------------
-add_executable(naa_scan tools/naa_scan.cpp)
-# iphlpapi: tools/naa_discover.h 用 GetAdaptersAddresses 枚举本机网卡（自动选网段）
-target_link_libraries(naa_scan PRIVATE ws2_32 iphlpapi)
-
-# NAA 控制通道黑盒探针（只做 TCP 交换，不发音频）
-add_executable(naa_probe tools/naa_probe.cpp)
-target_link_libraries(naa_probe PRIVATE ws2_32)
+# ---------------- NAA 端点发现（2026-10-24 用户要求彻底删除）----------------
+# 为什么删：数播的 NAA 只认 HQPlayer 私有握手（服务端先发 16 字节挑战，客户端要用未公开
+# 算法回应；EULA 禁止逆向、也禁止非 HQPlayer 推流）。回显/全零/MD5/只发 XML 等 8 种组合实测
+# 全部无回应 ⟹ 这条通路不可能对接成功。用户「NAA 放弃，彻底删除这一功能」。
+# 删除内容：naa_scan / naa_probe 两个工具 + tools/naa_discover.h + rtaweb 的 /api/naa/discover
+#          + 前端 NAA 后端选项。
+# 保留：底层 RTANet（我们自己的协议）——rtaplay --net 与 rtanet_rx 仍被回归测试使用。
 
 # ---------------- 元数据工具（ffprobe 标签 + 文件名/LLM 解析 + MetaBase 存取；不发声音，
 # parse 不带 --llm 时除本地 ffprobe 外零网络请求） ----------------
@@ -186,6 +185,11 @@ add_test(NAME host_msg COMMAND test_host_msg)
 add_executable(test_resampler tests/test_resampler.cpp)
 target_link_libraries(test_resampler PRIVATE rtadsp)
 add_test(NAME resampler COMMAND test_resampler)
+
+# ---------------- IR 采样率换算（房间校正 IR 与工程采样率不同时必须重采样，否则时间基准错 2.18 倍）----------------
+add_executable(test_ir_resample tests/test_ir_resample.cpp)
+target_link_libraries(test_ir_resample PRIVATE rtadsp)
+add_test(NAME ir_resample COMMAND test_ir_resample)
 
 add_executable(test_dither tests/test_dither.cpp)
 target_link_libraries(test_dither PRIVATE rtadsp)

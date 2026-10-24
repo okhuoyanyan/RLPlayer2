@@ -16,6 +16,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,11 @@ struct HttpRequest {
     std::string contentType = "application/json";  // 仅 POST，作为 Content-Type 头
     int timeoutMs = 20000;
     std::string proxy;                             // 空 = 直连；"host:port" 或 "http://host:port"
+    // 261024-05：流式接收钩子 —— 每从 socket 读到一段原始字节（chunked 已由平台解开）就调一次。
+    // 为什么挂在 HttpRequest 上而不是新加一个函数：平台层只该有一份读循环，
+    // 复制第二份迟早与第一份行为不一致（超时、代理、重定向都要重写一遍）。
+    // 契约：onChunk 只会在 http_request() 返回前被调用；回调里别把裸指针留到返回之后用。
+    std::function<void(const char* data, size_t n)> onChunk;
 };
 
 struct HttpResult {

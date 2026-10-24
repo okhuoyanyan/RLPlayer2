@@ -53,6 +53,7 @@ using rta::render::SinkOpenOpts;
 #include "meta/statusflags.h"       // gpu/gpuUsed 组合语义（用户 261024-04 #8，/api/status 与 /api/signal 同源）
 #include "net/rtanet_stream.h"
 #include "dsp/filter_families.h"
+#include "dsp/ir_resample.h"         // 261024-05 A2：IR 采样率与音源不同时先重采样
 #include "dsp/oversample_peak.h"
 #include "dsp/eq_text.h"
 #include "dsp/peq.h"               // 261024-02 #6：20 段参数均衡（RBJ 双二阶，float64 系数 / float32 处理）
@@ -62,7 +63,7 @@ using rta::render::SinkOpenOpts;
 #include "dsp/direct_sdm.h"
 #include "version.h"
 #include "crash_dump.h"            // 崩溃转储 + OS/CPU/tester 诊断（1.0.5 可观测性）
-#include "naa_discover.h"          // NAA 端点自动发现（261024-01 #11；CLI naa_scan 共用同一份）
+// 261024-05：naa_discover.h 已删除（用户「NAA 放弃，彻底删除这一功能」）
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -134,8 +135,8 @@ struct PlayParams {
     // ---- 输出后端 / 多声道 / 每声道微调 ----
     std::string sdmFilter;            // SDM（DSD 输出）用的 1x 滤波器；空 = 沿用 filter
     std::string sdmFilterNx;          // SDM 用的 Nx 滤波器；空 = 沿用 filterNx
-    std::string backend = "wasapi";   // wasapi | asio | naa | upnp | null
-    std::string naaHost;              // NAA 端点 host:port（自动发现填进来，手动只是兜底）
+    std::string backend = "wasapi";   // wasapi | wasapi-shared | asio | upnp | null（naa 已于 261024-05 删除）
+    std::string naaHost;              // 已废弃：NAA 删除后不再读写，只留给老配置解析（保兼容）
     std::string upnpDev;              // UPnP/DLNA 渲染器（设备描述 URL；后端 = upnp 时使用）
     int    outChannels = 0;           // 0 = 跟随源
     double trim[8] = {0,0,0,0,0,0,0,0};   // 每声道增益 dB
@@ -403,7 +404,7 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "sdmfilt")   p.sdmFilter = v;
         else if (k == "sdmfiltnx") p.sdmFilterNx = v;
         else if (k == "backend") p.backend = v;
-        else if (k == "naahost") p.naaHost = v;
+        // naahost：NAA 已删除，老配置里的这一行忽略（不报错，避免用户配置迁移失败）
         else if (k == "upnpdev")  p.upnpDev = v;
         else if (k == "channels") p.outChannels = atoi(v.c_str());
         else if (k == "trim") {
@@ -686,63 +687,12 @@ private:
     std::string err_;
 };
 
-// NAA：把 PCM 经 RTANet 推到端点机（rtanet_rx）。数值上与本地输出同源，不经过任何转码。
-class NaaSink : public OutSink {
-public:
-    bool open(const SinkOpenOpts& o, uint32_t rate, int ch, int bits) override {
-        rate_ = rate ? rate : 44100; ch_ = ch; bits_ = bits;
-        std::string host = o.naaHost.empty() ? std::string("127.0.0.1") : o.naaHost;
-        uint16_t port = 43210;
-        const size_t c = host.rfind(':');
-        if (c != std::string::npos) {
-            port = (uint16_t)atoi(host.c_str() + c + 1);
-            host = host.substr(0, c);
-        }
-        rta::net::RtaFormat want;
-        want.rate = rate_; want.channels = ch_; want.bits = bits_;
-        uint16_t udp = 0;
-        if (!cli_.negotiate(host, port, want, udp, 1, err_)) {
-            err_ = "NAA 协商失败（" + host + ":" + std::to_string(port) + "）：" + err_;
-            return false;
-        }
-        snd_.configure(host, udp, want, 1, 128);
-        period_ = 1024;
-        t0_ = now();
-        return true;
-    }
-    bool start() override { return true; }
-    size_t buffer_frames() const override { return period_; }
-    size_t write_one_period(const int32_t* pcm, size_t frames) override {
-        const size_t w = snd_.send(pcm, frames);
-        if (w == 0) { err_ = "发送失败（端点已断开？）"; return 0; }
-        sent_ += w;
-        // 按实时节奏推送，否则一瞬间就把端点的缓冲灌满
-        for (;;) {
-            const double el = now() - t0_;
-            const double want = (double)sent_ / (double)rate_;
-            if (el >= want) break;
-            double ms = (want - el) * 1000.0;
-            if (ms > 20.0) ms = 20.0;
-            Sleep((DWORD)(ms > 0 ? ms : 1));
-        }
-        return w;
-    }
-    void close() override { cli_.close(); }
-    const std::string& last_error() const override { return err_; }
-private:
-    static double now() {
-        LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
-        return (double)t.QuadPart / (double)f.QuadPart;
-    }
-    rta::net::RtaControlClient cli_;
-    rta::net::RtaSender snd_;
-    uint32_t rate_ = 44100;
-    int ch_ = 2, bits_ = 24;
-    size_t period_ = 1024;
-    size_t sent_ = 0;
-    double t0_ = 0.0;
-    std::string err_;
-};
+// 261024-05：NaaSink 已删除。
+// 它其实是我们自己的 RTANet（rta::net::RtaSender + RtaControlClient），只是历史上挂在
+// "NAA" 这个后端名字下。用户要求彻底删除 NAA（数播只认 HQPlayer 私有握手，实测 8 种握手
+// 变体全部无回应；EULA 禁止逆向）⟹ 界面不再提供这个后端。
+// 底层 RTANet 收发代码仍在 src/net/rtanet*.h，供命令行 rtaplay --net 与 rtanet_rx 使用
+//（回归测试 Network e2e bit-exact 依赖它，不能一起删）。
 
 static std::string path_in_exe_dir(const char* name);   // 定义在后面
 static void play_log(const std::string& s);              // 定义在后面
@@ -1007,7 +957,8 @@ static std::unique_ptr<OutSink> make_sink(const PlayParams& p) {
     // 万一将来有别的路径漏过来，也绝不能落到默认的 WasapiSink —— 那会真的接管本机声卡。
     if (p.backend == "upnp")           return std::make_unique<NullSink>();
     if (p.backend == "null")           return std::make_unique<NullSink>();
-    if (p.backend == "naa")            return std::make_unique<NaaSink>();
+    // 261024-05：backend=naa 已删除。老配置文件里残留的 naa 落到这里 —— 明确报错，不静默换后端。
+    if (p.backend == "naa")            return nullptr;
     if (p.backend == "asio")           return std::make_unique<AsioSink>();   // 见 audio/asio_out.h
     if (p.backend == "wasapi-shared")  return std::make_unique<WasapiSharedSink>();
     return std::make_unique<WasapiSink>();
@@ -1066,11 +1017,8 @@ static void upnp_mark_player_state(const std::string& file, bool ok, const std::
     }
 }
 
-// ---------------- NAA 端点自动发现（261024-01 #11）----------------
-// 用户原话：「NAA 端点（host:port）这个选项不应该出现啊，应该是自动获取的啊」。
-// 探测本体在 tools/naa_discover.h（与 CLI naa_scan 共用）。这里做异步任务：
-// Web UI 是单线程 accept，同步扫 254 个主机（每个最长 300ms）会把 /api/status 全部堵住，
-// 所以扫描放后台线程，前端轮询同一端点直到 scanning=false。
+#if 0   // 261024-05：NAA 端点发现已按用户要求彻底删除（数播只认 HQPlayer 私有握手，
+        // 实测 8 种握手变体全部无回应；EULA 禁止逆向）。保留这一段只是历史记录，不参与编译。
 struct NaaScanJob {
     std::mutex  m;
     bool        running = false;
@@ -1127,6 +1075,7 @@ static std::string naa_discover_json(bool force) {
     j << "]}";
     return j.str();
 }
+#endif  // 261024-05 NAA 删除
 
 // ---------------- DirectSDM：源 DSD 与目标 DSD 同速率时的逐位直通 ----------------
 // 判定必须在解码之前：DSD256 整曲解成 PCM 要几百 MB，先判再决定路径。
@@ -1218,8 +1167,7 @@ static bool play_one_direct(const std::string& file, const PlayParams& p) {
         // 信号链快照：DirectSDM 只有"源 → DoP → 设备"三环，如实写出来
         {
             std::string dev = "默认音频设备";
-            if (p.backend == "naa") dev = p.naaHost.empty() ? "NAA 127.0.0.1:43210" : p.naaHost;
-            else if (p.backend == "null") dev = "Null 输出（不出声）";
+            if (p.backend == "null") dev = "Null 输出（不出声）";
             else for (const auto& d : WasapiOutput::enumerate()) if (d.isDefault) dev = d.name;
             std::ostringstream sig;
             sig << "{\"src\":\"" << jesc(file) << "\""
@@ -2001,11 +1949,18 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 if (!irb.raw.empty()) {
                     const size_t maxCh = (size_t)std::max(in.channels, 2);
                     cfg.channel.resize(maxCh);
+                    // 261024-05（A2）：IR 采样率与音源不同时必须**先重采样**。
+                    // 为什么是 in.rate：信号链里卷积(4)在重采样(5)之前，卷积器看到的是源采样率。
+                    // 以前这里原样铺开 —— 44.1k 量的房间响应用在 96k 工程上，时间基准会被拉长
+                    // 2.18 倍（1 秒的响应当成 0.46 秒），听感是"房间变小/低频不对"。
+                    const bool needRate = (irb.rate != 0 && irb.rate != in.rate);
                     for (size_t c = 0; c < maxCh; ++c) {
                         auto& dst = cfg.channel[c];
-                        dst.ir.assign(irb.frames(), 0.0);
                         const int srcCh = (irb.channels > 1) ? (int)(c % (size_t)irb.channels) : 0;
-                        for (size_t n = 0; n < irb.frames(); ++n) dst.ir[n] = irb.sample(n, srcCh);
+                        std::vector<double> ir(irb.frames(), 0.0);
+                        for (size_t n = 0; n < irb.frames(); ++n) ir[n] = irb.sample(n, srcCh);
+                        if (needRate) ir = rta::dsp::ir_resample(ir, irb.rate, in.rate);
+                        dst.ir = std::move(ir);
                         dst.useGpu = p.convGpu;
                     }
                     convLoaded = true;
@@ -2051,9 +2006,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         if (p.backend == "null") {
             dev = "Null 输出（不出声）";
             devId = "null";
-        } else if (p.backend == "naa") {
-            dev = p.naaHost.empty() ? "NAA 127.0.0.1:43210" : p.naaHost;
-            devId = "naa";
+        } else if (false) {
         } else {
             for (const auto& d : WasapiOutput::enumerate()) {
                 const bool hit = pEff.device.empty() ? d.isDefault : (d.id == pEff.device);
@@ -3472,6 +3425,171 @@ static void summary_job_start(const std::string& key, rta::meta::EntityKind ek, 
     });
 }
 
+// ---------------- 资料层 materials 后台抓取（不阻塞单线程 HTTP accept）----------------
+// 背景（2026-10-24 实测）：/api/entity/knowledge 原先在 handler 里同步跑 knowledge_fetch
+// （维基 + 萌娘 HTTP），单次 1544ms；WebUi 是单线程阻塞 accept，期间 /api/status 被堵 1477ms。
+// 现在照上面的简介后台任务同一套模型：
+//   * 磁盘缓存已热（或 6h 失败负缓存）→ 同步秒回，语义与改造前完全一致（from_cache=true）；
+//   * 否则立即返回 {"ok":true,"pending":true,...}，后台线程抓取，前端轮询同一 URL 取结果。
+// 与 summary 的差别只有一处：结果留在表里（done）供后续轮询直接命中，而不是「一次性取走」。
+struct KnowledgeJob {
+    std::mutex mu;                       // 保护下面三个字段（与 g_know_mu 的分工：那把只锁表）
+    bool done = false;
+    rta::meta::KnowledgeResult kr;
+    double t0 = 0.0;                     // steady_clock 起点（秒）
+    double t_end = 0.0;                  // 完成时刻（秒；0=仍在跑）
+};
+static std::mutex g_know_mu;             // 只保护 g_know_jobs 这张表
+static std::map<std::string, std::shared_ptr<KnowledgeJob>> g_know_jobs;
+static const size_t kKnowJobsCap = 64;   // 超过上限就按完成时间清最老的 done 项
+
+static double know_now_s() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// 把 KnowledgeResult 拼成对外 JSON —— 字段与同步版逐字一致：ok/entity/materials/errors/from_cache/offline。
+static std::string knowledge_result_json(rta::meta::EntityKind ek, const std::string& name,
+                                         const rta::meta::KnowledgeResult& kr) {
+    const bool ok = !kr.materials.empty();
+    const std::string entId = kr.entityId.empty() ? rta::meta::entity_id(ek, name) : kr.entityId;
+    const std::string kindTag = rta::meta::entity_kind_tag(ek);
+
+    std::ostringstream j;
+    j << "{\"ok\":" << (ok ? "true" : "false")
+      << ",\"entity\":{"
+      << "\"id\":\"" << jesc(entId) << "\","
+      << "\"kind\":\"" << jesc(kindTag) << "\","
+      << "\"name\":\"" << jesc(name) << "\""
+      << "},"
+      << "\"materials\":[";
+    for (size_t i = 0; i < kr.materials.size(); ++i) {
+        if (i) j << ",";
+        const auto& m = kr.materials[i];
+        j << "{"
+          << "\"source\":\"" << jesc(m.source) << "\","
+          << "\"kind\":\"" << jesc(m.kind) << "\","
+          << "\"subject\":\"" << jesc(m.subject) << "\","
+          << "\"title\":\"" << jesc(m.title) << "\","
+          << "\"text\":\"" << jesc(m.text) << "\","
+          << "\"url\":\"" << jesc(m.url) << "\","
+          << "\"lang\":\"" << jesc(m.lang) << "\","
+          << "\"fetched_at\":" << m.fetched_at << ","
+          << "\"expires_at\":" << m.expires_at << ","
+          << "\"authority\":" << m.authority
+          << "}";
+    }
+    j << "],\"errors\":[";
+    bool firstErr = true;
+    for (const auto& ep : kr.errors) {
+        if (!firstErr) j << ",";
+        firstErr = false;
+        j << "{\"source\":\"" << jesc(ep.first) << "\",\"error\":\"" << jesc(ep.second) << "\"}";
+    }
+    if (!ok && kr.errors.empty()) {
+        const std::string errText = !kr.error.empty() ? kr.error : "未找到任何相关权威材料";
+        j << "{\"source\":\"general\",\"error\":\"" << jesc(errText) << "\"}";
+    }
+    j << "],"
+      << "\"from_cache\":" << (kr.from_cache ? "true" : "false") << ","
+      << "\"offline\":" << (kr.offline ? "true" : "false")
+      << "}";
+    return j.str();
+}
+
+// 后台还没跑完时立即回给前端的占位 JSON（字段齐全，材质/错误先空着）。
+static std::string knowledge_pending_json(rta::meta::EntityKind ek, const std::string& name) {
+    return "{\"ok\":true,\"pending\":true,\"entity\":{\"id\":\"" +
+           jesc(rta::meta::entity_id(ek, name)) + "\",\"kind\":\"" +
+           jesc(rta::meta::entity_kind_tag(ek)) + "\",\"name\":\"" + jesc(name) +
+           "\"},\"materials\":[],\"errors\":[],\"from_cache\":false,\"offline\":false}";
+}
+
+// 磁盘缓存是否「热」：有未过期材料，或 6 小时内的失败负缓存（两者都无需联网，可同步秒回）。
+static bool knowledge_cache_warm(const std::string& baseDir, rta::meta::EntityKind ek,
+                                 const std::string& name) {
+    const std::string eid = rta::meta::entity_id(ek, name);
+    if (rta::meta::knowledge_recent_miss(baseDir, eid, 6 * 3600)) return true;
+    std::vector<rta::meta::KnowledgeMaterial> mats;
+    std::string err;
+    if (!rta::meta::knowledge_load_cache(baseDir, eid, mats, &err)) return false;
+    return rta::meta::knowledge_has_unexpired(mats);
+}
+
+// 表清理（调用方必须持有 g_know_mu）：先删完成超过 600 秒的；再在超过上限时按完成时间删最老的 done 项。
+// 运行中的任务一律不删 —— 删了会让同一实体被重复抓取（白打一遍维基）。
+static void knowledge_jobs_sweep_locked() {
+    const double now = know_now_s();
+    for (auto it = g_know_jobs.begin(); it != g_know_jobs.end();) {
+        bool done = false;
+        double t_end = 0.0;
+        {
+            std::lock_guard<std::mutex> jl(it->second->mu);
+            done = it->second->done;
+            t_end = it->second->t_end;
+        }
+        if (done && t_end > 0.0 && now - t_end > 600.0) it = g_know_jobs.erase(it);
+        else ++it;
+    }
+    while (g_know_jobs.size() > kKnowJobsCap) {
+        auto victim = g_know_jobs.end();
+        double best = 0.0;
+        for (auto it = g_know_jobs.begin(); it != g_know_jobs.end(); ++it) {
+            bool done = false;
+            double t_end = 0.0;
+            {
+                std::lock_guard<std::mutex> jl(it->second->mu);
+                done = it->second->done;
+                t_end = it->second->t_end;
+            }
+            if (!done) continue;
+            if (victim == g_know_jobs.end() || t_end < best) { victim = it; best = t_end; }
+        }
+        if (victim == g_know_jobs.end()) break;   // 全是运行中的：不删
+        g_know_jobs.erase(victim);
+    }
+}
+
+// 起后台线程跑 knowledge_fetch。返回 false 表示线程起不来，调用方必须退回同步执行
+// （否则前端会对着一个永远 pending 的 URL 轮询）。
+static bool knowledge_job_start(const std::string& key, const std::shared_ptr<KnowledgeJob>& job,
+                                rta::meta::EntityKind ek, const std::string& name,
+                                const rta::meta::KnowledgeOpts& opts) {
+    try {
+        std::thread th([key, job, ek, name, opts]() {
+            rta::meta::KnowledgeResult kr;
+            try {
+                kr = rta::meta::knowledge_fetch(ek, name, opts);
+                if (kr.materials.empty())
+                    play_log("KNOWLEDGE fetched(no material) key=" + key +
+                             (kr.error.empty() ? std::string() : (" err=" + kr.error)));
+                else
+                    play_log("KNOWLEDGE fetched key=" + key +
+                             " materials=" + std::to_string(kr.materials.size()) +
+                             " fromCache=" + std::string(kr.from_cache ? "1" : "0"));
+            } catch (const std::exception& e) {
+                // 异常也必须落结果：绝不能让任务永远停在 running（前端会一直轮询）
+                kr.error = std::string("knowledge_fetch 抛出异常: ") + e.what();
+                play_log("KNOWLEDGE exception key=" + key + " err=" + kr.error);
+            } catch (...) {
+                kr.error = "knowledge_fetch 抛出未知异常";
+                play_log("KNOWLEDGE exception(unknown) key=" + key);
+            }
+            std::lock_guard<std::mutex> jl(job->mu);
+            job->kr = std::move(kr);
+            job->t_end = know_now_s();
+            job->done = true;
+        });
+        th.detach();
+        return true;
+    } catch (const std::exception& e) {
+        play_log("KNOWLEDGE thread-start failed key=" + key + " err=" + e.what() + " -> 同步回退");
+        return false;
+    } catch (...) {
+        play_log("KNOWLEDGE thread-start failed(unknown) key=" + key + " -> 同步回退");
+        return false;
+    }
+}
+
 static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
     auto& ps = g_ps;
 
@@ -4562,51 +4680,60 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         opts.refresh = refresh;
         if (!lang.empty()) opts.lang = lang;
 
-        const rta::meta::KnowledgeResult kr = rta::meta::knowledge_fetch(ek, name, opts);
-        const bool ok = !kr.materials.empty();
-        const std::string entId = kr.entityId.empty() ? rta::meta::entity_id(ek, name) : kr.entityId;
-        const std::string kindTag = rta::meta::entity_kind_tag(ek);
+        // 归一键：kind|name|refresh|lang —— refresh/lang 不同的请求不能互相串结果。
+        const std::string jobKey = kindStr + "|" + name + "|" + (refresh ? "1" : "0") + "|" + lang;
 
-        std::ostringstream j;
-        j << "{\"ok\":" << (ok ? "true" : "false")
-          << ",\"entity\":{"
-          << "\"id\":\"" << jesc(entId) << "\","
-          << "\"kind\":\"" << jesc(kindTag) << "\","
-          << "\"name\":\"" << jesc(name) << "\""
-          << "},"
-          << "\"materials\":[";
-        for (size_t i = 0; i < kr.materials.size(); ++i) {
-            if (i) j << ",";
-            const auto& m = kr.materials[i];
-            j << "{"
-              << "\"source\":\"" << jesc(m.source) << "\","
-              << "\"kind\":\"" << jesc(m.kind) << "\","
-              << "\"subject\":\"" << jesc(m.subject) << "\","
-              << "\"title\":\"" << jesc(m.title) << "\","
-              << "\"text\":\"" << jesc(m.text) << "\","
-              << "\"url\":\"" << jesc(m.url) << "\","
-              << "\"lang\":\"" << jesc(m.lang) << "\","
-              << "\"fetched_at\":" << m.fetched_at << ","
-              << "\"expires_at\":" << m.expires_at << ","
-              << "\"authority\":" << m.authority
-              << "}";
+        // 1) 缓存已热（未过期材料，或 6 小时内已确认「没有材料」）→ 同步秒回，
+        //    与原同步实现的返回逐字一致（from_cache=true）。只有真要联网才丢给后台线程。
+        if (!refresh && knowledge_cache_warm(opts.metabase, ek, name)) {
+            return knowledge_result_json(ek, name, rta::meta::knowledge_fetch(ek, name, opts));
         }
-        j << "],\"errors\":[";
-        bool firstErr = true;
-        for (const auto& ep : kr.errors) {
-            if (!firstErr) j << ",";
-            firstErr = false;
-            j << "{\"source\":\"" << jesc(ep.first) << "\",\"error\":\"" << jesc(ep.second) << "\"}";
+
+        // 2) 已有任务：完成就直接交付结果，没完成立即 pending（前端轮询同一 URL）。
+        std::shared_ptr<KnowledgeJob> job;
+        bool fresh_job = false;
+        {
+            std::lock_guard<std::mutex> lk(g_know_mu);
+            knowledge_jobs_sweep_locked();
+            auto it = g_know_jobs.find(jobKey);
+            if (it != g_know_jobs.end()) {
+                job = it->second;
+            } else {
+                job = std::make_shared<KnowledgeJob>();
+                job->t0 = know_now_s();
+                g_know_jobs[jobKey] = job;   // 先登记再起线程：线程抢先完成也不会丢结果
+                fresh_job = true;
+            }
         }
-        if (!ok && kr.errors.empty()) {
-            const std::string errText = !kr.error.empty() ? kr.error : "未找到任何相关权威材料";
-            j << "{\"source\":\"general\",\"error\":\"" << jesc(errText) << "\"}";
+        if (!fresh_job) {
+            {
+                std::lock_guard<std::mutex> jl(job->mu);
+                if (job->done) return knowledge_result_json(ek, name, job->kr);
+            }
+            return knowledge_pending_json(ek, name);   // 后台还在跑，立即返回
         }
-        j << "],"
-          << "\"from_cache\":" << (kr.from_cache ? "true" : "false") << ","
-          << "\"offline\":" << (kr.offline ? "true" : "false")
-          << "}";
-        return j.str();
+        if (knowledge_job_start(jobKey, job, ek, name, opts)) {
+            play_log("KNOWLEDGE fetch(async) kind=" + kindStr + " name=" + name + " key=" + jobKey);
+            return knowledge_pending_json(ek, name);
+        }
+        // 3) 线程起不来 → 同步执行（宁可变慢，也绝不让这个 URL 永远 pending）；结果塞回任务表
+        {
+            rta::meta::KnowledgeResult kr;
+            try {
+                kr = rta::meta::knowledge_fetch(ek, name, opts);
+            } catch (const std::exception& e) {
+                kr.error = std::string("knowledge_fetch 抛出异常: ") + e.what();
+            } catch (...) {
+                kr.error = "knowledge_fetch 抛出未知异常";
+            }
+            {
+                std::lock_guard<std::mutex> jl(job->mu);
+                job->kr = kr;
+                job->t_end = know_now_s();
+                job->done = true;
+                return knowledge_result_json(ek, name, job->kr);
+            }
+        }
     }
 
     // ---------------- 资料层(P3③ 检索综合): GET /api/entity/summary ----------------
@@ -5054,18 +5181,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
         return "{\"ok\":false,\"error\":\"未知的投放 API 路径\"}";
     }
 
-    // ---------------- NAA 端点自动发现（261024-01 #11）----------------
-    // 用户原话：「NAA 端点（host:port）这个选项不应该出现啊，应该是自动获取的啊」。
-    // 异步扫描（tools/naa_discover.h）：先返回 scanning=true，前端 700ms 轮询；
-    // 扫描完成后 30 秒内复用结果（?refresh=1 强制重扫）。
-    if (rq.path.rfind("/api/naa", 0) == 0) {
-        ct = "application/json; charset=utf-8";
-        if (rq.path.rfind("/api/naa/discover", 0) == 0) {
-            const bool force = (rq.path.find("refresh=1") != std::string::npos);
-            return naa_discover_json(force);
-        }
-        return "{\"ok\":false,\"error\":\"未知的 NAA API 路径\"}";
-    }
+    // 261024-05：/api/naa/discover 已按用户要求删除（数播只认 HQPlayer 私有握手，无法对接）。
 
     if (rq.path.rfind("/api/upnp", 0) == 0) {
         ct = "application/json; charset=utf-8";
@@ -5415,7 +5531,7 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
                                            "device", "bits", "taps", "atten", "transition", "phase",
                                            "modfamily", "oobgain", "ahmbits", "modcut", "moddith", "ir", "irgpu", "ramp", "theme", "eq",
                                            "gpuvendor", "dsdnative", "directsdm", "dsdkind", "dsdconv", "dsd2stage",
-                                           "backend", "naahost", "upnpdev", "channels", "trim",
+                                           "backend", "upnpdev", "channels", "trim",
                                            "inbackend", "indev", "inoffset", "inbuf", "inmon",
                                            "inseconds", "inout",
                                            "sdmfilt", "sdmfiltnx", "streamdecode",

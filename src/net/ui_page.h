@@ -307,7 +307,9 @@ h += "#npPage .npedge{display:none}";
     h += ".npgrid.nolyric #npLyric{display:none}";
     // 行2：左歌词 + 右标签栏（标签栏无可用资料时整列收起，歌词自动吃满）
     h += ".npbody{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:22px;min-height:0;align-items:stretch}";
-    h += ".nprail{display:none;min-height:0;align-self:start}";
+    // 261024-05 A12：AI 关闭时「专辑」标签也要常驻（本地曲目）——无歌词时歌词列 display:none，
+    // 药丸卡会被当成第一列拉伸成整行（截图可见），这里显式钉在右列并靠右，保持与有歌词时同一位置。
+    h += ".nprail{display:none;min-height:0;align-self:start;grid-column:2;grid-row:1;justify-self:end}";
     h += ".nprail.on{display:block}";
     // 资料卡：右侧一张紧凑浮卡（caption + 三个标签），比"贯穿全高的分隔线 + 飘着的药丸"更像正式组件
     h += ".nprailcard{display:flex;flex-direction:column;gap:5px;padding:9px;border-radius:14px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.08);backdrop-filter:blur(8px);min-width:104px}";
@@ -815,7 +817,7 @@ h += "#npPage .npedge{display:none}";
     //   点标签 → 从右侧滑出抽屉看内容（.npdrawer，默认 translateX(102%) + visibility:hidden）。
     h += "<div class=npbody id=npBody>";
     h += "<div class=nplyric2 id=npLyric><div class=npline>还没有在播放</div></div>";
-    h += "<aside class=nprail id=npRail><div class=nprailcard><div class=nprailcap>AI 整理</div>";
+    h += "<aside class=nprail id=npRail><div class=nprailcard><div class=nprailcap id=npRailCap>AI 整理</div>";
     h += "<div class=npchipwrap id=npTabs></div>";
     // 261024-04 #7：自动加载的状态/失败重试行（正常态 display:none，不打扰版面）
     h += "<div id=npSummHint class=nprailhint style='display:none'></div></div></aside>";

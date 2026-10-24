@@ -143,6 +143,12 @@ inline HttpResult http_request(const HttpRequest& req) {
         std::vector<unsigned char> buf(avail);
         DWORD got = 0;
         if (!::WinHttpReadData(hreq, buf.data(), avail, &got) || got == 0) break;
+        // 261024-05：边收边吐。每块先喂给调用方（SSE/流式 JSON），再进 body 兜底 ——
+        // 这样即使调用方的解析失败，完整 body 仍然可用（诊断与重试用得上）。
+        // 注意：onChunk 抛异常必须挡住 —— 它跑在传输层，抛出去会越过 WinHTTP 的清理路径。
+        if (req.onChunk) {
+            try { req.onChunk(reinterpret_cast<const char*>(buf.data()), (size_t)got); } catch (...) {}
+        }
         r.body.insert(r.body.end(), buf.begin(), buf.begin() + got);
     }
 

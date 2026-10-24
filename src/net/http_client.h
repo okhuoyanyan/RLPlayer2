@@ -85,6 +85,25 @@ inline HttpResponse http_post(const std::string& url, const std::string& body,
     return http_detail::from_platform(rta::platform::http_request(req));
 }
 
+// 流式 POST（261024-05）：每从 socket 读到一段字节就调 onChunk —— 这是 LLM SSE「不用枯等」的底座。
+// 与 http_post 的差别只有这一点：请求构造、代理、超时、重定向、chunked 解码全部走同一条路径。
+inline HttpResponse http_post_stream(const std::string& url, const std::string& body,
+                                     const std::vector<std::string>& headers,
+                                     const std::function<void(const char*, size_t)>& onChunk,
+                                     const char* contentType = "application/json",
+                                     int timeoutMs = 60000) {
+    rta::platform::HttpRequest req;
+    req.method      = "POST";
+    req.url         = url;
+    req.headers     = headers;
+    req.body        = body;
+    req.contentType = contentType ? contentType : "application/json";
+    req.timeoutMs   = timeoutMs;
+    req.proxy       = http_proxy();
+    req.onChunk     = onChunk;
+    return http_detail::from_platform(rta::platform::http_request(req));
+}
+
 // GET，可选附加请求头（每项形如 "名: 值"）
 inline HttpResponse http_get(const std::string& url,
                              const std::vector<std::string>& headers = {},

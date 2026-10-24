@@ -30,6 +30,7 @@
 #include <iterator>
 #include <functional>
 #include <ctime>
+#include <chrono>
 
 namespace rta::meta {
 
@@ -126,6 +127,25 @@ inline std::string llm_base_url(const std::string& raw) {
 }
 
 // ---------------------------------------------------------------------------
+// 流式（SSE）输出的回调类型 —— 用户反馈 261024-05「LLM 做流式比较好，不用枯等」
+//
+//   LlmDeltaFn         : 模型增量回调。每个 SSE delta 调一次；**可能在网络线程上**（见下文）。
+//   LlmChunkSink       : 传输层分块回调。每从 socket 读到一段原始字节调一次。
+//   LlmStreamTransport : 支持「边收边吐」的 POST。比 transport 多一个 on_chunk 参数，
+//                        status/error 语义与 transport 完全一致；body 只放未经 on_chunk 投递的
+//                        剩余字节（通常为空）。为空时 llm_chat_stream 退回 transport/http_post。
+//                        **硬约定**：on_chunk 只允许在 streamTransport 返回前调用 —— 返回后再调，
+//                        接收者（retrieval 的 progress 对象）可能已经析构，属于违约用法。
+// ---------------------------------------------------------------------------
+using LlmDeltaFn = std::function<void(const std::string& delta)>;
+using LlmChunkSink = std::function<void(const char* data, size_t n)>;
+using LlmStreamTransport = std::function<rta::net::HttpResponse(
+    const std::string& url,
+    const std::string& body,
+    const std::vector<std::string>& headers,
+    const LlmChunkSink& on_chunk)>;
+
+// ---------------------------------------------------------------------------
 // 配置（rlplayer-llm.conf：纯文本 key=value，# 注释，空行忽略）
 // ---------------------------------------------------------------------------
 
@@ -140,6 +160,10 @@ struct LlmConfig {
     std::function<rta::net::HttpResponse(const std::string& url,
                                          const std::string& body,
                                          const std::vector<std::string>& headers)> transport;
+    // 流式传输钩子（可选，真流式用）。为空时 llm_chat_stream 退回 transport / http_post：
+    // 拿完整 body 再按 SSE 增量解析 —— 解析结果与回调时序完全一样，只是拿不到"边收边吐"
+    // 带来的时延收益（整段响应到达后回调会一次性补齐）。接线见交付报告的「未验证项」。
+    LlmStreamTransport streamTransport;
 };
 
 // 缺文件 → 返回默认值（空 key）。key 名：base_url / api_key / model / llmmonthlycap；其他键忽略。
@@ -420,10 +444,14 @@ struct LlmReply {
     int totalTokens = 0;
 };
 
-// 完整请求体（含 model），llm_chat 用
+// 完整请求体（含 model），llm_chat / llm_chat_stream 共用。
+// stream=true 追加 "stream":true（流式）；deepseek 模型再加 stream_options.include_usage，
+// 让最后一个 chunk 带上 usage —— 该参数可用 RLPLAYER_LLM_STREAM_USAGE=0 关掉
+//（未联网验证：若某兼容端点因此 400，这一行是唯一要回退的地方）。
 inline std::string llm_build_chat_body(const std::string& model,
                                        const std::vector<LlmMessage>& msgs,
-                                       int maxTokens, float temperature, bool jsonObject) {
+                                       int maxTokens, float temperature, bool jsonObject,
+                                       bool stream = false) {
     std::ostringstream o;
     o << "{";
     if (!model.empty()) o << "\"model\":\"" << llm_esc(model) << "\",";
@@ -451,6 +479,14 @@ inline std::string llm_build_chat_body(const std::string& model,
     std::snprintf(tb, sizeof(tb), "%.2f", (double)temperature);   // 保留 2 位小数
     o << ",\"temperature\":" << tb;
     if (jsonObject) o << ",\"response_format\":{\"type\":\"json_object\"}";
+    if (stream) {
+        o << ",\"stream\":true";
+        if (model.find("deepseek") != std::string::npos) {
+            const char* uv = std::getenv("RLPLAYER_LLM_STREAM_USAGE");
+            const bool wantUsage = !(uv && std::string(uv) == "0");
+            if (wantUsage) o << ",\"stream_options\":{\"include_usage\":true}";
+        }
+    }
     o << "}";
     return o.str();
 }
@@ -458,8 +494,8 @@ inline std::string llm_build_chat_body(const std::string& model,
 // 纯函数（可测）：不含 model 的请求体，model 由 llm_chat 注入
 inline std::string llm_build_chat_body(const std::vector<LlmMessage>& msgs,
                                        int maxTokens = 800, float temperature = 0.2f,
-                                       bool jsonObject = false) {
-    return llm_build_chat_body(std::string(), msgs, maxTokens, temperature, jsonObject);
+                                       bool jsonObject = false, bool stream = false) {
+    return llm_build_chat_body(std::string(), msgs, maxTokens, temperature, jsonObject, stream);
 }
 
 // 纯函数（可测）：解析 /chat/completions 响应。错误分三类：非法 JSON / 服务端 error / 缺 choices
@@ -524,6 +560,323 @@ inline LlmReply llm_chat(const LlmConfig& cfg, const std::vector<LlmMessage>& ms
         const std::string m = cfg.monthOverride.empty() ? llm_current_month() : cfg.monthOverride;
         llm_record_usage(m, "chat", cfg.usagePath);
     }
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// 流式输出（SSE）— 用户反馈 261024-05「LLM 做流式比较好，不用枯等」
+//
+// 协议：POST {base}/chat/completions，body 带 "stream":true；服务端逐行回
+//   data: {"choices":[{"index":0,"delta":{"content":"…"}}]}
+//   data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{...}}
+//   data: [DONE]
+// 解析只认 "data:" 行；": 心跳"、event:/id:/retry:/空行一律忽略。
+//
+// 三种服务端行为都已覆盖（离线测试锁死）：
+//   ① 正常 SSE            → 逐 delta 回调；[DONE] 或 finish_reason 判"完整"
+//   ② 忽略 stream 回 JSON → 走 llm_parse_chat_response，全文作为【单个】delta 投递一次
+//   ③ 半截断开            → errorKind="truncated"、ok=false —— 绝不把半截当成功
+//
+// 线程：delta 回调在"解析线程"上执行 —— 走 streamTransport 时那是传输层的网络线程，
+// 走 transport/http_post 时是调用 llm_chat_stream 的线程。调用方必须自己保证回调安全
+//（retrieval.h 的 SummaryProgressEmitter 就是为此用 mutex + 快照）。
+// ---------------------------------------------------------------------------
+
+struct LlmStreamReply {
+    bool ok = false;
+    std::string content;    // 完整正文（失败时可能是半截 —— 只有 ok==true 才能用）
+    std::string error;      // 给人看的错误（已过 llm_redact）
+    std::string errorKind;  // 机器判据：config/cap/transport/http/server/truncated/json/empty
+    int  totalTokens = 0;   // usage.total_tokens（服务端不给就是 0）
+    int  deltaCount = 0;    // 增量回调次数（非流式回退固定 1 次）
+    int  events = 0;        // 收到的 data: 事件数（含 [DONE]）
+    bool sawDone = false;   // 收到 data: [DONE]
+    bool sawFinish = false; // 收到非空 finish_reason
+    bool streamed = false;  // 真的走了 SSE（false = 服务端忽略了 stream，回的是普通 JSON）
+    bool truncated = false; // 半截断开（errorKind=truncated 时为 true）
+    long long firstDeltaMs = -1;  // 首个 delta 距发请求的毫秒数（-1 = 没有）
+    long long totalMs = 0;
+};
+
+struct LlmSseState {
+    std::string lineBuf;   // 尚未遇到 '\n' 的残行（可能跨多个 feed 边界）
+    std::string content;   // 累计正文
+    std::string error;     // 首个错误（非空即失败）
+    std::string errorKind;
+    int totalTokens = 0;
+    int deltaCount = 0;
+    int events = 0;
+    bool sawDone = false;
+    bool sawFinish = false;
+    bool sawData = false;
+};
+
+// 纯函数（可测）：粗判一段 JSON 文本是否完整（括号配平、引号闭合、最后一个有效字符是 } 或 ]）。
+// 为什么必须有：net/json.h 的解析器是"宽进"的 —— 半截 JSON 也能解析出部分字段，
+// 不先判完整性就会把半截 delta 当成正常增量（这正是 6.3 回归的点）。
+inline bool llm_json_looks_complete(const std::string& s) {
+    int depth = 0;
+    bool in_str = false, esc = false;
+    char last = 0;
+    for (char c : s) {
+        if (in_str) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        if (c == '{' || c == '[') ++depth;
+        else if (c == '}' || c == ']') { --depth; if (depth < 0) return false; }
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') last = c;
+    }
+    return depth == 0 && !in_str && (last == '}' || last == ']');
+}
+
+// 纯函数（可测）：处理一条 data: 的 payload。
+inline void llm_sse_apply_payload(LlmSseState& st, const std::string& raw, const LlmDeltaFn& on_delta) {
+    if (!st.error.empty() || st.sawDone) return;
+    const std::string payload = llm_trim(raw);
+    if (payload.empty()) return;                      // "data:" 空行 = 心跳
+    st.sawData = true;
+    if (payload == "[DONE]") { st.sawDone = true; return; }
+    if (!llm_json_looks_complete(payload)) {
+        // 半截断开时最后一行几乎必然停在这里：判"截断"，绝不当成功
+        st.errorKind = "truncated";
+        const std::string head = payload.size() > 120 ? payload.substr(0, 120) + "…" : payload;
+        st.error = "流式分片不完整（括号/引号未闭合，连接多半中途断开）: " + head;
+        return;
+    }
+    const rta::net::Json j = rta::net::json_parse(payload);
+    if (j.type != rta::net::Json::Obj) {
+        st.errorKind = "malformed";
+        const std::string head = payload.size() > 120 ? payload.substr(0, 120) + "…" : payload;
+        st.error = "流式分片不是合法 JSON 对象: " + head;
+        return;
+    }
+    if (j.has("error")) {
+        const rta::net::Json& e = j["error"];
+        std::string msg = e.has("message") ? e["message"].s() : e.s();
+        if (msg.empty()) msg = "服务端未给出 message";
+        st.errorKind = "server";
+        st.error = "服务端错误: " + msg;
+        return;
+    }
+    if (j.has("usage")) st.totalTokens = (int)j["usage"]["total_tokens"].n();
+    if (!j.has("choices")) return;                    // 有些端点只回一个 usage 尾包
+    const rta::net::Json& ch = j["choices"];
+    if (ch.type != rta::net::Json::Arr || ch.size() == 0) return;
+    const rta::net::Json& c0 = ch.at(0);
+    const std::string finish = c0["finish_reason"].s();
+    if (!finish.empty()) st.sawFinish = true;
+    std::string piece;
+    if (c0.has("delta")) piece = c0["delta"]["content"].s();
+    else if (c0.has("message")) piece = c0["message"]["content"].s();  // 个别端点在 SSE 里回非流式结构
+    if (piece.empty()) return;                        // role / finish 包没有正文
+    st.content += piece;
+    ++st.deltaCount;
+    if (on_delta) on_delta(piece);
+}
+
+// 纯函数（可测）：处理一整行（已去掉 '\n'；"\r\n" 的 '\r' 在这里剥掉）。
+inline void llm_sse_handle_line(LlmSseState& st, std::string line, const LlmDeltaFn& on_delta) {
+    while (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) return;
+    if (line[0] == ':') return;                       // SSE 注释 / keep-alive
+    if (line.size() >= 5 && line.compare(0, 5, "data:") == 0) {
+        ++st.events;
+        llm_sse_apply_payload(st, line.substr(5), on_delta);
+        return;
+    }
+    // event: / id: / retry: / 裸行：SSE 里合法但不带正文，忽略
+}
+
+// 喂入一段原始字节（可分任意次、任意切点调用）；完整行会被立即处理。
+inline void llm_sse_feed(LlmSseState& st, const char* data, size_t n, const LlmDeltaFn& on_delta) {
+    if (!data || n == 0) return;
+    st.lineBuf.append(data, n);
+    size_t consumed = 0;
+    for (;;) {
+        const size_t nl = st.lineBuf.find('\n', consumed);
+        if (nl == std::string::npos) break;
+        llm_sse_handle_line(st, st.lineBuf.substr(consumed, nl - consumed), on_delta);
+        consumed = nl + 1;
+    }
+    if (consumed > 0) st.lineBuf.erase(0, consumed);
+}
+
+// 流结束：处理没有结尾换行的最后一行（[DONE] 允许不带换行），并判定"是否完整"。
+// 返回 false 时 st.error/st.errorKind 已填好；**半截流一律返回 false**。
+inline bool llm_sse_finish(LlmSseState& st, const LlmDeltaFn& on_delta) {
+    if (!st.lineBuf.empty()) {
+        std::string tail;
+        tail.swap(st.lineBuf);
+        llm_sse_handle_line(st, tail, on_delta);
+    }
+    if (!st.error.empty()) return false;
+    if (st.sawDone || st.sawFinish) return true;
+    st.errorKind = "truncated";
+    st.error = st.sawData
+        ? "流式响应中断：没收到 [DONE] 或 finish_reason（连接提前断开）"
+        : "流式响应为空：没有任何 data: 事件";
+    return false;
+}
+
+// 响应体类型判定（首字节路由）：流式钩子可能只先给几十字节，还不能确定是 SSE 还是普通 JSON，
+// 所以先缓冲头部，看到首个非空白字符再定：'{' '[' → JSON；其余 → SSE。
+// 一次性拿到完整 body 的路径（transport/http_post）也走同一个路由，保证两条路完全同构。
+struct LlmBodyRouter {
+    enum Mode { Unknown = 0, Sse, Json };
+    Mode mode = Unknown;
+    std::string head;      // Unknown 阶段缓冲的字节
+    std::string jsonText;  // Json 模式累积
+
+    void feed(const char* data, size_t n, LlmSseState& st, const LlmDeltaFn& on_delta) {
+        if (!data || n == 0) return;
+        if (mode == Sse) { llm_sse_feed(st, data, n, on_delta); return; }
+        if (mode == Json) { jsonText.append(data, n); return; }
+        head.append(data, n);
+        for (size_t i = 0; i < head.size(); ++i) {
+            const char c = head[i];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+            mode = (c == '{' || c == '[') ? Json : Sse;
+            break;
+        }
+        if (mode == Unknown && head.size() >= 64) mode = Sse;   // 64 字节还全是空白：按 SSE 处理（最后判空）
+        if (mode == Json) {
+            jsonText.swap(head);
+        } else if (mode == Sse) {
+            llm_sse_feed(st, head.data(), head.size(), on_delta);
+            head.clear();
+        }
+    }
+
+    void finish(LlmSseState& st, const LlmDeltaFn& on_delta) {
+        if (mode == Sse) { llm_sse_finish(st, on_delta); return; }
+        if (mode == Unknown && !head.empty()) jsonText.swap(head);
+    }
+};
+
+// 传输层失败（status==0）的错误细分：超时归 timeout，其余归 transport。
+// 判据只能是错误文本 —— 平台层把 WinHTTP 的 ERROR_WINHTTP_TIMEOUT 变成 message，
+// 这里保持"只做分类、不改写原文"（原文仍完整保留在 error 里）。
+inline std::string llm_transport_error_kind(const std::string& err) {
+    std::string low;
+    low.reserve(err.size());
+    for (char c : err) low += (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    if (low.find("timeout") != std::string::npos || low.find("timed out") != std::string::npos ||
+        err.find("超时") != std::string::npos) {
+        return "timeout";
+    }
+    return "transport";
+}
+
+// POST {base}/chat/completions 的流式版。超时/重试/计费口径与 llm_chat 一致：
+//   * 超时只作用在传输层（streamTransport 自己管；http_post 走 timeout_ms）
+//   * 单次调用不重试；重试归上层（retrieval.h 的 attempt 循环，每次重试都重新开一条流）
+//   * 成功（ok）才记一次 chat 用量；半截/失败不记账（与 llm_chat 的失败口径相同）
+inline LlmStreamReply llm_chat_stream(const LlmConfig& cfg, const std::vector<LlmMessage>& msgs,
+                                      const LlmDeltaFn& on_delta = LlmDeltaFn(),
+                                      int maxTokens = 800, float temperature = 0.2f,
+                                      bool jsonObject = false, int timeout_ms = 60000) {
+    LlmStreamReply r;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto ms_since = [&t0]() {
+        return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+    };
+
+    if (cfg.apiKey.empty()) { r.errorKind = "config"; r.error = "未配置 api_key（rlplayer-llm.conf）"; return r; }
+    std::string capErr;
+    if (!llm_check_cap(cfg, "", &capErr)) { r.errorKind = "cap"; r.error = capErr; return r; }
+
+    const std::string body = llm_build_chat_body(cfg.model, msgs, maxTokens, temperature, jsonObject, true);
+    const std::string url = llm_base_url(cfg.baseUrl) + "/chat/completions";
+    const std::vector<std::string> headers = { "Authorization: Bearer " + cfg.apiKey };
+
+    LlmSseState st;
+    LlmBodyRouter router;
+    // 回调包装：记首个 delta 时刻；用户回调抛异常不得把网络线程带崩（内容照常返回）
+    const LlmDeltaFn emit = [&](const std::string& d) {
+        if (r.firstDeltaMs < 0) r.firstDeltaMs = ms_since();
+        if (!on_delta) return;
+        try { on_delta(d); } catch (...) { }
+    };
+
+    rta::net::HttpResponse resp;
+    if (cfg.streamTransport) {
+        const LlmChunkSink sink = [&](const char* d, size_t n) { router.feed(d, n, st, emit); };
+        resp = cfg.streamTransport(url, body, headers, sink);
+    } else if (cfg.transport) {
+        resp = cfg.transport(url, body, headers);
+    } else {
+        // 261024-05：默认就用**真流式** POST（以前这里是 http_post，要等整段 body 到齐，
+        // 等于没有任何"不用枯等"的收益）。onChunk 只有 http_post_stream 会调；
+        // 不支持分块的传输实现（平台的其它后端）只管返回完整 body，语义不变。
+        const LlmChunkSink sink = [&](const char* d, size_t n) { router.feed(d, n, st, emit); };
+        resp = rta::net::http_post_stream(url, body, headers,
+                                          [&](const char* d, size_t n) { sink(d, n); },
+                                          "application/json", timeout_ms);
+    }
+    r.totalMs = ms_since();
+
+    if (resp.status == 0) {
+        r.errorKind = llm_transport_error_kind(resp.error);
+        r.truncated = st.sawData;   // 已经吐过半个流才算截断，否则就是根本没连上
+        r.error = llm_redact(cfg.apiKey, "网络请求失败: " + resp.error);
+        return r;
+    }
+    const std::string text(resp.body.begin(), resp.body.end());
+    if (resp.status < 200 || resp.status >= 300) {
+        const LlmReply p = llm_parse_chat_response(text);   // 借它提取服务端 error.message
+        r.errorKind = "http";
+        r.error = llm_redact(cfg.apiKey,
+            "HTTP " + std::to_string(resp.status) + (p.error.empty() ? "" : ": " + p.error));
+        return r;
+    }
+
+    // 传输层已经投递过的字节不会再出现在 body 里（约定），这里只补剩余部分
+    if (!text.empty()) router.feed(text.data(), text.size(), st, emit);
+    router.finish(st, emit);
+
+    if (router.mode == LlmBodyRouter::Json) {
+        // 服务端忽略了 stream：按普通 JSON 解析，全文作为单个 delta 投递（调用方只有一条代码路径）
+        const LlmReply p = llm_parse_chat_response(router.jsonText);
+        if (!p.ok) {
+            r.errorKind = "json";
+            r.error = llm_redact(cfg.apiKey, p.error);
+            return r;
+        }
+        r.content = p.content;
+        r.totalTokens = p.totalTokens;
+        r.streamed = false;
+        r.deltaCount = 1;
+        if (on_delta) emit(r.content);
+    } else if (router.mode == LlmBodyRouter::Sse) {
+        r.content = st.content;
+        r.totalTokens = st.totalTokens;
+        r.deltaCount = st.deltaCount;
+        r.events = st.events;
+        r.sawDone = st.sawDone;
+        r.sawFinish = st.sawFinish;
+        r.streamed = true;
+        if (!st.error.empty() || !(st.sawDone || st.sawFinish)) {
+            r.truncated = true;
+            r.errorKind = st.errorKind.empty() ? "truncated" : st.errorKind;
+            r.error = llm_redact(cfg.apiKey, st.error.empty() ? "流式响应中断" : st.error);
+            return r;
+        }
+    } else {
+        r.errorKind = "empty";
+        r.error = "流式响应为空（既不是 SSE 也不是 JSON）";
+        return r;
+    }
+
+    // E-8：成功响应计费口径（与 llm_chat 一致：只在 ok 时记一次 chat）
+    const std::string m = cfg.monthOverride.empty() ? llm_current_month() : cfg.monthOverride;
+    llm_record_usage(m, "chat", cfg.usagePath);
+    r.ok = true;
+    r.totalMs = ms_since();
     return r;
 }
 

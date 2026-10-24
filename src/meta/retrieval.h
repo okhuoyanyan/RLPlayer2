@@ -1115,6 +1115,142 @@ struct RetrievalOptions {
 };
 
 // ---------------------------------------------------------------------------
+// 生成进度回调（用户反馈 261024-05：LLM 流式，别让用户枯等）
+//
+// 纪律（与 llm.h 的流式契约配套）：
+//   1) 回调可能在**任意线程**被调用（真流式时是传输层网络线程）。SummaryProgressEmitter
+//      用 mutex 保护全部状态，并在锁内拷贝一份快照再调回调 —— 回调只拿到自己的副本，
+//      生产者从不读回调侧状态（只写不读），也不会因用户回调重入而死锁。
+//   2) 不传回调（默认）时 retrieval_fetch 走的仍是原来的 llm_chat 非流式路径，
+//      返回值逐字段不变（现有 test_retrieval / test_metacache 回归锁死）。
+//   3) 重试从头开始：每次尝试独立开一条流、独立 chars/partial（attempt 递增），
+//      绝不把上一次的半截拼到这一次后面。
+// ---------------------------------------------------------------------------
+
+enum class SummaryPhase { Idle = 0, Retrieving, Generating, Done, Failed };
+
+inline const char* summary_phase_name(SummaryPhase p) {
+    switch (p) {
+        case SummaryPhase::Idle:       return "idle";
+        case SummaryPhase::Retrieving: return "retrieval";
+        case SummaryPhase::Generating: return "generate";
+        case SummaryPhase::Done:       return "done";
+        case SummaryPhase::Failed:     return "failed";
+    }
+    return "idle";
+}
+
+struct SummaryProgress {
+    SummaryPhase phase = SummaryPhase::Idle;
+    std::string phase_name;   // 同上（"retrieval"/"generate"/...），方便日志与 JSON 直出
+    std::string detail;       // "knowledge+search" / "search hits=5" / "llm attempt=0" ...
+    int attempt = 0;          // 生成尝试序号（0 = 首次；重试递增 → UI 收到新 attempt 应清空 partial）
+    size_t chars = 0;         // 本次尝试已生成的**字节**数（== partial.size()，UTF-8）
+    int delta_count = 0;      // 本次尝试已收到的增量次数
+    std::string partial;      // 本次尝试已生成的部分文本（原始 JSON 片段；可能以半个多字节字符结尾）
+    long long elapsed_ms = 0; // 距本次阶段开始的毫秒数
+};
+
+using ProgressFn = std::function<void(const SummaryProgress&)>;
+
+class SummaryProgressEmitter {
+public:
+    explicit SummaryProgressEmitter(ProgressFn fn) : fn_(std::move(fn)) {}
+    bool enabled() const { return static_cast<bool>(fn_); }
+
+    // 阶段切换（检索/生成/完成/失败）
+    void phase(SummaryPhase ph, const std::string& detail = {}) {
+        SummaryProgress snap;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            phase_ = ph;
+            detail_ = detail;
+            phase_start_ = std::chrono::steady_clock::now();
+            snap = snapshot_locked();
+        }
+        deliver(snap);
+    }
+
+    // 新一次生成尝试：清零 chars/partial/delta 并递增 attempt —— 重试必须从头开始
+    void begin_attempt(int attempt, const std::string& detail = {}) {
+        SummaryProgress snap;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            phase_ = SummaryPhase::Generating;
+            detail_ = detail;
+            attempt_ = attempt;
+            chars_ = 0;
+            delta_count_ = 0;
+            partial_.clear();
+            phase_start_ = std::chrono::steady_clock::now();
+            snap = snapshot_locked();
+        }
+        deliver(snap);
+    }
+
+    // 一段增量文本（原样追加；不做 UTF-8 对齐 —— 完整文本由 llm_chat_stream 拼接）
+    void delta(const std::string& text) {
+        if (text.empty()) return;
+        SummaryProgress snap;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            partial_ += text;
+            chars_ = partial_.size();
+            ++delta_count_;
+            snap = snapshot_locked();
+        }
+        deliver(snap);
+    }
+
+private:
+    SummaryProgress snapshot_locked() const {
+        SummaryProgress s;
+        s.phase = phase_;
+        s.phase_name = summary_phase_name(phase_);
+        s.detail = detail_;
+        s.attempt = attempt_;
+        s.chars = chars_;
+        s.delta_count = delta_count_;
+        s.partial = partial_;
+        s.elapsed_ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - phase_start_).count();
+        return s;
+    }
+    void deliver(const SummaryProgress& s) {
+        if (!fn_) return;
+        try { fn_(s); } catch (...) { }   // UI 回调抛异常不得打断生成
+    }
+
+    ProgressFn fn_;
+    mutable std::mutex mtx_;
+    SummaryPhase phase_ = SummaryPhase::Idle;
+    std::string detail_;
+    int attempt_ = 0;
+    size_t chars_ = 0;
+    int delta_count_ = 0;
+    std::string partial_;
+    std::chrono::steady_clock::time_point phase_start_ = std::chrono::steady_clock::now();
+};
+
+// 统一聊天入口：有进度回调 → 流式（逐 delta 推进度）；没有回调 → 原来的 llm_chat
+// （非流式，行为逐字节不变 —— 这是"不传回调时完全向后兼容"的唯一保证点）。
+inline LlmReply retrieval_chat(const LlmConfig& cfg, const std::vector<LlmMessage>& msgs,
+                               int maxTokens, float temperature, bool jsonObject,
+                               SummaryProgressEmitter& progress) {
+    if (!progress.enabled()) return llm_chat(cfg, msgs, maxTokens, temperature, jsonObject);
+    const LlmStreamReply s = llm_chat_stream(cfg, msgs,
+        [&progress](const std::string& d) { progress.delta(d); },
+        maxTokens, temperature, jsonObject);
+    LlmReply r;
+    r.ok = s.ok;
+    r.content = s.content;
+    r.error = s.error;
+    r.totalTokens = s.totalTokens;
+    return r;
+}
+
+
+// ---------------------------------------------------------------------------
 // AI 自有知识整理（无权威材料时的兜底；2026-10-23 用户 261023-04 #14/#15）
 //
 // 背景：用户实测「塞壬唱片」等实体维基没有条目 → 旧逻辑直接回「未找到权威材料，拒绝综合」，
@@ -1207,7 +1343,9 @@ inline SummaryResult parse_ai_only_reply(const std::string& text) {
 inline SummaryResult summary_ai_only_generate(const std::string& entityName,
                                               const std::string& kindLabel,
                                               const std::string& lang,
-                                              const LlmConfig& cfg) {
+                                              const LlmConfig& cfg,
+                                              ProgressFn on_progress = nullptr) {
+    SummaryProgressEmitter progress(on_progress);   // 拷贝（不是 move）：嵌套兜底路径还要复用同一个回调
     const std::vector<LlmMessage> base_msgs = build_ai_only_prompt(entityName, kindLabel, lang);
     SummaryResult parsed;
     std::string last_err;
@@ -1219,7 +1357,8 @@ inline SummaryResult summary_ai_only_generate(const std::string& entityName,
                 "{\"sections\":[{\"heading\":\"简介\",\"paragraphs\":[{\"text\":\"……\"}]}]}，不要任何其它文字。" });
         }
         retrieval_rate_limiter().acquire();
-        const LlmReply rep = llm_chat(cfg, msgs, 2000, 0.3f, true);
+        progress.begin_attempt(attempt, "ai_only attempt=" + std::to_string(attempt));
+        const LlmReply rep = retrieval_chat(cfg, msgs, 2000, 0.3f, true, progress);
         if (!rep.ok) { last_err = rep.error; continue; }
         parsed = parse_ai_only_reply(rep.content);
         if (parsed.ok) break;
@@ -1231,6 +1370,9 @@ inline SummaryResult summary_ai_only_generate(const std::string& entityName,
         parsed.expires_at = parsed.generated_at + 7 * 86400;
         parsed.from_cache = false;
         parsed.offline = false;
+        progress.phase(SummaryPhase::Done, "ai_only ok");
+    } else {
+        progress.phase(SummaryPhase::Failed, last_err);
     }
     return parsed;
 }
@@ -1273,7 +1415,9 @@ inline std::vector<LlmMessage> build_track_prompt(const std::string& title,
 inline SummaryResult retrieval_fetch_track(const std::string& title,
                                            const std::string& artist,
                                            const std::string& lang,
-                                           const RetrievalOptions& opts) {
+                                           const RetrievalOptions& opts,
+                                           ProgressFn on_progress = nullptr) {
+    SummaryProgressEmitter progress(on_progress);   // 拷贝（不是 move）：嵌套兜底路径还要复用同一个回调
     const std::string baseDir = !opts.metabase.empty() ? opts.metabase : EntityStore::instance().baseDir();
     const std::string eid = entity_make_id("track", entity_norm(artist) + "\x1f" + entity_norm(title));
     SummaryResult cached;
@@ -1291,6 +1435,7 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
         return err;
     }
 
+    progress.phase(SummaryPhase::Retrieving, "track search");
     // 2026-10-24（261024-02 #1/#7）：分阶段计时（与专辑/艺术家路径同口径，日志可对比）
     const auto t_trk0 = std::chrono::steady_clock::now();
     long long trk_search_ms = 0, trk_fetch_ms = 0, trk_llm_ms = 0;
@@ -1353,8 +1498,9 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
                     "）。请只输出严格 JSON：{\"fields\":{...},\"sections\":[{\"heading\":\"简介\",\"paragraphs\":[{\"text\":\"…\"}]}]}" });
             }
             retrieval_rate_limiter().acquire();
+            progress.begin_attempt(attempt, "track llm attempt=" + std::to_string(attempt));
             const auto t_l0 = std::chrono::steady_clock::now();
-            const LlmReply rep = llm_chat(cfg, msgs, 2200, 0.3f, true);
+            const LlmReply rep = retrieval_chat(cfg, msgs, 2200, 0.3f, true, progress);
             trk_llm_ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t_l0).count();
             if (!rep.ok) { last_err = rep.error; continue; }
@@ -1365,7 +1511,7 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
     }
     if (!sr.ok) {
         // 检索不到材料 → 退回 AI 自有知识（仍标 unverified，UI 只显示「AI 整理」）
-        sr = summary_ai_only_generate(artist.empty() ? title : (artist + " - " + title), "歌曲", lang, cfg);
+        sr = summary_ai_only_generate(artist.empty() ? title : (artist + " - " + title), "歌曲", lang, cfg, on_progress);
     } else {
         sr.unverified = true;   // 检索正文未做逐段引用校验 → 仍按"AI 整理"标注
         sr.disclaimer = "AI 整理";
@@ -1376,6 +1522,9 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
         sr.diag = "search=" + std::to_string(trk_search_ms) + "ms fetch=" + std::to_string(trk_fetch_ms) +
                   "ms llm=" + std::to_string(trk_llm_ms) + "ms hits=" + std::to_string(hits.size());
         summary_save_cache(baseDir, eid, lang, sr);
+        progress.phase(SummaryPhase::Done, "track ok");
+    } else {
+        progress.phase(SummaryPhase::Failed, sr.error);
     }
     return sr;
 }
@@ -1384,7 +1533,10 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
 inline SummaryResult retrieval_fetch(EntityKind kind,
                                      const std::string& name,
                                      const std::string& lang = "zh",
-                                     const RetrievalOptions& opts = {}) {
+                                     const RetrievalOptions& opts = {},
+                                     ProgressFn on_progress = nullptr) {
+    // 进度回调（可为空）：空时全程走 llm_chat，行为与改造前逐字段一致。
+    SummaryProgressEmitter progress(on_progress);
     const std::string eid = !opts.entity_id.empty()
         ? opts.entity_id
         : ((!opts.artist.empty() && kind == EntityKind::Release)
@@ -1440,6 +1592,8 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         return err_res;
     }
 
+    // 进度：走到这里才真正联网/生成（缓存命中与离线早退不推事件 —— 那种路径本来就不等）
+    progress.phase(SummaryPhase::Retrieving, "knowledge+search");
     // 2026-10-24（261024-02 #1/#7）：分阶段计时（A/B 与"为什么慢"都靠它，不许拍脑袋）
     const auto t_stage0 = std::chrono::steady_clock::now();
     auto ms_since = [](std::chrono::steady_clock::time_point a) {
@@ -1559,6 +1713,8 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         retrieval_rate_limiter().acquire();
         const DsSearchReply s_rep = ds_search(cfg, query, opts.max_search_hits > 0 ? opts.max_search_hits : 5);
         diag_search_ms = ms_since(t_search0);
+        progress.phase(SummaryPhase::Retrieving,
+                       "search hits=" + std::to_string(s_rep.hits.size()));
         if (s_rep.ok) {
             std::vector<SearchHit> raw_hits;
             raw_hits.reserve(s_rep.hits.size());
@@ -1604,6 +1760,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
                 fetched_hits.push_back(std::move(fh));
             }
             diag_fetch_ms = ms_since(t_fetch0);
+            progress.phase(SummaryPhase::Retrieving, "fetch pages=" + std::to_string(fetch_count));
             for (size_t i = fetch_count; i < valid_hits.size(); ++i) {
                 fetched_hits.push_back(valid_hits[i]);
             }
@@ -1641,6 +1798,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             cached.from_cache = true;
             cached.offline = true;
             cached.error = "未检索到任何权威材料，已回退至本地缓存";
+            progress.phase(SummaryPhase::Done, "cache_fallback");
             return cached;
         }
         if (!cfg.apiKey.empty()) {
@@ -1649,7 +1807,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             // 2026-10-24（261024-04 #4）：这条兜底路径以前**不带 diag**，于是日志里只剩
             // "unverified=1"、看不出时间花在哪。AI 整理同样是 10~30s 的 LLM 调用，必须计时。
             const auto t_ai0 = std::chrono::steady_clock::now();
-            SummaryResult ai_res = summary_ai_only_generate(label, kind_label, lang, cfg);
+            SummaryResult ai_res = summary_ai_only_generate(label, kind_label, lang, cfg, on_progress);
             diag_llm_ms += (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t_ai0).count();
             if (ai_res.ok) {
@@ -1664,6 +1822,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         SummaryResult err_res;
         err_res.ok = false;
         err_res.error = "未找到任何相关权威材料，AI 整理也未成功（防幻觉兜底）";
+        progress.phase(SummaryPhase::Failed, err_res.error);
         return err_res;
     }
 
@@ -1710,8 +1869,11 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             break;   // 第三次交给下面的 AI 整理兜底
         }
         retrieval_rate_limiter().acquire();
+        // 每次尝试（含重试）都从这里重新开一条流：begin_attempt 清零 chars/partial
+        progress.begin_attempt(attempt, "llm attempt=" + std::to_string(attempt) +
+                                        " tokens=" + std::to_string(attempt_tokens));
         const auto t_llm0 = std::chrono::steady_clock::now();
-        const LlmReply chat_rep = llm_chat(cfg, attempt_msgs, attempt_tokens, 0.2f, true);
+        const LlmReply chat_rep = retrieval_chat(cfg, attempt_msgs, attempt_tokens, 0.2f, true, progress);
         const long long llm_ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t_llm0).count();
         if (!chat_rep.ok) {
@@ -1731,10 +1893,11 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             cached.from_cache = true;
             cached.offline = true;
             cached.error = "综合校验失败 (" + last_err + ")，已回退至本地缓存";
+            progress.phase(SummaryPhase::Done, "cache_fallback");
             return cached;
         }
         SummaryResult ai_fb = summary_ai_only_generate(promptEntityName,
-            (kind == EntityKind::Release) ? "专辑" : "艺术家", lang, cfg);
+            (kind == EntityKind::Release) ? "专辑" : "艺术家", lang, cfg, on_progress);
         if (ai_fb.ok) {
             ai_fb.error = "权威综合失败，已用 AI 自有知识整理（" + last_err + "）";
             ai_fb.diag = "fallback=ai_only; " + last_err;
@@ -1746,6 +1909,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         SummaryResult err_res;
         err_res.ok = false;
         err_res.error = last_err;
+        progress.phase(SummaryPhase::Failed, last_err);
         return err_res;
     }
 
@@ -1762,6 +1926,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
                   "ms llm=" + std::to_string(diag_llm_ms) + "ms hits=" +
                   std::to_string(fetched_hits.size());
     summary_save_cache(baseDir, eid, lang, parsed);
+    progress.phase(SummaryPhase::Done, "llm ok");
 
     return parsed;
 }
@@ -1769,18 +1934,20 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
 inline SummaryResult retrieval_fetch(const std::string& kind_str,
                                      const std::string& name,
                                      const std::string& lang = "zh",
-                                     const RetrievalOptions& opts = {}) {
+                                     const RetrievalOptions& opts = {},
+                                     ProgressFn on_progress = nullptr) {
     EntityKind k = EntityKind::Person;
     if (!entity_kind_from_tag(kind_str, k)) {
         k = EntityKind::Person;
     }
-    return retrieval_fetch(k, name, lang, opts);
+    return retrieval_fetch(k, name, lang, opts, std::move(on_progress));
 }
 
 inline SummaryResult retrieval_fetch(const Entity& entity,
                                      const std::string& lang = "zh",
-                                     const RetrievalOptions& opts = {}) {
-    return retrieval_fetch(entity.kind, entity.name, lang, opts);
+                                     const RetrievalOptions& opts = {},
+                                     ProgressFn on_progress = nullptr) {
+    return retrieval_fetch(entity.kind, entity.name, lang, opts, std::move(on_progress));
 }
 
 } // namespace rta::meta

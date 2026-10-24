@@ -500,18 +500,22 @@ function renderFieldGrid(fields, kind, opts) {
   // 261024-02 #3：曲目列表用本地曲库逐行渲染（序号 / 曲名 / 时长三列对齐），不再用 AI 的一行文本。
   // 只有调用方真的传了本地曲目（opts.tracklist）才渲染；否则保留 AI 的文本版（并在末尾标注 AI 推测）。
   var tl = (opts && opts.tracklist) || null;
-  if (tl && tl.length) {
-    var tlh = '<div class="efrow wide"><div class=lb>曲目列表</div><div class=vl><div class=ef-tracklist>';
-    tl.forEach(function (t, i) {
-      var n = (typeof t.n === 'number' && t.n > 0) ? t.n : (i + 1);
-      tlh += '<div class=eft-row><span class=eft-n>' + (n < 10 ? '0' : '') + n + '</span>' +
-             '<span class=eft-t title="' + esc(t.title || '') + '">' + esc(t.title || '') + '</span>' +
-             '<span class=eft-d>' + fmtDurLong(t.dur || 0) + '</span></div>';
-    });
-    tlh += '</div></div></div>';
-    rows += tlh;
-  }
+  if (tl && tl.length) rows += efTracklistHtml(tl);
   return rows ? ('<div class=efields>' + rows + '</div>') : '';
+}
+// 261024-05 A12：曲目列表块单独成函数 —— 抽屉「专辑」标签要**先渲染本地曲目**，
+// 不能让 AI 的 sections/文字内容挡住列表（旧实现只在有 fields 时才顺带渲染）。
+function efTracklistHtml(tl) {
+  if (!tl || !tl.length) return '';
+  var tlh = '<div class="efrow wide"><div class=lb>曲目列表</div><div class=vl><div class=ef-tracklist>';
+  tl.forEach(function (t, i) {
+    var n = (typeof t.n === 'number' && t.n > 0) ? t.n : (i + 1);
+    tlh += '<div class=eft-row><span class=eft-n>' + (n < 10 ? '0' : '') + n + '</span>' +
+           '<span class=eft-t title="' + esc(t.title || '') + '">' + esc(t.title || '') + '</span>' +
+           '<span class=eft-d>' + fmtDurLong(t.dur || 0) + '</span></div>';
+  });
+  tlh += '</div></div></div>';
+  return tlh;
 }
 // 简介类区块的统一渲染：优先 fields 网格，兜底 sections 段落。
 // title 非空时作为小标题（内容全是 AI 整理的板块一律传「AI 整理」，全站同一措辞 —— 261024-01 #2）。
@@ -570,16 +574,24 @@ function renderSummaryContent(summary, title, kind, opts) {
 // 简介请求（2026-10-23 DEBUG）：后端把「未命中缓存」的生成放到了后台线程，首次请求立即回
 // {"pending":true}，这里按 2s 轮询同一个 URL 直到出结果/超时。这样自动生成期间
 // /api/status（400ms 轮询）与播放控制不会被单线程 HTTP 后端堵住（以前会整站卡死）。
-function fetchSummary(url, onDone, tries) {
+// 261024-05 #T2：加 isWanted() —— 切歌/离开专辑页后**下一次轮询不再发出**，已发出的回来也丢弃
+// （旧实现会把旧 key 的 pending 每 2s 继续打 60 次，正是"旧专辑任务带到下一张"的一部分）。
+var SUMM_ABORT = { aborted: true };
+function fetchSummary(url, onDone, tries, isWanted) {
   tries = tries || 0;
+  if (isWanted && !isWanted()) { onDone(SUMM_ABORT); return; }
   api(url).then(function (j) {
+    if (isWanted && !isWanted()) { onDone(SUMM_ABORT); return; }
     if (j && j.pending) {
       if (tries >= 60) { onDone({ ok: false, error: '资料整理超时' }); return; }
-      setTimeout(function () { fetchSummary(url, onDone, tries + 1); }, 2000);
+      setTimeout(function () { fetchSummary(url, onDone, tries + 1, isWanted); }, 2000);
       return;
     }
     onDone(j);
-  }).catch(function (e) { onDone({ ok: false, error: String(e) }); });
+  }).catch(function (e) {
+    if (isWanted && !isWanted()) { onDone(SUMM_ABORT); return; }
+    onDone({ ok: false, error: String(e) });
+  });
 }
 
 /* ---------------- 261024-04 #7：summary 的页面级缓存 + 单飞去重 ----------------
@@ -597,7 +609,7 @@ function summHas(s) {
 function summaryCached(url) {
   return Object.prototype.hasOwnProperty.call(SUMC.cache, url) ? SUMC.cache[url] : null;
 }
-function summaryOnce(url, cb, refresh) {
+function summaryOnce(url, cb, refresh, isWanted) {
   cb = cb || function () { };
   if (refresh) delete SUMC.cache[url];
   else if (Object.prototype.hasOwnProperty.call(SUMC.cache, url)) {
@@ -606,13 +618,23 @@ function summaryOnce(url, cb, refresh) {
     return;
   }
   var q = SUMC.inflight[url];
-  if (q) { q.push(cb); return; }
-  q = SUMC.inflight[url] = [cb];
+  if (q) { q.push({ fn: cb, want: isWanted }); return; }
+  q = SUMC.inflight[url] = [{ fn: cb, want: isWanted }];
+  // 261024-05 #T2：同一实体可能有多个等待者（抽屉 + 预取）。只要还有一个想要，轮询就继续；
+  // 全部取消 → 立刻停（下一次 2s 轮询不再发出），结果也不进缓存。
+  function stillWanted() {
+    for (var i = 0; i < q.length; ++i) if (!q[i].want || q[i].want()) return true;
+    return false;
+  }
   fetchSummary(url, function (s) {
     delete SUMC.inflight[url];
+    if (s === SUMM_ABORT) return;
     SUMC.cache[url] = s;
-    for (var i = 0; i < q.length; ++i) { try { q[i](s); } catch (e) { } }
-  });
+    for (var i = 0; i < q.length; ++i) {
+      if (q[i].want && !q[i].want()) continue;
+      try { q[i].fn(s); } catch (e) { }
+    }
+  }, 0, stillWanted);
 }
 
 // 261024-02 #2：引用 chip 拆成两个动作 —— 点 chip 本体 = 用系统浏览器打开；点右侧「复制」= 复制链接。
@@ -652,6 +674,8 @@ function bindCopyChips(container) {
 }
 
 function openAlbum(k) {
+  // 261024-05 #T2：打开另一张专辑 = 离开上一张 → 先停掉它的曲目预取队列（含在飞轮询）
+  albPrefStop();
   S.view = 'album';
   api('/api/lib/album?k=' + encodeURIComponent(k)).then(function (j) {
     if (S.view !== 'album') return;   // 已切走 → 丢弃（否则会把别页内容覆写成专辑页）
@@ -733,7 +757,10 @@ function openAlbum(k) {
           el.remove();   // 无资料 / 无 key 又无缓存 → 干脆不显示
         }
       };
-      summaryOnce(albUrl, renderAlbumSummary);
+      // 261024-05 #T2：离开这张专辑页后不再轮询它的 release 摘要（旧 key 的请求不再发出）
+      summaryOnce(albUrl, renderAlbumSummary, false, function () {
+        return S.view === 'album' && !!S.album && String(S.album.k) === albK;
+      });
       // 261024-04 #7：整张专辑 = 专辑本身（上面）+ 每首曲目（后台，并发 ≤2）
       albumTrackPrefetch(j);
     }
@@ -762,13 +789,30 @@ function openAlbum(k) {
      * 曲目级是纯后台：并发 ≤2、不阻塞渲染、不弹错；顶部一条 2px 细进度条 + 一行小字，完成即消失；
      * 同一实体只请求一次（summaryOnce 的缓存 + 单飞）；同一张专辑只排一次队；
      * 失败也计入进度（不是一直转），不留错误提示（曲目级本来就没人盯着看）。 */
-var ALBPREF = { key: '', total: 0, done: 0, active: 0, queue: [], timer: 0 };
+var ALBPREF = { key: '', gen: 0, total: 0, done: 0, active: 0, queue: [], timer: 0, live: { v: 0 } };
 function albPrefKey(a) { return String((a && a.k) || '') + '|' + String((a && a.name) || ''); }
 // 曲目级 URL 的拼法与单曲页抽屉（npDataEnsure）保持一致，才能命中同一份缓存
 function albumTrackUrl(t, alb) {
   var ar = (t && t.artist) || (alb && alb.artist) || '';
   return '/api/entity/summary?kind=track&name=' + encodeURIComponent((t && t.title) || '') +
          (ar ? ('&artist=' + encodeURIComponent(ar)) : '') + '&lang=zh';
+}
+// 261024-05 #T2：离开专辑页 / 打开另一张专辑 → 立刻停掉剩余队列（含还在 2s 轮询的旧 key）。
+// 用户原话：「只在单曲播放页面才预取本曲所属的专辑，不是全部专辑」——专辑页的"整张"只能指
+// **当前打开的这张**，绝不能把上一张的待办带进下一张。
+function albPrefStop() {
+  ALBPREF.live.v = 0;                    // 在飞请求的轮询/回调全部失效
+  ALBPREF.gen++;
+  ALBPREF.key = ''; ALBPREF.total = 0; ALBPREF.done = 0; ALBPREF.active = 0;
+  ALBPREF.queue = [];
+  if (ALBPREF.timer) { clearTimeout(ALBPREF.timer); ALBPREF.timer = 0; }
+  ALBPREF.live = { v: 0 };               // 给下一次预取一个全新的令牌
+  var box = D('albProgWrap'); if (box) box.innerHTML = '';
+}
+// 每次派发/回调前都重新确认「页面仍是这张专辑」：视图变了、专辑换了、被 stop 了 → false
+function albPrefAlive(gen) {
+  return gen === ALBPREF.gen && ALBPREF.live.v === 1 && S.view === 'album' &&
+         !!S.album && albPrefKey(S.album) === ALBPREF.key;
 }
 function albPrefRender() {
   var box = D('albProgWrap');
@@ -782,10 +826,13 @@ function albPrefRender() {
                   '<span class=bar><i style="width:' + pct + '%"></i></span></div>';
 }
 function albPrefPump() {
+  var gen = ALBPREF.gen;
   while (ALBPREF.active < 2 && ALBPREF.queue.length) {
+    if (!albPrefAlive(gen)) return;      // 已切页/换专辑：队列里剩下的一条也不再发
     var it = ALBPREF.queue.shift();
     ALBPREF.active++;
     summaryOnce(it.url, function () {
+      if (!albPrefAlive(gen)) return;    // 旧专辑的结果绝不改新专辑的进度/并发数
       ALBPREF.active--;
       ALBPREF.done++;
       albPrefRender();
@@ -793,23 +840,24 @@ function albPrefPump() {
         clearTimeout(ALBPREF.timer);
         ALBPREF.timer = setTimeout(function () {
           var b = D('albProgWrap');
-          if (b && ALBPREF.done >= ALBPREF.total) b.innerHTML = '';
+          if (b && albPrefAlive(gen) && ALBPREF.done >= ALBPREF.total) b.innerHTML = '';
         }, 2600);
       }
       albPrefPump();
-    });
+    }, false, function () { return albPrefAlive(gen); });
   }
 }
 function albumTrackPrefetch(alb) {
   if (META.summary != 1) return;
   if (META.hasLlmKey !== true && META.summaryEnabled !== true) return;
   var key = albPrefKey(alb);
-  if (ALBPREF.key === key) return;      // 同一张专辑只排一次
+  if (ALBPREF.key === key && ALBPREF.live.v === 1) return;   // 同一张专辑只排一次
   var tracks = (alb && alb.tracks) || [];
   var q = [];
   tracks.forEach(function (t) { if (t && t.title) q.push({ url: albumTrackUrl(t, alb) }); });
   if (!q.length) return;
-  ALBPREF = { key: key, total: q.length, done: 0, active: 0, queue: q, timer: 0 };
+  var gen = ALBPREF.gen + 1;
+  ALBPREF = { key: key, gen: gen, total: q.length, done: 0, active: 0, queue: q, timer: 0, live: { v: 1 } };
   albPrefRender();
   albPrefPump();
 }
@@ -1003,12 +1051,31 @@ function openArtistProfile(who, refresh) {
   } else {
     var rec = ARTIST_KNOW[who] = { state: 'loading', res: null, waiters: [paintKnow] };
     var uKnow = '/api/entity/knowledge?kind=person&name=' + encodeURIComponent(who) + (refresh ? '&refresh=1' : '');
-    api(uKnow).catch(function (err) { return { ok: false, error: String(err), materials: [] }; })
-      .then(function (res) {
-        rec.state = 'done'; rec.res = res;
-        var ws = rec.waiters; rec.waiters = [];
-        ws.forEach(function (f) { try { f(res); } catch (e) { } });
-      });
+    // D1（261024-05 主控追加）：后端把 knowledge 改成「先回 pending、后台再跑」，避免一次堵 1.5s。
+    // pending ⟹ 700ms 后用**同一 URL** 重试（最多 40 次），期间资料区块保持「正在获取资料…」；
+    // 仅当仍停在这个艺术家页时才重试（切走即停，不再发请求）。ok:false 不重试。
+    var kTries = 0;
+    var knowFetch = function () {
+      if (S.view !== 'artist' || S.artistWho !== who) {
+        rec.state = 'idle'; rec.waiters = [];     // 已切走：停掉重试链（下次进来重新取）
+        return;
+      }
+      api(uKnow).catch(function (err) { return { ok: false, error: String(err), materials: [] }; })
+        .then(function (res) {
+          if (res && res.pending === true) {
+            if (kTries < 40) {
+              kTries++;
+              setTimeout(knowFetch, 700);
+              return;                              // 保持加载态：不 paint 空结果
+            }
+            res = { ok: false, error: '资料获取超时', materials: [] };
+          }
+          rec.state = 'done'; rec.res = res;
+          var ws = rec.waiters; rec.waiters = [];
+          ws.forEach(function (f) { try { f(res); } catch (e) { } });
+        });
+    };
+    knowFetch();
   }
 
   // ③ 简介（AI 整理）：与知识并行，谁先到都不丢；summaryOnce 保证同一实体只请求一次
@@ -2254,6 +2321,8 @@ function openSettingsTab(g) {
   if (sp && sp.scrollTo) sp.scrollTo(0, 0);
 }
 function setView(v) {
+  // 261024-05 #T2：离开专辑页 → 立即停掉整张专辑的曲目预取队列，切页面后不再发旧 key 的请求
+  if (v !== 'album') albPrefStop();
   S.view = v;
   // 2026-10-23（uicheck 复现的真实 bug）：全局搜索框有 260ms 防抖，输入后立刻点左侧别的导航，
   // 定时器仍会触发 setView('tracks')+loadTracks，把用户刚切的页面顶掉（队列页就是这么被换掉的）。
@@ -2880,7 +2949,6 @@ function backendHint() {
     // 261024-01 #11：端点来自自动发现，手动框只是折叠兜底。
     // 注意：自动发现没找到时**不能**回落到手动框里的历史默认值（127.0.0.1:43210），
     // 那会让界面宣称"推到 127.0.0.1"而其实根本没发现端点（本轮截图自检抓到）。
-    var epSel = D('sp_naa_dev');
     var ep = (epSel && epSel.value) || '';
     // 未发现时的原因已经写在黄色结论行（sp_naa_msg）里，这里不再重复，避免同一屏两遍同样的话。
     m.textContent = 'NAA：把 PCM 按 RTANet 协议推到 ' + (ep || '端点（尚未发现）') + '（端点机需运行 rtanet_rx）。';
@@ -3273,63 +3341,12 @@ function scanCastDevices(force) {
   });
 }
 
-/* ---------------- NAA 端点自动发现（261024-01 #11） ---------------- */
+/* 261024-05：NAA 端点自动发现整段已删除（后端选项一起去掉，没有任何调用点）。 */
+/* 261024-05：NAA 端点发现已删除（用户「NAA 放弃，彻底删除这一功能」）。
+   数播的 NAA 只认 HQPlayer 私有握手，实测 8 种握手变体全部无回应；界面已不再提供该后端。 */
 var _naaPollTimer = null;
-function renderNaaEndpoints(res) {
-  var s = D('sp_naa_dev');
-  var m = D('sp_naa_msg');
-  var eps = (res && res.endpoints) || [];
-  if (s) {
-    if (!eps.length) {
-      s.innerHTML = '<option value="">（未发现 NAA 端点）</option>';
-    } else {
-      var h = '';
-      eps.forEach(function (e) {
-        var v = e.host + ':' + (e.port || 43210);
-        h += '<option value="' + esc(v) + '">' + esc(v) + '</option>';
-      });
-      s.innerHTML = h;
-      // 自动获取：优先沿用已保存的端点，否则选第一个并写回设置（用户不用再手填）
-      var saved = (ADV.naaHost || '').trim();
-      var hit = false;
-      for (var i = 0; i < s.options.length; i++) {
-        if (s.options[i].value === saved) { s.value = saved; hit = true; break; }
-      }
-      if (!hit) {
-        s.selectedIndex = 0;
-        ADV.naaHost = s.value;
-        if (D('sp_naahost')) D('sp_naahost').value = s.value;
-        saveSettings();
-      }
-    }
-  }
-  if (m) {
-    m.textContent = (res && res.note) || '';
-    m.style.color = eps.length ? 'var(--mut2)' : 'var(--warn, #eab308)';
-  }
-}
-function discoverNaa(force) {
-  var m = D('sp_naa_msg');
-  var btn = D('sp_naa_scan');
-  clearTimeout(_naaPollTimer);
-  if (btn) btn.disabled = true;
-  if (m) {
-    m.textContent = '正在自动发现 NAA 端点（只读扫描本机网段的 TCP 43210）…';
-    m.style.color = 'var(--mut2)';
-  }
-  api('/api/naa/discover' + (force ? '?refresh=1' : '')).then(function (j) {
-    if (j && j.scanning) {
-      _naaPollTimer = setTimeout(function () { discoverNaa(false); }, 700);
-      return;
-    }
-    if (btn) btn.disabled = false;
-    renderNaaEndpoints(j);
-    backendHint();
-  }).catch(function () {
-    if (btn) btn.disabled = false;
-    if (m) { m.textContent = '自动发现失败：/api/naa/discover 无响应'; m.style.color = 'var(--err)'; }
-  });
-}
+function renderNaaEndpoints() { /* 已删除 */ }
+function discoverNaa() { clearTimeout(_naaPollTimer); /* 已删除 */ }
 
 /* ---------------- 后端相关控件的显隐 / 启用状态（261024-01 #9/#11） ---------------- */
 // 261024-01 #9/#11：后端 = UPnP 时，本机设备 / 采样率 / 位深 / 声道 / 缓冲 / 渐变 / 输出模式 /
@@ -3345,7 +3362,6 @@ function _setFieldVisible(id, on) {
 }
 function applyBackendState() {
   var bk = (D('sp_backend') && D('sp_backend').value) || 'wasapi';
-  var naaBox = D('sp_naawrap'); if (naaBox) naaBox.style.display = (bk === 'naa') ? '' : 'none';
   var upnpBox = D('sp_upnpwrap'); if (upnpBox) upnpBox.style.display = (bk === 'upnp') ? '' : 'none';
   _UPNP_IRRELEVANT.forEach(function (id) { _setFieldVisible(id, bk !== 'upnp'); });
   // NAA 下"输出设备"没有意义（声音走 RTANet），但采样率/位深/声道/缓冲仍影响 DSP 输出，保留。
@@ -3731,28 +3747,15 @@ function renderSettingsPage() {
        +   opt('wasapi', 'WASAPI（独占 · 事件驱动）', BK)
        +   opt('wasapi-shared', 'WASAPI 共享（兼容虚拟机 / 远程桌面）', BK)
        +   opt('asio', 'ASIO', BK)
-       +   opt('naa', 'NetworkAudioAdapter（NAA / RTANet）', BK)
+       // 261024-05：NAA 后端已删除（用户「NAA 放弃，彻底删除这一功能」）。
+       // 数播的 NAA 只认 HQPlayer 私有握手，实测 8 种握手变体全部无回应，且 EULA 禁止逆向。
        +   opt('upnp', 'UPnP / DLNA 投放（局域网渲染器）', BK)
        +   opt('null', 'Null output（只跑 DSP，不出声）', BK)
        + '</select></div>'
        + '<button class="btn pri" id=sp_bpfix style="flex:none;white-space:nowrap" ' +
          'title="判据：输出采样率 = 源 / 抖动 = none / 音量 0 dB / 无 EQ·IR / 独占 WASAPI">切到 bit-perfect 直通</button>'
        + '</div>'
-       // 261024-01 #11：用户原话「NAA 端点（host:port）这个选项不应该出现啊，应该是自动获取的」。
-      // 默认自动发现（下拉列出扫到的端点），手动输入收进折叠的「兜底」里，默认不展开。
-      + '<div class="sfld wide" id=sp_naawrap style="display:none">'
-      + '<label>NAA 端点（自动发现）</label>'
-      + '<div style="display:flex;gap:8px">'
-      + '<select id=sp_naa_dev style="flex:1"><option value="">（正在发现…）</option></select>'
-      + '<button class=btn id=sp_naa_scan style="white-space:nowrap">重新发现</button>'
-      + '</div>'
-      + '<div class=hint id=sp_naa_msg></div>'
-      + '<details style="margin-top:8px">'
-      + '<summary class=hint style="cursor:pointer;color:var(--mut2)">手动指定端点（自动发现不可用时）</summary>'
-      + '<input type=text id=sp_naahost value="' +
-           esc(ADV.naaHost || '127.0.0.1:43210') + '" style="margin-top:6px">'
-      + '<div class=hint>host:port，端口默认 43210；端点机需运行 rtanet_rx（真正的 networkaudiod 协议尚未逆向）</div>'
-      + '</details></div>'
+      // 261024-05：NAA 端点选择/发现区块已删除（整个后端一起去掉）。
       // 261024-01 #9：后端下拉新增「UPnP / DLNA 投放」。选中后这里直接选目标渲染器，
       // 与下方「投放」区块共用同一份发现结果、同一个选择、同一条会话（不出现两套打架的控制）。
       + '<div class="sfld wide" id=sp_upnpwrap style="display:none">'
@@ -4112,7 +4115,6 @@ function renderSettingsPage() {
         applyBackendState();
         // 只有"输出后端 = UPnP"时才需要渲染器列表（目标设备下拉在输出页里）
         if (((D('sp_backend') && D('sp_backend').value) || 'wasapi') === 'upnp') scanCastDevices(false);
-        if (((D('sp_backend') && D('sp_backend').value) || 'wasapi') === 'naa') discoverNaa(false);
       } else if (b.dataset.g === 'stream') {
         loadSrcConfig();
         scanCastDevices(false);   // 推送区块的设备列表
@@ -4128,19 +4130,10 @@ function renderSettingsPage() {
     backendHint();
     applyBackendState();
     loadDeviceList();        // ASIO 列驱动，WASAPI 列端点，NAA/Null 没有本地设备
-    // 261024-01 #9/#11：切到 NAA / UPnP 时自动发现目标（用户不用手填端点 / 设备地址）
-    if (this.value === 'naa') discoverNaa(true);
-    else if (this.value === 'upnp') scanCastDevices(true);
+    // 261024-01 #9：切到 UPnP 时自动发现目标渲染器
+    if (this.value === 'upnp') scanCastDevices(true);
   };
-  if (D('sp_naahost')) D('sp_naahost').oninput = function () { ADV.naaHost = this.value; saveSettings(); backendHint(); };
-  // 261024-01 #11：NAA 端点下拉 = 自动发现结果（手动框只是折叠兜底）
-  if (D('sp_naa_scan')) D('sp_naa_scan').onclick = function () { discoverNaa(true); };
-  if (D('sp_naa_dev')) D('sp_naa_dev').onchange = function () {
-    ADV.naaHost = this.value || '';
-    if (D('sp_naahost')) D('sp_naahost').value = this.value || '';
-    saveSettings();
-    backendHint();
-  };
+  // 261024-05：NAA 端点下拉绑定已删除（控件不再存在）
   // 261024-01 #9：目标渲染器与「投放」区块同一个选择（不出现两套互相打架的控制）
   if (D('sp_upnp_scan')) D('sp_upnp_scan').onclick = function () { scanCastDevices(true); };
   if (D('sp_upnp_dev')) D('sp_upnp_dev').onchange = function () { syncUpnpDev(this.value); backendHint(); };
@@ -5451,8 +5444,6 @@ function collectSettings() {
   // 输出后端 / 声道 / 每声道微调
   if (D('sp_backend')) ADV.backend = D('sp_backend').value || 'wasapi';
   // 261024-01 #11：NAA 端点优先取自动发现的下拉；手动框（折叠兜底）有值则以它为准
-  if (D('sp_naa_dev') && D('sp_naa_dev').value) ADV.naaHost = D('sp_naa_dev').value;
-  if (D('sp_naahost') && (D('sp_naahost').value || '').trim()) ADV.naaHost = (D('sp_naahost').value || '').trim();
   // 261024-01 #9：UPnP 目标渲染器（与「投放」区块同一下拉选择）
   if (D('sp_upnp_dev') && D('sp_upnp_dev').value) ADV.upnpDev = D('sp_upnp_dev').value;
   if (D('sp_ch')) ADV.channels = parseInt(D('sp_ch').value, 10) || 0;
@@ -5599,7 +5590,7 @@ function closeNowPlaying() { var pg = D('npPage'); if (pg) pg.classList.remove('
      - 「作品」只在判定为古典时出现，走 /api/entity/versions（Discogs 版本推荐），
        并提供进入「古典作品」整页的入口（左导航已按 #9 移除）。
    状态机：idle → loading（骨架）→ ok / error；切歌/关页丢弃过期回调。 */
-var NP_DATA = { key: '', active: '', tabs: [], cache: {}, inflight: {}, req: 0, bodyKey: '', tabSig: '' };
+var NP_DATA = { key: '', active: '', tabs: [], cache: {}, inflight: {}, req: 0, bodyKey: '', tabSig: '', live: { v: 1 } };
 
 function npFileName(p) {
   var s = String(p || '').replace(/\\/g, '/');
@@ -5671,11 +5662,13 @@ function npBindEqChips() {
   if (ir) ir.onclick = function () { closeNowPlaying(); openSettingsTab('eq'); };
 }
 function npDataReset() {
-  NP_DATA = { key: '', active: '', tabs: [], cache: {}, inflight: {}, req: 0, bodyKey: '', tabSig: '' };
+  // 261024-05 #T2：切歌 → 取消上一首所有在飞/轮询中的资料请求（旧实体的轮询不该继续打后端）
+  if (NP_DATA.live) NP_DATA.live.v = 0;
+  NP_DATA = { key: '', active: '', tabs: [], cache: {}, inflight: {}, req: 0, bodyKey: '', tabSig: '', live: { v: 1 } };
   var b = D('npDataBody'); if (b) b.innerHTML = '';
   var t = D('npTabs'); if (t) t.innerHTML = '';
   var s = D('npDataStat'); if (s) s.textContent = '';
-  NPPREF.key = '';    // 切歌：允许下一首重新预取（旧请求的结果由 key 守卫丢弃）
+  npPrefReset();      // 切歌：取消上一首的预取（含仍在 2s 轮询的旧专辑），下一首重新预取
   npDrawerClose();
 }
 // 抽屉开关（#3b ③）：资料默认不占版面，点标签才从右侧滑出
@@ -5754,7 +5747,8 @@ function npDataRenderTabs() {
     var st = NP_DATA.cache[t.k] || { state: 'idle' };
     var cls = st.state === 'ok' ? ' ok' : (st.state === 'loading' ? ' busy' : (st.state === 'error' ? ' err' : ''));
     h += '<button class="npchip' + cls + (NP_DATA.active === t.k ? ' on' : '') + '" data-k="' + esc(t.k) + '"' +
-         ' title="' + esc(t.label + '：' + (t.name || '') + '（点击查看 AI 整理的资料）') + '">' +
+         ' title="' + esc(t.label + '：' + (t.name || '') + '（' +
+           (t.k === 'release' ? (npAiReady() ? '本地曲目 + AI 整理' : '本地曲目') : 'AI 整理') + '）') + '">' +
          '<i class=dot></i>' + esc(t.label) + '</button>';
   });
   el.innerHTML = h;
@@ -5768,8 +5762,20 @@ function npDataToggle(kind) {
   npDataActivate(kind);
 }
 function npDataStatHtml(kind, st) {
-  if (!st || st.state === 'idle' || st.state === 'loading') return '整理中…';
+  // 261024-05 A12：AI 关闭时「专辑」标签只有本地曲目 —— 不能显示永远等不到的"整理中…"
+  if (kind === 'release' && !npAiReady()) {
+    var ln = ((st && st.local && st.local.tracks) || []).length;
+    return ln ? ('本地曲目 · ' + ln + ' 首') : '本地曲库';
+  }
+  if (!st || st.state === 'idle' || st.state === 'loading') {
+    if (kind === 'release' && st && st.local) return '本地曲目已就绪 · AI 整理中…';
+    return '整理中…';
+  }
   if (st.state === 'error') return '暂无资料';
+  if (st.state === 'local') {
+    var n0 = ((st.local && st.local.tracks) || []).length;
+    return n0 ? ('本地曲目 · ' + n0 + ' 首') : '本地曲库';
+  }
   var d = st.data || {};
   if (kind === 'work') {
     var n = (d.performances || []).length;
@@ -5846,10 +5852,24 @@ function npDataRenderBody(force) {
   var st = NP_DATA.cache[kind] || { state: 'idle' };
   npDataHeader(kind, st);
   // renderNp 400ms 一次：内容没变就不重绘（否则抽屉里的滚动位置会被反复重置）
-  var sig = kind + '|' + st.state + '|' + (st.data ? (st.data.generated_at || (st.data.summaryCached ? 'c' : 'f')) : (st.error || ''));
+  // 261024-05 A12：本地专辑到达 / 曲目数变化也必须触发重绘，否则"先本地后 AI"只生效一半。
+  var lsig = st.local ? ('L' + ((st.local.tracks || []).length)) : (st.localState || '-');
+  var sig = kind + '|' + st.state + '|' + lsig + '|' +
+            (st.data ? (st.data.generated_at || (st.data.summaryCached ? 'c' : 'f')) : (st.error || ''));
   var need = (sig !== NP_DATA.bodyKey);
   if (!need && !force) return;
   NP_DATA.bodyKey = sig;
+  var keepTop = body.scrollTop || 0;
+  // 261024-05 A12：专辑标签 = **先本地曲目、后 AI 文本**。加载中只给一行轻量占位（不整块骨架），
+  // AI 回来只补文字字段；列表永远来自本地曲库，绝不被 AI 的「曲目列表」覆盖。
+  if (kind === 'release') {
+    body.innerHTML = npReleaseBody(st);
+    bindCopyChips(body);
+    if (keepTop) body.scrollTop = keepTop;
+    var rfb = D('npDataRefresh');
+    if (rfb) rfb.onclick = function () { npDataEnsure('release', true); };
+    return;
+  }
   if (st.state === 'idle' || st.state === 'loading') { body.innerHTML = npDataSkeleton(); return; }
   if (st.state === 'error') {
     body.innerHTML = '<div class=npdhint>暂无该实体的资料。' + (st.error ? ('（' + esc(st.error) + '）') : '') + '</div>' +
@@ -5890,13 +5910,83 @@ function npLocalAlbum(name, artist, cb) {
     }).catch(function () { cb(null); });
   }).catch(function () { cb(null); });
 }
+// 261024-05 A12：AI 整理是否真的可用（设置开关 + 后端权威 key/开关），决定要不要发 summary 请求。
+// 注意与 npDataCan 的区别：那个还看当前曲目的 summaryAvailable 缓存标记，这里只看"能力"。
+function npAiReady() {
+  return META.summary == 1 && (META.hasLlmKey === true || META.summaryEnabled === true);
+}
+function npLocalKeyOf(t) { return String((t && t.name) || '') + '|' + String((t && t.artist) || ''); }
+function npReleaseOpts(st) {
+  var alb = st.local || (st.data && st.data.__album) || null;
+  var opts = { drop: { '曲目列表': 1 } };   // 用下面的对齐表格替代 AI 的一行文本
+  if (alb) {
+    var trs = alb.tracks || [], tot = 0;
+    trs.forEach(function (t) { tot += (t.dur || 0); });
+    if (!tot) tot = alb.dur || 0;
+    opts.local = {};
+    if (tot > 0) opts.local['时长'] = fmtDurLong(tot);
+    if (alb.artist) opts.local['艺术家'] = alb.artist;
+  }
+  return opts;
+}
+// 抽屉「专辑」正文：本地资料字段 + 本地曲目表（列表的唯一真相源），AI 只补文字字段。
+// 状态无关：idle/loading/local/ok/error 都走这里 —— 本地一到就显示，AI 到/失败只是换文字。
+function npReleaseBody(st) {
+  st = st || {};
+  var alb = st.local || (st.data && st.data.__album) || null;
+  var opts = npReleaseOpts(st);
+  var ai = (st.state === 'ok') ? st.data : null;
+  var h = '';
+  if (ai) h = renderSummaryContent(ai, '', 'release', opts);
+  if (!h) h = renderFieldGrid({}, 'release', opts);      // AI 不在/失败：静默只显示本地资料字段
+  if (alb) h += efTracklistHtml(alb.tracks || []);
+  if (!alb) {
+    if (st.state === 'loading' || st.state === 'idle' || st.localState === 'loading') {
+      h += '<div class=npdhint>正在读取本地曲目…</div>';
+    } else {
+      h += '<div class=npdhint>本地曲库中没有这张专辑的曲目。</div>';
+    }
+  }
+  if (ai) {
+    h += '<div style="margin-top:16px"><button class="btn" id=npDataRefresh" ' +
+         'style="font-size:11px;padding:3px 10px" title="重新请求 AI 整理（会消耗一次模型调用）">重新整理</button></div>';
+  }
+  return h || '<div class=npdhint>暂无该专辑的资料。</div>';
+}
+// 261024-05 A12：切到「专辑」标签**先**用本地曲库拿这张专辑并渲染曲目列表（不依赖 AI、不等摘要）。
+// 失败静默（localState=none），AI 文本后到时由 npDataEnsure/npPrefetchRelease 补进缓存再重绘。
+function npLocalAlbumLoad(kind) {
+  var t = npDataTab(kind); if (!t) return;
+  var st = NP_DATA.cache[kind] || (NP_DATA.cache[kind] = {});
+  if (!st.local && st.data && st.data.__album) st.local = st.data.__album;
+  if (st.local) return;                                  // 预取时已经拿到本地专辑
+  var key = npLocalKeyOf(t);
+  if (st.localKey === key && st.localState === 'loading') return;
+  st.localKey = key;
+  st.localState = 'loading';
+  if (NP_DATA.active === kind) npDataRenderBody(true);
+  npLocalAlbum(t.name, t.artist || '', function (alb) {
+    var cur = NP_DATA.cache[kind];
+    if (!cur || cur.localKey !== key) return;            // 切歌/换实体 → 丢弃
+    if (cur.data) cur.data.__album = alb || null;
+    cur.local = alb || null;
+    cur.localState = alb ? 'ok' : 'none';
+    if (NP_DATA.active === kind) npDataRenderBody(true);
+  });
+}
 // 261024-02 追加（Lead 指定，属于 #1 的体感）：打开单曲页 / 切歌时**后台预取当前专辑的 release 资料**。
 // 目的：用户点「专辑」标签时直接命中缓存/已完成的生成任务，不用再等 10~30s 的首次生成。
 // 纪律：
 //   * 只在"用户已开启在线资料整理"时预取（META.summary==1 且 hasLlmKey/summaryEnabled 为真）；
 //   * 只预取 release 这一个实体，一次（同一首歌只发一次）；不打开抽屉、不改变任何 UI 状态；
 //   * 失败静默（不 toast、不留错误态）；切歌后旧结果直接丢弃（key 不匹配）。
-var NPPREF = { key: '' };
+// 261024-05 #T2：切歌时不仅丢结果，还要**停掉旧专辑的轮询**（旧实现 pending 会每 2s 再打 60 次）。
+var NPPREF = { key: '', live: { v: 0 } };
+function npPrefReset() {
+  NPPREF.live.v = 0;
+  NPPREF.key = '';
+  NPPREF.live = { v: 0 };
+}
 // 单曲页各类资料的 URL 只在这里拼（抽屉 / 预取 / 自动加载共用，才能命中同一份 summaryOnce 缓存）
 function npSummUrl(kind, t, force) {
   return '/api/entity/summary?kind=' + kind + '&name=' + encodeURIComponent((t && t.name) || '') +
@@ -5904,27 +5994,32 @@ function npSummUrl(kind, t, force) {
          (force ? '&refresh=1' : '');
 }
 function npPrefetchRelease() {
-  if (META.summary != 1) return;
-  if (META.hasLlmKey !== true && META.summaryEnabled !== true) return;
+  if (!npAiReady()) return;
   var tabs = NP_DATA.tabs || [], rel = null;
   for (var i = 0; i < tabs.length; ++i) if (tabs[i].k === 'release') rel = tabs[i];
   if (!rel) return;
   var myTrack = S.lastCur || '';
   var key = myTrack + '|' + rel.name + '|' + (rel.artist || '');
   if (NPPREF.key === key) return;
-  NPPREF.key = key;
+  var live = { v: 1 };
+  NPPREF = { key: key, live: live };
   var u = npSummUrl('release', rel);
   summaryOnce(u, function (s) {
-    if (NPPREF.key !== key || (S.lastCur || '') !== myTrack) return;   // 切歌 → 丢弃
+    if (!live.v || NPPREF.live !== live) return;                     // 已切歌/已取消 → 丢弃
+    if ((S.lastCur || '') !== myTrack) return;
     if (!summHas(s)) return;                                          // 失败静默
     var finish = function () {
-      if (NP_DATA.cache['release'] && NP_DATA.cache['release'].state === 'ok') return;  // 用户已自己取到
-      NP_DATA.cache['release'] = { state: 'ok', data: s };
+      if (!live.v || NPPREF.live !== live) return;                   // 本地专辑回来前已切歌
+      var cur = NP_DATA.cache['release'] || {};
+      if (cur.state === 'ok') return;                                // 用户已自己取到
+      var alb = s.__album || cur.local || null;
+      NP_DATA.cache['release'] = { state: 'ok', data: s, local: alb,
+                                  localState: alb ? 'ok' : (cur.localState || ''), localKey: cur.localKey };
       npDataRenderTabs();
       if (NP_DATA.active === 'release') npDataRenderBody();
     };
     npLocalAlbum(rel.name, rel.artist || '', function (alb) { if (alb) s.__album = alb; finish(); });
-  });
+  }, false, function () { return live.v === 1 && NPPREF.live === live; });
 }
 /* 261024-04 #7：打开 AI 整理后，**进入单曲页就自动加载**这首歌的 summary（用户原话：不再需要点击）。
    纪律：
@@ -5962,21 +6057,42 @@ function npRailHint() {
 }
 function npDataEnsure(kind, force) {
   var t = npDataTab(kind); if (!t) return;
+  // 261024-05 A12：AI 不可用时一次 summary 请求都不发；专辑标签照样有本地曲目/资料字段
+  if (!npDataCan(S.curMeta)) {
+    if (kind === 'release') {
+      var stl = NP_DATA.cache[kind] || (NP_DATA.cache[kind] = {});
+      if (stl.state !== 'ok') stl.state = 'local';
+      if (NP_DATA.active === kind) npDataRenderBody();
+    }
+    return;
+  }
   var st = NP_DATA.cache[kind];
-  if (!force && st && (st.state === 'loading' || st.state === 'ok')) return;
+  // release 的 local 态：只有**AI 确实试过且失败**才自动停手（AI 刚开启时要允许补请求）
+  if (!force && st && (st.state === 'loading' || st.state === 'ok' ||
+      (kind === 'release' && st.state === 'local' && st.aiFailed))) return;
   var fp = kind + '|' + t.name + '|' + (t.artist || '') + '|' + (t.composer || '');
   if (!force && NP_DATA.inflight[fp]) return;
   NP_DATA.inflight[fp] = 1;
   var req = NP_DATA.req;
-  NP_DATA.cache[kind] = { state: 'loading' };
+  var prev = NP_DATA.cache[kind] || {};   // 换态时保留本地专辑（先本地、后 AI）
+  NP_DATA.cache[kind] = { state: 'loading', local: prev.local || null,
+                          localState: prev.localState || '', localKey: prev.localKey || '',
+                          aiFailed: prev.aiFailed || 0 };
   if (NP_DATA.active === kind) npDataRenderBody();
 
   function done(data, err) {
     delete NP_DATA.inflight[fp];
     if (NP_DATA.req !== req) return;               // 已切歌 → 丢弃过期结果
     if (!D('npPage') || !D('npPage').classList.contains('on')) return;
-    if (data) NP_DATA.cache[kind] = { state: 'ok', data: data };
-    else NP_DATA.cache[kind] = { state: 'error', error: err || '' };
+    var cur = NP_DATA.cache[kind] || {};
+    var alb = cur.local || (data && data.__album) || null;
+    if (data) NP_DATA.cache[kind] = { state: 'ok', data: data, local: alb,
+                                      localState: alb ? 'ok' : cur.localState,
+                                      localKey: cur.localKey || '' };
+    else NP_DATA.cache[kind] = { state: (kind === 'release' && alb) ? 'local' : 'error',
+                                 error: err || '', local: alb,
+                                 localState: alb ? 'ok' : cur.localState,
+                                 localKey: cur.localKey || '', aiFailed: 1 };
     if (NP_DATA.active === kind) npDataRenderBody();
   }
   if (kind === 'work') {
@@ -5987,6 +6103,8 @@ function npDataEnsure(kind, force) {
     return;
   }
   // 261024-04 #7：走 summaryOnce —— 同一实体只请求一次（专辑页/单曲页/预取共用同一份缓存）
+  // 261024-05 #T2：切歌后（npDataReset 换掉 live）该实体的轮询立刻停，不再发旧 key 的请求
+  var live = NP_DATA.live || { v: 1 };
   var u = npSummUrl(kind, t, force);
   summaryOnce(u, function (s) {
     // 261024-01 #4：后端新增结构化 fields（可能没有 sections）⟹ 有 fields 也算有资料
@@ -6000,13 +6118,18 @@ function npDataEnsure(kind, force) {
     } else {
       done(s, '');
     }
-  });
+  }, false, function () { return live.v === 1 && NP_DATA.live === live; });
 }
 function npDataActivate(kind) {
   NP_DATA.active = kind;
+  var st = NP_DATA.cache[kind];
+  if (!st) st = NP_DATA.cache[kind] = { state: 'idle' };
+  // 261024-05 A12：AI 关闭时专辑标签直接是"本地曲库"态 —— 点开就有曲目，不发任何 AI 请求
+  if (kind === 'release' && !npDataCan(S.curMeta) && st.state !== 'ok') st.state = 'local';
   npDataRenderTabs();
-  npDataRenderBody();
-  npDrawerOpen();          // 先滑出抽屉（骨架态），再请求 —— 点一下就有反馈，不做"静默等 10 秒"
+  npDataRenderBody(true);  // 强制刷一次：占位/本地列表立刻出现（点一下就有反馈）
+  npDrawerOpen();
+  if (kind === 'release') npLocalAlbumLoad(kind);   // 先本地曲目，AI 文本后到再补
   npDataEnsure(kind, false);
 }
 // 打开「古典作品 · 演绎版本」整页（左导航已移除，这是唯一入口；返回按钮见 loadWorksView）
@@ -6021,8 +6144,11 @@ function updateNpData(m) {
   var key = S.lastCur || '';
   if (NP_DATA.key !== key) { npDataReset(); NP_DATA.key = key; NP_DATA.req++; }
   var can = npDataCan(m);
-  var tabs = can ? npDataTargets(m) : [];
-  if (!can || !tabs.length) {
+  var tabs = npDataTargets(m);
+  // 261024-05 A12：AI 不可用时「专辑」标签仍然保留（本地曲目就能填满抽屉）；其余标签是 AI 专属
+  if (!can) tabs = tabs.filter(function (t) { return t.k === 'release'; });
+  if (D('npRailCap')) D('npRailCap').textContent = can ? 'AI 整理' : '专辑资料';
+  if (!tabs.length) {
     // 没有任何可用资料：整个标签栏收起（不占版面、不留空白块），抽屉也收起
     rail.classList.remove('on');
     if (grid) grid.classList.remove('withdata');

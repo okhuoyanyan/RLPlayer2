@@ -1,4 +1,4 @@
-﻿# make_dist.ps1 - build the ONE official release package (Full / self-contained).
+# make_dist.ps1 - build the ONE official release package (Full / self-contained).
 #
 # Policy since 1.0.2:
 #   * There is no "Lite" package any more. Every release is the official
@@ -159,7 +159,7 @@ if (Test-Path $clang) {
 }
 
 $tools = @('rtaplay.exe', 'dsdconv.exe', 'make_dsd.exe', 'rtanet_rx.exe', 'dopinfo.exe',
-           'wavcmp.exe', 'wasapi_probe.exe', 'naa_scan.exe', 'naa_probe.exe', 'upnp_scan.exe',
+           'wavcmp.exe', 'wasapi_probe.exe', 'upnp_scan.exe',
            'aidecode.exe', 'rtatag.exe', 'rtacapture.exe', 'rtacast.exe', 'filter_report.exe',
            'wasapi_ex_probe.exe', 'gpubench_conv.exe')
 foreach ($f in $tools) {

@@ -18,6 +18,7 @@
 #include "dsp/parallel.h"
 #include "dsp/modulator.h"
 #include "dsp/eq_text.h"
+#include "dsp/ir_resample.h"   // 261024-05 A2：IR 采样率 ≠ 源时先重采样（卷积在重采样之前）
 #include <fstream>
 #include <sstream>
 #include <functional>
@@ -336,11 +337,18 @@ int main(int argc, char** argv) {
         AudioBuffer irBuf;
         try { irBuf = read_wav(irFile); }
         catch (const std::exception& e) { printf("!! 读取 IR 失败: %s\n", e.what()); return 1; }
-        if (irBuf.rate != in.rate)
-            printf("!! 警告: IR 采样率 %u 与源 %u 不同（尚未做 IR 重采样，结果会不正确）\n",
-                   irBuf.rate, in.rate);
         std::vector<double> ir(irBuf.frames());
         for (size_t i = 0; i < ir.size(); ++i) ir[i] = irBuf.sample(i, 0);
+        // 261024-05 #A2：IR 采样率与音源不同时**先重采样**。
+        // 为什么换算到 in.rate 而不是输出采样率：信号链里卷积(4)在重采样(5)**之前**，
+        // 卷积器看到的是源采样率的样本；以前这里只打印一句警告就原样用，44.1k 量出来的
+        // 房间响应用在 96k 上会把时间基准拉长 2.18 倍（1 秒的响应当成 0.46 秒）。
+        if (irBuf.rate && irBuf.rate != in.rate) {
+            const size_t before = ir.size();
+            ir = rta::dsp::ir_resample(ir, irBuf.rate, in.rate);
+            printf("IR: 采样率 %u Hz != 源 %u Hz，已重采样 %zu -> %zu 抽头\n",
+                   irBuf.rate, in.rate, before, ir.size());
+        }
         cfg.channel.resize((size_t)std::max((int)cfg.channel.size(), in.channels));
         for (int c = 0; c < in.channels; ++c) cfg.channel[(size_t)c].ir = ir;
         if (useGpu) for (int c = 0; c < in.channels; ++c) cfg.channel[(size_t)c].useGpu = true;
