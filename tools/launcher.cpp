@@ -24,6 +24,7 @@
 #include <cstring>
 
 #include "wv2_host.h"
+#include "platform/host_msg.h"     // 261024-02 #2：postMessage 协议解析 + 外链协议白名单（可单测）
 #include "version.h"               // RLPLAYER_VERSION（单一版本号真相源）
 #include "crash_dump.h"            // 崩溃转储 + OS/CPU/tester 诊断（1.0.5 可观测性）
 #include "audio/wasapi_out.h"      // 输出端点数（横幅用，只读枚举，不开设备）
@@ -117,6 +118,15 @@ static std::wstring exe_dir() {
 }
 
 // UTF-8 窄串 → 宽串（横幅里拼 OS/CPU 品牌用）
+// 261024-02 #2：页面 postMessage 是 UTF-16，协议解析统一在 UTF-8 上做（host_msg.h 只认 std::string）
+static std::string wide_to_utf8(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string s((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
 static std::wstring utf8_to_wide(const std::string& s) {
     const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
     if (n <= 0) return L"?";
@@ -833,20 +843,39 @@ static bool open_webview_window(int port) {
     const std::wstring userData = exe_dir() + L"\\webview2";
     auto onMessage = [hwnd](const std::wstring& m) {
         logf(L"wvmsg: %s", m.c_str());
-        if (m == L"min") { ShowWindow(hwnd, SW_MINIMIZE); }
-        else if (m == L"max") { ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE); }
-        else if (m == L"close") { PostMessageW(hwnd, WM_CLOSE, 0, 0); }
-        else if (m == L"drag") {
+        // 261024-02 #2：协议解析抽到 platform/host_msg.h（纯函数、可单测），这里只负责"动作"。
+        const auto hm = rta::platform::parse_host_message(wide_to_utf8(m));
+        switch (hm.action) {
+        case rta::platform::HostAction::Minimize: ShowWindow(hwnd, SW_MINIMIZE); break;
+        case rta::platform::HostAction::Maximize: ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE); break;
+        case rta::platform::HostAction::Close: PostMessageW(hwnd, WM_CLOSE, 0, 0); break;
+        case rta::platform::HostAction::Drag:
             ReleaseCapture();
             SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
-        } else if (m.rfind(L"theme:", 0) == 0) {
+            break;
+        case rta::platform::HostAction::Theme: {
             // 三套主题各刷各的 --bg：只分深浅会让浅蓝主题露一条 #f4f6f9 的浅灰边
-            const bool blue = (m == L"theme:blue");
-            const bool dark = (m == L"theme:dark");
+            const bool blue = (hm.arg == "blue");
+            const bool dark = (hm.arg == "dark");
             g_themeFromPage = true;      // 见 g_themeFromPage 的注：此后不再听 conf
             g_captionBlue = blue;
             g_captionDark = dark;
             apply_caption(hwnd, dark, blue);
+            break;
+        }
+        case rta::platform::HostAction::OpenUrl: {
+            // 只放 http/https（白名单在 host_msg.h 里，有单测）。打开失败/被拒都留证据。
+            if (!hm.allowed) {
+                logf(L"openurl REJECTED: %s (reason: %s)",
+                     utf8_to_wide(hm.arg).c_str(), utf8_to_wide(hm.reason).c_str());
+                break;
+            }
+            const std::wstring wurl = utf8_to_wide(hm.arg);
+            const HINSTANCE hi = ShellExecuteW(nullptr, L"open", wurl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            logf(L"openurl OK: %s (ShellExecute=%lld)", wurl.c_str(), (long long)(intptr_t)hi);
+            break;
+        }
+        default: break;
         }
     };
     if (!rta::wv2::create(hwnd, userData, url, &g_wvCtl, &g_wv, err, onMessage)) {
