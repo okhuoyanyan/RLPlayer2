@@ -10,6 +10,8 @@
 // 闭括号后紧跟连字符漏切分（均来自曲库 MUSIC 真实文件名形态）。
 // 2026-10-21 再追加「全角 （） 摘组回归」3 组（调研文档 §5 未解决项 10 的修复，
 // MUSIC 实测 10 首受影响）：全角括号组照常摘除/分类，artist 段不误伤。
+// 2026-10-24 追加「全角组 3 边界（不闭合/嵌套半角/括号后正文）+ 缺陷 2 兜底」：
+// 尾括号把 title 摘空或只剩标点时，title 回退为原名去扩展名并置 trailing_only。
 #include "meta/parse.h"
 #include <cstdio>
 #include <string>
@@ -284,6 +286,83 @@ int main() {
         ck_eq(p.artist, "人声音质（甜系女声）", "全3 artist 整体保留（artist 段不做尾部摘组）");
         ck_eq(p.title,  "恋文",                "全3 title");
         ck_conf(p.confidence, 0.8f,            "全3 confidence=0.8（回退切分同基准）");
+    }
+
+    // ---- 缺陷 1 边界回归（2026-10-24）：全角组只在「完整、成对、位于尾部」时摘 ----
+    // 修复本体 2026-10-21 已落在 pd_strip_trailing_groups（括号族含 EF BC 88/89）；
+    // 这里补规格要求的 3 个边界：不闭合、嵌套半角、括号后还有正文。
+    {
+        std::printf("- 边1 全角括号不闭合 → 保留原文\n");
+        const ParsedName p = parse_filename("不夜城 Night Fall（feat.冬名");
+        ck_eq(p.title,  "不夜城 Night Fall（feat.冬名", "边1 title 原样保留（未闭合不摘）");
+        ck_eq(p.feat,   "",                             "边1 feat 为空");
+        ck_eq(p.version, "",                            "边1 version 为空");
+    }
+    {
+        std::printf("- 边2 全角组内嵌半角括号 → 整体算一组\n");
+        const ParsedName p = parse_filename("群星 - 天空（Live (Remix)）");
+        ck_eq(p.artist,  "群星",           "边2 artist");
+        ck_eq(p.title,   "天空",           "边2 title");
+        ck_eq(p.version, "Live (Remix)",   "边2 version（嵌套半角原样留在组内）");
+        ck_eq(p.feat,    "",               "边2 feat 为空");
+    }
+    {
+        std::printf("- 边3 全角括号后还有正文 → 不摘\n");
+        const ParsedName p = parse_filename("群星 - 天空（Live） 后文");
+        ck_eq(p.artist,  "群星",                 "边3 artist");
+        ck_eq(p.title,   "天空（Live） 后文",     "边3 title 原样保留（组不在尾部）");
+        ck_eq(p.version, "",                     "边3 version 为空");
+        ck_eq(p.feat,    "",                     "边3 feat 为空");
+    }
+    {
+        std::printf("- 边4 连续两组全角括号：feat + 副题\n");
+        const ParsedName p = parse_filename("砂糖星辰（feat.冬名）（Song for ANK & Kumako）");
+        ck_eq(p.title,   "砂糖星辰",                 "边4 title");
+        ck_eq(p.feat,    "冬名",                     "边4 feat");
+        ck_eq(p.version, "Song for ANK & Kumako",    "边4 version");
+    }
+
+    // ---- 缺陷 2 回归（2026-10-24）：尾括号摘空 → 回退原名 + trailing_only ----
+    {
+        std::printf("- 空1 5 [break.] → title 回退为原名去扩展名\n");
+        const ParsedName p = parse_filename("5 [break.]");
+        ck_eq(p.artist,  "",           "空1 artist 为空");
+        ck_eq(p.title,   "5 [break.]", "空1 title=原名（非空，不再是 \"\"）");
+        ck_eq(p.version, "break.",     "空1 version 保留摘出的组（解析证据）");
+        ck(p.trailing_only,            "空1 trailing_only=true");
+        ck_conf(p.confidence, 0.3f,    "空1 confidence=0.3（兜底，弱结果）");
+    }
+    {
+        std::printf("- 空2 带扩展名的整名同样兜底\n");
+        const ParsedName p = parse_filename("5 [break.].flac");
+        ck_eq(p.title, "5 [break.]", "空2 title=原名去扩展名");
+        ck(p.trailing_only,          "空2 trailing_only=true");
+    }
+    {
+        std::printf("- 空3 摘完只剩标点 → 也回退\n");
+        const ParsedName p = parse_filename("!!!（Live）");
+        ck_eq(p.title, "!!!（Live）", "空3 title=原名（只剩 \"!!!\" 不算标题）");
+        ck_eq(p.version, "Live",      "空3 version");
+        ck(p.trailing_only,           "空3 trailing_only=true");
+    }
+    {
+        std::printf("- 空4 普通曲目/feat 组不置 flag\n");
+        ParsedName p = parse_filename("谭晶 - 游京 (长征版)");
+        ck_eq(p.title, "游京",       "空4a title");
+        ck_eq(p.version, "长征版",   "空4a version");
+        ck(!p.trailing_only,          "空4a 普通曲目 trailing_only=false");
+        p = parse_filename("未来永劫 (feat.可不)");
+        ck_eq(p.title, "未来永劫",   "空4b title");
+        ck_eq(p.feat,  "可不",       "空4b feat");
+        ck(!p.trailing_only,          "空4b 只有 feat 组时 trailing_only=false");
+    }
+    {
+        std::printf("- 空5 标签/LLM 路径的 flag 恒为 false\n");
+        const ParsedName t = parse_from_tags("五条人", "阿珍爱上了阿强");
+        ck(!t.trailing_only, "空5a tag 路径 trailing_only=false");
+        const ParsedName l = parse_llm_parse(
+            "{\"artist\": \"A\", \"title\": \"T\", \"feat\": \"\", \"version\": \"\"}");
+        ck(!l.trailing_only, "空5b llm 路径 trailing_only=false");
     }
 
     std::printf("\n%s\n", g_fail == 0 ? "全部通过" : (std::to_string(g_fail) + " 项失败").c_str());

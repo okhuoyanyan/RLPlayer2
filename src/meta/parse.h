@@ -6,7 +6,8 @@
 //
 // 三个入口 + 一个提示词生成：
 //   parse_from_tags(artist, title)  标签透传（都不空 = 可信，conf 1.0；否则 0.5）
-//   parse_filename(stem)            文件名规则拆分（曲号 / " - " 切分 / version / feat）
+//   parse_filename(stem)            文件名规则拆分（曲号 / " - " 切分 / version / feat；
+//                                   误传整名时先去掉常见音频扩展名，见 pd_strip_audio_ext）
 //   parse_llm_parse(llmText)        解析 deepseek-flash 的回包（剥 ```json 围栏后取四键 JSON）
 //   parse_llm_prompt(stem)          生成给 deepseek-flash 的提示词（只要求输出四键 JSON）
 //
@@ -30,6 +31,10 @@ struct ParsedName {
     std::string artist, title, feat, version;
     std::string method;      // "tag" | "rule" | "llm"
     float confidence = 0.f;  // 规则解析的启发置信度 0~1
+    // 缺陷 2 兜底标记（2026-10-24）：尾部括号组把 title 摘空/只剩标点后，title 已
+    // 回退成「原始文件名（去扩展名）」。此时 title 只保证非空、可搜索，不代表解析
+    // 成功；上层可据此跳过写回或降权（confidence 同时压到 0.3）。
+    bool trailing_only = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -250,6 +255,79 @@ inline void pd_classify_group(const std::string& group, std::string& feat,
     versionGroups->push_back(g);
 }
 
+// 缺陷 2 修复（2026-10-24）：判断一个码点是否只是「空白/标点/符号」。
+// 只服务于 pd_title_meaningful：标题里出现任何实义字符（字母、数字、假名、汉字…）
+// 就算有内容；只有空白与标点（"…" / "!!!" / "（）" / "★"）才算「摘空了」。
+// 覆盖常见区间即可；未列出的非 ASCII 码点一律当实义字符（保守：宁可认为有标题，
+// 也不误触发回退——回退结果带 trailing_only，上层可再判断）。
+inline bool pd_cp_is_filler(unsigned cp) {
+    if (cp == 0x00A0 || cp == 0x1680 || cp == 0x2028 || cp == 0x2029 ||
+        cp == 0x202F || cp == 0x205F || cp == 0x3000 || cp == 0xFEFF) return true; // 空白/零宽
+    if (cp >= 0x2000 && cp <= 0x206F) return true; // 通用标点：– — ‘ ’ “ ” … •
+    if (cp >= 0x2E00 && cp <= 0x2E7F) return true; // 补充标点
+    if (cp >= 0x3001 && cp <= 0x303F) return true; // CJK 标点：、。〈〉《》「」【】〜
+    if (cp >= 0xFE10 && cp <= 0xFE19) return true; // 竖排标点
+    if (cp >= 0xFE30 && cp <= 0xFE6F) return true; // CJK 兼容形式
+    if (cp >= 0xFF01 && cp <= 0xFF0F) return true; // 全角 ！＂＃…／
+    if (cp >= 0xFF1A && cp <= 0xFF20) return true; // 全角 ：；＜＝＞？＠
+    if (cp >= 0xFF3B && cp <= 0xFF40) return true; // 全角 ［＼］＾＿｀
+    if (cp >= 0xFF5B && cp <= 0xFF65) return true; // 全角 ｛｜｝～ 与半角 ｡｢｣､･
+    if (cp >= 0x2190 && cp <= 0x2BFF) return true; // 箭头/数学/装饰符号：★☆♪
+    if (cp >= 0x1F000 && cp <= 0x1FAFF) return true; // emoji/图形符号
+    if (cp >= 0x00A1 && cp <= 0x00BF) return true; // Latin-1 标点/符号
+    if (cp == 0x00D7 || cp == 0x00F7) return true; // × ÷
+    return false;
+}
+
+// 标题是否还有实义内容（见 pd_cp_is_filler）。逐字节走 UTF-8；非法/截断序列
+// 一律当「有内容」（保守，不把损坏输入误判成可回退）。
+inline bool pd_title_meaningful(const std::string& s) {
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) {
+            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+                return true;
+            ++i;
+            continue;
+        }
+        size_t len = 0;
+        unsigned cp = 0;
+        if      ((c & 0xE0) == 0xC0) { len = 2; cp = c & 0x1Fu; }
+        else if ((c & 0xF0) == 0xE0) { len = 3; cp = c & 0x0Fu; }
+        else if ((c & 0xF8) == 0xF0) { len = 4; cp = c & 0x07u; }
+        else return true;                         // 非法首字节
+        if (i + len > s.size()) return true;      // 截断序列
+        bool ok = true;
+        for (size_t k = 1; k < len; ++k) {
+            const unsigned char cc = (unsigned char)s[i + k];
+            if ((cc & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        if (!ok) return true;                     // 非法续字节
+        if (!pd_cp_is_filler(cp)) return true;
+        i += len;
+    }
+    return false;
+}
+
+// 兜底标题的扩展名处理：parse_filename 的约定入参是 stem（文件头），但上层偶尔
+// 会把带扩展名的整名递进来；缺陷 2 要求兜底标题为「原名去扩展名」，故只对常见
+// 音频扩展名做一次大小写不敏感剥离。stem 不带扩展名时逐字节原样返回。
+inline std::string pd_strip_audio_ext(const std::string& s) {
+    static const char* const kExts[] = {
+        ".flac", ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".dsf", ".dff",
+        ".aiff", ".aif", ".wv", ".ape", ".wma", ".mp4", ".mka", ".webm",
+    };
+    const std::string low = pd_lower_ascii(s);
+    for (const char* e : kExts) {
+        const std::string ext(e);
+        if (low.size() > ext.size() &&
+            low.compare(low.size() - ext.size(), ext.size(), ext) == 0)
+            return s.substr(0, s.size() - ext.size());
+    }
+    return s;
+}
+
 } // namespace parse_detail
 
 // ---------------------------------------------------------------------------
@@ -289,7 +367,8 @@ inline ParsedName parse_from_tags(const std::string& artist, const std::string& 
 //   6) artist 段保持原样（括号里的别名/读音不拆）；
 //   7) 置信度：切分成功且 title 非空 → 0.8；有 feat/version 各 +0.05，封顶 0.9；
 //      artist 空 → 0.4（防御路径：正常 trim 后切分出空 artist 理论上不可达）；
-//      title 摘完括号/feat 后变空 → 按弱结果 0.3 处理。
+//      title 摘完括号/feat 后变空 → 按弱结果 0.3 处理；若尾部括号把 title 摘空/
+//      只剩标点，则回退成原始文件名（去扩展名）并置 trailing_only=true（缺陷 2）。
 // method 恒为 "rule"。
 inline ParsedName parse_filename(const std::string& stem) {
     ParsedName r;
@@ -297,6 +376,10 @@ inline ParsedName parse_filename(const std::string& stem) {
     namespace pd = parse_detail;
     std::string s = pd::pd_trim(stem);
     if (s.empty()) return r;                          // 空输入 → 全空 + confidence 0
+    // 缺陷 2 修复（2026-10-24）：约定入参是 stem，但上层偶尔会递进带扩展名的整名；
+    // 只剥常见音频扩展名（stem 不受影响），让 "5 [break.].flac" 也能走到下面的兜底。
+    s = pd::pd_trim(pd::pd_strip_audio_ext(s));
+    const std::string original = s;                   // 兜底用：尚未剥曲号/括号
     s = pd::pd_trim(pd::pd_strip_trackno(s));
 
     const size_t cut = s.find(" - ");
@@ -327,7 +410,7 @@ inline ParsedName parse_filename(const std::string& stem) {
     // 规则 4：version（只对 title 段）。摘出的括号组先收集，稍后统一分类
     //（缺陷 1 修复：feat 标记开头的组改摘进 feat，不再错进 version）。
     std::vector<std::string> groups;
-    pd::pd_strip_trailing_groups(r.title, &groups);
+    const bool stripped = pd::pd_strip_trailing_groups(r.title, &groups);
     r.title = pd::pd_trim(r.title);
 
     // 规则 5：feat（只对 title 段），feat 内再做括号摘除
@@ -354,6 +437,18 @@ inline ParsedName parse_filename(const std::string& stem) {
             if (!r.version.empty()) r.version += " / ";
             r.version += g;
         }
+    }
+
+    // 缺陷 2 修复（2026-10-24）：尾部括号把 title 整个吃掉时（"5 [break.]"：
+    // 剥曲号 → "[break.]" → 摘组后空；"!!! (Live)" → "!!!" 只剩符号），旧行为
+    // 返回 title="" 会被上层当成解析失败。这里回退成原始文件名（已去扩展名，曲号
+    // 与括号都保留），并置 trailing_only 让上层知道 title 只是可搜索的兜底串；
+    // confidence 压回 0.3（与「摘完变空题」同档），不再享受 feat/version 加成。
+    // 已摘出的 version/feat 保留为解析证据；trailing_only=true 时上层可整体丢弃。
+    if (stripped && !pd::pd_title_meaningful(r.title)) {
+        r.title = original;
+        r.trailing_only = true;
+        conf = 0.3f;
     }
 
     // 规则 7：加成与封顶（加成只挂在 0.8 基准上；0.3/0.4 的弱路径不加成）
