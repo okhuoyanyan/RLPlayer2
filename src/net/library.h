@@ -18,6 +18,7 @@
 #include "audio/media_info.h"
 #include "net/scan_pool.h"
 #include "meta/entities.h"
+#include "meta/cue.h"          // CUE 整轨分轨解析（仅头文件；library 侧把它变成虚拟曲目）
 #include <memory>
 #include <string>
 #include <vector>
@@ -29,6 +30,7 @@
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 
@@ -58,6 +60,19 @@ struct LibTrack {
     // 读回后不需要再判来源。只用于①防止覆盖真实标签 ②测试/调试能量出「这值从哪来」。
     bool   albumFromDir = false;
     bool   discFromDir  = false;
+
+    // ---- CUE 整轨分轨（2026-10-25 第二里程碑）----
+    // 一张 .cue 把「一个整轨音频文件」切成 N 首：**path 仍然是物理音频路径**（播放器照旧能播，
+    // 封面/搜索/播放入口都不需要改），这首在文件里的位置由 cueOff/cueLen 给出。
+    //   cuePath 非空  ⟺ 这是一条虚拟曲目（整轨被 cue 认领，不再单独出现）
+    //   cueNo         = cue 文本里的 TRACK 号（可对回原文）
+    //   cueOff/cueLen = 起点/长度，单位是**采样帧**（不是秒，也不是 1/75 帧；-1 = 未知）
+    // 落盘语义：索引 v4 起末尾 4 列就是这四个字段（见 indexTextLocked）。
+    std::string cuePath;      // 所属 .cue 的绝对路径（UTF-8）；空 = 普通（非 cue）曲目
+    int         cueNo  = 0;
+    long long   cueOff = 0;
+    long long   cueLen = 0;
+    bool isCueTrack() const { return !cuePath.empty(); }
 };
 
 struct LibAlbum {
@@ -353,6 +368,162 @@ inline bool lib_is_audio(const fsx::path& p) {
 }
 
 // ---------------------------------------------------------------------------
+// CUE 整轨分轨 —— library 侧（2026-10-25 第二里程碑）
+//
+// 场景：发烧友的「整轨 FLAC/WAV + .cue」在库里应当显示成 N 首（而不是 1 首 40 分钟的大曲目）。
+// 分工：
+//   * src/meta/cue.h        解析（文本 → 带 1/75 帧偏移的轨列表），不改；
+//   * 本节的 lib_cue_expand 纯函数（探测表 → N 条虚拟曲目），不读盘/不起进程，可逐字段断言；
+//   * Library::startScan    认领整轨（文件真的存在、探测成功、没被别的 cue 抢走）→ 整轨不再单独
+//                           入库，改成 N 条虚拟曲目；任何一步不成立都**退回整轨**（不丢歌）。
+// 判据：tests/test_cue.cpp（契约，139 条逐字段断言）+ tests/test_library.cpp 的 [5] 节（真实扫描）。
+//
+// ⚠️ 未接入（如实记录，铁律 4）：
+//   1) 播放偏移属于 tools/rtaweb.cpp（不在本条工作范围）：这里只保证库能给出 cueOff/cueLen 与
+//      lib_cue_range_sec()，播放侧还没用它来 seek；
+//   2) 实体图（entity_graph_from_library_tracks）按 path 建种子，同一整轨的 N 首 path 相同 ——
+//      这条链路的去重/归并尚未按 cue 区分；
+//   3) 多 FILE cue 的「每份文件一个时长」已支持，但同一 cue 里跨文件的曲目顺序 = FILE 出现顺序。
+// ---------------------------------------------------------------------------
+
+// 路径比较键：大小写不敏感 + '/' 统一成 '\' + 去掉尾分隔符。
+// 为什么需要：Windows 文件系统不敏感，而 cue 里的 FILE 常与磁盘真名大小写不一致
+// （tests/test_cue.cpp 用例 16：cue 写 ALBUM.WAV、磁盘是 album.wav）。
+// **只用于比较/查找，绝不拿它去打开文件**（真名要保留，否则播放侧拿到的是错的拼写）。
+inline std::string lib_path_key(const std::string& p) {
+    std::string k = p;
+    for (auto& c : k) {
+        if (c == '/') c = '\\';
+        else if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    }
+    while (!k.empty() && k.back() == '\\') k.pop_back();
+    return k;
+}
+
+// .cue 扩展名识别（大小写不敏感；".cue.txt" 不算，见 test_cue.cpp 用例 15）
+inline bool lib_is_cue(const fsx::path& p) {
+    std::string ext = u8s(p.extension().u8string());
+    for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+    return ext == ".cue";
+}
+
+// cue 的 FILE 指向的音频**此刻是否真的在磁盘上**。
+// 为什么必须真 stat：只用扩展名/文本会把「整轨已删除、只剩 cue」也认领走，于是 cue 里的 N 首
+// 变成 N 条打不开的幽灵曲目（而整轨本来也不会出现）——这正是「丢歌」的形态。
+inline bool lib_cue_audio_exists(const std::string& p) {
+    if (p.empty() || !lib_valid_utf8(p)) return false;
+    std::error_code ec;
+    try {
+        const fsx::path wp = p8(p);
+        if (!fsx::is_regular_file(wp, ec)) return false;
+        return lib_is_audio(wp);
+    } catch (const std::exception&) { return false; }
+}
+
+// 纯函数：一份已解析的 cue + 物理文件探测表 → N 条虚拟曲目。
+//   * 不读盘、不起进程（判据可复现：test_cue.cpp 用构造的 probes 断言**具体采样数**）。
+//   * probes 的键是物理文件路径，大小写/分隔符不敏感；值里的 path 应当是**磁盘真名**。
+//   * 文件没探测到（不存在）⟹ 只跳过那份文件的轨，其余照常展开（降级，不丢歌）。
+//   * 长度 = 下一轨起点 - 本轨起点；每份文件的末轨 = 文件总时长 - 本轨起点
+//     （所以要 ffprobe 的 format duration；拿不到就如实标 -1 / 0，不编数字）。
+//   * 采样率未知（ffprobe 失败）⟹ cueOff = -1，时长退回 cue 自带的 1/75 帧差值。
+//   * 专辑级 trackNo 连续 1..N（跨文件也不重复），cueNo 保留 cue 里的原始 TRACK 号。
+inline std::vector<LibTrack> lib_cue_expand(const rta::meta::CueSheet& sh,
+                                            const std::map<std::string, LibTrack>& probes) {
+    std::vector<LibTrack> out;
+    if (sh.tracks.empty() || probes.empty()) return out;
+
+    std::map<std::string, const LibTrack*> probeByKey;
+    for (const auto& kv : probes) probeByKey[lib_path_key(kv.first)] = &kv.second;
+
+    // 按 FILE 分组（保持 cue 里的出现顺序 —— 跨文件 trackNo 要连续）；组内按 INDEX 01 升序
+    std::vector<std::string> fileOrder;
+    std::map<std::string, std::vector<const rta::meta::CueTrack*>> byFile;
+    for (const auto& ct : sh.tracks) {
+        if (!ct.audio || ct.index1 < 0) continue;          // 数据轨 / 没有 INDEX 的轨不产生曲目
+        const std::string k = lib_path_key(ct.file);
+        if (byFile.find(k) == byFile.end()) fileOrder.push_back(k);
+        byFile[k].push_back(&ct);
+    }
+
+    // 专辑艺术家：全局 PERFORMER 优先；只有轨级 PERFORMER 的 cue 取第一条非空的，
+    // 否则 albumVecLocked 会退化成 t.artist ⟹ 每首各自成一张专辑（一张 12 轨的专辑变 12 张）。
+    std::string albArtist = sh.performer;
+    if (albArtist.empty()) {
+        for (const auto& ct : sh.tracks)
+            if (ct.audio && !ct.performer.empty()) { albArtist = ct.performer; break; }
+    }
+    const int year = atoi(sh.date.c_str());
+
+    for (const auto& fk : fileOrder) {
+        auto pit = probeByKey.find(fk);
+        if (pit == probeByKey.end()) continue;             // 该文件不存在/没探测到 → 跳过（降级）
+        const LibTrack& probe = *pit->second;
+        std::vector<const rta::meta::CueTrack*> trs = byFile[fk];
+        std::stable_sort(trs.begin(), trs.end(),
+                         [](const rta::meta::CueTrack* a, const rta::meta::CueTrack* b) {
+                             return a->index1 < b->index1;
+                         });
+        const int sr = probe.sampleRate;
+        for (size_t i = 0; i < trs.size(); ++i) {
+            const rta::meta::CueTrack& ct = *trs[i];
+            LibTrack t = probe;                            // 采样率/位深/声道/封面/mtime/size 透传
+            t.path = probe.path.empty() ? ct.file : probe.path;   // 用磁盘真名，不用 cue 里的拼写
+            // ---- 曲名：TITLE → 轨 PERFORMER → 「文件名 #NN」 ----
+            t.title = ct.title;
+            if (t.title.empty()) t.title = ct.performer;
+            if (t.title.empty()) {
+                std::string stem = u8s(p8(ct.file).stem().u8string());
+                if (stem.empty()) stem = ct.file;
+                char b[32];
+                std::snprintf(b, sizeof(b), " #%02d", ct.number);
+                t.title = stem + b;
+            }
+            t.artist      = ct.performer.empty() ? albArtist : ct.performer;
+            t.album       = sh.albumTitle.empty() ? ct.albumTitle : sh.albumTitle;
+            t.albumArtist = albArtist;
+            t.genre       = sh.genre;
+            t.year        = year;
+            t.trackNo     = (int)out.size() + 1;           // 专辑内连续 1..N
+            t.discNo      = 0;
+            t.cuePath     = sh.cuePath;
+            t.cueNo       = ct.number;
+            t.cueOff      = rta::meta::cue_frames_to_samples(ct.index1, sr);
+            // ---- 长度：下一轨起点（同文件）或 文件总时长 - 本轨起点 ----
+            long long lenSamples = -1;
+            if (t.cueOff >= 0) {
+                long long endSamples = -1;
+                if (i + 1 < trs.size())
+                    endSamples = rta::meta::cue_frames_to_samples(trs[i + 1]->index1, sr);
+                else if (probe.duration > 0.0)
+                    endSamples = (long long)std::llround(probe.duration * (double)sr);
+                if (endSamples >= t.cueOff) lenSamples = endSamples - t.cueOff;
+            }
+            t.cueLen = lenSamples;
+            // ---- 时长：与播放侧同一口径（采样数）；采样率未知才退回 cue 的帧差值 ----
+            if (t.cueLen >= 0 && sr > 0) t.duration = (double)t.cueLen / (double)sr;
+            else if (i + 1 < trs.size())  t.duration = rta::meta::cue_frames_to_sec(trs[i + 1]->index1 - ct.index1);
+            else if (probe.duration > 0.0) {
+                t.duration = probe.duration - (double)ct.index1 / 75.0;
+                if (t.duration < 0.0) t.duration = 0.0;
+            } else t.duration = 0.0;
+            out.push_back(std::move(t));
+        }
+    }
+    return out;
+}
+
+// 虚拟曲目在整轨里的播放区间（秒）。返回 false ⟹ 播放侧应退回整轨（头尾未知就别假装知道）。
+inline bool lib_cue_range_sec(const LibTrack& t, double& startSec, double& endSec) {
+    startSec = 0.0;
+    endSec   = 0.0;
+    if (!t.isCueTrack() || t.cueOff < 0 || t.cueLen <= 0 || t.sampleRate <= 0) return false;
+    startSec = (double)t.cueOff / (double)t.sampleRate;
+    endSec   = (double)(t.cueOff + t.cueLen) / (double)t.sampleRate;
+    return endSec > startSec;
+}
+
+// ---------------------------------------------------------------------------
 // 目录结构判据 → 扫描入库回填（2026-10-25）
 //
 // 背景（真机实测）：albumVecLocked() 在**读时**用 entity_find_album_dir_for_track() 纠正专辑名/碟号，
@@ -642,8 +813,12 @@ inline void Library::load() {
     // 2026-10-23：索引格式版本校验。旧索引（无 #libIndexV 或版本不符）直接丢弃，
     // 本次扫描会全量重建 —— 否则升级后「扫描逻辑改了但旧索引被复用」，修复永远不生效。
     // 代价：升级后首次启动会全量扫一遍（653 首约 10 秒，并行 8 线程），之后照旧增量。
+    // v4 = 2026-10-25 起「CUE 虚拟分轨」：末尾追加 cue / cueN / cueOff / cueLen 四列。
+    // 为什么版本不符要整份丢弃：v3 索引里那些 40 分钟的"整轨曲目"如果被复用，cue 永远不会生效
+    // （增量扫描按 mtime+size 复用旧记录，而 cue 文件本身不在旧记录里）。代价：升级后首次启动
+    // 全量扫一遍（653 首约 10 秒）。
     {
-        const bool fresh = (idx.find("#libIndexV\t3") != std::string::npos);
+        const bool fresh = (idx.find("#libIndexV\t4") != std::string::npos);
         if (!fresh && !idx.empty()) idx.clear();
     }
     std::vector<LibTrack> loaded;
@@ -675,6 +850,13 @@ inline void Library::load() {
                         t.duration    = atof(f[13].c_str());
                         t.hasCover    = atoi(f[14].c_str());
                         t.genre       = f[15];
+                        // v4 追加列（v3 只有 16 列；前 16 列的读取路径与 v3 逐字相同）
+                        if (f.size() >= 20) {
+                            t.cuePath = f[16];
+                            t.cueNo   = atoi(f[17].c_str());
+                            t.cueOff  = _strtoi64(f[18].c_str(), nullptr, 10);
+                            t.cueLen  = _strtoi64(f[19].c_str(), nullptr, 10);
+                        }
                         if (!t.path.empty()) loaded.push_back(t);
                     }
                 }
@@ -730,8 +912,12 @@ inline std::string Library::indexTextLocked() const {
     // 索引格式版本：改动「扫描产出字段」时必须 +1，否则旧索引会因为 mtime+size 未变而被整份复用，
     // 新逻辑永远不生效（2026-10-23 真机踩到：加了内嵌封面判定，用户那首 cv 仍是 false）。
     // v2 = 2026-10-23 起 hasCover 同时覆盖「内嵌封面流」与「同目录封面文件」。
-    s += "#libIndexV\t3\n";   // v3 = 2026-10-23 起「音频流字段不再被封面流覆盖」(24-bit 不再变 8)
-    s += "#path\tmtime\tsize\talbum\talbumArtist\tartist\ttitle\ttrack\tdisc\tyear\tsr\tbits\tch\tdur\thasCover\tgenre\n";
+    // v3 = 2026-10-23 起「音频流字段不再被封面流覆盖」(24-bit 不再变 8)
+    // v4 = 2026-10-25 起 CUE 虚拟分轨：**前 16 列逐字不变**，末尾追加 cue / cueN / cueOff / cueLen。
+    //      为什么追加而不是插列：老读取路径（含用户手里 v3 索引）只看前 16 列，列序不动才不会串列。
+    s += "#libIndexV\t4\n";
+    s += "#path\tmtime\tsize\talbum\talbumArtist\tartist\ttitle\ttrack\tdisc\tyear\tsr\tbits\tch\tdur\thasCover\tgenre"
+         "\tcue\tcueN\tcueOff\tcueLen\n";
     char buf[256];
     for (auto& t : tracks_) {
         s += lib_clean_field(t.path); s += '\t';
@@ -743,8 +929,10 @@ inline std::string Library::indexTextLocked() const {
         std::snprintf(buf, sizeof(buf), "%d\t%d\t%d\t%d\t%d\t%d\t%.3f\t%d\t", t.trackNo, t.discNo, t.year,
                       t.sampleRate, t.bits, t.channels, t.duration, t.hasCover);
         s += buf;
-        s += lib_clean_field(t.genre);
-        s += '\n';
+        s += lib_clean_field(t.genre);     s += '\t';
+        s += lib_clean_field(t.cuePath);   s += '\t';
+        std::snprintf(buf, sizeof(buf), "%d\t%lld\t%lld\n", t.cueNo, t.cueOff, t.cueLen);
+        s += buf;
     }
     return s;
 }
@@ -926,6 +1114,7 @@ inline void Library::startScan(bool forceFull) {
 
         std::vector<LibTrack> fresh;
         std::vector<std::string> walked;
+        std::vector<std::string> cueWalked;  // 单独的 .cue 收集（见下方「CUE 认领判定」）
         std::vector<std::string> badRoots;   // 打不开的根（含所有含非 ASCII 的旧版本症状）
         std::error_code ec;
         size_t seen = 0;
@@ -951,6 +1140,10 @@ inline void Library::startScan(bool forceFull) {
                 if (lib_is_audio(ep)) {
                     walked.push_back(u8s(ep.u8string()));
                     total_.store((int)walked.size());
+                } else if (lib_is_cue(ep)) {
+                    // .cue 不是音频，不进 walked（否则会被当成曲目去 ffprobe）；
+                    // 它只用来「认领整轨」，展开出的虚拟曲目在探测之后追加。
+                    cueWalked.push_back(u8s(ep.u8string()));
                 }
                 // ---- 分片让出（261025-01 一.1：大库扫描不能把机器/界面拖死）----
                 // 每 200 个目录项让出一次时间片，并且每 150ms 汇报一次「已发现多少首」，
@@ -971,7 +1164,9 @@ inline void Library::startScan(bool forceFull) {
 
         const int n = (int)walked.size();
         total_.store(n);
-        if (n == 0) {
+        // 只有 cue、没有任何可遍历音频（例如整轨在库根之外）时不能走"0 首"分支：
+        // 那条分支会清空索引，而 cue 认领的整轨恰恰不在 walked 里。
+        if (n == 0 && cueWalked.empty()) {
             const auto tEnd = std::chrono::steady_clock::now();
             const double durMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
             // ★ 2026-10-25 防"库被清空"：旧实现在 n==0 时无条件 tracks_.clear() —— 而"n==0"有两个
@@ -1012,6 +1207,56 @@ inline void Library::startScan(bool forceFull) {
             return;
         }
 
+        // =====================================================================
+        // CUE 认领判定（在 ffprobe 探测之前做：解析只是读几个 KB 的文本，很便宜）
+        //
+        // 认领条件（缺一条就**退回整轨**，绝不因为 cue 写错而丢歌）：
+        //   ① cue 能解析出 >=1 条「AUDIO 且带 INDEX 01」的轨；
+        //   ② 这些轨的 FILE 指向的音频**真实存在**（按大小写归一 key 与遍历结果对齐，路径取磁盘真名）；
+        //   ③ 该文件没被别的 cue 先认领（两张 cue 指同一整轨时先到先得，后者退回整轨）；
+        //   ④ 探测成功（拿得到采样率）—— 见下面的 finalize：否则整轨会变成 N 首「偏移未知」的
+        //      幽灵曲目（每首都从文件头开始播），比整轨更难用。
+        // 认领成功的文件不再单独入库，改由 lib_cue_expand 展开成 N 条虚拟曲目。
+        // =====================================================================
+        struct CueJob {
+            std::string cuePath;
+            rta::meta::CueSheet sh;
+            std::map<std::string, LibTrack> slots;   // key = lib_path_key(FILE 路径)，value.path = 磁盘真名
+        };
+        std::vector<CueJob> cueJobs;
+        std::unordered_map<std::string, char> cueCand;   // 候选认领（决定哪些文件必须**重探**）
+        if (!cueWalked.empty()) {
+            std::unordered_map<std::string, std::string> walkedByKey;   // 归一 key → 磁盘真名
+            walkedByKey.reserve(walked.size() * 2 + 8);
+            for (const auto& w : walked) walkedByKey.emplace(lib_path_key(w), w);
+            std::sort(cueWalked.begin(), cueWalked.end());   // 稳定：抢同一整轨时结果每次一致
+            for (const auto& cf : cueWalked) {
+                if (cancel_.load()) break;
+                CueJob job;
+                job.cuePath = cf;
+                job.sh = rta::meta::cue_parse_file(cf);
+                if (job.sh.tracks.empty()) continue;         // 解析失败/全坏轨 → 整轨照旧（不丢歌）
+                for (const auto& ct : job.sh.tracks) {
+                    if (!ct.audio || ct.index1 < 0) continue;
+                    const std::string k = lib_path_key(ct.file);
+                    if (cueCand.count(k) || job.slots.count(k)) continue;
+                    auto wit = walkedByKey.find(k);
+                    const std::string real = (wit != walkedByKey.end()) ? wit->second : ct.file;
+                    // 不在遍历结果里时仍要 stat：整轨可能就在库根之外（cue 在库内）
+                    if (wit == walkedByKey.end() && !lib_cue_audio_exists(real)) continue;
+                    LibTrack slot;
+                    slot.path = real;
+                    job.slots.emplace(k, std::move(slot));
+                    cueCand[k] = 1;
+                }
+                if (!job.slots.empty()) cueJobs.push_back(std::move(job));
+            }
+        }
+        // 探测结果回填表：认领文件在并行池里**强制重探**（不能复用 mtime+size 缓存 ——
+        // 上次 ffprobe 失败时 duration=0，复用会让末轨永远 0 秒），探到后在这里共享给 cue 展开。
+        std::mutex cueProbeMtx;
+        std::map<std::string, LibTrack> cueProbeMap;
+
         fresh.resize((size_t)n);
         std::atomic<int> completed{0};
         std::atomic<int> probedCount{0};
@@ -1032,7 +1277,8 @@ inline void Library::startScan(bool forceFull) {
         for (int i = 0; i < n; ++i) {
             if (cancel_.load()) break;
             const bool submitted = pool->submit([this, i, n, &walked, &oldByPath, &old, forceFull, &ffprobe,
-                                                 &fresh, &completed, &probedCount, &cachedCount, &dirMemo, &lastMsg]() {
+                                                 &fresh, &completed, &probedCount, &cachedCount, &dirMemo, &lastMsg,
+                                                 &cueCand, &cueProbeMtx, &cueProbeMap]() {
                 if (cancel_.load()) return;
                 const std::string& p = walked[(size_t)i];
                 long long mt = 0, sz = 0;
@@ -1044,10 +1290,16 @@ inline void Library::startScan(bool forceFull) {
                     auto s = fsx::file_size(wp, e2);
                     if (!e2) sz = (long long)s;
                 }
+                const std::string pkey = lib_path_key(p);
+                const bool cueOwned = (cueCand.count(pkey) != 0);
                 auto oit = oldByPath.find(p);
-                if (!forceFull && oit != oldByPath.end()) {
+                // ★ cue 认领的文件**每次扫描都重探**（cueOwned）：末轨长度要用文件总时长，而
+                //   mtime+size 只证明"文件没变"，不证明"上次探测成功"。
+                // ★ 缓存候选里排除 cue 虚拟曲目（isCueTrack）：否则删掉 .cue 后，整轨会命中
+                //   旧索引里那条"末轨虚拟曲目"的记录，结果库里只剩 1 首且歌名是 cue 的第 N 轨。
+                if (!forceFull && !cueOwned && oit != oldByPath.end()) {
                     const LibTrack& o = old[oit->second];
-                    if (o.mtime == mt && o.size == sz) {
+                    if (!o.isCueTrack() && o.mtime == mt && o.size == sz) {
                         // 复用旧记录，但仍要过一遍目录回填：老代码写的索引版本头也是 v3，但 album 列空、
                         // disc 列恒 0；这里就地补上 → 增量扫描也能自愈，不必靠升 #libIndexV 把用户的整份索引作废。
                         // 已有真实标签值的记录不会被改（lib_fill_album_disc_from_dir 只填空字段）。
@@ -1071,6 +1323,10 @@ inline void Library::startScan(bool forceFull) {
                 //   与 albumVecLocked 的读时纠正用同一份判据（entity_find_album_dir_for_track），
                 //   所以专辑键/曲目顺序都不变，只是落盘数据与 /api/lib/album 的 d 字段变成如实值。
                 lib_fill_album_disc_from_dir(t, &dirMemo);
+                if (cueOwned) {   // 把这次强制重探的结果交给 cue 展开（见下方 finalize）
+                    std::lock_guard<std::mutex> lk(cueProbeMtx);
+                    cueProbeMap[pkey] = t;
+                }
                 fresh[(size_t)i] = std::move(t);
                 probedCount.fetch_add(1, std::memory_order_relaxed);
                 const int c = completed.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1100,6 +1356,53 @@ inline void Library::startScan(bool forceFull) {
             return;
         }
 
+        // ---- CUE 展开（整轨 → N 条虚拟曲目）----
+        // 认领成功的整轨不再单独入库；任何一份 cue 失败都只是"它自己的整轨照旧"，不牵连别的。
+        std::vector<LibTrack> cueTracks;
+        std::unordered_map<std::string, char> cueClaimed;   // 最终认领（整轨从 fresh 里摘掉）
+        int cueOk = 0, cueLost = 0;
+        for (auto& job : cueJobs) {
+            std::map<std::string, LibTrack> probes;
+            for (auto& kv : job.slots) {
+                LibTrack pr;
+                auto pit = cueProbeMap.find(kv.first);
+                if (pit != cueProbeMap.end()) pr = pit->second;
+                else {
+                    // 没被遍历到（整轨在库根之外）或 n==0：这里补一次探测
+                    pr = lib_probe_one(kv.second.path, ffprobe);
+                    if (pr.path.empty()) pr.path = kv.second.path;
+                    std::error_code e2;
+                    const fsx::path wp = p8(kv.second.path);
+                    auto ft = fsx::last_write_time(wp, e2);
+                    if (!e2) pr.mtime = (long long)ft.time_since_epoch().count();
+                    auto fsz = fsx::file_size(wp, e2);
+                    if (!e2) pr.size = (long long)fsz;
+                }
+                if (pr.sampleRate <= 0) continue;    // 探测失败 → 该文件退回整轨（不产生幽灵曲目）
+                probes.emplace(kv.first, std::move(pr));
+            }
+            if (probes.empty()) { ++cueLost; continue; }
+            std::vector<LibTrack> vt = lib_cue_expand(job.sh, probes);
+            if (vt.empty()) { ++cueLost; continue; }
+            for (const auto& kv : probes) cueClaimed[kv.first] = 1;
+            for (auto& t : vt) {
+                lib_fill_album_disc_from_dir(t, &dirMemo);   // 与物理曲目同一份判据（只填空字段）
+                cueTracks.push_back(std::move(t));
+            }
+            ++cueOk;
+        }
+        if (!cueTracks.empty()) {
+            std::vector<LibTrack> kept;
+            kept.reserve(fresh.size() + cueTracks.size());
+            for (auto& t : fresh) {
+                if (t.path.empty()) continue;                          // 未探测的槽（cue 认领/取消）
+                if (cueClaimed.count(lib_path_key(t.path))) continue;   // 认领的整轨不再单独出现
+                kept.push_back(std::move(t));
+            }
+            for (auto& t : cueTracks) kept.push_back(std::move(t));
+            fresh.swap(kept);
+        }
+
         const auto tEnd = std::chrono::steady_clock::now();
         const double durMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
 
@@ -1113,6 +1416,9 @@ inline void Library::startScan(bool forceFull) {
             }();
             for (auto& o : old) {
                 if (freshByPath.count(o.path)) continue;
+                // 已被本次 cue 认领的整轨：它的曲目已经由 lib_cue_expand 重新展开，
+                // 再从旧索引里搬一条（整轨或旧虚拟曲目）回来就是重复。
+                if (cueClaimed.count(lib_path_key(o.path))) continue;
                 for (auto& br : badRoots)
                     if (lib_path_under(o.path, br)) { fresh.push_back(o); break; }
             }
@@ -1142,6 +1448,9 @@ inline void Library::startScan(bool forceFull) {
                 m += "；" + std::to_string(badRoots.size()) + " 个根目录无法访问（已保留其下旧记录）";
             const int gone = removedMissing_.load();
             if (gone > 0) m += "；已剔除 " + std::to_string(gone) + " 条不存在的文件";
+            if (!cueWalked.empty())
+                m += "；CUE 展开 " + std::to_string(cueOk) + " 张/" + std::to_string(cueTracks.size()) +
+                     " 首" + (cueLost > 0 ? "（" + std::to_string(cueLost) + " 张退回整轨）" : "");
             scanMsg_ = m;
         }
         scanning_.store(false);
