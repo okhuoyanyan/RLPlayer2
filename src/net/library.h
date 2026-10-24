@@ -53,6 +53,11 @@ struct LibTrack {
     double duration = 0;
     long long mtime = 0, size = 0;
     int    hasCover = 0;
+    // 来源标记（2026-10-25）：album / discNo 是不是「目录结构判据回填」的（= 该字段没有真实标签）。
+    // 不落盘、也不占索引列（列数/顺序必须与老索引一致）：落盘值本身就是「真实标签优先」的结果，
+    // 读回后不需要再判来源。只用于①防止覆盖真实标签 ②测试/调试能量出「这值从哪来」。
+    bool   albumFromDir = false;
+    bool   discFromDir  = false;
 };
 
 struct LibAlbum {
@@ -232,6 +237,71 @@ inline bool lib_is_audio(const fsx::path& p) {
                                   ".aif", ".aiff", ".aifc", ".caf", ".mka", ".mpc" };
     for (auto* x : kExt) if (ext == x) return true;
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// 目录结构判据 → 扫描入库回填（2026-10-25）
+//
+// 背景（真机实测）：albumVecLocked() 在**读时**用 entity_find_album_dir_for_track() 纠正专辑名/碟号，
+// 所以 UI 看起来是对的；但那只改了一个局部变量 —— 落盘的 rlplayer-index.tsv 里 album 列仍为空、
+// disc 列恒 0，/api/lib/album 的曲目对象 d 也恒 0。读时纠正治不了「落盘数据与接口字段不说实话」。
+//
+// 这里把**同一份判据**挪到扫描入库处（ffprobe 探测之后）执行一次，结果写进 LibTrack：
+//   * 真实标签优先：t.album 非空不写 album；t.discNo > 0 不写碟号。回填过的字段打 *FromDir 标记。
+//   * 专辑名的取法与 albumVecLocked 逐字一致（先 entity_parse_album_circle 拆「专辑 @ 社团」），
+//     否则落盘名 ≠ 读时推算名 → 专辑键（albumArtist \x1f album 的 FNV）会变，老链接/缓存全失效。
+//   * 索引列数/顺序不变（不加列）：落盘值已按「真实标签优先」定好，读回后无需再判来源。
+//     代价：目录**改名**后要等下一次全量扫描（/api/lib/scan?full=1）才会刷新 —— 增量扫描只按
+//     mtime+size 复用旧记录，见 startScan 里的缓存分支（那里对「album 空 / disc 0」的老记录会自愈）。
+// ---------------------------------------------------------------------------
+
+// 判据给一首曲目推出的专辑名与碟号（只依赖父目录，故同一目录的结果必然相同）
+struct LibDirAlbum {
+    std::string album;      // 已拆过「专辑 @ 社团」的专辑名（与 albumVecLocked 的 aName 同源同算法）
+    int  disc = 0;          // 目录推断的碟号（0 = 没推断出来）
+    bool fromDir = false;   // true = 命中真实专辑目录；false = 只有父目录名兜底（判据没命中）
+};
+
+inline LibDirAlbum lib_dir_album_for(const std::string& trackPath) {
+    LibDirAlbum r;
+    int inferredDisc = 0;
+    const fsx::path albDir = rta::meta::entity_find_album_dir_for_track(p8(trackPath), &inferredDisc);
+    if (!albDir.empty()) {
+        const std::string dn = u8s(albDir.filename().u8string());
+        std::string a, c;
+        rta::meta::entity_parse_album_circle(dn, a, c);
+        r.album   = a.empty() ? dn : a;
+        r.disc    = inferredDisc > 0 ? inferredDisc : 0;
+        r.fromDir = true;
+        return r;
+    }
+    // 兜底与 albumVecLocked 同源：判据没命中时用父目录名（那里也是这么做的），保证读时/写时同名同键。
+    const std::string dn = u8s(p8(trackPath).parent_path().filename().u8string());
+    r.album = dn.empty() ? std::string("未知专辑") : dn;
+    return r;
+}
+
+// 按父目录 memo 推断结果：并行扫描时同一目录会被多个线程问到，目录扫描（stat）不必重复做。
+// 键 = 父目录绝对路径（判据只依赖它），不是曲目路径。
+struct LibDirAlbumMemo {
+    std::mutex mtx;
+    std::unordered_map<std::string, LibDirAlbum> m;
+    LibDirAlbum get(const std::string& parentDir, const std::string& trackPath) {
+        { std::lock_guard<std::mutex> lk(mtx); auto it = m.find(parentDir); if (it != m.end()) return it->second; }
+        LibDirAlbum r = lib_dir_album_for(trackPath);
+        std::lock_guard<std::mutex> lk(mtx);
+        if (m.size() < 65536) m.emplace(parentDir, r);
+        return r;
+    }
+};
+
+// 把目录判据回填进一首曲目：真实标签优先，已有的字段绝不被覆盖。
+inline void lib_fill_album_disc_from_dir(LibTrack& t, LibDirAlbumMemo* memo = nullptr) {
+    if (!t.album.empty() && t.discNo > 0) return;          // 两样都有真实标签 → 连目录都不用看
+    const std::string pdir = u8s(p8(t.path).parent_path().u8string());
+    const LibDirAlbum da = memo ? memo->get(pdir, t.path) : lib_dir_album_for(t.path);
+    if (t.album.empty() && !da.album.empty()) { t.album = da.album; t.albumFromDir = true; }
+    if (t.discNo <= 0 && da.disc > 0)         { t.discNo = da.disc; t.discFromDir = true; }
 }
 
 // 一次 ffprobe 取全部信息（比 media_info.h 的两次调用快一倍）
@@ -689,10 +759,13 @@ inline void Library::startScan(bool forceFull) {
             activePool_ = pool;
         }
 
+        // 目录结构判据的按目录 memo（见 lib_dir_album_for / LibDirAlbumMemo 的注释）
+        LibDirAlbumMemo dirMemo;
+
         for (int i = 0; i < n; ++i) {
             if (cancel_.load()) break;
             const bool submitted = pool->submit([this, i, n, &walked, &oldByPath, &old, forceFull, &ffprobe,
-                                                 &fresh, &completed, &probedCount, &cachedCount]() {
+                                                 &fresh, &completed, &probedCount, &cachedCount, &dirMemo]() {
                 if (cancel_.load()) return;
                 const std::string& p = walked[(size_t)i];
                 long long mt = 0, sz = 0;
@@ -708,7 +781,12 @@ inline void Library::startScan(bool forceFull) {
                 if (!forceFull && oit != oldByPath.end()) {
                     const LibTrack& o = old[oit->second];
                     if (o.mtime == mt && o.size == sz) {
-                        fresh[(size_t)i] = o;
+                        // 复用旧记录，但仍要过一遍目录回填：老代码写的索引版本头也是 v3，但 album 列空、
+                        // disc 列恒 0；这里就地补上 → 增量扫描也能自愈，不必靠升 #libIndexV 把用户的整份索引作废。
+                        // 已有真实标签值的记录不会被改（lib_fill_album_disc_from_dir 只填空字段）。
+                        LibTrack t2 = o;
+                        lib_fill_album_disc_from_dir(t2, &dirMemo);
+                        fresh[(size_t)i] = std::move(t2);
                         cachedCount.fetch_add(1, std::memory_order_relaxed);
                         const int c = completed.fetch_add(1, std::memory_order_relaxed) + 1;
                         scanned_.store(c);
@@ -722,6 +800,10 @@ inline void Library::startScan(bool forceFull) {
                     std::string sn = u8s(p8(p).stem().u8string());
                     t.title = sn.empty() ? p : sn;
                 }
+                // ★ 目录结构判据回填（ffprobe 探测之后、落盘之前）：真实标签优先，只填空字段。
+                //   与 albumVecLocked 的读时纠正用同一份判据（entity_find_album_dir_for_track），
+                //   所以专辑键/曲目顺序都不变，只是落盘数据与 /api/lib/album 的 d 字段变成如实值。
+                lib_fill_album_disc_from_dir(t, &dirMemo);
                 fresh[(size_t)i] = std::move(t);
                 probedCount.fetch_add(1, std::memory_order_relaxed);
                 const int c = completed.fetch_add(1, std::memory_order_relaxed) + 1;
