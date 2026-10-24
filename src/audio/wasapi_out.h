@@ -148,6 +148,98 @@ struct WriteDetail {
     long long gbHr = -999;   // IAudioRenderClient::GetBuffer 的 HRESULT（-999 = 本次未调用）
 };
 
+// =====================================================================================
+// 独占容器的样本装箱（2026-10-25，外部评审 P0-A：容器/有效位错配 → 电平 −48 dBFS）
+// =====================================================================================
+// 现场形态（容器由 open() 的『格式阶梯』决定，任一组合 Initialize 成功即采用该档）：
+//   请求 bits=16 → 驱动拒收 PCM16 时落到 **EXT32/32 float**（本机 TASCAM 实测如此）
+//   请求 bits=24 → 可能落到 EXT32容器/24有效 或 EXT32/32 int
+// 旧 pack() 把「容器」当成了「请求位深」：float32 分支硬编码 k = 1/8388608（24-bit 定标），
+// int32 分支原样搬 src[i]（24-in-32 本该左移 8 位对齐到容器有效位）。于是只要两者不一致：
+//   16-bit → float32：满幅 32767/8388608 = 1/256 ⟹ **−48.16 dBFS**（能放，但极小声）
+//   24-bit → 32 int ：写在容器低 24 位，驱动按高 24 位解释 ⟹ 同样 −48 dBFS + 末 8 位截断
+//   32-bit → float32：同为 −48.16 dBFS
+// 内部所有判据（peak/clip/isp 都按请求位深归一化）全部显示正常 —— 与 2026-10-23 共享路径
+// 那个 −48 dB 的坑是同一形态（判据掩盖缺陷，铁律 3）。
+//
+// 正确口径（与共享路径 wasapi_shared.h: put_shared_sample / shared_pack_int32 完全一致）：
+//   1) 管线 int32 按【请求位深 srcBits】右对齐 ⟹ 归一化 x = v / 2^(srcBits−1)，乘增益后钳到 ±1
+//   2) 按【实际容器】(字节数 / 有效位 / 是否 float) 量化：float32 直接用 x；整型容器量化到
+//      容器有效位后**左对齐**到容器字节宽度（24-in-32 的低 8 位恒 0）
+//
+// 为什么没有直接 include wasapi_shared.h 复用那几个函数：依赖方向是反的
+// （wasapi_shared.h:65 包含本文件，为了复用 hr_name / 端点定位；反过来包含会形成循环，
+//  两种 include 顺序里必有一种看不到对方）。因此这里保留**唯一一份**表驱动实现，
+// 并由 tests/test_wasapi_shared.cpp §1.3c 与共享路径【逐字节对照】——任一侧改了口径，
+// 交叉断言立刻失败，不存在"两份实现悄悄漂移"的空间。
+struct ExContainer {
+    int  bytes   = 4;      // 每样本容器字节数（2 / 3 / 4）
+    int  valid   = 32;     // 容器内有效位（16 / 24 / 32）
+    bool isFloat = false;  // 容器是 IEEE float32
+};
+
+// 与 open() 的格式阶梯一一对应：PCM16 / 紧凑24 / EXT32-24有效 / EXT32-32int / EXT32-32float
+inline bool ex_container_known(const ExContainer& c) {
+    if (c.isFloat) return c.bytes == 4;
+    if (c.bytes == 2) return c.valid == 16;
+    if (c.bytes == 3) return c.valid == 24;
+    if (c.bytes == 4) return c.valid == 24 || c.valid == 32;
+    return false;
+}
+
+// 管线 int32（按 srcBits 右对齐）× 增益 → 归一化 double（钳到 ±1.0；非有限值 → 0）
+inline double ex_normalize(int32_t v, int srcBits, double gain) {
+    double x = (srcBits <= 0 || srcBits >= 32) ? (double)v / 2147483648.0
+                                              : (double)v / (double)(1LL << (srcBits - 1));
+    x *= gain;
+    if (!std::isfinite(x)) return 0.0;
+    if (x >  1.0) return  1.0;
+    if (x < -1.0) return -1.0;
+    return x;
+}
+
+// 归一化 → bits 位有符号整型（四舍五入远离零；饱和到 [−2^(bits−1), 2^(bits−1)−1]）
+inline int32_t ex_to_bits(double x, int bits) {
+    if (bits <= 0 || bits > 32) return 0;
+    if (!std::isfinite(x)) return 0;
+    if (x >  1.0) x =  1.0;
+    if (x < -1.0) x = -1.0;
+    const double lim = std::ldexp(1.0, bits - 1);
+    double v = x * lim;
+    v = (v >= 0.0) ? std::floor(v + 0.5) : std::ceil(v - 0.5);
+    if (v >  lim - 1.0) v =  lim - 1.0;
+    if (v < -lim)       v = -lim;
+    return (int32_t)v;
+}
+
+// 单样本写出（小端）；返回写入字节数（0 = 容器未知/空指针，调用方已在 open 拒绝）
+inline int ex_put_sample(const ExContainer& c, double x, unsigned char* dst) {
+    if (!dst || !ex_container_known(c)) return 0;
+    if (c.isFloat) {
+        const float f = (float)x;              // x 已在 ±1.0 内
+        std::memcpy(dst, &f, sizeof(f));
+        return 4;
+    }
+    int32_t v = 0;
+    if (c.bytes == 2)       v = ex_to_bits(x, 16);
+    else if (c.bytes == 3)  v = ex_to_bits(x, 24);
+    else if (c.valid == 24) v = (int32_t)((int64_t)ex_to_bits(x, 24) * 256);   // 24-in-32：左对齐，低 8 位补零
+    else                    v = ex_to_bits(x, 32);
+    const uint32_t u = (uint32_t)v;
+    for (int i = 0; i < c.bytes; ++i) dst[i] = (unsigned char)((u >> (8 * i)) & 0xFFu);
+    return c.bytes;
+}
+
+// ★ 整块交错装箱：生产的 pack() **就是**它（tests/test_wasapi_shared.cpp §1.3c 断言的同一个函数）。
+inline void ex_pack_int32(const ExContainer& c, int channels, int srcBits, double gain,
+                          unsigned char* dst, const int32_t* src, size_t frames) {
+    if (!dst || !src || channels <= 0 || !ex_container_known(c)) return;
+    const size_t n = frames * (size_t)channels;
+    const size_t b = (size_t)c.bytes;
+    for (size_t i = 0; i < n; ++i)
+        ex_put_sample(c, ex_normalize(src[i], srcBits, gain), dst + i * b);
+}
+
 class WasapiOutput {
 public:
     WasapiOutput() {
@@ -526,8 +618,11 @@ public:
         {
             for (int fi = 0; fi < nFmt; ++fi) {
                 if (std::strcmp(fmts[fi].tag, fmtUsed) == 0) {
-                    fmtBytes_ = fmts[fi].contBytes;
-                    fmtFloat_ = fmts[fi].flt;
+                    // 记录【容器】三要素（字节数 / 有效位 / 是否 float），pack() 只认这三个数，
+                    // 不再拿 bits_（请求位深）冒充它 —— P0-A 的根因就是这两者被当成了一回事。
+                    fmtc_.bytes   = fmts[fi].contBytes;
+                    fmtc_.valid   = fmts[fi].valid;
+                    fmtc_.isFloat = fmts[fi].flt;
                     break;
                 }
             }
@@ -806,67 +901,22 @@ public:
     }
 
 private:
-    // 应用微调增益：四舍五入，并按位深夹紧（越界会让 DAC 听到削波）
-    int32_t scaled(int32_t s) const {
-        const double v = (double)s * gain_;
-        const double lim = (double)((int64_t)1 << (bits_ - 1));
-        if (v >  lim - 1.0) return (int32_t)(int64_t)(lim - 1.0);
-        if (v < -lim)       return (int32_t)(int64_t)(-lim);
-        return (int32_t)(v >= 0.0 ? (v + 0.5) : (v - 0.5));
-    }
-
+    // ★ P0-A（2026-10-25）：单一装箱路径。
+    // 旧实现有「快路径/慢路径」两条各自硬编码定标的分叉：float32 恒定 ×1/8388608、
+    // 32 容器恒定原样搬 src，于是「请求位深 ≠ 容器有效位」时电平错 2^8（−48.16 dBFS）。
+    // 现在两条合流：容器三要素 + 请求位深 + 增益全部交给 ex_pack_int32 处理，
+    // 分叉消失 = 不可能再出现"一拖音量/一换驱动电平就变"的形态。
     void pack(BYTE* dst, const int32_t* src, size_t frames) {
         detail::pcm_dump("wasapi-ex", src, frames * (size_t)channels_, bits_);   // 取证（默认关闭）
-        const size_t n = frames * (size_t)channels_;
-        if (gain_ != 1.0) {
-            // 慢路径：只用于用户拖动音量滑块的场合（必须与快路径用同一容器宽度，否则一拖音量就爆音）
-            if (fmtBytes_ == 2) {
-                auto* p = (int16_t*)dst;
-                for (size_t i = 0; i < n; ++i) p[i] = (int16_t)scaled(src[i]);
-            } else if (fmtBytes_ == 3) {
-                for (size_t i = 0; i < n; ++i) {
-                    const uint32_t v = (uint32_t)scaled(src[i]);
-                    dst[i * 3 + 0] = (BYTE)(v & 0xFF);
-                    dst[i * 3 + 1] = (BYTE)((v >> 8) & 0xFF);
-                    dst[i * 3 + 2] = (BYTE)((v >> 16) & 0xFF);
-                }
-            } else if (fmtFloat_) {
-                auto* p = (float*)dst;
-                const float k = 1.0f / 8388608.0f;
-                for (size_t i = 0; i < n; ++i) p[i] = (float)scaled(src[i]) * k;
-            } else {
-                auto* p = (int32_t*)dst;
-                for (size_t i = 0; i < n; ++i) p[i] = scaled(src[i]);
-            }
-            return;
-        }
-        if (fmtBytes_ == 2) {
-            auto* p = (int16_t*)dst;
-            for (size_t i = 0; i < n; ++i) p[i] = (int16_t)src[i];
-        } else if (fmtBytes_ == 3) {
-            // 紧凑 24：3 字节小端，样本值域 ±2^23（TASCAM 等驱动只认这种）
-            for (size_t i = 0; i < n; ++i) {
-                const uint32_t v = (uint32_t)src[i];
-                dst[i * 3 + 0] = (BYTE)(v & 0xFF);
-                dst[i * 3 + 1] = (BYTE)((v >> 8) & 0xFF);
-                dst[i * 3 + 2] = (BYTE)((v >> 16) & 0xFF);
-            }
-        } else if (fmtFloat_) {
-            auto* p = (float*)dst;
-            const float k = 1.0f / 8388608.0f;   // 24-bit 定标 → float（±1.0）
-            for (size_t i = 0; i < n; ++i) p[i] = (float)src[i] * k;
-        } else {
-            // 32 容器（有效 24 或 32）：int32
-            auto* p = (int32_t*)dst;
-            for (size_t i = 0; i < n; ++i) p[i] = src[i];
-        }
+        ex_pack_int32(fmtc_, channels_, bits_, gain_, (unsigned char*)dst, src, frames);
     }
 
     bool comInit_ = false, running_ = false, realigned_ = false;
-    // 2026-10-23 真机 DEBUG：实际被驱动接受的独占格式（pack 必须按它取样字节数，
+    // 2026-10-23 真机 DEBUG：实际被驱动接受的独占格式（pack 必须按它取样字节数与定标，
     // 否则选到紧凑 24 却按 4 字节写 → 噪声/爆音）。由 open() 的格式阶梯设置。
-    int  fmtBytes_ = 4;      // 每样本容器字节数（2/3/4）
-    bool fmtFloat_ = false;  // 容器是 float32
+    // 2026-10-25 P0-A：改为三要素（字节数 / 有效位 / 是否 float）—— 只记字节数与 float
+    // 判定是不够的，"EXT32容器/24有效" 与 "EXT32/32 int" 字节数相同而定标差 8 位。
+    ExContainer fmtc_{};
     std::string fmtNote_;    // 例："独占格式=EXT24/24 紧凑(3字节)"
     IAudioClient* ac_ = nullptr;
     IAudioRenderClient* rc_ = nullptr;

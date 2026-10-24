@@ -378,6 +378,155 @@ int main() {
         ck(!server.is_running(), "HTTP 供源服务安全停止");
     }
 
+    // ========== 7b. 供源部分发送回归（2026-10-25 外部评审 P0-B）==========
+    // 现场形态：旧实现每个 64KB 块只 send 一次，nSend < nRead 时块尾字节被丢弃，
+    // 下一轮 fread 读的却是文件的下一块 ⟹ 流从丢字节处整体错位（长度仍对得上）。
+    // 判据（铁律 3）：桩把每次 send 截到 100 字节 —— 这正是旧实现出错的形态；
+    // 断言三件事：生产 pump_file 的返回值 == 文件大小、桩收到的字节数 == 文件大小、
+    // 内容【逐字节】相等（位置敏感，能抓到错位与重复）。
+    std::printf("\n-- 7b. 供源部分发送回归（桩：每次 send 只发 100 字节） --\n");
+    {
+        // 长度取 3 个 64KB 块 + 137：跨 4 个 fread 块，末块不整（块边界最容易丢字节）
+        const size_t N = 65536 * 3 + 137;
+        std::vector<uint8_t> expect(N);
+        for (size_t i = 0; i < N; ++i)
+            expect[i] = (uint8_t)((i * 31u + (i >> 8) * 7u + 5u) & 0xFFu);
+
+        const char* tmpPath = "rta_p0b_partial_send.bin";
+        bool wrote = false;
+        if (FILE* fw = std::fopen(tmpPath, "wb")) {
+            wrote = std::fwrite(expect.data(), 1, expect.size(), fw) == expect.size();
+            std::fclose(fw);
+        }
+        ck(wrote, "临时文件写入成功（3×64KB+137 字节）", tmpPath);
+
+        std::atomic<bool> stopFlag{false};
+        auto noSleep = [](int) {};
+        auto firstDiff = [](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) -> size_t {
+            const size_t n = std::min(a.size(), b.size());
+            for (size_t i = 0; i < n; ++i) if (a[i] != b[i]) return i;
+            return (a.size() == b.size()) ? (size_t)-1 : n;
+        };
+
+        // (a) 纯部分发送：每次只发 100 字节（旧实现在这里丢掉几乎每个块的块尾）
+        {
+            std::vector<uint8_t> got;
+            int calls = 0;
+            auto stub = [&](const char* p, int n) -> int {
+                ++calls;
+                const int take = std::min(n, 100);        // ★ 每次只发 100 字节
+                got.insert(got.end(), (const uint8_t*)p, (const uint8_t*)p + take);
+                return take;
+            };
+            FILE* f = std::fopen(tmpPath, "rb");
+            ck(f != nullptr, "临时文件可重新打开");
+            const int64_t sent = f ? upnp_detail::pump_file(f, (int64_t)N, 65536, stub, noSleep, &stopFlag)
+                                   : -1;
+            if (f) std::fclose(f);
+            ck(sent == (int64_t)N, "总发送字节数 == 文件大小",
+               std::to_string(sent) + " / " + std::to_string(N));
+            ck(got.size() == N, "桩收到的字节数 == 文件大小", std::to_string(got.size()));
+            ck(got == expect, "内容逐字节一致（无块尾丢字节、无重复）",
+               "长度 " + std::to_string(got.size()) + "，首个不符位置 " +
+               std::to_string(firstDiff(got, expect)));
+            ck(calls > (int)(N / 100), "确实发生了部分发送（桩调用次数 > N/100）",
+               std::to_string(calls) + " 次");
+            std::printf("  [INFO] 文件 %zu 字节 / 块 65536：pump_file 返回 %lld，桩调用 %d 次（每次 ≤100 字节）\n",
+                        N, (long long)sent, calls);
+        }
+
+        // (b) 发送过程中夹 WSAEWOULDBLOCK 形态的返回 0：必须短暂重试而不是截断
+        {
+            std::vector<uint8_t> got;
+            int calls = 0, stalls = 0;
+            auto stub = [&](const char* p, int n) -> int {
+                ++calls;
+                if (calls % 7 == 0) { ++stalls; return 0; }   // 模拟 WSAEWOULDBLOCK
+                const int take = std::min(n, 100);
+                got.insert(got.end(), (const uint8_t*)p, (const uint8_t*)p + take);
+                return take;
+            };
+            FILE* f = std::fopen(tmpPath, "rb");
+            const int64_t sent = f ? upnp_detail::pump_file(f, (int64_t)N, 65536, stub, noSleep, &stopFlag)
+                                   : -1;
+            if (f) std::fclose(f);
+            ck(stalls > 0, "确实触发了「暂时发不出去」的返回 0", std::to_string(stalls) + " 次");
+            std::printf("  [INFO] 夹入返回 0 共 %d 次后：pump_file 返回 %lld（= 文件大小）\n",
+                        stalls, (long long)sent);
+            ck(sent == (int64_t)N && got == expect,
+               "返回 0（WSAEWOULDBLOCK 形态）后仍整块发完且逐字节一致",
+               std::to_string(sent) + " / " + std::to_string(N));
+        }
+
+        // (c) 中途永久失败：返回值必须 == 实际发出的字节数，且已发前缀逐字节正确
+        //     （旧实现此时会继续读下一块 —— 那正是"丢字节"的另一种表现）
+        {
+            const size_t limit = 12345;
+            std::vector<uint8_t> got;
+            auto stub = [&](const char* p, int n) -> int {
+                if (got.size() >= limit) return -1;           // 对端断开
+                const int take = (int)std::min<size_t>(
+                    std::min<size_t>((size_t)100, (size_t)n), limit - got.size());
+                got.insert(got.end(), (const uint8_t*)p, (const uint8_t*)p + take);
+                return take;
+            };
+            FILE* f = std::fopen(tmpPath, "rb");
+            const int64_t sent = f ? upnp_detail::pump_file(f, (int64_t)N, 65536, stub, noSleep, &stopFlag)
+                                   : -1;
+            if (f) std::fclose(f);
+            ck(sent == (int64_t)got.size(), "永久错误：返回实际发出的字节数（不虚报）",
+               std::to_string(sent) + " / " + std::to_string(got.size()));
+            ck(sent == (int64_t)limit, "永久错误：恰好在失败点停下（不越界发送）",
+               std::to_string(sent));
+            std::printf("  [INFO] 永久错误发生在第 %lld 字节：pump_file 返回 %lld，未再读下一块\n",
+                        (long long)limit, (long long)sent);
+            ck(got.size() <= expect.size() &&
+               std::equal(got.begin(), got.end(), expect.begin()),
+               "永久错误：已发前缀与文件逐字节一致（绝不跳字节凑数）");
+        }
+
+        // (d) 内存缓冲分支（旧代码这条分支也不重试 WSAEWOULDBLOCK）
+        {
+            std::vector<uint8_t> got;
+            int calls = 0;
+            auto stub = [&](const char* p, int n) -> int {
+                if (++calls % 5 == 0) return 0;               // 每 5 次夹一次"暂时发不出去"
+                const int take = std::min(n, 100);
+                got.insert(got.end(), (const uint8_t*)p, (const uint8_t*)p + take);
+                return take;
+            };
+            const int64_t sent = upnp_detail::pump_buffer(expect.data(), (int64_t)N, stub, noSleep, &stopFlag);
+            ck(sent == (int64_t)N && got == expect, "pump_buffer 用 100 字节桩同样整块发完",
+               std::to_string(sent) + " / " + std::to_string(N));
+        }
+
+        // (e) 真回环（文件分支 + 真 winsock 全链路）：生产 pump_file 在真实 socket 上跑一遍
+        {
+            UpnpHttpServer server;
+            const uint16_t port = 8913;
+            if (server.start(port, "127.0.0.1")) {
+                const std::string sp = server.register_file(tmpPath, "audio/wav");
+                const std::string base = "http://127.0.0.1:" + std::to_string(port) + sp;
+                HttpResponse r = http_get(base, {}, 8000);
+                ck(r.status == 200 && r.body.size() == N, "文件供源 200 且长度 = 文件大小",
+                   std::to_string(r.status) + " / " + std::to_string(r.body.size()));
+                ck(r.body == expect, "文件供源逐字节一致（真实 socket + 生产 pump_file）",
+                   "首个不符位置 " + std::to_string(firstDiff(r.body, expect)));
+                HttpResponse rr = http_get(base, {"Range: bytes=65536-131071"}, 8000);
+                ck(rr.status == 206 && rr.body.size() == 65536, "文件供源 Range 206 / 64KB",
+                   std::to_string(rr.status) + " / " + std::to_string(rr.body.size()));
+                ck(rr.body == std::vector<uint8_t>(expect.begin() + 65536, expect.begin() + 131072),
+                   "Range 切片逐字节一致（fseek 起点 + 整块发完）");
+                server.stop();
+                ck(!server.is_running(), "文件供源服务安全停止");
+            } else {
+                ck(false, "文件供源回环服务启动（127.0.0.1:8913）", "端口被占用");
+            }
+        }
+
+        std::remove(tmpPath);
+    }
+
     // ================= 8) 网络发现用例 opt-in =================
     std::printf("\n-- 8. 网络发现用例 (opt-in) --\n");
     {

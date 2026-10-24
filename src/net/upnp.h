@@ -132,6 +132,79 @@ inline bool http_get(const std::string& host, int port, const std::string& path,
     if (wsaInit) WSACleanup();
     return !out.empty();
 }
+
+// ---------------- 供源发送：整块发完（2026-10-25，外部评审 P0-B）----------------
+// 现场形态（本文件旧 561-564 行）：文件分支把 fread 的【一整块】交给一次 ::send，
+// 返回值 nSend < nRead 时块尾直接丢弃，下一轮 fread 读的却是文件的【下一块】。
+// 阻塞 socket 也会部分发送（内核发送缓冲满 / SO_SNDTIMEO），于是：
+//   丢掉的字节数 = 块尾那几十 KB 里的任意几个 ⟹ 之后的流从那里开始整体错位。
+// 对 WAV 这种"按字节解释采样"的格式，错位 = 从错位点起整条流变成噪声，
+// 而且 Content-Length 依然对得上（对端不会报错），是最难从日志看出来的形态。
+// 缓冲分支（旧 567-574 行）当年写对了，但它在 nSend<=0 时同样直接 break，
+// WSAEWOULDBLOCK 一出现就截断 —— 所以两条分支现在共用下面这一份实现。
+//
+// 约定（调用方负责把 WSAGetLastError 映射成这三态）：
+//   > 0 本次实际发出的字节数（可能远小于请求量）
+//     0 暂时发不出去（WSAEWOULDBLOCK / WSAEINTR 之类），可短暂等待后重试
+//    -1 永久错误（对端关闭 / 其它 socket 错误），放弃这一块
+// 用模板而不是 std::function：供源每个 64KB 块要调用上千次，且测试要能塞桩。
+template <class SendOnce, class SleepMs>
+inline size_t send_block_all(SendOnce&& sendOnce, const char* buf, size_t len,
+                             SleepMs&& sleepMs, const std::atomic<bool>* stop,
+                             int stallBudgetMs = 5000) {
+    size_t done = 0;
+    int stalledMs = 0;
+    while (done < len) {
+        if (stop && stop->load()) break;
+        const size_t left = len - done;
+        const int ask = (int)std::min<size_t>(left, (size_t)1u << 20);   // 单次最多 1 MiB
+        const int r = sendOnce(buf + done, ask);
+        if (r > 0) {
+            done += (size_t)r;
+            stalledMs = 0;
+            continue;
+        }
+        if (r < 0) break;                       // 永久错误：这一块发不完了
+        if (++stalledMs > stallBudgetMs) break; // 1ms/次 ⟹ 迭代次数 ≈ 毫秒预算
+        sleepMs(1);
+    }
+    return done;
+}
+
+// ★ 文件供源主循环（生产 handle_client 的 isFile 分支直接调用它，不是测试另抄一份）：
+// 读一块 → 整块发完 → 下一块。返回实际发出的字节数。
+// 关键不变量：某块没发完就【立刻停止】，绝不再读下一块 —— 否则又是旧实现那种块间丢字节。
+template <class SendOnce, class SleepMs>
+inline int64_t pump_file(std::FILE* f, int64_t toSend, size_t chunkBytes,
+                         SendOnce&& sendOnce, SleepMs&& sleepMs,
+                         const std::atomic<bool>* stop, int stallBudgetMs = 5000) {
+    if (!f || toSend <= 0) return 0;
+    if (chunkBytes == 0) chunkBytes = 65536;
+    std::vector<unsigned char> chunk(chunkBytes);
+    int64_t sent = 0;
+    while (toSend > 0) {
+        if (stop && stop->load()) break;
+        const size_t want = (size_t)std::min<int64_t>(toSend, (int64_t)chunk.size());
+        const size_t got = std::fread(chunk.data(), 1, want, f);
+        if (got == 0) break;                    // EOF / 读错误
+        const size_t ok = send_block_all(sendOnce, (const char*)chunk.data(), got,
+                                        sleepMs, stop, stallBudgetMs);
+        sent += (int64_t)ok;
+        toSend -= (int64_t)ok;
+        if (ok < got) break;                    // ★ 本块没发完 = 连接已废，不能再读下一块
+    }
+    return sent;
+}
+
+// 内存缓冲供源：同一套"整块发完"语义（不分块读，只分次 send）。
+template <class SendOnce, class SleepMs>
+inline int64_t pump_buffer(const unsigned char* data, int64_t toSend,
+                           SendOnce&& sendOnce, SleepMs&& sleepMs,
+                           const std::atomic<bool>* stop, int stallBudgetMs = 5000) {
+    if (!data || toSend <= 0) return 0;
+    return (int64_t)send_block_all(sendOnce, (const char*)data, (size_t)toSend,
+                                   sleepMs, stop, stallBudgetMs);
+}
 } // namespace upnp_detail
 
 // 发一次 SSDP M-SEARCH，收集 MediaRenderer。timeoutMs 建议 1500~2500。
@@ -472,6 +545,25 @@ private:
         ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
         ::setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
 
+        // 单次 send 的适配层（P0-B）：把 winsock 错误码映射成 upnp_detail 的三态约定。
+        //   WSAEWOULDBLOCK / WSAEINTR → 0  ⟹ 短暂发不出去，等待后重试
+        //   其余（含 WSAETIMEDOUT、对端 RST、对端正常关闭）→ -1 ⟹ 放弃，绝不装作发完了
+        // 注：阻塞 socket + SO_SNDTIMEO 触发 WSAETIMEDOUT 时，内核实际已发出的字节数不确定，
+        // 重试可能重复发送，因此按永久错误处理（宁可让对端看到短流，也不产出重复字节）。
+        auto sendOnce = [c](const char* p, int n) -> int {
+            const int r = ::send(c, p, n, 0);
+            if (r > 0) return r;
+            if (r == 0) return -1;                                  // 对端已关闭
+            const int e = ::WSAGetLastError();
+            if (e == WSAEWOULDBLOCK || e == WSAEINTR) return 0;     // 暂时发不出去
+            return -1;
+        };
+        auto sleepMs = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        // 响应头也必须整块发完：头只发一半，对端直接解析失败
+        auto sendAll = [&](const char* p, size_t n) {
+            return upnp_detail::send_block_all(sendOnce, p, n, sleepMs, &stop_, 3000);
+        };
+
         std::string reqBuf;
         char tmp[4096];
         while (reqBuf.find("\r\n\r\n") == std::string::npos && reqBuf.size() < 65536) {
@@ -519,7 +611,7 @@ private:
         // 校验 token 与防目录遍历
         if (!found || !validate_stream_token(path, entry.token)) {
             const char* notFoundResp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            ::send(c, notFoundResp, (int)std::strlen(notFoundResp), 0);
+            sendAll(notFoundResp, std::strlen(notFoundResp));
             record_log(clientIp, clientPort, method, path, rangeHeader, 404, 0);
             ::closesocket(c);
             return;
@@ -531,7 +623,7 @@ private:
             fileHandle = std::fopen(entry.filePath.c_str(), "rb");
             if (!fileHandle) {
                 const char* notFoundResp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                ::send(c, notFoundResp, (int)std::strlen(notFoundResp), 0);
+                sendAll(notFoundResp, std::strlen(notFoundResp));
                 record_log(clientIp, clientPort, method, path, rangeHeader, 404, 0);
                 ::closesocket(c);
                 return;
@@ -546,32 +638,20 @@ private:
         HttpRange range = parse_http_range(rangeHeader, totalSize);
         StreamResponseHeaders respHeaders = build_stream_response_headers(range, totalSize, entry.mimeType);
 
-        ::send(c, respHeaders.headerString.data(), (int)respHeaders.headerString.size(), 0);
+        sendAll(respHeaders.headerString.data(), respHeaders.headerString.size());
 
         int64_t sent = 0;
         if (method == "GET" && (respHeaders.statusCode == 200 || respHeaders.statusCode == 206)) {
-            int64_t toSend = respHeaders.contentLength;
+            const int64_t toSend = respHeaders.contentLength;
             if (entry.isFile && fileHandle) {
                 _fseeki64(fileHandle, respHeaders.rangeStart, SEEK_SET);
-                std::vector<uint8_t> chunk(65536);
-                while (toSend > 0 && !stop_.load()) {
-                    size_t readLen = (size_t)std::min<int64_t>(toSend, (int64_t)chunk.size());
-                    size_t nRead = std::fread(chunk.data(), 1, readLen, fileHandle);
-                    if (nRead == 0) break;
-                    int nSend = ::send(c, (const char*)chunk.data(), (int)nRead, 0);
-                    if (nSend <= 0) break;
-                    sent += nSend;
-                    toSend -= nSend;
-                }
+                // ★ P0-B：读一块 → **整块发完** → 再读下一块。
+                // 旧实现每个块只 send 一次，部分发送时块尾字节被丢弃、下一轮读的是文件下一块
+                // ⟹ 流从那里整体错位（长度还对得上，最难发现）。
+                sent = upnp_detail::pump_file(fileHandle, toSend, 65536, sendOnce, sleepMs, &stop_);
             } else if (!entry.isFile) {
-                const uint8_t* p = entry.buffer.data() + respHeaders.rangeStart;
-                while (toSend > 0 && !stop_.load()) {
-                    int chunkLen = (int)std::min<int64_t>(toSend, 65536);
-                    int nSend = ::send(c, (const char*)p + sent, chunkLen, 0);
-                    if (nSend <= 0) break;
-                    sent += nSend;
-                    toSend -= nSend;
-                }
+                sent = upnp_detail::pump_buffer(entry.buffer.data() + respHeaders.rangeStart,
+                                                toSend, sendOnce, sleepMs, &stop_);
             }
         }
         if (fileHandle) std::fclose(fileHandle);

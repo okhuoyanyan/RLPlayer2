@@ -9,6 +9,9 @@
 //      §1.2 数值换算（f64_to_s16 / s24 / s24_in_32 / s32；含 int16 全域往返扫描）
 //      §1.3 管线 int32 → 字节（put_shared_sample_from_s32：位深归一化 + 装箱整链）
 //      §1.3b 整块交错装箱（shared_pack_int32 / shared_pack_f32 —— 生产 pack() 用的就是它们）
+//      §1.3c 独占容器装箱（ex_pack_int32 —— 生产 WasapiOutput::pack() 用的就是它；
+//            2026-10-25 P0-A：16→float32 / 24→EXT32-int 的 −48 dBFS 量化错位，
+//            含 16/24-bit 全域逐样本扫描 + 与共享路径逐字节对照）
 //      §1.4 老回归：int32→float32 换算边界（s32_to_f32 / s32_to_f32_bits）
 //      §1.5 老回归：shared_writable 钳制
 //   §2 设备 smoke：【只写数字静音（全零样本）且 ≤1 秒】，先打印醒目横幅
@@ -147,8 +150,17 @@ int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
 #endif
     std::string wantDev;
-    if (argc > 1 && argv[1] && argv[1][0]) wantDev = argv[1];
-    else if (const char* e = std::getenv("RTA_SHARED_DEV")) wantDev = e;
+    // 2026-10-25：新增 --offline（或 RTA_NO_DEVICE=1）——只跑 §1 纯离线部分，
+    // **完全不开音频设备**（铁律 1 的最保守形态）。默认行为不变（ctest 仍跑 §2 静音 smoke）。
+    bool offlineOnly = false;
+    for (int i = 1; i < argc && argv[i]; ++i) {
+        if (std::strcmp(argv[i], "--offline") == 0) { offlineOnly = true; continue; }
+        if (argv[i][0] == '\0') continue;
+        if (argv[i][0] == '-') { std::printf("  [WARN] 未知选项 %s（已忽略）\n", argv[i]); continue; }
+        wantDev = argv[i];   // 兼容旧用法：第一个非选项参数 = 端点名/子串
+    }
+    if (const char* e = std::getenv("RTA_SHARED_DEV")) { if (wantDev.empty()) wantDev = e; }
+    if (const char* e = std::getenv("RTA_NO_DEVICE")) { if (std::string(e) == "1") offlineOnly = true; }
     std::printf("== wasapi_shared：§1 纯离线（格式映射/换算/钳制，不开设备） ==\n");
 
     // ============================ §1.0 格式映射 ============================
@@ -391,6 +403,202 @@ int main(int argc, char** argv) {
         ck(bytes_eq(b, {0x00, 0x00, 0x00, 0x40}), "float32 输入 → int24in32 0.5", hexs(b, 4));
     }
 
+    // ---- §1.3c 独占容器装箱（2026-10-25 外部评审 P0-A：电平 −48 dBFS）----
+    // 被测对象 = 生产 WasapiOutput::pack() 直接调用的 ex_pack_int32 / ex_put_sample，
+    // 不是测试另抄一份。判据设计（铁律 3）：
+    //   · 每条都断言「0.5 输入 ⟹ 0.5 的样本值」，并显式算出电平（dBFS），
+    //     因为旧实现的错误恰好是"结构完全正常、只是电平少了 48 dB"，肉眼/结构断言抓不到；
+    //   · 同时断言旧口径（×1/8388608、原样搬 src）会给出什么值 —— 防回归也防判据误写；
+    //   · 逐样本扫描（16-bit 全域 65536、24-bit 全域 16777216）而不是抽样；
+    //   · 末尾与共享路径 shared_pack_int32 逐字节对照：两份实现不许悄悄漂移。
+    std::printf("\n-- §1.3c 独占容器装箱 ex_pack_int32：请求位深 × 容器有效位 --\n");
+    {
+        using rta::audio::ExContainer;
+        using rta::audio::ex_pack_int32;
+        using rta::audio::ex_put_sample;
+        using rta::audio::ex_normalize;
+
+        const ExContainer cF32  {4, 32, true };    // EXT32/32 float（TASCAM 的 16-bit 兜底容器）
+        const ExContainer cPcm16{2, 16, false};    // PCM16 / EXT16
+        const ExContainer cC24  {3, 24, false};    // EXT24/24 紧凑（3 字节）
+        const ExContainer cI24  {4, 24, false};    // EXT32容器/24有效（24-in-32，左对齐）
+        const ExContainer cI32  {4, 32, false};    // EXT32/32 int
+        unsigned char b[32];
+
+        auto f32_at = [](const unsigned char* p) { float f; std::memcpy(&f, p, 4); return f; };
+        auto i32_at = [](const unsigned char* p) { uint32_t u; std::memcpy(&u, p, 4); return (int32_t)u; };
+        auto dbfs = [](double x) { return 20.0 * std::log10(x > 0.0 ? x : 1e-30); };
+
+        // ---- (a) 16-bit 请求 → float32 容器（TASCAM 实测路径；旧实现 −48.16 dBFS）----
+        const int32_t s16_half[1] = { 16384 };                 // 16-bit 域的 0.5
+        const int32_t s16_full[1] = { 32767 };
+        const int32_t s16_min[1]  = { -32768 };
+        std::memset(b, 0xEE, sizeof(b));
+        ex_pack_int32(cF32, 1, 16, 1.0, b, s16_half, 1);
+        ck(f32_at(b) == 0.5f, "16-bit 0.5 → float32 容器 = 0.5（不是 0.5/32768）",
+           std::to_string(f32_at(b)));
+        ck(f32_at(b) != 16384.0f / 8388608.0f, "16-bit → float32 不再是旧口径 ×1/8388608",
+           std::to_string(f32_at(b)) + " vs 旧 " + std::to_string(16384.0f / 8388608.0f));
+        ck(b[4] == 0xEE, "float32 容器不越界写（第 5 字节仍是毒值）");
+
+        ex_pack_int32(cF32, 1, 16, 1.0, b, s16_full, 1);
+        const double db16 = dbfs((double)f32_at(b));
+        ck(std::fabs(db16) < 0.001, "16-bit 满幅 → 0.00 dBFS（旧实现为 −48.16 dBFS）",
+           "实测 " + std::to_string(db16) + " dBFS / 样本 " + std::to_string(f32_at(b)));
+        ck(std::fabs(db16 - (-48.16)) > 5.0, "16-bit 满幅不再落在 −48 dBFS 附近",
+           std::to_string(db16) + " dBFS");
+
+        ex_pack_int32(cF32, 1, 16, 1.0, b, s16_min, 1);
+        ck(f32_at(b) == -1.0f, "16-bit 负满幅 → float32 = −1.0（满幅不塌）", std::to_string(f32_at(b)));
+
+        // 负向对照（判据本体）：把旧口径的电平也算出来钉死，证明"改掉的正是 −48.16 dBFS"，
+        // 而不是"随便断言了一个数"。旧公式 = src × 1/8388608（24-bit 定标）。
+        const double oldDb16 = dbfs(32767.0 / 8388608.0);
+        ck(std::fabs(oldDb16 - (-48.1648)) < 0.01,
+           "旧口径 16-bit 满幅 = −48.16 dBFS（缺陷量级对照）", std::to_string(oldDb16) + " dBFS");
+        const double oldDb24 = dbfs(8388607.0 / 2147483648.0);
+        ck(std::fabs(oldDb24 - (-48.1648)) < 0.01,
+           "旧口径 24-bit 写进 32 位容器 = −48.16 dBFS（缺陷量级对照）", std::to_string(oldDb24) + " dBFS");
+
+        // ---- (b) 24-bit 请求 → EXT32容器/24有效 与 EXT32/32 int（同为 4 字节，定标差 8 位）----
+        const int32_t s24_half[1] = { 4194304 };               // 24-bit 域的 0.5 = 2^22
+        const int32_t s24_full[1] = { 8388607 };
+        const int32_t s24_min[1]  = { -8388608 };
+        ex_pack_int32(cI24, 1, 24, 1.0, b, s24_half, 1);
+        ck(i32_at(b) == 1073741824, "24-bit 0.5 → EXT32容器/24有效 = 0x40000000（左移 8 位）",
+           hexs(b, 4));
+        ck(i32_at(b) != 4194304, "24-bit → 24-in-32 不再是旧口径原样搬（0x00400000）", hexs(b, 4));
+        ex_pack_int32(cI32, 1, 24, 1.0, b, s24_half, 1);
+        ck(i32_at(b) == 1073741824, "24-bit 0.5 → EXT32/32 int = 0x40000000（占满 32 位域）",
+           hexs(b, 4));
+        ex_pack_int32(cI32, 1, 24, 1.0, b, s24_full, 1);
+        ck(i32_at(b) == 2147483392 && (i32_at(b) & 0xFF) == 0,
+           "24-bit 满幅 → 0x7FFFFF00（低 8 位恒 0）", hexs(b, 4));
+        ex_pack_int32(cI24, 1, 24, 1.0, b, s24_full, 1);
+        ck(i32_at(b) == 2147483392, "24-in-32 满幅 → 0x7FFFFF00（同一左对齐规则）", hexs(b, 4));
+        ex_pack_int32(cI24, 1, 24, 1.0, b, s24_min, 1);
+        ck(i32_at(b) == INT32_MIN, "24-bit 负满幅 → 0x80000000", hexs(b, 4));
+
+        // ---- (c) 32-bit 请求 → float32 容器（旧实现同样 −48.16 dBFS）----
+        const int32_t s32_half[1] = { 1073741824 };
+        ex_pack_int32(cF32, 1, 32, 1.0, b, s32_half, 1);
+        ck(f32_at(b) == 0.5f, "32-bit 0.5 → float32 容器 = 0.5", std::to_string(f32_at(b)));
+
+        // ---- (d) 位深与容器一致时，输出必须与旧实现【逐位相同】（不能修出回归）----
+        const int32_t s16_neg[1] = { -16384 };
+        ex_pack_int32(cPcm16, 1, 16, 1.0, b, s16_neg, 1);
+        ck(bytes_eq(b, {0x00, 0xC0}), "16-bit −0.5 → PCM16 = 0xC000（与旧实现逐位一致）", hexs(b, 2));
+        ex_pack_int32(cC24, 1, 24, 1.0, b, s24_half, 1);
+        ck(bytes_eq(b, {0x00, 0x00, 0x40}), "24-bit 0.5 → 紧凑 24 = 00 00 40（3 字节）", hexs(b, 3));
+        ex_pack_int32(cI32, 1, 32, 1.0, b, s32_half, 1);
+        ck(i32_at(b) == 1073741824, "32-bit 0.5 → EXT32/32 int 原样", hexs(b, 4));
+
+        // ---- (e) 交错步长：2 声道 2 帧（旧实现的快速/慢速两条分支都要按容器宽度步进）----
+        {
+            const int32_t inter[4] = { 4194304, -4194304, 0, 8388607 };
+            std::memset(b, 0xEE, sizeof(b));
+            ex_pack_int32(cI24, 2, 24, 1.0, b, inter, 2);
+            ck(bytes_eq(b, {0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0xC0,
+                            0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x7F}),
+               "24→24-in-32 2帧2声道交错 → 16 字节", hexs(b, 16));
+            ck(b[16] == 0xEE, "块装箱不越界写（第 17 字节仍是毒值）");
+        }
+
+        // ---- (f) 增益：乘法域必须与容器无关（旧实现慢路径的 float32 定标同样写死）----
+        ex_pack_int32(cF32, 1, 16, 2.0, b, s16_half, 1);
+        ck(f32_at(b) == 1.0f, "增益 ×2：16-bit 0.5 → float32 1.0", std::to_string(f32_at(b)));
+        ex_pack_int32(cF32, 1, 16, 4.0, b, s16_half, 1);
+        ck(f32_at(b) == 1.0f, "增益 ×4：0.5 → 饱和 1.0（不回绕）", std::to_string(f32_at(b)));
+        ex_pack_int32(cI24, 1, 24, 4.0, b, s24_half, 1);
+        ck(i32_at(b) == 2147483392, "增益 ×4：24-bit 0.5 → 饱和 0x7FFFFF00", hexs(b, 4));
+
+        // ---- (g) 逐样本扫描（不是抽样）----
+        {
+            int bad = 0;
+            for (int v = -32768; v <= 32767; ++v) {
+                unsigned char t[4];
+                ex_put_sample(cF32, ex_normalize(v, 16, 1.0), t);
+                if (f32_at(t) != (float)((double)v / 32768.0)) ++bad;
+            }
+            ck(bad == 0, "16-bit 全域 65536 码值 → float32 逐样本相等",
+               "不符 " + std::to_string(bad));
+        }
+        {
+            int bad = 0;
+            for (int64_t v = -8388608; v <= 8388607; ++v) {
+                unsigned char t[4];
+                ex_put_sample(cI24, ex_normalize((int32_t)v, 24, 1.0), t);
+                if (i32_at(t) != (int32_t)(v * 256)) ++bad;
+            }
+            ck(bad == 0, "24-bit 全域 16777216 码值 → EXT32/24有效 逐样本相等",
+               "不符 " + std::to_string(bad));
+        }
+
+        // 取证汇总（现场实测值，不是把断言里的常数再打印一遍）
+        {
+            unsigned char m[4];
+            ex_pack_int32(cF32, 1, 16, 1.0, m, s16_half, 1);
+            const double m16half = (double)f32_at(m);
+            ex_pack_int32(cF32, 1, 16, 1.0, m, s16_full, 1);
+            const double m16fullDb = dbfs((double)f32_at(m));
+            ex_pack_int32(cI24, 1, 24, 1.0, m, s24_half, 1);
+            const int32_t m24half = i32_at(m);
+            ex_pack_int32(cI32, 1, 24, 1.0, m, s24_full, 1);
+            const int32_t m24full = i32_at(m);
+            std::printf("  [INFO] 16→float32 : 0.5 → %.9f（旧源码实测 0.001953125）；满幅 → %.2f dBFS（旧 −48.17）\n",
+                        m16half, m16fullDb);
+            std::printf("  [INFO] 24→EXT32int: 0.5 → 0x%08X（旧源码实测 0x%08X）；满幅 → 0x%08X\n",
+                        (unsigned)m24half, 4194304u, (unsigned)m24full);
+        }
+
+        // ---- (h) 与共享路径逐字节对照（两份实现的"同一份口径"由这里钉住）----
+        {
+            struct Pair { ExContainer ex; SharedSampleFmt sh; const char* name; };
+            const Pair pairs[] = {
+                { {4, 32, true },  SharedSampleFmt::Float32,   "float32" },
+                { {2, 16, false},  SharedSampleFmt::Int16,     "int16" },
+                { {3, 24, false},  SharedSampleFmt::Int24,     "int24 紧凑" },
+                { {4, 24, false},  SharedSampleFmt::Int24In32, "24-in-32" },
+                { {4, 32, false},  SharedSampleFmt::Int32,     "int32" },
+            };
+            const int bitsSet[3] = { 16, 24, 32 };
+            const double gains[3] = { 1.0, 0.5, 2.0 };
+            int pairsChecked = 0, mismatches = 0;
+            std::string firstBad;
+            for (const auto& pr : pairs) {
+                for (int bi = 0; bi < 3; ++bi) {
+                    const int sb = bitsSet[bi];
+                    const double denom = (sb >= 32) ? 2147483648.0 : (double)(1LL << (sb - 1));
+                    int32_t src[64];
+                    for (int i = 0; i < 64; ++i) {
+                        const double x = (i - 32) / 31.0;                  // ≈ ±1.03（含越界样本）
+                        src[i] = (int32_t)(x > 1.0 ? 1.0 : (x < -1.0 ? -1.0 : x) * denom);
+                    }
+                    for (double g : gains) {
+                        unsigned char ba[256], bb[256];
+                        std::memset(ba, 0xEE, sizeof(ba));
+                        std::memset(bb, 0xEE, sizeof(bb));
+                        ex_pack_int32(pr.ex, 2, sb, g, ba, src, 32);
+                        shared_pack_int32(pr.sh, 2, sb, g, bb, src, 32, 0.0);
+                        const int nb = shared_fmt_bytes(pr.sh) * 64;
+                        ++pairsChecked;
+                        if (std::memcmp(ba, bb, (size_t)nb) != 0) {
+                            ++mismatches;
+                            if (firstBad.empty())
+                                firstBad = std::string(pr.name) + " srcBits=" + std::to_string(sb) +
+                                           " gain=" + std::to_string(g) + " 独占=" + hexs(ba, nb) +
+                                           " 共享=" + hexs(bb, nb);
+                        }
+                    }
+                }
+            }
+            ck(mismatches == 0,
+               "独占 ex_pack_int32 与共享 shared_pack_int32 逐字节一致（5 容器 × 3 源位深 × 3 增益）",
+               "对照 " + std::to_string(pairsChecked) + " 组，不符 " + std::to_string(mismatches) +
+               (firstBad.empty() ? "" : "；首例 " + firstBad));
+        }
+    }
+
     // ==================== §1.4 老回归：int32 → float32 ====================
     std::printf("\n-- §1.4 老回归：s32_to_f32 / s32_to_f32_bits --\n");
     ck(s32_to_f32(0) == 0.0, "s32_to_f32(0) == 0");
@@ -445,6 +653,12 @@ int main(int argc, char** argv) {
     }
 
     // ---- §2 设备 smoke：只写数字静音，≤1 秒，先打印横幅 ----
+    if (offlineOnly) {
+        std::printf("\n== wasapi_shared：§2 设备 smoke ==\n");
+        std::printf("  [SKIP] --offline / RTA_NO_DEVICE=1：只跑 §1 离线部分，不打开任何音频设备\n");
+        std::printf("\n%s（失败 %d 项）\n", g_fail == 0 ? "wasapi_shared 离线部分全部通过" : "存在失败", g_fail);
+        return g_fail == 0 ? 0 : 1;
+    }
     std::printf("\n== wasapi_shared：§2 设备 smoke ==\n");
     std::string devName = "(未知)", devId;
     bool foundWanted = wantDev.empty();
