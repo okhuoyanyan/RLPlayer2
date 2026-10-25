@@ -147,6 +147,8 @@ public:
         for (auto& b : ss_.eq) b.reset();
         for (auto& q : ss_.quant) q.reset();
         for (auto& l : ss_.loud) if (l) l->reset();
+        // 2026-10-25：延迟线改持久后，跳转也必须清历史（否则跳转后先吐出上一个位置的尾巴）
+        for (auto& d : ss_.delay) d.reset();
     }
 
     bool willBeBitPerfect(const AudioBuffer& in) const {
@@ -239,8 +241,24 @@ public:
             mx.process(ip.data(), op.data(), nIn);
             st.usedMatrix = true;
         } else {
-            // 单位路由（声道数不变时才允许）
-            for (int c = 0; c < outCh && c < inCh; ++c) work[(size_t)c] = planes[(size_t)c];
+            // 单位路由：前 min(in,out) 路一一对应，超出部分补零。
+            // ★ 2026-10-25 真 BUG 修复（单声道 → 多声道 = 单边）：
+            //   旧代码只填 c < min(in,out)，于是【单声道源 + 2 声道输出】时右声道恒为
+            //   数字静音 —— 用户听到「只有左边有声」。这不是设计取舍，是漏了分支：
+            //   同项目监听链为此显式建了 1→N 矩阵（src/audio/wasapi_capture.h:535-538
+            //   注释原文「唯一需要显式展开的是【单声道 → 多声道复制】…不能因为走 DSP
+            //   就变单边」），而播放链自己反而没做。
+            //   生产触发路径（用户什么都不用改）：
+            //     tools/rtaweb.cpp:2802 共享后端 pEff.outChannels = 系统混音声道数
+            //     tools/rtaweb.cpp:2909/2910 → cfg.outChannels = outCh（!= in.channels）
+            //   实测（tests/test_playback_edges.cpp §1）：mono 16/24-bit → 512 帧里
+            //   右声道 512/512 全 0、左声道逐样本正确。
+            //   2ch → 6ch 的既有语义（前两路逐位 + 其余静音）保持不变
+            //   （tests/test_channel_gain.cpp 第 3 节钉住）。
+            const int cp = (inCh < outCh) ? inCh : outCh;
+            for (int c = 0; c < cp; ++c) work[(size_t)c] = planes[(size_t)c];
+            if (inCh == 1 && outCh > 1)
+                for (int c = 1; c < outCh; ++c) work[(size_t)c] = planes[0];
         }
 
         // ---- 阶段 3 前置：20 段 PEQ（输入采样率，现有文件 EQ 之前）----
@@ -276,8 +294,17 @@ public:
                 st.eqBiquads += (int)cp.eq.size();
             }
             if (cp.delaySamples > 0) {
-                dsp::DelayLine d;
-                d.set_samples((size_t)cp.delaySamples);
+                // ★ 2026-10-25 真 BUG 修复：延迟线必须是【持久状态】。
+                //   旧代码每块新建一条 DelayLine 再 set_samples（= 清零），等价于
+                //   「本块先补 delaySamples 个零、再把本块最后 delaySamples 个样本丢掉」：
+                //   实测（tests/test_playback_edges.cpp 第 3 节）2 块 x 256 帧、delay=64 时
+                //   64/512 个样本丢失、块边界出现 0（断点/爆音）。
+                //   EQ / 卷积 / 重采样 / 量化器都早已改成持久状态，只有延迟线漏了。
+                // 现状：tools/rtaweb.cpp 还没有把 delaySamples 接到设置页，
+                //   所以这是【潜伏缺陷】（接线后才会听到）；本次一并修掉。
+                if ((size_t)c >= ss_.delay.size()) ss_.delay.resize((size_t)outCh);
+                dsp::DelayLine& d = ss_.delay[(size_t)c];
+                if (d.samples() != (size_t)cp.delaySamples) d.set_samples((size_t)cp.delaySamples);
                 for (auto& v : w) v = d.process(v);
                 st.usedDelay = true;
                 st.maxDelaySamples = std::max(st.maxDelaySamples, cp.delaySamples);
@@ -387,6 +414,8 @@ private:
         std::vector<dsp::Quantizer>              quant;
         std::vector<std::unique_ptr<dsp::StreamingConvolver>> conv;   // 每输出声道
         std::vector<std::unique_ptr<dsp::Loudness>> loud;             // 每声道（各自持有滤波状态）
+        // 每输出声道延迟线（2026-10-25 修复：原先每块新建 ⟹ 每块丢 delaySamples 个样本）
+        std::vector<dsp::DelayLine> delay;
         double prepareMs = 0.0;      // prepare_stream() 耗时（滤波器设计 + 状态分配）
         size_t coeffBytes = 0;       // 重采样器系数表字节数（多相 L × 每相抽头 × 8）
     };
@@ -423,6 +452,8 @@ private:
         }
         ss_.conv.clear();
         ss_.conv.resize((size_t)outCh);      // unique_ptr 不可拷贝，不能用 assign(n, nullptr)
+        // 延迟线按输出声道各一条（长度在首次 process 时按 cfg_.channel[c].delaySamples 定长）
+        ss_.delay.assign((size_t)outCh, dsp::DelayLine{});
 
         ss_.loud.clear();
         if (cfg_.loudnessEnabled) {

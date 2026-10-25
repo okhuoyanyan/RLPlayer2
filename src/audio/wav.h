@@ -12,6 +12,16 @@
 
 namespace rta::audio {
 
+// 位级有限性判定（NaN / ±Inf 都返回 false）。
+// 为什么不用 std::isfinite：MSVC/clang 在 -ffast-math 下可能把它折叠成常量 true
+// （CMakeLists 已加 -fno-finite-math-only -fhonor-nans 兜底，这里再按位判一次，
+//  成本 1 条指令，且与 dsp/dither.h 的 finite_bits_u64 同一手法）。
+inline bool audio_finite(double x) {
+    uint64_t b = 0;
+    std::memcpy(&b, &x, sizeof(b));
+    return ((b >> 52) & 0x7FFull) != 0x7FFull;
+}
+
 struct AudioBuffer {
     uint32_t rate   = 44100;
     int      channels = 2;
@@ -31,6 +41,17 @@ struct AudioBuffer {
     }
     void setSample(size_t frame, int ch, double x) {
         int32_t& v = raw[frame * (size_t)channels + (size_t)ch];
+        // ★ 2026-10-25 真 BUG 修复（NaN/±Inf 输入）：
+        //   旧代码把 x 直接乘 fullScale 再四舍五入。floor(NaN+0.5)=NaN，而
+        //   「if (s < lo) s = lo; if (s > hi) s = hi;」对 NaN 两个比较都是 false，
+        //   于是落到 (int32_t)NaN —— C++ 里是 UB，x64 上得 INT_MIN。
+        //   实测（tests/test_playback_edges.cpp §2）：bits=16 的缓冲里出现 -2147483648，
+        //   越出容器域 65536 倍；下游两个后端（wasapi_out.h 的 ex_normalize、
+        //   wasapi_shared.h 的 f64_to_signed_bits）都有「非有限 → 0」的守卫，但它们
+        //   拿到的已经是 -2147483648/2^31 = -1.0 ⟹ **满幅负直流**（爆音 + clip 计数）。
+        //   这里统一成与两个后端一致的「非有限 → 0」：坏 IR/坏 EQ/坏上游只该出静音。
+        //   有限越界（如 -1.5）行为不变，仍然只钳位到负满幅。
+        if (!audio_finite(x)) { v = 0; return; }
         if (isFloat) { float f = (float)x; std::memcpy(&v, &f, 4); return; }
         double s = x * fullScale();
         s = (s >= 0.0) ? std::floor(s + 0.5) : std::ceil(s - 0.5);
@@ -141,6 +162,16 @@ inline int parse_wav_header(const uint8_t* data, size_t size, WavHeaderInfo& out
             }
             if (ch < 1 || ch > 32) {
                 if (errorMsg) *errorMsg = "WAV 声道数非法 (允许 1..32, 当前=" + std::to_string(ch) + ")";
+                return -1;
+            }
+            // ★ 2026-10-25 真 BUG 修复：采样率此前完全不校验。
+            //   rate=0 的文件会被当成合法音频一路放下去：时长 = 帧数/0 = inf，
+            //   render_loop 的 STAT pos = played/deviceRate = inf，而用户只看到
+            //   「打开输出后端失败」这种与真因无关的文案（判据与事实脱钩，铁律 3）。
+            //   4 MHz 是防御上限：现役 PCM（≤768k）与 DSD 承载率（≤1536k）都远低于它。
+            if (rate == 0 || rate > 4000000u) {
+                if (errorMsg) *errorMsg = "WAV 采样率非法 (当前=" + std::to_string(rate) +
+                                          "，允许 1..4000000 Hz)";
                 return -1;
             }
             haveFmt = true;
@@ -344,6 +375,11 @@ inline AudioBuffer read_wav(const std::string& path) {
     }
     if (ch < 1 || ch > 32)
         throw std::runtime_error(ctx("WAV 声道数非法(允许 1..32)"));
+    // ★ 2026-10-25 真 BUG 修复（同 parse_wav_header 的理由）：rate=0 必须在这里就被拒绝，
+    //   否则会得到 rate=0 的 AudioBuffer，时长/进度全变 inf，错误却在很远的设备层才出现。
+    if (rate == 0 || rate > 4000000u)
+        throw std::runtime_error(ctx("WAV 采样率非法(当前=" + std::to_string(rate) +
+                                     " Hz，允许 1..4000000; 0 会让时长/进度变成 inf)"));
 
     ab.rate = rate; ab.channels = ch; ab.bits = bps;
     ab.isFloat = (fmtTag == 3);

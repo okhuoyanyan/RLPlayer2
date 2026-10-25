@@ -275,6 +275,12 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
     size_t pendFrames = 0;
     size_t played = 0;
     int timeouts = 0;
+    // 「这一串连续写不进去」的起点（timeouts 0→1 时记）。
+    // ★ 2026-10-25 真 BUG 修复：RENDERFAIL 文案里的秒数原先写成 timeouts*20/1000，
+    //   而 20ms 只是【旧时序】的轮询上限。现默认 fastFeed=true，等待上限是 per/2
+    //   （96k/per=960 ⟹ 5ms），于是同一句文案把 1.005 秒说成 4.020 秒（实测 +300%）。
+    //   归因证据必须等于实测墙钟，否则排障方向会被 4 倍误差带偏（铁律 3）。
+    double timeoutT0 = 0.0;
     // ---- 吞吐率判据（STARVING）状态 ----
     // 判据只看「帧/秒」与 deviceRate 的比值 —— 这个量纲与缓冲深度、周期量化、
     // 轮询节奏全都无关。反面教材（已算过，见测试注释）：用「写入次数/轮询次数」
@@ -667,9 +673,14 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
             // 手里有数据却 4 秒写不进去 ⟹ 设备异常。2026-10-22 VM 事故根因：
             // 独占模式在 VM 板载 HD Audio 上 GetCurrentPadding 恒满 → write_available 恒 0。
             // 旧版在这里静默 break，END pos=0 error="" 成悬案；现在必须留下完整归因。
+            if (timeouts == 0) timeoutT0 = tAfter;   // 这一串的起点（用于实测时长）
             if (++timeouts > 200) {
                 std::ostringstream fs;
-                fs << "RENDERFAIL 设备流 " << (timeouts * 20 / 1000.0) << " 秒未接受数据"
+                // 时长取【实测墙钟】（tAfter - timeoutT0），不再用「次数 x 20ms」估算：
+                // fastFeed 下一轮只等 per/2，两者能差 4 倍。次数本身仍如实带上。
+                fs.setf(std::ios::fixed); fs.precision(2);
+                fs << "RENDERFAIL 设备流 " << (tAfter - timeoutT0) << " 秒未接受数据"
+                   << "（连续 " << timeouts << " 次写入失败）"
                    << "（疑似虚拟声卡/独占模式不可用）"
                    << " w0=" << h.dbgW0->load() << " wr=" << h.dbgWr->load();
                 // 与 STAT 同一口径：把「写不进去」的成因一并带出（不支持计数的后端省略）。
