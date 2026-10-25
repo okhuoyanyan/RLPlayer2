@@ -33,6 +33,7 @@
 #include <mutex>
 #include <atomic>
 #include <cstring>
+#include <cctype>
 #include <cstdio>
 #include <cmath>
 #include "pcm_dump.h"
@@ -314,27 +315,46 @@ inline ASIOError asio_guarded_channel_info(IASIO* d, ASIOChannelInfo* ci) {
 }
 
 // 注册表枚举：返回驱动名 + CLSID 字符串
+//
+// ⚠️ 2026-10-26（用户 261025-02 #4）：**必须两个注册表视图都枚举**，旧代码只读了默认视图。
+//   ASIO 驱动把自己的键同时写进 HKLM\SOFTWARE\ASIO（64 位视图）与
+//   HKLM\SOFTWARE\WOW6432Node\ASIO（32 位视图）。64 位宿主进程用默认 KEY_READ 枚举时
+//   只看得到 64 位视图；只在 32 位视图注册的驱动（32 位驱动 / 32 位安装器）会被漏掉 ——
+//   那种机器上列表就是空的，界面只能显示兜底项「（第一个可用驱动）」。
+//   去重键 = CLSID（同名同 CLSID 只保留 64 位视图那一份；没有 CLSID 的键按名字去重）。
+//   x86 = true 表示只在 32 位视图里注册：64 位宿主 CoCreateInstance 会失败，
+//   界面可以据此把它标灰（而不是让用户选了一个永远开不起来的驱动）。
 struct AsioDriverEntry {
     std::string name;
     std::string clsid;
+    bool x86 = false;
 };
-inline std::vector<AsioDriverEntry> asio_enum_drivers() {
-    std::vector<AsioDriverEntry> out;
+
+inline bool asio_same_str_ci(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+    return true;
+}
+
+// 枚举单个视图（viewFlag = KEY_WOW64_64KEY / KEY_WOW64_32KEY），结果追加进 out（已去重）。
+inline void asio_enum_one_view(DWORD viewFlag, bool x86, std::vector<AsioDriverEntry>& out) {
     HKEY hk = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\ASIO", 0, KEY_READ, &hk) != ERROR_SUCCESS)
-        return out;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\ASIO", 0,
+                      KEY_READ | viewFlag, &hk) != ERROR_SUCCESS) return;
     for (DWORD i = 0;; ++i) {
         wchar_t name[256];
         DWORD len = 256;
         if (RegEnumKeyExW(hk, i, name, &len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
-        std::wstring sub = std::wstring(L"SOFTWARE\\ASIO\\") + name;
-        HKEY hd = nullptr;
         AsioDriverEntry e;
+        e.x86 = x86;
         char nb[512] = {0};
         WideCharToMultiByte(CP_UTF8, 0, name, -1, nb, sizeof(nb) - 1, nullptr, nullptr);
         e.name = nb;
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub.c_str(), 0, KEY_READ, &hd) == ERROR_SUCCESS) {
-            wchar_t cbuf[256]; DWORD clen = sizeof(cbuf); DWORD type = 0;
+        const std::wstring sub = std::wstring(L"SOFTWARE\\ASIO\\") + name;
+        HKEY hd = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub.c_str(), 0, KEY_READ | viewFlag, &hd) == ERROR_SUCCESS) {
+            wchar_t cbuf[256] = {0}; DWORD clen = sizeof(cbuf) - sizeof(wchar_t); DWORD type = 0;
             if (RegQueryValueExW(hd, L"CLSID", nullptr, &type, (LPBYTE)cbuf, &clen) == ERROR_SUCCESS) {
                 char cb[256] = {0};
                 WideCharToMultiByte(CP_UTF8, 0, cbuf, -1, cb, sizeof(cb) - 1, nullptr, nullptr);
@@ -342,9 +362,23 @@ inline std::vector<AsioDriverEntry> asio_enum_drivers() {
             }
             RegCloseKey(hd);
         }
-        out.push_back(e);
+        bool dup = false;
+        for (const auto& x : out) {
+            if (!e.clsid.empty() && !x.clsid.empty()) {
+                if (asio_same_str_ci(x.clsid, e.clsid)) { dup = true; break; }
+            } else if (e.clsid.empty() && x.clsid.empty() && asio_same_str_ci(x.name, e.name)) {
+                dup = true; break;
+            }
+        }
+        if (!dup) out.push_back(e);
     }
     RegCloseKey(hk);
+}
+
+inline std::vector<AsioDriverEntry> asio_enum_drivers() {
+    std::vector<AsioDriverEntry> out;
+    asio_enum_one_view(KEY_WOW64_64KEY, false, out);   // 主视图（64 位宿主可直接 CoCreate）
+    asio_enum_one_view(KEY_WOW64_32KEY, true, out);    // WOW6432Node（32 位驱动）
     return out;
 }
 

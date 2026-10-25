@@ -215,6 +215,23 @@ struct PlayerState {
     // 在信号链 JSON 生成处一并写入，/api/status 直接带出，供底栏常驻徽标使用。
     std::string bpState;
     std::string bpWhy;
+    // ---- 输出格式自证（2026-10-26 用户 261025-02 #2/#5）----
+    // 为什么必须由后端给：底栏原先只能显示 outRate，而 **DoP 的 outRate 是载波率**
+    // （DSD128 / 48k 族 = 6144000/16 = 384000）—— 和"PCM 升频到 384k"的数字一模一样。
+    // 用户看到 384000 就判断"选了 DSD 却变成 PCM 升频"，后端不把 outMode/dsdRate 交出来，
+    // 这个误解永远无法自证（实测：确实走了 SDM 调制 + DoP 打包）。
+    //   outMode    pcm | dop | native
+    //   dsd        实际输出的 DSD 档位（64/128/256/512；PCM = 0）
+    //   dsdRate    实际 1-bit 位率（DSD128 = 6144000；PCM = 0）
+    //   modFamily  调制器族（只有 DoP/调制路径有；native 直通 = 空）
+    //   modOrder   **实际生效**的阶数（stable_sdm_order 可能按稳定性下调，不是用户填的那个）
+    //   fallbackWhy 非空 = 本次实际输出与用户请求不一致的原因（空 = 没降级）
+    std::string outMode;
+    int         outDsdLevel = 0;
+    uint32_t    outDsdRate  = 0;
+    std::string outModFamily;
+    int         outModOrder = 0;
+    std::string outFallbackWhy;
     double outRate = 0;
     int    outBits = 0;
     // 2026-10-24（用户 261024-04 #8：bit-perfect 时信号链没绿点、右下角 GPU 图标还亮着）：
@@ -242,6 +259,19 @@ struct PlayerState {
     }
 };
 static PlayerState g_ps;
+
+// 写"输出格式自证"字段（唯一入口：字段成组更新，且必须持 ps.mtx ——
+// /api/status 的读线程也在同一把锁下取值。调用点不得已经持有 ps.mtx，否则死锁）。
+static void set_dsd_out_state(const char* mode, int level, uint32_t bitRate,
+                              const std::string& family, int order, const std::string& why) {
+    std::lock_guard<std::mutex> lk(g_ps.mtx);
+    g_ps.outMode        = mode;
+    g_ps.outDsdLevel    = level;
+    g_ps.outDsdRate     = bitRate;
+    g_ps.outModFamily   = family;
+    g_ps.outModOrder    = order;
+    g_ps.outFallbackWhy = why;
+}
 
 // 20 段参数均衡 PEQ（261024-02 #6）：全局单例。播放线程处理音频，HTTP 线程改参数（热更新）。
 static std::shared_ptr<rta::dsp::PeqEngine> g_peq;
@@ -1240,8 +1270,15 @@ static bool native_dsd_precheck(const PlayParams& p, std::string& why) {
     // 现在三种等价写法都接受；"max"（要升频）和具体数字（要换率）仍然明确拒绝。
     const bool rateFollowsSource = (p.rate.empty() || p.rate == "src" || p.rate == "follow");
     if (!rateFollowsSource) {
-        why = "Native DSD 按源位率直通，不做升频：采样率设置当前是「" + p.rate +
-              "」，请改成「跟随源」（设置 → 输出 → 采样率；等价写法 src / follow）。";
+        // 2026-10-26（用户 261025-02 #3/#5）：「Native 升频怎么设」的答案是**做不到**，
+        // 所以文案必须一次说清三件事：①这台设备的能力边界 ②想升速该走哪条路 ③现在怎么才能播。
+        // 边界（AGENTS.md §8.6）：DSD→DSD 速率转换归 DSD 调制专线；本文件只负责如实告知，
+        // 绝不在这里偷偷换率或改用 DoP（那才是"假成功"）。
+        why = "本设备原生 DSD 仅同速率直通：1-bit 流不进重采样器、也不重调制，"
+              "所以 Native 只能按源位率输出。采样率设置当前是「" + p.rate + "」。"
+              "想升速请用 DoP（PCM 源由 SDM 调制器生成目标档 1-bit，DSD 源重调制后装箱），"
+              "或等 DSD 调制专线提供 DSD→DSD 速率转换；"
+              "要现在就能播，请把「采样率」改成「跟随源」（设置 → 输出 → 采样率；等价写法 src / follow）。";
         return false;
     }
     return true;
@@ -1439,6 +1476,16 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
             meta_on_play(file);   // 播放触发元数据补全(设置可关;inFlight 去重,后台线程)
             std::lock_guard<std::mutex> lk(ps.mtx);
             ps.signal = sig.str();
+            // 输出自证（261025-02 #2）：DirectSDM 与"原生失败⟹DoP 回落"都是 **DoP 封装**
+            // （24-bit 载波里装 1-bit 流）：outRate=载波率、dsdRate=1-bit 位率。
+            // 只看 outRate 会被误读成 PCM，所以必须同时给出 outMode/modOrder=0（无调制）。
+            ps.outMode        = "dop";
+            ps.outDsdLevel    = (srcRate % 48000u == 0) ? (int)(srcRate / 48000u)
+                                                        : (int)(srcRate / 44100u);
+            ps.outDsdRate     = srcRate;
+            ps.outModFamily.clear();
+            ps.outModOrder    = 0;
+            ps.outFallbackWhy = opts.fallbackNote;
             ps.info = (opts.fallbackNote.empty() ? std::string("DirectSDM：")
                                                 : ("原生 DSD 不可用 ⟹ DoP 回落：" + opts.fallbackNote + "；"))
                     + "DSD 源 " + std::to_string(srcRate) + " Hz → DoP " +
@@ -1661,6 +1708,10 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
         // 设置里选的 DSD 档位与源位率不同时：Native 按**源**位率直通（不重调制），必须写明，
         // 否则用户选了"Native 256"却按 64 播放，信号链看起来像"256 没生效"。
         std::string rateNote;
+        // 261025-02 #3/#5：native 只做**同速率**直通。用户要"DSD native 升频"时必须说清
+        // "这台设备做不到什么、替代路径是什么"，而不是只丢一句"设置成跟随源"。
+        // ⚠️ DSD→DSD 速率转换归 **DSD 调制专线**（AGENTS.md §8.6），这里只负责把限制讲明白。
+        std::string rateWhy;
         if (p.dsd >= 64) {
             const uint32_t base = (srcRate % 48000u == 0) ? 48000u : 44100u;
             const uint32_t want = rta::dsp::dsd_rate(p.dsd, base);
@@ -1670,6 +1721,12 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
                     "（设置选的 DSD%d 与源 DSD%d 不同：Native 按源位率直通，不重调制）",
                     p.dsd, (int)(srcRate / base));
                 rateNote = nb;
+                char wb[320];
+                std::snprintf(wb, sizeof(wb),
+                    "本设备原生 DSD 仅同速率直通：请求 DSD%d、源是 DSD%d ⟹ 已按源位率 %u Hz 输出；"
+                    "升速请用 DoP（PCM/DSD 源都能靠 SDM 调制升到目标档）或等 DSD 调制专线提供 DSD→DSD 转换",
+                    p.dsd, (int)(srcRate / base), (unsigned)srcRate);
+                rateWhy = wb;
             }
         }
         // HTTP 层只能看扩展名；"声道改动"要拿到源声道数才判得了，所以在这里补这一条。
@@ -1803,6 +1860,11 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
 
         ps.outRate = srcRate;
         ps.outBits = 1;
+        // 输出自证（261025-02 #2/#5）：native = 1-bit 直送驱动，没有任何调制器参与 ⟹ modOrder=0。
+        // 请求的 DSD 档位与源不同时 rateWhy 非空（那是"升速做不到"的唯一诚实说法）。
+        set_dsd_out_state("native",
+                          (srcRate % 48000u == 0) ? (int)(srcRate / 48000u) : (int)(srcRate / 44100u),
+                          srcRate, std::string(), 0, rateWhy);
         ps.total.store(bitsCount);   // 无 cue = bitsTotal（与旧实现逐位一致）；cue = 本区间样点数
         ps.played.store(0);
         ps.startDb.store(0.0);
@@ -2099,6 +2161,60 @@ static std::string conf_get(const std::string& key, const std::string& def = std
         if (line.substr(0, e) == key) return line.substr(e + 1);
     }
     return def;
+}
+
+// ---------------- ASIO 驱动列表的 JSON（字段名固定，前端按它写）----------------
+// 契约（2026-10-26 用户 261025-02 #4）：
+//   "asioDrivers":[{"name":"AudioByte ASIO","clsid":"{112135E1-...}"}, …]
+//   "asioActive" : 当前设置指向的驱动 CLSID（"" = 未指定，运行时按注册表顺序挑第一个能开的）
+// 为什么必须由一个函数产出：/api/devices、/api/asiodevices、/api/asio 三处都要同一份列表，
+// 各写一遍必然漂移 —— 本轮"下拉只剩兜底项"的一半原因就是端点之间字段名不一致。
+static std::string asio_drivers_json(const std::vector<rta::audio::AsioDriverEntry>& list) {
+    std::string o = "[";
+    for (size_t i = 0; i < list.size(); ++i) {
+        if (i) o += ",";
+        o += "{\"name\":\"" + jesc(list[i].name) + "\",\"clsid\":\"" + jesc(list[i].clsid) + "\"";
+        if (list[i].x86) o += ",\"x86Only\":true";   // 只在 32 位视图注册：64 位宿主开不起来
+        o += "}";
+    }
+    return o + "]";
+}
+
+// 当前生效的 ASIO 驱动。判定口径与 AsioSink::open / play_one_native_dsd 完全一致：
+// 先按 CLSID，再按驱动名（大小写不敏感）；都不匹配 = 空（= 自动挑第一个可用的）。
+static std::string asio_active_clsid(const std::vector<rta::audio::AsioDriverEntry>& list) {
+    const std::string dev = conf_get("device", "");
+    if (dev.empty()) return std::string();
+    if (is_asio_clsid(dev)) {
+        for (const auto& e : list) if (rta::audio::asio_same_str_ci(e.clsid, dev)) return e.clsid;
+        return std::string();
+    }
+    for (const auto& e : list) if (rta::audio::asio_same_str_ci(e.name, dev)) return e.clsid;
+    return std::string();
+}
+
+// 直接拼成可以塞进任意 JSON 对象的片段（调用方自己加前导逗号）。
+static std::string asio_json_fields() {
+    const auto list = rta::audio::asio_enum_drivers();
+    const std::string act = asio_active_clsid(list);
+    std::string nm;
+    for (const auto& e : list) if (!act.empty() && rta::audio::asio_same_str_ci(e.clsid, act)) nm = e.name;
+    return "\"asioDrivers\":" + asio_drivers_json(list) +
+           ",\"asioActive\":\"" + jesc(act) + "\"" +
+           ",\"asioActiveName\":\"" + jesc(nm) + "\"" +
+           ",\"asioDriverCount\":" + std::to_string((long long)list.size());
+}
+
+// 预设探测的"驱动未指定"提醒（用户 261025-02 #4/#5）。
+// 为什么必须有：设置里没指定 ASIO 驱动时，preset_probe_caps 会按注册表顺序挑"第一个 init 成功的"
+// —— 那可能是和用户以为的完全不同的设备。把"能力其实来自哪台驱动"写出来，才不会出现
+// "AudioByte 明明支持原生 DSD，预设却说没有 DSD 通路 ⟹ 降级成 PCM 384000"这种无从解释的现象。
+static std::string preset_auto_driver_note(const rta::engine::DeviceCaps& c) {
+    if (c.backend != "asio") return std::string();
+    if (!conf_get("device", "").empty()) return std::string();
+    return "设置里没有指定 ASIO 驱动：本机能力按「" + c.deviceName +
+           "」（注册表里第一个 init 成功的驱动）报，换成别的驱动结论可能完全不同 —— "
+           "请先在「设置 → 输出 → 设备」选定驱动再套预设";
 }
 
 // 每次播放开始时把「大文件流式」策略刷成配置值：
@@ -2473,7 +2589,16 @@ static std::string preset_caps_json() {
       << ",\"channels\":" << c.channels
       << ",\"bits\":" << c.bits
       << "},\"readonly\":true,\"notes\":[";
-    if (!c.probeNote.empty()) j << "\"" << jesc(c.probeNote) << "\"";
+    // 能力来自哪台设备必须能自证（用户 261025-02 #4/#5）：先写探测说明，再写"驱动未指定"提醒
+    bool wroteNote = false;
+    auto pushNote = [&](const std::string& n) {
+        if (n.empty()) return;
+        if (wroteNote) j << ",";
+        wroteNote = true;
+        j << "\"" << jesc(n) << "\"";
+    };
+    pushNote(c.probeNote);
+    pushNote(preset_auto_driver_note(c));
     j << "]}";
     return j.str();
 }
@@ -2549,6 +2674,27 @@ static std::string preset_apply_json(const std::string& path) {
                                      std::string(prof == PresetProfile::BitPerfect
                                                  ? "，并关闭 ISP 预衰减" : ""));
 
+    // ---- 封装（原生 / DoP）与预设的关系：用户 261025-02 #5「点了 DSD 升频却落了 DoP」----
+    // 预设**刻意不写封装**（dsdnative 保持用户设置）。原因不是懒：原生 DSD 只能直通 DSD 源，
+    // PCM 源必须靠 DoP 的 SDM 调制；把封装自动改成原生，会让下一首 PCM 文件直接被参数门拒绝。
+    // 但用户看不出来"图省事"和"能力不足"的区别 ⟹ 当场把当前封装与设备能力写进响应 + notes。
+    const bool packNative = conf_get("dsdnative", "0") == "1";
+    const std::string packing = packNative ? "native" : "dop";
+    if (s.dsd > 0 && caps.dsdNative && !packNative) {
+        notes.push_back("封装当前是 DoP（本机驱动其实支持原生 DSD，最高 " + caps.dsdNativeMax +
+                        "）：预设不改封装 —— 原生只能同速率直通 DSD 源，PCM 源必须靠 DoP 的 SDM 调制。"
+                        "要 1-bit 直送请在「设置 → 输出 → 封装」改成「原生」（同一首歌的两个听法不同）。");
+    } else if (s.dsd > 0 && !caps.dsdNative) {
+        notes.push_back("本机探测不到原生 DSD 通道（原生 " +
+                        (caps.dsdNativeMax.empty() ? std::string("无") : caps.dsdNativeMax) +
+                        "）⟹ 即使把封装改成「原生」也开不起来；DSD 输出只能走 DoP 载波（PCM/DSD 源都可以）。");
+    }
+
+    {
+        const std::string ad = preset_auto_driver_note(caps);
+        if (!ad.empty()) notes.push_back(ad);
+    }
+
     play_log("PRESET_APPLY profile=" + std::string(preset_profile_name(prof)) +
              " rate=" + s.rate + " filter=" + (s.filter.empty() ? std::string("-") : s.filter) +
              " tapsPerInput=" + std::to_string(s.minTapsPerInput) +
@@ -2571,6 +2717,10 @@ static std::string preset_apply_json(const std::string& path) {
       << ",\"shaper\":\"" << jesc(s.shaper) << "\""
       << ",\"volume\":" << (long long)std::llround(s.volumeDb)
       << ",\"directsdm\":" << s.directSdm
+      // 封装（用户 261025-02 #5）：preset 不改它，但必须让前端能直接显示"这次到底走原生还是 DoP"
+      << ",\"packing\":\"" << packing << "\""
+      << ",\"dsdNativeAvailable\":" << (caps.dsdNative ? "true" : "false")
+      << ",\"dsdNativeMax\":\"" << jesc(caps.dsdNativeMax) << "\""
       << "},\"notes\":[";
     for (size_t i = 0; i < notes.size(); ++i) {
         if (i) j << ",";
@@ -2661,6 +2811,9 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
     g_dbgPeak.store(0.0);
     g_dbgClip.store(0);
     apply_dsd_src_settings(p);
+    // 每次本地播放先复位"输出格式自证"字段：不复位的话 /api/status 会把上一曲的 outMode 当成本次事实
+    // （与 ps.gpu 每曲复位同一个教训，见 261024-04 #8）。真正走 DSD 的分支会重新写。
+    set_dsd_out_state("pcm", 0, 0, std::string(), 0, std::string());
     // ---- Native DSD（ASIO 原生 1-bit）：单独一条路径，与 DoP 完全分开 ----
     // 参数门不满足 ⟹ **明确报错**（绝不静默退回 DoP）：用户选了 Native 却听到 DoP，
     // 本身就是一条会被误判成"成功"的假链路。
@@ -3066,6 +3219,12 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             cfg.outRate = dsdRate;
             cfg.outBits = 24;                         // DoP 固定 24-bit 容器
             cfg.shaper  = rta::dsp::Shaper::None;     // 抖动交给调制器之后的 1-bit 量化
+            // 自证（261025-02 #2）：**PCM 源同样走这里** —— dsd>=64 就是"要 DSD 输出"，
+            // 与源是 PCM 还是 DSD 无关（PCM 源由 SdmModulator 调制出 1-bit 再装箱）。
+            // 这里先把"请求值"写出去；真正的生效阶数由生产者在 stable_sdm_order 之后覆盖。
+            set_dsd_out_state("dop", p.dsd, dsdRate,
+                              p.modFamily.empty() ? std::string("dsd") : p.modFamily,
+                              p.modOrder > 0 ? p.modOrder : 5, directNote);
         }
 
         // 设备能力检查（仅 WASAPI）。HF-01/02/04 接线（2026-10-22）：
@@ -3584,6 +3743,11 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 mcfg.family = rta::dsp::parse_modulator_family(p.modFamily);
                 mcfg.levels = 2;                 // 1-bit (DoP)
                 mcfg.order = rta::dsp::stable_sdm_order(p.modOrder > 0 ? p.modOrder : 5, mcfg.fs, mcfg.levels, mcfg.family);
+                // 生效阶数如实上报（261025-02 #5）：用户填 7 阶、stable_sdm_order 按位率/族下调时，
+                // /api/status 的 modOrder 必须是**实际**值，否则"我选了 EC-7"永远无法证伪。
+                set_dsd_out_state("dop", p.dsd, dsdRate,
+                                  p.modFamily.empty() ? std::string("dsd") : p.modFamily,
+                                  (int)mcfg.order, directNote);
                 mcfg.cutoffHz = (p.modCutoff > 0.0) ? (p.modCutoff * 1000.0) : 100000.0;
                 // 默认 0.0005：1-bit 的量化步长是 2.0，旧默认 0.01 等于注入 -34 dBFS 白噪，
                 // 实测把 DSD64 的带内 SNR 从 89 dB 砍到 54 dB（听感：持续嘶声）。
@@ -7562,26 +7726,26 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
 
     // ASIO 驱动列表（设置页里显示，让用户知道本机有什么 ASIO 后端）
-    if (rq.path.rfind("/api/asio", 0) == 0) {
+    //
+    // ⚠️ 2026-10-26（用户 261025-02 #4）根因修复：这里原来是
+    //     if (rq.path.rfind("/api/asio", 0) == 0)   ← **前缀匹配**
+    //   而 "/api/asiodevices" 正好以 "/api/asio" 开头 ⟹ 请求被这个块吃掉，
+    //   返回的是 {"drivers":["AudioByte ASIO", …]}（**字符串数组、没有 CLSID**），
+    //   可设置页按 {"drivers":[{name,id}]} 解析（ui_script.h 的 loadDeviceList）——
+    //   每个 d.name/d.id 都是 undefined ⟹ 下拉里除了兜底项「（第一个可用驱动）」什么都建不出来。
+    //   现在改成**精确路径匹配**（允许带 ?query），并把同一份 asioDrivers 一起给出去。
+    // 精确匹配 "/api/asio"（长度 9）；后面只能是结尾或 '?'。这样 "/api/asiodevices" 不会被吞。
+    if (rq.path.compare(0, 9, "/api/asio") == 0 &&
+        (rq.path.size() == 9 || rq.path[9] == '?')) {
         ct = "application/json; charset=utf-8";
+        const auto list = rta::audio::asio_enum_drivers();
         std::ostringstream j;
-        j << "{\"ok\":true,\"drivers\":[";
-        HKEY hk = nullptr;
-        bool first = true;
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\ASIO", 0, KEY_READ, &hk) == ERROR_SUCCESS) {
-            for (DWORD i = 0;; ++i) {
-                wchar_t name[256];
-                DWORD len = 256;
-                if (RegEnumKeyExW(hk, i, name, &len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
-                char buf[512] = {0};
-                WideCharToMultiByte(CP_UTF8, 0, name, -1, buf, sizeof(buf) - 1, nullptr, nullptr);
-                if (!first) j << ",";
-                first = false;
-                j << "\"" << jesc(buf) << "\"";
-            }
-            RegCloseKey(hk);
+        j << "{\"ok\":true,\"drivers\":[";          // 兼容旧调用方：驱动名数组
+        for (size_t i = 0; i < list.size(); ++i) {
+            if (i) j << ",";
+            j << "\"" << jesc(list[i].name) << "\"";
         }
-        j << "]}";
+        j << "]," << asio_json_fields() << "}";
         return j.str();
     }
 
@@ -7598,7 +7762,10 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             j << "{\"id\":\"" << jesc(d.id) << "\",\"name\":\"" << jesc(d.name) << "\""
               << ",\"default\":" << (d.isDefault ? "true" : "false") << "}";
         }
-        j << "]}";
+        // ASIO 驱动一起带出（用户 261025-02 #4）：设置页切到 ASIO 后端时**不必再单独打一个端点**，
+        // 一个 /api/devices 就能把"WASAPI 端点 + ASIO 驱动 + 当前生效驱动"全部填进同一个下拉。
+        // 字段名固定：asioDrivers[{name,clsid}] / asioActive（CLSID，空=自动挑第一个可用的）。
+        j << "]," << asio_json_fields() << "}";
         return j.str();
     }
 
@@ -7707,17 +7874,20 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
 
     // ASIO 驱动列表（后端下拉里选 ASIO 时用它填设备）
+    // 字段（用户 261025-02 #4 定死）：
+    //   drivers[{name,id}]        ← 旧契约，id = CLSID（保留，避免已发布脚本/旧页面断掉）
+    //   asioDrivers[{name,clsid}] ← 新契约（与 /api/devices 同一份，字段名一致）
+    //   asioActive                ← 当前设置指向的 CLSID（"" = 未指定）
     if (rq.path.rfind("/api/asiodevices", 0) == 0) {
         ct = "application/json; charset=utf-8";
+        const auto list = rta::audio::asio_enum_drivers();
         std::ostringstream j;
         j << "{\"ok\":true,\"drivers\":[";
-        bool first = true;
-        for (const auto& e : rta::audio::asio_enum_drivers()) {
-            if (!first) j << ",";
-            first = false;
-            j << "{\"name\":\"" << jesc(e.name) << "\",\"id\":\"" << jesc(e.clsid) << "\"}";
+        for (size_t i = 0; i < list.size(); ++i) {
+            if (i) j << ",";
+            j << "{\"name\":\"" << jesc(list[i].name) << "\",\"id\":\"" << jesc(list[i].clsid) << "\"}";
         }
-        j << "]}";
+        j << "]," << asio_json_fields() << "}";
         return j.str();
     }
 
@@ -8677,7 +8847,19 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
           // 2026-10-23（用户 261023-02 #1）：status 也带上 bit-perfect 结论，
           // 让底栏徽标不用额外请求 /api/signal 就能显示（轮询已经是 400ms 一次）。
           << ",\"bitPerfect\":\"" << jesc(ps.bpState) << "\""
-          << ",\"bitPerfectWhy\":\"" << jesc(ps.bpWhy) << "\"";
+          << ",\"bitPerfectWhy\":\"" << jesc(ps.bpWhy) << "\""
+          // ---- 输出格式自证（用户 261025-02 #2/#4/#5）----
+          // 底栏只拿到 outRate 时，DoP 的载波率（DSD128 48k 族 = 384000）必然被误读成"PCM 升频"。
+          // 这五个字段是唯一的真相源：outMode=dop + dsdRate=6144000 就能一眼看出是真 DSD。
+          << ",\"outMode\":\"" << jesc(castMode ? std::string("pcm") : ps.outMode) << "\""
+          << ",\"dsd\":" << (castMode ? 0 : ps.outDsdLevel)
+          << ",\"dsdRate\":" << (castMode ? 0u : ps.outDsdRate)
+          << ",\"modFamily\":\"" << jesc(castMode ? std::string() : ps.outModFamily) << "\""
+          << ",\"modOrder\":" << (castMode ? 0 : ps.outModOrder)
+          << ",\"fallbackWhy\":\""
+          << jesc(castMode
+                  ? std::string("UPnP 投放：输出格式与采样率由远端渲染器决定（本机 DSP 未介入，无法自证）")
+                  : ps.outFallbackWhy) << "\"";
         const MetaSettings msStat = meta_settings_load();
         bool hasKeyStat = false;
         {
