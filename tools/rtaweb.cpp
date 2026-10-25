@@ -4488,6 +4488,15 @@ static bool cover_has_disk(const std::string& key) {
 }
 
 // 请求线程专用：读正缓存字节（≤ 8 MB）。
+// 按文件头给 Content-Type（用户手动设置的封面可能是 PNG/WEBP）
+static const char* cover_mime_of(const std::vector<unsigned char>& b) {
+    if (b.size() >= 8 && b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G') return "image/png";
+    if (b.size() >= 3 && b[0] == 0xFF && b[1] == 0xD8) return "image/jpeg";
+    if (b.size() >= 12 && b[0] == 'R' && b[1] == 'I' && b[8] == 'W' && b[9] == 'E') return "image/webp";
+    if (b.size() >= 4 && b[0] == 'G' && b[1] == 'I' && b[2] == 'F') return "image/gif";
+    return "image/jpeg";
+}
+
 static bool cover_read_cached(const std::string& key, std::vector<unsigned char>& out) {
     if (key.empty()) return false;
     const std::string p = cover_paths(key).jpg;
@@ -6299,7 +6308,7 @@ static bool is_side_effect_path(const std::string& p) {
         "/api/artist/prefetch",
         // 专辑封面预热（2026-10-26）：会落盘 covercache + 打网络。
         // 只读端点是 /api/lib/cover（单张）与 /api/lib/cover/progress（进度）。
-        "/api/lib/cover/prefetch",
+        "/api/lib/cover/prefetch", "/api/lib/cover/set",
     };
     for (const char* k : kNeedPost) {
         const size_t n = std::strlen(k);
@@ -6659,7 +6668,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                   << "\",\"artist\":\"" << jesc(a.artist) << "\",\"year\":" << a.year
                   << ",\"n\":" << a.nTracks << ",\"dur\":" << a.duration
                   << ",\"sr\":" << sr << ",\"bits\":" << bits
-                  << ",\"cv\":" << (a.hasCover ? "true" : "false")
+                  // 2026-10-26：cv 的语义 = **有图可显示**（内嵌/同目录 或 网图缓存），
+                  // 不然前端只判 cv 会把 46 张网图吞掉（实测 AFTER 仍是 118/181）。
+                  << ",\"cv\":" << ((a.hasCover || csrc == "net") ? "true" : "false")
                   << ",\"cvSrc\":\"" << csrc << "\"";
                 if (csrc == "net") j << ",\"cvUrl\":\"/api/lib/cover?k=" << a.key << "\"";
                 j << "}";
@@ -6678,7 +6689,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             const std::string csrc = cover_src_of(a.key, a.hasCover);
             j << "{\"ok\":true,\"k\":\"" << a.key << "\",\"name\":\"" << jesc(a.name)
               << "\",\"artist\":\"" << jesc(a.artist) << "\",\"year\":" << a.year
-              << ",\"dur\":" << a.duration << ",\"cv\":" << (a.hasCover ? "true" : "false")
+              << ",\"dur\":" << a.duration
+              << ",\"cv\":" << ((a.hasCover || csrc == "net") ? "true" : "false")
               << ",\"cvSrc\":\"" << csrc << "\"";
             if (csrc == "net") j << ",\"cvUrl\":\"/api/lib/cover?k=" << a.key << "\"";
             j << ",\"tracks\":[";
@@ -6798,6 +6810,43 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             return j.str();
         }
         // ---- 一张封面（只读；零网络，见文件中部「专辑封面在线抓取」注释）----
+        // 2026-10-26（261026-02 #3 的人工兜底）：用户手动给某张专辑指定封面。
+        // 为什么要它：同人自出版专辑在网易/QQ/iTunes 全都查不到、文件里也没有图（实测 17/181），
+        // 程序再怎么抓也抓不到 —— 这类只能由用户挑一张图。落盘到 covercache（**不改动音乐文件**）。
+        // 契约：POST /api/lib/cover/set?k=<专辑键>，body = 图片原始字节（jpg/png/webp/gif），≤24 MB。
+        if (rq.path.rfind("/api/lib/cover/set", 0) == 0) {
+            std::string key;
+            const size_t qp = rq.path.find("?k=");
+            if (qp != std::string::npos) key = urlDecode(rq.path.substr(qp + 3));
+            std::string kk;
+            for (char c : key) if (std::isxdigit((unsigned char)c)) kk.push_back((char)std::tolower((unsigned char)c));
+            // 专辑键必须是平台生成的 16 位十六进制（fnv_hex 的长度）：这样什么都没有的垃圾输入
+            // （例如 k=..\..\windows\win.ini 里恰好含 hex 字符 "d"）不会莫名其妙写出一张 d.jpg。
+            if (kk.size() != 16) return "{\"ok\":false,\"error\":\"专辑键非法（应为 16 位十六进制）\"}";
+            if (rq.body.size() < 1024) return "{\"ok\":false,\"error\":\"图片太小（<1KB）\"}";
+            if (rq.body.size() > 24u * 1024u * 1024u) return "{\"ok\":false,\"error\":\"图片超过 24MB\"}";
+            const std::vector<unsigned char> body(rq.body.begin(), rq.body.end());
+            if (!cover_looks_like_image(body)) return "{\"ok\":false,\"error\":\"不是可识别的图片（jpg/png/webp/gif）\"}";
+            const CoverPaths pp = cover_paths(kk);
+            std::error_code ec;
+            fs::create_directories(fs::u8path(pp.dir), ec);
+            const std::string tmp = pp.jpg + ".part";
+            {
+                std::ofstream f(fs::u8path(tmp), std::ios::binary | std::ios::trunc);
+                if (!f) return "{\"ok\":false,\"error\":\"无法写入 covercache\"}";
+                f.write(rq.body.data(), (std::streamsize)rq.body.size());
+                f.flush();
+                if (!f) return "{\"ok\":false,\"error\":\"写入失败（磁盘满？）\"}";
+            }
+            std::error_code em;
+            if (!MoveFileExW(widen(tmp).c_str(), widen(pp.jpg).c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                fs::rename(fs::u8path(tmp), fs::u8path(pp.jpg), em);
+                if (em) { fs::remove(fs::u8path(tmp), em); return "{\"ok\":false,\"error\":\"改名失败\"}"; }
+            }
+            fs::remove(fs::u8path(pp.none), em);
+            play_log("COVERSET k=" + kk + " bytes=" + std::to_string((long long)rq.body.size()));
+            return std::string("{\"ok\":true,\"k\":\"") + kk + "\",\"bytes\":" + std::to_string((long long)rq.body.size()) + "}";
+        }
         if (rq.path.rfind("/api/lib/cover", 0) == 0) {
             std::string key;
             const size_t p = rq.path.find("?k=");
@@ -6820,7 +6869,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 // ② 磁盘正缓存（网图）
                 bytes.clear();
                 mime = "image/jpeg";
-                if (cover_read_cached(key, bytes)) src = "net";
+                if (cover_read_cached(key, bytes)) { src = "net"; mime = cover_mime_of(bytes); }
             }
             const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - t0).count();

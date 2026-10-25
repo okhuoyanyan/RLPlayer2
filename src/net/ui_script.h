@@ -979,6 +979,10 @@ function openAlbum(k) {
             '<div class=sub>' + sub.join(' \u00b7 ') + '</div>' +
             '<button class="btn pri" id=albPlayAll aria-label="播放整张专辑" title="' + albPlayTitle + '">' + albPlayText + '</button> ' +
             '<button class=btn id=aAdd>加入队列</button> ' +
+            // 2026-10-26（261026-02 #3）：找不到封面的专辑（同人自出版，全网没有）允许用户自己挑一张图，
+            // 存进 covercache（**不动音乐文件**）——这是把「99%」补到 100% 的人工通道。
+            '<button class=btn id=aSetCover title="为这张专辑指定一张封面图（存到本地缓存，不改动音乐文件）">设置封面</button> ' +
+            '<input type=file id=aCoverFile accept="image/*" style="display:none"> ' +
             '<button class=btn id=aShuf>随机播放</button>' +
             '</div></div>';
 
@@ -1073,6 +1077,23 @@ function openAlbum(k) {
     if (D('aPlay')) D('aPlay').onclick = function () { playAlbum(j.k, 0); };
     D('aAdd').onclick = function () { enqueueAlbum(j.k); };
     D('aShuf').onclick = function () { playAlbum(j.k, Math.floor(Math.random() * j.tracks.length)); };
+    // 2026-10-26（261026-02 #3）：人工补封面（同人自出版专辑全网无图时的唯一出路；存 covercache，不动音乐文件）
+    if (D('aSetCover')) D('aSetCover').onclick = function () { D('aCoverFile').click(); };
+    if (D('aCoverFile')) D('aCoverFile').onchange = function (ev) {
+      var f = ev.target.files && ev.target.files[0];
+      if (!f) return;
+      var x = new XMLHttpRequest();
+      x.open('POST', '/api/lib/cover/set?k=' + encodeURIComponent(j.k));
+      x.onload = function () {
+        try {
+          var r = JSON.parse(x.responseText);
+          if (r && r.ok) { toast('封面已设置'); openAlbum(j.k); }
+          else { toast('设置失败：' + ((r && r.error) || '未知原因')); }
+        } catch (e) { toast('设置失败：响应无法解析'); }
+      };
+      x.onerror = function () { toast('设置失败：网络错误'); };
+      x.send(f);
+    };
     Array.prototype.forEach.call(D('list').querySelectorAll('.fav-btn'), function (btn) {
       btn.onclick = function (ev) {
         ev.stopPropagation();

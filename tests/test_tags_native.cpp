@@ -488,23 +488,10 @@ struct AbResult {
 //   * 「原生错」⟹ 仍然 FAIL；
 //   * 「ffprobe 是占位、原生是真名」⟹ 记为 allowedImprove（有上限），并用专门断言钉住。
 static bool tgIsPlaceholderTag(const std::string& s) {
-    if (s.empty()) return false;
-    size_t q = 0, other = 0;
-    for (size_t i = 0; i < s.size();) {
-        const unsigned char c = (unsigned char)s[i];
-        size_t len = c < 0x80 ? 1 : (c >> 5 == 0x6 ? 2 : (c >> 4 == 0xE ? 3 : (c >> 3 == 0x1E ? 4 : 1)));
-        if (len == 1) {
-            const char ch = s[i];
-            if (ch == '?') { ++q; ++i; continue; }
-            if (ch == ' ' || ch == '\t' || (ch >= '0' && ch <= '9')) { ++i; continue; }
-            ++other; ++i; continue;
-        }
-        // 全角问号 U+FF1F
-        if (len == 3 && i + 2 < s.size() && (unsigned char)s[i] == 0xEF &&
-            (unsigned char)s[i + 1] == 0xBC && (unsigned char)s[i + 2] == 0x9F) { ++q; i += 3; continue; }
-        ++other; i += len;
-    }
-    return q > 0 && other == 0;
+    // 261026-02 #4：口径改成与实现**同一份**判据（src/meta/tags_native.h 的 tag_is_corrupt），
+    // 否则"混合占位 -> 真名"这类已解释的改进会被当成"原生错"。
+    // 说明：这里的函数名保留旧名，避免改动十几处调用点；语义是"这个值是不是坏的（问号占大头）"。
+    return rta::meta::native::detail::tag_is_corrupt(s);
 }
 static int g_allowedImprove = 0;
 
@@ -1330,6 +1317,308 @@ static void wavSpecial(const fs::path& root) {
     fs::remove_all(work, ec);
 }
 
+// ===========================================================================
+// [6] 261026-02 #4「问号标签智能修复」：**合成夹具**逐条判据（铁律 3：每条规则都能被单独否定）
+//
+// 规则（都在 src/meta/tags_native.h，判据与实现一一对应）：
+//   R1 同键择优（跨块）：cur 残缺、cand 不残缺、长度差 <= 3 倍 ⟹ 取 cand。
+//   R1b 同键拼接：两来源码点数等长（或 <= 2 倍）时，把 cur 里的 '?' 用 cand 同位字符补上。
+//   R2 只覆盖残缺值：正常值**一个字节都不改**（下面 6 组反向夹具点名叫板）。
+//   R3 文件名兜底：只对残缺值生效；推不出来就保持原样；总开关 RLPLAYER_TAG_GUESS=0 整体关闭。
+// 夹具形态覆盖：INFO 纯占位+ID3 真名 / INFO 混合占位+ID3 真名 / 两边都占位 / 两边都正常 /
+//   MP3 占位+文件名正常 / FLAC 占位+文件名正常 / MP3+FLAC 两边都占位（不许编造）/
+//   文件名六种形态（NN. Title / Artist - Title / 中文括号前缀 / 纯英文 / 日文 / 全角括号）。
+// ===========================================================================
+static size_t countQ(const std::string& s) {
+    size_t n = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '?') ++n;
+        else if ((unsigned char)s[i] == 0xEF && i + 2 < s.size() &&
+                 (unsigned char)s[i + 1] == 0xBC && (unsigned char)s[i + 2] == 0x9F) { ++n; i += 2; }
+    }
+    return n;
+}
+static void tagGuessFixtures(const fs::path& dir) {
+    std::printf("\n== [6] 问号标签智能修复：合成夹具 ==\n");
+    using rta::meta::native::detail::qm_guess_title_from_filename;
+    using rta::meta::native::detail::qm_guess_artist_from_filename;
+    using rta::meta::native::detail::tag_is_corrupt;
+    using rta::meta::native::detail::tag_better_replaces;
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    // ---- R1/R2 纯函数判据（不碰文件）----
+    ck(tag_is_corrupt("??????????????"), "R1 纯占位判残缺");
+    ck(tag_is_corrupt("????? (Chinese Tea)"), "R1 混合占位（CJK 段变问号 + ASCII 尾巴）判残缺");
+    ck(tag_is_corrupt("Palace Memories NHK???????????????????????I"), "R1 长混合占位判残缺");
+    ck(!tag_is_corrupt("U.N.\xE3\x82\xAA\xE3\x83\xBC\xE3\x82\xA8\xE3\x83\xB3\xE3\x81\xAF\xE5\xBD\xBC\xE5\xA5\xB3\xE3\x81\xAA\xE3\x81\xAE\xE3\x81\x8B\xEF\xBC\x9F"),
+       "R2 正常日文标题（末尾一个全角问号）**不**判残缺");
+    ck(!tag_is_corrupt("May I May I\xEF\xBC\x9F"), "R2 \"May I May I？\" 不判残缺");
+    ck(!tag_is_corrupt("TV\xE3\x82\xA2\xE3\x83\x8B\xE3\x83\xA1"), "R2 正常日文不判残缺");
+    ck(!tag_is_corrupt(""), "R2 空串不判残缺（空值另有口径）");
+    ck(tag_better_replaces("???", "\xE4\xB8\x8D\xE7\x94\xB1\xE5\xB7\xB1"), "R1 残缺 -> 完好：可覆盖");
+    ck(!tag_better_replaces("\xE8\x92\xBC\xE6\x96\x87", "\xE6\x81\x8B\xE6\x96\x87"), "R2 正常 -> 正常：**不许**覆盖");
+    ck(!tag_better_replaces("??", std::string(200, 'x')), "R1 长度差 > 3 倍：不覆盖（防误配）");
+
+    // ---- R3 文件名推导（六种形态）----
+    struct G { std::string path, artist, albumArtist, want; };
+    const G gs[] = {
+        { "D:/m/01. Foo Bar.flac",                       "",      "", "Foo Bar" },                    // NN. Title
+        { "D:/m/03. \xE3\x82\xB9\xE3\x82\xAB\xE3\x83\xBC.wav", "", "", "\xE3\x82\xB9\xE3\x82\xAB\xE3\x83\xBC" }, // NN. 日文
+        // "Artist - Title"：**艺人未知时不去前缀**（" - " 两边谁是谁无法判定，去了就可能把艺人的名字
+        // 当成曲名）。只有标签里的 artist 与该段一致时才去 —— 下一组用 artist="Artist" 验证。
+        { "D:/m/Artist - My Song.mp3",                   "",      "", "Artist - My Song" },
+        { "D:/m/Artist - My Song.mp3",                   "Artist", "", "My Song" },
+        { "D:/m/\xE5\x99\xA8\xE4\xB9\x90\xEF\xBC\x88\xE9\x92\xA2\xE7\x90\xB4\xEF\xBC\x89 - Sonata (Live).wav", "", "",
+          "Sonata (Live)" },                                                                             // 中文括号前缀
+        { "D:/m/\xE5\x99\xA8\xE4\xB9\x90\xEF\xBC\x88\xE9\x92\xA2\xE7\x90\xB4\xEF\xBC\x89- Moonlight.wav", "", "",
+          "Moonlight" },                                                                                 // 全角括号无空格
+        { "D:/m/05. (Bonus) Track Two.wav",              "",      "", "(Bonus) Track Two" },         // 括号但**没有**连字符：不剥
+        { "D:/m/01. 7PM.flac",                           "",      "", "7PM" },                       // 两码点标题可过
+        { std::string("D:/m/") + "\xE9" "\x9F" "\xB3" "\xE8" "\xBD" "\xA8" "01.wav", "", "", "" },
+    };
+    for (const auto& g : gs) {
+        const std::string got = qm_guess_title_from_filename(g.path, g.artist, g.albumArtist);
+        ck(got == g.want, "R3 文件名推导：" + U8(fs::path(W(g.path)).filename()) + " ⟹ [" + g.want + "]",
+           "得到 [" + got + "]");
+    }
+    ck(qm_guess_artist_from_filename("D:/m/Artist - My Song.mp3") == "Artist", "R3 艺术家推导：Artist - Title");
+    ck(qm_guess_artist_from_filename("D:/m/01. \xE6\x9C\xAA\xE7\x9F\xA5\xE8\x89\xBA\xE6\x9C\xAF\xE5\xAE\xB6 - \xE9\x9F\xB3\xE8\xBD\xA8" "01.wav").empty(),
+       "R3 艺术家推导：\"未知艺术家 - 音轨01\" **不**猜（占位词 + 曲目占位）");
+    ck(qm_guess_artist_from_filename("D:/m/\xEF\xBC\x88\xE9\x92\xA2\xE7\x90\xB4\xEF\xBC\x89 - Sonata.wav").empty(),
+       "R3 艺术家推导：以全角括号开头的段**不是**艺人");
+
+    // ---- 真实容器夹具：WAV ----
+    auto wavCase = [&](const char* name,
+                       std::vector<std::pair<std::string, std::string>> info, bool id3,
+                       std::string t0, std::string a0, std::string al0,
+                       std::string wt, std::string wa, std::string wal,
+                       bool expectNative) {
+        WavSpec s;
+        s.frames = 441;                       // 10 ms，够解析就行
+        s.info = info;
+        s.id3chunk = id3;
+        s.id3Title = t0; s.id3Artist = a0; s.id3Album = al0;
+        const fs::path p = dir / W(name);
+        writeFile(p, buildWav(s));
+        TagInfo t;
+        std::string why;
+        const bool ok = rta::meta::native::probe_file(U8(p), &t, &why);
+        ck(ok == expectNative, std::string("WAV 夹具解析状态：") + name, why);
+        if (ok) ck(t.title == wt && t.artist == wa && t.album == wal,
+                   std::string("WAV 夹具取值：") + name,
+                   "title=[" + t.title + "] artist=[" + t.artist + "] album=[" + t.album + "]");
+        return ok;
+    };
+    // W1 INFO 纯占位 + ID3 真名 ⟹ 取 ID3
+    wavCase("qm_pure_then_id3.wav",
+            { {"INAM", "?????????????????????"}, {"IART", "????"}, {"IPRD", "??????"} }, true,
+            "\xE3\x81\x84\xE3\x81\xAE\xE3\x81\xA1\xE3\x80\x82", "\xE4\xB8\x8A\xE6\x9D\xBE", "\xE6\x9D\xB1\xE6\x96\xB9",
+            "\xE3\x81\x84\xE3\x81\xAE\xE3\x81\xA1\xE3\x80\x82", "\xE4\xB8\x8A\xE6\x9D\xBE", "\xE6\x9D\xB1\xE6\x96\xB9", true);
+    // W2 INFO 混合占位 + ID3 真名 ⟹ 取 ID3（已剔除的"纯占位"判据认不出这一类）
+    wavCase("qm_mixed_then_id3.wav",
+            { {"INAM", "????? (Chinese Tea)"}, {"IPRD", "?????"} }, true,
+            "\xE4\xB8\x8A\xE6\xB5\xB7\xE7\xB4\x85\xE8\x8C\xB6\xE9\xA4\xA8 (Chinese Tea)", "", "\xE6\x9D\xB1\xE6\x96\xB9\xE5\xAD\x90\xE5\xAE\x88\xE5\x94\x84",
+            "\xE4\xB8\x8A\xE6\xB5\xB7\xE7\xB4\x85\xE8\x8C\xB6\xE9\xA4\xA8 (Chinese Tea)", "", "\xE6\x9D\xB1\xE6\x96\xB9\xE5\xAD\x90\xE5\xAE\x88\xE5\x94\x84", true);
+    // W3 两边都占位 ⟹ 保持占位（本例文件名 "qm_both_placeholder" 可读，会触发 R3 文件名兜底；
+    // 所以这里额外用**文件名无可推导内容**的 "c.wav" 来单独验证"两边都占位时不编造"）
+    {
+        WavSpec s; s.frames = 441; s.info = { {"INAM", "??????"} }; s.id3chunk = true; s.id3Title = "??????";
+        const fs::path p = dir / L"c.wav";
+        writeFile(p, buildWav(s));
+        TagInfo t; std::string why;
+        const bool ok = rta::meta::native::probe_file(U8(p), &t, &why);
+        ck(ok && t.title == "??????", "W3 两边都占位 + 文件名无信息 ⟹ 保持占位（不编造）", t.title + " " + why);
+    }
+    wavCase("7.wav",
+            { {"INAM", "??????"} }, true, "??????", "", "",
+            "??????", "", "", true);
+    // W4 两边都正常且**不同** ⟹ 保持 INFO（先到先得口径不变，正常值一个字节都不改）
+    wavCase("qm_both_good.wav",
+            { {"INAM", "InfoTitle"}, {"IART", "InfoArtist"} }, true, "ID3Title", "ID3Artist", "",
+            "InfoTitle", "InfoArtist", "", true);
+    // W5 id3 在前、INFO 正常 ⟹ 仍是 ID3（先到先得），不许因为"新规则"被改
+    {
+        WavSpec s; s.frames = 441; s.id3chunk = true; s.id3First = true;
+        s.id3Title = "FirstWins"; s.info = { {"INAM", "LaterInfo"} };
+        const fs::path p = dir / L"qm_id3_first.wav";
+        writeFile(p, buildWav(s));
+        TagInfo t; std::string why;
+        ck(rta::meta::native::probe_file(U8(p), &t, &why) && t.title == "FirstWins",
+           "R2 先到先得仍是先到先得（id3 在前、两边都正常 ⟹ 取 ID3）", t.title + " " + why);
+    }
+    // W6 残缺标题 + 文件名正常 ⟹ 文件名兜底（INFO/ID3 都残）
+    {
+        WavSpec s; s.frames = 441; s.info = { {"INAM", "??????"} };
+        const fs::path p = dir / L"qm_name_fallback.wav";
+        writeFile(p, buildWav(s));
+        TagInfo t; std::string why;
+        const bool ok = rta::meta::native::probe_file(U8(p), &t, &why);
+        ck(ok && t.title == "qm_name_fallback", "R3 残缺标题 ⟹ 用文件名兜底", t.title + " " + why);
+    }
+    // W7 残缺标题 + 文件名推不出有效名字 ⟹ 保持原样（不编造）
+    // 注：Windows 文件名里不可能出现 '?'，所以"文件名也占位"只能表现为"文件名没有信息"——
+    // 这里用"标题被摘干净后只剩单码点"的文件名（"a.wav"），推出来不满足 >=2 码点 ⟹ 不采用。
+    {
+        WavSpec s; s.frames = 441; s.info = { {"INAM", "??????"} };
+        const fs::path p = dir / L"a.wav";
+        writeFile(p, buildWav(s));
+        TagInfo t; std::string why;
+        const bool ok = rta::meta::native::probe_file(U8(p), &t, &why);
+        ck(ok && t.title == "??????", "R3 文件名推不出有效名字 ⟹ 不编造，保持原样", t.title + " " + why);
+    }
+
+    // ---- MP3 / FLAC：占位标题 + 正常文件名 / 都占位 ----
+    {
+        Mp3Spec s; s.title = "?????"; s.artist = "KnownArtist";
+        const fs::path p = dir / L"06. Real Mp3 Title.mp3";
+        writeFile(p, buildMp3(s));
+        TagInfo t; std::string why;
+        const bool ok = rta::meta::native::probe_file(U8(p), &t, &why);
+        ck(ok && t.title == "Real Mp3 Title" && t.artist == "KnownArtist",
+           "R3 MP3 占位标题 + 正常文件名 ⟹ 文件名兜底（artist 不受影响）",
+           "title=[" + t.title + "] artist=[" + t.artist + "] " + why);
+    }
+    {
+        Mp3Spec s; s.title = "?????"; s.artist = "";
+        const fs::path p = dir / L"b.mp3";                 // 文件名无可推导内容 ⟹ 保持占位
+        writeFile(p, buildMp3(s));
+        TagInfo t; std::string why;
+        const bool ok = rta::meta::native::probe_file(U8(p), &t, &why);
+        ck(ok && t.title == "?????", "R3 MP3 占位标题 + 文件名无信息 ⟹ 保持原样", t.title + " " + why);
+    }
+    {
+        FlacSpec s;
+        s.tags = { {"TITLE", "?????"}, {"ARTIST", "SomeArtist"} };
+        const fs::path p = dir / L"07. Real Flac Title.flac";
+        writeFile(p, buildFlac(s));
+        TagInfo t; std::string why;
+        const bool ok = rta::meta::native::probe_file(U8(p), &t, &why);
+        ck(ok && t.title == "Real Flac Title", "R3 FLAC 占位标题 + 正常文件名 ⟹ 文件名兜底",
+           "title=[" + t.title + "] " + why);
+    }
+    {
+        FlacSpec s;
+        s.tags = { {"TITLE", "Good Title"}, {"ARTIST", "Good Artist"} };
+        const fs::path p = dir / L"08. Unrelated Name.flac";
+        writeFile(p, buildFlac(s));
+        TagInfo t; std::string why;
+        const bool ok = rta::meta::native::probe_file(U8(p), &t, &why);
+        ck(ok && t.title == "Good Title" && t.artist == "Good Artist",
+           "R2 正常标签**不许**被文件名改（FLAC）", t.title + "/" + t.artist);
+    }
+
+    // ---- 总开关：RLPLAYER_TAG_GUESS=0 ⟹ 文件名兜底与跨块择优全关，行为回到 261025-02 ----
+    {
+        _putenv_s("RLPLAYER_TAG_GUESS", "0");
+        WavSpec s; s.frames = 441; s.info = { {"INAM", "??????"} };
+        const fs::path p = dir / L"qm_switch_off.wav";
+        writeFile(p, buildWav(s));
+        TagInfo t; std::string why;
+        const bool ok = rta::meta::native::probe_file(U8(p), &t, &why);
+        ck(ok && t.title == "??????", "开关 OFF：文件名兜底关闭（保持占位原值）", t.title);
+        WavSpec m; m.frames = 441; m.id3chunk = true;
+        m.info = { {"INAM", "????? (Chinese Tea)"} };
+        m.id3Title = "\xE4\xB8\x8A\xE6\xB5\xB7\xE7\xB4\x85\xE8\x8C\xB6\xE9\xA4\xA8 (Chinese Tea)";
+        const fs::path p2 = dir / L"qm_switch_off2.wav";
+        writeFile(p2, buildWav(m));
+        TagInfo t2; std::string why2;
+        const bool ok2 = rta::meta::native::probe_file(U8(p2), &t2, &why2);
+        ck(ok2 && t2.title == "????? (Chinese Tea)", "开关 OFF：跨块择优关闭（INFO 的混合占位仍是先到先得）",
+           t2.title);
+        _putenv_s("RLPLAYER_TAG_GUESS", "1");
+        TagInfo t3; std::string why3;
+        ck(rta::meta::native::probe_file(U8(p2), &t3, &why3) &&
+               t3.title == "\xE4\xB8\x8A\xE6\xB5\xB7\xE7\xB4\x85\xE8\x8C\xB6\xE9\xA4\xA8 (Chinese Tea)",
+           "开关 ON：同一条夹具被修好（证明开关真的起作用）", t3.title);
+    }
+
+}
+
+
+// ---------------------------------------------------------------------------
+// [7] 261026-02 #4 真实库判据：MUSIC 全量逐文件跑**两条路径**
+//   (a) RLPLAYER_TAG_GUESS=1（智能修复开）
+//   (b) RLPLAYER_TAG_GUESS=0（关，= 261025-02 的行为）
+// 判据：
+//   1) **非占位标签零改动**：repair 里没有任何 '?' 的字段，开/关两次必须逐字节相同。
+//      （这是"正常标签一个字节都不许改"的直接证据，不看汇总，逐字段比。）
+//   2) 修前带 '?' 的行数 -> 修后行数，逐行打印「原值 -> 新值」。
+//   3) 修复只减不增：修复后带 '?' 的行数必须 <= 修前。
+// 只做只读探测（probe_file），不写库、不碰索引，不起 ffprobe。
+// ---------------------------------------------------------------------------
+static void tagGuessRealLibrary(const fs::path& root) {
+    std::printf("\n== [7] 问号标签智能修复：真实库逐条对比 ==\n");
+    const fs::path music = root / "MUSIC";
+    std::error_code ec;
+    std::vector<std::string> files;
+    if (fs::is_directory(music, ec)) {
+        for (auto& de : fs::recursive_directory_iterator(music, fs::directory_options::skip_permission_denied, ec)) {
+            if (!de.is_regular_file(ec)) continue;
+            const std::string e = rta::meta::native::detail::lower_ext(U8(de.path()));
+            if (e == ".flac" || e == ".wav" || e == ".wave" || e == ".mp3" || e == ".ogg") files.push_back(U8(de.path()));
+        }
+    }
+    if (files.empty()) {
+        std::printf("  [WARN] 没有 MUSIC（或没有可解析文件），本节**未覆盖真实库**（铁律 4：不假装覆盖）\n");
+        return;
+    }
+    struct Row { std::string file; TagInfo on, off; };
+    std::vector<Row> rows;
+    int zeroChangeViolations = 0, reparsedOn = 0;
+    std::string firstViolation;
+    for (const auto& f : files) {
+        _putenv_s("RLPLAYER_TAG_GUESS", "0");
+        Row r; r.file = f;
+        const bool okOff = rta::meta::native::probe_file(f, &r.off, nullptr);
+        _putenv_s("RLPLAYER_TAG_GUESS", "1");
+        const bool okOn = rta::meta::native::probe_file(f, &r.on, nullptr);
+        if (!okOff || !okOn) continue;            // 回退 ffprobe 的文件不参与（本节只测原生通道）
+        ++reparsedOn;
+        // 判据 1：repair 值里"没有任何 '?'"的字段，必须与关闭时逐字节相同
+        auto cmp = [&](const char* name, const std::string& a, const std::string& b) {
+            if (countQ(a) != 0) return;            // 只检查"非占位"字段
+            if (a == b) return;
+            ++zeroChangeViolations;
+            if (firstViolation.empty())
+                firstViolation = std::string(name) + " @ " + r.file + " off=[" + a + "] on=[" + b + "]";
+        };
+        cmp("title", r.off.title, r.on.title);
+        cmp("artist", r.off.artist, r.on.artist);
+        cmp("album", r.off.album, r.on.album);
+        rows.push_back(std::move(r));
+    }
+    ck(zeroChangeViolations == 0, "非占位标签**零改动**（开/关两次逐字段相同）", firstViolation);
+    ck(reparsedOn == (int)files.size(), "全部文件都能原生解析（本节覆盖 100% 文件）",
+       std::to_string(reparsedOn) + "/" + std::to_string(files.size()));
+
+    int rowsQBefore = 0, rowsQAfter = 0, fieldQBefore = 0, fieldQAfter = 0;
+    for (const auto& r : rows) {
+        const int qb = (int)(countQ(r.off.title) + countQ(r.off.artist) + countQ(r.off.album));
+        const int qa = (int)(countQ(r.on.title) + countQ(r.on.artist) + countQ(r.on.album));
+        if (qb) ++rowsQBefore;
+        if (qa) ++rowsQAfter;
+        fieldQBefore += qb;
+        fieldQAfter  += qa;
+        if (!qb) continue;                          // 只打印修前带问号的行（人工可读）
+        std::printf("  %s\n", U8(fs::path(W(r.file)).filename()).c_str());
+        auto line = [&](const char* label, const std::string& a, const std::string& b) {
+            if (countQ(a) == 0 && a == b) return;
+            std::printf("       %-6s 原[%s] -> 新[%s]%s\n", label, a.c_str(), b.c_str(),
+                        countQ(b) ? "   <<仍含?" : "");
+        };
+        line("title", r.off.title, r.on.title);
+        line("artist", r.off.artist, r.on.artist);
+        line("album", r.off.album, r.on.album);
+    }
+    std::printf("  汇总：文件 %zu，带 '?' 的行 %d -> %d；带 '?' 的字段 %d 个 -> %d 个\n",
+                rows.size(), rowsQBefore, rowsQAfter, fieldQBefore, fieldQAfter);
+    ck(rowsQAfter <= rowsQBefore, "修复只减不增（带 '?' 的行数不上升）",
+       std::to_string(rowsQBefore) + " -> " + std::to_string(rowsQAfter));
+    ck(rowsQBefore == 0 || rowsQAfter < rowsQBefore, "至少修好一行（否则本规则在本库上没有收益，需复核）",
+       std::to_string(rowsQBefore) + " -> " + std::to_string(rowsQAfter));
+    _putenv_s("RLPLAYER_TAG_GUESS", "1");
+}
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     std::printf("== 原生标签快速通道验证（FLAC/WAV/MP3/OGG） ==\n");
@@ -1349,6 +1638,8 @@ int main(int argc, char** argv) {
     const int compared = abReal(root);
     std::printf("\n[INFO] A/B 比对文件数 = %d\n", compared);
     wavSpecial(root);
+    tagGuessFixtures(tmp / "qmark");
+    tagGuessRealLibrary(root);
     throughputAndRegression(root);
 
     fs::remove_all(tmp, ec);

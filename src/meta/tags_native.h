@@ -124,6 +124,29 @@ inline SharedStats& stats() { static SharedStats s; return s; }
 // 为什么用 GetEnvironmentVariableW 而不是 _wgetenv：扫描是 8 线程并行，每个文件都会问一次开关；
 // MS CRT 的 _wgetenv 返回的是**共享缓冲**（它自己被标记为 deprecated，建议 _wdupenv_s），
 // 并发读有撕裂风险。GetEnvironmentVariableW 是线程安全的，且不用分配内存。
+// RLPLAYER_TAG_GUESS=0/off/false/no ⟹ 关闭「问号标签智能修复」整条链路（跨块择优 + 文件名兜底），
+// 行为回到 261025-02（只做"纯占位不占位"）。默认开。
+// 为什么要有总开关：这是**唯一**会在解析器里"推断"值的地方（推错了会进索引），
+// 用户必须能在不改代码的情况下整体关掉（设置项 RLPLAYER_TAG_GUESS 由 launcher/配置写入环境变量）。
+inline bool guess_enabled() {
+#ifdef _WIN32
+    wchar_t v[64] = {0};
+    const DWORD n = ::GetEnvironmentVariableW(L"RLPLAYER_TAG_GUESS", v, 64);
+    if (n == 0 || n >= 64) return true;
+    std::string s;
+    for (DWORD i = 0; i < n; ++i) if (v[i] < 128) s.push_back((char)v[i]);
+    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+    if (s == "0" || s == "off" || s == "false" || s == "no") return false;
+    return true;
+#else
+    const char* v = std::getenv("RLPLAYER_TAG_GUESS");
+    if (!v) return true;
+    std::string s(v);
+    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+    return !(s == "0" || s == "off" || s == "false" || s == "no");
+#endif
+}
+
 inline bool enabled() {
 #ifdef _WIN32
     wchar_t v[64] = {0};
@@ -620,31 +643,306 @@ inline bool tag_is_placeholder(const std::string& s) {
     return sawQ;
 }
 
-// 跨块合并：把一块里读到的值「先到先得」地吃进去（槽空着且值非空才吃）。
+// ---- 261026-02 #4：「问号标题」的第二层判定（**混合占位**）----
+// tag_is_placeholder 只认「去掉数字/空格后全是 '?'」——那只能救回一小部分。真实库里的坏值
+// 大多是**混合**的：中文/日文那一段被写盘工具替换成了 '?'，拉丁字母与括号却是好的，例如
+//     title  = "????? (Chinese Tea)"          同文件 ID3 TIT2 = "上海紅茶館 (Chinese Tea)"
+//     album  = "Palace Memories NHK???????????????????????I"
+//     artist = "Falcom Sound Team J.D.K. (??????????????????????)"
+// 这类值不是"空"，但**明显残缺**：实义字符里问号占了大头。判据（可单独否定）：
+//   * 至少有一个 '?'（全角 '？' 也算）；
+//   * 实义字符数 (字母/数字/CJK/假名；不含空白与标点) <= 3  或  问号数 >= 实义字符数的一半
+//     ⟹ 问号与实义字符同量级。
+// 反面样本（必须判「不是占位」）："U.N.オーエンは彼女なのか？"（0 个 ASCII '?'，问号只在末尾）、
+//   "May I May I？"（实义 9 > 问号 1*1.5）、"7PM"（无问号）—— tests/test_tags_native.cpp [6] 有断言。
+// 为什么阈值选 1/2：本库 654 个文件里，被这条判为残缺的只有那些"整段变问号"的坏值
+// （逐条列在 tests/test_tags_native.cpp [6] 的正反样本里）；正常标题里偶尔出现一个问号时
+// 实义字符通常 >= 问号数的 2 倍（"May I May I？" = 实义 9 / 问号 1），不会被误判。
+// 「实义字符」的口径（261026-02 #4，第二轮修正）：
+//   * ASCII 字母/数字 —— 实义；
+//   * CJK / 假名 / 韩文 / 全角字母数字 —— 实义；
+//   * **空白、标点、符号**（" -~()<>/.:，。「」…）—— **不算实义**。
+// 为什么标点不算：写盘工具把非 ASCII 文本变问号时，**标点照样被替换**（实测
+//   "??? -snow amber- (Remix)"：后面的空格/连字符/圆括号是 ASCII 原文，不是被救回来的内容）。
+// 如果标点算实义，"?" 与 " -()" 一比一，问号占比就会被稀释到判不出来。
+// 反过来，三字节的 CJK 标点（全角括号、书名号）也不算 —— 它们同样是常驻原文。
+// UTF-8 首字节 -> 该字符的字节数（1~4）。
+// ⚠️ 每个位移比较都必须**显式加括号**：'&' 的优先级低于 '=='，写成 (c >> 5) & 0x7 == 0x6 会先算 0x7 == 0x6，
+//    再算 & 0 —— 结果永远为 0，函数恒返回 1（261026-02 #4 实测踩过两次，症状是"CJK 全被拆成单字节"）。
+inline size_t qm_cp_size(unsigned char c) {
+    // UTF-8 首字节 -> 字节数。**查表**而不是算：位移/比较混写的表达式在这里连续踩过两次坑
+    // （261026-02 #4：结果恒为 1，CJK 被拆成单字节；不报错，规则静默失效），查表没有歧义。
+    static const unsigned char kLens[256] = {
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,   // 0x00..0x7F
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,   // 0x80..0xBF 续字节（按 1）
+        2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2, 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,   // 0xC0..0xDF
+        3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,                                     // 0xE0..0xEF
+        4,4,4,4,4,4,4,4,                                                     // 0xF0..0xF7
+        1,1,1,1,1,1,1,1                                                      // 0xF8..0xFF（非法）
+    };
+    return (size_t)kLens[c];
+}
+
+struct PlaceholderStats { size_t q = 0, real = 0; };
+
+inline bool qm_cp_is_symbol(unsigned cp) {
+    if (cp < 0x80) {
+        if ((cp >= '0' && cp <= '9') || (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z')) return false;
+        return true;                                        // ASCII 空白/标点/符号
+    }
+    if (cp == 0x3000 || cp == 0x00A0 || cp == 0xFEFF) return true;          // 全角空格/NBSP/BOM
+    if (cp >= 0x2000 && cp <= 0x2BFF) return true;       // 通用标点、箭头、数学、装饰符号
+    if (cp >= 0x3001 && cp <= 0x303F) return true;       // CJK 标点 、。「」【】〜
+    if (cp >= 0xFE10 && cp <= 0xFE6F) return true;       // 竖排/兼容标点
+    if (cp >= 0xFF01 && cp <= 0xFF0F) return true;       // 全角 ！＂＃…／
+    if (cp >= 0xFF1A && cp <= 0xFF20) return true;       // 全角 ：；＜＝＞？＠
+    if (cp >= 0xFF3B && cp <= 0xFF40) return true;       // 全角 ［＼］＾＿｀
+    if (cp >= 0xFF5B && cp <= 0xFF65) return true;       // 全角 ｛｜｝～
+    if (cp == 0x00B7 || cp == 0x2019 || cp == 0x2018) return true;           // · ’ ‘
+    return false;
+}
+
+inline PlaceholderStats tag_placeholder_stats(const std::string& s) {
+    PlaceholderStats st;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = (unsigned char)s[i];
+        if (c == '?') { ++st.q; ++i; continue; }
+        // 全角问号 U+FF1F = EF BC 9F
+        if (c == 0xEF && i + 2 < s.size() && (unsigned char)s[i + 1] == 0xBC && (unsigned char)s[i + 2] == 0x9F) {
+            ++st.q; i += 3; continue;
+        }
+        size_t len = qm_cp_size(c);
+        if (i + len > s.size()) len = 1;
+        unsigned cp = len == 1 ? c : 0;
+        if (len > 1) {
+            // 掩码必须 0x1F / 0x0F / 0x07（2/3/4 字节 UTF-8 首字节的有效位）。
+            // 261026-02 #4 实测踩过：3 字节误写成 0x0F 会把码点算错（"）" U+FF09 算成 U+0FC9），
+            // 于是"全角括号永远匹配不上" —— 不报错，只是规则静默失效。
+            cp = c & (len == 2 ? 0x1Fu : (len == 3 ? 0x0Fu : 0x07u));   // 2/3/4 字节首字节有效位
+            for (size_t k = 1; k < len; ++k) cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3Fu);
+        }
+        if (!qm_cp_is_symbol(cp)) ++st.real;
+        i += len;
+    }
+    return st;
+}
+
+// 含 '?' 且"问号占了大头" ⟹ 残缺值（见上）。纯占位（tag_is_placeholder）一定是残缺值。
+inline bool tag_is_corrupt(const std::string& s) {
+    if (s.empty()) return false;
+    if (tag_is_placeholder(s)) return true;
+    const PlaceholderStats st = tag_placeholder_stats(s);
+    if (st.q == 0) return false;
+    if (st.real == 0) return true;                  // 一个实义字符都没有（"???"）
+    if (st.q * 2 >= st.real) return true;           // 问号 >= 实义的一半
+    // 短值补充：实义 <= 3 且问号 >= 2（"???x" / "x???" / "??????arr"）——
+    // 这种"一句话里只坏了一小段"的值全局占比可能很低，但它照样是坏值。
+    if (st.real <= 3 && st.q >= 2) return true;
+    if (st.q >= 3 && st.q * 4 >= st.real) return true;   // 夹杂型：问号 >= 3 且占到实义的四分之一
+    return false;
+}
+
+// 两个来源的同一字段：能不能用 better 覆盖 cur？（261026-02 #4 规则 1/2）
+// 条件全部成立才覆盖：cur 残缺、better 不残缺、better 非空、**长度差 <= 3 倍**。
+// 长度上限是"防呆"：它挡掉"残缺标题 25 个字符 vs 另一个来源完全不相干的 200 字长文本"这类误配。
+// 261026-02 #4 规则 1b：**同键两来源互补拼接**（"????? (Chinese Tea)" + "上海紅茶館 (Chinese Tea)"）。
+// 坏值不是"整段变问号"，而是"只有 CJK 段变问号、ASCII 段完好"（`?????:??????????` =
+// "?????:??????????" vs "《黑神话：悟空》游戏音乐精选集"）。这种情况下两个来源**字节长度几乎相同**，
+// 长度判据（<=3 倍）会放行，但"取后者"会把后者里本来就残的部分一起带进来 —— 更好的做法是
+// 逐字符对齐：cur 里是 '?'、better 里不是 '?' ⟹ 取 better 的字符；cur 里是 '?'、better 里也是 '?'
+// ⟹ 仍然是 '?'。要求：
+//   * 只对**残缺**值生效（正常值一律原样保留，绝不"两个来源拼一拼"）；
+//   * 逐**码点**对齐（CJK 一个码点 3 字节，按字节对会错位）；
+//   * 拼接结果必须**不是残缺值**，且参与拼接的码点数 >= 总数的一半（防止"只捡回两个字符"就宣布成功）；
+//   * 长度差 <= 2 倍（同一条防呆，比 tag_better_replaces 的 3 倍还严：拼接要求两边真的对得上）。
+inline std::vector<std::string> qm_split_cp(const std::string& s) {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = (unsigned char)s[i];
+        size_t len = qm_cp_size(c);
+        if (i + len > s.size()) len = 1;
+        out.push_back(s.substr(i, len));
+        i += len;
+    }
+    return out;
+}
+// 一个 UTF-8 码点字符串 -> 码点值（无效/截断时返回 0xFFFFFFFF）。
+inline unsigned qm_cp_value(const std::string& cp) {
+    if (cp.empty()) return 0xFFFFFFFFu;
+    const unsigned char c0 = (unsigned char)cp[0];
+    const size_t len = qm_cp_size(c0);
+    if (len == 1) return (unsigned)c0;
+    if (cp.size() < len) return 0xFFFFFFFFu;
+    unsigned v = 0;
+    if (len == 2)      v = (unsigned)(c0 & 0x1Fu);
+    else if (len == 3) v = (unsigned)(c0 & 0x0Fu);
+    else               v = (unsigned)(c0 & 0x07u);
+    for (size_t k = 1; k < len; ++k) {
+        const unsigned cont = (unsigned)((unsigned char)cp[k] & 0x3Fu);
+        v = (v << 6) | cont;
+    }
+    return v;
+}
+inline bool qm_cp_is_q(const std::string& cp) {
+    // 只认**恰好一个** ASCII '?' 或**恰好一个**全角 '？'（U+FF1F）。
+    // ⚠️ 不能用 cp.find('?') != npos：多字节字符的续字节里也可能出现 0x3F，
+    //    那样会把正常字符误判成问号（261026-02 #4 实测：拼接结果出现乱码）。
+    if (cp == "?") return true;
+    return cp.size() == 3 && (unsigned char)cp[0] == 0xEF && (unsigned char)cp[1] == 0xBC && (unsigned char)cp[2] == 0x9F;
+}
+
+// 空白码点（半角/全角空格、NBSP）
+inline bool qm_cp_is_blank(const std::string& cp) {
+    return cp == " " || cp == "\t" ||
+           (cp.size() == 3 && (unsigned char)cp[0] == 0xE3 && (unsigned char)cp[1] == 0x80 && (unsigned char)cp[2] == 0x80);
+}
+// 标点/符号码点（用 qm_cp_is_symbol 的同一口径）
+inline bool qm_cp_is_punct(const std::string& cp) {
+    const unsigned v = qm_cp_value(cp);
+    return v != 0xFFFFFFFFu && qm_cp_is_symbol(v);
+}
+// "实义"字符 = 不是空白、不是标点、不是问号
+inline bool qm_cp_is_substantive(const std::string& cp) {
+    return !qm_cp_is_blank(cp) && !qm_cp_is_q(cp) && !qm_cp_is_punct(cp);
+}
+// 把 cur 里的 '?' 用 better 的同位置字符补上；返回"补上的码点数"。
+//   * 两边码点数相差 <= 2 倍才对齐（差得太多说明不是同一句话，宁可不拼）；
+//   * better 比 cur 短/长时按 cur 的位置截断/补空（只补 cur 里确实是 '?' 的位置）。
+inline size_t qm_merge_at(std::string& dst, const std::string& cur, const std::string& better) {
+    const std::vector<std::string> a = qm_split_cp(cur), b = qm_split_cp(better);
+    if (a.empty() || b.empty()) return 0;
+    const size_t lo = std::min(a.size(), b.size()), hi = std::max(a.size(), b.size());
+    if (hi > lo * 2) return 0;
+    std::string out;
+    out.reserve(cur.size() + 8);
+    size_t fed = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (qm_cp_is_q(a[i]) && i < b.size() && !qm_cp_is_q(b[i])) { out += b[i]; ++fed; }
+        else out += a[i];                          // 其余**一律保留 cur 的字符**（绝不引入 better 的残字）
+    }
+    if (fed == 0) return 0;
+    dst = out;
+    return fed;
+}
+
+inline bool tag_merge_replaces(const std::string& cur, const std::string& better, std::string* merged) {
+    if (better.empty() || !tag_is_corrupt(cur)) return false;
+    std::string out;
+    const size_t fed = qm_merge_at(out, cur, better);
+    if (fed == 0) return false;
+    const size_t used = qm_split_cp(cur).size();
+    if (fed * 2 < used) return false;              // 拼回不到一半 ⟹ 不算"补齐"
+    if (out == cur || tag_is_corrupt(out)) return false;
+    if (merged) *merged = out;
+    return true;
+}
+
+// 同长对齐的**部分**补齐（261026-02 #4 收尾）：两边码点数**完全相等**时才允许"只补一部分"。
+// 依据：等长 ⟹ 同一个位置就是同一句话的第 N 个字，取 better 的那一个字符是确定性的（不是猜）；
+// 真实库里 "Kokoro no Ame ~???~" vs "Kokoro no Ame ~心の雨~"、" Partners ... (????????!)" vs
+// "(伙伴〜游戏进行时!)" 都是这种"只坏了一小段"的形态，拼完仍是残缺值（问号占比没降下来），
+// 但**用户看到的内容**确实更完整了 —— 所以判据不是"必须修成不残缺"，而是：
+//   * 拼出来的每个字符都来自 cur（非 '?' 位置）或 better（'?' 位置）；
+//   * 至少补回 1 个字符，且**补回后 '?' 变少**；
+//   * 长度完全相同（否则就是两句话，不拼）。
+inline bool tag_merge_equal_aligned(const std::string& cur, const std::string& better, std::string* merged) {
+    // 判据：两边**码点数完全相等**（⟹ 同一个位置就是同一句话的第 N 个字），且 cur 是残缺值。
+    // 逐位取值规则（确定性、不"猜"）：
+    //   1) cur 这一位是 '?'、"全角空格" 或空 ⟹ 取 better 的同位字符；
+    //   2) 否则保留 cur 的字符；
+    //   3) 但若 better 的同位是**实义字符**、cur 的同位是空白/标点（也就是被翻车工具"吃掉"的段），
+    //      也取 better —— 这正是 "J. Strauss … (?????????,??326)" 与
+    //      "(自由射手快速波尔卡，作品326)" 那类"只有 CJK 段变问号、标点也一起丢"的形态。
+    // 最后要求：至少补回 1 个码点、结果与原文不同、问号数严格下降（否则没有收益）。
+    if (better.empty() || !tag_is_corrupt(cur)) return false;
+    const std::vector<std::string> a = qm_split_cp(cur), b = qm_split_cp(better);
+    if (a.size() != b.size() || a.empty()) return false;
+    std::string out;
+    out.reserve(cur.size() + 8);
+    size_t fed = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const bool curBad = qm_cp_is_q(a[i]) || qm_cp_is_blank(a[i]);
+        const bool curFiller = qm_cp_is_q(a[i]) || qm_cp_is_blank(a[i]) || qm_cp_is_punct(a[i]);
+        const bool betReal = qm_cp_is_substantive(b[i]);
+        if (curBad || (curFiller && betReal)) { out += b[i]; if (!qm_cp_is_q(b[i])) ++fed; }
+        else out += a[i];
+    }
+    if (fed == 0 || out == cur) return false;
+    if (tag_placeholder_stats(out).q >= tag_placeholder_stats(cur).q) return false;
+    if (merged) *merged = out;
+    return true;
+}
+
+inline bool tag_better_replaces(const std::string& cur, const std::string& better) {
+    if (better.empty() || cur == better) return false;
+    if (!tag_is_corrupt(cur)) return false;
+    if (tag_is_corrupt(better)) return false;
+    const size_t a = cur.size(), b = better.size();
+    if (a == 0 || b == 0) return true;
+    const size_t lo = (a < b) ? a : b, hi = (a < b) ? b : a;
+    return hi <= lo * 3;
+}
+
+// 跨块合并：把一块里读到的值「先到先得」地吃进去（槽空着且值非空才吃）；
+// 261026-02 #4 起再加一条「**只覆盖占位**」的择优（见 tag_better_replaces）。
 struct TagMerger {
     TagValues acc;                 // 已入库的（每个键的第一个非空值）
+    std::string src[8];            // 每个键的来源块名（"INFO" / "id3" / "bext"），仅用于日志
     bool genreNumeric = false;     // 已入库的 genre 来自 ID3 的数字流派引用 ⟹ 需要回退
     // 261025-02 第 6 条：纯 '?' 的值**不占位**（见 tag_is_placeholder 的实测依据）。
     // 只在 WAV 的跨块合并里生效 —— MP3/OGG 没有"同键双来源"这个结构，不需要这条。
-    void absorb(const TagValues& v, bool vGenreNumeric = false) {
+    void absorb(const TagValues& v, bool vGenreNumeric = false, const char* from = "") {
         TagValues vv = v;
-        if (tag_is_placeholder(vv.title))  vv.title.clear();
-        if (tag_is_placeholder(vv.artist)) vv.artist.clear();
-        if (tag_is_placeholder(vv.album))  vv.album.clear();
-        if (tag_is_placeholder(vv.albumArtist)) vv.albumArtist.clear();
-        if (tag_is_placeholder(vv.genre))  vv.genre.clear();
-        if (tag_is_placeholder(vv.track))  vv.track.clear();
-        if (tag_is_placeholder(vv.disc))   vv.disc.clear();
-        if (tag_is_placeholder(vv.date))   vv.date.clear();
+        // ⚠️ 261026-02 #4：这里**不再**把"纯占位"整段清空 —— 混合占位（"????? (Chinese Tea)"）
+        // 在纯占位判据下是"合法值"，先到先得会把后面 ID3 的完好值挡住（实测 17 首）。现在统统
+        // 先吃进来，再由下面的 repick() 决定要不要用后来者覆盖（只覆盖残缺值，不覆盖正常值）。
+        // 唯一仍要清空的是空串（空值不占位，与 lib_probe_one 的 put() 同口径）。
         bool tookGenre = false;
-        if (!acc.hasTitle && !vv.title.empty())             { acc.title = vv.title; acc.hasTitle = true; }
-        if (!acc.hasArtist && !vv.artist.empty())           { acc.artist = vv.artist; acc.hasArtist = true; }
-        if (!acc.hasAlbum && !vv.album.empty())             { acc.album = vv.album; acc.hasAlbum = true; }
+        // 261026-02 #4：已经入了一个**残缺**值时，后来的完好值可以覆盖它（只覆盖残缺值）。
+        //   顺序：先试"整值替换"（tag_better_replaces，<=3 倍长度），不成再试"逐码点拼接"
+        //   （tag_merge_replaces，<=2 倍长度）。两者都只对**残缺**值生效。
+        //
+        // ⚠️ 另有一条**更早**的既有规则必须先跑：261025-02 第 6 条「纯占位不占位」（去数字/空格后全是 '?'）。
+        // 它比"残缺"更严（纯占位 ⊆ 残缺），语义是"这一份等于没有 ⟹ 后来的**任何非空值**都直接上位"，
+        // 不看长度、不做拼接。实测证据：本库那 16 首 WAV 的 INAM 是 25 个 '?'，而 TIT2 是真名，
+        // 长度可能差好几倍，靠"<=3 倍"会被误挡；而"纯占位"本来就没有"更差"的余地，取谁都更准。
+        // （本函数是把两条规则放在一起的地方，所以顺序写死在这里：纯占位 → 整值替换 → 拼接。）
+        auto repick = [&](std::string& dst, bool& has, std::string& srcOf, const std::string& cand, const char* field) {
+            if (!has || !guess_enabled()) return;      // 总开关 RLPLAYER_TAG_GUESS=0 ⟹ 回到"先到先得"
+            if (tag_is_placeholder(dst) && !cand.empty() && !tag_is_placeholder(cand)) {
+                std::fprintf(stderr, "TAGGUESS field=%s from=crosschunk value=%s old=%s srcs=%s->%s rule=pure-placeholder\n",
+                             field, cand.c_str(), dst.c_str(), srcOf.c_str(), from);
+                dst = cand; srcOf = from;
+                return;
+            }
+            if (tag_better_replaces(dst, cand)) {
+                std::fprintf(stderr, "TAGGUESS field=%s from=crosschunk value=%s old=%s srcs=%s->%s\n",
+                             field, cand.c_str(), dst.c_str(), srcOf.c_str(), from);
+                dst = cand; srcOf = from;
+                return;
+            }
+            std::string merged;
+            if (tag_merge_replaces(dst, cand, &merged) || tag_merge_equal_aligned(dst, cand, &merged)) {
+                std::fprintf(stderr, "TAGGUESS field=%s from=crosschunk-merge value=%s old=%s srcs=%s+%s\n",
+                             field, merged.c_str(), dst.c_str(), srcOf.c_str(), from);
+                dst = merged; srcOf += "+";
+            }
+        };
+        if (!acc.hasTitle && !vv.title.empty())             { acc.title = vv.title; acc.hasTitle = true; src[0] = from; }
+        if (!acc.hasArtist && !vv.artist.empty())           { acc.artist = vv.artist; acc.hasArtist = true; src[1] = from; }
+        if (!acc.hasAlbum && !vv.album.empty())             { acc.album = vv.album; acc.hasAlbum = true; src[2] = from; }
         if (!acc.hasAlbumArtist && !vv.albumArtist.empty()) { acc.albumArtist = vv.albumArtist; acc.hasAlbumArtist = true; }
         if (!acc.hasGenre && !vv.genre.empty())             { acc.genre = vv.genre; acc.hasGenre = true; tookGenre = true; }
         if (!acc.hasDate && !vv.date.empty())               { acc.date = vv.date; acc.hasDate = true; }
         if (!acc.hasTrack && !vv.track.empty())             { acc.track = vv.track; acc.hasTrack = true; }
         if (!acc.hasDisc && !vv.disc.empty())               { acc.disc = vv.disc; acc.hasDisc = true; }
+        repick(acc.title,  acc.hasTitle,  src[0], vv.title,  "title");
+        repick(acc.artist, acc.hasArtist, src[1], vv.artist, "artist");
+        repick(acc.album,  acc.hasAlbum,  src[2], vv.album,  "album");
         if (tookGenre) genreNumeric = vGenreNumeric;
     }
 };
@@ -916,6 +1214,64 @@ inline void apply_wav_info_tag(TagValues& tv, const std::string& id, const char*
     else if (id == "ITRK" || id == "IPRT") TagValues::overwrite(tv.track, tv.hasTrack, s);
 }
 
+// ---------------------------------------------------------------------------
+// 取证用（不参与入库路径）：把 WAV 的 LIST/INFO 与 "id3 " 两个来源**分别**读出来。
+// 261026-02 #4 修「问号标题」时用来逐文件看清「同键两个来源各是什么」，也给 tests 用。
+// 口径与 parse_wav 完全一致（同一个 apply_wav_info_tag / parse_id3v2_tag / TagMerger），
+// 唯一的区别是**不合并**：两个来源各给一份，便于比较与打日志。
+// ---------------------------------------------------------------------------
+inline bool dump_wav_sources(FileReader& r, TagValues& info, bool& hasInfo,
+                            TagValues& id3, bool& hasId3, std::string& whyInfo, std::string& whyId3) {
+    hasInfo = hasId3 = false;
+    whyInfo.clear();
+    whyId3.clear();
+    unsigned char h[12];
+    if (!r.read_at(0, h, 12)) return false;
+    if (std::memcmp(h, "RIFF", 4) != 0 || std::memcmp(h + 8, "WAVE", 4) != 0) return false;
+    const long long fsize = r.size();
+    long long p = 12;
+    while (p + 8 <= fsize) {
+        unsigned char ch[8];
+        if (!r.read_at(p, ch, 8)) break;
+        const long long len = (long long)le32(ch + 4);
+        const long long body = p + 8;
+        if (len < 0 || body + len > fsize) break;
+        if (std::memcmp(ch, "LIST", 4) == 0 && len >= 4 && len <= (1 << 20)) {
+            std::vector<unsigned char> buf((size_t)len);
+            if (!r.read_at(body, buf.data(), buf.size())) break;
+            if (std::memcmp(buf.data(), "INFO", 4) == 0) {
+                TagValues iv;
+                size_t q = 4;
+                while (q + 8 <= buf.size()) {
+                    const char* sid = (const char*)buf.data() + q;
+                    const long long sl = (long long)le32(buf.data() + q + 4);
+                    q += 8;
+                    if (sl < 0 || q + (size_t)sl > buf.size()) break;
+                    apply_wav_info_tag(iv, std::string(sid, 4), (const char*)buf.data() + q, (size_t)sl);
+                    q += (size_t)sl + ((size_t)sl & 1u);
+                }
+                info = iv;
+                hasInfo = true;
+            }
+        } else if ((std::memcmp(ch, "id3 ", 4) == 0 || std::memcmp(ch, "ID3 ", 4) == 0) && len <= (32 << 20)) {
+            std::vector<unsigned char> id3buf((size_t)len);
+            if (len > 0 && !r.read_at(body, id3buf.data(), id3buf.size())) break;
+            if (id3buf.size() >= 10 && std::memcmp(id3buf.data(), "ID3", 3) == 0) {
+                MemoryByteSource ms(id3buf.data(), id3buf.size());
+                TagValues dv;
+                Id3Out io;
+                if (parse_id3v2_tag(ms, 0, (long long)id3buf.size(), dv, io, whyId3)) {
+                    id3 = dv;
+                    hasId3 = true;
+                }
+            }
+        }
+        if (std::memcmp(ch, "data", 4) == 0 && body + len > fsize) break;
+        p = body + len + (len & 1);
+    }
+    return hasInfo || hasId3;
+}
+
 inline bool parse_wav(FileReader& r, TagInfo& t, std::string& why) {
     unsigned char h[12];
     if (!r.read_at(0, h, 12)) { why = "WAV: 文件头过短"; return false; }
@@ -983,7 +1339,7 @@ inline bool parse_wav(FileReader& r, TagInfo& t, std::string& why) {
                         apply_wav_info_tag(iv, std::string(sid, 4), (const char*)buf.data() + q, (size_t)sl);
                         q += (size_t)sl + ((size_t)sl & 1u);
                     }
-                    mg.absorb(iv);                      // 跨块：先到先得
+                    mg.absorb(iv, false, "INFO");      // 跨块：先到先得 + 只覆盖残缺值（261026-02 #4）
                 }
             }
         } else if (std::memcmp(ch, "id3 ", 4) == 0 || std::memcmp(ch, "ID3 ", 4) == 0) {
@@ -1017,7 +1373,7 @@ inline bool parse_wav(FileReader& r, TagInfo& t, std::string& why) {
                 }
                 if (io.hasCover) t.hasCover = true;
                 if (!io.firstApicDesc.empty() && firstApicDesc.empty()) firstApicDesc = io.firstApicDesc;
-                mg.absorb(dv, io.genreNumeric);
+                mg.absorb(dv, io.genreNumeric, "id3");
             }
         } else if (std::memcmp(ch, "bext", 4) == 0) {
             // Broadcast Wave 的 bext：ffmpeg 把 origination_date（偏移 320，10 字节）写成 **date**，
@@ -1035,7 +1391,7 @@ inline bool parse_wav(FileReader& r, TagInfo& t, std::string& why) {
             TagValues bv;
             const std::string d = trim_tag_tail(std::string((const char*)bx + 320, dn));
             if (!d.empty()) TagValues::overwrite(bv.date, bv.hasDate, d);
-            mg.absorb(bv);
+            mg.absorb(bv, false, "bext");
         } else if (std::memcmp(ch, "iXML", 4) == 0 || std::memcmp(ch, "axml", 4) == 0) {
             // iXML/axml 是 XML 元数据，ffmpeg 会解析出若干键（本库 71 个 WAV 里 0 个）。
             // 没实测过它们的字段映射 ⟹ 照旧交给 ffprobe（保底不丢标签，铁律 3）。
@@ -1217,6 +1573,225 @@ inline std::string lower_ext(const std::string& path) {
     return e;
 }
 
+// ---------------------------------------------------------------------------
+// 261026-02 #4 规则 3：**文件名兜底**（只对残缺值生效）
+// 为什么需要：本库有些 WAV 的 LIST/INFO 与 "id3 " 两份都是坏的（例如
+//   "均衡（二重奏） - 天空悲恋曲.wav" 的 INFO 是 "??????"、根本没有 id3 块），
+// 但**文件名里就是正确名字**。这里从文件名推导，仅在标签值残缺时采用。
+//
+// 推导步骤（顺序固定，每步失败就停在该步）：
+//   1) 去扩展名 + 去首尾空白；
+//   2) 去行首曲号（"03. " / "01 - " / "[02]" …，规则见 qm_ 注释）；
+//   3) 去「器乐音质（钢琴）- 」这类**中文括号前缀**：开头是 "（…）" 或 "(…)" 组、其后紧跟
+//      " - " / "- " / " -" 时，连分隔符一起去掉（只去掉**一个**，可重复以处理多层）；
+//   4) 去「艺人 - 」前缀：仅当 " - " 之前那一段与**已入库的 artist 相同**（或与 albumArtist 相同）
+//      时去掉（大小写不敏感），避免把 "A - B" 这种标题拆错；
+//   5) 结果必须：不含 '?'、不是残缺值、去空白后长度 >= 2。
+// 专辑/艺术家同理但**更保守**：只在原值完全为空（或纯占位）时才用，且要求文件名确实带
+// "艺人 - " 前缀（艺术家）；专辑不做文件名推导（文件名里从来不写专辑名，推必错）。
+// ---------------------------------------------------------------------------
+inline bool qm_is_ws(char c) { return c == ' ' || c == '\t'; }
+inline bool qm_usable_guess(const std::string& s);   // 定义在下面（qm_strip_bracket_prefix 要用它做"剥完是否更好"）
+
+inline std::string qm_trim(const std::string& s) {
+    // ⚠️ 必须是 substr(b, e - b)：本函数**只有一个参数**，substr(npos) 会抛 std::out_of_range
+    // （261026-02 #4 实测踩过：写成 substr(b, e) 时，只要串首有空白就抛异常/被捕获成空串，
+    //  表现为"文件名末尾带空格时推导永远失败"）。
+    size_t b = 0, e = s.size();
+    while (b < e && qm_is_ws(s[b])) ++b;
+    while (e > b && qm_is_ws(s[e - 1])) --e;
+    return s.substr(b, e - b);
+}
+
+inline std::string qm_lower_ascii(const std::string& s) {
+    std::string o(s);
+    for (auto& c : o) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    return o;
+}
+
+// 去掉开头的一到三位数字曲号：要求数字后是 '.' 或空白，或紧跟分隔符 "- " / "_ "。
+// （"7PM" / "25 o'clock" 这类不动；整串全是数字也不动。）
+inline std::string qm_strip_trackno(const std::string& s) {
+    size_t k = 0;
+    while (k < s.size() && s[k] >= '0' && s[k] <= '9' && k < 3) ++k;
+    if (k == 0) return s;
+    if (s[k] >= '0' && s[k] <= '9') return s;                 // 超过三位
+    if (k < s.size() && s[k] != '.' && s[k] != ' ' && s[k] != '_' && s[k] != '-') return s;
+    size_t q = k;
+    while (q < s.size() && (s[q] == '.' || s[q] == ' ' || s[q] == '_' || s[q] == '-')) ++q;
+    const std::string rest = qm_trim(s.substr(q));
+    if (rest.empty()) return s;
+    // "5.1" 这类版本号不当曲号
+    if (k < s.size() && s[k] == '.' && k + 1 < s.size() && s[k + 1] >= '0' && s[k + 1] <= '9') return s;
+    return rest;
+}
+
+// 去掉开头的「（…）/ (…) / 【…】/ […]」组 + 紧随其后的 " - "（"器乐音质（钢琴）- xxx" → "xxx"）。
+// 只去掉"括号组后紧跟连字符"的形式：真实标题里的括号（"Kanon D-Dur (Quintet)"）不会被切掉。
+inline std::string qm_strip_bracket_prefix(const std::string& s) {
+    // 语义：「排在**第一个**『（…）』/【…】/(…) 等括号组、且该组之后紧跟 ' - '」的位置，
+    // 把它以及前面的内容整段去掉（例如 "器乐音质（钢琴）- 标题" ⟹ "标题"）。
+    // 括号组里**不含** '-'，所以"第一个括号 + '-'"是确定性的分隔点（不会把标题里的
+    // "Kanon D-Dur (Quintet)" 误当前缀）。
+    // 实现只用码点数组 + 码点值，不碰字节级 find/compare（全角括号 opener/closer 只差最后一个
+    // 字节，字节级搜索会撞进多字节字符内部，261026-02 #4 踩过）。
+    struct Pair { unsigned op; unsigned cl; };
+    static const Pair kPairs[] = {
+        { 0xFF08u, 0xFF09u },   // 全角 （）
+        { 0x0028u, 0x0029u },   // ASCII ()
+        { 0x3010u, 0x3011u },   // 【】
+        { 0x300Cu, 0x300Du },   // 「」
+        { 0x005Bu, 0x005Du },   // ASCII []
+    };
+    const std::vector<std::string> A = qm_split_cp(s);
+    for (size_t close = 0; close < A.size(); ++close) {
+        // close 处必须是一个 closer
+        const unsigned cp = qm_cp_value(A[close]);
+        const Pair* hit = nullptr;
+        for (const Pair& pr : kPairs) if (cp == pr.cl) { hit = &pr; break; }
+        if (!hit) continue;
+        // 往前找配对的 opener（同族、不嵌套：遇到同族 opener 就停）
+        size_t open = close;
+        while (open > 0) {
+            --open;
+            const unsigned q = qm_cp_value(A[open]);
+            if (q == hit->op) break;
+            if (q == hit->cl) { open = close; break; }   // 嵌套的闭括号 ⟹ 这一组不完整
+        }
+        if (open >= close) continue;
+        // 组后必须紧跟 ' - '（允许零或多个空格 + 一个连字符 + 零或多个空格）
+        size_t p = close + 1;
+        while (p < A.size() && A[p] == " ") ++p;
+        if (p >= A.size() || A[p] != "-") continue;
+        ++p;
+        while (p < A.size() && A[p] == " ") ++p;
+        if (p >= A.size()) continue;
+        std::string rest;
+        for (size_t k = p; k < A.size(); ++k) rest += A[k];
+        rest = qm_trim(rest);
+        if (rest.empty()) continue;
+        if (!qm_usable_guess(rest)) continue;            // 剥完比原文更差 ⟹ 不剥
+        return qm_trim(rest);
+    }
+    return qm_trim(s);
+}
+
+// 去「艺人 - 」前缀：仅当 " - " 前那段与已知艺术家一致时。
+inline std::string qm_strip_known_artist_prefix(const std::string& s, const std::string& artist) {
+    const size_t cut = s.find(" - ");
+    if (cut == std::string::npos) return s;
+    const std::string head = qm_trim(s.substr(0, cut));
+    if (head.empty() || artist.empty()) return s;
+    if (qm_lower_ascii(head) != qm_lower_ascii(qm_trim(artist))) return s;
+    const std::string rest = qm_trim(s.substr(cut + 3));
+    return rest.empty() ? s : rest;
+}
+
+// 结果可用性：不含 '?'（含全角 '？'）、不是残缺值、去掉空白后至少有 2 个码点
+// （按码点算而不是字节：单字标题 "鲸" 只有一个 3 字节码点，不该因为"3 字节 >= 2"混过去；
+//  真实库里的 "01. a"、"1 7PM" 这类两码点标题则应当能通过）。
+inline bool qm_usable_guess(const std::string& s) {
+    if (s.find('?') != std::string::npos) return false;
+    if (tag_is_corrupt(s)) return false;
+    size_t n = 0;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = (unsigned char)s[i];
+        if (c == 0xEF && i + 2 < s.size() && (unsigned char)s[i + 1] == 0xBC && (unsigned char)s[i + 2] == 0x9F) return false; // 全角？
+        if (c == ' ' || c == '\t') { ++i; continue; }
+        ++n; ++i;
+    }
+    return n >= 2;
+}
+
+// 给出文件名里"最像曲名"的候选（已按上面的步骤去掉前缀）。返回空串 = 推不出来。
+// 「艺人 - 曲名」形式的文件名里，前缀是不是**真艺人**。排除两类：
+//   * 占位词：未知艺术家 / 未知艺人 / 佚名 / unknown / various artists / VA（这些放进 artist 字段
+//     只会多一个无用的"艺术家"分组，还不如留空让 UI 走"未知艺术家"的既有兜底）；
+//   * 曲目占位：曲名那一段是「音轨01 / Track 01 / track01」（文件名本身就是占位）。
+// 实测（本库 盈月纪年 / 盈月纪年2 共 19 个文件）：文件名是 "01. 未知艺术家 - 音轨01.wav"，
+// 标签里没有任何艺术家 —— 这类必须**不猜**。
+inline bool qm_placeholder_artist_word(const std::string& s) {
+    // ⚠️ 中文词表用 \u 转义写：源文件的执行字符集是 Latin-1 时，直接写汉字会被编译器拆坏
+    // （261026-02 #4 实测：MSVC 判据下 "未知艺术家" 匹配不上）。
+    static const char* const kWords[] = {
+        "\u672A\u77E5\u827A\u672F\u5BB6", "\u672A\u77E5\u827A\u4EBA", "\u672A\u77E5\u6B4C\u624B",
+        "\u4F5A\u540D", "\u533F\u540D",
+        "unknown artist", "unknown", "various artists", "various", "va", "v.a.", "n/a" };
+    const std::string low = qm_lower_ascii(qm_trim(s));
+    for (const char* w : kWords) if (low == w) return true;
+    return false;
+}
+inline bool qm_track_placeholder_title(const std::string& s) {
+    // 判据："音轨NN" / "Track NN" / "Audio NN"（大小写不敏感，允许空白/下划线/连字符/点连接）。
+    // 实现说明（261026-02 #4 实测）：不要用 std::strlen / std::string::compare 去比"音轨"这类
+    // 多字节常量 —— 在 -O2 内联之后它们在这台机器上会给出诡异结果（同一函数单独调用正确、
+    // 被另一处调用就返回 0）。这里改成**逐字节、按显式长度**比较，且常量的长度写成 sizeof-1，
+    // 不再依赖任何库函数的合同。
+    static const char kYinGui[] = { (char)0xE9, (char)0x9F, (char)0xB3, (char)0xE8, (char)0xBD, (char)0xA8, 0 };
+    const size_t kYinGuiLen = sizeof(kYinGui) - 1;
+    const std::string low = qm_lower_ascii(qm_trim(s));
+    struct Name { const char* p; size_t n; };
+    const Name names[] = { { kYinGui, kYinGuiLen },
+                           { "track", 5 }, { "audio", 5 } };
+    for (const Name& nm : names) {
+        if (low.size() < nm.n) continue;
+        bool same = true;
+        for (size_t i = 0; i < nm.n; ++i) { if (low[i] != nm.p[i]) { same = false; break; } }
+        if (!same) continue;
+        size_t k = nm.n;
+        while (k < low.size() && (low[k] == ' ' || low[k] == '_' || low[k] == '-' || low[k] == '.')) ++k;
+        const bool digits = k < low.size();
+        while (k < low.size() && low[k] >= '0' && low[k] <= '9') ++k;
+        if (digits && k == low.size()) return true;
+    }
+    return false;
+}
+
+inline std::string qm_guess_title_from_filename(const std::string& path, const std::string& artist,
+                                                const std::string& albumArtist) {
+    std::string s = path;
+    const size_t slash = s.find_last_of("/\\");
+    s = (slash == std::string::npos) ? s : s.substr(slash + 1);
+    const std::string ext = lower_ext(s);
+    if (!ext.empty()) s = s.substr(0, s.size() - ext.size());
+    s = qm_trim(s);
+    s = qm_trim(qm_strip_trackno(s));
+    s = qm_strip_bracket_prefix(s);
+    s = qm_strip_known_artist_prefix(s, artist);
+    s = qm_strip_known_artist_prefix(s, albumArtist);
+    s = qm_trim(s);
+    if (qm_track_placeholder_title(s)) return std::string();        // "音轨01" 之类：文件名自己没信息
+    return qm_usable_guess(s) ? s : std::string();
+}
+
+// 从「艺人 - 曲名」形式的文件名推艺术家（只在原值完全为空/纯占位时用）。
+inline std::string qm_guess_artist_from_filename(const std::string& path) {
+    std::string s = path;
+    const size_t slash = s.find_last_of("/\\");
+    s = (slash == std::string::npos) ? s : s.substr(slash + 1);
+    const std::string ext = lower_ext(s);
+    if (!ext.empty()) s = s.substr(0, s.size() - ext.size());
+    s = qm_trim(qm_strip_trackno(qm_trim(s)));
+    const size_t cut = s.find(" - ");
+    if (cut == std::string::npos || cut == 0) return std::string();
+    const std::string head = qm_trim(s.substr(0, cut));
+    if (head.empty() || head.find('?') != std::string::npos) return std::string();
+    // 「（…）- 」这种是音质标注，不是艺人
+    if (head[0] == '(' || head[0] == '[' || head.compare(0, 3, "\xEF\xBC\x88") == 0) return std::string();
+    if (qm_placeholder_artist_word(head)) return std::string();     // "未知艺术家 - 音轨01"
+    if (qm_track_placeholder_title(qm_trim(s.substr(cut + 3)))) return std::string();
+    return qm_usable_guess(head) ? head : std::string();
+}
+
+// 日志（261026-02 #4 第 4 条：所有推导都要留痕）。格式固定，便于 grep / 事后回溯：
+//   TAGGUESS file=<路径> field=title from=filename value=<新值> old=<原值>
+// 走 stderr（与 lib_probe_one 的回退日志同一路），并且**不在探针路径里任何地方抛异常**。
+inline void qm_log_guess(const std::string& file, const char* field, const char* from,
+                         const std::string& value, const std::string& old) {
+    std::fprintf(stderr, "TAGGUESS file=%s field=%s from=%s value=%s old=%s\n",
+                 file.c_str(), field, from, value.c_str(), old.c_str());
+}
+
 } // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -1254,6 +1829,39 @@ inline bool probe_file(const std::string& path, TagInfo* out, std::string* why) 
         stats().fellBack.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    // ---- 261026-02 #4 规则 3：文件名兜底（**只对残缺值生效**，四类容器通用）----
+    // 为什么不再只限 WAV：发布后在**任何曲库**里都可能遇到"标签被写坏、文件名还是对的"，
+    // 规则本身与容器无关（只看"这个字段是不是残缺值"），所以不按扩展名设限。
+    // 总开关：RLPLAYER_TAG_GUESS=0/off/false/no ⟹ 整条规则（含跨块择优）关闭，行为回到 261025-02。
+    if (guess_enabled()) {
+        if (detail::tag_is_corrupt(t.title)) {
+            const std::string g = detail::qm_guess_title_from_filename(path, t.artist, t.albumArtist);
+            if (!g.empty()) {
+                detail::qm_log_guess(path, "title", "filename", g, t.title);
+                t.title = g;
+            }
+        }
+        // 艺术家：只比标题更保守 —— 只有**完全为空或纯占位**（不含混合占位）时才用文件名里的「艺人 - 」。
+        if (detail::tag_is_placeholder(t.artist)) {
+            const std::string g = detail::qm_guess_artist_from_filename(path);
+            if (!g.empty()) {
+                detail::qm_log_guess(path, "artist", "filename", g, t.artist);
+                t.artist = g;
+            }
+        }
+        // 专辑：**不做文件名推导**（文件名里从来不写专辑名，推必错）。混合占位的专辑留给日志可见性：
+        // 若同目录能确认专辑目录，交由 library.h 的 lib_fill_album_disc_from_dir（它只填空字段）。
+    }
+    // 第 4 条：留痕 —— 修前/修后逐条可回溯（跨块覆盖的细节在 TagMerger 里已经打过）。
+    if (detail::tag_is_corrupt(t.title))
+        std::fprintf(stderr, "TAGGUESS file=%s field=title from=none value= old=%s why=unrepaired\n",
+                     path.c_str(), t.title.c_str());
+    if (detail::tag_is_corrupt(t.album))
+        std::fprintf(stderr, "TAGGUESS file=%s field=album from=none value= old=%s why=unrepaired\n",
+                     path.c_str(), t.album.c_str());
+    if (detail::tag_is_corrupt(t.artist))
+        std::fprintf(stderr, "TAGGUESS file=%s field=artist from=none value= old=%s why=unrepaired\n",
+                     path.c_str(), t.artist.c_str());
     t.year = std::atoi(t.date.c_str());
     *out = std::move(t);
     stats().parsed.fetch_add(1, std::memory_order_relaxed);

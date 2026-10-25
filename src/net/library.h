@@ -86,6 +86,17 @@ struct LibAlbum {
     std::vector<size_t> idx;  // tracks_ 下标，已按 disc/track 排序
 };
 
+// 封面在线抓取（2026-10-26）：「专辑键 → 专辑名 + 艺术家 + 拼好的搜索词」。
+// 为什么需要反查：抓取线程只拿到 key，而网易云的专辑搜索接口吃的是**文字**（s=专辑名 艺术家）；
+// 而专辑名/艺术家在库里有两种来源（真实标签 / 目录回填，见 albumVecLocked 的 aName 推导），
+// 只有 Library 自己知道最终拼出来的那个值 —— 由本模块给，调用方不要自己再猜一遍。
+struct LibCoverTerm {
+    std::string key;      // 专辑键（与 /api/lib/cover?k= 同一个）
+    std::string name;     // 专辑名（可能来自目录回填）
+    std::string artist;   // 专辑艺术家（albumArtist 优先，退回 artist；可能为空）
+    std::string term;     // 已拼好的搜索词："名 艺术家"，艺术家为空时只有名
+};
+
 // addRoot 的完整结果：ok=false 时 why 是人话原因（HTTP 层原样回给 UI，别只说"目录不存在"）
 struct addRootResult { bool ok = false; std::string why; };
 
@@ -210,6 +221,14 @@ public:
 
     // 某专辑的封面（字节 + mime），失败返回空
     bool albumCover(const std::string& key, std::vector<unsigned char>& bytes, std::string& mime);
+
+    // ---- 封面在线抓取用的「按 album+artist 反查」（2026-10-26）----
+    // ① 全库快照：所有「内嵌流与同目录封面文件都没有」的专辑（hasCover 在扫描时已算好：
+    //    内嵌 video 流 **或** 同目录 cover/folder/front 任一存在 ⟹ hasCover=1，见 lib_probe 尾部）。
+    //    文件系统 IO 由调用方做（磁盘正/负缓存留在 rtaweb），本模块只回答「库里有没有图」。
+    std::vector<LibCoverTerm> albumsWithoutCover() const;
+    // ② 单张反查：按 key 取回专辑名/艺术家/搜索词。key 不在库里返回 false。
+    bool albumCoverTerm(const std::string& key, LibCoverTerm& out) const;
 
     // ---- 扫描 ----
     void load();            // 读配置与索引
@@ -624,7 +643,25 @@ inline LibTrack lib_probe_one(const std::string& file, const std::string& ffprob
         std::string why;
         if (rta::meta::native::probe_file(file, &ni, &why)) {
             t.title = ni.title; t.artist = ni.artist; t.album = ni.album;
-            t.albumArtist = ni.albumArtist; t.genre = ni.genre;
+            t.albumArtist = ni.albumArtist;         // （提前：下面文件名兜底要用它去对「艺人 - 」前缀）
+            // ---- 261026-02 #4 规则 3：文件名兜底（**只对残缺值生效**，四类容器通用）----
+            // 通用能力，不认容器、不认具体文件名：判据只有"这个字段是不是残缺值"
+            // （detail::tag_is_corrupt）+ "文件名能不能推出一条像样的名字"。总开关 RLPLAYER_TAG_GUESS。
+            // 放在这里而不是 tags_native.h：ffprobe 回退分支同样要享受这条规则（同一份代码路径）。
+            // 与 probe_file 里的那份**完全同源**（同一个 detail::qm_guess_title_from_filename），
+            // probe_file 的先跑一次，这里再跑一次是幂等的（都只对残缺值生效）。
+            if (rta::meta::native::guess_enabled()) {
+                if (rta::meta::native::detail::tag_is_corrupt(t.title)) {
+                    const std::string g = rta::meta::native::detail::qm_guess_title_from_filename(
+                        file, t.artist, t.albumArtist);
+                    if (!g.empty() && !rta::meta::native::detail::tag_is_corrupt(g)) {
+                        std::fprintf(stderr, "TAGGUESS file=%s field=title from=filename value=%s old=%s\n",
+                                     file.c_str(), g.c_str(), t.title.c_str());
+                        t.title = g;
+                    }
+                }
+            }
+            t.genre = ni.genre;
             t.trackNo = ni.trackNo; t.discNo = ni.discNo; t.year = ni.year;
             t.sampleRate = ni.sampleRate; t.channels = ni.channels;
             t.bits = ni.bits; t.duration = ni.duration; t.codec = ni.codec;
@@ -1005,6 +1042,28 @@ inline std::string Library::indexTextLocked() const {
 // ⟹ 一次专辑重建能把整个控制面堵住十几秒，看着就像"卡死/又在扫描"。
 // 现在：① 每个目录只 stat 一次（LibDirAlbumMemo，键=父目录）；② 碟号预先算进 discOf[]，
 // 比较器里**不再碰文件系统**；③ 结束时把专辑数写进 albumCount_（status 无锁读）。
+// 专辑键用的目录归一：把 CD1 / Disc 2 / disk_3 / CD-01 之类的后缀去掉，让多碟装仍归成一张专辑。
+// 只做小写化 + 去尾部碟号，不动中间路径（避免把 "CD Collection" 这类正常目录名改坏）。
+inline std::string lib_dir_album_key(const std::string& dir) {
+    std::string d;
+    d.reserve(dir.size());
+    for (char c : dir) d.push_back((char)std::tolower((unsigned char)c));
+    for (;;) {
+        size_t e = d.size();
+        while (e > 0 && (d[e - 1] == '\\' || d[e - 1] == '/')) --e;
+        size_t digitsEnd = e;
+        while (e > 0 && std::isdigit((unsigned char)d[e - 1])) --e;
+        if (e == digitsEnd) break;
+        size_t q = e;
+        if (q > 0 && (d[q - 1] == '-' || d[q - 1] == '_' || d[q - 1] == ' ')) --q;
+        if (q >= 2 && d.compare(q - 2, 2, "cd") == 0) { d.resize(q - 2); continue; }
+        if (q >= 4 && d.compare(q - 4, 4, "disc") == 0) { d.resize(q - 4); continue; }
+        if (q >= 4 && d.compare(q - 4, 4, "disk") == 0) { d.resize(q - 4); continue; }
+        break;
+    }
+    return d;
+}
+
 inline const std::vector<LibAlbum>& Library::albumVecLocked() const {
     if (!albumsDirty_) return albums_;
     albums_.clear();
@@ -1017,8 +1076,8 @@ inline const std::vector<LibAlbum>& Library::albumVecLocked() const {
         std::string aName = t.album;
         std::string aArtist = t.albumArtist.empty() ? t.artist : t.albumArtist;
         int discForSort = t.discNo;
+        std::string pdir = u8s(p8(t.path).parent_path().u8string());
         if (aName.empty() || discForSort == 0) {
-            const std::string pdir = u8s(p8(t.path).parent_path().u8string());
             const LibDirAlbum da = memo.get(pdir, t.path);
             if (da.fromDir) {
                 if (aName.empty()) aName = da.album;
@@ -1028,7 +1087,13 @@ inline const std::vector<LibAlbum>& Library::albumVecLocked() const {
             }
         }
         discOf[i] = discForSort;
-        const std::string rawKey = aArtist + "\x1f" + aName;
+        // ★ 2026-10-26（261026-02 #3 的根因之一）：专辑键**不能带 artist**。
+        // 旧键 = (albumArtist?:artist) + "\x1f" + album ⟹ 同一张碟里每首 artist 不同就被切成多个"专辑"：
+        // 实测本库 654 首被切成 **301 张卡**，而物理目录只有 87 个（RESOLVERS 一张碟裂成 19 张）。
+        // 后果：专辑页看着零碎、封面按裂开的卡逐张去搜（同一张碟搜 19 次）、覆盖率分母被人为放大。
+        // 新键 = 专辑名 + "\x1f" + 目录（目录做 CD1/Disc 2 归一，保证多碟装仍合成一张）。
+        const std::string dirKey = lib_dir_album_key(pdir);
+        const std::string rawKey = aName + "\x1f" + dirKey;
         auto it = byKey.find(rawKey);
         if (it == byKey.end()) {
             LibAlbum a; a.key = fnv_hex(rawKey); a.name = aName; a.artist = aArtist; a.year = t.year;
@@ -1138,6 +1203,45 @@ inline bool Library::albumCover(const std::string& key, std::vector<unsigned cha
     }
     bytes.swap(b);
     return !bytes.empty();
+}
+
+// ---------------- 封面在线抓取：按 album+artist 反查（2026-10-26）----------------
+// 为什么由 Library 出这份数据，而不是让 rtaweb 自己拼：
+//   /api/lib/albums 里的 name/artist 是 albumVecLocked() 的**成品**（真实标签，缺了才用目录名回填，
+//   且 albumArtist 优先于 artist）。抓取侧只拿到专辑键，若自己回头翻 tracks_ 拼搜索词，
+//   就会与 UI 上显示的那张专辑不一致（缺标签的专辑在 UI 上叫目录名，tracks_ 里却是空串）。
+// 只读：不落盘、不改索引；专辑表还没整理时由 albumVecLocked() 触发一次整理（与 albums() 同代价）。
+inline std::string lib_cover_term(const std::string& name, const std::string& artist) {
+    std::string t = name;
+    if (!artist.empty()) { if (!t.empty()) t += ' '; t += artist; }
+    return t;
+}
+
+inline std::vector<LibCoverTerm> Library::albumsWithoutCover() const {
+    std::vector<LibCoverTerm> out;
+    std::lock_guard<std::mutex> lk(mtx_);
+    const auto& v = albumVecLocked();
+    out.reserve(v.size());
+    for (const auto& a : v) {
+        if (a.hasCover) continue;                 // 库里已有图（内嵌流或同目录封面文件）
+        LibCoverTerm t;
+        t.key = a.key; t.name = a.name; t.artist = a.artist;
+        t.term = lib_cover_term(a.name, a.artist);
+        out.push_back(std::move(t));
+    }
+    return out;
+}
+
+inline bool Library::albumCoverTerm(const std::string& key, LibCoverTerm& out) const {
+    if (key.empty()) return false;
+    std::lock_guard<std::mutex> lk(mtx_);
+    for (const auto& a : albumVecLocked()) {
+        if (a.key != key) continue;
+        out.key = a.key; out.name = a.name; out.artist = a.artist;
+        out.term = lib_cover_term(a.name, a.artist);
+        return true;
+    }
+    return false;
 }
 
 inline void Library::joinScan() {
