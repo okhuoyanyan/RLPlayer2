@@ -31,6 +31,15 @@ else()
   add_compile_options(-O3 -march=${RTA_ARCH} -ffast-math -fno-finite-math-only
                       -fhonor-nans -fhonor-infinities -fno-math-errno)
   add_compile_options(-fno-strict-aliasing)
+  # 2026-10-25（移植自协作者 macOS 分支 01f8787 的「编译选项」那一层）：
+  # FMA 收缩会让 DSP 的定点/浮点轨迹在**指令集不同**时产生可测差异 —— 实测在 -DRTA_ARCH=znver5
+  # 的开发构建里，EC-7@DSD512 的带内 SNR 从 121.8 dB 塌到 60.9 dB（239 条 vfmadd 融合）。
+  # 分发基线 x86-64-v2 没有 FMA，这个旗标对发布产物是**逐字节 no-op**（已用 SHA256 验证）。
+  # 需要极限性能时可显式 -DRTA_FP_CONTRACT=fast 关掉本守卫。
+  set(RTA_FP_CONTRACT "off" CACHE STRING "FP contraction: off (deterministic) | fast")
+  if (RTA_FP_CONTRACT STREQUAL "off")
+    add_compile_options(-ffp-contract=off)
+  endif()
   add_compile_options($<$<CONFIG:Release>:-DNDEBUG>)
 endif()
 
@@ -581,3 +590,11 @@ add_test(NAME dsd_stream_decode COMMAND test_dsd_stream_decode)
 add_executable(test_tags_native tests/test_tags_native.cpp)
 target_include_directories(test_tags_native PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME tags_native COMMAND test_tags_native)
+
+# ---------------- 三档官方推荐预设的决策纯函数（2026-10-25）----------------
+# 只 include engine/preset_profiles.h：不开设备、不读文件 ⟹ 无声卡/无驱动也能跑。
+# 探测侧（WASAPI IsFormatSupported / ASIO canSampleRate、kAsioCanDoIoFormat）在 rtaweb 里，
+# 由 GET /api/preset/caps 的实测输出验证 —— 探针与决策分开测，判据才不互相污染。
+add_executable(test_preset_profiles tests/test_preset_profiles.cpp)
+target_include_directories(test_preset_profiles PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME preset_profiles COMMAND test_preset_profiles)

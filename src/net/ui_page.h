@@ -630,8 +630,22 @@ h += "#npPage .npedge{display:none}";
     h += ".meta-card input[type=text],.meta-card input[type=password]{width:100%;padding:7px 10px;border-radius:8px;border:1px solid var(--line);background:var(--field);font-size:12px;font-family:inherit;line-height:1.45;color:var(--txt);min-height:31px;transition:.15s}";
     h += ".meta-card input:focus{outline:0;border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-weak)}";
     h += "@media (max-width:1100px){.meta-adv-grid{grid-template-columns:1fr}}";
+    // 官方推荐预设卡片
+    h += ".preset-card{margin-bottom:18px;border:1px solid var(--line);border-radius:12px;background:var(--bg2);overflow:hidden}";
+    h += ".preset-card-head{display:flex;align-items:center;justify-content:space-between;padding:11px 16px;border-bottom:1px solid var(--line);background:var(--bg3)}";
+    h += ".preset-card-title{font-size:13px;font-weight:650;color:var(--txt);display:flex;align-items:center;gap:8px}";
+    h += ".preset-caps-line{font-size:12px;color:var(--txt2);padding:9px 16px;border-bottom:1px solid var(--line);background:var(--field);display:flex;align-items:center;gap:6px}";
+    h += ".preset-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:14px 16px}";
+    h += "@media (max-width:920px){.preset-grid{grid-template-columns:1fr}}";
+    h += ".preset-btn{display:flex;flex-direction:column;align-items:flex-start;text-align:left;padding:12px 14px;border-radius:10px;border:1px solid var(--line);background:var(--field);color:var(--txt);cursor:pointer;transition:all .15s ease;min-height:76px;width:100%}";
+    h += ".preset-btn:hover{border-color:var(--acc);background:var(--hov);transform:translateY(-1px);box-shadow:0 3px 12px var(--shadow)}";
+    h += ".preset-btn:active{transform:translateY(0)}";
+    h += ".preset-btn-top{display:flex;align-items:center;justify-content:space-between;width:100%;margin-bottom:6px}";
+    h += ".preset-btn-title{font-size:13px;font-weight:650;color:var(--txt)}";
+    h += ".preset-btn-badge{font-size:11px;color:var(--warn);font-weight:600}";
+    h += ".preset-btn-sub{font-size:11.5px;line-height:1.45;color:var(--mut)}";
     // 设置页分页（对齐 HQPlayer 的 Inputs / Outputs / PCM / SDM / Advanced）
-    h += ".stabs{display:flex;gap:4px;padding:10px 0 12px;margin:-20px 0 14px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:6}";
+    h += ".stabs{display:flex;gap:4px;padding:10px 0 12px;margin:0 0 14px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:6}";
     h += ".stab{padding:7px 15px;border-radius:8px;font-size:12px;color:var(--mut);border:1px solid transparent;transition:.13s}";
     h += ".stab:hover{background:var(--hov);color:var(--txt2)}";
     h += ".stab.on{background:var(--acc-weak);color:var(--acc-text);border-color:rgba(59,130,246,.32);font-weight:600}";

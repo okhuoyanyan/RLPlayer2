@@ -131,9 +131,24 @@ function apiRaw(u, body) {
   return fetch(u, opt).then(function (r) {
     clearTimeout(timer);
     if (!r.ok) {
-      var err = new Error('HTTP ' + r.status);
-      err.status = r.status;
-      throw err;
+      return r.text().then(function (txt) {
+        var msg = '';
+        try {
+          var j = JSON.parse(txt);
+          if (j && j.error) msg = j.error;
+          else if (j && j.message) msg = j.message;
+        } catch (e) {
+          msg = txt;
+        }
+        if (!msg) msg = 'HTTP ' + r.status;
+        var err = new Error(msg);
+        err.status = r.status;
+        throw err;
+      }, function () {
+        var err = new Error('HTTP ' + r.status);
+        err.status = r.status;
+        throw err;
+      });
     }
     return r.json();
   }, function (e) {
@@ -143,7 +158,10 @@ function apiRaw(u, body) {
 }
 
 function api(u, body) {
-  return apiRaw(u, body).catch(function () {
+  return apiRaw(u, body).catch(function (err) {
+    if (err && err.status && err.status >= 400 && err.status < 500) {
+      throw err;
+    }
     return new Promise(function (res) { setTimeout(res, 200); }).then(function () {
       return apiRaw(u, body);
     });
@@ -1409,8 +1427,10 @@ function renderArtistProfile(who, j, summary) {
 
   if (!isOk) {
     // 261024-01 #3a：**删除整个「资料暂缺」说明块**。没有词条资料 → 上面 AI 资料安静显示，这里什么都不放。
-    // 只有"在线整理也没开"这种确实无内容可显示的情况，才给一行极简空态 + 重试（绝不写一大段解释）。
-    if (META.summary != 1) {
+    // 只有"确实无内容可显示"的情况，才给一行极简空态 + 重试（绝不写一大段解释）。
+    // 2026-10-25（uicheck 抓到的真空白）：在线整理**开着但没配 LLM key**时，上面那张 AI 卡永远填不满，
+    // 旧条件只判 META.summary != 1 ⟹ 整页空白（三个分支一个都不命中）。补上 hasLlmKey 判断。
+    if (META.summary != 1 || META.hasLlmKey !== true) {
       h += '<div class="card empty-card" style="padding:22px 20px;text-align:center;background:var(--phbg);border:1px solid var(--line);border-radius:12px;margin-top:14px">' +
            '<div style="color:var(--mut);font-size:12.5px">暂无资料</div>' +
            '<button class="btn" id=bRetryKnowledge style="margin-top:12px">重试获取</button>' +
@@ -4215,6 +4235,306 @@ function llmTest() {
   });
 }
 
+/* ---------------- 官方推荐预设与硬件能力 ---------------- */
+var _capsCache = null;
+var _capsTime = 0;
+
+function setSelectValue(sel, val) {
+  if (!sel || val === undefined || val === null) return;
+  var strVal = String(val);
+  var found = false;
+  for (var i = 0; i < sel.options.length; i++) {
+    if (sel.options[i].value === strVal) { found = true; break; }
+  }
+  if (!found) {
+    var opt = document.createElement('option');
+    opt.value = strVal;
+    opt.textContent = strVal;
+    sel.appendChild(opt);
+  }
+  sel.value = strVal;
+}
+
+function presetCardHtml() {
+  var dev = (_capsCache && _capsCache.device) || {};
+  var name = dev.name || '检测中…';
+  var maxRate = dev.maxRate ? (dev.maxRate + ' Hz') : '- Hz';
+  var dsdStr = '-';
+  if (dev.dsdNative !== undefined) {
+    dsdStr = dev.dsdNative ? ('是（最高 ' + (dev.dsdNativeMax || 'dsd256') + '）') : '否';
+  }
+  var pcmTargetRate = dev.maxRate ? dev.maxRate : '384000';
+  var dsdTarget = (dev.dsdNative && dev.dsdNativeMax) ? dev.dsdNativeMax : (dev.dopMax || dev.dsdNativeMax || 'dsd256');
+
+  var dsdBadge = '';
+  if (dev.dsdNative === false) {
+    dsdBadge = dev.dop ? '★ 降级为 DoP' : '★ 硬件不支持 DSD';
+  }
+  var pcmBadge = '';
+  if (dev.maxRate && dev.maxRate <= 192000) {
+    pcmBadge = '★ 仅到 ' + (dev.maxRate >= 1000 ? (dev.maxRate / 1000 + 'k') : dev.maxRate);
+  }
+
+  var h = '<div class="preset-card" id=presetCard>'
+        + '<div class=preset-card-head>'
+        + '<span class=preset-card-title>'
+        + '<svg width=15 height=15 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 style="color:var(--acc)"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>'
+        + '官方推荐预设'
+        + '</span>'
+        + '<button class="btn" id=presetCapsRefresh title="刷新硬件能力" aria-label="刷新硬件能力" style="font-size:11.5px;padding:3px 9px;display:flex;align-items:center;gap:4px">'
+        + '<svg width=12 height=12 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>'
+        + '刷新</button>'
+        + '</div>'
+        + '<div class=preset-caps-line id=presetCapsInfo>'
+        + '当前设备：' + esc(name) + ' · 最高 ' + esc(maxRate) + ' · 原生 DSD ' + esc(dsdStr)
+        + '</div>'
+        + '<div class=preset-grid>'
+        + '<button class=preset-btn id=presetBitPerfect aria-label="原音直通（bit-perfect）">'
+        + '<div class=preset-btn-top>'
+        + '<span class=preset-btn-title>原音直通（bit-perfect）</span>'
+        + '<span class=preset-btn-badge id=presetBpBadge style="' + (dev.exclusive === false ? '' : 'display:none') + '">' + (dev.exclusive === false ? '★ 仅共享模式' : '') + '</span>'
+        + '</div>'
+        + '<div class=preset-btn-sub>不升频、音量 0 dB、无 EQ/IR；只保证不动数据，不等于最好听</div>'
+        + '</button>'
+        + '<button class=preset-btn id=presetPcm aria-label="PCM 升频">'
+        + '<div class=preset-btn-top>'
+        + '<span class=preset-btn-title>PCM 升频</span>'
+        + '<span class=preset-btn-badge id=presetPcmBadge style="' + (pcmBadge ? '' : 'display:none') + '">' + pcmBadge + '</span>'
+        + '</div>'
+        + '<div class=preset-btn-sub id=presetPcmSub>升到设备最高档（当前 ' + esc(pcmTargetRate) + '），tight 滤波 + 每相位 512 抽头</div>'
+        + '</button>'
+        + '<button class=preset-btn id=presetDsd aria-label="DSD 升频">'
+        + '<div class=preset-btn-top>'
+        + '<span class=preset-btn-title>DSD 升频</span>'
+        + '<span class=preset-btn-badge id=presetDsdBadge style="' + (dsdBadge ? '' : 'display:none') + '">' + dsdBadge + '</span>'
+        + '</div>'
+        + '<div class=preset-btn-sub id=presetDsdSub>升到 ' + esc(dsdTarget) + '，EC-7 调制器</div>'
+        + '</button>'
+        + '</div>'
+        + '</div>';
+  return h;
+}
+
+function renderPresetCaps(j) {
+  if (!j || !j.ok) return;
+  var dev = j.device || {};
+  var name = dev.name || '默认设备';
+  var maxRate = dev.maxRate ? (dev.maxRate + ' Hz') : '未知';
+  var dsdStr = dev.dsdNative ? ('是（最高 ' + (dev.dsdNativeMax || 'dsd256') + '）') : '否';
+
+  if (D('presetCapsInfo')) {
+    D('presetCapsInfo').textContent = '当前设备：' + name + ' · 最高 ' + maxRate + ' · 原生 DSD ' + dsdStr;
+  }
+  var pcmTargetRate = dev.maxRate ? dev.maxRate : '384000';
+  if (D('presetPcmSub')) {
+    D('presetPcmSub').textContent = '升到设备最高档（当前 ' + pcmTargetRate + '），tight 滤波 + 每相位 512 抽头';
+  }
+  var dsdTarget = (dev.dsdNative && dev.dsdNativeMax) ? dev.dsdNativeMax : (dev.dopMax || dev.dsdNativeMax || 'dsd256');
+  if (D('presetDsdSub')) {
+    D('presetDsdSub').textContent = '升到 ' + dsdTarget + '，EC-7 调制器';
+  }
+  if (D('presetDsdBadge')) {
+    if (dev.dsdNative === false) {
+      D('presetDsdBadge').textContent = dev.dop ? '★ 降级为 DoP' : '★ 硬件不支持 DSD';
+      D('presetDsdBadge').style.display = '';
+    } else {
+      D('presetDsdBadge').style.display = 'none';
+    }
+  }
+  if (D('presetPcmBadge')) {
+    if (dev.maxRate && dev.maxRate <= 192000) {
+      D('presetPcmBadge').textContent = '★ 仅到 ' + (dev.maxRate >= 1000 ? (dev.maxRate / 1000 + 'k') : dev.maxRate);
+      D('presetPcmBadge').style.display = '';
+    } else {
+      D('presetPcmBadge').style.display = 'none';
+    }
+  }
+  if (D('presetBpBadge')) {
+    if (dev.exclusive === false) {
+      D('presetBpBadge').textContent = '★ 仅共享模式';
+      D('presetBpBadge').style.display = '';
+    } else {
+      D('presetBpBadge').style.display = 'none';
+    }
+  }
+}
+
+function loadPresetCaps(force) {
+  var now = Date.now();
+  if (!force && _capsCache && (now - _capsTime < 10000)) {
+    renderPresetCaps(_capsCache);
+    return Promise.resolve(_capsCache);
+  }
+  return fetch('/api/preset/caps').then(function (r) {
+    return r.json();
+  }).then(function (j) {
+    if (j && j.ok) {
+      _capsCache = j;
+      _capsTime = Date.now();
+      renderPresetCaps(j);
+    }
+    return j;
+  }).catch(function (err) {
+    console.error('loadPresetCaps error:', err);
+  });
+}
+
+function applyPresetControls(applied, profile) {
+  if (!applied || typeof applied !== 'object') return;
+
+  var r = applied.rate !== undefined ? applied.rate : applied.sRate;
+  if (r === undefined && profile === 'bitperfect') r = 'follow';
+  if (r !== undefined) {
+    setSelectValue(D('sRate'), r);
+    setSelectValue(D('sp_rate'), r);
+  }
+
+  var f = applied.filter !== undefined ? applied.filter : applied.sFilt;
+  if (f !== undefined) {
+    setSelectValue(D('sFilt'), f);
+    setSelectValue(D('sp_filt'), f);
+  }
+
+  var fnx = applied.filterNx !== undefined ? applied.filterNx : applied.sFiltNx;
+  if (fnx !== undefined) {
+    setSelectValue(D('sFiltNx'), fnx);
+    setSelectValue(D('sp_filtNx'), fnx);
+  }
+
+  var sh = applied.shaper !== undefined ? applied.shaper : applied.sShap;
+  if (sh === undefined && profile === 'bitperfect') sh = 'none';
+  if (sh !== undefined) {
+    setSelectValue(D('sShap'), sh);
+    setSelectValue(D('sp_shaper'), sh);
+  }
+
+  var dsd = applied.dsd !== undefined ? applied.dsd : applied.sDSD;
+  if (dsd === undefined && (profile === 'bitperfect' || profile === 'pcm')) dsd = '0';
+  if (dsd !== undefined) {
+    setSelectValue(D('sDSD'), dsd);
+    if (D('sp_outmode')) D('sp_outmode').value = outModeOf();
+    if (D('sp_dsdrate')) D('sp_dsdrate').value = dsdRateOf();
+    if (D('sp_dsdpk')) D('sp_dsdpk').value = dsdPackOf();
+    applyDsdState();
+  }
+
+  var buf = applied.buffer !== undefined ? applied.buffer : applied.sBuf;
+  if (buf !== undefined) {
+    if (D('sBuf')) D('sBuf').value = String(buf);
+    if (D('sp_buffer')) D('sp_buffer').value = String(buf);
+  }
+
+  var vol = applied.volume !== undefined ? applied.volume : applied.vol;
+  if (vol === undefined && profile === 'bitperfect') vol = 0;
+  if (vol !== undefined) {
+    var vNum = Number(vol) || 0;
+    S.vol = vNum;
+    S.volDb = vNum;
+    if (D('vol')) D('vol').value = String(vNum);
+    if (D('volDb')) D('volDb').textContent = vNum.toFixed(1) + ' dB';
+    api('/api/volume', 'vol=' + vNum).catch(function () {});
+  }
+
+  var isp = applied.isp !== undefined ? applied.isp : applied.sIsp;
+  if (isp === undefined && profile === 'bitperfect') isp = false;
+  if (isp !== undefined) {
+    var ispBool = (isp === true || isp === 1 || isp === '1');
+    if (D('sIsp')) D('sIsp').checked = ispBool;
+    if (D('sp_isp')) D('sp_isp').checked = ispBool;
+    ADV.isp = ispBool;
+  }
+
+  var s2s = applied.twostage !== undefined ? applied.twostage : applied.s2s;
+  if (s2s !== undefined) {
+    var s2sBool = (s2s === true || s2s === 1 || s2s === '1');
+    if (D('s2s')) D('s2s').checked = s2sBool;
+    if (D('sp_2s')) D('sp_2s').checked = s2sBool;
+  }
+
+  if (applied.backend !== undefined) {
+    if (D('sp_backend')) D('sp_backend').value = applied.backend;
+    ADV.backend = applied.backend;
+    applyBackendState();
+  }
+
+  for (var k in applied) {
+    var el = D(k);
+    if (el) {
+      if (el.tagName === 'SELECT') setSelectValue(el, applied[k]);
+      else if (el.type === 'checkbox') el.checked = !!applied[k];
+      else el.value = applied[k];
+    }
+  }
+
+  saveSettings(true);
+  tick();
+  if (typeof syncLiveSignal === 'function') syncLiveSignal();
+  if (typeof updateSignalChain === 'function') updateSignalChain();
+  if (D('modal') && D('modal').classList.contains('on')) showChain();
+}
+
+function applyPreset(profile) {
+  var bBp = D('presetBitPerfect'), bPcm = D('presetPcm'), bDsd = D('presetDsd');
+  if (bBp) bBp.disabled = true;
+  if (bPcm) bPcm.disabled = true;
+  if (bDsd) bDsd.disabled = true;
+
+  return api('/api/preset/apply?profile=' + encodeURIComponent(profile), '').then(function (j) {
+    if (bBp) bBp.disabled = false;
+    if (bPcm) bPcm.disabled = false;
+    if (bDsd) bDsd.disabled = false;
+
+    if (!j || !j.ok) {
+      toast((j && (j.error || j.message)) || '应用预设失败');
+      return j;
+    }
+
+    if (j.applied) {
+      applyPresetControls(j.applied, profile);
+    }
+
+    if (j.notes && Array.isArray(j.notes) && j.notes.length) {
+      j.notes.forEach(function (note, idx) {
+        setTimeout(function () { toast(note); }, idx * 1200);
+      });
+    } else {
+      toast('已应用 ' + (profile === 'bitperfect' ? '原音直通' : (profile === 'pcm' ? 'PCM 升频' : 'DSD 升频')) + ' 预设');
+    }
+    return j;
+  }).catch(function (err) {
+    if (bBp) bBp.disabled = false;
+    if (bPcm) bPcm.disabled = false;
+    if (bDsd) bDsd.disabled = false;
+
+    var msg = (err && (err.message || err.error)) || String(err) || '应用预设失败';
+    toast(msg);
+  });
+}
+
+function bindPresetCard() {
+  if (D('presetCapsRefresh')) {
+    D('presetCapsRefresh').onclick = function () {
+      var btn = this;
+      btn.disabled = true;
+      loadPresetCaps(true).then(function () {
+        btn.disabled = false;
+        toast('硬件能力已刷新');
+      }).catch(function () {
+        btn.disabled = false;
+      });
+    };
+  }
+  if (D('presetBitPerfect')) {
+    D('presetBitPerfect').onclick = function () { applyPreset('bitperfect'); };
+  }
+  if (D('presetPcm')) {
+    D('presetPcm').onclick = function () { applyPreset('pcm'); };
+  }
+  if (D('presetDsd')) {
+    D('presetDsd').onclick = function () { applyPreset('dsd'); };
+  }
+}
+
 function renderSettingsPage() {
   var filts = D('sFilt') ? D('sFilt').innerHTML : '';
   // Nx 下拉必须带上"跟随 1x"（空值），否则重建后浏览器退回第一项，一保存就把 Nx 改掉
@@ -4223,6 +4543,9 @@ function renderSettingsPage() {
   var BK = ADV.backend || 'wasapi';
   var CH = String(ADV.channels || 0);
   var h = '';
+
+  // ---------- 官方推荐预设卡片 ----------
+  h += presetCardHtml();
 
   // ---------- 页签（对齐 HQPlayer：Inputs / Outputs / PCM / SDM / Advanced） ----------
   h += '<div class=stabs>'
@@ -4575,6 +4898,9 @@ function renderSettingsPage() {
      + '<span style="font-size:11.5px;color:var(--mut2)">改动在下一次播放时生效</span></div>';
 
   D('setpage').innerHTML = h;
+
+  bindPresetCard();
+  loadPresetCaps(false);
 
   // P1.5：源开关的绑定不在上面的静态清单里 —— 重建 HTML 后逐源重新绑定
   //（/api/providers 已到则用缓存渲染+绑定；没到则等 fillMetaProviders 到达时补填）。
