@@ -484,10 +484,20 @@ function loadAlbums(q, title) {
     S.albums = j.albums || [];
     if (!S.albums.length) {
       head(title || '专辑', '0 张', '');
-      D('list').innerHTML = '<div class=empty>' +
-        (S.roots.length ? '库里还没有音乐<br><span style="font-size:11.5px">在右侧「设置」里添加音乐目录，然后点重新扫描</span>'
-                        : '还没有设置音乐目录<br><span style="font-size:11.5px">打开右侧「设置」→ 添加目录 → 重新扫描</span>') +
-        '</div>';
+      var hasRoots = (S.roots && S.roots.length > 0);
+      var emptyH = '<div class="empty-guide-card" id=emptyGuideCard style="max-width:520px;margin:clamp(30px,8vh,70px) auto;padding:32px 28px;background:var(--card);border:1px solid var(--line);border-radius:12px;text-align:center">' +
+        '<div style="font-size:36px;margin-bottom:12px">&#127925;</div>' +
+        '<div style="font-size:15px;font-weight:650;margin-bottom:8px">' +
+        (hasRoots ? '已添加音乐目录，但未找到音频文件' : '还没有添加音乐目录') + '</div>' +
+        '<div style="color:var(--mut2);font-size:12.5px;line-height:1.7;margin-bottom:20px">' +
+        (hasRoots ? '当前目录中未发现可识别的音频文件，请确认音频格式或更换目录。' : 'RLPlayer 会自动为您建立高保真音乐库并整理专辑与元数据。<br>支持 FLAC、DSD (DSF/DFF)、WAV、ALAC、CUE 分轨等格式。') + '</div>' +
+        '<div style="display:flex;justify-content:center;gap:12px">' +
+        '<button class="btn pri" id=bEmptyAddRoot>📁 ' + (hasRoots ? '管理音乐目录' : '添加音乐目录') + '</button>' +
+        '<button class="btn" id=bEmptyScan>🔄 ' + (hasRoots ? '重新扫描' : '扫描目录') + '</button>' +
+        '</div></div>';
+      D('list').innerHTML = emptyH;
+      if (D('bEmptyAddRoot')) D('bEmptyAddRoot').onclick = function () { openSettingsTab('adv'); };
+      if (D('bEmptyScan')) D('bEmptyScan').onclick = function () { D('bScan').click(); };
       return;
     }
     head(title || '专辑', S.albums.length + ' 张专辑', '');
@@ -928,11 +938,12 @@ function openAlbum(k) {
          '<span class=sum>' + j.tracks.length + ' 首 · 总时长 ' + fmtDurLong(localTotal) + '</span></div>';
     j.tracks.forEach(function (t, i) {
       var isFav = FAV_SET.has(t.path);
-      h += '<div class="trow trow-track" data-i=' + i + ' style="grid-template-columns:28px 24px minmax(120px,1fr) minmax(0,1fr) 58px;gap:8px">' +
+      h += '<div class="trow trow-track" data-i=' + i + ' style="grid-template-columns:28px 24px minmax(120px,1.6fr) minmax(0,1fr) 92px 58px;gap:8px">' +
            '<div class=n>' + (t.n || (i + 1)) + '</div>' +
            favIconHtml(t.path, isFav) +
            '<div class=tt title="' + esc(t.title) + '">' + esc(t.title) + '</div>' +
-           '<div class=ar>' + esc(t.artist || j.artist) + '</div>' +
+           '<div class=ar title="' + esc(t.artist || j.artist) + '">' + esc(t.artist || j.artist) + '</div>' +
+           '<div class=bd>' + fmtTag(t.sr, t.bits) + '</div>' +
            '<div class=du>' + fmtDurLong(t.dur) + '</div>' +
            '</div>';
     });
@@ -1729,7 +1740,22 @@ function renderTracksView() {
   var q = S.tracksQuery || '';
   var totalCount = t.length;
   head(q ? ('搜索：' + q) : '曲目', totalCount + ' 首', '');
-  if (!totalCount) { D('list').innerHTML = '<div class=empty>没有匹配的曲目</div>'; return; }
+  if (!totalCount) {
+    if (q) {
+      var emptyH = '<div class=empty id=searchEmpty style="padding:48px 20px;text-align:center">' +
+                   '<div style="font-size:15px;font-weight:600;margin-bottom:6px">未找到与 “' + esc(q) + '” 相关的曲目</div>' +
+                   '<div style="color:var(--mut2);font-size:12px;margin-bottom:16px">请尝试缩短搜索词，或检查是否有错别字</div>' +
+                   '<button class="btn" id=bSearchClear>清空搜索词</button></div>';
+      D('list').innerHTML = emptyH;
+      if (D('bSearchClear')) D('bSearchClear').onclick = function () {
+        if (D('qClear')) D('qClear').click();
+        else { D('q').value = ''; loadAlbums(''); }
+      };
+    } else {
+      D('list').innerHTML = '<div class=empty>没有匹配的曲目</div>';
+    }
+    return;
+  }
 
   var sortMode = S.trackSort || 'default';
   var sorted = t.slice();
@@ -1983,6 +2009,62 @@ function showQueueContextMenu(x, y, idx) {
   _activeCtxMenu = menu;
 }
 
+function updateNextTrackInfo() {
+  var el = D('npNextTrack');
+  var heroEl = D('npNextTrackHero');
+  var tqBadge = D('tqBadge');
+  var qLen = (S.q && S.q.items) ? S.q.items.length : 0;
+  if (tqBadge) {
+    if (qLen > 0) {
+      tqBadge.textContent = qLen;
+      tqBadge.style.display = '';
+    } else {
+      tqBadge.style.display = 'none';
+    }
+  }
+  if (!S.playing || !qLen) {
+    if (el) el.style.display = 'none';
+    if (heroEl) heroEl.style.display = 'none';
+    return;
+  }
+  var curIdx = (S.q.index !== undefined ? S.q.index : -1);
+  if (curIdx < 0 && S.lastCur) {
+    curIdx = S.q.items.indexOf(S.lastCur);
+  }
+  var repMode = (D('sRep') && D('sRep').value) || '0';
+  var nextIdx = curIdx + 1;
+  var hasNext = true;
+  if (nextIdx >= qLen) {
+    if (repMode === '1') {
+      nextIdx = 0;
+    } else {
+      hasNext = false;
+    }
+  }
+  var remain = Math.max(0, qLen - 1 - (curIdx >= 0 ? curIdx : 0));
+  var text = '';
+  var tip = '';
+  if (hasNext && qLen > 0) {
+    var nextPath = S.q.items[nextIdx] || '';
+    var nextTitle = nam(nextPath);
+    text = '下一首: ' + nextTitle + (remain > 0 ? (' · 剩 ' + remain + ' 首') : '');
+    tip = '下一首：' + nextTitle + '（队列共 ' + qLen + ' 首，剩余 ' + remain + ' 首）';
+  } else {
+    text = '队列末尾' + (qLen > 0 ? (' · 共 ' + qLen + ' 首') : '');
+    tip = '当前已是队列最后一首（共 ' + qLen + ' 首）';
+  }
+  if (el) {
+    el.textContent = text;
+    el.title = tip;
+    el.style.display = '';
+  }
+  if (heroEl) {
+    heroEl.textContent = text;
+    heroEl.title = tip;
+    heroEl.style.display = '';
+  }
+}
+
 /* ---------------- 队列 ---------------- */
 function loadQ() {
   api('/api/queue').then(function (j) {
@@ -1991,6 +2073,7 @@ function loadQ() {
     if (D('sShuf')) D('sShuf').checked = !!j.shuffle;
     if (D('sRep') && j.repeat !== undefined) { D('sRep').value = String(j.repeat); applyRep(j.repeat); }
     D('rcnt').textContent = '共 ' + S.q.items.length + ' 首';
+    updateNextTrackInfo();
     if (!S.q.items.length) {
       D('qlist').innerHTML = '<div class=empty style="padding:26px 14px">队列为空<br><span style="font-size:11px">右键专辑或曲目可加入</span></div>';
       return;
@@ -2125,6 +2208,7 @@ function tick() {
       D('nps').textContent = (j.playing ? (j.paused ? '已暂停' : '播放中') : '已停止') +
         (j.outRate ? ' \u00b7 ' + j.outRate + ' Hz / ' + j.outBits + ' bit' : '');
       D('fmt').textContent = j.outRate ? (Math.round(j.outRate / 100) / 10) + 'k/' + j.outBits : '--';
+      updateNextTrackInfo();
       // 261024-04 #8：底栏 GPU 徽标只表示「GPU **真的参与**了本次播放」。
       // 后端新字段 gpuUsed（本次播放 GPU 是否实际参与）；字段还没上线时回退旧的 gpu 字段。
       // 选择"不参与就不亮"而不是"显示灰色 GPU 可用·未参与"：底栏右侧本来就挤，
@@ -2139,6 +2223,7 @@ function tick() {
       D('fmt').textContent = '--';
       D('gpub').style.display = 'none';
       if (S.lastCur) { S.lastCur = ''; D('npt').textContent = '未播放'; D('npart').textContent = ''; D('nps').textContent = '选择一个专辑开始'; D('cv').style.backgroundImage = ''; S.npMetaHtml = ''; if (D('npMeta')) D('npMeta').innerHTML = ''; }
+      updateNextTrackInfo();
     }
     // 2026-10-23 #1：底栏常驻一个「b-p」徽标，不打开信号链也能知道当前是否 bit-perfect。
     // 2026-10-23 用户 261023-04 #1：改成紧凑 chip（class=bp-yes/bp-no/bp-direct），
@@ -2453,17 +2538,35 @@ function renderLibStats(j) {
 }
 function loadLibStats() {
   api('/api/lib/stats').then(function (j) {
+    var wasScanning = S.scanning;
     S.scanning = !!j.scanning;
     S.roots = j.roots || [];
     renderLibStats(j);
+    var bScanEl = D('bScan');
     if (S.scanning) {
+      if (bScanEl) {
+        bScanEl.classList.add('spinning');
+        bScanEl.title = '正在扫描音乐库 (' + (j.scanned || 0) + '/' + (j.total || 0) + ')';
+      }
       D('scanbar').style.display = '';
       var pct = j.total > 0 ? Math.min(100, j.scanned / j.total * 100) : 0;
       D('scanfill').style.width = pct + '%';
       D('cnt').textContent = '扫描中 ' + j.scanned + '/' + j.total;
     } else {
+      if (bScanEl) {
+        bScanEl.classList.remove('spinning');
+        bScanEl.title = '重新扫描音乐库';
+      }
       D('scanbar').style.display = 'none';
-      if (j.tracks === 0 && S.view === 'albums' && !D('list').children.length) loadAlbums('');
+      if (wasScanning) {
+        var msg = '扫描完成：共 ' + (j.tracks || 0) + ' 首曲目，' + (j.albums || 0) + ' 张专辑';
+        toast(msg);
+        window._lastScanSummary = { tracks: j.tracks, albums: j.albums };
+        if (S.view === 'albums') loadAlbums('');
+        else if (S.view === 'tracks') loadTracks(S.tracksQuery || '');
+      } else if (j.tracks === 0 && S.view === 'albums' && !D('list').children.length) {
+        loadAlbums('');
+      }
     }
     if (D('roots2')) {
       var h = '';
@@ -2738,8 +2841,22 @@ Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
 
 /* ---------------- 搜索（全局） ---------------- */
 var searchTimer = 0;
+function updateSearchClearBtn() {
+  var btn = D('qClear');
+  if (!btn) return;
+  btn.style.display = (D('q') && D('q').value) ? '' : 'none';
+}
+if (D('qClear')) {
+  D('qClear').onclick = function () {
+    D('q').value = '';
+    updateSearchClearBtn();
+    D('q').focus();
+    loadAlbums('');
+  };
+}
 D('q').oninput = function () {
   var v = this.value.trim();
+  updateSearchClearBtn();
   clearTimeout(searchTimer);
   searchTimer = setTimeout(function () {
     if (v) { setView('tracks'); loadTracks(v); }
@@ -2747,7 +2864,11 @@ D('q').oninput = function () {
   }, 260);
 };
 D('q').onkeydown = function (e) {
-  if (e.key === 'Escape') { this.value = ''; loadAlbums(''); }
+  if (e.key === 'Escape') {
+    this.value = '';
+    updateSearchClearBtn();
+    loadAlbums('');
+  }
   if (e.key === 'Enter' && S.view === 'tracks') {
     var first = document.querySelector('#list .trow');
     if (first) first.click();
@@ -6783,6 +6904,7 @@ function renderNp() {
     applyCastUi();
   }
   updateFavUi();
+  updateNextTrackInfo();
   updateNpData(S.curMeta);
   // 视口/行高变化后抽屉底边要重新让出控制区（否则矮窗下会压住播放控制条）
   if (npDrawerIsOpen()) npDrawerFit();
