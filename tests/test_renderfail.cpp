@@ -351,7 +351,10 @@ int main() {
         const std::string& m = h.failMsg;
         ck(contains(m, "RENDERFAIL"), "failMsg 含 RENDERFAIL 标记", m);
         ck(contains(m, "未接受数据"), "failMsg 含「未接受数据」人话归因", m);
-        ck(contains(m, "秒未接受数据"), "failMsg 含超时时长（200×20ms≈4 秒）", m);
+        // 2026-10-25：这句文案里的秒数已改为【实测墙钟】（旧实现写死「次数×20ms」，
+        // fastFeed 默认时序下把 1.005 秒说成 4.020 秒 = +300%）。数值判据见
+        // tests/test_playback_edges.cpp 第 5 节（声称时长 vs 实测墙钟，±10%）。
+        ck(contains(m, "秒未接受数据"), "failMsg 含超时时长（实测墙钟，数值由 playback_edges §5 钉住）", m);
         ck(contains(m, "w0=") && contains(m, "wr="), "failMsg 含 w0/wr 计数", m);
         ck(contains(m, "last_pad=9600"), "failMsg 含 last_pad（恒满 = 事故特征）", m);
         ck(contains(m, "GetBuffer HRESULT=-999"), "failMsg 含 GetBuffer HRESULT", m);
