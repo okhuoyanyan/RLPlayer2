@@ -297,6 +297,9 @@ inline std::string rta_ui_page() {
     h += "#bpBadge{display:none;align-items:center;font-size:9.5px;font-weight:700;letter-spacing:.4px;padding:2px 7px;border-radius:5px;border:1px solid var(--line);background:var(--hov);white-space:nowrap;line-height:1.5}";
     h += "#bpBadge.bp-yes{display:inline-flex;color:var(--ok-text);border-color:var(--ok-line);background:var(--ok-bg)}";
     h += "#bpBadge.bp-no{display:inline-flex;color:var(--warn);border-color:currentColor;background:var(--hov)}";
+// 2026-10-25（261025-02 #1）：升频三态（PCM-PCM / PCM-DSD / DSD-DSD）统一用 bp-up 的冷色，
+// 与 bit-perfect 的绿、非 bit-perfect 的橙区分开 —— 一眼能看出「这次到底有没有动数据」。
+h += "#bpBadge.bp-up{display:inline-flex;color:var(--acc);border-color:currentColor;background:var(--hov)}";
     h += "#bpBadge.bp-direct{display:inline-flex;color:var(--bp-direct);border-color:currentColor;background:var(--hov)}";
     // 窄屏（1024 级）：中间控制组收窄、右侧只压缩音量条与格式徽标 —— 歌词/信号链/音量必须还在。
     h += "@media (max-width:1180px){.bar{gap:10px;padding:0 12px}.ctr{width:300px}.np{max-width:260px}.np .cv2{width:48px;height:48px}.vol{gap:6px}.vol input[type=range]{width:64px}#fmt{display:none}}";

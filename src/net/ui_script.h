@@ -2184,11 +2184,45 @@ function loadMeta(f) {
 }
 
 /* ---------------- 状态 ---------------- */
+// 2026-10-25（261025-02 #1）：底栏徽标从两态扩成六态 —— 非升频的 bit-perfect / 非 bit-perfect / bit，
+// 以及三种升频方向（PCM→PCM、PCM→DSD、DSD→DSD）。判据优先用后端权威字段，缺字段才退回推导：
+//   direct            = DirectSDM 1-bit 直通（最严格）
+//   resample=false    = 没有重采样 ⟹ 落在「非升频」两态
+//   resample=true     = 升频；再看输出是不是 DSD（dsd 字段非 0），源是不是 DSD（按当前文件扩展名）
+function srcIsDsdPath(p) { return /\.(dsf|dff)$/i.test(String(p || '')); }
+function bpBadgeInfo() {
+  var bpv = S.bpState || '';
+  var cur = S.cur || (D('npt') && D('npt').title) || '';
+  var srcDsd = srcIsDsdPath(cur);
+  var up = !!S.bpResample;
+  var dsdOut = !!S.bpDsdOut || S.bpOutMode === 'dop' || S.bpOutMode === 'native';
+  var t = '', c = '', title = S.bpWhy || '';
+  if (bpv === 'direct') { t = 'BIT-PERFECT·1bit'; c = 'bp-direct'; title = title || 'DirectSDM：DSD 1-bit 直通，跳过 PCM 与调制'; }
+  else if (!up) {
+    if (bpv === 'yes') { t = 'bit-perfect'; c = 'bp-yes'; title = title || '不升频 · 0 dB · 无抖动/整形 · 无 EQ/IR'; }
+    else if (bpv === 'no') { t = '非 bit-perfect'; c = 'bp-no'; title = title || '没有升频，但链路里有改动（原因见信号链）'; }
+    else { t = 'bit'; c = 'bp-no'; title = title || '直通，但没有拿到后端的 bit-perfect 结论'; }
+  } else if (dsdOut) {
+    t = srcDsd ? 'DSD-DSD 升频' : 'PCM-DSD 升频';
+    c = 'bp-up'; title = title || (srcDsd ? 'DSD 源 → 更高 DSD 档（经解码 + 重新调制）' : 'PCM 源 → DSD（SDM 调制）');
+  } else {
+    t = 'PCM-PCM 升频'; c = 'bp-up'; title = title || 'PCM 源 → 更高 PCM 采样率';
+  }
+  if (S.bpFallback) title = (title ? title + '；' : '') + '降级原因：' + S.bpFallback;
+  return { text: t, cls: c, title: title };
+}
+
 function tick() {
   api('/api/status').then(function (j) {
     S.playing = !!j.playing; S.paused = !!j.paused; S.dur = j.dur; S.pos = j.pos;
     // 2026-10-23 #1：底栏 bit-perfect 徽标的数据源（后端权威判定，见 /api/status 的 bitPerfect 字段）
     S.bpState = j.bitPerfect || ""; S.bpWhy = j.bitPerfectWhy || "";
+    // 2026-10-25（261025-02 #1）：徽标要分「升频方向」，需要这次播放的真实链路口径。
+    // resample=是否重采样；dsd=输出 DSD 档（0=不是 DSD 输出）；outMode 是后端新加的权威字段（没有就退回推导）。
+    S.bpResample = !!j.resample;
+    S.bpDsdOut = !!(j.dsd && String(j.dsd) !== '0');
+    S.bpOutMode = j.outMode || '';
+    S.bpFallback = j.fallbackWhy || '';
     // 2026-10-23 261023-03 #2/#5：资料简介的显示门控只用后端权威状态（400ms 轮询顺带更新）
     if (typeof j.hasLlmKey === 'boolean') META.hasLlmKey = j.hasLlmKey;
     if (typeof j.summaryEnabled === 'boolean') META.summaryEnabled = j.summaryEnabled;
@@ -2254,10 +2288,10 @@ function tick() {
     // 2026-10-23 用户 261023-04 #1：改成紧凑 chip（class=bp-yes/bp-no/bp-direct），
     // 配色与显隐交给 CSS（三套主题各有一套颜色），这里不写死颜色、也不占中间列。
     if (D('bpBadge')) {
-      var bpv = S.bpState || '';
-      D('bpBadge').textContent = bpv === 'direct' ? 'BIT-PERFECT·1bit' : (bpv === 'yes' ? 'BIT-PERFECT' : (bpv === 'no' ? '非 bit-perfect' : ''));
-      D('bpBadge').className = bpv ? ('bp-' + bpv) : '';
-      D('bpBadge').title = S.bpWhy || '';
+      var bi = bpBadgeInfo();
+      D('bpBadge').textContent = bi.text;
+      D('bpBadge').className = bi.cls;
+      D('bpBadge').title = bi.title;
     }
     if (j.error) D('nps').textContent = j.error;
     syncAlbPlayAllBtn();
@@ -4602,10 +4636,6 @@ function renderSettingsPage() {
        + sel('sp_outmode', '输出模式',
              opt('pcm', 'PCM', outModeOf()) + opt('dsd', 'DSD（SDM）', outModeOf()),
              'DSD 的比特率与封装（DoP / Native）在 SDM 页设置')
-       + sel('sp_rate', '输出采样率', D('sRate').innerHTML, '自动 = 所选设备的最高采样率')
-       + sel('sp_bits', '输出位深（PCM）',
-             opt(0, '24 bit', ADV.bits) + opt(16, '16 bit', ADV.bits) + opt(32, '32 bit', ADV.bits),
-             'DSD 输出恒为 1 bit，此项只在 PCM 模式生效')
        + sel('sp_ch', '输出声道数',
              opt('0', '跟随源声道数', CH) + opt('2', '2 声道（立体声）', CH) +
              opt('6', '5.1（6 声道）', CH) + opt('8', '7.1（8 声道）', CH),
@@ -4623,6 +4653,14 @@ function renderSettingsPage() {
 
   // ---------- PCM ----------
   h += '<div class=spane data-g=pcm>'
+     // 2026-10-25（261025-02 #4）：用户「输出采样率/位深应该放到 PCM 里才对」——
+     // 它们是 PCM 链路的属性（DSD 恒 1 bit、速率在 SDM 页），放在「输出」页里会让人以为
+     // 输出页没有 SDM 的内容。id 不变（sRate/sBits），只挪 DOM 位置，保存/读取逻辑零改动。
+     + sgroup('输出格式（PCM）', 'DSD 输出用 SDM 页的档位，这里只影响 PCM 链路',
+         sel('sp_rate', '输出采样率', D('sRate').innerHTML, '自动 = 所选设备的最高采样率')
+       + sel('sp_bits', '输出位深（PCM）',
+             opt(0, '24 bit', ADV.bits) + opt(16, '16 bit', ADV.bits) + opt(32, '32 bit', ADV.bits),
+             'DSD 输出恒为 1 bit，此项只在 PCM 模式生效'))
      + sgroup('升频与滤波', 'HQPlayer 的 poly-sinc 家族',
          sel('sp_filt', '1x 滤波器（44.1 / 48 kHz 音源）', filts, '播放 44.1 / 48 kHz 文件时使用')
        + sel('sp_filtNx', 'Nx 滤波器（88.2 kHz 及以上音源）', filtsNx,
