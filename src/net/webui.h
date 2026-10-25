@@ -153,14 +153,36 @@ inline void WebUi::stop() {
     WSACleanup();
 }
 
+// 2026-10-26（261026-02 #3「加载失败，网络异常或服务响应超时」的根因）：
+// 以前是**单线程串行 handle()**，而浏览器打开一页要并发几十张封面/头像。
+// 实测：首张封面 152 ms、连取 20 张 2156 ms ⟹ 一次列表页会把后面的 /api/lib/album 请求
+// 挤到客户端 8 s 超时之外，界面就报「加载失败」。
+// 现在改成**有上限的并发**：最多 kMaxWorkers 个连接并行处理，超出的仍回落到本线程串行处理。
+// 线程安全前提（已核对）：handler 内部对播放状态(ps.mtx)、库(mtx_)、日志(g_logMx)、
+// 索引写盘都持锁；webui 自己的状态只剩 listen_/stop_，只在 start/stop 里动。
+static constexpr int kMaxWorkers = 6;
+
 inline void WebUi::loop() {
+    // 用 shared_ptr 持有计数：worker 是 detached 的，loop() 退出后它可能还在跑，
+    // 按引用捕获会变成悬垂引用（这类崩溃以前踩过一次，不能再犯）。
+    auto active = std::make_shared<std::atomic<int>>(0);
     while (!stop_.load()) {
         SOCKET c = ::accept(listen_, nullptr, nullptr);
         if (c == INVALID_SOCKET) { if (stop_.load()) break; continue; }
+        if (active->load() < kMaxWorkers) {
+            active->fetch_add(1);
+            std::thread([this, c, active] {
+                handle(c);
+                ::closesocket(c);
+                active->fetch_sub(1);
+            }).detach();
+            continue;
+        }
         handle(c);
         ::closesocket(c);
     }
 }
+
 
 inline void WebUi::handle(SOCKET c) {
     int status = 200;
