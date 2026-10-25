@@ -961,13 +961,17 @@ function openAlbum(k) {
          '<span class=sum>' + j.tracks.length + ' 首 · 总时长 ' + fmtDurLong(localTotal) + '</span></div>';
     j.tracks.forEach(function (t, i) {
       var isFav = FAV_SET.has(t.path);
-      h += '<div class="trow trow-track" data-i=' + i + ' style="grid-template-columns:28px 24px minmax(120px,1.6fr) minmax(0,1fr) 92px 58px;gap:8px">' +
+      h += '<div class="trow trow-track" data-i=' + i + ' style="grid-template-columns:28px 24px minmax(120px,1.6fr) minmax(0,1fr) 92px 58px 26px;gap:8px">' +
            '<div class=n>' + (t.n || (i + 1)) + '</div>' +
            favIconHtml(t.path, isFav) +
            '<div class=tt title="' + esc(t.title) + '">' + esc(t.title) + '</div>' +
            '<div class=ar title="' + esc(t.artist || j.artist) + '">' + esc(t.artist || j.artist) + '</div>' +
            '<div class=bd>' + fmtTag(t.sr, t.bits) + '</div>' +
            '<div class=du>' + fmtDurLong(t.dur) + '</div>' +
+           // 2026-10-26（261025-02 #3）：曲目行加一个**看得见**的「+」——
+           // 以前专辑页只能"点行=播放整张"，没有任何单曲入队入口（右键也没处理），
+           // 用户想在专辑里把某一首加进播放列表是做不到的。
+           '<button class="add-btn" title="加入播放队列" aria-label="加入播放队列">+</button>' +
            '</div>';
     });
     h += '</div>';
@@ -1045,9 +1049,24 @@ function openAlbum(k) {
     Array.prototype.forEach.call(D('list').querySelectorAll('.trow'), function (e) {
       e.onclick = function (ev) {
         if (ev.target.closest && ev.target.closest('.fav-btn')) return;
+        if (ev.target.closest && ev.target.closest('.add-btn')) {
+          // 2026-10-26（261025-02 #3）：专辑页曲目行此前**没有单曲入队入口**
+          // （左键=播放整张，右键无处理）⟹ 用户在专辑页根本无法把某一首加进播放列表。
+          ev.stopPropagation();
+          var tk0 = (j.tracks || [])[+e.dataset.i] || {};
+          addPathCue(tk0.path, tk0.cs, tk0.ce);
+          return;
+        }
         var ti = +e.dataset.i;
         var tk = (j.tracks || [])[ti] || {};
         playAlbum(j.k, ti, tk.cs, tk.ce);      // cue 曲目：把本轨起止秒一起带上
+      };
+      // 右键菜单：立即播放 / 加入队列（同样是单曲入口）
+      e.oncontextmenu = function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        var tk = (j.tracks || [])[+e.dataset.i] || {};
+        showTrackMenu(ev.clientX, ev.clientY, tk);
       };
     });
   }).catch(function (e) {
@@ -1985,6 +2004,38 @@ function addPath(f) {
 function playRemote(it) {
   api('/api/play', 'rid=' + encodeURIComponent(it.id) + '&rsuffix=' + encodeURIComponent(it.sf || '') + '&' + params())
     .then(function (j) { if (!j.ok) toast(j.error || '播放失败'); else loadQ(); });
+}
+
+/* 2026-10-26（261025-02 #3）：通用的「单曲操作菜单」。
+   专辑页曲目行、曲目列表、文件夹行都用它，避免每个列表各写一套（以前只有队列项有菜单）。 */
+function showTrackMenu(x, y, tk) {
+  hideContextMenu();
+  var m = document.createElement('div');
+  m.className = 'ctxmenu';
+  m.style.left = Math.max(4, x) + 'px';
+  m.style.top = Math.max(4, y) + 'px';
+  function item(label, fn) {
+    var d = document.createElement('div');
+    d.className = 'ctxitem';
+    d.textContent = label;
+    d.onclick = function (ev) { ev.stopPropagation(); hideContextMenu(); fn(); };
+    m.appendChild(d);
+  }
+  item('立即播放', function () { playPath(tk.path, tk.cs, tk.ce); });
+  item('加入播放队列', function () { addPathCue(tk.path, tk.cs, tk.ce); });
+  document.body.appendChild(m);
+  _activeCtxMenu = m;
+  // 贴边回推（菜单比窗口大时也不会跑到屏幕外）
+  var r = m.getBoundingClientRect();
+  if (r.right > innerWidth - 4) m.style.left = Math.max(4, innerWidth - r.width - 4) + 'px';
+  if (r.bottom > innerHeight - 4) m.style.top = Math.max(4, innerHeight - r.height - 4) + 'px';
+}
+// cue 曲目的入队：必须把区间一起带上，否则同一整轨的多首只会入队"整首"
+function addPathCue(f, cs, ce) {
+  api('/api/add', 'file=' + encodeURIComponent(f) + cueQuery(cs, ce)).then(function (j) {
+    if (j && j.ok === false) { toast(j.error || '加入失败'); return; }
+    toast('已加入队列'); loadQ();
+  });
 }
 
 /* ---------------- 队列右键菜单 ---------------- */

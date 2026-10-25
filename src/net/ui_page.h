@@ -69,7 +69,7 @@ inline std::string rta_ui_page() {
          "--warn:#b45309;--danger:#c2410c;--bp-direct:#4338ca;"
          "}";
     h += "*{box-sizing:border-box;margin:0;padding:0}html,body{height:100%}";
-    h += "body{font:13px/1.5 Inter,'Segoe UI Variable','Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--txt);overflow:hidden;-webkit-font-smoothing:antialiased}";
+    h += "body{font:13px/1.5 'Microsoft YaHei UI','Microsoft YaHei','PingFang SC','Noto Sans CJK SC','Noto Sans SC','Source Han Sans SC','Yu Gothic UI','Hiragino Sans',Inter,'Segoe UI Variable','Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--txt);overflow:hidden;-webkit-font-smoothing:antialiased}";
     h += "button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}input,select{font:inherit;color:inherit}";
     h += "a{color:inherit;text-decoration:none}";
     // 2026-10-23 用户 261023-04 #8：深色主题下曲目页「默认排序」下拉的**菜单列表**看不清。
@@ -300,6 +300,14 @@ inline std::string rta_ui_page() {
 // 2026-10-25（261025-02 #1）：升频三态（PCM-PCM / PCM-DSD / DSD-DSD）统一用 bp-up 的冷色，
 // 与 bit-perfect 的绿、非 bit-perfect 的橙区分开 —— 一眼能看出「这次到底有没有动数据」。
 h += "#bpBadge.bp-up{display:inline-flex;color:var(--acc);border-color:currentColor;background:var(--hov)}";
+// 2026-10-26（261025-02 #3）：曲目行「+」入队按钮 —— 默认淡显，hover 行才亮，键盘也够得着
+h += ".add-btn{display:flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:6px;border:1px solid var(--line);background:transparent;color:var(--mut2);font-size:14px;line-height:1;cursor:pointer;padding:0;opacity:.45;transition:opacity .12s,color .12s,border-color .12s}";
+h += ".trow:hover .add-btn{opacity:1}";
+h += ".add-btn:hover{color:var(--acc);border-color:var(--acc);background:var(--hov)}";
+h += ".add-btn:focus-visible{opacity:1;outline:2px solid var(--acc);outline-offset:1px}";
+h += ".ctxmenu{position:fixed;z-index:9000;min-width:132px;padding:4px;border-radius:9px;border:1px solid var(--line);background:var(--bg2);box-shadow:0 10px 30px rgba(0,0,0,.35)}";
+h += ".ctxitem{padding:7px 11px;border-radius:6px;font-size:12.5px;cursor:pointer;white-space:nowrap}";
+h += ".ctxitem:hover{background:var(--hov);color:var(--acc)}";
     h += "#bpBadge.bp-direct{display:inline-flex;color:var(--bp-direct);border-color:currentColor;background:var(--hov)}";
     // 窄屏（1024 级）：中间控制组收窄、右侧只压缩音量条与格式徽标 —— 歌词/信号链/音量必须还在。
     h += "@media (max-width:1180px){.bar{gap:10px;padding:0 12px}.ctr{width:300px}.np{max-width:260px}.np .cv2{width:48px;height:48px}.vol{gap:6px}.vol input[type=range]{width:64px}#fmt{display:none}}";
