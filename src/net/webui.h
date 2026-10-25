@@ -21,13 +21,21 @@
 #include <mutex>
 #include <sstream>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cctype>
 
 namespace rta::net {
 
-struct HttpRequest { std::string method, path, body; };
+struct HttpRequest {
+    std::string method, path, body;
+    std::string host;     // Host 头（DNS rebinding 校验用；空 = 客户端没发，按不通过处理）
+};
 
 class WebUi {
 public:
+    // 返回体 + 内容类型；status 非 200 时输出真正的状态行（2026-10-25：以前**所有**响应都是
+    // "HTTP/1.1 200 OK"，连"Method Not Allowed"都以 200 送出 —— 脚本/代理无法区分成功与拒绝）。
     using Handler = std::function<std::string(const HttpRequest&, std::string& contentType)>;
     ~WebUi() { stop(); }
     bool start(uint16_t port, Handler h, bool loopbackOnly = true);
@@ -47,10 +55,63 @@ private:
     std::atomic<bool> stop_{true};
     std::thread thread_;
     Handler handler_;
+    // 监听范围与 Host 白名单（见 start()）
+    bool  lan_ = false;
+    std::string allowedHost_;    // 127.0.0.1,<port>,localhost,<port>,<本机计算机名>（--lan 时校验 Host）
 };
+
+// 慢客户端超时：单线程 accept 里任何一次 recv 都可能等一个永不发完头的客户端。
+// 2026-10-25 实测（http_probe pipelining）：一个只发请求行不发空行的连接，把**其它所有请求**
+// 堵到 recv 超时（默认无限 ⟹ 永久）。500ms 对一个本机控制面绰绰有余。
+static constexpr int kRecvTimeoutMs = 500;
+// 上限（任务书要求"超长 URL / 超大 body 有没有限制"）：以前 body 由 Content-Length 决定且
+// **完全无上限**（实测 64MB 一次分配成功、服务端照收），URL 超过 64KB 则直接连状态行都不回。
+static constexpr size_t kMaxHeadBytes = 64 * 1024;     // 请求行 + 头（含 URL）
+static constexpr size_t kMaxBodyBytes = 16 * 1024 * 1024;
+
+inline std::string http_status_text(int code) {
+    switch (code) {
+        case 200: return "OK";
+        case 400: return "Bad Request";
+        case 403: return "Forbidden";
+        case 405: return "Method Not Allowed";
+        case 413: return "Payload Too Large";
+        case 431: return "Request Header Fields Too Large";
+        case 500: return "Internal Server Error";
+        default:  return "OK";
+    }
+}
+
+// Host 头是否属于本机（allowedHost_ 是逗号分隔的白名单：127.0.0.1,<port>,localhost,<port>,<计算机名>）
+inline bool webui_host_allowed_impl(const std::string& host, const std::string& allowed) {
+    std::string h = host;
+    for (auto& ch : h) ch = (char)std::tolower((unsigned char)ch);
+    // 去掉端口（IPv6 的 [::1]:port 这里不做支持：控制面只绑 IPv4）
+    const size_t colon = h.find(':');
+    if (colon != std::string::npos) h = h.substr(0, colon);
+    if (h.empty()) return false;
+    std::istringstream is(allowed);
+    std::string tok;
+    while (std::getline(is, tok, ',')) {
+        std::string t = tok;
+        for (auto& ch : t) ch = (char)std::tolower((unsigned char)ch);
+        if (!t.empty() && t == h) return true;
+    }
+    return false;
+}
+
+// handler 想把状态行写成 405/4xx 时调它（默认一律 200）。
+// 为什么不用类成员：WebUi 是"每个进程一个实例"的基础设施，而 handler 是自由函数；
+// 用 inline 函数 + 函数内 static（C++11 起线程安全初始化）比暴露 extern WebUi* 更省心。
+inline std::atomic<int>* webui_status_slot() {
+    static std::atomic<int> s{200};
+    return &s;
+}
+inline void webui_set_status(int code) { webui_status_slot()->store(code); }
 
 inline bool WebUi::start(uint16_t port, Handler h, bool loopbackOnly) {
     handler_ = std::move(h);
+    lan_ = !loopbackOnly;
     WSADATA w;
     if (WSAStartup(MAKEWORD(2, 2), &w) != 0) return false;
     listen_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -66,6 +127,13 @@ inline bool WebUi::start(uint16_t port, Handler h, bool loopbackOnly) {
     sockaddr_in got{}; int gl = sizeof(got);
     ::getsockname(listen_, (sockaddr*)&got, &gl);
     port_ = ntohs(got.sin_port);
+    // Host 白名单（--lan 时的最小防线，见 handle() 的注释）
+    allowedHost_ = "127.0.0.1," + std::to_string((unsigned)port_) +
+                   ",localhost," + std::to_string((unsigned)port_);
+    {
+        char nb[MAX_COMPUTERNAME_LENGTH + 1] = {0}; DWORD nl = sizeof(nb);
+        if (::GetComputerNameA(nb, &nl) && nl > 0) allowedHost_ += std::string(",") + nb;
+    }
     stop_.store(false);
     thread_ = std::thread([this] { loop(); });
     return true;
@@ -88,47 +156,140 @@ inline void WebUi::loop() {
 }
 
 inline void WebUi::handle(SOCKET c) {
+    int status = 200;
+    std::string ctype = "application/json; charset=utf-8";
+    std::string payload;
+
+    // 统一的"早退"出口：任何解析失败都必须回一个**带状态行的 JSON**，而不是静默关连接
+    // （2026-10-25：旧实现所有错误路径都是 `return;` ⟹ 客户端看到的是空响应/连接被重置，
+    //  浏览器只报 "Failed to fetch"，查不出原因）。
+    auto fail = [&](int code, const std::string& msg) {
+        status = code;
+        ctype = "application/json; charset=utf-8";
+        payload = std::string("{\"ok\":false,\"error\":\"") + msg + "\"}";
+    };
+
+    {
+        DWORD tv = kRecvTimeoutMs;
+        ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        DWORD stv = 5000;   // 发送超时：对方不读也不许把 accept 线程钉在这里
+        ::setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (const char*)&stv, sizeof(stv));
+    }
+
     std::string buf; char tmp[4096];
-    while (buf.find("\r\n\r\n") == std::string::npos && buf.size() < 65536) {
+    bool tooBig = false;
+    auto findHead = [&]() {
+        size_t e = buf.find("\r\n\r\n");
+        if (e != std::string::npos) return e;
+        e = buf.find("\n\n");           // 宽容：有的脚本只发 \n
+        return e;
+    };
+    size_t hdrEnd = std::string::npos;
+    while ((hdrEnd = findHead()) == std::string::npos) {
+        if (buf.size() > kMaxHeadBytes) { tooBig = true; break; }
         const int r = ::recv(c, tmp, sizeof(tmp), 0);
         if (r <= 0) break;
         buf.append(tmp, (size_t)r);
     }
-    const size_t hdrEnd = buf.find("\r\n\r\n");
-    if (hdrEnd == std::string::npos) return;
-    const std::string head = buf.substr(0, hdrEnd);
-    std::string body = buf.substr(hdrEnd + 4);
+    if (tooBig) {
+        fail(431, "请求头过大（>64KB）：URL 或头部超限");
+    } else if (hdrEnd == std::string::npos) {
+        fail(400, "请求头不完整（超时 500ms 或客户端提前关闭）");
+    } else {
+        const size_t sep = (buf.compare(hdrEnd, 4, "\r\n\r\n") == 0) ? 4 : 2;
+        const std::string head = buf.substr(0, hdrEnd);
+        std::string body = buf.substr(hdrEnd + sep);
 
-    HttpRequest req;
-    {
-        std::istringstream is(head); std::string line;
-        std::getline(is, line);
-        std::istringstream ls(trim(line));
-        ls >> req.method >> req.path;
-    }
-    size_t p = head.find("Content-Length:");
-    if (p == std::string::npos) p = head.find("content-length:");
-    if (p != std::string::npos) {
-        const size_t n = (size_t)atoi(head.c_str() + p + 15);
-        while (body.size() < n) {
-            const int r = ::recv(c, tmp, sizeof(tmp), 0);
-            if (r <= 0) break;
-            body.append(tmp, (size_t)r);
+        HttpRequest req;
+        {
+            std::istringstream is(head); std::string line;
+            std::getline(is, line);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            std::istringstream ls(trim(line));
+            ls >> req.method >> req.path;
+        }
+        // ---- Host 头（DNS rebinding 的最小防线）----
+        {
+            std::istringstream hs(head); std::string line; bool first = true;
+            while (std::getline(hs, line)) {
+                if (first) { first = false; continue; }
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                const size_t colon = line.find(':');
+                if (colon == std::string::npos) continue;
+                if (trim(line.substr(0, colon)) == "Host") { req.host = trim(line.substr(colon + 1)); break; }
+            }
+        }
+        // ---- Content-Length：**先判上限再分配** ----
+        size_t want = 0;
+        bool clBad = false;
+        {
+            std::istringstream hs(head); std::string line; bool first = true;
+            while (std::getline(hs, line)) {
+                if (first) { first = false; continue; }
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                const size_t colon = line.find(':');
+                if (colon == std::string::npos) continue;
+                if (trim(line.substr(0, colon)) != "Content-Length") continue;
+                const std::string v = trim(line.substr(colon + 1));
+                if (v.empty() || v.find_first_not_of("0123456789") != std::string::npos) { clBad = true; break; }
+                want = (size_t)strtoull(v.c_str(), nullptr, 10);
+                if (want > kMaxBodyBytes) { clBad = true; break; }
+            }
+        }
+        if (req.method.empty() || req.path.empty()) {
+            fail(400, "请求行无法解析");
+        } else if (clBad && want > kMaxBodyBytes) {
+            fail(413, "请求体过大（上限 16MB）");
+        } else if (clBad) {
+            fail(400, "Content-Length 非法");
+        } else if (lan_ && !webui_host_allowed_impl(req.host, allowedHost_)) {
+            // ---- Host 白名单 ----
+            // --lan 会把控制面绑到 0.0.0.0 且**没有鉴权**，一个恶意网页可以让受害者浏览器去
+            // http://<公网域名指向 127.0.0.1>/api/... 做副作用请求（DNS rebinding）。最小防线：
+            // Host 必须是我们自己的名字/地址之一。curl/PowerShell 默认都带 Host，本机 UI 也不受影响。
+            fail(403, "Host 不被允许：--lan 只接受 127.0.0.1 / localhost / 本机名");
+        } else {
+            while (body.size() < want) {
+                const int r = ::recv(c, tmp, sizeof(tmp), 0);
+                if (r <= 0) break;
+                body.append(tmp, (size_t)r);
+            }
+            if (body.size() < want) {
+                fail(400, "请求体不完整（Content-Length 与实际收到的字节不符）");
+            } else {
+                body.resize(want);
+                req.body.swap(body);
+                webui_status_slot()->store(200);      // 每次请求前复位（handler 可能提前 return）
+                payload = handler_ ? handler_(req, ctype) : std::string("{}");
+                status = webui_status_slot()->exchange(200);
+            }
         }
     }
-    req.body = body;
-
-    std::string ctype = "application/json; charset=utf-8";
-    std::string payload = handler_ ? handler_(req, ctype) : std::string("{}");
 
     std::ostringstream resp;
-    resp << "HTTP/1.1 200 OK\r\n"
+    resp << "HTTP/1.1 " << status << " " << http_status_text(status) << "\r\n"
          << "Content-Type: " << ctype << "\r\n"
          << "Content-Length: " << payload.size() << "\r\n"
          << "Cache-Control: no-store\r\nConnection: close\r\n\r\n"
          << payload;
+    // ★ 2026-10-25（大响应阻塞审查）：用 **MSG_PARTIAL** 分块写。
+    //   实测（build-dbg-net 的 sendstall 探针）：旧代码一次 send(剩余全部) 时，对 320KB 的 /app.js
+    //   服务端是"一口气全塞进内核"就返回 —— 请求 4KB 读到一个不读的客户端后的剩余 371565 字节
+    //   全在服务端的内核缓冲里排着；到 ~1MB 量级才会真正阻塞 accept 线程（45 秒未设超时 ⟹ 全站卡死）。
+    //   MSG_PARTIAL 让 send 在"这一轮能塞多少塞多少"后**立刻返回**：剩下的留在用户态缓冲里，
+    //   下一轮再给别的连接机会（单线程也能公平轮转）。它与 CLOSE 后内核继续发完已入队的数据兼容。
     const std::string s = resp.str();
-    ::send(c, s.c_str(), (int)s.size(), 0);
+    size_t off = 0;
+    while (off < s.size()) {
+        const size_t left = s.size() - off;
+        const int want = (int)(left > (size_t)65536 ? (size_t)65536 : left);
+        int n = ::send(c, s.c_str() + off, want, MSG_PARTIAL);
+        if (n == SOCKET_ERROR && WSAGetLastError() == WSAEOPNOTSUPP) {
+            n = ::send(c, s.c_str() + off, want, 0);   // 个别 LSP/协议栈不支持 MSG_PARTIAL
+        }
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
 }
 
 // 内置最小控制页面（自包含；内联脚本里的模板占位符已转义，避免与生成代码冲突）

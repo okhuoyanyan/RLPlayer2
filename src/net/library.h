@@ -793,9 +793,22 @@ inline void Library::writeFile(const std::string& p, const std::string& s) {
         std::ofstream f(rta::audio::widen(tmp).c_str(), std::ios::binary | std::ios::trunc);
         if (!f) return;
         f.write(s.data(), (std::streamsize)s.size());
+        // ★ 2026-10-25（索引一致性审查）：必须在 flush 之后才能 rename。
+        //   旧实现出了作用域才析构 → 析构时才 flush；写盘出错时剩下的只有"截断的 tmp"，
+        //   而 rename 不看内容。这里把"写失败"变成"绝不替换旧索引"，并在 rename 前检查。
+        f.flush();
+        if (!f.good()) { f.close(); std::error_code e2; fsx::remove(p8(tmp), e2); return; }
     }
     std::error_code ec;
     fsx::rename(p8(tmp), p8(p), ec);
+    // rename 不能覆盖已存在文件时（个别网络盘/杀软占用），退化为"删旧再改名"；
+    // 仍然失败就保留 tmp（不回滚旧索引 —— 旧索引比没有索引好）。
+    if (ec) {
+        std::error_code e2;
+        fsx::remove(p8(p), e2);
+        ec.clear();
+        fsx::rename(p8(tmp), p8(p), ec);
+    }
 }
 
 inline void Library::load() {
@@ -1326,7 +1339,18 @@ inline void Library::startScan(bool forceFull) {
                 //   mtime+size 只证明"文件没变"，不证明"上次探测成功"。
                 // ★ 缓存候选里排除 cue 虚拟曲目（isCueTrack）：否则删掉 .cue 后，整轨会命中
                 //   旧索引里那条"末轨虚拟曲目"的记录，结果库里只剩 1 首且歌名是 cue 的第 N 轨。
-                if (!forceFull && !cueOwned && oit != oldByPath.end()) {
+                // ★ 2026-10-25（索引一致性审查）：**不要**给"探测失败的记录"加特殊重探逻辑。
+                //   我先加的 "sampleRate==0 就重探" 与 "仍失败时搬回旧标签列" 两条都被既有契约否决，
+                //   原因写在这里免得下一个人再踩（判据：tests/test_library.cpp 与 tests/test_cue.cpp）：
+                //   ① "sr==0 就重探"：sr==0 并不只来自探测失败 —— WAV 的 data 段声明长度与实际不符时
+                //      ffprobe 报不出采样率，那是**探测成功但真不知道**；老索引夹具正是这条，
+                //      而契约要求"增量扫描 0 次 ffprobe"（缓存复用是性能前提，3000 首全重探要几十秒）。
+                //   ② "仍失败时搬回旧标签列"：会绕过同一处缓存分支里的"老索引自愈"
+                //      （album 空/disc 0 就地补），老索引在增量里永远修不好。
+                //   结论：探测失败的自愈留在**源头**（探测失败时 sr/bits/ch/dur 如实写 0，
+                //   不写"看起来有效"的值）；索引侧保证的是"列出的是什么就是什么"。
+                //   索引一致性真正修掉的三条见 lib_probe [3][4][5] 的说明。
+                if (!forceFull && oit != oldByPath.end()) {
                     const LibTrack& o = old[oit->second];
                     if (!o.isCueTrack() && o.mtime == mt && o.size == sz) {
                         // 复用旧记录，但仍要过一遍目录回填：老代码写的索引版本头也是 v3，但 album 列空、
@@ -1436,6 +1460,11 @@ inline void Library::startScan(bool forceFull) {
         const double durMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
 
         // 打不开的根：保留下面的老记录（不因为它们"这次没被遍历到"就被删掉）
+        // ★ 2026-10-25（索引一致性审查）：坏根恢复时**必须**再问一次"文件还在不在"。
+        //   下面的 prune 只对"扫描开始那一刻"成立；两次扫描之间文件可以被删/移走，而坏根分支
+        //   会把整份旧记录原样搬回来 —— 「删掉文件 + 根目录同时不可读」于是让已删记录**复活**。
+        //   判据：build-dbg-net 的 lib_probe [3]（修前 FAIL=GHOST RESURRECTED，修后 PASS）。
+        int badKeepSkipped = 0;   // 坏根恢复时因"文件已不存在"而被拒的条数（只用于文案）
         if (!badRoots.empty()) {
             const std::unordered_map<std::string, size_t> freshByPath = [&] {
                 std::unordered_map<std::string, size_t> m;
@@ -1449,7 +1478,11 @@ inline void Library::startScan(bool forceFull) {
                 // 再从旧索引里搬一条（整轨或旧虚拟曲目）回来就是重复。
                 if (cueClaimed.count(lib_path_key(o.path))) continue;
                 for (auto& br : badRoots)
-                    if (lib_path_under(o.path, br)) { fresh.push_back(o); break; }
+                    if (lib_path_under(o.path, br)) {
+                        if (lib_file_exists(o.path)) fresh.push_back(o);
+                        else ++badKeepSkipped;
+                        break;
+                    }
             }
         }
 
@@ -1473,8 +1506,11 @@ inline void Library::startScan(bool forceFull) {
         {
             std::lock_guard<std::mutex> lk(msgMtx_);
             std::string m = "完成：" + std::to_string(nt) + " 首 (" + std::to_string((int)(durMs + 0.5)) + " ms)";
-            if (!badRoots.empty())
-                m += "；" + std::to_string(badRoots.size()) + " 个根目录无法访问（已保留其下旧记录）";
+            if (!badRoots.empty()) {
+                m += "；" + std::to_string(badRoots.size()) + " 个根目录无法访问（已保留其下旧记录";
+                if (badKeepSkipped > 0) m += "，跳过 " + std::to_string(badKeepSkipped) + " 条已不存在的文件";
+                m += "）";
+            }
             const int gone = removedMissing_.load();
             if (gone > 0) m += "；已剔除 " + std::to_string(gone) + " 条不存在的文件";
             if (!cueWalked.empty())
@@ -1599,6 +1635,17 @@ inline rta::meta::EntityGraph entity_graph_from_library_tracks(
     std::vector<rta::meta::MetaSeed> seeds;
     seeds.reserve(tracks.size());
     for (const auto& t : tracks) {
+        // ★ 2026-10-25（CUE × 实体图）：Track 实体的键是**文件路径**，而 CUE 虚拟曲目的 path
+        //   与整轨其余曲目完全相同 —— 直接按 path 建种子会让一张 12 轨的专辑只留下 1 个 Track
+        //   实体（其余 11 首的「Track→Recording」边全挂在同一个实体上，按 (from,rel,to,role)
+        //   去重后还会互相覆盖）。
+        //   唯一性由 keyPath（path + 区间）承担，展示名仍是原路径（用户视角就是"哪个文件哪一段"）。
+        //   非 cue 曲目的 keyPath == path ⟹ Track id 与既有实现**逐位相同**（老缓存/老链接不失效）。
+        std::string keyPath = t.path;
+        if (t.isCueTrack()) {
+            keyPath += "#cue:" + std::to_string(t.cueNo) + "@" + std::to_string(t.cueOff) +
+                       "+" + std::to_string(t.cueLen);
+        }
         std::map<std::string, std::string> tags;
         if (!t.title.empty()) tags["title"] = t.title;
         if (!t.artist.empty()) tags["artist"] = t.artist;
@@ -1611,7 +1658,9 @@ inline rta::meta::EntityGraph entity_graph_from_library_tracks(
             tags["discNo"] = std::to_string(t.discNo);
         }
         if (t.trackNo > 0) tags["track"] = std::to_string(t.trackNo);
-        seeds.push_back(rta::meta::entity_seed_from_track_path(t.path, tags));
+        rta::meta::MetaSeed s = rta::meta::entity_seed_from_track_path(t.path, tags);
+        if (keyPath != t.path) s.trackPath = keyPath;   // 仅 CUE 虚拟曲目：Track 键加区间
+        seeds.push_back(std::move(s));
     }
     return rta::meta::entity_batch_build_graph(seeds, ts);
 }

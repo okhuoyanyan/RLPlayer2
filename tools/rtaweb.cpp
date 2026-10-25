@@ -4827,8 +4827,90 @@ static std::string handle(const rta::net::HttpRequest& rq, std::string& ct) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 副作用端点必须 POST（2026-10-25，外部评审 P1#6）
+//
+// 背景（实测，build-dbg-net http_probe）：
+//   GET /api/fav?file=...&on=1      → 200，并且真的写进 rlplayer-favs.json
+//   GET /api/pl/save?name=x         → 建 playlists\x.m3u8
+//   GET /api/lib/remove?path=<dir>  → 200，剔除记录并落盘
+//   GET /api/lib/scan / prune / quit / play / settings …
+// 全部可被一个 <img src="http://127.0.0.1:8899/api/lib/remove?path=D:\Music"> 触发 ——
+// 因为 handler 从不看 method，而 WebUi 单线程 accept 对所有响应都回 200。
+//
+// 最小修法（不动前端：前端本来就一律用 fetch POST 调这些端点，见 ui_script.h 的 api()）：
+//   ① 这张表里的端点只接受 POST（GET 一律 405 + JSON）；
+//   ② 主页面 / 静态资源仍然是 GET。
+// 只读端点（status/albums/diag/…）不受影响。
+// ---------------------------------------------------------------------------
+static bool is_side_effect_path(const std::string& p) {
+    static const char* kNeedPost[] = {
+        "/api/play", "/api/pause", "/api/stop", "/api/seek", "/api/skip", "/api/volume",
+        "/api/clear", "/api/repeat", "/api/shuffle", "/api/add", "/api/qdel", "/api/qmove",
+        "/api/fav", "/api/pl", "/api/lib/scan", "/api/lib/prune", "/api/lib/remove",
+        "/api/lib/roots", "/api/rescan", "/api/quit", "/api/shutdown", "/api/settings",
+        "/api/writeback", "/api/enrich", "/api/peq", "/api/opra/apply", "/api/cast/start",
+        "/api/cast/stop", "/api/upnp", "/api/src", "/api/input/start", "/api/input/stop",
+        "/api/buffer/reset", "/api/upload", "/api/llm",
+    };
+    for (const char* k : kNeedPost) {
+        const size_t n = std::strlen(k);
+        if (p.compare(0, n, k) != 0) continue;
+        // 前缀必须"整段"命中：/api/pause 不能匹配到 /api/pauses
+        if (p.size() == n) return true;
+        const char c = p[n];
+        if (c == '/' || c == '?' || c == '&') return true;
+    }
+    return false;
+}
+
+// 只读白名单里的例外：这些端点在**同名前缀**下是查询语义，必须继续允许 GET。
+// （/api/fav/list、/api/peq 的 GET 现状、/api/writeback 的 GET 预览、/api/settings 的 GET 读取）
+static bool is_side_effect_exempt(const std::string& p) {
+    static const char* kGetOk[] = {
+        "/api/fav/list", "/api/pl/load", "/api/writeback/status", "/api/writeback/dry", "/api/src/browse",
+        "/api/src/search", "/api/src/cover", "/api/lib/status", "/api/lib/stats",
+        "/api/lib/albums", "/api/lib/album", "/api/lib/search", "/api/lib/cover",
+    };
+    for (const char* k : kGetOk) if (p.rfind(k, 0) == 0) return true;
+    return false;
+}
+
 static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct) {
     auto& ps = g_ps;
+
+    // ---- 副作用端点强制 POST（见上方注释）----
+    // ★ GET 副作用判定不是"查表就完"，还要看参数：
+    //   * /api/writeback 的 GET 是**纯只读预览**（writeback_preview_scan，不跑 ffmpeg、不写文件）；
+    //   * /api/settings 的 GET 只是读当前设置（POST 才落盘）；
+    //   * /api/peq 的 GET 只读状态（POST 才热更新+落盘）；
+    //   带显式副作用参数（dry=0 / apply=1 / action=…）的 GET 一律仍按副作用处理。
+    auto hasSideEffectQuery = [&](const std::string& p) {
+        const size_t q = p.find('?');
+        if (q == std::string::npos) return false;
+        const std::string qs = p.substr(q);
+        auto has = [&](const char* needle) { return qs.find(needle) != std::string::npos; };
+        if (has("apply=1") || has("apply=true")) return true;
+        if (has("action=")) return true;
+        if (p.rfind("/api/writeback", 0) == 0 && !has("dry=1") && !has("dry=true") && qs.size() > 1) return true;
+        return false;
+    };
+    auto getReadOnlyOk = [&](const std::string& p) {
+        if (hasSideEffectQuery(p)) return false;
+        if (p.rfind("/api/writeback", 0) == 0) return p.rfind("/api/writeback/status", 0) != 0;  // 预览端点
+        if (p.rfind("/api/settings", 0) == 0) return true;
+        if (p.rfind("/api/peq", 0) == 0) return p.rfind("/api/peq/preset", 0) != 0;
+        return false;
+    };
+    // 注意：/api/fav 既要有 GET 列表（/api/fav/list）又要有 POST 切换，所以先判豁免。
+    if (!is_side_effect_exempt(rq.path) && !getReadOnlyOk(rq.path) &&
+        is_side_effect_path(rq.path) && rq.method != "POST") {
+        ct = "application/json; charset=utf-8";
+        rta::net::webui_set_status(405);   // 状态行由 webui 写（见 webui.h 的 webui_set_status）
+        return std::string("{\"ok\":false,\"error\":\"Method Not Allowed：") +
+               (rq.method.empty() ? std::string("?") : rq.method) +
+               " 不支持，" + rq.path.substr(0, rq.path.find('?')) + " 只接受 POST\"}";
+    }
 
     if (rq.path.rfind("/favicon", 0) == 0) {
         ct = "image/png";
