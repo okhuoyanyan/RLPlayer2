@@ -68,6 +68,11 @@ static constexpr int kRecvTimeoutMs = 500;
 // **完全无上限**（实测 64MB 一次分配成功、服务端照收），URL 超过 64KB 则直接连状态行都不回。
 static constexpr size_t kMaxHeadBytes = 64 * 1024;     // 请求行 + 头（含 URL）
 static constexpr size_t kMaxBodyBytes = 16 * 1024 * 1024;
+// 2026-10-26（261026-02 #1）：** /api/upload 必须放行大文件 ** ——
+// 拖一首 FLAC（30~200 MB）进来时走的就是这条上传通道；16 MB 的上限会让它 413，
+// 前端于是拿到空路径列表，弹出「没有可加入的文件」。这是我自己引入的回归。
+// 只对这一条路径放宽（其它端点仍然 16 MB），上限 2 GB（单曲最大也就几百 MB）。
+static constexpr size_t kMaxUploadBytes = (size_t)2 * 1024 * 1024 * 1024;
 
 inline std::string http_status_text(int code) {
     switch (code) {
@@ -235,13 +240,17 @@ inline void WebUi::handle(SOCKET c) {
                 const std::string v = trim(line.substr(colon + 1));
                 if (v.empty() || v.find_first_not_of("0123456789") != std::string::npos) { clBad = true; break; }
                 want = (size_t)strtoull(v.c_str(), nullptr, 10);
-                if (want > kMaxBodyBytes) { clBad = true; break; }
+                // 上传端点单独放宽（见 kMaxUploadBytes 注释）
+                const size_t cap = (req.path.rfind("/api/upload", 0) == 0) ? kMaxUploadBytes : kMaxBodyBytes;
+                if (want > cap) { clBad = true; break; }
             }
         }
         if (req.method.empty() || req.path.empty()) {
             fail(400, "请求行无法解析");
-        } else if (clBad && want > kMaxBodyBytes) {
-            fail(413, "请求体过大（上限 16MB）");
+        } else if (clBad && want > ((req.path.rfind("/api/upload", 0) == 0) ? kMaxUploadBytes : kMaxBodyBytes)) {
+            fail(413, (req.path.rfind("/api/upload", 0) == 0)
+                        ? "请求体过大（上传上限 2GB）"
+                        : "请求体过大（上限 16MB）");
         } else if (clBad) {
             fail(400, "Content-Length 非法");
         } else if (lan_ && !webui_host_allowed_impl(req.host, allowedHost_)) {

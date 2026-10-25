@@ -1182,6 +1182,10 @@ function enqueueAlbum(k) {
 function loadArtists() {
   S.view = 'artists';
   head('艺术家', '加载中…', '');
+  // 2026-10-26（261026-01 #1）：艺术家头像走外部源，但**抓取必须后台做** ——
+  // WebUi 是单线程 accept，如果在图片请求里同步抓，246 个头像会把整站串行阻塞掉。
+  // 这里只做一件事：告诉后端"开始预热这些名字"，图片端点本身只读缓存（未命中立刻 404）。
+  api('/api/artist/prefetch').then(function () { }).catch(function () { });
   api('/api/lib/albums').then(function (j) {
     var m = {}, order = [];
     (j.albums || []).forEach(function (a) {
@@ -1196,12 +1200,10 @@ function loadArtists() {
     var h = '<div class=grid style="grid-template-columns:repeat(auto-fill,minmax(150px,1fr))">';
     order.forEach(function (k) {
       var v = m[k];
-      // 头像统一圆形（评审 #4）：占位字母**始终**渲染在底层，封面用 <img> 覆盖并 onerror 自隐。
-      // 以前用 background-image：封面文件缺失时整块纯黑、连首字母都没有（Irotas/RØSE 就是这样）。
-      var phChar = (String(k).trim().slice(0, 1) || '?').toUpperCase();
+      // 2026-10-26（261026-01 #1）：头像来自**外部艺术家图源**（/api/artist/image），
+      // 用户钦定「取不到就留空、不许用专辑封面顶替」⟹ 不再渲染 .ph 首字母，也不再借专辑封面。
       h += '<div class=card data-a="' + esc(k) + '"><div class=cv style="border-radius:50%;overflow:hidden">' +
-           '<div class=ph style="border-radius:50%">' + esc(phChar) + '</div>' +
-           (v.cv ? '<img src="/api/lib/cover?k=' + v.key + '" loading=lazy alt="" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:50%" onerror="this.style.display=\'none\'">' : '') + '</div>' +
+           '<img src="/api/artist/image?name=' + encodeURIComponent(k) + '" loading=lazy alt="" onerror="this.style.display=\'none\'" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:50%">' +
            '<div class=nm>' + esc(k) + '</div><div class=ar>' + v.n + ' 张专辑</div></div>';
     });
     h += '</div>';
@@ -1240,19 +1242,22 @@ function renderAlbumSubset(who) {
      ② 资料回来后只重绘这几块；③ 切走再回来：同 who 的请求 in-flight ⟹ 挂回调复用，
         已有结果 ⟹ 直接渲染，绝不重复请求（费用纪律）。 */
 var ARTIST_KNOW = {};    // who -> { state: 'loading'|'done', res, waiters: [] }
-function artistCoverKey(who) {
+// 已废弃：以前用「该艺术家第一张有封面的专辑封面」当头像。
+// 2026-10-26 用户钦定「不要用封面来替换」⟹ 保留函数只为兼容旧调用，返回空。
+function artistCoverKey(who) { return ''; }
+function artistCoverKeyUnused(who) {
   if (!(S.albums && S.albums.length)) return '';
   for (var i = 0; i < S.albums.length; i++) {
     if ((S.albums[i].artist || '') === who && S.albums[i].cv) return S.albums[i].k;
   }
   return '';
 }
+// 2026-10-26（261026-01 #1）：艺术家头像改用**外部艺术家图源**（/api/artist/image）。
+// 用户明确：艺术家确实需要接外部源；**取不到就留空，绝不能用专辑封面顶替**。
 function artistHeroHtml(who, subText) {
-  var cvKey = artistCoverKey(who);
-  var cvStyle = cvKey ? ("background-image:url('/api/lib/cover?k=" + cvKey + "')") : '';
+  var imgUrl = '/api/artist/image?name=' + encodeURIComponent(who);
   return '<div class="ahead artist-head">' +
-       '<div class=cv style="border-radius:50%;' + cvStyle + '">' +
-       (cvKey ? '' : '<div class=ph style="border-radius:50%">' + esc(String(who).slice(0, 1).toUpperCase()) + '</div>') +
+       '<div class=cv style="border-radius:50%;background-image:url(\'' + imgUrl + '\')">' +
        '</div>' +
        '<div class=info>' +
        '<div class=kind>ARTIST · 艺术家资料</div>' +
@@ -4388,6 +4393,12 @@ function presetCardHtml() {
         + '</div>'
         + '<div class=preset-btn-sub id=presetPcmSub>升到设备最高档（当前 ' + esc(pcmTargetRate) + '），tight 滤波 + 每相位 512 抽头</div>'
         + '</button>'
+        + '<button class=preset-btn id=presetPcm2Dsd aria-label="PCM 升频到 DSD">'
+        + '<div class=preset-btn-top>'
+        + '<span class=preset-btn-title>PCM → DSD 升频</span>'
+        + '</div>'
+        + '<div class=preset-btn-sub>PCM 源经 SDM 调制直接出 DSD（' + esc(dsdTarget) + '，EC-7）</div>'
+        + '</button>'
         + '<button class=preset-btn id=presetDsd aria-label="DSD 升频">'
         + '<div class=preset-btn-top>'
         + '<span class=preset-btn-title>DSD 升频</span>'
@@ -4617,6 +4628,7 @@ function bindPresetCard() {
   }
   if (D('presetDsd')) {
     D('presetDsd').onclick = function () { applyPreset('dsd'); };
+  if (D('presetPcm2Dsd')) D('presetPcm2Dsd').onclick = function () { applyPreset('pcm2dsd'); };
   }
 }
 
@@ -4629,9 +4641,7 @@ function renderSettingsPage() {
   var CH = String(ADV.channels || 0);
   var h = '';
 
-  // ---------- 官方推荐预设卡片 ----------
-  h += presetCardHtml();
-
+  // 2026-10-26（261026-01 #2）：官方推荐预设卡片**移进「输出」面板**（用户：不要做在所有东西外面）。
   // ---------- 页签（对齐 HQPlayer：Inputs / Outputs / PCM / SDM / Advanced） ----------
   h += '<div class=stabs>'
      + '<button class="stab on" data-g=in>输入</button>'
@@ -4650,7 +4660,10 @@ function renderSettingsPage() {
      + '</div>';
 
   // ---------- 输出 ----------
+  // 2026-10-26（261026-01 #2）：官方推荐预设卡片放在这里（用户要求「做到输出里面」）
   h += '<div class="spane" data-g=out>'
+     // 2026-10-26（261026-01 #2）：官方推荐预设放在「输出」面板最上方（用户要求「做到输出里面」）。
+     + presetCardHtml()
      + sgroup('输出后端', '独占 = bit-perfect；共享 = 兼容性最好（虚拟机 / 远程桌面）',
          // 261024-04 #2：用户要求「放在后端那个选项的右边」—— bit-perfect 直通按钮从独立一行挪进
          // 「后端」下拉的同一行（flex 行，底对齐；下拉可缩、按钮 nowrap，窄窗也不换行）。

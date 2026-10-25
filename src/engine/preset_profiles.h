@@ -42,13 +42,19 @@ constexpr uint32_t kPresetRateCap = 384000u;
 // 只能说明它对采样率不做校验，不能当成真能力 —— 一律按 DSD512 封顶并记 note。
 constexpr int kPresetDsdMaxLevel = 512;
 
-enum class PresetProfile { BitPerfect, Pcm, Dsd };
+enum class PresetProfile {
+    BitPerfect,   // 原音直通（PCM 直出 / DSD 直通）
+    Pcm,          // PCM -> PCM 升频
+    Dsd,          // DSD  -> DSD 升频（异速率经解码 + 重新调制）
+    PcmToDsd      // PCM  -> DSD（SDM 调制），2026-10-26 用户要求单独成档
+};
 
 inline const char* preset_profile_name(PresetProfile p) {
     switch (p) {
         case PresetProfile::BitPerfect: return "bitperfect";
         case PresetProfile::Pcm:        return "pcm";
         case PresetProfile::Dsd:        return "dsd";
+        case PresetProfile::PcmToDsd:   return "pcm2dsd";
     }
     return "pcm";
 }
@@ -62,6 +68,8 @@ inline bool preset_profile_parse(const std::string& s, PresetProfile& out) {
     if (v == "bitperfect" || v == "bit-perfect" || v == "bp") { out = PresetProfile::BitPerfect; return true; }
     if (v == "pcm" || v == "pcm-upsample" || v == "upsample") { out = PresetProfile::Pcm; return true; }
     if (v == "dsd" || v == "sdmod" || v == "dsd-upsample") { out = PresetProfile::Dsd; return true; }
+    // 2026-10-26（261026-01 #1）：PCM -> DSD 单独成档
+    if (v == "pcm2dsd" || v == "pcm-dsd" || v == "pcm_dsd" || v == "pcm-to-dsd") { out = PresetProfile::PcmToDsd; return true; }
     return false;
 }
 
@@ -291,6 +299,43 @@ inline PresetSettings plan_preset(PresetProfile prof, const DeviceCaps& caps, co
             s.notes.push_back("源是 DSD：本档先把 DSD 解成 PCM 再升频（要 1-bit 直通请用原音直通档）");
         }
         s.notes.push_back("已清空 EQ/IR/等响度/每声道增益（官方推荐链路的基线）");
+        return s;
+    }
+
+    // ---------------- ④ PCM -> DSD（SDM 调制）----------------
+    // 用户 2026-10-26 要求单独成档：源是 PCM，目标是把 PCM 调制成 DSD。
+    // 与「DSD 升频」的区别只在于源格式（那条要处理 DSD->DSD 的直通/重调制判定），
+    // 调制参数相同：EC-7 + tight 滤波 + 每相位 512 抽头。
+    if (prof == PresetProfile::PcmToDsd) {
+        s.filter = "poly-sinc-tight-lp";
+        s.minTapsPerInput = 512;
+        s.shaper = "none";            // 抖动交给 1-bit 量化（与 DSD 档一致）
+        s.rate = "follow";
+        s.directSdm = 0;              // PCM 源没有"直通"可言
+        if (capLevel == 0) {
+            const uint32_t target = preset_max_pcm_rate(caps.rates, kPresetRateCap);
+            s.dsd = 0;
+            s.modFamily.clear();
+            s.modOrder = 0;
+            s.rate = target == 0 ? std::string("follow") : detail::num(target);
+            s.shaper = target == 0 ? std::string("none") : std::string("auto");
+            s.notes.push_back("✗ 设备没有 DSD 通路（原生 " +
+                              (caps.dsdNativeMax.empty() ? std::string("无") : caps.dsdNativeMax) +
+                              "、DoP " + (caps.dopMax.empty() ? std::string("无") : caps.dopMax) +
+                              "）：PCM→DSD 档无法兑现，已降级为 PCM 升频（" +
+                              (target == 0 ? std::string("跟随源") : (detail::num(target) + " Hz")) + "）");
+            return s;
+        }
+        s.dsd = capLevel;
+        s.modFamily = "ec";
+        s.modOrder = 7;
+        if (caps.dsdNative && nativeLvl >= capLevel) {
+            s.notes.push_back("PCM → DSD" + detail::numi(capLevel) + "：设备原生支持 DSD（封装选「原生」可 1-bit 直送）");
+        } else {
+            s.notes.push_back("PCM → DSD" + detail::numi(capLevel) + "：设备无原生 DSD ⟹ 走 DoP，载波 " +
+                              detail::num(dop_carrier_for_level(capLevel)) + " Hz");
+        }
+        s.notes.push_back("调制器 EC-7 + poly-sinc-tight-lp（每相位 512 抽头）：这条链路不经 PCM 升频");
         return s;
     }
 

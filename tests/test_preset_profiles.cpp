@@ -338,6 +338,42 @@ int main() {
            "Case 18: DoP 最高档由 PCM 载波率推得（96k 设备没有 DoP）");
     }
 
+    // ---- [19] PCM -> DSD 档（2026-10-26，261026-01 #1）----
+    {
+        std::printf("\n-- [19] PCM -> DSD 档 --\n");
+        DeviceCaps c;
+        c.backend = "asio"; c.rates = {44100, 48000, 96000, 192000, 384000}; c.maxRate = 384000;
+        c.dsdNative = true; c.dsdNativeMax = "dsd256"; c.dop = true; c.dopMax = "dsd256";
+        // PCM 源：必须调制到 DSD，且不能有 directsdm
+        const PresetSettings s1 = plan_preset(PresetProfile::PcmToDsd, c, pcm_src(44100, 16));
+        ck(s1.dsd == 256, "PCM源 + 有DSD能力 => dsd=256", std::to_string(s1.dsd));
+        ck(s1.modFamily == "ec" && s1.modOrder == 7, "调制器 EC-7", s1.modFamily + "/" + std::to_string(s1.modOrder));
+        ck(s1.filter == "poly-sinc-tight-lp" && s1.minTapsPerInput == 512, "tight 滤波 + 512 抽头/相位",
+           s1.filter + "/" + std::to_string(s1.minTapsPerInput));
+        ck(s1.directSdm == 0, "PCM 源没有 DirectSDM 直通", std::to_string(s1.directSdm));
+        ck(s1.rate == "follow", "rate=follow（载波由 dsd 档决定）", s1.rate);
+        // 只有 DoP 的设备
+        DeviceCaps c2;
+        c2.rates = {44100, 48000, 176400, 352800}; c2.maxRate = 352800;
+        c2.dsdNative = false; c2.dop = true; c2.dopMax = "dsd128";
+        const PresetSettings s2 = plan_preset(PresetProfile::PcmToDsd, c2, pcm_src(44100, 16));
+        ck(s2.dsd == 128, "无原生 DSD 的设备 => 走 DoP 的 dsd128", std::to_string(s2.dsd));
+        // 完全没有 DSD 通路：降级为 PCM 升频并写明
+        DeviceCaps c3;
+        c3.rates = {44100, 48000, 96000}; c3.maxRate = 96000;
+        const PresetSettings s3 = plan_preset(PresetProfile::PcmToDsd, c3, pcm_src(44100, 16));
+        ck(s3.dsd == 0, "无 DSD 通路 => dsd=0（降级）", std::to_string(s3.dsd));
+        ck(s3.rate == "96000", "降级后按设备最高 PCM 率", s3.rate);
+        bool hasNote = false;
+        for (auto& n : s3.notes) if (n.find("没有 DSD 通路") != std::string::npos) hasNote = true;
+        ck(hasNote, "降级必须写清原因（notes 含「没有 DSD 通路」）", std::to_string(s3.notes.size()));
+        // 名称解析
+        PresetProfile pr;
+        ck(preset_profile_parse("pcm2dsd", pr) && pr == PresetProfile::PcmToDsd, "解析 pcm2dsd");
+        ck(preset_profile_parse("PCM-DSD", pr) && pr == PresetProfile::PcmToDsd, "解析 PCM-DSD（大小写/连字符）");
+        ck(std::string(preset_profile_name(PresetProfile::PcmToDsd)) == "pcm2dsd", "规范名 pcm2dsd");
+    }
+
     if (g_fails == 0) std::printf("\n[ALL PASS] 三档预设决策单测全部通过\n");
     else               std::printf("\n[FAILED] %d 项未通过\n", g_fails);
     return g_fails == 0 ? 0 : 1;
