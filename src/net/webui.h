@@ -141,7 +141,9 @@ inline bool WebUi::start(uint16_t port, Handler h, bool loopbackOnly) {
 
 inline void WebUi::stop() {
     stop_.store(true);
-    if (listen_ != INVALID_SOCKET) { ::closesocket(listen_); listen_ = INVALID_SOCKET; }
+    // 2026-10-25（移植自协作者 mac 分支 7799e09）：先 shutdown 再 close —— 阻塞在 accept 上的线程
+    // 只有 shutdown 才能确定性地唤醒（close 唤醒是平台相关的"可能"）。签名换 SD_BOTH 让 accept 立刻返回。
+    if (listen_ != INVALID_SOCKET) { ::shutdown(listen_, SD_BOTH); ::closesocket(listen_); listen_ = INVALID_SOCKET; }
     if (thread_.joinable()) thread_.join();
     WSACleanup();
 }

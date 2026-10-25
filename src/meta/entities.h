@@ -25,6 +25,8 @@
 //
 // 头文件库：全部 inline，namespace rta::meta，不用异常（同 store.h / parse.h）。
 #pragma once
+// 2026-10-25（移植自协作者 mac 分支）：显式包含 —— 之前靠 MSVC STL 间接带进来，换 libc++/clang-cl 就断。
+#include <algorithm>
 #include "meta/store.h"          // MetaStore::hashOf / MetaValue / meta_path_of / meta_jesc
 #include "meta/year.h"           // E-14：年份清洗复用统一纯函数 pv_year4
 #include <cmath>

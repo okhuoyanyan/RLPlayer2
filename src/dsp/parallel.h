@@ -4,6 +4,8 @@
 // 为什么不直接用 std::async：每次调用都创建线程，开销 50~100 µs，
 // 对 4096 帧一块的处理来说占比太高。这里用常驻线程池，只在真正划算时才启用。
 #pragma once
+// 2026-10-25（移植自协作者 mac 分支）：显式包含 —— 之前靠 MSVC STL 间接带进来，换 libc++/clang-cl 就断。
+#include <exception>
 #include <thread>
 #include <mutex>
 #include <condition_variable>

@@ -273,6 +273,23 @@ private:
     std::atomic<size_t> trackCount_{0};
     mutable std::atomic<size_t> albumCount_{0};   // albumVecLocked() 是 const
     std::shared_ptr<ScanPool> activePool_;
+
+public:
+    // 2026-10-25（移植自协作者 mac 分支 7799e09，我们树上的真雷）：
+    // instance() 用的是函数内 static，进程退出时静态析构会来跑这个析构；如果 th_ 还 joinable，
+    // std::thread 的析构函数会直接 std::terminate ⟹ MSVC 报成 0xC0000409。
+    // rtaweb 目前靠 main 末尾 std::_Exit(0) 跳过静态析构把它盖住，但只要多一个使用者、或多一条
+    // 走 return 的退出路径就会踩。这里做成幂等收尾：停扫描 → 汇总 → join（try/catch 兜底）。
+    ~Library() {
+        try {
+            cancel_.store(true);
+            stopScan();
+            joinScan();
+            if (th_.joinable()) th_.join();
+        } catch (...) {
+            // 退出路径上绝不能让异常逃出去（那同样是 std::terminate）
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
