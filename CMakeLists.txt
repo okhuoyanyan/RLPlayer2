@@ -417,6 +417,13 @@ add_executable(test_render_loop_dry tests/test_render_loop_dry.cpp)
 target_link_libraries(test_render_loop_dry PRIVATE rtadsp)
 add_test(NAME render_loop_dry COMMAND test_render_loop_dry)
 
+# 音频回放链路边界/数值回归（2026-10-25 深度 DEBUG 路线）：单声道 → 多声道上混、
+# NaN/Inf 容器不变式、每声道延迟跨块连续性、WAV 采样率=0、RENDERFAIL 归因时长口径。
+# 全部离线（mock sink / 内存 WAV），绝不打开音频设备（铁律 1）。
+add_executable(test_playback_edges tests/test_playback_edges.cpp)
+target_link_libraries(test_playback_edges PRIVATE rtadsp)
+add_test(NAME playback_edges COMMAND test_playback_edges)
+
 # 输出采样率选择纯逻辑（2026-10-22 事故：第二首 44.1k 按 44100 开流，因 rate=max 探测瞬时为空
 # 被当成「跟随源率」）—— 全离线，不开设备（铁律 1）
 add_executable(test_ratepick tests/test_ratepick.cpp)

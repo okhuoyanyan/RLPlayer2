@@ -11,6 +11,7 @@
 #include "dsp/filter_families.h"
 #include "dsp/resampler.h"
 #include <cstdio>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <cmath>
@@ -357,6 +358,116 @@ int main() {
 
         const auto* pGaussHires = find_preset("poly-sinc-gauss-hires-lp", true);
         check(pGaussHires && pGaussHires->forNx, "poly-sinc-gauss-hires-lp 正确标记为 Nx 专用");
+    }
+
+    // =================================================================
+    // 9. 抽头预算与输出采样率解耦（tapsPerInput 家族）+ 既有预设逐位回归
+    // =================================================================
+    // 背景（实测见 docs/PCM回放质量-实测与改进.md）：
+    //   原型在内插域设计，每相位抽头 T = totalTaps / L。同一个 4095 抽头预设，
+    //   44.1k->705.6k（L=16）有 255 抽头/相位，44.1k->384k（L=1280）只剩 4 个：
+    //   通带 20 kHz 处 -5.1 dB、1 kHz 单音镜像只压到 -29 dB。
+    //   新家族直接指定"每输入样本内核长度"，令 T 与 L 无关，频响因此与输出率无关。
+    printf("\n=== 9. 抽头预算与输出采样率解耦（tapsPerInput）与既有预设回归 ===\n");
+    {
+        auto proto_of = [](const FilterPreset& fp, uint32_t inR, uint32_t outR, int* Lp, int* Tp) {
+            ResamplerConfig c; c.inRate = inR; c.outRate = outR; c.channels = 1;
+            apply_preset(c, fp);
+            PolyphaseResampler rs(c);
+            std::vector<double> h; rs.prototype_into(h);
+            if (Lp) *Lp = rs.upFactor();
+            if (Tp) *Tp = rs.tapsPerPhase();
+            return h;
+        };
+        // 9.1 家族构成：老式预设必须全部 tapsPerInput==0（否则等于悄悄改历史输出）
+        size_t legacyN = 0, newN = 0;
+        for (const auto& fp : filter_presets()) { if (fp.tapsPerInput == 0) ++legacyN; else ++newN; }
+        printf("  预设构成：老式 %zu 个，内核长度家族 %zu 个\n", legacyN, newN);
+        check(newN >= 2, "存在 tapsPerInput 家族预设", std::to_string(newN) + " 个");
+
+        // 9.2 既有预设的系数特征回归（容差判据，不用逐点哈希）
+        //     为什么不哈希：本项目 Release 带 -ffast-math，求和会被重排/向量化，
+        //     逐点哈希在别的编译标志下必然假红。改用 5 个宏观特征的总和 + 1e-6 相对容差：
+        //     fast-math 抖动约 1e-11，而任何真实参数改动都 >= 1e-3。
+        double g0 = 0, g2 = 0, g3 = 0, gm = 0;
+        int hashed = 0;
+        for (const auto& fp : filter_presets()) {
+            if (fp.tapsPerInput != 0) continue;      // 只锁"老式"预设
+            for (auto io : { std::pair<uint32_t, uint32_t>{44100, 88200}, {44100, 384000} }) {
+                auto h = proto_of(fp, io.first, io.second, nullptr, nullptr);
+                double s0 = 0, s2 = 0, s3 = 0, mx = 0;
+                for (size_t i = 0; i < h.size(); ++i) {
+                    const double a = h[i];
+                    s0 += a; s2 += a * a; s3 += (double)i * a * a;
+                    if (std::fabs(a) > mx) mx = std::fabs(a);
+                }
+                g0 += s0; g2 += s2; g3 += s3; gm += mx; ++hashed;
+            }
+        }
+        auto close_to = [](double v, double ref) { return std::fabs(v - ref) <= 1e-6 * std::fabs(ref); };
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "sum_s0=%.9g sum_s2=%.9g sum_s3=%.9g sum_mx=%.9g centroid=%.9g (%d 个原型)",
+                      g0, g2, g3, gm, g3 / g2, hashed);
+        printf("  %s\n", buf);
+        check(close_to(g0, 64100.0001622) && near(g2, 55112.7823516) && near(g3, 18162854114.0) &&
+              close_to(gm, 89.936182514) && near(g3 / g2, 329557.923571),
+              "既有 50 个预设（2 个速率）系数特征与基线一致（相对容差 1e-6）",
+              std::to_string(gm));
+
+        // 9.3 新家族：频响与输出采样率无关 + CPU 代价可预测
+        for (const char* nm : { "poly-sinc-tight-lp", "apod-20k-tight" }) {
+            const FilterPreset* fp = find_preset(nm, false);
+            check(fp != nullptr, std::string(nm) + " 预设存在");
+            if (!fp) continue;
+            check(fp->tapsPerInput > 0, std::string(nm) + " 使用内核长度制式",
+                  "tapsPerInput=" + std::to_string(fp->tapsPerInput));
+            double f01min = 1e18, f01max = -1e18, d20min = 1e9, d20max = -1e9, worstSt = -1e9;
+            int Tfirst = 0, Tspread = 0;
+            for (uint32_t ov : { 88200u, 192000u, 352800u, 384000u, 705600u }) {
+                int L = 0, T = 0;
+                auto h = proto_of(*fp, 44100, ov, &L, &T);
+                if (Tfirst == 0) Tfirst = T; else Tspread = std::max(Tspread, std::abs(T - Tfirst));
+                const double gain = 20.0 * std::log10((double)L);
+                auto rel = [&](double f) { return magnitude_db(h, 2.0 * f / (44100.0 * (double)L)) - gain; };
+                double lo = 20.0, hi = 0.499 * 44100.0;
+                for (int i = 0; i < 60; ++i) { const double m = 0.5 * (lo + hi); if (rel(m) > -0.1) lo = m; else hi = m; }
+                const double f01 = 0.5 * (lo + hi);
+                f01min = std::min(f01min, f01); f01max = std::max(f01max, f01);
+                const double d20 = rel(20000.0);
+                d20min = std::min(d20min, d20); d20max = std::max(d20max, d20);
+                const double fMax = 44100.0 * (double)L * 0.5;      // 内插域 Nyquist（超过它频率轴会镜像回来）
+                for (int i = 1; i <= 120; ++i) {
+                    const double f = 22050.0 * (1.0 + 3.0 * (double)i / 120.0);
+                    if (f >= fMax) break;
+                    worstSt = std::max(worstSt, rel(f));
+                }
+            }
+            char buf[200];
+            std::snprintf(buf, sizeof(buf), "-0.1dB 点 %.0f..%.0f Hz, 20 kHz %.3f..%.3f dB, 最差阻带 %.1f dB",
+                          f01min, f01max, d20min, d20max, worstSt);
+            printf("  %-22s %s\n", nm, buf);
+            check(f01max - f01min < 20.0, std::string(nm) + " 频响与输出采样率无关（-0.1dB 跨 5 个速率一致）");
+            check(d20max - d20min < 0.005, std::string(nm) + " 20 kHz 处幅度跨速率一致 (<0.005 dB)");
+            check(worstSt <= -130.0, std::string(nm) + " 阻带 >=130 dB");
+            check(Tspread == 0 && Tfirst == fp->tapsPerInput,
+                  std::string(nm) + " 每相位抽头数跨速率恒定（CPU 代价可预测）",
+                  "T=" + std::to_string(Tfirst));
+        }
+
+        // 9.4 现状锁定（铁律 4：未解决项必须在测试里写明基线）
+        //     老式短预设在 L 很大时仍然只有 4 抽头/相位、20 kHz 仍然塌陷。
+        //     本判据是"当前基线"，不是"正确行为"：若把 resampler 的抽头地板默认打开，
+        //     请连同 docs/PCM回放质量-实测与改进.md 一起更新这两条断言。
+        {
+            const FilterPreset* fp = find_preset("poly-sinc-short-lp", false);
+            int L = 0, T = 0;
+            auto h = proto_of(*fp, 44100, 384000, &L, &T);
+            const double gain = 20.0 * std::log10((double)L);
+            const double d20 = magnitude_db(h, 2.0 * 20000.0 / (44100.0 * (double)L)) - gain;
+            printf("  [现状基线] poly-sinc-short-lp @44.1k->384k: T=%d, 20 kHz = %.2f dB（未修）\n", T, d20);
+            check(T == 4, "既有短预设在高 L 下仍是 4 抽头/相位（现状基线）");
+            check(d20 < -4.0, "既有短预设在 384k 下 20 kHz 仍塌陷（现状基线）", std::to_string(d20) + " dB");
+        }
     }
 
     printf("\n%s (失败项 %d)\n", fails == 0 ? "全部通过" : "存在失败", fails);

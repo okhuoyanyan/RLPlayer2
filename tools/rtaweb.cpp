@@ -2819,6 +2819,10 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 cfg.taps = fp->taps; cfg.transition = fp->transition; cfg.attenDb = fp->attenDb;
                 cfg.filterWindow = fp->window; cfg.filterPhase = fp->phase;
                 cfg.twoStage = fp->twoStage;
+                // 2026-10-25（音质线）：每相位抽头地板 —— 新预设（*-tight）靠它把「每相位抽头数 T」与
+                // 插值因子 L 解耦；否则 44.1→384k（L=1280）时 4095 抽头的预设只剩 4 抽头/相位
+                // （20 kHz 掉 5 dB、THD+N 只剩 -29 dBFS）。既有预设 tapsPerInput=0，逐位不变。
+                cfg.minTapsPerInput = fp->tapsPerInput;
                 if (fp->twoStage && fp->stage2Taps > 0) cfg.stage2Taps = fp->stage2Taps;
             }
         }

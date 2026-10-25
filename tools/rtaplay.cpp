@@ -659,6 +659,7 @@ int main(int argc, char** argv) {
         cfg.filterWindow = fp->window;
         cfg.filterPhase  = fp->phase;
         cfg.twoStage     = fp->twoStage;
+        cfg.minTapsPerInput = fp->tapsPerInput;   // 2026-10-25：每相位抽头地板（* -tight 预设靠它）
         if (fp->twoStage && fp->stage2Taps > 0) cfg.stage2Taps = fp->stage2Taps;
         printf("滤波器: %s (%d 抽头, 过渡 %.3f, 阻带 %.0f dB, %s%s)\n",
                fp->name, fp->taps, fp->transition, fp->attenDb,
@@ -709,6 +710,7 @@ int main(int argc, char** argv) {
                     cfg.taps = fp->taps; cfg.transition = fp->transition; cfg.attenDb = fp->attenDb;
                     cfg.filterWindow = fp->window; cfg.filterPhase = fp->phase;
                     cfg.twoStage = fp->twoStage;
+                    cfg.minTapsPerInput = fp->tapsPerInput;   // 2026-10-25：每相位抽头地板
                     if (fp->twoStage && fp->stage2Taps > 0) cfg.stage2Taps = fp->stage2Taps;
                     ++applied;
                 }

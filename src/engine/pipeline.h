@@ -57,6 +57,9 @@ struct PipelineConfig {
     double   transition = 0.04;
     dsp::WindowKind filterWindow = dsp::WindowKind::Kaiser;   // 命名滤波器（--filter）
     dsp::PhaseKind  filterPhase  = dsp::PhaseKind::Linear;
+    // 2026-10-25（音质线）：每相位抽头地板。0 = 老行为（T = taps/L，L 大时 T 会小到 4）；
+    // 新预设（*-tight）用它把 T 与 L 解耦，否则 44.1→384k 时通带 20 kHz 掉 5 dB。
+    int      minTapsPerInput = 0;
 
     // 等响度补偿（手册 4.2 Loudness）。依 cfg.volumeDb 决定提升量：
     // 音量在上界及以上时提升量为 0 ⟹ 自动旁路 ⟹ 比特完美不受影响。
@@ -434,6 +437,7 @@ private:
             rc.totalTaps = cfg_.taps; rc.attenDb = cfg_.attenDb; rc.transition = cfg_.transition;
             rc.window = cfg_.filterWindow; rc.phase = cfg_.filterPhase;
             rc.twoStage = cfg_.twoStage; rc.stage2Taps = cfg_.stage2Taps;
+            rc.minTapsPerInput = cfg_.minTapsPerInput;   // 2026-10-25：每相位抽头地板透传
             ss_.rs = std::make_unique<dsp::PolyphaseResampler>(rc);
             ss_.rs->set_use_gpu(cfg_.gpuResample);
         }

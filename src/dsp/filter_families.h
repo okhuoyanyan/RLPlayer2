@@ -224,6 +224,10 @@ struct FilterPreset {
     bool        apodizing   = false; // true = 切趾（通带高频平滑渐进衰减）
     double      apodF1      = 0.0;   // 滚降起始相对输入 Nyquist 比例（例如 18.4k / 22.05k）
     double      apodF2      = 0.0;   // 滚降终止相对输入 Nyquist 比例（例如 21.8k / 22.05k）
+    // 每个【输入样本】的内核长度（抽头数）。0 = 关闭（沿用 taps，历史行为逐位不变）。
+    // >0 时重采样器令每相位抽头 T = tapsPerInput、原型长度 = T × L，使频响与输出
+    // 采样率解耦（详见 resampler.h ResamplerConfig::minTapsPerInput 的注释）。
+    int         tapsPerInput = 0;
 };
 
 // 抽头数量级参考手册：short≈4k, medium≈32k, long≈256k, xl≈1M, sinc-M≈1M, 16M≈16M
@@ -294,6 +298,24 @@ inline const std::vector<FilterPreset>& filter_presets() {
         { "apod-20k",                  4095,    0.10,  120, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64, true, 18400.0 / 22050.0, 21800.0 / 22050.0 },
         { "apod-19k-short",            4095,    0.10,  120, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64, true, 18000.0 / 22050.0, 21400.0 / 22050.0 },
         { "apod-wide",                 4095,    0.10,  120, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64, true, 17800.0 / 22050.0, 21700.0 / 22050.0 },
+
+        // ---- 9. 「内核长度」家族（tapsPerInput）：抽头预算与输出采样率解耦（可选、可回退）----
+        // 为什么需要（实测依据见 docs/PCM回放质量-实测与改进.md）：
+        //   旧预设的抽头预算 totalTaps 是在【内插域】指定的，每相位抽头 T = totalTaps / L。
+        //   44.1k->192k 的 L=640、44.1k->384k 的 L=1280 时，4095 抽头预设只剩 6 / 4 个抽头：
+        //   通带 20 kHz 处 -5.1 dB，1 kHz 单音的镜像只压到 -29 dB（端到端 THD+N 实测 -29 dBFS）。
+        //   而 44.1k->705.6k 的 L=16 有 255 个抽头，同一预设是砖墙 —— 同一预设在不同
+        //   输出采样率下质量天差地别。
+        //   这组预设直接指定「每个输入样本的内核长度」T，令原型长度 = T × L：
+        //   频响与输出采样率【无关】，代价是每输出样本 T 次乘加、系数表 T × L 个 double。
+        //   T=512 时：通带平坦到 21.4 kHz、阻带 >=140 dB、每输出样本 512 次乘加
+        //   （对比：sinc-M 在 705.6k 下每输出样本 32767 次乘加）。
+        // tapsPerInput 默认 0 ⟹ 其余 50 个预设的系数与输出逐位不变（tests/test_filters 第 9 节有容差基线）。
+        { "poly-sinc-tight-lp",       32767,    0.020, 140, WindowKind::Kaiser, PhaseKind::Linear, false, false, 64, false, 0.0, 0.0, 512 },
+        // 注意：切趾预设的过渡带由 apodF1/apodF2 决定，transition 只影响 1x 域的
+        // 旁瓣窗口分析（与 apod-20k 保持一致取 0.10，否则 test_filters 的
+        // "通带 0.9fc 内平坦" 判据会落在切趾滚降区里，读出 2.1 dB 的假纹波）。
+        { "apod-20k-tight",           32767,    0.100, 140, WindowKind::Kaiser, PhaseKind::Linear, false, false, 64, true, 18400.0 / 22050.0, 21800.0 / 22050.0, 512 },
     };
     return p;
 }
