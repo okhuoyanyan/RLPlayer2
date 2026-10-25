@@ -1,24 +1,33 @@
 // test_tags_native.cpp — 原生标签快速通道（261025-01 一.1/一.8：首次全量扫描 15000 首要等几分钟）
 //
 // 判据（铁律 3：每条判据都能被单独否定）：
-//   [1] 单元：**手工构造** 4 类容器的字节流（不依赖 ffmpeg/ffprobe），逐字段断言解析结果；
-//       同时断言「该回退的必须回退」：RF64 / WAV 里的 "id3 " 块 / bext / ID3v2.2 / unsynchronisation /
-//       数字流派引用 / Opus / FLAC total_samples=0 / OGG 末页缺失 …… 一条条点名，回退错了就是红。
+//   [1] 单元：**手工构造** 4 类容器的字节流，逐字段断言解析结果；同时断言「该回退的必须回退」：
+//       RF64 / 短 bext（<337）/ ID3v2.2 / unsynchronisation / 帧标志位 / 数字流派引用 / Opus /
+//       FLAC total_samples=0 / OGG 末页缺失 …… 一条条点名，回退错了就是红。
+//       WAV 的 "id3 " 块与 bext 现在有 10 组正向夹具：两种块顺序（LIST→id3 / id3→LIST，断言的是
+//       **先到先得** —— oracle 是 lib_probe_one 的实际行为，不是 ffmpeg 的语义，见 [1] 里的长注释）、
+//       bext 的 origination_date（含"bext 在前才生效"与"空日期不占位"）、块内重复键的两条反向规则、
+//       APIC 封面与描述补缺（描述压过 TIT2/INAM）、数字流派是否真的入库、块内不是 ID3v2、ID3v2.4 ——
+//       除了断言字段值，每组还走一遍 [2] 的 A/B。
 //   [2] A/B（唯一能证明「开关变量不影响入库结果」的判据）：build/testdata 与 MUSIC 里各取真实文件
 //       （FLAC/WAV/MP3/OGG 各 5 个），用 lib_probe_one 在 RLPLAYER_NATIVE_TAGS=1/0 下逐字段比对
 //       （title/artist/album/albumArtist/genre/year/trackNo/discNo/sr/bits/ch/hasCover + 时长 ±1 帧）。
+//       实现抽成 abOne()，[1] 的夹具与 [5] 的全量扫描用的是**同一条判据**。
 //   [3] 吞吐：N 个「1 秒静音 FLAC」的**首次全量扫描**（Library::startScan(true)，与 /api/lib/scan 同一入口）
 //       对比「每个文件起一次 ffprobe」的基线，给出首/s 与单首耗时（附 3000/15000 首的推算）。
 //   [4] 回归：同一份夹具，RLPLAYER_NATIVE_TAGS=0/1 各扫一次，**索引文件必须逐字节相同**
 //       （列数/字段/时长小数位全都要对得上，只比字段不算数）。
+//   [5] WAV 专项（261025 收尾）：MUSIC 的 71 个 WAV **逐个** A/B（0 差异）、原生命中数必须 71/71
+//       （改动前 19/71，差的 52 个就是 51 个 "id3 " 块 + 1 个 bext），并把整个 MUSIC 曲库
+//       用 Library 全量扫两遍（RLPLAYER_NATIVE_TAGS=0/1）比索引字节。
 //
 // ⚠️ 未解决项（铁律 4）：
-//   1) 真实 WAV 里带 "id3 " 块 / bext / iXML / axml 的，原生通道**主动回退** ffprobe（这些块的标签
-//      语义与 INFO 不同、且与块顺序有关，实测本库 71 个 WAV 里 52 个属于这一类）⟹ 它们的扫描速度
-//      仍是 ffprobe 水平。本测试的 A/B 覆盖它们（结果一致），吞吐夹具用的是纯 flac。
-//   2) 本文件未登记进 CMakeLists（本任务允许的文件范围不含 CMakeLists.txt）。
-//      编译/运行方式见文件末尾注释里的命令行。
-//   3) MUSIC 不存在时 [2] 只用 build/testdata 的文件并如实打印「真实文件数不足」，不假装覆盖。
+//   1) WAV 的 iXML/axml 仍**主动回退** ffprobe：XML 字段到 ffprobe 键的映射没实测过，
+//      本库 71 个 WAV 里 0 个样本。同理 "id3 " 块里的 ID3v2.2/unsynchronisation/帧标志位，
+//      以及 bext 长度 < 337（ffmpeg 会整份拒绝）——这些继续回退，宁可慢一次。
+//   2) MUSIC 不存在时 [2]/[5] 只用 build/testdata 的文件并如实打印「真实文件数不足」，不假装覆盖。
+//   3) [5] 的全库扫描要起 655 次 ffprobe（一遍），ctest 里约多花 15~20 s；这是"索引逐字节"这条
+//      判据的成本，不能靠抽查代替。
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -140,86 +149,7 @@ static std::vector<unsigned char> buildFlac(const FlacSpec& s) {
     return out;
 }
 
-// ---- WAV ----
-struct WavSpec {
-    int sr = 44100, ch = 2, bits = 16, fmtTag = 1;
-    long long frames = 44100;                      // 1.0 s
-    long long dataDecl = -1;                       // -1 = 与真实字节一致；其它值用于「声明超长」
-    std::vector<std::pair<std::string, std::string>> info;   // INAM/IART/IPRD/IGNR/ICRD/ITRK
-    bool id3chunk = false, bext = false, rf64 = false, extensible = false;
-};
-static std::vector<unsigned char> buildWav(const WavSpec& s) {
-    std::vector<unsigned char> data((size_t)(s.frames * s.ch * (s.bits / 8)), 0);
-    std::vector<unsigned char> fmt;
-    if (s.extensible) {
-        put16le(fmt, 0xFFFE); put16le(fmt, (uint32_t)s.ch); put32le(fmt, (uint32_t)s.sr);
-        put32le(fmt, (uint32_t)(s.sr * s.ch * (s.bits / 8))); put16le(fmt, (uint32_t)(s.ch * (s.bits / 8)));
-        put16le(fmt, (uint32_t)s.bits); put16le(fmt, 22); put16le(fmt, (uint32_t)s.bits); put32le(fmt, 3);
-        put32le(fmt, (uint32_t)s.fmtTag); put16le(fmt, 0); put16le(fmt, 0x0010);
-        const unsigned char guidTail[8] = { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 };
-        put(fmt, guidTail, 8);
-    } else {
-        put16le(fmt, (uint32_t)s.fmtTag); put16le(fmt, (uint32_t)s.ch); put32le(fmt, (uint32_t)s.sr);
-        put32le(fmt, (uint32_t)(s.sr * s.ch * (s.bits / 8))); put16le(fmt, (uint32_t)(s.ch * (s.bits / 8)));
-        put16le(fmt, (uint32_t)s.bits);
-    }
-    std::vector<unsigned char> chunks;
-    {   // fmt
-        putStr(chunks, "fmt "); put32le(chunks, (uint32_t)fmt.size()); put(chunks, fmt.data(), fmt.size());
-    }
-    if (s.bext) {
-        std::vector<unsigned char> b(602, 0);
-        std::memcpy(b.data(), "desc", 4);
-        putStr(chunks, "bext"); put32le(chunks, (uint32_t)b.size()); put(chunks, b.data(), b.size());
-    }
-    if (!s.info.empty()) {
-        std::vector<unsigned char> body;
-        putStr(body, "INFO");
-        for (auto& kv : s.info) {
-            std::vector<unsigned char> vb;
-            putStr(vb, kv.second); vb.push_back(0);
-            if (vb.size() & 1u) vb.push_back(0);
-            putStr(body, kv.first); put32le(body, (uint32_t)vb.size()); put(body, vb.data(), vb.size());
-        }
-        putStr(chunks, "LIST"); put32le(chunks, (uint32_t)body.size()); put(chunks, body.data(), body.size());
-    }
-    {   // data
-        putStr(chunks, "data");
-        put32le(chunks, (uint32_t)(s.dataDecl >= 0 ? s.dataDecl : (long long)data.size()));
-        put(chunks, data.data(), data.size());
-    }
-    if (s.id3chunk) {
-        std::vector<unsigned char> frame;
-        putStr(frame, "TIT2");
-        std::vector<unsigned char> body; body.push_back(0); putStr(body, "ID3T");
-        put32be(frame, (uint32_t)body.size()); put16be(frame, 0); put(frame, body.data(), body.size());
-        std::vector<unsigned char> tag;
-        putStr(tag, "ID3"); tag.push_back(3); tag.push_back(0); tag.push_back(0);
-        syncsafe32(tag, (uint32_t)frame.size());
-        put(tag, frame.data(), frame.size());
-        putStr(chunks, "id3 "); put32le(chunks, (uint32_t)tag.size()); put(chunks, tag.data(), tag.size());
-        if (tag.size() & 1u) chunks.push_back(0);
-    }
-    std::vector<unsigned char> out;
-    putStr(out, s.rf64 ? "RF64" : "RIFF");
-    put32le(out, (uint32_t)(chunks.size() + 4));
-    putStr(out, "WAVE");
-    put(out, chunks.data(), chunks.size());
-    return out;
-}
-
-// ---- MP3 ----
-static std::vector<unsigned char> mpeg1Frame(int brIdx = 9, int srIdx = 0, int pad = 0, int mode = 0) {
-    static const int kBr[16] = { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0 };
-    static const int kSr[3] = { 44100, 48000, 32000 };
-    std::vector<unsigned char> f;
-    f.push_back(0xFF); f.push_back(0xFB);                       // MPEG1 Layer III
-    f.push_back((unsigned char)((brIdx << 4) | (srIdx << 2) | (pad << 1)));
-    f.push_back((unsigned char)(mode << 6));
-    const int len = 144 * kBr[brIdx] * 1000 / kSr[srIdx] + pad;
-    f.resize((size_t)len, 0);
-    return f;
-}
+// ---- ID3v2 帧构造（MP3 的 ID3v2 前缀与 WAV 的 "id3 " 块共用同一套帧）----
 static void putUtf16le(std::vector<unsigned char>& body, const std::string& utf8) {   // UTF-8 -> UTF-16LE
     const int n = ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), nullptr, 0);
     if (n <= 0) return;
@@ -255,6 +185,124 @@ static void id3ApicFrame(std::vector<unsigned char>& tag, int ver, const std::st
     if (ver == 4) syncsafe32(tag, (uint32_t)body.size()); else put32be(tag, (uint32_t)body.size());
     put16be(tag, 0);
     put(tag, body.data(), body.size());
+}
+// ---- WAV ----
+struct WavSpec {
+    int sr = 44100, ch = 2, bits = 16, fmtTag = 1;
+    long long frames = 44100;                      // 1.0 s
+    long long dataDecl = -1;                       // -1 = 与真实字节一致；其它值用于「声明超长」
+    std::vector<std::pair<std::string, std::string>> info;   // INAM/IART/IPRD/IGNR/ICRD/ITRK
+    bool id3chunk = false, bext = false, rf64 = false, extensible = false;
+    // ---- "id3 " 块（ID3v2 in RIFF）----
+    bool id3First = false;                         // true ⟹ id3 块排在 LIST 之前（默认排在 LIST 之后）
+    bool id3BadMagic = false;                      // 块内不是 ID3v2（ffmpeg 忽略它、不报错也不加标签）
+    int  id3ver = 3;
+    std::string id3Title = "ID3T", id3Artist, id3Album, id3AlbumArtist, id3Genre, id3Date, id3Track, id3Disc;
+    std::string id3Title2;                         // 第二个 TIT2（同一个标签内应当「先到先得」）
+    bool id3Apic = false;
+    std::string id3ApicMime = "image/jpeg", id3ApicDesc;
+    // ---- bext ----
+    bool bextFirst = false;                        // true ⟹ bext 排在 LIST 之前
+    std::string bextDate;                          // origination_date（空 ⟹ 不写；ffmpeg 也不写 date 键）
+    long long bextSize = 602;                      // < 337 ⟹ ffprobe 整份拒绝，原生必须回退
+};
+static void wavChunk(std::vector<unsigned char>& out, const char* id, const std::vector<unsigned char>& body) {
+    putStr(out, id); put32le(out, (uint32_t)body.size()); put(out, body.data(), body.size());
+    if (body.size() & 1u) out.push_back(0);
+}
+static std::vector<unsigned char> buildWavId3Chunk(const WavSpec& s) {
+    std::vector<unsigned char> tag;
+    if (s.id3BadMagic) {
+        const std::string junk = "XXXX-not-an-id3v2-tag";
+        putStr(tag, junk);
+        return tag;
+    }
+    std::vector<unsigned char> frames;
+    if (!s.id3Title.empty())       id3TextFrame(frames, s.id3ver, "TIT2", s.id3Title);
+    if (!s.id3Title2.empty())      id3TextFrame(frames, s.id3ver, "TIT2", s.id3Title2);
+    if (!s.id3Artist.empty())      id3TextFrame(frames, s.id3ver, "TPE1", s.id3Artist);
+    if (!s.id3Album.empty())       id3TextFrame(frames, s.id3ver, "TALB", s.id3Album);
+    if (!s.id3AlbumArtist.empty()) id3TextFrame(frames, s.id3ver, "TPE2", s.id3AlbumArtist);
+    if (!s.id3Genre.empty())       id3TextFrame(frames, s.id3ver, "TCON", s.id3Genre);
+    if (!s.id3Date.empty())        id3TextFrame(frames, s.id3ver, s.id3ver == 4 ? "TDRC" : "TYER", s.id3Date);
+    if (!s.id3Track.empty())       id3TextFrame(frames, s.id3ver, "TRCK", s.id3Track);
+    if (!s.id3Disc.empty())        id3TextFrame(frames, s.id3ver, "TPOS", s.id3Disc);
+    if (s.id3Apic)                 id3ApicFrame(frames, s.id3ver, s.id3ApicMime, s.id3ApicDesc);
+    putStr(tag, "ID3");
+    tag.push_back((unsigned char)s.id3ver); tag.push_back(0); tag.push_back(0);
+    syncsafe32(tag, (uint32_t)frames.size());
+    put(tag, frames.data(), frames.size());
+    return tag;
+}
+static std::vector<unsigned char> buildWavBextChunk(const WavSpec& s) {
+    std::vector<unsigned char> b((size_t)s.bextSize, 0);
+    if (b.size() > 3) std::memcpy(b.data(), "desc", 4);
+    if (b.size() >= 267) std::memcpy(b.data() + 256, "Logic Pro X", 11);
+    if (b.size() >= 330 && !s.bextDate.empty()) {
+        const size_t m = std::min<size_t>(s.bextDate.size(), 10);
+        std::memcpy(b.data() + 320, s.bextDate.data(), m);
+    }
+    return b;
+}
+static std::vector<unsigned char> buildWav(const WavSpec& s) {
+    std::vector<unsigned char> data((size_t)(s.frames * s.ch * (s.bits / 8)), 0);
+    std::vector<unsigned char> fmt;
+    if (s.extensible) {
+        put16le(fmt, 0xFFFE); put16le(fmt, (uint32_t)s.ch); put32le(fmt, (uint32_t)s.sr);
+        put32le(fmt, (uint32_t)(s.sr * s.ch * (s.bits / 8))); put16le(fmt, (uint32_t)(s.ch * (s.bits / 8)));
+        put16le(fmt, (uint32_t)s.bits); put16le(fmt, 22); put16le(fmt, (uint32_t)s.bits); put32le(fmt, 3);
+        put32le(fmt, (uint32_t)s.fmtTag); put16le(fmt, 0); put16le(fmt, 0x0010);
+        const unsigned char guidTail[8] = { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 };
+        put(fmt, guidTail, 8);
+    } else {
+        put16le(fmt, (uint32_t)s.fmtTag); put16le(fmt, (uint32_t)s.ch); put32le(fmt, (uint32_t)s.sr);
+        put32le(fmt, (uint32_t)(s.sr * s.ch * (s.bits / 8))); put16le(fmt, (uint32_t)(s.ch * (s.bits / 8)));
+        put16le(fmt, (uint32_t)s.bits);
+    }
+    std::vector<unsigned char> chunks;
+    {   // fmt
+        putStr(chunks, "fmt "); put32le(chunks, (uint32_t)fmt.size()); put(chunks, fmt.data(), fmt.size());
+    }
+    // 块顺序可调：id3First/bextFirst 用来造「LIST 在前 / id3 在前」两种夹具
+    if (s.id3chunk && s.id3First)  wavChunk(chunks, "id3 ", buildWavId3Chunk(s));
+    if (s.bext && s.bextFirst)     wavChunk(chunks, "bext", buildWavBextChunk(s));
+    if (!s.info.empty()) {
+        std::vector<unsigned char> body;
+        putStr(body, "INFO");
+        for (auto& kv : s.info) {
+            std::vector<unsigned char> vb;
+            putStr(vb, kv.second); vb.push_back(0);
+            if (vb.size() & 1u) vb.push_back(0);
+            putStr(body, kv.first); put32le(body, (uint32_t)vb.size()); put(body, vb.data(), vb.size());
+        }
+        putStr(chunks, "LIST"); put32le(chunks, (uint32_t)body.size()); put(chunks, body.data(), body.size());
+    }
+    {   // data
+        putStr(chunks, "data");
+        put32le(chunks, (uint32_t)(s.dataDecl >= 0 ? s.dataDecl : (long long)data.size()));
+        put(chunks, data.data(), data.size());
+    }
+    if (s.id3chunk && !s.id3First) wavChunk(chunks, "id3 ", buildWavId3Chunk(s));
+    if (s.bext && !s.bextFirst)    wavChunk(chunks, "bext", buildWavBextChunk(s));
+    std::vector<unsigned char> out;
+    putStr(out, s.rf64 ? "RF64" : "RIFF");
+    put32le(out, (uint32_t)(chunks.size() + 4));
+    putStr(out, "WAVE");
+    put(out, chunks.data(), chunks.size());
+    return out;
+}
+
+// ---- MP3 ----
+static std::vector<unsigned char> mpeg1Frame(int brIdx = 9, int srIdx = 0, int pad = 0, int mode = 0) {
+    static const int kBr[16] = { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0 };
+    static const int kSr[3] = { 44100, 48000, 32000 };
+    std::vector<unsigned char> f;
+    f.push_back(0xFF); f.push_back(0xFB);                       // MPEG1 Layer III
+    f.push_back((unsigned char)((brIdx << 4) | (srIdx << 2) | (pad << 1)));
+    f.push_back((unsigned char)(mode << 6));
+    const int len = 144 * kBr[brIdx] * 1000 / kSr[srIdx] + pad;
+    f.resize((size_t)len, 0);
+    return f;
 }
 struct Mp3Spec {
     int ver = 3;                                  // 3 / 4 / 2（2 = 不支持，应回退）
@@ -423,6 +471,51 @@ static std::vector<std::string> collectAudio(const fs::path& dir, const std::str
 }
 
 // ===========================================================================
+// A/B 单文件比对（[2] 与 [5] 共用同一条判据，避免"抽查用 A 口径、全量用 B 口径"）
+//   两边都走 lib_probe_one（即**入库结果**），字段与容差完全按 261025-01 的验收口径：
+//   title/artist/album/albumArtist/genre/track/disc/year/sr/bits/ch/hasCover 逐字段，
+//   时长按 ±1 帧（1/sr）。
+// ===========================================================================
+struct AbResult {
+    std::vector<std::string> diffs;
+    bool hit = false;                 // 原生通道是否真的命中了这个文件（而不是悄悄回退）
+    std::string why;                  // hit=false 时的回退原因
+    LibTrack ff, nt;
+};
+static AbResult abOne(const std::string& f) {
+    AbResult r;
+    setNative(false);
+    r.ff = rta::net::lib_probe_one(f);
+    setNative(true);
+    const unsigned long long before = rta::meta::native::stats().parsed.load();
+    r.nt = rta::net::lib_probe_one(f);
+    r.hit = rta::meta::native::stats().parsed.load() != before;
+    if (!r.hit) {
+        TagInfo tmp;
+        rta::meta::native::probe_file(f, &tmp, &r.why);    // 只为拿到回退原因（会重复解析一次，可忽略）
+    }
+    auto eq = [&](const char* n, const std::string& a, const std::string& b) {
+        if (a != b) r.diffs.push_back(std::string(n) + " ff=[" + a + "] nat=[" + b + "]");
+    };
+    eq("title", r.ff.title, r.nt.title);
+    eq("artist", r.ff.artist, r.nt.artist);
+    eq("album", r.ff.album, r.nt.album);
+    eq("albumArtist", r.ff.albumArtist, r.nt.albumArtist);
+    eq("genre", r.ff.genre, r.nt.genre);
+    if (r.ff.trackNo != r.nt.trackNo) r.diffs.push_back("track " + std::to_string(r.ff.trackNo) + "/" + std::to_string(r.nt.trackNo));
+    if (r.ff.discNo != r.nt.discNo) r.diffs.push_back("disc " + std::to_string(r.ff.discNo) + "/" + std::to_string(r.nt.discNo));
+    if (r.ff.year != r.nt.year) r.diffs.push_back("year " + std::to_string(r.ff.year) + "/" + std::to_string(r.nt.year));
+    if (r.ff.sampleRate != r.nt.sampleRate) r.diffs.push_back("sr " + std::to_string(r.ff.sampleRate) + "/" + std::to_string(r.nt.sampleRate));
+    if (r.ff.bits != r.nt.bits) r.diffs.push_back("bits " + std::to_string(r.ff.bits) + "/" + std::to_string(r.nt.bits));
+    if (r.ff.channels != r.nt.channels) r.diffs.push_back("ch " + std::to_string(r.ff.channels) + "/" + std::to_string(r.nt.channels));
+    if (r.ff.hasCover != r.nt.hasCover) r.diffs.push_back("cover " + std::to_string(r.ff.hasCover) + "/" + std::to_string(r.nt.hasCover));
+    const double frame = r.ff.sampleRate > 0 ? 1.0 / r.ff.sampleRate : 1e-6;
+    if (!(std::fabs(r.ff.duration - r.nt.duration) <= frame))
+        r.diffs.push_back("dur " + std::to_string(r.ff.duration) + "/" + std::to_string(r.nt.duration));
+    return r;
+}
+
+// ===========================================================================
 // [1] 单元：手工构造字节流
 // ===========================================================================
 static void unitTests(const fs::path& dir) {
@@ -535,29 +628,234 @@ static void unitTests(const fs::path& dir) {
         ck(t.sampleRate == 48000 && t.bits == 24 && std::fabs(t.duration - 1.0) < 1e-9,
            "WAV extensible：sr/bits/时长", std::to_string(t.sampleRate) + "/" + std::to_string(t.bits));
     }
-    // ---- WAV：必须回退的四种 ----
+    // ---- WAV：RF64 仍然回退（唯一没动的"必须回退"项）----
     {
         WavSpec r; r.rf64 = true;
         const fs::path p = dir / "rf64.wav";
         writeFile(p, buildWav(r));
         TagInfo t; std::string why;
         ck(!probeNative(p, t, why), "RF64 ⟹ 回退 ffprobe", why);
-
-        WavSpec i; i.id3chunk = true;
-        const fs::path q = dir / "id3chunk.wav";
-        writeFile(q, buildWav(i));
-        TagInfo t2; std::string why2;
-        ck(!probeNative(q, t2, why2) && why2.find("id3") != std::string::npos,
-           "WAV 含 'id3 ' 块 ⟹ 回退 ffprobe（那里的 ID3 标签我们不解）", why2);
-
-        WavSpec b; b.bext = true;
-        const fs::path rp = dir / "bext.wav";
-        writeFile(rp, buildWav(b));
-        TagInfo t3; std::string why3;
-        ck(!probeNative(rp, t3, why3) && why3.find("bext") != std::string::npos,
-           "WAV 含 bext ⟹ 回退 ffprobe（origination_date 会变成 year）", why3);
     }
 
+    // ---- WAV：LIST/INFO ↔ "id3 " 块的合并顺序（**先到先得**，不是"后者覆盖"）----
+    // 这条判据的 oracle 是 lib_probe_one，不是 ffmpeg 的语义（两者不同！）：
+    //   ffmpeg 对不同的块是**追加**，ffprobe 会打出两条同键 tag；而 lib_probe_one 因为段标记带
+    //   '\r' 匹配不上 [FORMAT]，put() 只在目标为空时赋值 ⟹ 入库的是**第一个非空值**。
+    // 实测（本机 ffprobe 9.0 + 本仓库 library.h）：LIST→id3 的文件最终取 INFO；id3→LIST 取 ID3。
+    {
+        WavSpec a;
+        a.info = { {"INAM","INFO 标题"},{"IART","INFO 艺术家"},{"IPRD","INFO 专辑"},
+                   {"IGNR","Rock"},{"ICRD","2001"},{"ITRK","3"} };
+        a.id3chunk = true;
+        a.id3Title = "ID3 标题"; a.id3Artist = "ID3 艺术家"; a.id3Album = "ID3 专辑";
+        a.id3Genre = "Jazz"; a.id3Date = "1999"; a.id3Track = "7/12"; a.id3Disc = "2";
+        const fs::path p = dir / "list_then_id3.wav";
+        writeFile(p, buildWav(a));
+        TagInfo t; std::string why;
+        ck(probeNative(p, t, why), "WAV LIST→id3：原生解析成功（不再回退）", why);
+        ck(t.title == "INFO 标题" && t.artist == "INFO 艺术家" && t.album == "INFO 专辑" &&
+           t.genre == "Rock" && t.year == 2001 && t.trackNo == 3,
+           "LIST→id3 ⟹ 取 INFO（先到先得：ffprobe 先打 INFO 那条，lib_probe_one 只认第一条）",
+           t.title + "|" + t.artist + "|" + t.album + "|" + t.genre + "|" +
+           std::to_string(t.year) + "|" + std::to_string(t.trackNo));
+        ck(t.discNo == 2, "LIST→id3 ⟹ ID3 独有的 TPOS 仍然保留（逐键先到先得，不是整块丢弃）",
+           std::to_string(t.discNo));
+
+        WavSpec b = a;
+        b.id3First = true;                                  // id3 块排在 LIST 之前
+        const fs::path q = dir / "id3_then_list.wav";
+        writeFile(q, buildWav(b));
+        TagInfo t2; std::string why2;
+        ck(probeNative(q, t2, why2), "WAV id3→LIST：原生解析成功（不再回退）", why2);
+        ck(t2.title == "ID3 标题" && t2.artist == "ID3 艺术家" && t2.album == "ID3 专辑" &&
+           t2.genre == "Jazz" && t2.year == 1999 && t2.trackNo == 7 && t2.discNo == 2,
+           "id3→LIST ⟹ 取 ID3（title/artist/album/genre/date/track(7/12→7)/disc）",
+           t2.title + "|" + t2.genre + "|" + std::to_string(t2.year) + "|" +
+           std::to_string(t2.trackNo) + "|" + std::to_string(t2.discNo));
+
+        // 两个夹具都走一遍 lib_probe_one 的 A/B（与真实文件同一条判据）：
+        // 既证明「原生值与 ffprobe 路径逐字段一致」，也证明「确实没有回退」（hit）。
+        for (const fs::path& fx : { p, q }) {
+            const AbResult r = abOne(U8(fx));
+            ck(r.diffs.empty(), "覆盖顺序夹具与 ffprobe 逐字段一致（" + U8(fx.filename()) + "）",
+               r.diffs.empty() ? "" : r.diffs[0]);
+            ck(r.hit, "覆盖顺序夹具由原生通道解析（没有回退 ffprobe）（" + U8(fx.filename()) + "）", r.why);
+        }
+    }
+
+    // ---- WAV：块内重复键的两条反向规则（同一 INFO 块 = 后者赢；同一 ID3 标签 = 前者赢）----
+    {
+        WavSpec s;
+        s.info = { {"INAM","FirstINAM"},{"INAM","SecondINAM"} };
+        const fs::path p = dir / "two_inam.wav";
+        writeFile(p, buildWav(s));
+        TagInfo t; std::string why;
+        ck(probeNative(p, t, why) && t.title == "SecondINAM",
+           "同一个 LIST/INFO 块内 INAM×2 ⟹ 后者赢（ffmpeg 自己就覆盖了）", t.title);
+        const AbResult r = abOne(U8(p));
+        ck(r.diffs.empty(), "INFO 重复键夹具与 ffprobe 一致", r.diffs.empty() ? "" : r.diffs[0]);
+
+        WavSpec b; b.id3chunk = true; b.id3Title = "FirstTIT2"; b.id3Title2 = "SecondTIT2";
+        const fs::path q = dir / "two_tit2.wav";
+        writeFile(q, buildWav(b));
+        TagInfo t2; std::string why2;
+        ck(probeNative(q, t2, why2) && t2.title == "FirstTIT2",
+           "同一个 ID3 标签内 TIT2×2 ⟹ 前者赢（ffmpeg 用 DONT_OVERWRITE）", t2.title);
+        const AbResult r2 = abOne(U8(q));
+        ck(r2.diffs.empty(), "ID3 重复帧夹具与 ffprobe 一致", r2.diffs.empty() ? "" : r2.diffs[0]);
+    }
+
+    // ---- WAV：bext 的 origination_date → date（back 同样遵守块顺序）----
+    {
+        WavSpec a;
+        a.info = { {"INAM","B 标题"},{"ICRD","2001"} };
+        a.bext = true; a.bextDate = "2022-08-16";
+        const fs::path p = dir / "list_then_bext.wav";
+        writeFile(p, buildWav(a));
+        TagInfo t; std::string why;
+        ck(probeNative(p, t, why), "WAV LIST→bext：原生解析成功", why);
+        ck(t.date == "2001" && t.year == 2001 && t.title == "B 标题",
+           "LIST→bext ⟹ 取先到的 ICRD（date=2001，bext 的 2022-08-16 被丢弃）",
+           t.date + "|" + std::to_string(t.year));
+
+        WavSpec b = a; b.bextFirst = true;                   // bext 在 LIST 之前
+        const fs::path q = dir / "bext_then_list.wav";
+        writeFile(q, buildWav(b));
+        TagInfo t2; std::string why2;
+        ck(probeNative(q, t2, why2), "WAV bext→LIST：原生解析成功", why2);
+        ck(t2.date == "2022-08-16" && t2.year == 2022,
+           "bext→LIST ⟹ bext 的 origination_date 先到（date=2022-08-16 → year 2022）",
+           t2.date + "|" + std::to_string(t2.year));
+
+        // origination_date 为空：ffmpeg 不写 date 键 ⟹ 后面 LIST 的 ICRD 仍然能进（空值不占位）
+        WavSpec c = b; c.bextDate.clear();                   // bext 在前但没日期，LIST 的 ICRD 随后
+        const fs::path s = dir / "bext_nodate.wav";
+        writeFile(s, buildWav(c));
+        TagInfo t3; std::string why3;
+        ck(probeNative(s, t3, why3), "WAV bext 无 origination_date：原生解析成功", why3);
+        ck(t3.date == "2001", "bext 日期为空 ⟹ 不占位，后面的 ICRD 生效（date=2001）", t3.date);
+
+        for (const fs::path& fx : { p, q, s }) {
+            const AbResult r = abOne(U8(fx));
+            ck(r.diffs.empty(), "bext 夹具与 ffprobe 逐字段一致（" + U8(fx.filename()) + "）",
+               r.diffs.empty() ? "" : r.diffs[0]);
+            ck(r.hit, "bext 夹具由原生通道解析（" + U8(fx.filename()) + "）", r.why);
+        }
+    }
+
+    // ---- WAV：bext 太短仍然回退（实测 ffprobe 9.0 会整份文件报 invalid data）----
+    {
+        WavSpec s; s.bext = true; s.bextSize = 330; s.bextDate = "2022-08-16";
+        const fs::path p = dir / "bext330.wav";
+        writeFile(p, buildWav(s));
+        TagInfo t; std::string why;
+        ck(!probeNative(p, t, why) && why.find("bext") != std::string::npos,
+           "WAV bext 只有 330 字节 ⟹ 回退 ffprobe（<337 时 ffprobe 连流都不给）", why);
+        const AbResult r = abOne(U8(p));
+        ck(r.diffs.empty() && !r.hit, "短 bext 夹具：回退后结果与 ffprobe 一致（都是空曲目）",
+           r.diffs.empty() ? "" : r.diffs[0]);
+    }
+
+    // ---- WAV：id3 块里的 APIC ⟹ 封面流（MIME 判据与 MP3 完全同一条）----
+    {
+        WavSpec s; s.id3chunk = true; s.id3Title = "带封面"; s.id3Apic = true;
+        const fs::path p = dir / "id3_apic.wav";
+        writeFile(p, buildWav(s));
+        TagInfo t; std::string why;
+        ck(probeNative(p, t, why) && t.hasCover, "WAV id3 APIC(image/jpeg) ⟹ hasCover=1", why);
+
+        WavSpec u = s; u.id3ApicMime = "image/JPEG";       // 大写：APIC 的 MIME 判据大小写不敏感（实测）
+        const fs::path q = dir / "id3_apic_upper.wav";
+        writeFile(q, buildWav(u));
+        TagInfo t2; std::string why2;
+        ck(probeNative(q, t2, why2) && t2.hasCover, "WAV id3 APIC(image/JPEG 大写) ⟹ hasCover=1", why2);
+
+        WavSpec v = s; v.id3ApicMime = "image/xyz";        // 未知类型：ffprobe 不建流
+        const fs::path rp = dir / "id3_apic_bad.wav";
+        writeFile(rp, buildWav(v));
+        TagInfo t3; std::string why3;
+        ck(probeNative(rp, t3, why3) && !t3.hasCover, "WAV id3 APIC(未知 MIME) ⟹ hasCover=0", why3);
+
+        // APIC 描述 = 封面流的 title ⟹ **先打印、先入库**，所以它压过 TIT2/INAM（实测两例）
+        WavSpec w; w.id3chunk = true; w.id3Title.clear(); w.id3Apic = true; w.id3ApicDesc = "MyDesc";
+        const fs::path dp = dir / "id3_apic_desc.wav";
+        writeFile(dp, buildWav(w));
+        TagInfo t4; std::string why4;
+        ck(probeNative(dp, t4, why4), "WAV 只有 APIC（无 TIT2）：仍可解析", why4);
+        ck(t4.title == "MyDesc", "无 TIT2 时曲名取 APIC 描述（复刻 lib_probe_one 的流标签补缺）", t4.title);
+
+        WavSpec x = s; x.id3ApicDesc = "DescWins";          // 同时有 TIT2 ⟹ 仍是描述赢
+        const fs::path xp = dir / "id3_apic_desc_title.wav";
+        writeFile(xp, buildWav(x));
+        TagInfo t5; std::string why5;
+        ck(probeNative(xp, t5, why5) && t5.title == "DescWins",
+           "TIT2 与 APIC 描述同时存在 ⟹ 取描述（流标签先打印、先入库）", t5.title);
+
+        WavSpec y = w; y.info = { {"INAM","InfoTitle"} };  // 描述 vs 后面的 INAM ⟹ 仍是描述
+        const fs::path yp = dir / "id3_apic_desc_info.wav";
+        writeFile(yp, buildWav(y));
+        TagInfo t6; std::string why6;
+        ck(probeNative(yp, t6, why6) && t6.title == "MyDesc",
+           "INFO 的 INAM 也压不过 APIC 描述（流标签在前）", t6.title);
+
+        for (const fs::path& fx : { p, q, rp, dp, xp, yp }) {
+            const AbResult r = abOne(U8(fx));
+            ck(r.diffs.empty(), "APIC 夹具与 ffprobe 逐字段一致（" + U8(fx.filename()) + "）",
+               r.diffs.empty() ? "" : r.diffs[0]);
+        }
+    }
+
+    // ---- WAV：id3 里的数字流派引用只在"它真的入库"时回退 ----
+    {
+        WavSpec s; s.id3chunk = true; s.id3Genre = "(17)";
+        const fs::path p = dir / "id3_numgenre.wav";
+        writeFile(p, buildWav(s));
+        TagInfo t; std::string why;
+        ck(!probeNative(p, t, why) && why.find("流派") != std::string::npos,
+           "id3 TCON='(17)' 是最终的 genre ⟹ 回退 ffprobe（不抄 192 条流派表）", why);
+        const AbResult r = abOne(U8(p));
+        ck(r.diffs.empty() && !r.hit, "数字流派夹具：回退后与 ffprobe 一致", r.diffs.empty() ? "" : r.diffs[0]);
+
+        // 反过来：INFO 的 IGNR 在前 ⟹ 数字 TCON 根本进不了最终标签 ⟹ 不必回退
+        WavSpec b = s; b.id3First = false; b.info = { {"IGNR","InfoGenre"} };
+        const fs::path q = dir / "numgenre_after_info.wav";
+        writeFile(q, buildWav(b));
+        TagInfo t2; std::string why2;
+        ck(probeNative(q, t2, why2) && t2.genre == "InfoGenre",
+           "INFO 的 IGNR 先到 ⟹ 数字 TCON 不入库，genre 取 InfoGenre 且无需回退",
+           why2 + "|" + t2.genre);
+        const AbResult r2 = abOne(U8(q));
+        ck(r2.diffs.empty() && r2.hit, "数字流派未入库的夹具：原生解析且与 ffprobe 一致",
+           r2.diffs.empty() ? r2.why : r2.diffs[0]);
+    }
+
+    // ---- WAV：id3 块内不是 ID3v2 ⟹ 与 ffprobe 一样忽略（不加标签、也不回退）----
+    {
+        WavSpec s; s.id3chunk = true; s.id3BadMagic = true; s.info = { {"INAM","只有 INFO"} };
+        const fs::path p = dir / "id3_badmagic.wav";
+        writeFile(p, buildWav(s));
+        TagInfo t; std::string why;
+        ck(probeNative(p, t, why), "WAV id3 块内是垃圾字节：仍能原生解析（ffmpeg 也忽略它）", why);
+        ck(t.title == "只有 INFO", "垃圾 id3 块不产生标签（title 取 INFO）", t.title);
+        const AbResult r = abOne(U8(p));
+        ck(r.diffs.empty() && r.hit, "垃圾 id3 块夹具：原生解析且与 ffprobe 一致",
+           r.diffs.empty() ? r.why : r.diffs[0]);
+    }
+
+    // ---- WAV：id3 块里的 ID3v2.4（TDRC）----
+    {
+        WavSpec s; s.id3chunk = true; s.id3ver = 4; s.id3Title = "v24"; s.id3Date = "2010-05-01";
+        s.id3Track = "5";
+        const fs::path p = dir / "id3v24.wav";
+        writeFile(p, buildWav(s));
+        TagInfo t; std::string why;
+        ck(probeNative(p, t, why), "WAV id3 块里的 ID3v2.4：解析成功", why);
+        ck(t.title == "v24" && t.year == 2010 && t.trackNo == 5,
+           "ID3v2.4 的 TDRC→year、TRCK→track", t.title + "|" + std::to_string(t.year) + "|" +
+           std::to_string(t.trackNo));
+        const AbResult r = abOne(U8(p));
+        ck(r.diffs.empty(), "ID3v2.4 夹具与 ffprobe 逐字段一致", r.diffs.empty() ? "" : r.diffs[0]);
+    }
     // ---- MP3：ID3v2.3 + Xing + LAME delay/padding ----
     {
         Mp3Spec s;
@@ -701,45 +999,16 @@ static int abReal(const fs::path& root) {
         std::printf("  -- %s：%zu 个文件 --\n", pk.ext, pk.files.size());
         if (pk.files.empty()) { ck(false, std::string("有 ") + pk.ext + " 真实文件可比对"); continue; }
         for (auto& f : pk.files) {
-            setNative(false);
-            const LibTrack ff = rta::net::lib_probe_one(f);
-            setNative(true);
-            const unsigned long long before = rta::meta::native::stats().parsed.load();
-            const LibTrack nt = rta::net::lib_probe_one(f);
-            const bool hit = rta::meta::native::stats().parsed.load() != before;
-            std::string why;
-            if (!hit) {
-                TagInfo tmpTags;
-                rta::meta::native::probe_file(f, &tmpTags, &why);    // 只为拿到回退原因（会重复解析一次，可忽略）
-            }
+            const AbResult r = abOne(f);
             ++compared;
-            std::vector<std::string> d;
-            auto eq = [&](const char* n, const std::string& a, const std::string& b) {
-                if (a != b) d.push_back(std::string(n) + " ff=[" + a + "] nat=[" + b + "]");
-            };
-            eq("title", ff.title, nt.title);
-            eq("artist", ff.artist, nt.artist);
-            eq("album", ff.album, nt.album);
-            eq("albumArtist", ff.albumArtist, nt.albumArtist);
-            eq("genre", ff.genre, nt.genre);
-            if (ff.trackNo != nt.trackNo) d.push_back("track " + std::to_string(ff.trackNo) + "/" + std::to_string(nt.trackNo));
-            if (ff.discNo != nt.discNo) d.push_back("disc " + std::to_string(ff.discNo) + "/" + std::to_string(nt.discNo));
-            if (ff.year != nt.year) d.push_back("year " + std::to_string(ff.year) + "/" + std::to_string(nt.year));
-            if (ff.sampleRate != nt.sampleRate) d.push_back("sr " + std::to_string(ff.sampleRate) + "/" + std::to_string(nt.sampleRate));
-            if (ff.bits != nt.bits) d.push_back("bits " + std::to_string(ff.bits) + "/" + std::to_string(nt.bits));
-            if (ff.channels != nt.channels) d.push_back("ch " + std::to_string(ff.channels) + "/" + std::to_string(nt.channels));
-            if (ff.hasCover != nt.hasCover) d.push_back("cover " + std::to_string(ff.hasCover) + "/" + std::to_string(nt.hasCover));
-            const double frame = ff.sampleRate > 0 ? 1.0 / ff.sampleRate : 1e-6;
-            if (!(std::fabs(ff.duration - nt.duration) <= frame))
-                d.push_back("dur " + std::to_string(ff.duration) + "/" + std::to_string(nt.duration));
             std::string base = U8(fs::path(W(f)).filename());
             std::printf("     %s %-28s dur=%.3f->%.3f cover=%d/%d %s\n",
-                        hit ? "NAT" : "FBK", base.c_str(), ff.duration, nt.duration, ff.hasCover, nt.hasCover,
-                        hit ? "" : why.c_str());
-            if (!d.empty()) {
+                        r.hit ? "NAT" : "FBK", base.c_str(), r.ff.duration, r.nt.duration,
+                        r.ff.hasCover, r.nt.hasCover, r.hit ? "" : r.why.c_str());
+            if (!r.diffs.empty()) {
                 ++diffs;
                 std::printf("       [DIFF] %s\n", f.c_str());
-                for (auto& x : d) std::printf("              %s\n", x.c_str());
+                for (auto& x : r.diffs) std::printf("              %s\n", x.c_str());
             }
         }
     }
@@ -873,6 +1142,119 @@ static void throughputAndRegression(const fs::path& root) {
     fs::remove_all(work, ec);
 }
 
+// ===========================================================================
+// [5] WAV 专项：'id3 ' 块 / bext（261025：本库 52 个文件此前每个都要起一次 ffprobe 进程）
+//   判据一（正确性）：MUSIC 的**每一个** WAV 都 A/B（ffprobe vs 原生，逐字段 + 时长 ±1 帧），0 差异。
+//   判据二（覆盖）：这 71 个 WAV 全部原生命中。改动前是 19/71 —— 差异就来自这 52 个带
+//                  'id3 ' 块（51）与 bext（1）的文件，本函数逐文件实测这两个数，不靠记忆。
+//   判据三（回归）：把 MUSIC 整个曲库用 Library 全量扫两遍（RLPLAYER_NATIVE_TAGS=0/1），
+//                  索引文件必须**逐字节相同**（字段、时长小数位、编码都要对得上）。
+// ===========================================================================
+// 读 RIFF 顶层块 ID（只读块头，用来把"带 id3 / bext 的"和"纯 LIST/INFO 的"分开统计）
+static std::vector<std::string> wavChunkIds(const std::string& file) {
+    std::vector<std::string> ids;
+    std::ifstream f(fs::path(W(file)), std::ios::binary);
+    if (!f) return ids;
+    char head[12] = {0};
+    f.read(head, 12);
+    if (f.gcount() != 12 || std::memcmp(head, "RIFF", 4) != 0 || std::memcmp(head + 8, "WAVE", 4) != 0) return ids;
+    for (;;) {
+        char ch[8];
+        f.read(ch, 8);
+        if (f.gcount() != 8) break;
+        const uint32_t len = (uint32_t)(unsigned char)ch[4] | ((uint32_t)(unsigned char)ch[5] << 8) |
+                             ((uint32_t)(unsigned char)ch[6] << 16) | ((uint32_t)(unsigned char)ch[7] << 24);
+        ids.push_back(std::string(ch, 4));
+        f.seekg((std::streamoff)len + (std::streamoff)(len & 1u), std::ios::cur);
+        if (!f) break;
+    }
+    return ids;
+}
+
+static void wavSpecial(const fs::path& root) {
+    std::printf("\n== [5] WAV 专项：'id3 ' 块 / bext ==\n");
+    const std::vector<std::string> wavs = collectAudio(root / "MUSIC", ".wav", (size_t)-1);
+    if (wavs.empty()) {
+        ck(false, "MUSIC 里有 WAV 可比对（否则本专项等于没跑）");
+        return;
+    }
+    int withId3 = 0, withBext = 0, diffs = 0, hit = 0;
+    std::vector<std::string> fallbacks;
+    for (const std::string& f : wavs) {
+        const std::vector<std::string> ids = wavChunkIds(f);
+        const bool hasId3Tag = std::find(ids.begin(), ids.end(), "id3 ") != ids.end();
+        const bool hasBextChunk = std::find(ids.begin(), ids.end(), "bext") != ids.end();
+        if (hasId3Tag) ++withId3;
+        if (hasBextChunk) ++withBext;
+        const AbResult r = abOne(f);
+        if (r.hit) ++hit;
+        else if (fallbacks.size() < 12) fallbacks.push_back(U8(fs::path(W(f)).filename()) + " ⟸ " + r.why);
+        // 逐个打印（71 行）：这是「52 个带 id3 的文件逐个 A/B」这条判据的审计轨迹，
+        // 不能只给一行汇总 —— 汇总绿了但某一行为 FBK 也能被一眼看到。
+        std::printf("     %s %-46s tag=%s%s dur=%.3f->%.3f cover=%d/%d %s\n",
+                    r.hit ? "NAT" : "FBK", U8(fs::path(W(f)).filename()).c_str(),
+                    hasId3Tag ? "id3" : "-", hasBextChunk ? "+bext" : "",
+                    r.ff.duration, r.nt.duration, r.ff.hasCover, r.nt.hasCover,
+                    r.hit ? "" : r.why.c_str());
+        if (!r.diffs.empty()) {
+            ++diffs;
+            std::printf("     [DIFF] %s\n", f.c_str());
+            for (auto& x : r.diffs) std::printf("            %s\n", x.c_str());
+        }
+    }
+    std::printf("  WAV 总数=%zu：带 'id3 ' 块 %d 个、带 bext %d 个；原生命中=%d、回退=%d\n",
+                wavs.size(), withId3, withBext, hit, (int)wavs.size() - hit);
+    for (auto& s : fallbacks) std::printf("  回退：%s\n", s.c_str());
+    ck(diffs == 0, "MUSIC 全部 WAV 逐字段一致（含 cover/位深/声道/时长 ±1 帧）",
+       std::to_string(diffs) + " 处不一致");
+    if (wavs.size() == 71) {
+        ck(withId3 == 51 && withBext == 1,
+           "样本实况复核：71 个 WAV = 51 个带 'id3 ' 块 + 1 个带 bext（这 52 个在改动前必然回退）",
+           std::to_string(withId3) + "/" + std::to_string(withBext));
+    } else {
+        std::printf("  [WARN] MUSIC 的 WAV 数不是 71（%zu），跳过'改动前 52 个回退'的实况复核\n", wavs.size());
+    }
+    ck(hit == (int)wavs.size(), "WAV 原生命中数 = 全部（改动前 19/71，差的 52 个就是 id3/bext）",
+       std::to_string(hit) + "/" + std::to_string(wavs.size()));
+
+    // ---- 判据三：整个 MUSIC 全量扫两遍，索引逐字节相同 ----
+    std::error_code ec;
+    const fs::path work = fs::temp_directory_path() / "rta_tags_wavspecial";
+    fs::remove_all(work, ec);
+    auto scanMUSIC = [&](bool native, const fs::path& lib) {
+        fs::remove_all(lib, ec);
+        setLibDir(lib);
+        Library& L = Library::instance();
+        for (auto r : L.roots()) L.removeRoot(r);
+        L.addRootEx(U8(root / "MUSIC"));
+        L.load();
+        setNative(native);
+        const auto t0 = std::chrono::steady_clock::now();
+        L.startScan(true);                     // 与 /api/lib/scan?full=1 同一入口
+        L.joinScan();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("  %-8s %zu 首  %8.1f ms  %s\n", native ? "native" : "ffprobe", L.trackCount(), ms,
+                    L.scanMsg().c_str());
+        return L.trackCount();
+    };
+    const fs::path libFf = work / "lib_ffprobe", libNat = work / "lib_native";
+    const size_t nFf = scanMUSIC(false, libFf);
+    const size_t nNat = scanMUSIC(true, libNat);
+    auto readAll = [](const fs::path& p) {
+        std::ifstream f(p, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    };
+    const std::string a = readAll(libFf / "rlplayer-index.tsv");
+    const std::string b = readAll(libNat / "rlplayer-index.tsv");
+    ck(nFf == nNat && nFf > 0, "MUSIC 两次全量扫描的曲目数相同（>0）",
+       std::to_string(nFf) + "/" + std::to_string(nNat));
+    ck(!a.empty() && a.size() == b.size(), "MUSIC 索引文件大小相同",
+       std::to_string(a.size()) + "/" + std::to_string(b.size()));
+    ck(a == b, "MUSIC 全库索引逐字节相同（RLPLAYER_NATIVE_TAGS=0/1）",
+       a == b ? "" : "首个差异位置 " + std::to_string(a.find_first_not_of(b)));
+    fs::remove_all(work, ec);
+}
+
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     std::printf("== 原生标签快速通道验证（FLAC/WAV/MP3/OGG） ==\n");
@@ -891,6 +1273,7 @@ int main(int argc, char** argv) {
     unitTests(tmp);
     const int compared = abReal(root);
     std::printf("\n[INFO] A/B 比对文件数 = %d\n", compared);
+    wavSpecial(root);
     throughputAndRegression(root);
 
     fs::remove_all(tmp, ec);
@@ -898,8 +1281,8 @@ int main(int argc, char** argv) {
                 g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
-// 编译/运行（本文件未登记进 CMakeLists，见文件头「未解决项 2」）：
+// 运行：ctest -R tags_native（已登记进 CMakeLists）；或单独编译：
 //   & "C:\Program Files\AMD\ROCm\7.2\bin\clang++.exe" -std=c++23 -O2 -w -I src ^
-//       tests\test_tags_native.cpp -o build-tags\test_tags_native.exe
-//   .\build-tags\test_tags_native.exe            # 在仓库根运行；MUSIC 不存在时自动降级
+//       tests\test_tags_native.cpp -o build-tags2\test_tags_native.exe
+//   .\build-tags2\test_tags_native.exe           # 在仓库根运行；MUSIC 不存在时自动降级
 //   $env:RL_TEST_TAGS_SCALE=3000                 # 可选：吞吐夹具规模（默认 1000）

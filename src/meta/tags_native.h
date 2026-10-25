@@ -29,22 +29,29 @@
 //         （**只判 ffprobe 会不会建封面流**：MIME 必须是它认识的图片类型，见 picture_mime_accepted）；
 //         跳过 ID3v2 前缀（ffprobe 对 FLAC 也只认 Vorbis comment，实测）；total_samples=0（流式 FLAC）⟹ 回退。
 //   WAV ：RIFF/WAVE + fmt （PCM/float，含 WAVE_FORMAT_EXTENSIBLE）+ data 长度算时长
-//         + LIST/INFO（INAM/IART/IPRD/IGNR/ICRD/ITRK/IPRT）。
-//         RF64/RIFX/非 PCM/"id3 " 块/bext/iXML/axml ⟹ 回退（后四者的标签我们不解，见未解决项 5）。
+//         + LIST/INFO（INAM/IART/IPRD/IGNR/ICRD/ITRK/IPRT）
+//         + "id3 " 块（ID3v2 in RIFF；帧解析与 MP3 **共用** parse_id3v2_tag）
+//         + bext（origination_date → date，偏移 320 起 10 字节）。
+//         三类标签合并成最终值，口径是**先到先得**（第一个非空值赢）—— 不是 ffmpeg 的语义，
+//         而是 net::library.h lib_probe_one 的**实际**行为（段标记因 CRLF 匹配不上，见未解决项 8）.
+//         APIC（id3 块里）的有效性判据与 MP3 相同：MIME 必须是 ffprobe 认识的图片类型才建封面流。
+//         RF64/RIFX/非 PCM/iXML/axml ⟹ 回退（XML 元数据的字段映射未实测，见未解决项 5）。
 //   MP3 ：ID3v2.3/2.4 文本帧（TIT2/TPE1/TALB/TPE2/TPOS/TCON/TDRC/TYER/TRCK）+ APIC
 //         + 首帧 Xing/Info（含 LAME delay/padding）或 CBR 估算。ID3v2.2 / unsynchronisation /
 //         帧标志位 / 数字流派引用（TCON='(17)'）⟹ 回退。
 //         ⚠️ **ID3v1 故意不读**：实测 ffprobe 9.0 对「只有 ID3v1」的 MP3 返回**零标签**，
 //            读了反而与 ffprobe 不一致（会把「没有标签」变成「有标签」）。
-//         ⚠️ APIC 的**描述**会成为封面流的 title，lib_probe_one 的 stream-tag 补缺会把它当曲名
-//            （实测）；所以「无 TIT2 + 有效 APIC 描述」时这里也用描述补缺，否则 A/B 会红。
+//         ⚠️ APIC 的**描述**会成为封面流的 title；ffprobe 先打印流、后打印 format，而 lib_probe_one
+//            只取第一个非空值 ⟹ **描述压过 TIT2**（实测：TIT2=TitleFromTIT2 + 描述=DescFromAPIC
+//            时 ffprobe 路径给的是 DescFromAPIC）。这里照做，否则 A/B 会红。
 //   OGG ：第一页的 Vorbis identification（声道/采样率）+ 注释包（可跨页）
 //         的 TITLE/ARTIST/ALBUM/ALBUMARTIST/DATE/GENRE/TRACKNUMBER/DISCNUMBER
 //         + METADATA_BLOCK_PICTURE（base64 前缀解出 MIME 后按同一口径判）+ 末页 granulepos 算时长。
 //         Opus/Speex/Theora/链式流/找不到末页 ⟹ 回退。
 //
-// 实测覆盖（MUSIC 654 个四类文件）：原生 602（92%），回退 52（51 个带 "id3 " 块的 WAV + 1 个 bext）；
-// build/testdata 98 个文件 100% 原生。扫描吞吐见 tests/test_tags_native.cpp 的 [3]。
+// 实测覆盖（MUSIC）：WAV 71/71 全部原生（原先 19/71 —— 52 个带 "id3 " 块/bext 的此前每次都要起
+// ffprobe 进程）；四类容器合计 654 个文件，原生 654（100%）。build/testdata 98 个文件也是 100%。
+// 扫描吞吐见 tests/test_tags_native.cpp 的 [3]，WAV 专项 A/B 见 [5]。
 //
 // ⚠️ 未解决项（铁律 4）：
 //   1) ID3v2 文本帧 enc=0（ISO-8859-1）按**原字节透传**，与 ffmpeg 的行为一致（实测）；但如果将来
@@ -53,10 +60,21 @@
 //      抄不全就是错值，宁可慢一次。
 //   3) WAV 的 LIST/INFO 值按原字节透传（GBK 中文标签会与 ffprobe 一样是非法 UTF-8 字节，行为一致）。
 //   4) 只覆盖 4 类容器；ape/wv/m4a/dsf/dff 等一律回退 ffprobe。
-//   5) **下一步最大的一块**：WAV 里的 "id3 " 块（ID3v2 in RIFF）、bext、iXML/axml。
-//      实测本库 71 个 WAV 里 52 个带这些块 —— 它们仍要起 ffprobe 进程。要吃掉这一块，需要把
-//      parse_mp3 里的 ID3v2 帧解析抽成可复用函数，并按「块顺序 = 后者覆盖前者」合并 LIST/INFO
-//      （实测：LIST→id3 时 ID3 赢，id3→LIST 时 INFO 赢；bext 的 origination_date 会变成 date）。
+//   5) WAV 的 iXML/axml 仍回退 ffprobe（XML 字段到 ffprobe 键的映射没实测过，本库 0 个样本）。
+//   6) WAV 的 "id3 " 块里的 ID3v2.2 / unsynchronisation / 帧标志位同样回退（与 MP3 同口径）；
+//      bext 长度 < 337 也回退 —— 实测 ffmpeg 9.0 对短 bext 会**整份文件报 invalid data**，
+//      这时原生解析"成功"反而与 ffprobe 不一致。
+//   7) 数字流派引用（TCON="(17)"）只有**真的入库**才回退：WAV 里如果前面的 LIST/INFO 已经占了
+//      genre（先到先得），这个数字值根本进不了最终标签（实测），就不必多起一个 ffprobe。
+//   8) ⚠️ **依赖 library.h 的一个既有缺陷**（不在本任务可改范围，记录在案）：lib_probe_one 用
+//      `-of default=nw=0` 的段标记 [FORMAT]/[STREAM] 判断标签权威性，但 ffprobe 输出是 CRLF，
+//      行末的 '\r' 让 `line == "[FORMAT]"` **永远为假** ⟹ inFormat 恒 false ⟹ put() 只在目标为空时
+//      赋值。后果有两个：
+//        a) 多个来源的同键标签（WAV 的 LIST + id3 块，ffprobe 会打出两条）取**第一条**，与 ffmpeg
+//           的"后者覆盖"相反；本文件因此也按"先到先得"实现（否则 A/B 与索引逐字节两条判据全红）。
+//        b) 流标签（APIC 描述 / OGG 的流内 Vorbis comment）会**压过** format 标签，与代码注释里
+//           写的"format 优先、缺失回退 stream"不一致。
+//      修 library.h 会让本条与本文件的合并口径一起失效，必须同步改（并重跑 [5] 的两条判据）。
 #pragma once
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -467,124 +485,11 @@ inline bool parse_flac(FileReader& r, TagInfo& t, std::string& why) {
 }
 
 // ---------------------------------------------------------------------------
-// WAV（RIFF/WAVE，PCM 或 IEEE float）
-// ---------------------------------------------------------------------------
-inline void apply_wav_info_tag(TagInfo& t, const std::string& id, const char* v, size_t n) {
-    // 值以 NUL 结尾（长度字段常含 NUL 与填充），先取到第一个 NUL（与 C 字符串语义一致）
-    size_t len = 0;
-    while (len < n && v[len] != '\0') ++len;
-    const std::string s = trim_tag_tail(std::string(v, len));
-    if      (id == "INAM") t.title = s;
-    else if (id == "IART") t.artist = s;
-    else if (id == "IPRD") t.album = s;
-    else if (id == "IGNR") t.genre = s;
-    else if (id == "ICRD") t.date = s;
-    else if (id == "ITRK" || id == "IPRT") t.trackNo = std::atoi(s.c_str());
-}
-
-inline bool parse_wav(FileReader& r, TagInfo& t, std::string& why) {
-    unsigned char h[12];
-    if (!r.read_at(0, h, 12)) { why = "WAV: 文件头过短"; return false; }
-    if (std::memcmp(h, "RIFF", 4) != 0 || std::memcmp(h + 8, "WAVE", 4) != 0) {
-        why = "WAV: 不是 RIFF/WAVE（RF64/RIFX 不支持）";
-        return false;
-    }
-    const long long fsize = r.size();
-    long long p = 12;
-    long long dataOff = -1, dataLen = 0;
-    bool gotFmt = false;
-    int  fmtTag = 0, bits = 0, blockAlign = 0;
-    while (p + 8 <= fsize) {
-        unsigned char ch[8];
-        if (!r.read_at(p, ch, 8)) { why = "WAV: 块头越界"; return false; }
-        const long long len = (long long)le32(ch + 4);
-        const long long body = p + 8;
-        // data 块声明长度可能大于实际文件（截断/流式录制）：ffmpeg 按实际可读长度截断，
-        // 所以这里也只对「非 data 块」要求严格越界检查。
-        const bool isData = std::memcmp(ch, "data", 4) == 0;
-        if (len < 0 || (!isData && body + len > fsize)) { why = "WAV: 块长度越界"; return false; }
-        if (body > fsize) { why = "WAV: 块头越界"; return false; }
-        if (std::memcmp(ch, "fmt ", 4) == 0) {
-            if (len < 16) { why = "WAV: fmt 块过短"; return false; }
-            unsigned char f[40] = {0};
-            const size_t want = (size_t)std::min<long long>(len, 40);
-            if (!r.read_at(body, f, want)) { why = "WAV: fmt 读失败"; return false; }
-            fmtTag      = (int)le16(f);
-            t.channels  = (int)le16(f + 2);
-            t.sampleRate= (int)le32(f + 4);
-            blockAlign  = (int)le16(f + 12);
-            bits        = (int)le16(f + 14);
-            if (fmtTag == 0xFFFE) {                       // WAVE_FORMAT_EXTENSIBLE
-                if (len < 40) { why = "WAV: extensible fmt 过短"; return false; }
-                const int validBits = (int)le16(f + 18);
-                const uint16_t sub = le16(f + 24);
-                if (validBits != bits) { why = "WAV: 有效位深与容器位深不同（交给 ffprobe）"; return false; }
-                if (sub != 1 && sub != 3) { why = "WAV: extensible 子格式非 PCM/float"; return false; }
-                fmtTag = (int)sub;
-            }
-            if (fmtTag != 1 && fmtTag != 3) { why = "WAV: 非 PCM/float 编码"; return false; }
-            gotFmt = true;
-        } else if (isData) {
-            if (dataOff < 0) { dataOff = body; dataLen = std::min(len, fsize - body); }
-        } else if (std::memcmp(ch, "LIST", 4) == 0) {
-            if (len >= 4 && len <= (1 << 20)) {
-                std::vector<unsigned char> buf((size_t)len);
-                if (!r.read_at(body, buf.data(), buf.size())) { why = "WAV: LIST 读失败"; return false; }
-                if (std::memcmp(buf.data(), "INFO", 4) == 0) {
-                    size_t q = 4;
-                    while (q + 8 <= buf.size()) {
-                        const char* sid = (const char*)buf.data() + q;
-                        const long long sl = (long long)le32(buf.data() + q + 4);
-                        q += 8;
-                        if (sl < 0 || q + (size_t)sl > buf.size()) break;
-                        apply_wav_info_tag(t, std::string(sid, 4), (const char*)buf.data() + q, (size_t)sl);
-                        q += (size_t)sl + ((size_t)sl & 1u);
-                    }
-                }
-            }
-        } else if (std::memcmp(ch, "id3 ", 4) == 0 || std::memcmp(ch, "ID3 ", 4) == 0) {
-            // ffmpeg 会把这个块当 ID3v2 解析（读得到标签），我们不解 ⟹ 保底交给 ffprobe。
-            why = "WAV: 含 'id3 ' 块（ID3v2 in RIFF，交给 ffprobe）";
-            return false;
-        } else if (std::memcmp(ch, "bext", 4) == 0 || std::memcmp(ch, "iXML", 4) == 0 ||
-                   std::memcmp(ch, "axml", 4) == 0) {
-            // Broadcast Wave 的 bext 里有 origination_date（实测：本库 71 个 WAV 里有 1 个，
-            // ffprobe 读出 date=2022-08-16 → year=2022），iXML/axml 同理可能带标签字段。
-            // 这些字段在 LIST/INFO 之外，本地不解 ⟹ 交给 ffprobe（保底不丢年份）。
-            why = "WAV: 含 bext/iXML/axml 元数据块（交给 ffprobe）";
-            return false;
-        }
-        if (isData && body + len > fsize) break;      // 声明的 data 超出文件：已截断，后面没有块了
-        p = body + len + (len & 1);
-    }
-    if (!gotFmt) { why = "WAV: 缺 fmt 块"; return false; }
-    if (dataOff < 0) { why = "WAV: 缺 data 块"; return false; }
-    if (t.sampleRate <= 0 || t.channels <= 0 || blockAlign <= 0 || bits <= 0) {
-        why = "WAV: fmt 参数无效";
-        return false;
-    }
-    // data 声明长度可能大于实际文件（截断/流式录制）：ffmpeg 按实际可读长度截断，这里同样处理。
-    long long remain = fsize - dataOff;
-    if (remain <= 0) { why = "WAV: data 块为空"; return false; }
-    const long long used = std::min(dataLen > 0 ? dataLen : remain, remain);
-    t.duration = (double)used / ((double)blockAlign * (double)t.sampleRate);
-    if (!(t.duration > 0.0)) { why = "WAV: 时长算不出来"; return false; }
-    // 位深口径必须与 ffprobe 的 bits_per_raw_sample 一致（实测本机 ffprobe 9.0）：
-    //   pcm_s16le → N/A、pcm_u8 → N/A、pcm_f32le/f64le → N/A  ⟹ 旧代码把它们统一写成 16；
-    //   pcm_s24le → 24、pcm_s32le → 32。
-    // 所以这里只在 24/32 位整数 PCM 时报真值，其余情形报 0，由 lib_probe_one 的 upsell 逻辑写成 16。
-    t.bits = (fmtTag == 1 && (bits == 24 || bits == 32)) ? bits : 0;
-    if (fmtTag == 3)      t.codec = (bits == 64) ? "pcm_f64le" : "pcm_f32le";
-    else if (bits == 8)   t.codec = "pcm_u8";
-    else if (bits == 16)  t.codec = "pcm_s16le";
-    else if (bits == 24)  t.codec = "pcm_s24le";
-    else if (bits == 32)  t.codec = "pcm_s32le";
-    else                  t.codec = "pcm";
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// MP3（ID3v2.3/2.4 + 首帧 Xing/Info 或 CBR 估算）
+// ID3v2（MP3 的标签前缀 与 WAV 的 "id3 " 块共用）
+//   * decode_id3_text_enc / apic_desc_text：文本编码与 APIC 结构；
+//   * TagValues / TagMerger：合并口径（见下面那段实测说明，别改成「后者覆盖前者」）；
+//   * parse_id3v2_tag：两种容器共用的帧解析（按字节来源抽象读取，见 ByteSource）。
+// 紧跟其后的 parse_mp3 只是把结果落到 TagInfo，并补首帧/Xing 的时长口径。
 // ---------------------------------------------------------------------------
 inline bool decode_id3_text_enc(unsigned char enc, const unsigned char* p, size_t len, std::string& out,
                                 std::string& why) {
@@ -656,27 +561,183 @@ inline bool apic_desc_text(const unsigned char* body, size_t n, std::string& out
     return decode_id3_text_enc(enc, body + start, i - start, out, why);
 }
 
-inline bool apply_id3_text_frame(const std::string& id, const unsigned char* body, size_t n, TagInfo& t,
-                                 std::string& why) {
+// ---------------------------------------------------------------------------
+// 标签值的合并口径（**先到先得**）。这一段是 A/B 与「索引逐字节」两条判据能不能过的关键，
+// 不要按直觉改成「后者覆盖前者」。实测（本机 ffprobe 9.0 + 本仓库 net/library.h 的实际结果；
+// 夹具 + 71 个真实 WAV）：
+//   * 不同的块之间，ffmpeg 是**追加**（ID3 走 AV_DICT_MULTIKEY）⟹ ffprobe 会打出两条同键 tag：
+//     LIST→id3 的文件先打 [TAG:title=INFO值] 再打 [TAG:title=ID3值]，id3→LIST 反过来。
+//   * 同一个 LIST/INFO 块内重复键：ffmpeg 用覆盖 ⟹ **后者**赢（实测 INAM×2 → 取第二个）。
+//   * 同一个 ID3 标签内重复帧：ffmpeg 用 DONT_OVERWRITE ⟹ **前者**赢（实测 TIT2×2 → 取第一个）。
+//   * 而 lib_probe_one 按 -of default=nw=0 的段标记解析，比的却是 "[FORMAT]"/"[STREAM]"；
+//     ffprobe 的输出是 CRLF（行尾带 '\r'）⟹ **段标记永远匹配不上**，inFormat 恒为 false
+//     ⟹ put() 只在目标为空时赋值 ⟹ 最终入库的是**第一个非空值**（流标签先打印，所以
+//     APIC 描述会压过 TIT2 —— 实测 x_id3_apic_desc_title.wav: FF=DescFromAPIC）。
+// 结论：每个键取「第一个非空值」；「块内重复」先按 ffmpeg 的行为压成一条，再参与跨块合并。
+// （library.h 的 CRLF 缺陷不在本文件可改范围，见本文件顶部未解决项 8。）
+// ---------------------------------------------------------------------------
+struct TagValues {
+    std::string title, artist, album, albumArtist, genre, date, track, disc;
+    bool hasTitle = false, hasArtist = false, hasAlbum = false, hasAlbumArtist = false;
+    bool hasGenre = false, hasDate = false, hasTrack = false, hasDisc = false;
+    // 直接覆盖 = ffmpeg 在**同一个 INFO 块内**的行为（后一条 av_dict_set 覆盖前一条）
+    static void overwrite(std::string& dst, bool& has, const std::string& v) { dst = v; has = true; }
+    // 只在槽还空着时写 = ffmpeg 在**同一个 ID3 标签内**的行为（DONT_OVERWRITE）；空值不占位
+    // （lib_probe_one 的 put() 对空值同样不会锁住字段）
+    static bool putFirst(std::string& dst, bool& has, const std::string& v) {
+        if (has || v.empty()) return false;
+        dst = v; has = true; return true;
+    }
+};
+
+// 跨块合并：把一块里读到的值「先到先得」地吃进去（槽空着且值非空才吃）。
+struct TagMerger {
+    TagValues acc;                 // 已入库的（每个键的第一个非空值）
+    bool genreNumeric = false;     // 已入库的 genre 来自 ID3 的数字流派引用 ⟹ 需要回退
+    void absorb(const TagValues& v, bool vGenreNumeric = false) {
+        bool tookGenre = false;
+        if (!acc.hasTitle && !v.title.empty())             { acc.title = v.title; acc.hasTitle = true; }
+        if (!acc.hasArtist && !v.artist.empty())           { acc.artist = v.artist; acc.hasArtist = true; }
+        if (!acc.hasAlbum && !v.album.empty())             { acc.album = v.album; acc.hasAlbum = true; }
+        if (!acc.hasAlbumArtist && !v.albumArtist.empty()) { acc.albumArtist = v.albumArtist; acc.hasAlbumArtist = true; }
+        if (!acc.hasGenre && !v.genre.empty())             { acc.genre = v.genre; acc.hasGenre = true; tookGenre = true; }
+        if (!acc.hasDate && !v.date.empty())               { acc.date = v.date; acc.hasDate = true; }
+        if (!acc.hasTrack && !v.track.empty())             { acc.track = v.track; acc.hasTrack = true; }
+        if (!acc.hasDisc && !v.disc.empty())               { acc.disc = v.disc; acc.hasDisc = true; }
+        if (tookGenre) genreNumeric = vGenreNumeric;
+    }
+};
+
+// 把一个 ID3v2 文本帧写进 TagValues（**同一个标签内先到先得**，见上）。
+// genreNumeric：TCON 是数字流派引用（"(17)" / "(17)Rock" / "17"）——ffmpeg 会用 192 条表
+// 转成名字，本地没抄那张表。**不在这里直接失败**：这个值可能根本进不了最终标签
+// （前面的 INFO 已经占了 genre，或者后面还有别的块），由调用方按「它是否真的入库」决定回退。
+inline bool apply_id3_text_frame(const std::string& id, const unsigned char* body, size_t n, TagValues& tv,
+                                 bool* genreNumeric, std::string& why) {
     std::string v;
     if (!decode_id3_text(body, n, v, why)) return false;
     v = trim_tag_tail(v);
-    if (id == "TIT2")      t.title = v;
-    else if (id == "TPE1") t.artist = v;
-    else if (id == "TALB") t.album = v;
-    else if (id == "TPE2") t.albumArtist = v;
-    else if (id == "TPOS") t.discNo = std::atoi(v.c_str());
-    else if (id == "TRCK") t.trackNo = std::atoi(v.c_str());
-    else if (id == "TDRC" || id == "TYER") t.date = v;
+    if (id == "TIT2")      TagValues::putFirst(tv.title, tv.hasTitle, v);
+    else if (id == "TPE1") TagValues::putFirst(tv.artist, tv.hasArtist, v);
+    else if (id == "TALB") TagValues::putFirst(tv.album, tv.hasAlbum, v);
+    else if (id == "TPE2") TagValues::putFirst(tv.albumArtist, tv.hasAlbumArtist, v);
+    else if (id == "TPOS") TagValues::putFirst(tv.disc, tv.hasDisc, v);
+    else if (id == "TRCK") TagValues::putFirst(tv.track, tv.hasTrack, v);
+    else if (id == "TDRC" || id == "TYER") TagValues::putFirst(tv.date, tv.hasDate, v);
     else if (id == "TCON") {
-        // 数字流派引用（"(17)" / "(17)Rock" / "17"）由 ffmpeg 用 192 条表转成名字；
-        // 本地没抄那张表 ⟹ 交给 ffprobe（宁可慢一次，也不给错流派）。
-        if (!v.empty() && (v[0] == '(' || (v.find_first_not_of("0123456789") == std::string::npos &&
-                                           v.find_first_of("0123456789") != std::string::npos))) {
-            why = "MP3: TCON 是数字流派引用（交给 ffprobe）";
-            return false;
+        const bool numeric = !v.empty() &&
+            (v[0] == '(' || (v.find_first_not_of("0123456789") == std::string::npos &&
+                             v.find_first_of("0123456789") != std::string::npos));
+        if (TagValues::putFirst(tv.genre, tv.hasGenre, v) && genreNumeric) *genreNumeric = numeric;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ID3v2 帧解析（MP3 的 ID3v2 前缀 与 WAV 的 "id3 " 块共用这一份实现）
+//
+// 为什么抽出来：RIFF 里的 "id3 " 块装的就是**同一个 ID3v2 字节流**，ffmpeg 也是用同一个
+// ff_id3v2_parse 处理的（实测：同一套帧 ID / 编码 / APIC 规则在两种容器里表现一致）。
+// 复制两份必然漂移（铁律 3），所以只留一份，两种容器各给一个「字节来源」。
+//
+// 字节来源抽象：MP3 的标签里可能有几百 KB 的 APIC，**不能整块读进内存**（真实库里有 460 KB 的；
+// 15000 首全量扫会白白多读几 GB），所以走 FileByteSource 按需读；WAV 的 "id3 " 块本来就要
+// 按块长度整块读（和 LIST 一样），走 MemoryByteSource。
+// ---------------------------------------------------------------------------
+class ByteSource {
+public:
+    virtual ~ByteSource() = default;
+    virtual bool readAt(long long off, void* dst, size_t n) const = 0;
+};
+class FileByteSource final : public ByteSource {
+public:
+    explicit FileByteSource(FileReader& r) : r_(r) {}
+    bool readAt(long long off, void* dst, size_t n) const override { return r_.read_at(off, dst, n); }
+private:
+    FileReader& r_;
+};
+class MemoryByteSource final : public ByteSource {
+public:
+    MemoryByteSource(const unsigned char* p, size_t n) : p_(p), n_(n) {}
+    bool readAt(long long off, void* dst, size_t n) const override {
+        if (off < 0 || n == 0 || (size_t)off + n > n_) return false;
+        std::memcpy(dst, p_ + (size_t)off, n);
+        return true;
+    }
+private:
+    const unsigned char* p_;
+    size_t n_;
+};
+
+// ID3v2 解析的附加结果（TagValues 之外、WAV 合并与回退判断要用到的东西）
+struct Id3Out {
+    bool hasCover = false;          // 有「ffprobe 会真的建封面流」的 APIC（判据同 apic_mime_accepted）
+    std::string firstApicDesc;      // 第一个这类 APIC 的描述：ffmpeg 把它放到封面流的 title 上
+    bool genreNumeric = false;      // 入库的 genre 来自数字流派引用（"(17)" / "17"）
+    long long totalLen = 0;         // ID3v2 标签总字节数（含 10 字节头/footer）；MP3 用它算音频起点
+};
+
+// 解析 off 处的一个完整 ID3v2 标签。帧字段写进 tv（**同一个标签内先到先得**，与 ffmpeg 的
+// DONT_OVERWRITE 一致，见上面 TagValues 的实测说明）。avail = 从 off 起可用的字节数。
+inline bool parse_id3v2_tag(const ByteSource& src, long long off, long long avail, TagValues& tv, Id3Out& out,
+                            std::string& why) {
+    out = Id3Out();
+    unsigned char h[10];
+    if (avail < 10 || !src.readAt(off, h, 10)) { why = "ID3v2 头读不到"; return false; }
+    if (std::memcmp(h, "ID3", 3) != 0) { why = "ID3v2 幻数不符"; return false; }
+    const int ver = h[3];
+    if (ver != 3 && ver != 4) { why = "ID3v2 版本不是 2.3/2.4"; return false; }
+    if (h[5] & 0x80) { why = "ID3v2 使用了 unsynchronisation"; return false; }
+    const long long tagLen = 10 + (long long)syncsafe28(h + 6) + ((h[5] & 0x10) ? 10 : 0);
+    if (tagLen > avail) { why = "ID3v2 长度越界"; return false; }
+    out.totalLen = tagLen;
+    long long fp = 10;                                  // 相对 off
+    if (h[5] & 0x40) {                                  // 扩展头
+        unsigned char e[4];
+        if (!src.readAt(off + fp, e, 4)) { why = "ID3 扩展头读不到"; return false; }
+        const long long ext = (ver == 4) ? (long long)syncsafe28(e) : (long long)le32(e);
+        if (ext < 0 || fp + ext > tagLen) { why = "ID3 扩展头越界"; return false; }
+        fp += ext;
+    }
+    while (fp + 10 <= tagLen) {
+        unsigned char fh[10];
+        if (!src.readAt(off + fp, fh, 10)) { why = "ID3 帧头读不到"; return false; }
+        if (fh[0] == 0 && fh[1] == 0 && fh[2] == 0 && fh[3] == 0) break;   // padding
+        for (int i = 0; i < 4; ++i) {
+            const unsigned char c = fh[i];
+            if (!(std::isalnum(c) || c == '_' || c == '-')) { why = "ID3 帧 ID 非法"; return false; }
         }
-        t.genre = v;
+        const long long fsz = (ver == 4) ? (long long)syncsafe28(fh + 4) : (long long)be32(fh + 4);
+        if (fh[8] || fh[9]) { why = "ID3 帧带标志（压缩/加密/分组）"; return false; }
+        if (fsz < 0 || fp + 10 + fsz > tagLen) { why = "ID3 帧长度越界"; return false; }
+        const std::string id((const char*)fh, 4);
+        if (id == "APIC" || id == "PIC") {
+            // 只读前 512 字节（MIME/描述就在最前面）：ffprobe 只在 MIME 是已知图片类型时才建封面流，
+            // 空/未知 MIME 的 APIC 它直接忽略（实测）⟹ 我们也只按 MIME 判，不按帧存在判。
+            // 同时取「第一个非空描述」：ffmpeg 把它放到封面流的 title 上，会成为补缺曲名。
+            const size_t want = (size_t)std::min<long long>(fsz, 512);
+            if (want > 0) {
+                std::vector<unsigned char> ab(want);
+                if (!src.readAt(off + fp + 10, ab.data(), ab.size())) { why = "ID3 APIC 读失败"; return false; }
+                if (apic_mime_accepted(ab.data(), ab.size())) {
+                    out.hasCover = true;
+                    // 只有「真的建了封面流」的 APIC，它的描述才会成为流标题 ⟹ 只有这时才收集描述。
+                    if (out.firstApicDesc.empty()) {
+                        std::string d, dwhy;
+                        if (apic_desc_text(ab.data(), ab.size(), d, dwhy)) out.firstApicDesc = trim_tag_tail(d);
+                    }
+                }
+            }
+        } else if (id == "TIT2" || id == "TPE1" || id == "TALB" || id == "TPE2" || id == "TPOS" ||
+                   id == "TRCK" || id == "TDRC" || id == "TYER" || id == "TCON") {
+            if (fsz > 0) {
+                std::vector<unsigned char> body((size_t)fsz);
+                if (!src.readAt(off + fp + 10, body.data(), body.size())) { why = "ID3 帧内容读失败"; return false; }
+                if (!apply_id3_text_frame(id, body.data(), body.size(), tv, &out.genreNumeric, why))
+                    return false;
+            }
+        }
+        fp += 10 + fsz;
     }
     return true;
 }
@@ -686,63 +747,26 @@ inline bool parse_mp3(FileReader& r, TagInfo& t, std::string& why) {
     long long audio = 0;
     unsigned char h[10];
     if (fsize >= 10 && r.read_at(0, h, 10) && std::memcmp(h, "ID3", 3) == 0) {
-        const int ver = h[3];
-        if (ver != 3 && ver != 4) { why = "MP3: ID3v2 版本不是 2.3/2.4"; return false; }
-        if (h[5] & 0x80) { why = "MP3: ID3v2 使用了 unsynchronisation"; return false; }
-        const long long tagLen = 10 + (long long)syncsafe28(h + 6) + ((h[5] & 0x10) ? 10 : 0);
-        if (tagLen > fsize) { why = "MP3: ID3v2 长度越界"; return false; }
-        long long fp = 10;
-        std::string firstApicDesc;                    // 见 APIC 分支：ffprobe 会把 APIC 描述当补缺曲名
-        if (h[5] & 0x40) {                            // 扩展头
-            unsigned char e[4];
-            if (!r.read_at(10, e, 4)) { why = "MP3: 扩展头读不到"; return false; }
-            const long long ext = (ver == 4) ? (long long)syncsafe28(e) : (long long)le32(e);
-            if (ext < 0 || 10 + ext > tagLen) { why = "MP3: 扩展头越界"; return false; }
-            fp = 10 + ext;
-        }
-        while (fp + 10 <= tagLen) {
-            unsigned char fh[10];
-            if (!r.read_at(fp, fh, 10)) { why = "MP3: ID3 帧头读不到"; return false; }
-            if (fh[0] == 0 && fh[1] == 0 && fh[2] == 0 && fh[3] == 0) break;   // padding
-            for (int i = 0; i < 4; ++i) {
-                const unsigned char c = fh[i];
-                if (!(std::isalnum(c) || c == '_' || c == '-')) { why = "MP3: ID3 帧 ID 非法"; return false; }
-            }
-            const long long fsz = (ver == 4) ? (long long)syncsafe28(fh + 4) : (long long)be32(fh + 4);
-            if (fh[8] || fh[9]) { why = "MP3: ID3 帧带标志（压缩/加密/分组）"; return false; }
-            if (fsz < 0 || fp + 10 + fsz > tagLen) { why = "MP3: ID3 帧长度越界"; return false; }
-            const std::string id((const char*)fh, 4);
-            if (id == "APIC" || id == "PIC") {
-                // 只读前 512 字节（MIME/描述就在最前面）：ffprobe 只在 MIME 是已知图片类型时才建封面流，
-                // 空/未知 MIME 的 APIC 它直接忽略（实测）⟹ 我们也只按 MIME 判，不按帧存在判。
-                // 同时取「第一个非空描述」：ffmpeg 把它放到封面流的 title 上，会成为补缺曲名。
-                const size_t want = (size_t)std::min<long long>(fsz, 512);
-                if (want > 0) {
-                    std::vector<unsigned char> ab(want);
-                    if (!r.read_at(fp + 10, ab.data(), ab.size())) { why = "MP3: APIC 读失败"; return false; }
-                    if (apic_mime_accepted(ab.data(), ab.size())) {
-                        t.hasCover = true;
-                        // 只有「真的建了封面流」的 APIC，它的描述才会成为流标题 ⟹ 只有这时才收集描述。
-                        // （实测：MIME 空/未知的 APIC，ffprobe 既没有 video 流，也没有 title。）
-                        if (firstApicDesc.empty()) {
-                            std::string d, dwhy;
-                            if (apic_desc_text(ab.data(), ab.size(), d, dwhy)) firstApicDesc = trim_tag_tail(d);
-                        }
-                    }
-                }
-            } else if (id == "TIT2" || id == "TPE1" || id == "TALB" || id == "TPE2" || id == "TPOS" ||
-                       id == "TRCK" || id == "TDRC" || id == "TYER" || id == "TCON") {
-                if (fsz > 0) {
-                    std::vector<unsigned char> body((size_t)fsz);
-                    if (!r.read_at(fp + 10, body.data(), body.size())) { why = "MP3: ID3 帧内容读失败"; return false; }
-                    if (!apply_id3_text_frame(id, body.data(), body.size(), t, why)) return false;
-                }
-            }
-            fp += 10 + fsz;
-        }
-        // 与 ffprobe 一致：format 的 title（TIT2）优先；没有 TIT2 时，封面流的 title（APIC 描述）补缺。
-        if (t.title.empty() && !firstApicDesc.empty()) t.title = firstApicDesc;
-        audio = tagLen;
+        // 帧解析与 WAV 的 "id3 " 块共用（parse_id3v2_tag）；这里只管把结果落进 TagInfo，
+        // 外加两条 MP3 侧的口径：数字流派引用要回退、封面流标题补缺。
+        FileByteSource src(r);
+        TagValues tv;
+        Id3Out io;
+        std::string iw;
+        if (!parse_id3v2_tag(src, 0, fsize, tv, io, iw)) { why = "MP3: " + iw; return false; }
+        if (io.genreNumeric) { why = "MP3: TCON 是数字流派引用（交给 ffprobe）"; return false; }
+        if (io.hasCover) t.hasCover = true;   // APIC 的 MIME 是 ffprobe 认识的图片类型 ⟹ 它会建封面流
+        // 与 lib_probe_one 的实际结果一致：封面流的 title（APIC 描述）先打印、先入库，
+        // 所以它压过 TIT2（实测 MP3 夹具：TIT2=TitleFromTIT2 + APIC 描述=DescFromAPIC ⟹ FF 取后者）。
+        t.title       = io.firstApicDesc.empty() ? tv.title : io.firstApicDesc;
+        t.artist      = tv.artist;
+        t.album       = tv.album;
+        t.albumArtist = tv.albumArtist;
+        t.genre       = tv.genre;
+        t.date        = tv.date;
+        t.trackNo     = std::atoi(tv.track.c_str());
+        t.discNo      = std::atoi(tv.disc.c_str());
+        audio = io.totalLen;
     }
 
     // ---- 首帧 ----
@@ -830,6 +854,191 @@ inline bool parse_mp3(FileReader& r, TagInfo& t, std::string& why) {
     // ---- 无 Xing / Xing 无帧数：CBR 估算（与 ffmpeg 同式：(文件字节 - ID3v2 长度) * 8 / 码率）----
     t.duration = (double)(fsize - audio) * 8.0 / ((double)brKbps * 1000.0);
     if (!(t.duration > 0.0)) { why = "MP3: 时长算不出来"; return false; }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// WAV（RIFF/WAVE，PCM 或 IEEE float）
+// ---------------------------------------------------------------------------
+// 一个 LIST/INFO 块里的条目 → TagValues。**块内是后者覆盖前者**（ffmpeg 的 ff_read_riff_info
+// 对该块逐条 av_dict_set 覆盖；实测 INAM×2 时 ffprobe 只打第二条，lib_probe_one 也只能拿到它）。
+inline void apply_wav_info_tag(TagValues& tv, const std::string& id, const char* v, size_t n) {
+    // 值以 NUL 结尾（长度字段常含 NUL 与填充），先取到第一个 NUL（与 C 字符串语义一致）
+    size_t len = 0;
+    while (len < n && v[len] != '\0') ++len;
+    const std::string s = trim_tag_tail(std::string(v, len));
+    if      (id == "INAM") TagValues::overwrite(tv.title, tv.hasTitle, s);
+    else if (id == "IART") TagValues::overwrite(tv.artist, tv.hasArtist, s);
+    else if (id == "IPRD") TagValues::overwrite(tv.album, tv.hasAlbum, s);
+    else if (id == "IGNR") TagValues::overwrite(tv.genre, tv.hasGenre, s);
+    else if (id == "ICRD") TagValues::overwrite(tv.date, tv.hasDate, s);
+    else if (id == "ITRK" || id == "IPRT") TagValues::overwrite(tv.track, tv.hasTrack, s);
+}
+
+inline bool parse_wav(FileReader& r, TagInfo& t, std::string& why) {
+    unsigned char h[12];
+    if (!r.read_at(0, h, 12)) { why = "WAV: 文件头过短"; return false; }
+    if (std::memcmp(h, "RIFF", 4) != 0 || std::memcmp(h + 8, "WAVE", 4) != 0) {
+        why = "WAV: 不是 RIFF/WAVE（RF64/RIFX 不支持）";
+        return false;
+    }
+    const long long fsize = r.size();
+    long long p = 12;
+    long long dataOff = -1, dataLen = 0;
+    bool gotFmt = false;
+    int  fmtTag = 0, bits = 0, blockAlign = 0;
+    // ---- 标签合并（LIST/INFO、id3 块、bext）----
+    // 口径见上面 TagValues/TagMerger 的实测说明：ffprobe 会把不同块的同键标签**都**打出来，
+    // 而 lib_probe_one 实际只取**第一个非空值**（段标记因 CRLF 匹配不上）。所以：
+    //   块与块之间 = 先到先得（LIST→id3 时 INFO 赢、id3→LIST 时 ID3 赢，与「后者覆盖」正好相反）；
+    //   同一个 INFO 块内 = 后者覆盖前者（ffmpeg 自己就覆盖了）；
+    //   同一个 ID3 标签内 = 先到先得（ffmpeg 用 DONT_OVERWRITE）。
+    TagMerger mg;                     // 跨块合并（先到先得）
+    std::string firstApicDesc;        // 封面流 title（APIC 描述）：流标签先打印，所以它优先于 format
+    while (p + 8 <= fsize) {
+        unsigned char ch[8];
+        if (!r.read_at(p, ch, 8)) { why = "WAV: 块头越界"; return false; }
+        const long long len = (long long)le32(ch + 4);
+        const long long body = p + 8;
+        // data 块声明长度可能大于实际文件（截断/流式录制）：ffmpeg 按实际可读长度截断，
+        // 所以这里也只对「非 data 块」要求严格越界检查。
+        const bool isData = std::memcmp(ch, "data", 4) == 0;
+        if (len < 0 || (!isData && body + len > fsize)) { why = "WAV: 块长度越界"; return false; }
+        if (body > fsize) { why = "WAV: 块头越界"; return false; }
+        if (std::memcmp(ch, "fmt ", 4) == 0) {
+            if (len < 16) { why = "WAV: fmt 块过短"; return false; }
+            unsigned char f[40] = {0};
+            const size_t want = (size_t)std::min<long long>(len, 40);
+            if (!r.read_at(body, f, want)) { why = "WAV: fmt 读失败"; return false; }
+            fmtTag      = (int)le16(f);
+            t.channels  = (int)le16(f + 2);
+            t.sampleRate= (int)le32(f + 4);
+            blockAlign  = (int)le16(f + 12);
+            bits        = (int)le16(f + 14);
+            if (fmtTag == 0xFFFE) {                       // WAVE_FORMAT_EXTENSIBLE
+                if (len < 40) { why = "WAV: extensible fmt 过短"; return false; }
+                const int validBits = (int)le16(f + 18);
+                const uint16_t sub = le16(f + 24);
+                if (validBits != bits) { why = "WAV: 有效位深与容器位深不同（交给 ffprobe）"; return false; }
+                if (sub != 1 && sub != 3) { why = "WAV: extensible 子格式非 PCM/float"; return false; }
+                fmtTag = (int)sub;
+            }
+            if (fmtTag != 1 && fmtTag != 3) { why = "WAV: 非 PCM/float 编码"; return false; }
+            gotFmt = true;
+        } else if (isData) {
+            if (dataOff < 0) { dataOff = body; dataLen = std::min(len, fsize - body); }
+        } else if (std::memcmp(ch, "LIST", 4) == 0) {
+            if (len >= 4 && len <= (1 << 20)) {
+                std::vector<unsigned char> buf((size_t)len);
+                if (!r.read_at(body, buf.data(), buf.size())) { why = "WAV: LIST 读失败"; return false; }
+                if (std::memcmp(buf.data(), "INFO", 4) == 0) {
+                    TagValues iv;                       // 块内：后者覆盖前者（ffmpeg 的行为）
+                    size_t q = 4;
+                    while (q + 8 <= buf.size()) {
+                        const char* sid = (const char*)buf.data() + q;
+                        const long long sl = (long long)le32(buf.data() + q + 4);
+                        q += 8;
+                        if (sl < 0 || q + (size_t)sl > buf.size()) break;
+                        apply_wav_info_tag(iv, std::string(sid, 4), (const char*)buf.data() + q, (size_t)sl);
+                        q += (size_t)sl + ((size_t)sl & 1u);
+                    }
+                    mg.absorb(iv);                      // 跨块：先到先得
+                }
+            }
+        } else if (std::memcmp(ch, "id3 ", 4) == 0 || std::memcmp(ch, "ID3 ", 4) == 0) {
+            // RIFF 里的 ID3v2（"ID3v2 in RIFF"）：ffmpeg 的 wav demuxer 就地解析这个块，标签并进
+            // format tags。跨块口径是**先到先得**（见 TagValues/TagMerger 的实测说明）：
+            // 实测本库 51 个真实文件 —— LIST→id3 的 30 个最终取 INFO 的值，id3→LIST 的 19 个取 ID3 的值。
+            // 块里的 APIC 会让 ffmpeg 建一条 video 流（封面流），其描述成为该流的 title
+            // ⟹ lib_probe_one 的 stream-tags 补缺会把它当曲名（与 MP3 同一条坑），这里同样收集。
+            // 帧级解析与 MP3 共用 parse_id3v2_tag（同一种字节流，不复制第二份）。
+            if (len > (32 << 20)) { why = "WAV: 'id3 ' 块过大"; return false; }
+            std::vector<unsigned char> id3buf((size_t)len);
+            if (len > 0 && !r.read_at(body, id3buf.data(), id3buf.size())) {
+                why = "WAV: 'id3 ' 块读失败";
+                return false;
+            }
+            if (id3buf.size() < 3 || std::memcmp(id3buf.data(), "ID3", 3) != 0) {
+                // ffmpeg 的 ff_id3v2_read 找不到幻数时只打一行 debug 日志、**不加标签也不报错**
+                // （实测夹具：块内是垃圾字节 ⟹ ffprobe 只报 INFO 的标签）。这里同样跳过，
+                // 不要把它当解析失败——否则这类文件会白白多起一个 ffprobe 进程。
+            } else if (id3buf.size() < 10) {
+                why = "WAV: 'id3 ' 块过短";
+                return false;
+            } else {
+                MemoryByteSource ms(id3buf.data(), id3buf.size());
+                TagValues dv;
+                Id3Out io;
+                std::string iw;
+                if (!parse_id3v2_tag(ms, 0, (long long)id3buf.size(), dv, io, iw)) {
+                    why = "WAV: " + iw;
+                    return false;
+                }
+                if (io.hasCover) t.hasCover = true;
+                if (!io.firstApicDesc.empty() && firstApicDesc.empty()) firstApicDesc = io.firstApicDesc;
+                mg.absorb(dv, io.genreNumeric);
+            }
+        } else if (std::memcmp(ch, "bext", 4) == 0) {
+            // Broadcast Wave 的 bext：ffmpeg 把 origination_date（偏移 320，10 字节）写成 **date**，
+            // originator → encoded_by、origination_time → creation_time（后两者 lib_probe_one 不取）。
+            // 实测（本机 ffprobe 9.0，逐字节造块扫 330..346）：
+            //   * 块长 < 337 ⟹ ffmpeg **整份文件报 invalid data**（连流都不给）⟹ 这里也必须回退，
+            //     否则我们会比 ffprobe "多解析"出一个文件（真出现这种文件就是 A/B 红）；
+            //   * 块长 >= 337 ⟹ date 照常读出；origination_date 为空 ⟹ ffmpeg 不写 date 键
+            //     （所以不能把前面 LIST 的 ICRD 清成空）。
+            if (len < 337) { why = "WAV: bext 块过短（ffprobe 会拒绝整个文件）"; return false; }
+            unsigned char bx[330];
+            if (!r.read_at(body, bx, sizeof(bx))) { why = "WAV: bext 读失败"; return false; }
+            size_t dn = 0;
+            while (dn < 10 && bx[320 + dn] != '\0') ++dn;
+            TagValues bv;
+            const std::string d = trim_tag_tail(std::string((const char*)bx + 320, dn));
+            if (!d.empty()) TagValues::overwrite(bv.date, bv.hasDate, d);
+            mg.absorb(bv);
+        } else if (std::memcmp(ch, "iXML", 4) == 0 || std::memcmp(ch, "axml", 4) == 0) {
+            // iXML/axml 是 XML 元数据，ffmpeg 会解析出若干键（本库 71 个 WAV 里 0 个）。
+            // 没实测过它们的字段映射 ⟹ 照旧交给 ffprobe（保底不丢标签，铁律 3）。
+            why = "WAV: 含 iXML/axml 元数据块（交给 ffprobe）";
+            return false;
+        }
+        if (isData && body + len > fsize) break;      // 声明的 data 超出文件：已截断，后面没有块了
+        p = body + len + (len & 1);
+    }
+    // 数字流派引用（"(17)"）要靠 ffmpeg 的 192 条表才能变成名字；只有它**真的入库**才需要回退。
+    // （如果前面的 INFO 已经占了 genre，它的值根本不会出现在最终标签里 ⟹ 不必回退，实测验证过。）
+    if (mg.genreNumeric) { why = "WAV: 'id3 ' 块的 TCON 是数字流派引用（交给 ffprobe）"; return false; }
+    // 落位：封面流的 title（APIC 描述）先打印、先入库，所以它有最高优先级；没有才用 format 的 title。
+    t.title       = firstApicDesc.empty() ? mg.acc.title : firstApicDesc;
+    t.artist      = mg.acc.artist;
+    t.album       = mg.acc.album;
+    t.albumArtist = mg.acc.albumArtist;
+    t.genre       = mg.acc.genre;
+    t.date        = mg.acc.date;
+    t.trackNo     = std::atoi(mg.acc.track.c_str());
+    t.discNo      = std::atoi(mg.acc.disc.c_str());
+    if (!gotFmt) { why = "WAV: 缺 fmt 块"; return false; }
+    if (dataOff < 0) { why = "WAV: 缺 data 块"; return false; }
+    if (t.sampleRate <= 0 || t.channels <= 0 || blockAlign <= 0 || bits <= 0) {
+        why = "WAV: fmt 参数无效";
+        return false;
+    }
+    // data 声明长度可能大于实际文件（截断/流式录制）：ffmpeg 按实际可读长度截断，这里同样处理。
+    long long remain = fsize - dataOff;
+    if (remain <= 0) { why = "WAV: data 块为空"; return false; }
+    const long long used = std::min(dataLen > 0 ? dataLen : remain, remain);
+    t.duration = (double)used / ((double)blockAlign * (double)t.sampleRate);
+    if (!(t.duration > 0.0)) { why = "WAV: 时长算不出来"; return false; }
+    // 位深口径必须与 ffprobe 的 bits_per_raw_sample 一致（实测本机 ffprobe 9.0）：
+    //   pcm_s16le → N/A、pcm_u8 → N/A、pcm_f32le/f64le → N/A  ⟹ 旧代码把它们统一写成 16；
+    //   pcm_s24le → 24、pcm_s32le → 32。
+    // 所以这里只在 24/32 位整数 PCM 时报真值，其余情形报 0，由 lib_probe_one 的 upsell 逻辑写成 16。
+    t.bits = (fmtTag == 1 && (bits == 24 || bits == 32)) ? bits : 0;
+    if (fmtTag == 3)      t.codec = (bits == 64) ? "pcm_f64le" : "pcm_f32le";
+    else if (bits == 8)   t.codec = "pcm_u8";
+    else if (bits == 16)  t.codec = "pcm_s16le";
+    else if (bits == 24)  t.codec = "pcm_s24le";
+    else if (bits == 32)  t.codec = "pcm_s32le";
+    else                  t.codec = "pcm";
     return true;
 }
 
