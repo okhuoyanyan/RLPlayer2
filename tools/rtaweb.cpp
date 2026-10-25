@@ -4855,7 +4855,7 @@ static bool is_side_effect_path(const std::string& p) {
         "/api/lib/roots", "/api/rescan", "/api/quit", "/api/shutdown", "/api/settings",
         "/api/writeback", "/api/enrich", "/api/peq", "/api/opra/apply", "/api/cast/start",
         "/api/cast/stop", "/api/upnp", "/api/src", "/api/input/start", "/api/input/stop",
-        "/api/buffer/reset", "/api/upload", "/api/llm",
+        "/api/buffer/reset", "/api/upload",
     };
     for (const char* k : kNeedPost) {
         const size_t n = std::strlen(k);
@@ -4875,6 +4875,8 @@ static bool is_side_effect_exempt(const std::string& p) {
         "/api/fav/list", "/api/pl/load", "/api/writeback/status", "/api/writeback/dry", "/api/src/browse",
         "/api/src/search", "/api/src/cover", "/api/lib/status", "/api/lib/stats",
         "/api/lib/albums", "/api/lib/album", "/api/lib/search", "/api/lib/cover",
+        // /api/llm：GET = 读配置状态（已配置 + 掩码），POST = 保存；状态读取必须允许 GET。
+        "/api/llm", "/api/llm/test",
     };
     for (const char* k : kGetOk) if (p.rfind(k, 0) == 0) return true;
     return false;
