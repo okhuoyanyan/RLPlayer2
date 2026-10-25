@@ -122,6 +122,25 @@ if(NOT RC_EXE)
   find_program(RC_EXE NAMES rc)
 endif()
 if(RC_EXE)
+  # 2026-10-25：版本号单一来源 —— 从 src/version.h 解析，代入 res/rlplayer.rc.in。
+  # 之前 rc 里四处（FILEVERSION / PRODUCTVERSION / FileVersion 字符串 / ProductVersion 字符串）
+  # 靠手改，结果 1.3.17~1.5.0 的包属性里一直写着 1.3.16.0。
+  file(STRINGS "${CMAKE_SOURCE_DIR}/src/version.h" RL_VER_LINE REGEX "#define[ ]+RLPLAYER_VERSION")
+  string(REGEX MATCH "\"([0-9]+)\\.([0-9]+)\\.([0-9]+)\"" RL_VER_MATCH "${RL_VER_LINE}")
+  set(RL_VER_MAJOR "${CMAKE_MATCH_1}")
+  set(RL_VER_MINOR "${CMAKE_MATCH_2}")
+  set(RL_VER_PATCH "${CMAKE_MATCH_3}")
+  if(NOT RL_VER_MAJOR)
+    set(RL_VER_MAJOR 0)
+    set(RL_VER_MINOR 0)
+    set(RL_VER_PATCH 0)
+  endif()
+  set(RL_FILEVER "${RL_VER_MAJOR},${RL_VER_MINOR},${RL_VER_PATCH},0")
+  set(RL_STRVER "${RL_VER_MAJOR}.${RL_VER_MINOR}.${RL_VER_PATCH}.0")
+  configure_file("${CMAKE_SOURCE_DIR}/res/rlplayer.rc.in" "${CMAKE_BINARY_DIR}/rlplayer.rc" @ONLY)
+  message(STATUS "RLPlayer version resource: ${RL_STRVER}")
+  set(RL_RC_FILE ${CMAKE_BINARY_DIR}/rlplayer.rc)
+
   set(RL_ICON_RES ${CMAKE_BINARY_DIR}/rlplayer.res)
   add_custom_command(
     OUTPUT ${RL_ICON_RES}
@@ -129,8 +148,8 @@ if(RC_EXE)
             /I "${CMAKE_SOURCE_DIR}/res"
             /I "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um"
             /I "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/shared"
-            "${CMAKE_SOURCE_DIR}/res/rlplayer.rc"
-    DEPENDS ${CMAKE_SOURCE_DIR}/res/rlplayer.rc ${CMAKE_SOURCE_DIR}/res/rlplayer.ico
+            "${RL_RC_FILE}"
+    DEPENDS ${RL_RC_FILE} ${CMAKE_SOURCE_DIR}/res/rlplayer.rc.in ${CMAKE_SOURCE_DIR}/src/version.h ${CMAKE_SOURCE_DIR}/res/rlplayer.ico
     VERBATIM)
   set_source_files_properties(${RL_ICON_RES} PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
   add_custom_target(rl_icon_res DEPENDS ${RL_ICON_RES})

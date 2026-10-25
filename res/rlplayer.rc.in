@@ -1,0 +1,37 @@
+// rlplayer.rc.in —— 模板：版本号由 CMake 从 src/version.h 解析后代入（2026-10-25）。
+// 为什么这么做：以前 rc 里四处版本号靠手改，FILEVERSION 与 PRODUCTVERSION/字符串经常不同步
+// （1.3.17~1.5.0 的包一直显示 1.3.16.0）。现在源头只有一个：src/version.h 的 RLPLAYER_VERSION。
+// rlplayer.rc — 程序图标与版本信息
+#pragma code_page(65001)
+#include <windows.h>
+
+IDI_APPICON ICON "rlplayer.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION @RL_FILEVER@
+ PRODUCTVERSION @RL_FILEVER@
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "RLPlayer"
+            VALUE "FileDescription", "RLPlayer 高保真音乐播放器"
+            VALUE "FileVersion", "@RL_STRVER@"
+            VALUE "InternalName", "RLPlayer"
+            VALUE "LegalCopyright", "RLPlayer"
+            VALUE "OriginalFilename", "RLPlayer.exe"
+            VALUE "ProductName", "RLPlayer"
+            VALUE "ProductVersion", "@RL_STRVER@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
