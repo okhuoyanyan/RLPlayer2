@@ -490,9 +490,11 @@ function head(title, subtitle, toolsHtml) {
 // （早期用 cv 标记决定是否请求，结果「扫描时没识别出封面」就永远不显示了）
 function albumCardHtml(a, i) {
   return '<div class=card data-i=' + i + '>' +
+    // 2026-10-26（261026-02 #3）：封面端点现在**找不到就 404**（不再回 1x1 占位图），
+    // 所以 onerror 必须是"隐藏 <img>、露出底下的首字母"，而不是让格子空着。
     '<div class=cv>' +
       '<div class=ph>' + esc((a.name || '?').slice(0, 1).toUpperCase()) + '</div>' +
-      '<img src="/api/lib/cover?k=' + a.k + '" loading=lazy alt="" onerror="this.style.display=\'none\'">' +
+      '<img src="' + (a.cvUrl || ('/api/lib/cover?k=' + a.k)) + '" loading=lazy alt="" onerror="this.style.display=\'none\'">' +
       '<div class=pl><svg width=13 height=13 viewBox="0 0 24 24" fill=#fff><path d="M8 5v14l11-7z"/></svg></div>' +
     '</div>' +
     '<div class=nm title="' + esc(a.name) + '">' + esc(a.name) + '</div>' +
@@ -500,8 +502,35 @@ function albumCardHtml(a, i) {
       (a.year ? '  \u00b7  ' + a.year : '') + (a.sr ? '  \u00b7  ' + fmtTag(a.sr, a.bits) : '') + '</div>' +
     '</div>';
 }
+// 2026-10-26（261026-02 #3）：封面抓取要有**看得见的进度**，并且进库页自动开跑。
+// 后端：POST /api/lib/cover/prefetch（副作用）· GET /api/lib/cover/progress → {running,done,total,hit,miss,fail}
+var COVP = { timer: 0 };
+function startCoverPrefetch() {
+  api('/api/lib/cover/prefetch', '').then(function (j) {
+    if (!j || !j.ok || !j.running || !j.queued) return;
+    toast('正在抓取封面：共 ' + j.queued + ' 张缺图');
+    pollCoverProgress();
+  }).catch(function () { });
+}
+function pollCoverProgress() {
+  if (COVP.timer) return;
+  COVP.timer = setInterval(function () {
+    api('/api/lib/cover/progress').then(function (g) {
+      if (!g || !g.ok) return;
+      var el = D('covProg');
+      if (el) { el.style.display = 'flex'; el.textContent = '封面 ' + (g.done || 0) + '/' + (g.total || 0) + '（命中 ' + (g.hit || 0) + '）'; }
+      if (!g.running) {
+        clearInterval(COVP.timer); COVP.timer = 0;
+        if (el && g.done > 0) setTimeout(function () { el.style.display = 'none'; }, 2500);
+        if (g.hit > 0) { toast('封面已补齐 ' + g.hit + ' 张'); loadAlbums(); }
+      }
+    }).catch(function () { });
+  }, 700);
+}
+
 function loadAlbums(q, title) {
   S.view = 'albums';
+  startCoverPrefetch();     // 进库页就开跑（没有缺图时后端立即返回 queued=0）
   head(title || '专辑', '加载中…', '');
   api('/api/lib/albums?q=' + encodeURIComponent(q || '')).then(function (j) {
     S.albums = j.albums || [];
@@ -927,7 +956,8 @@ function openAlbum(k) {
     if (S.view !== 'album') return;   // 已切走 → 丢弃（否则会把别页内容覆写成专辑页）
     if (!j.ok) { toast(j.error || '打不开专辑'); return; }
     S.album = j;
-    var cv = "background-image:url('/api/lib/cover?k=" + j.k + "')";
+    // 2026-10-26：封面 404 时不要留一块纯色空框 —— 用 <img> + 首字母底层（与列表页一致）
+    var cv = "";
     var sub = [];
     if (j.artist) sub.push(esc(j.artist));
     if (j.year) sub.push(j.year);
@@ -941,7 +971,10 @@ function openAlbum(k) {
     var isThisPlaying = (S.playing || S.paused) && S.lastCur && (j.tracks || []).some(function (t) { return t.path === S.lastCur; });
     var albPlayText = isThisPlaying ? (S.paused ? '▶ 继续播放' : '❚❚ 暂停') : '▶ 播放整张';
     var albPlayTitle = isThisPlaying ? (S.paused ? '继续播放专辑' : '暂停播放') : '播放整张专辑';
-    var h = '<div class=ahead><div class=cv style="' + cv + '"></div><div class=info>' +
+    var h = '<div class=ahead><div class=cv style="position:relative">' +
+            '<div class=ph>' + esc((j.name || '?').slice(0, 1).toUpperCase()) + '</div>' +
+            '<img src="' + (j.cvUrl || ('/api/lib/cover?k=' + j.k)) + '" alt="" onerror="this.style.display=\'none\'" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:inherit">' +
+            '</div><div class=info>' +
             '<div class=kind>ALBUM</div><h1 title="' + esc(j.name) + '">' + esc(j.name) + '</h1>' +
             '<div class=sub>' + sub.join(' \u00b7 ') + '</div>' +
             '<button class="btn pri" id=albPlayAll aria-label="播放整张专辑" title="' + albPlayTitle + '">' + albPlayText + '</button> ' +
