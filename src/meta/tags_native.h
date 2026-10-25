@@ -590,20 +590,61 @@ struct TagValues {
     }
 };
 
+// ---- 「??」占位判定（261025-02 第 6 条修，真实库实测 16/16）----
+// 本库里有一批 WAV 同时带 LIST/INFO 与 "id3 " 块，**FFI 那份是坏的**：INAM 的值是字面的
+// ASCII '?' 重复（实测 33 字节 3F×25 + " (Live)"），而同文件的 ID3 TIT2 是完整的 UTF-16
+// "たいせつなきみのために、ぼくにできるいちばんのこと (Live)"。那些 '?' 是**生成标签的工具
+// 写盘时就已经变成问号的**（原始字节就是 0x3F），不是我们解码错了，也不是 UI 字体缺字。
+// 于是「第一个非空值赢」这条口径会稳定地把好标签丢掉。这里只做一件事：**把"纯占位"判成空**。
+//   纯占位 = 去掉数字与空白之后，剩下的字符全是 '?'（含全角 '？'）
+//           且至少有一个 '?'（否则 "1080" 这种也是空的误判）。
+// 为什么这个判据站得住（铁律 3：判据要能被单独否定）：
+//   * 真实歌名几乎不可能只剩问号；本库 655 行里，被此判据判空的只有那 16 首 WAV 的 FFI 值，
+//     同文件的 ID3 值全部是合法 UTF-8 且有内容（tests/test_tags_native.cpp [5] 逐条断言）。
+//   * 它只影响 **空槽判断**，不改任何键的取值来源顺序：ID3 值仍然只在「INFO 那份为空」时才上位。
+//   * 整份标签只有 '?' 时（某些 WAV 根本没有 ID3 块），结果仍是 '?' —— 那是文件本身的坏，
+//     本文件无从修复，宁可原样透传（与 ffprobe 一致），也不凭空编名字。
+inline bool tag_is_placeholder(const std::string& s) {
+    bool sawQ = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const unsigned char c = (unsigned char)s[i];
+        if (c == '?' ) { sawQ = true; continue; }
+        if (c == ' ') continue;
+        if (c >= '0' && c <= '9') continue;
+        // 全角问号 U+FF1F = EF BC 9F
+        if (c == 0xEF && i + 2 < s.size() && (unsigned char)s[i+1] == 0xBC && (unsigned char)s[i+2] == 0x9F) {
+            sawQ = true; i += 2; continue;
+        }
+        return false;                                  // 有一个非问号字符 ⟹ 不是纯占位
+    }
+    return sawQ;
+}
+
 // 跨块合并：把一块里读到的值「先到先得」地吃进去（槽空着且值非空才吃）。
 struct TagMerger {
     TagValues acc;                 // 已入库的（每个键的第一个非空值）
     bool genreNumeric = false;     // 已入库的 genre 来自 ID3 的数字流派引用 ⟹ 需要回退
+    // 261025-02 第 6 条：纯 '?' 的值**不占位**（见 tag_is_placeholder 的实测依据）。
+    // 只在 WAV 的跨块合并里生效 —— MP3/OGG 没有"同键双来源"这个结构，不需要这条。
     void absorb(const TagValues& v, bool vGenreNumeric = false) {
+        TagValues vv = v;
+        if (tag_is_placeholder(vv.title))  vv.title.clear();
+        if (tag_is_placeholder(vv.artist)) vv.artist.clear();
+        if (tag_is_placeholder(vv.album))  vv.album.clear();
+        if (tag_is_placeholder(vv.albumArtist)) vv.albumArtist.clear();
+        if (tag_is_placeholder(vv.genre))  vv.genre.clear();
+        if (tag_is_placeholder(vv.track))  vv.track.clear();
+        if (tag_is_placeholder(vv.disc))   vv.disc.clear();
+        if (tag_is_placeholder(vv.date))   vv.date.clear();
         bool tookGenre = false;
-        if (!acc.hasTitle && !v.title.empty())             { acc.title = v.title; acc.hasTitle = true; }
-        if (!acc.hasArtist && !v.artist.empty())           { acc.artist = v.artist; acc.hasArtist = true; }
-        if (!acc.hasAlbum && !v.album.empty())             { acc.album = v.album; acc.hasAlbum = true; }
-        if (!acc.hasAlbumArtist && !v.albumArtist.empty()) { acc.albumArtist = v.albumArtist; acc.hasAlbumArtist = true; }
-        if (!acc.hasGenre && !v.genre.empty())             { acc.genre = v.genre; acc.hasGenre = true; tookGenre = true; }
-        if (!acc.hasDate && !v.date.empty())               { acc.date = v.date; acc.hasDate = true; }
-        if (!acc.hasTrack && !v.track.empty())             { acc.track = v.track; acc.hasTrack = true; }
-        if (!acc.hasDisc && !v.disc.empty())               { acc.disc = v.disc; acc.hasDisc = true; }
+        if (!acc.hasTitle && !vv.title.empty())             { acc.title = vv.title; acc.hasTitle = true; }
+        if (!acc.hasArtist && !vv.artist.empty())           { acc.artist = vv.artist; acc.hasArtist = true; }
+        if (!acc.hasAlbum && !vv.album.empty())             { acc.album = vv.album; acc.hasAlbum = true; }
+        if (!acc.hasAlbumArtist && !vv.albumArtist.empty()) { acc.albumArtist = vv.albumArtist; acc.hasAlbumArtist = true; }
+        if (!acc.hasGenre && !vv.genre.empty())             { acc.genre = vv.genre; acc.hasGenre = true; tookGenre = true; }
+        if (!acc.hasDate && !vv.date.empty())               { acc.date = vv.date; acc.hasDate = true; }
+        if (!acc.hasTrack && !vv.track.empty())             { acc.track = vv.track; acc.hasTrack = true; }
+        if (!acc.hasDisc && !vv.disc.empty())               { acc.disc = vv.disc; acc.hasDisc = true; }
         if (tookGenre) genreNumeric = vGenreNumeric;
     }
 };

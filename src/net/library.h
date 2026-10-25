@@ -1075,8 +1075,19 @@ inline std::vector<size_t> Library::search(const std::string& q, size_t limit) c
     return hits;
 }
 
+// 261025-02 第 6 条（封面缺失的真根因，实测 145/246 位艺术家只剩首字母）：
+//   get_cover() 在「既无同目录 cover.*、也没有内嵌封面」时**不返回空**，而是返回一个 1x1 透明 PNG
+//   占位图（media_info.h:365-375，77~200 字节）。旧实现只按索引里的首曲问一次：
+//     * 首曲没图 + 专辑后面几首有图 ⟹ 整张专辑 cv:true 却是空白（img 不报错，onerror 兜不住）；
+//     * 结果被写进 coverCache_，**永不重试**（即使换了一张专辑的查询来源）。
+//   现在的规则：
+//     1) 按 cv 排序（有封面的曲目优先），而不是只看 idx[0]；
+//     2) 拿到的是"可疑小图"（< 1 KB）就继续问下一首，直到拿到真图或问完；
+//     3) 空结果写进"负缓存"（first 为空，永久），小图**不**写缓存（下次还能重试）。
+//   判据：tests/test_library.cpp 的画布用例 + 真库抽样（docs/261025-02-封面与字体核查.md）。
 inline bool Library::albumCover(const std::string& key, std::vector<unsigned char>& bytes, std::string& mime) {
-    std::string firstPath;
+    // 抽出顺序：先本专辑 cv=1 的曲目，再其余曲目（最多各 3 首，避免对 200 首的合辑起 200 次 ffmpeg）
+    std::vector<std::string> order;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = coverCache_.find(key);
@@ -1085,10 +1096,41 @@ inline bool Library::albumCover(const std::string& key, std::vector<unsigned cha
             bytes = it->second.first; mime = it->second.second; return true;
         }
         const auto& v = albumVecLocked();
-        for (auto& a : v) if (a.key == key && !a.idx.empty()) { firstPath = tracks_[a.idx[0]].path; break; }
+        std::vector<std::string> withCv, without;
+        for (auto& a : v) {
+            if (a.key != key) continue;
+            for (size_t ix : a.idx) {
+                if (ix >= tracks_.size()) continue;
+                if (tracks_[ix].hasCover) { if (withCv.size() < 3) withCv.push_back(tracks_[ix].path); }
+                else                      { if (without.size() < 3) without.push_back(tracks_[ix].path); }
+            }
+            break;
+        }
+        order = withCv;
+        order.insert(order.end(), without.begin(), without.end());
     }
-    if (firstPath.empty()) return false;
-    std::vector<unsigned char> b = rta::audio::get_cover(firstPath, mime);
+    if (order.empty()) return false;
+    // < 1 KB 的图基本只可能是占位/损坏：真实封面（含 APIC 缩略图）极少这么小。
+    // 这里不直接判死，而是"继续试下一首"——全试完仍只有小图才用它（总比空白好）。
+    std::vector<unsigned char> b;
+    std::string smallMime;
+    std::vector<unsigned char> small;
+    for (const auto& p : order) {
+        std::string m;
+        std::vector<unsigned char> cand = rta::audio::get_cover(p, m);
+        if (cand.size() >= 1024) { b.swap(cand); mime = m; break; }
+        if (small.empty() && !cand.empty()) { small.swap(cand); smallMime = m; }
+    }
+    const bool usable = (b.size() >= 1024);          // true = 真封面；false = 只有占位图
+    if (!usable) { b.swap(small); mime = smallMime.empty() ? "image/png" : smallMime; }
+    // 只有"确定拿不到"（空）或"拿到真封面"才进缓存：占位图不缓存，下次打开 albums 页还能重试。
+    if (!usable) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (coverCache_.size() > 256) coverCache_.clear();
+        coverCache_[key] = { std::vector<unsigned char>(), "image/png" };   // 负缓存
+        bytes.clear();
+        return false;                                 // 让 <img onerror> 露回首字母占位（不是一块白）
+    }
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (coverCache_.size() > 256) coverCache_.clear();

@@ -482,6 +482,67 @@ struct AbResult {
     std::string why;                  // hit=false 时的回退原因
     LibTrack ff, nt;
 };
+// 2026-10-26（261025-02 #6）：解析器现在会**剔除"全是问号"的占位标题**（用户库里 16 个 WAV
+// 的 RIFF INFO 里就是字面 0x3F，而同文件的 ID3 里是完好的日文）。这会让原生结果与 ffprobe **故意不同**：
+// ffprobe 给 "?????????"，我们给真名。所以 A/B 判据要区分两件事：
+//   * 「原生错」⟹ 仍然 FAIL；
+//   * 「ffprobe 是占位、原生是真名」⟹ 记为 allowedImprove（有上限），并用专门断言钉住。
+static bool tgIsPlaceholderTag(const std::string& s) {
+    if (s.empty()) return false;
+    size_t q = 0, other = 0;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = (unsigned char)s[i];
+        size_t len = c < 0x80 ? 1 : (c >> 5 == 0x6 ? 2 : (c >> 4 == 0xE ? 3 : (c >> 3 == 0x1E ? 4 : 1)));
+        if (len == 1) {
+            const char ch = s[i];
+            if (ch == '?') { ++q; ++i; continue; }
+            if (ch == ' ' || ch == '\t' || (ch >= '0' && ch <= '9')) { ++i; continue; }
+            ++other; ++i; continue;
+        }
+        // 全角问号 U+FF1F
+        if (len == 3 && i + 2 < s.size() && (unsigned char)s[i] == 0xEF &&
+            (unsigned char)s[i + 1] == 0xBC && (unsigned char)s[i + 2] == 0x9F) { ++q; i += 3; continue; }
+        ++other; i += len;
+    }
+    return q > 0 && other == 0;
+}
+static int g_allowedImprove = 0;
+
+// 两份索引的容错比较（2026-10-26，261025-02 #6）：除了 title 列里
+// 「ffprobe 是占位问号、原生是真名」这一类**已解释的改进**，其余必须逐字节相同。
+struct IndexCmp { bool same = true; int improve = 0; std::string why; };
+static IndexCmp cmpIndexWithPlaceholderImprove(const std::string& a, const std::string& b) {
+    IndexCmp r;
+    std::vector<std::string> la, lb;
+    auto split = [](const std::string& s, std::vector<std::string>& out) {
+        std::string cur;
+        for (char c : s) { if (c == '\n') { out.push_back(cur); cur.clear(); } else cur.push_back(c); }
+        if (!cur.empty()) out.push_back(cur);
+    };
+    split(a, la); split(b, lb);
+    if (la.size() != lb.size()) { r.same = false; r.why = "行数不同 " + std::to_string(la.size()) + "/" + std::to_string(lb.size()); return r; }
+    for (size_t i = 0; i < la.size(); ++i) {
+        if (la[i] == lb[i]) continue;
+        auto ca = la[i], cb = lb[i];
+        std::vector<std::string> fa, fb;
+        auto sp = [](const std::string& s, std::vector<std::string>& o) {
+            std::string cur; for (char c : s) { if (c == '\t') { o.push_back(cur); cur.clear(); } else cur.push_back(c); } o.push_back(cur);
+        };
+        sp(ca, fa); sp(cb, fb);
+        if (fa.size() != fb.size()) { r.same = false; r.why = "行 " + std::to_string(i) + " 列数不同"; return r; }
+        bool okLine = true;
+        for (size_t k = 0; k < fa.size(); ++k) {
+            if (fa[k] == fb[k]) continue;
+            // 3=album 4=albumArtist 5=artist 6=title：都是标签文本列，都可能出现"标签本身是问号"的文件
+            if (k >= 3 && k <= 6 && tgIsPlaceholderTag(fa[k]) && !tgIsPlaceholderTag(fb[k])) { ++r.improve; continue; }
+            okLine = false;
+            r.why = "行 " + std::to_string(i) + " 列 " + std::to_string(k) + " ff=[" + fa[k] + "] nat=[" + fb[k] + "]";
+            break;
+        }
+        if (!okLine) { r.same = false; return r; }
+    }
+    return r;
+}
 static AbResult abOne(const std::string& f) {
     AbResult r;
     setNative(false);
@@ -495,7 +556,14 @@ static AbResult abOne(const std::string& f) {
         rta::meta::native::probe_file(f, &tmp, &r.why);    // 只为拿到回退原因（会重复解析一次，可忽略）
     }
     auto eq = [&](const char* n, const std::string& a, const std::string& b) {
-        if (a != b) r.diffs.push_back(std::string(n) + " ff=[" + a + "] nat=[" + b + "]");
+        if (a == b) return;
+        // 允许的改进：ffprobe 拿到的是"全是问号"的占位标题，原生解析拿到了真名。
+        if (tgIsPlaceholderTag(a) && !b.empty() && !tgIsPlaceholderTag(b)) {
+            ++g_allowedImprove;
+            std::printf("       [IMPROVE] %s: ff 占位 -> nat=[%s]\n", n, b.c_str());
+            return;
+        }
+        r.diffs.push_back(std::string(n) + " ff=[" + a + "] nat=[" + b + "]");
     };
     eq("title", r.ff.title, r.nt.title);
     eq("artist", r.ff.artist, r.nt.artist);
@@ -1014,6 +1082,10 @@ static int abReal(const fs::path& root) {
     }
     ck(diffs == 0, "A/B：全部真实文件逐字段一致（含 hasCover / 位深 / 时长 ±1 帧）",
        std::to_string(diffs) + " 处不一致");
+    // 允许的改进要有上界：库里这类"标签本身是问号"的文件实测 16 个（本轮修好 6 个），
+    // 超过 24 说明出现了新一类差异，必须重新核对而不是当成"改进"放过（铁律 3）。
+    ck(g_allowedImprove <= 24, "A/B 里「ffprobe 占位 -> 原生真名」的改进数在预期内",
+       std::to_string(g_allowedImprove) + " 处（上限 24）");
     ck(compared >= 12, "A/B 覆盖的真实文件数 >= 12（理想 20：每类 5 个）", std::to_string(compared) + " 个");
     return compared;
 }
@@ -1121,10 +1193,9 @@ static void throughputAndRegression(const fs::path& root) {
     const fs::path idxFf = work / "lib_ffprobe" / "rlplayer-index.tsv";
     const fs::path idxNat = work / "lib_native" / "rlplayer-index.tsv";
     const std::string a = readAll(idxFf), b = readAll(idxNat);
-    ck(!a.empty() && a.size() == b.size(), "两次扫描的索引文件大小相同",
-       std::to_string(a.size()) + " / " + std::to_string(b.size()));
-    ck(a == b, "索引逐字节相同（曲目数/专辑数/所有字段/时长小数位）",
-       a == b ? "" : "首个差异位置 " + std::to_string(a.find_first_not_of(b)));
+    const IndexCmp ic = cmpIndexWithPlaceholderImprove(a, b);
+    ck(!a.empty(), "两次扫描都写出了索引（非空）", std::to_string(a.size()) + " / " + std::to_string(b.size()));
+    ck(ic.same, "索引与 ffprobe 路径一致（允许「占位问号 -> 真名」的已解释差异）", ic.why);
     // 另扫一遍「关掉原生通道」的增量扫描：应 0 次探测（缓存命中）
     {
         const fs::path lib = work / "lib_ffprobe";
@@ -1251,10 +1322,11 @@ static void wavSpecial(const fs::path& root) {
     const std::string b = readAll(libNat / "rlplayer-index.tsv");
     ck(nFf == nNat && nFf > 0, "MUSIC 两次全量扫描的曲目数相同（>0）",
        std::to_string(nFf) + "/" + std::to_string(nNat));
-    ck(!a.empty() && a.size() == b.size(), "MUSIC 索引文件大小相同",
+    const IndexCmp ic2 = cmpIndexWithPlaceholderImprove(a, b);
+    ck(!a.empty() && !b.empty(), "MUSIC 两次扫描都写出了索引",
        std::to_string(a.size()) + "/" + std::to_string(b.size()));
-    ck(a == b, "MUSIC 全库索引逐字节相同（RLPLAYER_NATIVE_TAGS=0/1）",
-       a == b ? "" : "首个差异位置 " + std::to_string(a.find_first_not_of(b)));
+    ck(ic2.same, "MUSIC 索引与 ffprobe 路径一致（允许「占位问号 -> 真名」，其余逐字节相同）",
+       std::to_string(ic2.improve) + " 处已解释差异 " + ic2.why);
     fs::remove_all(work, ec);
 }
 
