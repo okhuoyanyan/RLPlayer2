@@ -4065,8 +4065,14 @@ struct QueueState {
     std::mutex mtx;
     std::vector<QItem> items;
     size_t index = 0;
-    int    repeat = 0;      // 0=关 1=列表循环 2=单曲循环
-    bool   shuffle = false; // 随机播放
+    // ★ 2026-10-26（用户 261026-08 #2「循环/随机合并成一个按钮」）：
+    //   repeat 现在是**四态播放模式**，且是唯一真相源：
+    //     0=关闭循环（顺序播完停止） 1=专辑/列表循环 2=单曲循环 3=随机播放（打乱后循环）
+    //   shuffle 不再是"第二份真相"，它变成 (repeat==3) 的派生量（见 apply_play_mode_locked）。
+    //   为什么必须并成一个字段：旧实现是两个独立开关（/api/repeat + /api/shuffle），
+    //   能组合出 6 种状态，其中"随机+单曲"之类既无意义也让界面无法用一个图标表达。
+    int    repeat = 0;
+    bool   shuffle = false; // 派生量：== (repeat==3)。落盘仍写 shuffle= 行以兼容旧队列文件
     std::vector<QItem> base;   // 随机前的原始顺序（关掉随机时还原）
 };
 static QueueState g_q;
@@ -7055,6 +7061,57 @@ static void queue_load() {
         }
     }
     if (g_q.index >= g_q.items.size()) g_q.index = 0;
+    // 兼容旧落盘（2026-10-26）：老版本写的是 repeat(0..2) + 独立 shuffle。
+    //   shuffle=1 的老队列一律读成四态里的"随机"（3），否则会出现"随机开着但图标说关闭"。
+    if (g_q.repeat == 3) g_q.shuffle = true;
+    else if (g_q.shuffle) g_q.repeat = 3;
+}
+
+// ---- 队列项的一行文本 → QItem（queue_load 与具名保存队列共用同一套解析规则）----
+// 格式：<路径>[	<cs>	<ce>]；没有 TAB = 普通曲目（旧格式，逐字节兼容）。
+static QItem item_from_line(const std::string& rest) {
+    const size_t t1 = rest.find('	');
+    if (t1 == std::string::npos) return QItem(rest);
+    QItem it;
+    it.path = rest.substr(0, t1);
+    const size_t t2 = rest.find('	', t1 + 1);
+    it.cs = std::atof(rest.c_str() + t1 + 1);
+    if (t2 != std::string::npos) it.ce = std::atof(rest.c_str() + t2 + 1);
+    return it;
+}
+
+// ---------------- 播放模式（四态）----------------
+// 契约（前端唯一入口是 /api/playmode?mode=N，N 与 g_q.repeat 同一套编号）：
+//   0 = 关闭循环（顺序播完停止）
+//   1 = 专辑/列表循环
+//   2 = 单曲循环
+//   3 = 随机播放（把队列打乱后循环；关掉时还原打乱前的原顺序）
+// 调用方**必须持有 g_q.mtx**（名字里的 _locked 就是这个意思）。
+// 为什么合并：见 QueueState::repeat 的注释 —— 两个开关能组合出 6 态，用户每次都要猜，
+// 而且"只改图标不改行为"是最容易骗自己的改法，所以入口收敛到这一个函数。
+static void apply_play_mode_locked(int mode) {
+    if (mode < 0 || mode > 3) mode = 0;
+    // 记住"正在播的那首"：重排后 index 必须仍然指向它，否则一按随机就跳歌。
+    // 记整项而不是只记路径 —— cue 专辑里同一路径有 N 项，只按路径还原会永远跳到第 1 首。
+    const QItem cur = (g_q.index < g_q.items.size()) ? g_q.items[g_q.index] : QItem();
+    const bool want = (mode == 3);
+    if (want && !g_q.shuffle) {
+        g_q.base = g_q.items;                     // 保存原顺序，退出随机时还原
+        if (g_q.items.size() > 1) {
+            std::mt19937 rng((unsigned)GetTickCount64());
+            std::shuffle(g_q.items.begin(), g_q.items.end(), rng);
+        }
+    } else if (!want && g_q.shuffle) {
+        if (!g_q.base.empty()) g_q.items = g_q.base;   // 还原原始顺序
+        g_q.base.clear();
+    }
+    g_q.repeat = mode;
+    g_q.shuffle = want;
+    if (!cur.path.empty()) {
+        for (size_t i = 0; i < g_q.items.size(); ++i)
+            if (g_q.items[i].same(cur)) { g_q.index = i; break; }
+    }
+    if (g_q.index >= g_q.items.size()) g_q.index = g_q.items.empty() ? 0 : g_q.items.size() - 1;
 }
 
 // ---- 预解码槽：当前曲播放的同时，后台把下一曲解码进内存 ----
@@ -7137,7 +7194,8 @@ static void queue_thread(PlayParams p, size_t start) {
             std::lock_guard<std::mutex> lk(g_q.mtx);
             if (g_q.items.empty()) break;
             if (idx >= g_q.items.size()) {
-                if (g_q.repeat == 1) idx = 0;
+                // 1=列表循环 / 3=随机（打乱后循环）：到底都回到第 0 项。
+                if (g_q.repeat == 1 || g_q.repeat == 3) idx = 0;
                 else break;
             }
             cur = g_q.items[idx];
@@ -7190,7 +7248,7 @@ static void queue_thread(PlayParams p, size_t start) {
         std::lock_guard<std::mutex> lk(g_q.mtx);
         if (g_q.repeat == 2) continue;                     // 单曲循环
         if (idx + 1 < g_q.items.size()) { idx += 1; continue; }
-        if (g_q.repeat == 1) { idx = 0; continue; }
+        if (g_q.repeat == 1 || g_q.repeat == 3) { idx = 0; continue; }   // 列表循环 / 随机
         break;
     }
     ps.playing = false;
@@ -9515,14 +9573,44 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         ct = "application/json; charset=utf-8";
         fav_load_if_needed();
         if (rq.path.rfind("/api/fav/list", 0) == 0) {
-            std::lock_guard<std::mutex> lk(g_favMu);
+            // ?meta=1（用户 261026-08 #5）：多回一份 title/artist/album/dur，供「我的最爱」页显示。
+            // 不带 meta 时**逐字节保持旧契约**（纯路径字符串数组），老调用点/老脚本零影响。
+            const bool wantMeta = rq.path.find("meta=1") != std::string::npos;
+            std::vector<std::string> files;
+            { std::lock_guard<std::mutex> lk(g_favMu); files.assign(g_favFiles.begin(), g_favFiles.end()); }
+
+            // 元数据只从**库索引**取（已扫过的曲目才有），绝不逐首 ffprobe：
+            // /api/fav/list 可能几百首，而 WebUi 是单线程阻塞 accept，逐个探活会把整站卡住
+            // （本文件 /api/artist/prefetch 那段注释记的就是同一个坑）。库里没有的由前端退回文件名。
+            std::map<std::string, rta::net::LibTrack> meta;
+            if (wantMeta && !files.empty()) {
+                std::set<std::string> want;
+                for (const auto& f : files) want.insert(rta::net::lib_path_key(f));
+                auto& lib = rta::net::Library::instance();
+                const size_t n = lib.trackCount();
+                for (size_t i = 0; i < n; ++i) {
+                    rta::net::LibTrack t;
+                    if (!lib.trackAt(i, t)) continue;
+                    const std::string k = rta::net::lib_path_key(t.path);
+                    if (want.count(k)) meta[k] = t;
+                }
+            }
             std::ostringstream j;
             j << "{\"ok\":true,\"files\":[";
             bool first = true;
-            for (const auto& f : g_favFiles) {
+            for (const auto& f : files) {
                 if (!first) j << ",";
                 first = false;
-                j << "\"" << jesc(f) << "\"";
+                if (!wantMeta) { j << "\"" << jesc(f) << "\""; continue; }
+                const auto it = meta.find(rta::net::lib_path_key(f));
+                j << "{\"file\":\"" << jesc(f) << "\"";
+                if (it != meta.end()) {
+                    j << ",\"title\":\"" << jesc(it->second.title) << "\""
+                      << ",\"artist\":\"" << jesc(it->second.artist) << "\""
+                      << ",\"album\":\"" << jesc(it->second.album) << "\""
+                      << ",\"dur\":" << it->second.duration;
+                }
+                j << "}";
             }
             j << "]}";
             return j.str();
@@ -10285,35 +10373,104 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return std::string(bytes.begin(), bytes.end());
     }
 
+    // ---------------- 播放模式（四态；用户 261026-08 #2）----------------
+    // POST /api/playmode?mode=0..3 （body 里给 mode= 也认）：
+    //   0=关闭循环（顺序播完停止） 1=专辑/列表循环 2=单曲循环 3=随机播放（打乱后循环）
+    // 一个端点写一个字段（g_q.repeat），图标与行为不可能再分叉 —— 这就是本项需求的核心。
+    // 不带 mode 时只回报当前状态（只读语义，给自检/脚本用）。
+    if (rq.path.rfind("/api/playmode", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        int mode = -1;
+        auto gv = [&](const char* key) -> int {
+            const std::string k = std::string(key) + "=";
+            size_t p = rq.path.find("?" + k);
+            if (p != std::string::npos) return atoi(rq.path.c_str() + p + 1 + k.size());
+            if (!rq.body.empty()) {
+                std::istringstream is(rq.body);
+                std::string tok;
+                while (std::getline(is, tok, '&')) {
+                    const size_t e = tok.find('=');
+                    if (e == std::string::npos) continue;
+                    if (urlDecode(tok.substr(0, e)) == key) return atoi(urlDecode(tok.substr(e + 1)).c_str());
+                }
+            }
+            return -1;
+        };
+        mode = gv("mode");
+        int cur = 0;
+        bool shuf = false;
+        {
+            std::lock_guard<std::mutex> lk(g_q.mtx);
+            if (mode >= 0) apply_play_mode_locked(mode);
+            cur = g_q.repeat;
+            shuf = g_q.shuffle;
+        }
+        if (mode >= 0) queue_save();
+        std::ostringstream j;
+        j << "{\"ok\":true,\"mode\":" << cur << ",\"repeat\":" << cur
+          << ",\"shuffle\":" << (shuf ? "true" : "false") << "}";
+        return j.str();
+    }
+    // /api/shuffle：保留给老前端/老脚本，但**语义收敛为四态模式的别名**
+    //   on=1 → 模式 3（随机）；on=0 → 从随机退回模式 1（列表循环）。
+    //   不再允许"随机 + 单曲"这种第五、第六种组合（那正是两处真相打架的来源）。
     if (rq.path.rfind("/api/shuffle", 0) == 0) {
         ct = "application/json; charset=utf-8";
         int on = 1;
         const size_t q = rq.path.find("?on=");
         if (q != std::string::npos) on = atoi(rq.path.c_str() + q + 4);
+        int mode = 0;
         {
             std::lock_guard<std::mutex> lk(g_q.mtx);
-            // 记住"正在播的那首"，重排后要让 index 仍然指向它，
-            // 否则一按随机就会跳歌（这是最容易被用户当成 bug 的细节）
-            // 记住整项（不是只记路径）：cue 专辑里同一路径有 N 项，只按路径还原会跳到第 1 首
-            const QItem cur = (g_q.index < g_q.items.size()) ? g_q.items[g_q.index] : QItem();
-            const bool want = (on != 0);
-            if (want && !g_q.shuffle) {
-                g_q.base = g_q.items;                 // 保存原顺序，关掉时能还原
-                if (g_q.items.size() > 1) {
-                    std::mt19937 rng((unsigned)GetTickCount64());
-                    std::shuffle(g_q.items.begin(), g_q.items.end(), rng);
-                }
-            } else if (!want && g_q.shuffle) {
-                if (!g_q.base.empty()) g_q.items = g_q.base;   // 还原原始顺序
-            }
-            g_q.shuffle = want;
-            if (!cur.path.empty()) {
-                for (size_t i = 0; i < g_q.items.size(); ++i)
-                    if (g_q.items[i].same(cur)) { g_q.index = i; break; }
-            }
+            mode = on ? 3 : (g_q.repeat == 3 ? 1 : g_q.repeat);
+            apply_play_mode_locked(mode);
         }
         queue_save();
-        return std::string("{\"ok\":true,\"shuffle\":") + (on ? "true" : "false") + "}";
+        std::ostringstream j;
+        j << "{\"ok\":true,\"shuffle\":" << (mode == 3 ? "true" : "false")
+          << ",\"mode\":" << mode << ",\"repeat\":" << mode << "}";
+        return j.str();
+    }
+    // ---------------- 整列替换队列（#5 播放全部 / 具名队列播放共用）----------------
+    // POST /api/queue/set  body: files=<urlencoded>
+ 每行一项：<路径>[<TAB>cs<TAB>ce]
+    // 为什么要一个"整列替换"：先 /api/clear 再 N 次 /api/add 会留下中间态
+    // （播放线程可能抢到空队列/半截队列），而"播放全部"必须一次到位。
+    if (rq.path.rfind("/api/queue/set", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        std::string files;
+        {
+            std::istringstream is(rq.body);
+            std::string tok;
+            while (std::getline(is, tok, '&')) {
+                const size_t e = tok.find('=');
+                if (e == std::string::npos) continue;
+                if (urlDecode(tok.substr(0, e)) == "files") files = urlDecode(tok.substr(e + 1));
+            }
+        }
+        std::vector<QItem> items;
+        {
+            std::istringstream ls(files);
+            std::string line;
+            while (std::getline(ls, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty()) continue;
+                items.push_back(item_from_line(line));
+            }
+        }
+        if (items.empty()) return "{\"ok\":false,\"error\":\"曲目列表为空\"}";
+        for (const auto& it : items)
+            if (!valid_utf8(it.path)) return utf8_path_reject(it.path);   // F1
+        size_t cnt = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_q.mtx);
+            g_q.items = std::move(items);
+            g_q.index = 0;
+            g_q.base.clear();
+            cnt = g_q.items.size();
+        }
+        queue_save();
+        return "{\"ok\":true,\"count\":" + std::to_string(cnt) + "}";
     }
     if (rq.path.rfind("/api/queue", 0) == 0) {
         ct = "application/json; charset=utf-8";
@@ -10321,6 +10478,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         std::ostringstream j;
         j << "{\"ok\":true,\"index\":" << g_q.index
           << ",\"repeat\":" << g_q.repeat
+          // #2：repeat 就是四态播放模式（0关/1列表/2单曲/3随机），别名 mode 让前端只读一个字段
+          << ",\"mode\":" << g_q.repeat
           << ",\"shuffle\":" << (g_q.shuffle ? "true" : "false") << ",\"items\":[";
         for (size_t i = 0; i < g_q.items.size(); ++i) {
             if (i) j << ",";
@@ -10357,17 +10516,24 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return "{\"ok\":true}";
     }
 
+    // /api/repeat：老入口，参数名沿用 rate=（= 模式号），语义与 /api/playmode 完全一致。
+    // 现在允许 rate=0..3（3 = 随机），并把 shuffle 一起收敛（唯一真相源 = g_q.repeat）。
     if (rq.path.rfind("/api/repeat", 0) == 0) {
         ct = "application/json; charset=utf-8";
         PlayParams p = parseForm(rq.body);
         int mode = atoi(p.rate.c_str());
-        if (mode < 0 || mode > 2) mode = 0;
+        if (mode < 0 || mode > 3) mode = 0;
+        bool shuf = false;
         {
             std::lock_guard<std::mutex> lk(g_q.mtx);
-            g_q.repeat = mode;
+            apply_play_mode_locked(mode);
+            shuf = g_q.shuffle;
         }
         queue_save();
-        return std::string("{\"ok\":true,\"repeat\":") + std::to_string(mode) + "}";
+        std::ostringstream j;
+        j << "{\"ok\":true,\"repeat\":" << mode << ",\"mode\":" << mode
+          << ",\"shuffle\":" << (shuf ? "true" : "false") << "}";
+        return j.str();
     }
 
     if (rq.path.rfind("/api/skip", 0) == 0) {
