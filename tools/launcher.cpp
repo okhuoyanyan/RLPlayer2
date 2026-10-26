@@ -95,6 +95,12 @@ static bool port_open(int port) {
 
 // 探一次 /api/ping，判断这个端口上跑的是不是本程序的服务。
 // 只看"端口通不通"会把任何监听者都当成自己。
+// 2026-10-26（261026-04 真机根因）：探测已有实例时必须**连版本一起比对**。
+// 旧行为只看"有 RLPlayer 在响应"就接管界面 ⟹ 新版 launcher 会去接管旧版服务，
+// 用户装了 1.5.2 却看到 1.5.1 的界面（296 张专辑、满屏问号，改动"全都没生效"）。
+// 现在：探测到的版本 ≠ 本程序版本 ⟹ 视为"别人的实例"，不接管，自己起一个。
+static std::string g_probeVersion;   // probe_app 成功时填该实例上报的 version
+
 static bool probe_app(int port) {
     SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return false;
@@ -117,7 +123,15 @@ static bool probe_app(int port) {
         if (resp.size() > 4096) break;
     }
     ::closesocket(s);
-    return resp.find("RLPlayer") != std::string::npos;
+    if (resp.find("RLPlayer") == std::string::npos) return false;
+    // 取 "version":"x.y.z"
+    const std::string key = "\"version\":\"";
+    const size_t k = resp.find(key);
+    if (k == std::string::npos) { g_probeVersion.clear(); return true; }
+    const size_t vs = k + key.size();
+    const size_t ve = resp.find('"', vs);
+    g_probeVersion = (ve == std::string::npos) ? std::string() : resp.substr(vs, ve - vs);
+    return true;
 }
 
 static std::wstring exe_dir() {
@@ -1506,6 +1520,18 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     for (int p = kDefaultPort; p < kDefaultPort + 12; ++p) {
         if (!port_open(p)) continue;
         if (!probe_app(p)) { logf(L"端口 %d 被别的程序占用，跳过", p); continue; }
+        // 2026-10-26（261026-04 真机根因）：版本不一致就不接管。
+        // 现场：用户开着 1.5.1（占 8899），再点 1.5.2 → 旧逻辑"接管界面"，
+        // 于是 1.5.2 的 launcher 打开的是 1.5.1 的页面（296 张专辑、满屏问号），
+        // 用户看到的全是旧版本，误判"新版本什么都没改"。
+        {
+            const std::string mine(RLPLAYER_VERSION);
+            if (!g_probeVersion.empty() && g_probeVersion != mine) {
+                logf(L"端口 %d 上是另一版本（%hs），本程序是 %hs：不接管，改起自己的实例", p, g_probeVersion.c_str(), mine.c_str());
+                continue;
+            }
+            if (g_probeVersion.empty()) logf(L"端口 %d 的实例没上报版本：按旧行为接管", p);
+        }
         // 服务已经在跑：接管界面即可，但【仍然常驻】—— 托盘和主题监听都在这里。
         // 早先这里直接 return 0，于是第二次双击只会开个窗口、没有托盘，主题也不会跟着变。
         logf(L"发现已有实例在 %d，接管界面", p);

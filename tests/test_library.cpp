@@ -339,7 +339,7 @@ int main() {
         }
         ck(healed == 4, "老索引经增量扫描自愈：4 首盒装曲目重新拿到 album/disc", std::to_string(healed));
         const std::string idx2 = readAll(idxFile);
-        ck(idx2.find("BoxSetAlbum") != std::string::npos && idx2.find("#libIndexV\t4") != std::string::npos,
+        ck(idx2.find("BoxSetAlbum") != std::string::npos && idx2.find("#libIndexV\t5") != std::string::npos,
            "自愈结果已重新落盘（版本头是 v4）");
     }
 
@@ -624,7 +624,7 @@ int main() {
             readIdx(libA, idxA);
             ck(!idxA.empty(), "v4 索引已落盘");
             const std::string textA = readAll(idxA);
-            ck(textA.find("#libIndexV\t4") != std::string::npos, "落盘版本头 = #libIndexV 4");
+            ck(textA.find("#libIndexV\t5") != std::string::npos, "落盘版本头 = #libIndexV 5（2026-10-26 升版：标签修复 + 专辑归并）");
             std::string headA;
             std::vector<std::vector<std::string>> rowsA;
             {

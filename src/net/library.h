@@ -97,6 +97,16 @@ struct LibCoverTerm {
     std::string term;     // 已拼好的搜索词："名 艺术家"，艺术家为空时只有名
 };
 
+// API 补图（2026-10-26）：「专辑键 → 名 + 艺术家 + 前 N 首曲名」。
+// 为什么还要曲名：同人自出版碟（例：东方同人 VOL.2）的**专辑名**太泛，公开网页上搜不到；
+// 只有曲名能把模型见过的那张碟钉住。缺了它，模型只能瞎猜 —— 猜出来的错图比空白更糟。
+struct LibApiCoverTerm {
+    std::string key;                     // 专辑键（与 /api/lib/cover?k= 同一个）
+    std::string name;                    // 专辑名（成品口径，与 /api/lib/albums 显示的一致）
+    std::string artist;                  // 专辑艺术家（albumArtist 优先，退回 artist；可能为空）
+    std::vector<std::string> titles;     // 前 N 首曲名（按 disc/track 顺序；空标题跳过）
+};
+
 // addRoot 的完整结果：ok=false 时 why 是人话原因（HTTP 层原样回给 UI，别只说"目录不存在"）
 struct addRootResult { bool ok = false; std::string why; };
 
@@ -198,6 +208,8 @@ public:
     double lastScanMs() const { return lastScanMs_.load(); }
     int lastScanProbed() const { return lastScanProbed_.load(); }
     int lastScanCached() const { return lastScanCached_.load(); }
+    // 2026-10-26：索引是否需要重新解析标签（v5 之前写的索引）。启动时用它决定要不要自动扫一次。
+    bool indexNeedsRetag() const { return idxHasHeader && !idxIsV5; }
 
     // ---- 查询 ----
     std::vector<LibAlbum> albums() const {
@@ -230,6 +242,14 @@ public:
     // ② 单张反查：按 key 取回专辑名/艺术家/搜索词。key 不在库里返回 false。
     bool albumCoverTerm(const std::string& key, LibCoverTerm& out) const;
 
+    // ---- API 补图用的「元数据包」反查（2026-10-26）----
+    // 与上面两个同一口径（无封面 = hasCover=0），只是多带前 N 首曲名；
+    // 只读、不落盘、不改索引。目录 IO（缓存 stat）仍由调用方做。
+    std::vector<LibApiCoverTerm> albumsWithoutCoverTitles(size_t maxTitles = 3) const;
+    bool albumCoverTermTitles(const std::string& key, size_t maxTitles, LibApiCoverTerm& out) const;
+    // 艺术家 → 其专辑名（去重，最多 maxAlbums 张；名字**精确**匹配库里的 artist 口径）。
+    std::vector<std::string> artistAlbumNames(const std::string& artist, size_t maxAlbums = 6) const;
+
     // ---- 扫描 ----
     void load();            // 读配置与索引
     void startScan(bool forceFull = false);
@@ -256,6 +276,13 @@ private:
     Library() = default;
 
     void saveRootsLocked();
+    // 2026-10-26：升级迁移记录（首次启动沿用旧版本目录的库根时置位，用于日志与 UI 提示）
+    mutable bool confMigrated_ = false;
+    // 2026-10-26：索引版本标记。idxIsV5=false 且确有版本头 ⟹ 旧索引，标签必须重探（否则修复永远不生效）。
+    bool idxIsV5 = false;
+    bool idxIsV4 = false;
+    bool idxHasHeader = false;
+    mutable std::string confMigratedFrom_;
     void saveIndexLocked();
     std::string indexTextLocked() const;          // 持锁只做内存序列化（写盘放到锁外）
     LibCleanResult pruneMissingLocked();          // 扫描线程内部用：调用方已持锁 */
@@ -812,9 +839,20 @@ inline std::string Library::libDataDir() {
 // 为什么不再共用一份：自检沙箱（8907/8908/8911）会写自己的库根与索引，共用会把用户库覆盖成空
 // （1.3.x「升级后曲库变空」的另一半原因）。端口从 RLPLAYER_PORT 取（rtaweb 启动时设置）。
 inline std::string Library::confLeaf(const char* base) {
+    // ★ 2026-10-26（261026-04 真机根因）：旧规则「非 8899 端口就加 .p<port>」把**用户数据切成多套**：
+    //   默认端口被占（例如还开着上一版实例）→ rtaweb 换端口启动 → 读写另一份 conf/索引 →
+    //   用户看到「曲库变空 / 296 张旧卡片 / 改动全不生效」。
+    // 新规则：**只有显式隔离才加后缀** ——
+    //   ① RLPLAYER_LIBRARY_DIR 已设置（自检沙箱、测试脚本都走这条）；
+    //   ② 显式 RLPLAYER_ISOLATE=1。
+    //   正常启动即使换了端口，也一律用主库，绝不再因为端口不同而分裂数据。
     const std::string port = lib_env_utf8(L"RLPLAYER_PORT", "RLPLAYER_PORT");
     std::string name(base);
-    if (!port.empty() && port != "8899") name += ".p" + port;
+    // RLPLAYER_LIBRARY_DIR 本身就已经是隔离目录 ⟹ 用不带后缀的文件名（测试脚本/沙箱都按这个名字准备数据）。
+    // 只有「同一个目录里并行跑多个端口」这种极端场景，才用 RLPLAYER_ISOLATE=1 显式要求按端口再分一份。
+    const bool hasDir = !lib_env_utf8(L"RLPLAYER_LIBRARY_DIR", "RLPLAYER_LIBRARY_DIR").empty();
+    const bool multiInstance = lib_env_utf8(L"RLPLAYER_ISOLATE", "RLPLAYER_ISOLATE") == std::string("1");
+    if (!hasDir && multiInstance && !port.empty() && port != "8899") name += ".p" + port;
     return name;
 }
 inline std::string Library::confPath() {
@@ -881,6 +919,60 @@ inline void Library::load() {
             } else line += conf[i];
         }
         if (roots_.empty()) {
+            // ★ 2026-10-26（261026-04 真机根因之四）：升级迁移。
+            // 新版本解压到新目录后没有 conf，旧版本目录里却有用户的库根 ——
+            // 若不做迁移，用户升级后看到的是"空库/4 张"，会觉得新版本什么都没了。
+            // 依次在 exe 同级、上级、以及上级目录下其它 RLPlayer-* 目录里找 conf，找到就沿用。
+            {
+                std::vector<std::string> dirs;
+                const std::string self = libDataDir();
+                auto parentOf = [](std::string s) {
+                    while (!s.empty() && (s.back() == '\\' || s.back() == '/')) s.pop_back();
+                    const size_t k = s.find_last_of("\\/");
+                    return (k == std::string::npos) ? std::string() : s.substr(0, k);
+                };
+                const std::string up1 = parentOf(self);
+                const std::string up2 = parentOf(up1);
+                if (!up1.empty()) { dirs.push_back(up1); dirs.push_back(up1 + "\\data"); }
+                if (!up2.empty()) dirs.push_back(up2);
+                // 扫 dist 下其它版本目录（最多 40 个，按名字倒序 = 版本从新到旧）
+                std::error_code ec2;
+                if (!up2.empty()) {
+                    std::vector<std::string> vers;
+                    for (auto it = fsx::directory_iterator(p8(up2), ec2);
+                         !ec2 && it != fsx::directory_iterator(); it.increment(ec2)) {
+                        const std::string nm = u8s(it->path().filename().u8string());
+                        if (nm.rfind("RLPlayer-", 0) == 0) vers.push_back(u8s(it->path().u8string()));
+                    }
+                    std::sort(vers.begin(), vers.end(), std::greater<std::string>());
+                    if (vers.size() > 40) vers.resize(40);
+                    for (auto& v : vers) { dirs.push_back(v); dirs.push_back(v + "\\data"); }
+                }
+                std::fprintf(stderr, "LIBROOTMIG self=[%s] candidates=%zu\n", self.c_str(), dirs.size());
+                for (const auto& d : dirs) {
+                    if (d == self) continue;
+                    const std::string cf = d + "\\rlplayer-library.conf";
+                    std::error_code ec;
+                    if (!fsx::exists(p8(cf), ec)) continue;
+                    std::string other = readFile(cf);
+                    if (other.size() >= 3 && (unsigned char)other[0] == 0xEF) other = other.substr(3);
+                    std::string ln;
+                    for (size_t i = 0; i <= other.size(); ++i) {
+                        if (i == other.size() || other[i] == '\n') {
+                            while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ')) ln.pop_back();
+                            if (!ln.empty() && ln[0] != '#') roots_.push_back(ln);
+                            ln.clear();
+                        } else ln += other[i];
+                    }
+                    if (!roots_.empty()) {
+                        confMigrated_ = true;
+                        confMigratedFrom_ = cf;
+                        break;
+                    }
+                }
+            }
+        }
+        if (roots_.empty()) {
             // 首次运行：探一遍常见位置，别一打开就是空的（HQPlayer 被诟病的就是这个）
             std::vector<std::string> cands;
             const std::string up = lib_env_utf8(L"USERPROFILE", "USERPROFILE");   // 同上：不能只信 getenv（中文用户名）
@@ -914,8 +1006,23 @@ inline void Library::load() {
     // （增量扫描按 mtime+size 复用旧记录，而 cue 文件本身不在旧记录里）。代价：升级后首次启动
     // 全量扫一遍（653 首约 10 秒）。
     {
-        const bool fresh = (idx.find("#libIndexV\t4") != std::string::npos);
-        if (!fresh && !idx.empty()) idx.clear();
+        // 2026-10-26（261026-04）升到 v5：本轮改了两件会影响**已落盘字段**的事 ——
+        //   ① 标签占位修复（R1/R1b/R3 会改 title/artist/album 的值）；
+        //   ② 专辑分组口径（键 = 专辑名 + 目录，不再含 artist）。
+        // v4 索引里存的是旧解析器写下的旧值，且版本号没变 ⟹ 会被原样复用，
+        // 于是"代码改了、界面不变"（实机证据：1.5.2 包扫同一份 MUSIC 全新库是 181 张，
+        // 而用户机器上仍是 296 张、满屏问号）。规则：口径一变就升版本，让旧索引整份作废。
+        // 代价：升级后首次启动全量重扫一次（659 首约 0.8 s，8 线程）。
+        // v5 = 2026-10-26：标签占位修复 + 专辑归并口径。**低版本索引不再整份丢弃**，
+        //      而是「读路径/mtime/size，但标签必须重探」（见 startScan 里的 forceRetag）。
+        //      为什么不丢弃：整份丢弃会让「用户的库结构」也一起没了（真机踩到：升级后曲库变空/只剩 4 首）。
+        idxIsV5 = (idx.find("#libIndexV\t5") != std::string::npos);
+        idxHasHeader = (idx.find("#libIndexV\t") != std::string::npos);
+        idxIsV4 = (idx.find("#libIndexV\t4") != std::string::npos);
+        // v3 及更早：**整份丢弃**（沿用既有铁律）。
+        // 为什么 v3 不能像 v4 那样"只重探标签"：v3 里存在 40 分钟的"整轨曲目"记录，
+        // 一旦被复用，CUE 分轨永远不生效（测试 [v3 索引被整份丢弃] 就是守这条）。
+        if (!idx.empty() && !idxIsV5 && !idxIsV4) idx.clear();
     }
     std::vector<LibTrack> loaded;
     if (!idx.empty()) {
@@ -1011,7 +1118,7 @@ inline std::string Library::indexTextLocked() const {
     // v3 = 2026-10-23 起「音频流字段不再被封面流覆盖」(24-bit 不再变 8)
     // v4 = 2026-10-25 起 CUE 虚拟分轨：**前 16 列逐字不变**，末尾追加 cue / cueN / cueOff / cueLen。
     //      为什么追加而不是插列：老读取路径（含用户手里 v3 索引）只看前 16 列，列序不动才不会串列。
-    s += "#libIndexV\t4\n";
+    s += "#libIndexV\t5\n";
     s += "#path\tmtime\tsize\talbum\talbumArtist\tartist\ttitle\ttrack\tdisc\tyear\tsr\tbits\tch\tdur\thasCover\tgenre"
          "\tcue\tcueN\tcueOff\tcueLen\n";
     char buf[256];
@@ -1242,6 +1349,64 @@ inline bool Library::albumCoverTerm(const std::string& key, LibCoverTerm& out) c
         return true;
     }
     return false;
+}
+
+// ---------------- API 补图：元数据包反查（2026-10-26）----------------
+// 调用方已持锁时用：取 a.idx 里前 maxTitles 个**非空**曲名（idx 已按 disc/track 排好）。
+inline void lib_api_titles_locked(const std::vector<LibTrack>& tr, const LibAlbum& a,
+                                 size_t maxTitles, std::vector<std::string>& out) {
+    out.clear();
+    if (maxTitles == 0) return;
+    for (size_t ix : a.idx) {
+        if (out.size() >= maxTitles) break;
+        if (ix >= tr.size()) continue;
+        if (!tr[ix].title.empty()) out.push_back(tr[ix].title);
+    }
+}
+
+inline std::vector<LibApiCoverTerm> Library::albumsWithoutCoverTitles(size_t maxTitles) const {
+    std::vector<LibApiCoverTerm> out;
+    std::lock_guard<std::mutex> lk(mtx_);
+    const auto& v = albumVecLocked();
+    out.reserve(v.size());
+    for (const auto& a : v) {
+        if (a.hasCover) continue;                  // 库里已有图：与 albumsWithoutCover() 同一判据
+        LibApiCoverTerm t;
+        t.key = a.key; t.name = a.name; t.artist = a.artist;
+        lib_api_titles_locked(tracks_, a, maxTitles, t.titles);
+        out.push_back(std::move(t));
+    }
+    return out;
+}
+
+inline bool Library::albumCoverTermTitles(const std::string& key, size_t maxTitles,
+                                         LibApiCoverTerm& out) const {
+    if (key.empty()) return false;
+    std::lock_guard<std::mutex> lk(mtx_);
+    for (const auto& a : albumVecLocked()) {
+        if (a.key != key) continue;
+        out.key = a.key; out.name = a.name; out.artist = a.artist;
+        lib_api_titles_locked(tracks_, a, maxTitles, out.titles);
+        return true;
+    }
+    return false;
+}
+
+inline std::vector<std::string> Library::artistAlbumNames(const std::string& artist,
+                                                         size_t maxAlbums) const {
+    std::vector<std::string> out;
+    if (artist.empty() || maxAlbums == 0) return out;
+    std::lock_guard<std::mutex> lk(mtx_);
+    for (const auto& a : albumVecLocked()) {
+        if (a.artist != artist) continue;
+        if (a.name.empty()) continue;
+        bool dup = false;
+        for (const auto& s : out) if (s == a.name) { dup = true; break; }
+        if (dup) continue;
+        out.push_back(a.name);
+        if (out.size() >= maxAlbums) break;
+    }
+    return out;
 }
 
 inline void Library::joinScan() {
@@ -1513,7 +1678,10 @@ inline void Library::startScan(bool forceFull) {
                 //   结论：探测失败的自愈留在**源头**（探测失败时 sr/bits/ch/dur 如实写 0，
                 //   不写"看起来有效"的值）；索引侧保证的是"列出的是什么就是什么"。
                 //   索引一致性真正修掉的三条见 lib_probe [3][4][5] 的说明。
-                if (!forceFull && oit != oldByPath.end()) {
+                // 2026-10-26：旧版本索引（v4 及更早）里的标签是旧解析器写的，必须重探；
+                // 现代价只有一次（655 首约 1 s），换来标签修复与专辑归并真正生效。
+                const bool retagOld = idxIsV4;   // 只有 v4 需要"留结构、重探标签"；v5 直接复用，v3 已整份丢弃
+                if (!forceFull && !retagOld && oit != oldByPath.end()) {
                     const LibTrack& o = old[oit->second];
                     if (!o.isCueTrack() && o.mtime == mt && o.size == sz) {
                         // 复用旧记录，但仍要过一遍目录回填：老代码写的索引版本头也是 v3，但 album 列空、

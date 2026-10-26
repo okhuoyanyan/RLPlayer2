@@ -1232,14 +1232,99 @@ function enqueueAlbum(k) {
   });
 }
 
+/* ---------------- 艺术家头像（2026-10-26 261026-01 #1） ----------------
+   后端现状（tools/rtaweb.cpp）：
+     GET  /api/artist/image?name=<名>   只读磁盘缓存（artistimg\<fnv16>.jpg），**零网络**；未命中 404。
+     POST /api/artist/prefetch          进后台预热（返回 {ok,queued,requested,running}）。
+   ★ prefetch **没有 progress 端点** ⟹ 「头像补齐中 X/Y」里的 X/Y 只能由前端自己数：
+     X = 已成功加载的 <img> 数，Y = 本页艺术家数。失败的图按批重放（服务器只查磁盘缓存，
+     重放=本地零网络，只是让刚预热好的图顶上来）。这与封面那套 /api/lib/cover/progress
+     轮询同构，只是数据源换成了 img 的 load 事件。 */
+function artistImgUrl(name, round) {
+  return '/api/artist/image?name=' + encodeURIComponent(name) + (round ? ('&r=' + round) : '');
+}
+// 低饱和圆形占位里的图标：音符（24px；详情页头像更大，传 44）
+function artistNoteSvg(size) {
+  return '<svg width=' + size + ' height=' + size + ' viewBox="0 0 24 24" fill=none stroke=currentColor' +
+         ' stroke-width=1.6 stroke-linecap=round stroke-linejoin=round aria-hidden=true>' +
+         '<path d="M9 17.5V5.6l9-1.7v11.6"/><circle cx="6.6" cy="17.6" r="2.5"/><circle cx="15.6" cy="15.6" r="2.5"/></svg>';
+}
+var ARTAV = { timer: 0, round: 0, total: 0, done: 0, queued: 0, stopped: false };
+function artaStop() {
+  if (ARTAV.timer) { clearInterval(ARTAV.timer); ARTAV.timer = 0; }
+  ARTAV.round = 0; ARTAV.total = 0; ARTAV.done = 0; ARTAV.queued = 0; ARTAV.stopped = false;
+}
+function artaRender() {
+  var box = D('artProgWrap');
+  if (!box) return;
+  if (!ARTAV.total) { box.innerHTML = ''; return; }
+  var pct = Math.round(ARTAV.done / ARTAV.total * 100);
+  // 三种措辞：还在轮询 → 补齐中；全部到位 → 已补齐；轮询停了但仍有缺图 → 如实说"其余暂无图源"
+  //（绝不写"已补齐 X/Y"来掩盖缺的图 —— 铁律 4）
+  var txt = (ARTAV.done >= ARTAV.total)
+    ? ('头像已补齐 ' + ARTAV.done + ' / ' + ARTAV.total + ' 位')
+    : (ARTAV.stopped
+        ? ('头像已有 ' + ARTAV.done + ' / ' + ARTAV.total + ' 位（其余暂无图源）')
+        : ('头像补齐中 ' + ARTAV.done + ' / ' + ARTAV.total + ' 位'));
+  box.innerHTML = '<div class=albprog><span class=t>' + esc(txt) + '</span>' +
+                  '<span class=bar><i style="width:' + pct + '%"></i></span></div>';
+}
+function artaBind() {
+  var imgs = document.querySelectorAll('#list .card .acv img');
+  ARTAV.total = imgs.length;
+  ARTAV.done = 0;
+  Array.prototype.forEach.call(imgs, function (im) {
+    im.onload = function () {
+      if (im.classList.contains('ok')) return;
+      im.classList.add('ok');
+      im.classList.remove('err');
+      ARTAV.done++;
+      artaRender();
+      if (ARTAV.done >= ARTAV.total && ARTAV.timer) { clearInterval(ARTAV.timer); ARTAV.timer = 0; }
+    };
+    im.onerror = function () { im.classList.add('err'); };
+    // 命中磁盘缓存时 load 事件可能早于我挂回调（图片在 innerHTML 解析时就开始了）⟹ 补一次
+    if (im.complete && im.naturalWidth > 0) im.onload();
+  });
+  artaRender();
+}
+// 一轮 1.8 s；每轮只重放 ≤48 张（WebUi 单线程 accept，246 张同时重放会把它挤住）
+function artaPoll() {
+  if (ARTAV.timer) return;
+  ARTAV.timer = setInterval(function () {
+    if (S.view !== 'artists' || !D('artProgWrap')) { artaStop(); return; }
+    var pend = [];
+    Array.prototype.forEach.call(document.querySelectorAll('#list .card .acv img'), function (im) {
+      if (!im.classList.contains('ok')) pend.push(im);
+    });
+    if (!pend.length) { artaStop(); artaRender(); return; }
+    ARTAV.round++;
+    var batch = 48, off = ((ARTAV.round - 1) * batch) % pend.length;
+    for (var i = 0; i < pend.length && i < batch; i++) {
+      var im = pend[(off + i) % pend.length];
+      im.src = artistImgUrl(im.getAttribute('data-n'), ARTAV.round);
+    }
+    artaRender();
+    if (ARTAV.round >= 20) {          // 约 36 s 后停手，但**保留真实进度**（缺的图不冒充补齐）
+      clearInterval(ARTAV.timer); ARTAV.timer = 0;
+      ARTAV.stopped = true; ARTAV.round = 0;
+      artaRender();
+    }
+  }, 1800);
+}
+
 /* ---------------- 艺术家 ---------------- */
 function loadArtists() {
   S.view = 'artists';
+  artaStop();
   head('艺术家', '加载中…', '');
   // 2026-10-26（261026-01 #1）：艺术家头像走外部源，但**抓取必须后台做** ——
   // WebUi 是单线程 accept，如果在图片请求里同步抓，246 个头像会把整站串行阻塞掉。
   // 这里只做一件事：告诉后端"开始预热这些名字"，图片端点本身只读缓存（未命中立刻 404）。
-  api('/api/artist/prefetch').then(function () { }).catch(function () { });
+  api('/api/artist/prefetch').then(function (j) {
+    if (j && j.ok && j.queued) ARTAV.queued = j.queued;
+    artaPoll();            // 预热一开跑就开始"补齐中 X/Y"轮询
+  }).catch(function () { artaPoll(); });
   api('/api/lib/albums').then(function (j) {
     var m = {}, order = [];
     (j.albums || []).forEach(function (a) {
@@ -1251,17 +1336,32 @@ function loadArtists() {
     order.sort(function (x, y) { return x.localeCompare(y, 'zh'); });
     head('艺术家', order.length + ' 位', '');
     if (!order.length) { D('list').innerHTML = '<div class=empty>库里还没有音乐</div>'; return; }
-    var h = '<div class=grid style="grid-template-columns:repeat(auto-fill,minmax(150px,1fr))">';
+    var h = '<div id=artProgWrap></div>';
+    h += '<div class=grid style="grid-template-columns:repeat(auto-fill,minmax(150px,1fr))">';
     order.forEach(function (k) {
       var v = m[k];
-      // 2026-10-26（261026-01 #1）：头像来自**外部艺术家图源**（/api/artist/image），
-      // 用户钦定「取不到就留空、不许用专辑封面顶替」⟹ 不再渲染 .ph 首字母，也不再借专辑封面。
-      h += '<div class=card data-a="' + esc(k) + '"><div class=cv style="border-radius:50%;overflow:hidden">' +
-           '<img src="/api/artist/image?name=' + encodeURIComponent(k) + '" loading=lazy alt="" onerror="this.style.display=\'none\'" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:50%">' +
-           '<div class=nm>' + esc(k) + '</div><div class=ar>' + v.n + ' 张专辑</div></div>';
+      // 2026-10-26（261026-01 #1）：头像来自**外部艺术家图源**（/api/artist/image）。
+      // 用户钦定「取不到就留空、不许用专辑封面顶替」⟹ 这里三件事同时成立：
+      //   ① 不渲染 .ph 首字母灰块（旧版那排灰字母就是它）；② 不借任何专辑封面；
+      //   ③ 取不到图时露一个**低饱和圆形占位**（浅描边 + 音符图标 opacity .35），页面不至于满屏空洞。
+      // <img> 永远留在 DOM 里（失败只是 opacity:0，不删不摘）⟹「img 数 === 艺术家数」可被断言。
+      h += '<div class=card data-a="' + esc(k) + '">' +
+           '<div class="cv acv">' +
+             '<div class=aph>' + artistNoteSvg(24) + '</div>' +
+             // ★ 不用 loading=lazy：惰性加载的图在视口外永远不会发请求 ⟹ 重放（换 src）也发不出去，
+             //   「补齐中 X/Y」会永远停在首屏那几张上（实测 35/127 卡死 30 s）。头像端点只读磁盘缓存、
+             //   零网络，127~246 张一起请求的代价就是几百毫秒本地读盘，值得换一个真的会收敛的进度。
+             '<img data-n="' + esc(k) + '" src="' + artistImgUrl(k) + '" alt=""' +
+             ' onerror="this.classList.add(\'err\')">' +
+           '</div>' +
+           '<div class=nm title="' + esc(k) + '">' + esc(k) + '</div>' +
+           '<div class=ar>' + v.n + ' 张专辑</div></div>';
     });
     h += '</div>';
     D('list').innerHTML = h;
+    // 渲染完立刻挂 load/error 统计 + 开始轮询（后端没有 progress 端点，X/Y 只能自己数）
+    artaBind();
+    artaPoll();
     Array.prototype.forEach.call(D('list').querySelectorAll('.card'), function (e) {
       e.onclick = function () {
         var who = e.dataset.a;
@@ -1308,10 +1408,14 @@ function artistCoverKeyUnused(who) {
 }
 // 2026-10-26（261026-01 #1）：艺术家头像改用**外部艺术家图源**（/api/artist/image）。
 // 用户明确：艺术家确实需要接外部源；**取不到就留空，绝不能用专辑封面顶替**。
+// 详情页与列表同一套处理：真 <img>（404 → opacity:0）+ 底下低饱和圆形占位，不再用 background-image
+// （background-image 加载失败时页面什么都不显示，只能看到 .cv 的灰底 = 用户说的"几乎全是空白/灰块"）。
 function artistHeroHtml(who, subText) {
-  var imgUrl = '/api/artist/image?name=' + encodeURIComponent(who);
   return '<div class="ahead artist-head">' +
-       '<div class=cv style="border-radius:50%;background-image:url(\'' + imgUrl + '\')">' +
+       '<div class="cv acv">' +
+         '<div class=aph>' + artistNoteSvg(44) + '</div>' +
+         '<img data-n="' + esc(who) + '" src="' + artistImgUrl(who) + '" alt=""' +
+         ' onerror="this.classList.add(\'err\')">' +
        '</div>' +
        '<div class=info>' +
        '<div class=kind>ARTIST · 艺术家资料</div>' +
@@ -5575,6 +5679,30 @@ function eqSettingsHtml() {
     + '选中行后 <b>↑↓</b>=增益 0.1 dB、<b>←→</b>=频率 ±1%（Shift 加速）。修改即时生效（热更新，交叉淡入防爆音），并自动保存到 rlplayer-peq.txt。</div></div>');
 
 
+  // 1.5 房间校正（测量向导）—— 2026-10-26（261026-01 #2）用户：「房间 EQ 功能请上架 EQ 那一栏的 UI」
+  // 位置：**紧跟 PEQ 之后**（第 2 张卡）——用户是在 EQ 页找这个功能，放在页尾等于没上架。
+  // ⚠️ 诚实性要求（铁律 4）：算法（src/dsp/room_correction.h）与测量编排（room_measurement.h）
+  //   已经写完并通过单测，但**没有任何 HTTP 端点**，前端不可能真的开测。所以这里是
+  //   「入口 + 说明 + 向导预览」：按钮带「预览」角标，向导第 1 步第一句就写清楚要后端接线。
+  //   一行也不能假装能测 —— 否则用户点「开始向导」会以为已经在测量房间。
+  h += '<div id=roomCorrCard>' + sgroup('房间校正（测量向导）', 'Farina 对数扫频 → 反卷积 → 心理声学平滑 → 目标曲线 → 最小相位校正 FIR · 多声道 2.0~7.1.4',
+      '<div class="sfld wide"><div class="in-stat-grid" style="grid-template-columns:repeat(auto-fit,minmax(250px,1fr))">'
+    + '<div class=in-stat-item><span class=lbl>算法版本</span><span class="val sm">C1 算法 + C2 测量编排</span>' +
+      '<div class=rcsub>room_correction.h · room_measurement.h</div></div>'
+    + '<div class=in-stat-item><span class=lbl>支持声道布局</span><span class="val sm">2.0 ~ 7.1.4（6 种）</span>' +
+      '<div class=rcsub>2.0 / 2.1 / 5.1 / 7.1 / 5.1.2 / 7.1.4 · 带 .1 的 LFE 分频 80 Hz</div></div>'
+    + '<div class=in-stat-item><span class=lbl>当前状态</span><span class="val sm" id=rcStatus>未测量</span>' +
+      '<div class=rcsub>还没有校正集（后端接线后这里会显示测量日期与布局）</div></div>'
+    + '</div></div>'
+    + '<div class="sfld wide" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
+    + '<button class="btn pri" id=bRoomWiz type=button>开始向导<span class=rcbadge>预览</span></button>'
+    + '<span class=rcnote>分 7 步走完一次测量（选布局 → 摆麦 → 测各声道 → 质检 → 生成校正集）。</span>'
+    + '</div>'
+    + '<div class="sfld wide"><div class=rcnote>测量录音与生成的校正 FIR（每声道一个 32-bit float WAV）'
+    + '将保存到 <code>data\\roomcorr\\</code>；应用后由播放链路的 FIR 卷积执行（与下面「房间校正 IR」同一个卷积器）。<br>'
+    + '⚠️ 当前版本<strong>只有前端界面</strong>：后端还没有 <code>/api/roomcorr/*</code> 端点，点「开始向导」只会看到向导流程说明，<strong>不会真的出声测量</strong>。</div></div>'
+    ) + '</div>';
+
   // 1. 耳机 EQ（OPRA）
   h += sgroup('耳机 EQ（OPRA 校准预设）', '收录 6,230 款耳机专业校准滤波 · CC BY-SA 4.0',
       '<div class="sfld wide" style="display:flex;align-items:center;gap:10px">'
@@ -5616,8 +5744,120 @@ function eqSettingsHtml() {
     // 评审 #11：这里原来还有一个「保存 EQ 与房间校正设置」按钮，与底部全局「保存设置」重复 → 移除；
     // sp_eq / sp_ir / sp_irgpu 的值本来就会随 saveSettings 一起提交，不需要第二个主操作。
     );
+
   return h;
 }
+/* ---------------- 房间校正向导（预览）2026-10-26 261026-01 #2 ----------------
+   为什么是「预览」：算法与测量编排已在 src/dsp 落地并通过单测，但**没有 HTTP 端点**
+   （/api/roomcorr/* 不存在）⟹ 前端无法真的开始测量。按铁律 4「如实记录未解决问题」，
+   这张向导只做流程演示：第 1 步第一句就写明「需要后端接线，当前版本为预览」，
+   按钮带「预览」角标，点「完成」不改任何播放状态、不发任何请求。 */
+var RCW = { step: 1, total: 7, layout: '2.0' };
+// 与 room_correction.h::room_layouts() 一一对应（2.0/2.1/5.1/7.1/5.1.2/7.1.4）
+var RC_LAYOUTS = ['2.0', '2.1', '5.1', '7.1', '5.1.2', '7.1.4'];
+var RC_STEPS = [
+  { t: '开始之前：这是预览，还不能真的测',
+    b: '该向导需要后端接线，当前版本为预览：界面、流程与文案都可以走一遍，但 RLPlayer 目前<b>没有房间测量的 HTTP 端点</b>（<code>/api/roomcorr/*</code>），所以不会播放扫频、不会录音、也不会生成校正集。' +
+       '<span class=warnline>为什么要先上界面：算法（Farina 对数扫频 / 正则化反卷积 / 心理声学平滑 / 最小相位校正 FIR）与多声道测量编排已经写完并有单测；' +
+       '缺的只是把「播放 + 采集 + 会话进度」接到 WebUi 的那一层。接好之后，这个向导不用重做。</span>' },
+  { t: '第 1 步：选声道布局',
+    b: '先在下面选一套布局。带 <b>.1</b> 的布局会做 80 Hz 超低分频，并在 40~120 Hz 做超低与主声道的时延对齐；' +
+       '带 <b>.2/.4</b> 的天空声道会单独测。选定的布局决定接下来要测几个声道（2.0 两个，7.1.4 十二个）。' },
+  { t: '第 2 步：摆好测量麦克风',
+    b: '把麦克风放在<b>听音位</b>（你平时头的位置），高度与耳朵齐平，指向正前方。' +
+       '测试音会逐个声道播放，所以你不需要移动麦克风 —— 这是「一麦多位」的做法：每个声道单独测一次，最后拼成整套房间响应。' +
+       '房间里尽量安静、关掉风扇与空调；麦克风离反射面太近会让低频测量偏高。' },
+  { t: '第 3 步：播放扫频（会出声）',
+    b: '每个声道会播放一次 10 秒的对数扫频（20 Hz ~ 22 kHz），电平 <b>−20 dBFS</b>。' +
+       '<span class=warnline>这是要听得见的测试音（房间测量必须真的出声，否则测不到房间）。' +
+       '真实接线后会先弹一次授权横幅：设备名、时长、峰值电平、以及独占模式会静音系统其它声音 —— 得到你确认后再开始。</span>' },
+  { t: '第 4 步：采集与反卷积',
+    b: '扫频播放的同时录制，并且<b>多录 1 秒</b>：用来装下房间混响尾和扫频泄漏尾，' +
+       '否则圆周反卷积会把尾巴绕回脉冲响应的头部，低频就会测歪。录到的信号与参考扫频做频域正则化反卷积，得到每个声道的房间脉冲响应。' },
+  { t: '第 5 步：质检（不合格就重测）',
+    b: '每个声道都会算信噪比、直达声到达时间，并检查超低有没有反接（40~120 Hz 带限互相关的极性）。' +
+       '信噪比太低通常是环境太吵或电平太小；超低反接只要把音箱线正负换过来再测。质检不合格的声道会单独提示重测，不影响已测好的。' },
+  { t: '第 6 步：生成校正集并保存',
+    b: '把每个声道的响应做<b>变分数倍频程平滑</b>（低频 1/6 oct → 高频 1/3 oct），减去目标曲线，' +
+       '限制最大提升量，转成最小相位，再截断加窗成 8192 taps 的校正 FIR。' +
+       '每声道一个 32-bit float WAV，测量文件与校正集都会保存到 <code>data\\roomcorr\\</code>。' +
+       '<span class=warnline>当前版本到此为止：不写文件、不改播放链路。真实接线后这里会多一个「启用这套校正」开关。</span>' }
+];
+function rcWizEnsure() {
+  var box = D('roomWiz');
+  if (box) return box;
+  box = document.createElement('div');
+  box.id = 'roomWiz';
+  box.innerHTML =
+    '<div class="rw-card" role=dialog aria-modal=true aria-labelledby=rwTitle>' +
+      '<div class=rw-head><span>房间校正向导</span><span class=rcbadge>预览</span><span class=sp></span>' +
+        '<button class=rw-x id=rcClose type=button title="关闭">&#10005;</button></div>' +
+      '<div class=rw-dots id=rcDots></div>' +
+      '<div class=rw-step id=rcStep></div>' +
+      '<div class=rw-title id=rwTitle></div>' +
+      '<div class=rw-body id=rcBody></div>' +
+      '<div class=rw-foot><button class="btn" id=rcPrev type=button>上一步</button>' +
+        '<button class="btn pri" id=rcNext type=button>下一步</button><span class=sp></span>' +
+        '<span class=rcnote>预览版：不会出声、不写文件</span></div>' +
+    '</div>';
+  document.body.appendChild(box);
+  D('rcClose').onclick = rcWizClose;
+  D('rcPrev').onclick = function () { if (RCW.step > 1) { RCW.step--; rcWizRender(); } };
+  D('rcNext').onclick = function () {
+    if (RCW.step < RCW.total) { RCW.step++; rcWizRender(); } else rcWizClose();
+  };
+  box.onclick = function (ev) { if (ev.target === box) rcWizClose(); };
+  // ESC 关向导；捕获阶段拦住，避免它同时被全局 ESC（返回上一级视图）吃掉
+  document.addEventListener('keydown', function (ev) {
+    if (!D('roomWiz') || !D('roomWiz').classList.contains('on')) return;
+    if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); rcWizClose(); }
+  }, true);
+  return box;
+}
+function rcWizRender() {
+  var box = rcWizEnsure();
+  if (!box) return;
+  var s = RC_STEPS[RCW.step - 1] || { t: '', b: '' };
+  var dots = '';
+  for (var i = 1; i <= RCW.total; i++) dots += '<i class="rw-dot' + (i <= RCW.step ? ' on' : '') + '"></i>';
+  D('rcDots').innerHTML = dots;
+  D('rcStep').textContent = '第 ' + RCW.step + ' / ' + RCW.total + ' 步';
+  D('rwTitle').textContent = s.t;
+  var body = s.b;
+  if (RCW.step === 2) {
+    body += '<div style="margin-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
+            '<label style="font-size:12px;color:var(--mut2)">声道布局' +
+            '<select id=rcLayout style="margin-left:8px">' +
+            RC_LAYOUTS.map(function (o) {
+              return '<option' + (o === RCW.layout ? ' selected' : '') + '>' + o + '</option>';
+            }).join('') + '</select></label>' +
+            '<span class=rcnote>当前选择：<b id=rcLayoutNow>' + RCW.layout + '</b></span></div>';
+  }
+  D('rcBody').innerHTML = body;
+  if (D('rcLayout')) {
+    D('rcLayout').onchange = function () {
+      RCW.layout = this.value;
+      if (D('rcLayoutNow')) D('rcLayoutNow').textContent = RCW.layout;
+    };
+  }
+  D('rcPrev').disabled = RCW.step <= 1;
+  D('rcNext').textContent = (RCW.step >= RCW.total) ? '完成（关闭）' : '下一步';
+}
+function rcWizOpen() {
+  var box = rcWizEnsure();
+  if (!box) return;
+  RCW.step = 1;
+  box.classList.add('on');
+  rcWizRender();
+}
+function rcWizClose() {
+  var box = D('roomWiz');
+  if (box) box.classList.remove('on');
+}
+function initRoomCorr() {
+  if (D('bRoomWiz')) D('bRoomWiz').onclick = rcWizOpen;
+}
+
 /* ---------------- 20 段参数均衡 PEQ（261024-02 #6） ---------------- */
 var PEQ_STATE = null;
 var PEQ_TIMER = 0;
@@ -6064,6 +6304,7 @@ function initPeqControls() {
 
 function initEqViewLogic() {
   initPeqControls();
+  initRoomCorr();      // 2026-10-26（261026-01 #2）：「房间校正」卡片的「开始向导」按钮（预览）
   var sInput = D('sp_opra_search');
   var guide = D('eqSearchGuide');
   var hint = D('sp_opra_searchhint');

@@ -198,6 +198,16 @@ inline std::string rta_ui_page() {
     h += ".ahead .kind{font-size:10px;letter-spacing:1.4px;color:var(--mut2);font-weight:600}";
     h += ".ahead h1{font-size:26px;line-height:1.2;font-weight:750;letter-spacing:-.4px;margin:5px 0 7px;word-break:break-word;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}";
         h += ".ahead .sub{font-size:12.5px;color:var(--mut);margin-bottom:13px}";
+    // ===== 艺术家头像（2026-10-26 261026-01 #1）=====
+    // 用户原话：「艺术家页…几乎全都是空白或者是专辑封面」+「不要用专辑封面，也不要大灰块」。
+    // 旧实现有两个坑：① .card .cv / .ahead .cv 自带 background:var(--cvbg) —— 图没取到时
+    // 留下就是一块**灰底**；② 列表里还渲染了 .ph 首字母块。现在 .acv 一律去掉灰底，
+    // 图取不到时露出低饱和圆形占位（浅描边 + 音符图标，opacity .35），<img> 保留但 opacity:0。
+    h += ".card .cv.acv,.ahead .cv.acv{background:transparent;border-radius:50%}";
+    h += ".card .cv.acv .aph,.ahead .cv.acv .aph{position:absolute;inset:0;display:grid;place-items:center;color:var(--mut2);opacity:.35;pointer-events:none}";
+    h += ".card .cv.acv img.err,.ahead .cv.acv img.err{opacity:0}";
+    h += ".ahead .cv.acv img,.ahead .cv.acv svg{display:block}";
+    h += ".ahead .cv.acv img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}";
     h += ".bio-box{font-size:13px;line-height:1.75;color:var(--txt2);white-space:pre-wrap;word-break:break-word}";
     h += ".bio-box.collapsed{max-height:140px;overflow:hidden;-webkit-mask-image:linear-gradient(180deg,#000 65%,transparent)}";
     // 261024-04 #4b：资料块（AI 整理 / 简介 / 风格 / 来源）原来**没有任何 CSS**（.sec-card 只在标记里出现），
@@ -611,6 +621,33 @@ h += "#npPage .npedge{display:none}";
     h += ".peqstat.bypass{color:var(--mut)}";
     h += ".peqstat.bypass .tag{color:var(--mut2);border-style:dashed}";
     h += ".peqstat .sub{font-size:11px;color:var(--mut2)}";
+    // ===== 房间校正（测量向导）2026-10-26 261026-01 #2 =====
+    // 后端还没有 HTTP 端点（算法 room_correction.h / 编排 room_measurement.h，无人暴露），
+    // 所以这张卡是「入口 + 说明 + 向导预览」：按钮上必须带「预览」角标，向导第一步必须写明。
+    h += ".rcbadge{font-size:10px;font-weight:700;letter-spacing:.4px;padding:1px 7px;border-radius:8px;border:1px solid var(--warn);color:var(--warn);margin-left:7px;vertical-align:1px}";
+    h += ".rcnote{font-size:11.5px;color:var(--mut2);line-height:1.7}";
+    h += ".rcsub{font-size:10.5px;color:var(--mut2);line-height:1.55;margin-top:4px;word-break:break-word}";
+    h += ".rcnote code{font-family:ui-monospace,Consolas,monospace;font-size:11px;background:var(--field);border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--txt2)}";
+    h += "#roomWiz{position:fixed;inset:0;z-index:120;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.55);padding:24px}";
+    h += "#roomWiz.on{display:flex}";
+    h += ".rw-card{width:min(600px,94vw);max-height:86vh;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 64px var(--shadow);padding:20px 22px}";
+    h += ".rw-head{display:flex;align-items:center;gap:9px;font-size:14px;font-weight:650;color:var(--txt)}";
+    h += ".rw-head .sp{flex:1}";
+    h += ".rw-x{background:none;border:0;color:var(--mut2);font-size:18px;line-height:1;padding:4px;cursor:pointer;border-radius:6px}";
+    h += ".rw-x:hover{color:var(--txt);background:var(--hov)}";
+    h += ".rw-dots{display:flex;gap:5px;margin:12px 0 14px}";
+    h += ".rw-dot{flex:1;height:3px;border-radius:2px;background:var(--track)}";
+    h += ".rw-dot.on{background:var(--acc)}";
+    h += ".rw-step{font-size:10.5px;color:var(--mut2);letter-spacing:.4px}";
+    h += ".rw-title{font-size:14px;font-weight:650;color:var(--txt);margin:3px 0 9px}";
+    h += ".rw-body{font-size:12.5px;color:var(--txt2);line-height:1.8;min-height:104px}";
+    h += ".rw-body b{color:var(--txt)}";
+    h += ".rw-body code{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;background:var(--field);border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--txt2)}";
+    h += ".rw-body .warnline{display:block;margin-top:10px;padding:8px 11px;border-left:3px solid var(--warn);background:var(--hov);border-radius:0 8px 8px 0;color:var(--txt2)}";
+    h += ".rw-body select{height:30px;padding:0 9px;border-radius:7px;border:1px solid var(--line);background:var(--field);color:var(--txt);font-size:12px;font-family:inherit}";
+    h += ".rw-foot{display:flex;align-items:center;gap:8px;margin-top:16px;padding-top:13px;border-top:1px solid var(--line)}";
+    h += ".rw-foot .sp{flex:1}";
+    h += ".rw-foot .btn[disabled]{opacity:.4;cursor:not-allowed}";
 
     // 2026-10-24（用户 261024-01 #5）：「密码框跟其他框样式不一样」的根因 ——
     // 旧选择器只列了 text/number，password 完全没命中任何一条规则 ⟹ 落到浏览器默认样式
