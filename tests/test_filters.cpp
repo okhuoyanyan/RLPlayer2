@@ -391,10 +391,17 @@ int main() {
         //     fast-math 抖动约 1e-11，而任何真实参数改动都 >= 1e-3。
         double g0 = 0, g2 = 0, g3 = 0, gm = 0;
         int hashed = 0;
-        for (const auto& fp : filter_presets()) {
-            if (fp.tapsPerInput != 0) continue;      // 只锁"老式"预设
+        // 2026-10-26（261026-06）：改成**显式名单**。
+        // 原来按「所有 tapsPerInput==0」锁基线，一旦新增 legacy 预设就把新系数算进合计 ⟹ 必然假红
+        // （用户要求补 27 项滤波器时就是这样红了 134.165414）。基线的作用是"防止既有预设被悄悄改动"，
+        // 新预设加入本不应改变它，所以这里写死那 50 个名字。
+        static const char* kLegacyNames[] = { "poly-sinc-short-lp", "poly-sinc-short-mp", "poly-sinc-short-2s", "poly-sinc-lp", "poly-sinc-mp", "poly-sinc-2s", "poly-sinc-mp-2s", "poly-sinc-long-lp", "poly-sinc-long-mp", "poly-sinc-long-ip", "poly-sinc-long-2s", "poly-sinc-xl", "poly-sinc-xla", "poly-sinc-xtr", "poly-sinc-gauss-short", "poly-sinc-gauss-long", "poly-sinc-gauss-mp", "poly-sinc-gauss-2s", "poly-sinc-gauss-long-2s", "poly-sinc-gauss-hires-lp", "poly-sinc-gauss-hires-mp", "poly-sinc-gauss-hires-ip", "poly-sinc-gauss-xl", "poly-sinc-gauss-xla", "poly-sinc-ext2", "poly-sinc-ext2-2s", "poly-sinc-ext2-xl", "poly-sinc-ext2-xla", "poly-sinc-hb", "poly-sinc-hb-s", "poly-sinc-hb-m", "poly-sinc-hb-l", "poly-sinc-hb-2s", "poly-sinc-hb-s-2s", "poly-sinc-hb-m-2s", "poly-sinc-hb-l-2s", "sinc-S", "sinc-M", "sinc-MG", "sinc-L", "sinc-LL", "closed-form-fast", "closed-form", "closed-form-M", "closed-form-16M", "minringFIR", "minringFIR-mp", "apod-20k", "apod-19k-short", "apod-wide" };
+        for (const char* ln : kLegacyNames) {
+            const FilterPreset* fp = find_preset(ln, false);
+            if (!fp) { check(false, std::string("基线预设存在: ") + ln); continue; }
+            if (fp->tapsPerInput != 0) continue;
             for (auto io : { std::pair<uint32_t, uint32_t>{44100, 88200}, {44100, 384000} }) {
-                auto h = proto_of(fp, io.first, io.second, nullptr, nullptr);
+                auto h = proto_of(*fp, io.first, io.second, nullptr, nullptr);
                 double s0 = 0, s2 = 0, s3 = 0, mx = 0;
                 for (size_t i = 0; i < h.size(); ++i) {
                     const double a = h[i];

@@ -92,6 +92,14 @@ using rta::render::SinkOpenOpts;
 #include <set>
 #include <map>
 
+// ---- 房间校正（2026-10-26）----
+// C1 算法 / C2 会话 / WASAPI 传输这三个头文件都是**头文件库**（不新增编译单元）。
+// 必须放在标准库之后：room_transport_wasapi.h 内部用 std::this_thread::sleep_for。
+#include <cmath>
+#include "dsp/room_correction.h"
+#include "dsp/room_measurement.h"
+#include "dsp/room_transport_wasapi.h"
+
 namespace fs = std::filesystem;
 using namespace rta;
 using namespace rta::audio;
@@ -7525,6 +7533,502 @@ static bool knowledge_job_start(const std::string& key, const std::shared_ptr<Kn
     }
 }
 
+
+// ===========================================================================
+// 房间校正 HTTP 端点（2026-10-26；算法 / 会话 / 传输一律不在本文件）
+//
+//   端点                              方法  语义
+//   /api/roomcorr/layouts             GET   布局预置（room_layouts()，6 种）
+//   /api/roomcorr/status              GET   进度 / 最近结果（只读、永不阻塞）
+//   /api/roomcorr/download?layout=X   GET   该布局的校正集 JSON（没有则 404）
+//   /api/roomcorr/measure             POST  **副作用**：起后台测量（必须 confirm=1）
+//   /api/roomcorr/cancel              POST  **副作用**：置取消标志（协作式中止，不杀线程）
+//
+// 分层（C1/C2/传输均已离线验证，本块只做 HTTP 外壳，绝不复制算法）：
+//   C1 src/dsp/room_correction.h         扫频/反卷积/平滑/目标曲线/最小相位/超低对齐/布局
+//   C2 src/dsp/room_measurement.h        会话编排 + 质检 + CorrectionSet
+//   T  src/dsp/room_transport_wasapi.h   MeasurementTransport 的真实实现（WASAPI 播放+采集）
+//
+// 铁律 1（绝不擅自出声）：
+//   · measure **必须** confirm=1，否则 400 并且什么都不做（不开设备、不建线程）。
+//     扫频本质可闻：UI 必须先把「设备名 / 时长 / 电平 / 独占会静音系统声音」摊开、用户点确认。
+//   · 电平默认 −20 dBFS，本文件**不做任何放大**；> −20 dBFS 直接 400（不静默夹到 −20）。
+//   · 日志逐条写清 levelDb / 设备 / 时长（rlplayer-playback.log 的 ROOMCORR 行）。
+//   · src=null → **模拟房间**（内卷积 + 实时节奏），不开任何设备、不发声：给自动化门禁与
+//     离线验证用。它走的是与真实测量**完全相同**的会话/反卷积/质检/落盘路径，只换传输层。
+//
+// 请求线程零阻塞：measure 只做参数校验 + 起一个 detached 线程，实测 < 5 ms 返回。
+// ===========================================================================
+struct RoomCorrState {
+    std::atomic<bool> running{false};
+    std::atomic<bool> cancelled{false};
+    std::mutex mtx;        // 保护下面全部非原子字段
+    std::mutex startMx;    // 「检查 running + 复位状态 + 起线程」必须原子（webui 最多 6 个并发 worker）
+    int  step = 0, totalSteps = 0;
+    std::string stepName = "idle";   // idle|starting|measuring|analyzing|done|cancelled|error
+    std::string channel;
+    std::string lastError;
+    std::string layout;
+    std::string target = "flat";
+    double levelDb = -20.0, sweepSeconds = 0.0, lastRunMs = 0.0;
+    bool simulated = false;
+    bool hasCorrectionSet = false;
+    int  irTaps = 0;
+    uint32_t irFs = 0;
+    std::string filePath;
+    std::vector<std::string> warnings;
+    bool diskProbed = false;         // 内存里没有校正集时，磁盘只探一次（重启后照样如实上报）
+};
+static RoomCorrState g_roomcorr;
+
+// 落盘位置：<exe>\data\roomcorr\correction-<layout>.json（与 data\opra_index.json 同一约定）。
+// 独立 build 目录 = 完全隔离，测试不会碰到真实安装目录。
+static std::string roomcorr_dir() { return path_in_exe_dir("data\\roomcorr"); }
+static std::string roomcorr_file(const std::string& layout) {
+    return roomcorr_dir() + "\\correction-" + layout + ".json";
+}
+
+// 布局名白名单只认 room_layouts() 的预置名：download 的 layout 参数直接拼进文件名，
+// 不做白名单就是一个路径穿越（?layout=..\..\x）。
+static const std::vector<rta::dsp::RoomLayout>& roomcorr_all_layouts() {
+    static const std::vector<rta::dsp::RoomLayout> kAll = rta::dsp::room_layouts();
+    return kAll;
+}
+static const rta::dsp::RoomLayout* roomcorr_find_layout(const std::string& name) {
+    for (const auto& L : roomcorr_all_layouts()) if (name == L.name) return &L;
+    return nullptr;
+}
+static std::string roomcorr_layout_names() {
+    std::string s;
+    for (const auto& L : roomcorr_all_layouts()) { if (!s.empty()) s += "/"; s += L.name; }
+    return s;
+}
+
+// JSON 里的浮点一律定点 3~9 位（NaN/∞ 归 0：绝不写出非法 JSON）。
+static std::string roomcorr_fmt(double v, int prec) {
+    if (!std::isfinite(v)) return "0";
+    char b[64];
+    std::snprintf(b, sizeof(b), "%.*f", prec, v);
+    return b;
+}
+
+// 参数解析：query + body（form 编码）都收 —— 与 /api/input/start 同一口径。
+static std::map<std::string, std::string> roomcorr_params(const rta::net::HttpRequest& req) {
+    std::map<std::string, std::string> m;
+    auto trim = [](std::string s) {
+        while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
+        size_t p = 0;
+        while (p < s.size() && (s[p] == '\r' || s[p] == '\n' || s[p] == ' ' || s[p] == '\t')) p++;
+        return s.substr(p);
+    };
+    auto parseStr = [&](const std::string& str) {
+        std::istringstream is(str);
+        std::string tok;
+        while (std::getline(is, tok, '&')) {
+            tok = trim(tok);
+            if (tok.empty()) continue;
+            const size_t e = tok.find('=');
+            if (e == std::string::npos) m[trim(urlDecode(tok))] = "1";
+            else m[trim(urlDecode(tok.substr(0, e)))] = trim(urlDecode(tok.substr(e + 1)));
+        }
+    };
+    const size_t q = req.path.find('?');
+    if (q != std::string::npos) parseStr(req.path.substr(q + 1));
+    if (!req.body.empty()) parseStr(req.body);
+    return m;
+}
+static bool roomcorr_num(const std::map<std::string, std::string>& p, const char* k, double& out) {
+    const auto it = p.find(k);
+    if (it == p.end() || it->second.empty()) return false;
+    const char* s = it->second.c_str();
+    char* end = nullptr;
+    const double v = std::strtod(s, &end);
+    if (!end || *end != '\0' || !std::isfinite(v)) return false;
+    out = v;
+    return true;
+}
+
+// src=null 的「模拟房间」传输：不开设备、不发声，其余与会话层契约一字不差。
+// 按**实时节奏**产出样本的理由：真实测量每声道要（扫频 + 1 s 尾音）秒，而 /status 的
+// step 变化与 cancel 的协作中止只在这个时间尺度上可观测；瞬时跑完会让门禁"看不见过程"。
+class RoomSimTransport : public rta::dsp::MeasurementTransport {
+public:
+    explicit RoomSimTransport(double fs) : fs_(fs > 0.0 ? fs : 48000.0) {
+        // 稀疏房间 IR：直达声 12 ms + 4 次早期反射（含一次反相）+ 混响尾
+        add(0.012,  1.00);
+        add(0.020,  0.42);
+        add(0.029, -0.25);
+        add(0.043,  0.15);
+        add(0.064,  0.08);
+        add(0.090,  0.05);
+    }
+    std::vector<double> play_and_capture(const std::vector<double>& out, size_t samplesToCapture) override {
+        std::vector<double> rec;
+        if (out.empty()) return rec;
+        const size_t need = std::max(samplesToCapture, out.size() + (size_t)(1.0 * fs_));
+        rec.assign(need, 0.0);
+        // 本底噪声（确定性 LCG，−94 dBFS 量级）：全零录音会被判"反卷积失败"，
+        // 而带噪声才有峰前窗，SNR 质检才走真实分支。
+        uint32_t seed = 0x12345678u;
+        for (size_t i = 0; i < rec.size(); ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            rec[i] = ((double)((seed >> 9) & 0xFFFFu) / 65535.0 - 0.5) * 2.0e-5;
+        }
+        for (const auto& tp : taps_) {
+            if (tp.off >= rec.size()) continue;
+            const size_t n = std::min(out.size(), rec.size() - tp.off);
+            for (size_t i = 0; i < n; ++i) rec[tp.off + i] += out[i] * tp.gain;
+        }
+        // 实时节奏 + 10 ms 粒度响应取消（取消时返回空 ⟹ 会话判该声道无效，随后 aborted）
+        const size_t chunk = std::max<size_t>(1, (size_t)(0.010 * fs_));
+        const auto t0 = std::chrono::steady_clock::now();
+        for (size_t done = chunk; done < rec.size() + chunk; done += chunk) {
+            if (cancelled && cancelled()) return {};
+            const size_t at = std::min(done, rec.size());
+            const auto want = std::chrono::microseconds((long long)((double)at / fs_ * 1e6));
+            const auto now = std::chrono::steady_clock::now();
+            if (t0 + want > now) std::this_thread::sleep_until(t0 + want);
+        }
+        return rec;
+    }
+private:
+    struct SimTap { size_t off; double gain; };
+    void add(double sec, double g) { taps_.push_back({(size_t)(sec * fs_), g}); }
+    double fs_;
+    std::vector<SimTap> taps_;
+};
+
+struct RoomCorrRequest {
+    std::string layoutName;
+    rta::dsp::RoomLayout layout{};
+    rta::dsp::SweepSpec  spec{};
+    std::string target = "flat";
+    std::string playDev, capDev;
+    double levelDb = -20.0;
+    double seconds = 10.0;
+    bool simulated = false;
+};
+
+static rta::dsp::TargetCurve roomcorr_target_curve(const std::string& name) {
+    if (name == "tilt") return rta::dsp::TargetCurve::tilt();
+    if (name == "bass") return rta::dsp::TargetCurve::bass_shelf();
+    return rta::dsp::TargetCurve::flat();
+}
+
+// ---- 文件读写（窄串 fopen 不认中文路径 ⟹ 一律 fs::u8path）----
+static bool roomcorr_read_file(const std::string& path, std::string& out, size_t cap) {
+    std::error_code ec;
+    const auto sz = fs::file_size(fs::u8path(path), ec);
+    if (ec || sz == 0 || (size_t)sz > cap) return false;
+    std::ifstream f(fs::u8path(path), std::ios::binary);
+    if (!f) return false;
+    out.assign((size_t)sz, '\0');
+    f.read(&out[0], (std::streamsize)sz);
+    return (size_t)f.gcount() == (size_t)sz;
+}
+// 只读文件头部（最多 cap 字节）：磁盘探测只需要前几百字节里的 fs/taps，而校正集本身
+// 动辄几百 KB（12 声道 × 8192 抽头），整份读进来纯属浪费。
+static bool roomcorr_read_head(const std::string& path, std::string& out, size_t cap) {
+    std::ifstream f(fs::u8path(path), std::ios::binary);
+    if (!f) return false;
+    out.assign(cap, '\0');
+    f.read(&out[0], (std::streamsize)cap);
+    const std::streamsize got = f.gcount();
+    out.resize((size_t)(got > 0 ? got : 0));
+    return !out.empty();
+}
+// 先写 .tmp 再 rename（同 library.h writeFile）：绝不留下"半截 JSON 覆盖掉好文件"。
+static bool roomcorr_write_file(const std::string& path, const std::string& text, std::string& err) {
+    std::error_code ec;
+    const size_t slash = path.find_last_of('\\');
+    if (slash != std::string::npos) fs::create_directories(fs::u8path(path.substr(0, slash)), ec);
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(fs::u8path(tmp), std::ios::binary | std::ios::trunc);
+        if (!f) { err = "无法创建 " + tmp; return false; }
+        f.write(text.data(), (std::streamsize)text.size());
+        f.flush();
+        if (!f.good()) { err = "写入失败 " + tmp; f.close(); return false; }
+    }
+    fs::rename(fs::u8path(tmp), fs::u8path(path), ec);
+    if (ec) {
+        std::error_code e2;
+        fs::remove(fs::u8path(path), e2);
+        ec.clear();
+        fs::rename(fs::u8path(tmp), fs::u8path(path), ec);
+        if (ec) { err = "改名失败 " + path; return false; }
+    }
+    return true;
+}
+
+// 校正集 JSON（格式自定；应用侧需要的 fs/taps/chNames/subDelaySamples/subGainDb 全在顶层）。
+// 每声道带 snrDb/peakMs/valid 与 IR 系数（最小相位 FIR，归一化到 200 Hz~2 kHz = 0 dB）。
+static std::string roomcorr_set_json(const rta::dsp::CorrectionSet& cs,
+                                     const rta::dsp::MeasurementSessionResult& res,
+                                     const RoomCorrRequest& req) {
+    std::ostringstream j;
+    j << "{\"ok\":true,\"version\":1"
+      << ",\"layout\":\"" << jesc(req.layoutName) << "\""
+      << ",\"fs\":" << cs.fs
+      << ",\"taps\":" << cs.taps
+      << ",\"levelDb\":" << roomcorr_fmt(req.levelDb, 1)
+      << ",\"sweepSeconds\":" << roomcorr_fmt(req.seconds, 3)
+      << ",\"target\":\"" << jesc(req.target) << "\""
+      << ",\"simulated\":" << (req.simulated ? "true" : "false")
+      << ",\"subDelaySamples\":" << roomcorr_fmt(cs.subDelaySamples, 3)
+      << ",\"subGainDb\":" << roomcorr_fmt(cs.subGainDb, 3)
+      << ",\"chNames\":[";
+    for (size_t i = 0; i < cs.channelNames.size(); ++i) {
+        if (i) j << ",";
+        j << "\"" << jesc(cs.channelNames[i]) << "\"";
+    }
+    j << "],\"warnings\":[";
+    for (size_t i = 0; i < res.warnings.size(); ++i) {
+        if (i) j << ",";
+        j << "\"" << jesc(res.warnings[i]) << "\"";
+    }
+    j << "],\"channels\":[";
+    for (size_t i = 0; i < cs.correctionIrs.size(); ++i) {
+        if (i) j << ",";
+        const std::string name = (i < cs.channelNames.size()) ? cs.channelNames[i] : std::string("?");
+        const rta::dsp::ChannelMeasurement* cm =
+            (i < res.channels.size()) ? &res.channels[i] : nullptr;
+        j << "{\"name\":\"" << jesc(name) << "\""
+          << ",\"snrDb\":" << roomcorr_fmt(cm ? cm->snrDb : 0.0, 2)
+          << ",\"peakMs\":" << roomcorr_fmt(cm ? cm->peakMs : 0.0, 3)
+          << ",\"valid\":" << ((cm && cm->valid) ? "true" : "false")
+          << ",\"ir\":[";
+        const auto& ir = cs.correctionIrs[i];
+        for (size_t k = 0; k < ir.size(); ++k) {
+            if (k) j << ",";
+            j << roomcorr_fmt(ir[k], 9);
+        }
+        j << "]}";
+    }
+    j << "]}";
+    return j.str();
+}
+
+// 磁盘探测（调用方已持 mtx）：进程重启后 /status 仍能如实报出"磁盘上有一套校正集"。
+static bool roomcorr_find_int(const std::string& s, const char* key, long long& out) {
+    const size_t p = s.find(key);
+    if (p == std::string::npos) return false;
+    size_t i = p + std::strlen(key);
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+    long long v = 0;
+    bool any = false;
+    while (i < s.size() && s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); ++i; any = true; }
+    if (!any) return false;
+    out = v;
+    return true;
+}
+static void roomcorr_probe_disk_locked() {
+    if (g_roomcorr.hasCorrectionSet || g_roomcorr.diskProbed) return;
+    g_roomcorr.diskProbed = true;
+    std::error_code ec;
+    const fs::path dir = fs::u8path(roomcorr_dir());
+    if (!fs::exists(dir, ec)) return;
+    fs::path best;
+    fs::file_time_type bestT{};
+    for (auto& e : fs::directory_iterator(dir, fs::directory_options::skip_permission_denied, ec)) {
+        if (!e.is_regular_file(ec)) continue;
+        const std::string leaf = pathToUtf8(e.path().filename());
+        if (leaf.rfind("correction-", 0) != 0) continue;
+        if (pathToUtf8(e.path().extension()) != ".json") continue;
+        const auto t = e.last_write_time(ec);
+        if (ec) continue;
+        if (best.empty() || t > bestT) { best = e.path(); bestT = t; }
+    }
+    if (best.empty()) return;
+    std::string head;
+    if (!roomcorr_read_head(pathToUtf8(best), head, 65536)) return;
+    long long fsv = 0, taps = 0;
+    roomcorr_find_int(head, "\"fs\":", fsv);
+    roomcorr_find_int(head, "\"taps\":", taps);
+    g_roomcorr.hasCorrectionSet = true;
+    g_roomcorr.irFs = (uint32_t)std::max<long long>(0, fsv);
+    g_roomcorr.irTaps = (int)std::max<long long>(0, taps);
+    g_roomcorr.filePath = pathToUtf8(best);
+    const std::string leaf = pathToUtf8(best.filename());   // correction-<layout>.json
+    if (leaf.size() > 11 + 5) g_roomcorr.layout = leaf.substr(11, leaf.size() - 11 - 5);
+}
+
+// ---- 后台测量线程（detached：与 artistimg/summary 同一套做法，退出时不会被 joinable 卡死）----
+static void roomcorr_worker(RoomCorrRequest req) {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto elapsedMs = [&]() {
+        return (double)std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t0).count();
+    };
+    auto setStepName = [](const char* s) {
+        std::lock_guard<std::mutex> lk(g_roomcorr.mtx);
+        g_roomcorr.stepName = s;
+    };
+    auto fail = [&](const std::string& e) {
+        {
+            std::lock_guard<std::mutex> lk(g_roomcorr.mtx);
+            g_roomcorr.lastError = e;
+            g_roomcorr.stepName = "error";
+            g_roomcorr.lastRunMs = elapsedMs();
+        }
+        g_roomcorr.running.store(false);
+        play_log("ROOMCORR fail layout=" + req.layoutName + " err=" + e +
+                 " ms=" + std::to_string((long long)elapsedMs()));
+    };
+    const std::string lv = roomcorr_fmt(req.levelDb, 1);
+    const std::string sec = roomcorr_fmt(req.seconds, 3);
+    try {
+        setStepName("measuring");
+        // 铁律 1：横幅必须写清「设备名 / 时长 / 电平 / 独占说明」（共享模式不独占，但会混入系统声音）
+        play_log("ROOMCORR start layout=" + req.layoutName +
+                 " ch=" + std::to_string(req.layout.chCount) +
+                 " fs=" + roomcorr_fmt(req.spec.fs, 0) +
+                 " seconds=" + sec + " levelDb=" + lv +
+                 " target=" + req.target +
+                 " transport=" + (req.simulated ? "sim(src=null,不发声)" : "wasapi") +
+                 " play=" + (req.playDev.empty() ? "<default>" : req.playDev) +
+                 " cap=" + (req.capDev.empty() ? "<default>" : req.capDev));
+        if (!req.simulated)
+            play_log("ROOMCORR ★ 可闻扫频：每声道 " + sec + " s，峰值 " + lv +
+                     " dBFS（不放大），共享模式（不独占，但其它程序的声音会混进录音）"
+                     " —— 已由调用方 confirm=1 确认");
+
+        std::unique_ptr<rta::dsp::WasapiRoomTransport> real;
+        std::unique_ptr<RoomSimTransport> sim;
+        rta::dsp::MeasurementTransport* tx = nullptr;
+        if (req.simulated) {
+            sim = std::make_unique<RoomSimTransport>(req.spec.fs);
+            tx = sim.get();
+        } else {
+            rta::dsp::RoomTxConfig cfg;
+            cfg.playDeviceId = req.playDev;
+            cfg.captureDeviceId = req.capDev;
+            cfg.channels = req.layout.chCount;
+            real = std::make_unique<rta::dsp::WasapiRoomTransport>(cfg);
+            tx = real.get();
+        }
+        tx->cancelled = [] { return g_roomcorr.cancelled.load() || g_shutdown.load(); };
+        tx->onProgress = [](int step, int total, const char* name) {
+            std::lock_guard<std::mutex> lk(g_roomcorr.mtx);
+            g_roomcorr.step = step;
+            g_roomcorr.totalSteps = total;
+            g_roomcorr.channel = name ? name : "";
+        };
+
+        rta::dsp::MeasurementSession session(req.spec, req.layout, req.levelDb);
+        const rta::dsp::MeasurementSessionResult res = session.run(*tx);
+
+        {
+            std::lock_guard<std::mutex> lk(g_roomcorr.mtx);
+            g_roomcorr.warnings = res.warnings;
+            if (!res.aborted && res.channels.size() == (size_t)req.layout.chCount)
+                g_roomcorr.step = req.layout.chCount;
+        }
+        // 取消/退出：保留已完成的部分，**不落盘半套校正**（半套比不校更误导）
+        if (res.aborted || g_roomcorr.cancelled.load() || g_shutdown.load()) {
+            {
+                std::lock_guard<std::mutex> lk(g_roomcorr.mtx);
+                g_roomcorr.stepName = "cancelled";
+                g_roomcorr.lastError = "测量已取消（协作式中止，未写出校正集）";
+                g_roomcorr.lastRunMs = elapsedMs();
+                g_roomcorr.running.store(false);
+            }
+            // play_log 自己带锁（g_playLogMx），一律放到 g_roomcorr.mtx 之外调用
+            play_log("ROOMCORR cancel layout=" + req.layoutName +
+                     " doneCh=" + std::to_string(res.channels.size()) + "/" +
+                     std::to_string(req.layout.chCount) + " ms=" + std::to_string((long long)elapsedMs()));
+            return;
+        }
+        if (real && !real->lastOk() && !real->lastError().empty()) {
+            fail("传输层失败：" + real->lastError());
+            return;
+        }
+        if (res.channels.empty()) {
+            fail(res.warnings.empty() ? std::string("测量未产生任何声道") : res.warnings.front());
+            return;
+        }
+        setStepName("analyzing");
+        const rta::dsp::CorrectionOpts opt;   // taps=8192 / 限升 +6 dB / fMax 16 kHz（C1 缺省）
+        rta::dsp::CorrectionSet cs =
+            rta::dsp::build_corrections(res, roomcorr_target_curve(req.target), opt, req.spec.fs, 0.0);
+        // 逐声道取证行（任务书要求的格式：layout/ch/snr/peakMs/taps，外加 levelDb）
+        for (size_t i = 0; i < res.channels.size(); ++i) {
+            const auto& c = res.channels[i];
+            play_log("ROOMCORR layout=" + req.layoutName + " ch=" + c.channelName +
+                     " snr=" + roomcorr_fmt(c.snrDb, 1) +
+                     " peakMs=" + roomcorr_fmt(c.peakMs, 2) +
+                     " taps=" + std::to_string(cs.taps) +
+                     " levelDb=" + lv + " valid=" + (c.valid ? "1" : "0"));
+        }
+        if (cs.channelNames.empty() || cs.correctionIrs.size() != cs.channelNames.size()) {
+            std::string why = "校正集构建失败（任一声道无效就不给半套校正）";
+            if (!res.warnings.empty()) why += "：" + res.warnings.front();
+            fail(why);
+            return;
+        }
+        const std::string path = roomcorr_file(req.layoutName);
+        const std::string text = roomcorr_set_json(cs, res, req);
+        std::string werr;
+        if (!roomcorr_write_file(path, text, werr)) {
+            fail("校正集落盘失败：" + werr);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_roomcorr.mtx);
+            g_roomcorr.hasCorrectionSet = true;
+            g_roomcorr.irTaps = cs.taps;
+            g_roomcorr.irFs = cs.fs;
+            g_roomcorr.filePath = path;
+            g_roomcorr.channel.clear();
+            g_roomcorr.lastError.clear();
+            g_roomcorr.stepName = "done";
+            g_roomcorr.lastRunMs = elapsedMs();
+        }
+        g_roomcorr.running.store(false);
+        play_log("ROOMCORR done layout=" + req.layoutName + " taps=" + std::to_string(cs.taps) +
+                 " fs=" + std::to_string((unsigned)cs.fs) +
+                 " ch=" + std::to_string(cs.channelNames.size()) +
+                 " bytes=" + std::to_string(text.size()) +
+                 " subDelay=" + roomcorr_fmt(cs.subDelaySamples, 2) +
+                 " subGain=" + roomcorr_fmt(cs.subGainDb, 2) +
+                 " file=" + path + " ms=" + std::to_string((long long)elapsedMs()));
+    } catch (const std::exception& e) {
+        fail(std::string("后台测量异常：") + e.what());
+    } catch (...) {
+        fail("后台测量异常（unknown）");
+    }
+}
+
+// 起一轮测量。true = 已起线程；false = 上一轮还在跑（不排队）。
+static bool roomcorr_start(RoomCorrRequest req) {
+    std::lock_guard<std::mutex> slk(g_roomcorr.startMx);
+    if (g_roomcorr.running.load()) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_roomcorr.mtx);
+        g_roomcorr.step = 0;
+        g_roomcorr.totalSteps = req.layout.chCount;
+        g_roomcorr.stepName = "starting";
+        g_roomcorr.channel.clear();
+        g_roomcorr.lastError.clear();
+        g_roomcorr.layout = req.layoutName;
+        g_roomcorr.target = req.target;
+        g_roomcorr.levelDb = req.levelDb;
+        g_roomcorr.sweepSeconds = req.seconds;
+        g_roomcorr.simulated = req.simulated;
+        g_roomcorr.warnings.clear();
+        g_roomcorr.lastRunMs = 0.0;
+    }
+    g_roomcorr.cancelled.store(false);
+    g_roomcorr.running.store(true);
+    try {
+        std::thread(roomcorr_worker, std::move(req)).detach();
+    } catch (...) {
+        g_roomcorr.running.store(false);
+        return false;
+    }
+    return true;
+}
+
 // 2026-10-25：请求处理整体兜一层 catch。理由（实测）：扫描线程/端点里一次 fs::path 构造失败
 // 就会抛 std::filesystem_error，而 WebUi 的 accept 循环跑在 std::thread 上 —— 异常一出就是
 // std::terminate（0xC0000409），整个服务消失，浏览器侧只看到 "Failed to fetch"（261025-01 一.7）。
@@ -7581,6 +8085,9 @@ static bool is_side_effect_path(const std::string& p) {
         "/api/lib/cover/apiFill", "/api/lib/cover/apifill",
         // API 补艺术家头像：同样落盘 + 打网络（只读端点是 /api/artist/image）。
         "/api/artist/apifill",
+        // 房间校正：measure 会**发出可闻扫频**并写 data\roomcorr\*.json，cancel 会打断测量
+        // —— 都是纯副作用，只接受 POST（只读端点是 layouts / status / download）。
+        "/api/roomcorr/measure", "/api/roomcorr/cancel",
     };
     for (const char* k : kNeedPost) {
         const size_t n = std::strlen(k);
@@ -7663,6 +8170,186 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     if (rq.path == "/" || rq.path == "/index.html") {
         ct = "text/html; charset=utf-8";
         return page();
+    }
+
+    // ---------------- 房间校正 API（2026-10-26）----------------
+    // 只读：layouts / status / download（GET 白名单，不进 kNeedPost）
+    // 副作用：measure / cancel（已进 kNeedPost ⟹ 非 POST 在函数开头就 405 了）
+    if (rq.path.rfind("/api/roomcorr/", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        auto rc_bad = [&](int code, const std::string& msg) {
+            rta::net::webui_set_status(code);
+            return std::string("{\"ok\":false,\"error\":\"") + jesc(msg) + "\"}";
+        };
+
+        // ---- GET /api/roomcorr/layouts ----
+        if (rq.path.rfind("/api/roomcorr/layouts", 0) == 0) {
+            std::ostringstream j;
+            j << "{\"ok\":true,\"layouts\":[";
+            bool first = true;
+            for (const auto& L : roomcorr_all_layouts()) {
+                if (!first) j << ",";
+                first = false;
+                j << "{\"name\":\"" << jesc(L.name ? L.name : "") << "\""
+                  << ",\"chCount\":" << L.chCount
+                  << ",\"sub\":" << (L.sub ? "true" : "false")
+                  << ",\"crossoverHz\":" << roomcorr_fmt(L.crossoverHz, 1)
+                  << ",\"chNames\":[";
+                for (int i = 0; i < L.chCount; ++i) {
+                    if (i) j << ",";
+                    j << "\"" << jesc(L.chName[i] ? L.chName[i] : "?") << "\"";
+                }
+                j << "]}";
+            }
+            j << "]}";
+            return j.str();
+        }
+
+        // ---- GET /api/roomcorr/status ----
+        if (rq.path.rfind("/api/roomcorr/status", 0) == 0) {
+            std::lock_guard<std::mutex> lk(g_roomcorr.mtx);
+            roomcorr_probe_disk_locked();
+            std::ostringstream j;
+            j << "{\"ok\":true"
+              << ",\"running\":" << (g_roomcorr.running.load() ? "true" : "false")
+              << ",\"step\":" << g_roomcorr.step
+              << ",\"totalSteps\":" << g_roomcorr.totalSteps
+              << ",\"stepName\":\"" << jesc(g_roomcorr.stepName) << "\""
+              << ",\"channel\":\"" << jesc(g_roomcorr.channel) << "\""
+              << ",\"lastError\":\"" << jesc(g_roomcorr.lastError) << "\""
+              << ",\"hasCorrectionSet\":" << (g_roomcorr.hasCorrectionSet ? "true" : "false")
+              << ",\"irTaps\":" << g_roomcorr.irTaps
+              << ",\"irFs\":" << g_roomcorr.irFs
+              << ",\"layout\":\"" << jesc(g_roomcorr.layout) << "\""
+              << ",\"target\":\"" << jesc(g_roomcorr.target) << "\""
+              << ",\"levelDb\":" << roomcorr_fmt(g_roomcorr.levelDb, 1)
+              << ",\"sweepSeconds\":" << roomcorr_fmt(g_roomcorr.sweepSeconds, 3)
+              << ",\"simulated\":" << (g_roomcorr.simulated ? "true" : "false")
+              << ",\"lastRunMs\":" << roomcorr_fmt(g_roomcorr.lastRunMs, 0)
+              << ",\"file\":\"" << jesc(g_roomcorr.filePath) << "\""
+              << ",\"warnings\":[";
+            for (size_t i = 0; i < g_roomcorr.warnings.size(); ++i) {
+                if (i) j << ",";
+                j << "\"" << jesc(g_roomcorr.warnings[i]) << "\"";
+            }
+            j << "]}";
+            return j.str();
+        }
+
+        // ---- GET /api/roomcorr/download?layout=<名> ----
+        if (rq.path.rfind("/api/roomcorr/download", 0) == 0) {
+            auto ps = roomcorr_params(rq);
+            const std::string name = ps.count("layout") ? ps["layout"] : "";
+            if (!roomcorr_find_layout(name))
+                return rc_bad(400, "layout 必须是预置布局名（" + roomcorr_layout_names() + "）");
+            std::string body;
+            if (!roomcorr_read_file(roomcorr_file(name), body, 64u * 1024u * 1024u))
+                return rc_bad(404, "该布局还没有校正集：先 POST /api/roomcorr/measure");
+            return body;
+        }
+
+        // ---- POST /api/roomcorr/measure ----
+        if (rq.path.rfind("/api/roomcorr/measure", 0) == 0) {
+            auto ps = roomcorr_params(rq);
+            // 铁律 1：缺 confirm=1 一律拒绝，且**什么都不做**（不开设备、不建线程）
+            const auto itc = ps.find("confirm");
+            const bool confirmed = (itc != ps.end()) && (itc->second == "1" || itc->second == "true");
+            if (!confirmed) return rc_bad(400, "测量会发出可闻扫频，需 confirm=1 确认");
+
+            const std::string layoutName = ps.count("layout") ? ps["layout"] : "";
+            const rta::dsp::RoomLayout* lay = roomcorr_find_layout(layoutName);
+            if (!lay)
+                return rc_bad(400, "layout 无效（收到 \"" + layoutName + "\"）；可选：" + roomcorr_layout_names());
+
+            double fsV = 48000.0;
+            if (ps.count("fs") && !roomcorr_num(ps, "fs", fsV)) return rc_bad(400, "fs 不是合法数字");
+            if (fsV < 8000.0 || fsV > 192000.0) return rc_bad(400, "fs 超出范围（8000~192000）");
+
+            double seconds = 10.0;
+            if (ps.count("seconds") && !roomcorr_num(ps, "seconds", seconds))
+                return rc_bad(400, "seconds 不是合法数字");
+            if (seconds < 0.5 || seconds > 60.0)
+                return rc_bad(400, "seconds 允许 0.5~60 秒（收到 " + roomcorr_fmt(seconds, 3) + "）");
+
+            double levelDb = -20.0;
+            if (ps.count("levelDb") && !roomcorr_num(ps, "levelDb", levelDb))
+                return rc_bad(400, "levelDb 不是合法数字");
+            if (levelDb > -20.0 + 1e-9)
+                return rc_bad(400, "测量电平上限 −20 dBFS（铁律 1：不做任何放大），收到 " +
+                                        roomcorr_fmt(levelDb, 1) + " dBFS");
+            if (levelDb < -60.0)
+                return rc_bad(400, "levelDb 下限 −60 dBFS（再低就测不出房间了）");
+
+            const std::string target = ps.count("target") ? ps["target"] : "flat";
+            if (target != "flat" && target != "tilt" && target != "bass")
+                return rc_bad(400, "target 只支持 flat|tilt|bass（收到 " + target + "）");
+
+            const std::string src = ps.count("src") ? ps["src"] : "";
+            const bool simulated = (src == "null");
+            if (!src.empty() && !simulated)
+                return rc_bad(400, "src 只支持 null（模拟房间：不开设备、不发声），或不传");
+            // 真实测量的传输层固定 48 kHz 共享模式（room_transport_wasapi.h）：别的 fs 时间轴是错的，
+            // 与其静默给错结果不如明确拒绝；离线模拟（src=null）不受此限。
+            if (!simulated && std::fabs(fsV - 48000.0) > 0.5)
+                return rc_bad(400, "真实测量的 WASAPI 传输层固定 48 kHz 共享模式，目前只支持 fs=48000；"
+                                   "离线模拟（src=null）可用任意 fs");
+
+            if (!simulated) {
+                // 设备占用：正在播放音乐或正在采集时，测量会被污染或抢设备（模拟源不受影响）
+                if (g_ps.playing.load())
+                    return rc_bad(400, "正在播放音乐：测量会混进音乐声，请先停止播放再测量");
+                if (g_inputSession.running.load())
+                    return rc_bad(400, "设备忙：采集已在运行中（先 POST /api/input/stop）");
+            }
+
+            RoomCorrRequest req;
+            req.layoutName = layoutName;
+            req.layout = *lay;
+            req.spec.fs = fsV;
+            req.spec.durSec = seconds;
+            req.spec.f1 = std::min(22050.0, 0.499 * fsV);
+            req.target = target;
+            req.levelDb = levelDb;
+            req.seconds = seconds;
+            req.simulated = simulated;
+            req.playDev = ps.count("playDev") ? ps["playDev"] : "";
+            req.capDev  = ps.count("capDev") ? ps["capDev"] : "";
+            if (seconds > 10.0)
+                play_log("ROOMCORR warn seconds=" + roomcorr_fmt(seconds, 1) +
+                         " > 10 s（长时测量；用户已 confirm=1）");
+
+            // ★ 请求线程只做「校验 + 起线程」：起线程之后立刻返回，绝不等测量跑完
+            if (!roomcorr_start(std::move(req)))
+                return rc_bad(400, "测量已在运行中（等它结束，或先 POST /api/roomcorr/cancel）");
+
+            std::ostringstream j;
+            j << "{\"ok\":true,\"running\":true"
+              << ",\"layout\":\"" << jesc(layoutName) << "\""
+              << ",\"chCount\":" << lay->chCount
+              << ",\"fs\":" << roomcorr_fmt(fsV, 0)
+              << ",\"seconds\":" << roomcorr_fmt(seconds, 3)
+              << ",\"levelDb\":" << roomcorr_fmt(levelDb, 1)
+              << ",\"target\":\"" << jesc(target) << "\""
+              << ",\"simulated\":" << (simulated ? "true" : "false")
+              << ",\"playDev\":\"" << jesc(ps.count("playDev") ? ps["playDev"] : "") << "\""
+              << ",\"capDev\":\"" << jesc(ps.count("capDev") ? ps["capDev"] : "") << "\""
+              << ",\"message\":\""
+              << (simulated ? "模拟房间测量已启动（不开设备、不发声）"
+                            : "后台测量已启动：会播放可闻扫频；共享模式不独占，但会混入系统其它声音")
+              << "\"}";
+            return j.str();
+        }
+
+        // ---- POST /api/roomcorr/cancel ----
+        if (rq.path.rfind("/api/roomcorr/cancel", 0) == 0) {
+            const bool wasRunning = g_roomcorr.running.load();
+            g_roomcorr.cancelled.store(true);   // 协作式：只置标志，由会话/传输自己收尾（铁律 2）
+            play_log(std::string("ROOMCORR cancel requested running=") + (wasRunning ? "1" : "0"));
+            return std::string("{\"ok\":true,\"cancelRequested\":true,\"running\":") +
+                   (wasRunning ? "true" : "false") + "}";
+        }
+
+        return rc_bad(404, "未知的 /api/roomcorr 端点");
     }
 
     if (rq.path.rfind("/api/files", 0) == 0) {

@@ -5702,28 +5702,30 @@ function eqSettingsHtml() {
     + '选中行后 <b>↑↓</b>=增益 0.1 dB、<b>←→</b>=频率 ±1%（Shift 加速）。修改即时生效（热更新，交叉淡入防爆音），并自动保存到 rlplayer-peq.txt。</div></div>');
 
 
-  // 1.5 房间校正（测量向导）—— 2026-10-26（261026-01 #2）用户：「房间 EQ 功能请上架 EQ 那一栏的 UI」
+  // 1.5 房间校正（测量向导）—— 2026-10-26（261026-01 #2 用户：「房间 EQ 功能请上架 EQ 那一栏的 UI」）
   // 位置：**紧跟 PEQ 之后**（第 2 张卡）——用户是在 EQ 页找这个功能，放在页尾等于没上架。
-  // ⚠️ 诚实性要求（铁律 4）：算法（src/dsp/room_correction.h）与测量编排（room_measurement.h）
-  //   已经写完并通过单测，但**没有任何 HTTP 端点**，前端不可能真的开测。所以这里是
-  //   「入口 + 说明 + 向导预览」：按钮带「预览」角标，向导第 1 步第一句就写清楚要后端接线。
-  //   一行也不能假装能测 —— 否则用户点「开始向导」会以为已经在测量房间。
+  // 2026-10-26 晚（261026-06）：后端 /api/roomcorr/{layouts,status,measure,cancel,download} 已接上，
+  //   测量走真实 WASAPI（共享播放 + 采集，src/dsp/room_transport_wasapi.h），
+  //   所以「预览」角标与「不会真的出声」的免责声明全部移除 —— 留着就是在骗用户。
+  //   铁律 1 不变：向导最后一步必须弹授权横幅（设备名 / 时长 / 电平 / 会盖过系统声音）并要用户点确认，
+  //   默认电平 −20 dBFS（MeasurementSession 缺省），不做任何放大。
   h += '<div id=roomCorrCard>' + sgroup('房间校正（测量向导）', 'Farina 对数扫频 → 反卷积 → 心理声学平滑 → 目标曲线 → 最小相位校正 FIR · 多声道 2.0~7.1.4',
       '<div class="sfld wide"><div class="in-stat-grid" style="grid-template-columns:repeat(auto-fit,minmax(250px,1fr))">'
     + '<div class=in-stat-item><span class=lbl>算法版本</span><span class="val sm">C1 算法 + C2 测量编排</span>' +
-      '<div class=rcsub>room_correction.h · room_measurement.h</div></div>'
+      '<div class=rcsub>room_correction.h · room_measurement.h · room_transport_wasapi.h</div></div>'
     + '<div class=in-stat-item><span class=lbl>支持声道布局</span><span class="val sm">2.0 ~ 7.1.4（6 种）</span>' +
       '<div class=rcsub>2.0 / 2.1 / 5.1 / 7.1 / 5.1.2 / 7.1.4 · 带 .1 的 LFE 分频 80 Hz</div></div>'
     + '<div class=in-stat-item><span class=lbl>当前状态</span><span class="val sm" id=rcStatus>未测量</span>' +
-      '<div class=rcsub>还没有校正集（后端接线后这里会显示测量日期与布局）</div></div>'
+      '<div class=rcsub id=rcStatusSub>点「开始向导」跑一次测量</div></div>'
     + '</div></div>'
     + '<div class="sfld wide" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
-    + '<button class="btn pri" id=bRoomWiz type=button>开始向导<span class=rcbadge>预览</span></button>'
-    + '<span class=rcnote>分 7 步走完一次测量（选布局 → 摆麦 → 测各声道 → 质检 → 生成校正集）。</span>'
+    + '<button class="btn pri" id=bRoomWiz type=button>开始向导</button>'
+    + '<button class="btn" id=bRoomDl type=button style="display:none">下载校正集</button>'
+    + '<span class=rcnote id=rcHint>分 7 步走完一次测量（选布局 → 摆麦 → 测各声道 → 质检 → 生成校正集）。</span>'
     + '</div>'
-    + '<div class="sfld wide"><div class=rcnote>测量录音与生成的校正 FIR（每声道一个 32-bit float WAV）'
-    + '将保存到 <code>data\\roomcorr\\</code>；应用后由播放链路的 FIR 卷积执行（与下面「房间校正 IR」同一个卷积器）。<br>'
-    + '⚠️ 当前版本<strong>只有前端界面</strong>：后端还没有 <code>/api/roomcorr/*</code> 端点，点「开始向导」只会看到向导流程说明，<strong>不会真的出声测量</strong>。</div></div>'
+    + '<div class="sfld wide"><div class=rcnote>测量结果（每声道校正 FIR，32-bit float）保存到 <code>data\\roomcorr\\</code>；'
+    + '应用后由播放链路的 FIR 卷积执行（与下面「房间校正 IR」同一个卷积器）。<br>'
+    + '测量会<strong>真的出声</strong>：每个声道一段对数扫频，默认电平 −20 dBFS，开始前会让你确认设备与时长。</div></div>'
     ) + '</div>';
 
   // 1. 耳机 EQ（OPRA）
@@ -5779,10 +5781,12 @@ var RCW = { step: 1, total: 7, layout: '2.0' };
 // 与 room_correction.h::room_layouts() 一一对应（2.0/2.1/5.1/7.1/5.1.2/7.1.4）
 var RC_LAYOUTS = ['2.0', '2.1', '5.1', '7.1', '5.1.2', '7.1.4'];
 var RC_STEPS = [
-  { t: '开始之前：这是预览，还不能真的测',
-    b: '该向导需要后端接线，当前版本为预览：界面、流程与文案都可以走一遍，但 RLPlayer 目前<b>没有房间测量的 HTTP 端点</b>（<code>/api/roomcorr/*</code>），所以不会播放扫频、不会录音、也不会生成校正集。' +
-       '<span class=warnline>为什么要先上界面：算法（Farina 对数扫频 / 正则化反卷积 / 心理声学平滑 / 最小相位校正 FIR）与多声道测量编排已经写完并有单测；' +
-       '缺的只是把「播放 + 采集 + 会话进度」接到 WebUi 的那一层。接好之后，这个向导不用重做。</span>' },
+  { t: '开始之前：会出声，先看清楚',
+    b: '这个向导会把你的房间<b>真的测一遍</b>：每个声道播放一段对数扫频（20 Hz ~ 22 kHz），同时录音，' +
+       '反卷积分出每个声道的房间脉冲响应，再据此生成校正 FIR。<br>' +
+       '<span class=warnline>扫频是要听得见的声音（不出声就测不到房间）。默认电平 −20 dBFS；' +
+       '最后一步会先把「播放设备 / 采集设备 / 时长 / 电平」摊开让你确认，确认后才开始。' +
+       '测量期间请关掉其它会出声的程序，否则会混进录音。</span>' },
   { t: '第 1 步：选声道布局',
     b: '先在下面选一套布局。带 <b>.1</b> 的布局会做 80 Hz 超低分频，并在 40~120 Hz 做超低与主声道的时延对齐；' +
        '带 <b>.2/.4</b> 的天空声道会单独测。选定的布局决定接下来要测几个声道（2.0 两个，7.1.4 十二个）。' },
@@ -5791,9 +5795,9 @@ var RC_STEPS = [
        '测试音会逐个声道播放，所以你不需要移动麦克风 —— 这是「一麦多位」的做法：每个声道单独测一次，最后拼成整套房间响应。' +
        '房间里尽量安静、关掉风扇与空调；麦克风离反射面太近会让低频测量偏高。' },
   { t: '第 3 步：播放扫频（会出声）',
-    b: '每个声道会播放一次 10 秒的对数扫频（20 Hz ~ 22 kHz），电平 <b>−20 dBFS</b>。' +
-       '<span class=warnline>这是要听得见的测试音（房间测量必须真的出声，否则测不到房间）。' +
-       '真实接线后会先弹一次授权横幅：设备名、时长、峰值电平、以及独占模式会静音系统其它声音 —— 得到你确认后再开始。</span>' },
+    b: '每个声道会播放一次对数扫频（20 Hz ~ 22 kHz），电平 <b>−20 dBFS</b>（可在最后一步改成 −30 dBFS）。' +
+       '<span class=warnline>这是要听得见的测试音。共享模式播放不会独占设备，但系统里其它声音会混进录音，' +
+       '所以测量期间请静音音乐/视频/通知音。</span>' },
   { t: '第 4 步：采集与反卷积',
     b: '扫频播放的同时录制，并且<b>多录 1 秒</b>：用来装下房间混响尾和扫频泄漏尾，' +
        '否则圆周反卷积会把尾巴绕回脉冲响应的头部，低频就会测歪。录到的信号与参考扫频做频域正则化反卷积，得到每个声道的房间脉冲响应。' },
@@ -5803,8 +5807,8 @@ var RC_STEPS = [
   { t: '第 6 步：生成校正集并保存',
     b: '把每个声道的响应做<b>变分数倍频程平滑</b>（低频 1/6 oct → 高频 1/3 oct），减去目标曲线，' +
        '限制最大提升量，转成最小相位，再截断加窗成 8192 taps 的校正 FIR。' +
-       '每声道一个 32-bit float WAV，测量文件与校正集都会保存到 <code>data\\roomcorr\\</code>。' +
-       '<span class=warnline>当前版本到此为止：不写文件、不改播放链路。真实接线后这里会多一个「启用这套校正」开关。</span>' }
+       '校正集保存到 <code>data\\roomcorr\\correction-<布局>.json</code>，可以直接下载。' +
+       '<span class=warnline>生成后还需要在下方「房间校正 IR」里把它挂进播放链路才会生效 —— 这一步本轮仍是手动的。</span>' }
 ];
 function rcWizEnsure() {
   var box = D('roomWiz');
@@ -5813,7 +5817,7 @@ function rcWizEnsure() {
   box.id = 'roomWiz';
   box.innerHTML =
     '<div class="rw-card" role=dialog aria-modal=true aria-labelledby=rwTitle>' +
-      '<div class=rw-head><span>房间校正向导</span><span class=rcbadge>预览</span><span class=sp></span>' +
+      '<div class=rw-head><span>房间校正向导</span><span class=sp></span>' +
         '<button class=rw-x id=rcClose type=button title="关闭">&#10005;</button></div>' +
       '<div class=rw-dots id=rcDots></div>' +
       '<div class=rw-step id=rcStep></div>' +
@@ -5821,7 +5825,7 @@ function rcWizEnsure() {
       '<div class=rw-body id=rcBody></div>' +
       '<div class=rw-foot><button class="btn" id=rcPrev type=button>上一步</button>' +
         '<button class="btn pri" id=rcNext type=button>下一步</button><span class=sp></span>' +
-        '<span class=rcnote>预览版：不会出声、不写文件</span></div>' +
+        '<span class=rcnote id=rcFootNote>测量会出声（默认 −20 dBFS）</span></div>' +
     '</div>';
   document.body.appendChild(box);
   D('rcClose').onclick = rcWizClose;
@@ -5863,8 +5867,129 @@ function rcWizRender() {
       if (D('rcLayoutNow')) D('rcLayoutNow').textContent = RCW.layout;
     };
   }
+  // 最后一步：真实测量面板（铁律 1 的四项摊开 + confirm）
+  if (RCW.step >= RCW.total) {
+    body += '<div style="margin-top:14px;padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:var(--field)">' +
+      '<div style="font-size:13px;font-weight:600;margin-bottom:8px">确认测量参数</div>' +
+      '<div class=rcsub style="line-height:1.9">' +
+        '播放设备：<select id=rcPlaySel style="max-width:340px;vertical-align:middle"></select>（共享模式，不独占）<br>' +
+        '采集设备：<select id=rcCapSel style="max-width:340px;vertical-align:middle"></select><br>' +
+        '声道布局：<b>' + RCW.layout + '</b> · 时长：<b><span id=rcSecsVal>' + RCW.seconds + '</span> 秒/声道</b>' +
+        ' · 电平：<b><span id=rcLevelVal>' + RCW.levelDb + '</span> dBFS</b><br>' +
+        '<span class=warnline>扫频会盖过正在播放的音乐；测量期间请静音其它程序。</span>' +
+      '</div>' +
+      '<div style="margin-top:10px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">' +
+        '<label style="font-size:12px">时长 <input id=rcSecs type=range min=0.5 max=30 step=0.5 value=' + RCW.seconds + ' style="width:120px;vertical-align:middle"></label>' +
+        '<label style="font-size:12px">电平 <input id=rcLevel type=range min=-60 max=-20 step=1 value=' + RCW.levelDb + ' style="width:120px;vertical-align:middle"></label>' +
+        '<label style="font-size:12px;display:flex;align-items:center;gap:6px">' +
+          '<input type=checkbox id=rcAck> 我知道会出声，开始测量</label>' +
+        '<button class="btn pri" id=rcGo type=button disabled>开始测量</button>' +
+        '<button class="btn" id=rcStop type=button style="display:none">中止</button>' +
+      '</div>' +
+      '<div id=rcProg style="margin-top:10px;font-size:12px;color:var(--mut2)"></div>' +
+    '</div>';
+  }
+  D('rcBody').innerHTML = body;
+  if (D('rcLayout')) { D('rcLayout').onchange = function () { RCW.layout = this.value; if (D('rcLayoutNow')) D('rcLayoutNow').textContent = RCW.layout; }; }
+  if (RCW.step >= RCW.total) rcBindMeasurePanel();
   D('rcPrev').disabled = RCW.step <= 1;
-  D('rcNext').textContent = (RCW.step >= RCW.total) ? '完成（关闭）' : '下一步';
+  D('rcNext').textContent = (RCW.step >= RCW.total) ? '关闭' : '下一步';
+}
+
+/* ---- 房间测量面板：设备探测 / 启动 / 进度轮询 / 中止（261026-06）---- */
+var RC_POLL = 0;
+function rcBindMeasurePanel() {
+  var secs = D('rcSecs'), level = D('rcLevel'), ack = D('rcAck'), go = D('rcGo');
+  if (secs) secs.oninput = function () { RCW.seconds = parseFloat(this.value); if (D('rcSecsVal')) D('rcSecsVal').textContent = RCW.seconds; };
+  if (level) level.oninput = function () { RCW.levelDb = parseFloat(this.value); if (D('rcLevelVal')) D('rcLevelVal').textContent = RCW.levelDb; };
+  if (ack) ack.onchange = function () { if (go) go.disabled = !this.checked; };
+  if (go) go.onclick = rcStartMeasure;
+  if (D('rcStop')) D('rcStop').onclick = function () {
+    api('/api/roomcorr/cancel').then(function () { rcProg('已请求中止…'); });
+  };
+  // 设备下拉（261026-06）：默认端点被独占时（DEVICE_IN_USE）用户能在这里换一个，
+  // 否则只会看到「打开播放端点失败」而无处可改。
+  api('/api/devices').then(function (j) {
+    var sel = D('rcPlaySel'); if (!sel) return;
+    var arr = (j && j.devices) || [];
+    var opt = '<option value="">系统默认输出</option>';
+    for (var i = 0; i < arr.length; i++) {
+      var d = arr[i];
+      opt += '<option value="' + esc(d.id || '') + '"' + (d['default'] ? ' selected' : '') + '>' +
+             esc((d.name || d.id) + (d['default'] ? '（默认）' : '')) + '</option>';
+    }
+    sel.innerHTML = opt;
+    RCW.playDev = sel.value;
+    sel.onchange = function () { RCW.playDev = this.value; };
+  }).catch(function () {});
+  api('/api/input/devices').then(function (j) {
+    var sel = D('rcCapSel'); if (!sel) return;
+    var arr = (j && j.devices) || [];
+    var opt = '<option value="">系统默认采集</option>';
+    for (var i = 0; i < arr.length; i++) {
+      var d = arr[i];
+      opt += '<option value="' + esc(d.id || '') + '"' + (d.isDefault ? ' selected' : '') + '>' +
+             esc((d.name || d.id) + (d.isDefault ? '（默认）' : '')) + '</option>';
+    }
+    sel.innerHTML = opt;
+    RCW.capDev = sel.value;
+    sel.onchange = function () { RCW.capDev = this.value; };
+  }).catch(function () {});
+}
+function rcProg(s) { if (D('rcProg')) D('rcProg').innerHTML = s; }
+function rcStartMeasure() {
+  if (!D('rcAck') || !D('rcAck').checked) return;
+  var q = 'layout=' + encodeURIComponent(RCW.layout) +
+          '&seconds=' + encodeURIComponent(RCW.seconds) +
+          '&levelDb=' + encodeURIComponent(RCW.levelDb) +
+          '&target=' + encodeURIComponent(RCW.target || 'flat') +
+          '&confirm=1' +
+          (RCW.playDev ? '&playDev=' + encodeURIComponent(RCW.playDev) : '') +
+          (RCW.capDev ? '&capDev=' + encodeURIComponent(RCW.capDev) : '');
+  rcProg('正在启动…');
+  api('/api/roomcorr/measure?' + q).then(function (j) {
+    if (!j || !j.ok) { rcProg('<span style=color:#e66>' + ((j && j.error) || '启动失败') + '</span>'); return; }
+    if (D('rcGo')) D('rcGo').disabled = true;
+    if (D('rcStop')) D('rcStop').style.display = '';
+    rcPollStart();
+  }).catch(function (e) { rcProg('<span style=color:#e66>请求失败：' + e + '</span>'); });
+}
+function rcPollStart() {
+  rcPollStop();
+  RC_POLL = setInterval(function () {
+    api('/api/roomcorr/status').then(function (j) {
+      if (!j) return;
+      if (j.running) {
+        rcProg('第 ' + j.step + ' / ' + j.totalSteps + ' 步' + (j.stepName ? '：' + j.stepName : '') +
+               (j.channel ? ' · 声道 ' + j.channel : '') + ' …');
+      } else {
+        rcPollStop();
+        if (D('rcStop')) D('rcStop').style.display = 'none';
+        if (D('rcGo')) D('rcGo').disabled = false;
+        if (j.hasCorrectionSet) {
+          rcProg('✅ 测量完成：' + (j.layout || RCW.layout) + ' · ' + j.irTaps + ' taps @ ' + j.irFs + ' Hz' +
+                 (j.warnings && j.warnings.length ? '<br>⚠️ ' + j.warnings.join('；') : ''));
+          var dl = D('bRoomDl'); if (dl) dl.style.display = '';
+          RCW.done = true;
+          rcStatusRefresh();
+        } else {
+          rcProg('<span style=color:#e66>' + (j.lastError || '测量未生成校正集') + '</span>');
+        }
+      }
+    }).catch(function () {});
+  }, 1200);
+}
+function rcPollStop() { if (RC_POLL) { clearInterval(RC_POLL); RC_POLL = 0; } }
+function rcStatusRefresh() {
+  api('/api/roomcorr/status').then(function (j) {
+    if (!j) return;
+    var el = D('rcStatus'), sub = D('rcStatusSub');
+    if (el) el.textContent = j.hasCorrectionSet ? ('已测量 · ' + (j.layout || '')) : '未测量';
+    if (sub) sub.textContent = j.hasCorrectionSet
+      ? (j.irTaps + ' taps @ ' + j.irFs + ' Hz' + (j.file ? ' · ' + j.file.split('\\').pop() : ''))
+      : '点「开始向导」跑一次测量';
+    if (D('bRoomDl')) D('bRoomDl').style.display = j.hasCorrectionSet ? '' : 'none';
+  }).catch(function () {});
 }
 function rcWizOpen() {
   var box = rcWizEnsure();
@@ -5879,6 +6004,13 @@ function rcWizClose() {
 }
 function initRoomCorr() {
   if (D('bRoomWiz')) D('bRoomWiz').onclick = rcWizOpen;
+  // 下载校正集（261026-06）：直接给下载链接，浏览器原生下载，不走 fetch
+  if (D('bRoomDl')) D('bRoomDl').onclick = function () {
+    var lg = (RCW.layout || '2.0');
+    window.location.href = '/api/roomcorr/download?layout=' + encodeURIComponent(lg);
+  };
+  // 进页面先刷一次真实状态（有校正集就显示，没有就提示未测量）
+  rcStatusRefresh();
 }
 
 /* ---------------- 20 段参数均衡 PEQ（261024-02 #6） ---------------- */
