@@ -83,6 +83,10 @@ struct LibAlbum {
     int    nTracks = 0;
     double duration = 0;
     bool   hasCover = false;
+    // 2026-10-26 (261026-05): legacy album key (pre key-formula change).
+    // Old formula: (albumArtist|artist) + 0x1f + album. Kept so covercache entries
+    // written by older versions are still found after upgrading.
+    std::string legacyKey;
     std::vector<size_t> idx;  // tracks_ 下标，已按 disc/track 排序
 };
 
@@ -1213,10 +1217,13 @@ inline const std::vector<LibAlbum>& Library::albumVecLocked() const {
         // 后果：专辑页看着零碎、封面按裂开的卡逐张去搜（同一张碟搜 19 次）、覆盖率分母被人为放大。
         // 新键 = 专辑名 + "\x1f" + 目录（目录做 CD1/Disc 2 归一，保证多碟装仍合成一张）。
         const std::string dirKey = lib_dir_album_key(pdir);
+        const std::string legacyRawKey = aArtist + "\x1f" + aName;
+        const std::string legacyHash = fnv_hex(legacyRawKey);
         const std::string rawKey = aName + "\x1f" + dirKey;
         auto it = byKey.find(rawKey);
         if (it == byKey.end()) {
             LibAlbum a; a.key = fnv_hex(rawKey); a.name = aName; a.artist = aArtist; a.year = t.year;
+            a.legacyKey = legacyHash;
             byKey[rawKey] = albums_.size();
             albums_.push_back(a);
             it = byKey.find(rawKey);

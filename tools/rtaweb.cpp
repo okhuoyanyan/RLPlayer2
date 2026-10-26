@@ -4421,6 +4421,9 @@ static std::vector<std::string> artistimg_parse_names(const std::string& raw) {
 //        {"ok":true,"queued":N,"running":true}，网络全部丢到后台线程
 //        · 不给 k：库里所有「内嵌无封面且无缓存」的专辑
 //        · 给 k（逗号/换行分隔）：只抓这几张（UI 打开专辑页时可单点预热）
+//        · all=1（2026-10-26 261026-05）：**忽略 .none 负缓存**，把"上一轮所有源都说没有"的专辑
+//          整批重试一遍 —— 加了 QQ/DizzyLab 两个新图源后，旧的 .none 是「旧图源集的结论」，
+//          不重试就永远补不上（实测 40 张 .none 里 5 张被新源补到）。
 //        上一轮还在跑 ⟹ {"ok":true,"queued":0,"running":false}（不排队，前端下次再试）
 //   GET  /api/lib/cover/progress      **只读**：{"ok":true,"running":bool,"done","total",
 //                                     "hit","miss","fail","lastName"}
@@ -4437,15 +4440,21 @@ static std::vector<std::string> artistimg_parse_names(const std::string& raw) {
 //   （任务书原话"失败写 .none（7 天）"，这里按"失败"=服务器说没有 实现，理由见上；
 //     瞬态失败只计数 fail，下一轮 prefetch 会重试。）
 //
-// 兜底开关：环境变量 RLPLAYER_COVER_HOST（scheme://host）可把搜索请求指到别处
-// （自动化测试用不可达地址验证「断网不崩、不阻塞」）。
-static constexpr int    kCoverBudgetMs      = 6000;             // 单张专辑总预算（硬上限）
-static constexpr int    kCoverSearchMs      = 3000;             // 搜索单跳上限
+// 兜底开关：环境变量 RLPLAYER_COVER_HOST / _QQ / _DIZZY（scheme://host）可把三个图源的搜索请求
+// 分别指到别处（自动化测试用不可达地址验证「断网不崩、不写脏缓存」）。
+// 单张专辑预算 18 s：三源链最坏情况 = 网易 2 跳(6s) + QQ 1 跳(3s) + DizzyLab 1 跳(3s) + 3 次下载(9s)。
+// 实测正常情况一张 0.3~1.5 s（三源都 miss 才是这个量级），断网时各跳立刻 connection refused，不占预算。
+static constexpr int    kCoverBudgetMs      = 18000;            // 单张专辑总预算（三源链硬上限）
+static constexpr int    kCoverSearchMs      = 3000;             // 搜索单跳上限（每源）
 static constexpr int    kCoverDownloadMs    = 3000;             // 下载单跳上限
 static constexpr size_t kCoverMinBytes      = 2048;             // 小于它当「没有封面」
 // 正缓存读取上限：163 真的会给 8~10 MB 的封面（实测 Inoch EP 8.6 MB、二次元律动 VOL.2 10.1 MB），
 // 旧上限 8 MB 会让"cvSrc=net 但 GET 404"（已实测到 2 张）。这里放宽到 24 MB 并让 has/read 同一口径。
 static constexpr unsigned long long kCoverMaxBytes = 24ull * 1024ull * 1024ull;
+// 2026-10-26 (261026-05): real covers can be huge (DizzyLab ships 3543x3543 images up to 10 MB).
+// Measured on the real library: 64 covers, only 4 exceed 3 MB and all 4 are PNG (max 9.66 MB).
+// treated as unusable and the next source is tried instead.
+static constexpr size_t kCoverSoftMaxBytes = 12u * 1024u * 1024u;
 static constexpr long long kCoverNegSec     = 7LL * 24 * 3600;  // 负缓存有效期：7 天
 static constexpr int    kCoverBgConcurrency = 2;                // 后台同时抓几张
 
@@ -4520,13 +4529,34 @@ static bool cover_neg_fresh(const std::string& key) {
     return !artistimg_file_older_than(p, kCoverNegSec);
 }
 
-static std::string cover_env_host() {
+static std::string cover_env_base(const char* name) {
     char* v = nullptr;
     size_t n = 0;
     std::string host;
-    if (_dupenv_s(&v, &n, "RLPLAYER_COVER_HOST") == 0 && v) { host = v; free(v); }
-    while (!host.empty() && (host.back() == ' ' || host.back() == '/')) host.pop_back();
-    return host;                              // 空 = 用网易官方域名
+    if (_dupenv_s(&v, &n, name) == 0 && v) { host = v; free(v); }
+    while (!host.empty() && (host.back() == ' ' || host.back() == '\t' || host.back() == '/')) host.pop_back();
+    return host;                              // 空 = 用官方域名
+}
+// 三个图源各自一个覆盖变量（自动化测试用它把某个/全部源指到不可达地址，验证"断网不写脏缓存"）：
+//   RLPLAYER_COVER_HOST        网易云（原有）
+//   RLPLAYER_COVER_HOST_QQ     QQ 音乐（2026-10-26 新增图源）
+//   RLPLAYER_COVER_HOST_DIZZY  DizzyLab（2026-10-26 新增图源）
+static std::string cover_env_host() {
+    const std::string h = cover_env_base("RLPLAYER_COVER_HOST");
+    return h.empty() ? std::string("https://music.163.com") : h;
+}
+static std::string cover_env_host_qq() {
+    const std::string h = cover_env_base("RLPLAYER_COVER_HOST_QQ");
+    return h.empty() ? std::string("https://c.y.qq.com") : h;
+}
+// 图片 CDN 的覆盖（只给离线注入用：搜索能通、图床不通时也要不写脏缓存）
+static std::string cover_env_img_qq() {
+    const std::string h = cover_env_base("RLPLAYER_COVER_IMG_QQ");
+    return h.empty() ? std::string("https://y.gtimg.cn") : h;
+}
+static std::string cover_env_img_dl() {
+    const std::string h = cover_env_base("RLPLAYER_COVER_IMG_DIZZY");
+    return h.empty() ? std::string("https://cdn.dizzylab.net") : h;
 }
 
 // ---------------- 名称比对（宁缺勿错，但容得下"同一张碟的不同写法"）----------------
@@ -4611,20 +4641,27 @@ static bool cover_vec_has(const std::vector<uint32_t>& hay, const std::vector<ui
     return false;
 }
 
+// diceOut/nameOut 只用于日志（COVSRC src=netease dice=…）：未命中时 diceOut = 最像的那条
+// （判"名字对不上"和"根本没结果"是两件事，报告里必须分得开）。
 static std::string cover_pick_pic(const std::string& js, const std::string& wantName,
-                                  const std::string& wantArtist) {
+                                  const std::string& wantArtist,
+                                  double* diceOut = nullptr, std::string* nameOut = nullptr) {
     const rta::net::Json j = rta::net::json_parse(js);
     const rta::net::Json& albums = j["result"]["albums"];
     const std::vector<uint32_t> want = cover_name_key(wantName);
     const std::vector<uint32_t> who  = cover_name_key(wantArtist);
     std::string best;
+    std::string bestName;
     double bestScore = 0.0;
+    double seenDice = 0.0;                       // 全部候选里最像的那条的 Dice（拒绝原因用）
     for (size_t i = 0; i < albums.size(); ++i) {
         const rta::net::Json& a = albums.at(i);
         const std::string pic = a["picUrl"].s();
         if (pic.empty()) continue;
         const std::vector<uint32_t> nm = cover_name_key(a["name"].s());
         const double d = cover_dice(want, nm);
+        if (d > seenDice) seenDice = d;
+        if (d > seenDice) seenDice = d;
         // 「一张名字被加了前缀/后缀」也算候选：《遠景Landscape》vs 网易的《遠景Landscape -Touhou Mellow
         // Beats-》Dice 只有 0.52，但它确实是同一张碟。所以包含关系单独放行 —— 只是仍要艺术家佐证。
         const bool contained = (want.size() >= 4 && cover_vec_has(nm, want)) ||
@@ -4643,8 +4680,10 @@ static std::string cover_pick_pic(const std::string& js, const std::string& want
             }
         }
         if (d < 0.90 && !artistOk) continue;          // 只是"有点像"或"名字被加了前后缀"：必须有艺术家佐证
-        if (d > bestScore) { best = pic; bestScore = d; if (d >= 0.999) break; }
+        if (d > bestScore) { best = pic; bestName = a["name"].s(); bestScore = d; if (d >= 0.999) break; }
     }
+    if (diceOut) *diceOut = best.empty() ? seenDice : bestScore;
+    if (nameOut) *nameOut = bestName;
     return best;
 }
 
@@ -4654,7 +4693,9 @@ static std::string cover_pick_pic(const std::string& js, const std::string& want
 // 既慢又容易触发对方限流。值 "" = 查过但没有。
 struct CoverTermCache {
     std::mutex mtx;
-    std::unordered_map<std::string, std::string> pic;
+    std::unordered_map<std::string, std::string> pic;                  // 网易：词 → 封面 URL（"" = 查过没有）
+    std::unordered_map<std::string, std::vector<struct CoverCand> > qq; // QQ：词 → 候选（见下「图源链」）
+    std::unordered_map<std::string, std::vector<struct CoverCand> > dl; // DizzyLab：词 → 候选
 };
 
 // 下载回来的到底是不是图（别把 4xx 错误页/防盗链 HTML 当封面存下来）
@@ -4669,10 +4710,318 @@ static bool cover_looks_like_image(const std::vector<unsigned char>& b) {
 // 一张待抓的专辑（**深拷贝**自库快照：后台线程绝不回头读 Library 单例）
 struct CoverJob { std::string key, name, artist, term; };
 
+// ---------------- 图源链：网易云(type=10) → QQ 音乐 → DizzyLab →（API 补图，另立端点）----------------
+// 2026-10-26（261026-05 用户反馈）：网易云查不到、QQ 音乐查得到的专辑永远补不上（例《盈月纪年2》
+// 《深空余音》）。QQ 的 client_search_cp 对同人碟覆盖比网易好；DizzyLab 是同人第一手目录（网页，非 API）。
+//
+// 三条纪律（沿用网易那条路已验证的口径，绝不放宽）：
+//   ① 名字核对是**硬闸**：Dice < 0.72 一律拒绝（why=name_mismatch）；0.72~0.90 必须有艺术家佐证；
+//      ≥0.90 认名字（只差繁体/标点/词序）。**绝不拿第一条结果凑数** —— 实测搜「深空余音」，
+//      QQ 第一条是「日落日出」（Dice 0.0）：错图落盘不会自己变对，比空白更糟。
+//   ② 只有**所有源都给出定论**（服务器明确说没有）才写 .none；任一源瞬态失败（status==0/超时/
+//      返回的不是搜索页）⟹ 不写负缓存，下一轮重试。断网一次不能把整库染成"没有封面"。
+//   ③ 下载回来的必须 ≥2048 B 且是图片魔数（jpg/png/webp）才落盘；先 .part 再原子改名。
+//
+// 日志（一行一源）：
+//   COVSRC src=qq name=<专辑> mid=<albummid> bytes=123456 dice=1.000 cand=<命中候选名>
+//   COVSRC src=dizzylab name=<专辑> mid=<catalog> bytes=… dice=…
+//   COVSRC src=qq name=<专辑> why=name_mismatch dice=0.286 cand=<最像的候选>   （拒绝也要留证据）
+struct CoverCand {                    // 一个候选（三源统一形态）
+    std::string name;                 // 专辑/作品名
+    std::string mid;                  // QQ albummid / DizzyLab catalog
+    std::string url;                  // 图片直链
+    std::vector<std::string> artists; // 艺术家/社团（可能多个，可能空）
+};
+
+struct CoverPick {                    // 一个源的裁选结果
+    bool found = false;
+    std::string url, mid, cand, why;
+    double dice = 0.0;
+    bool artistHit = false;
+};
+
+struct CoverSrcResult {               // 一个源的整轮结果
+    CoverPick pick;
+    bool transient = false;           // true ⟹ 本轮结论不可信，不许写 .none
+    std::string err;
+};
+
+// 名称裁决（QQ / DizzyLab 共用；网易那条路用 cover_pick_pic 里等价的阈值）。
+// wantName 为空 ⟹ 无从核对 ⟹ 一律不认（宁可空白）。
+static bool cover_name_verdict(const std::string& wantName, const std::string& wantArtist,
+                               const std::string& candName, const std::vector<std::string>& candArtists,
+                               double& diceOut, bool& artistOut, std::string& why) {
+    const std::vector<uint32_t> want = cover_name_key(wantName);
+    const std::vector<uint32_t> who  = cover_name_key(wantArtist);
+    const std::vector<uint32_t> nm   = cover_name_key(candName);
+    diceOut = cover_dice(want, nm);
+    artistOut = false;
+    if (who.size() >= 2) {
+        for (const auto& a : candArtists) {
+            const std::vector<uint32_t> ca = cover_name_key(a);
+            if (ca.size() >= 2 && (cover_vec_has(who, ca) || cover_vec_has(ca, who))) { artistOut = true; break; }
+        }
+    }
+    if (want.empty()) { why = "no_name"; return false; }
+    if (diceOut < 0.72) { why = "name_mismatch"; return false; }
+    if (diceOut < 0.90 && !artistOut) { why = "artist_mismatch"; return false; }
+    why = artistOut ? "name+artist" : "name";
+    return true;
+}
+
+// 在候选里挑一个：先看艺术家佐证（+0.5），再看 Dice。全被拒时把"最像的那条"的 Dice/原因带出去，
+// 供日志与报告区分「没结果」和「名字对不上」。
+static CoverPick cover_pick_best(const std::vector<CoverCand>& cands, const CoverJob& job) {
+    CoverPick best;
+    double bestScore = -1.0, seenDice = -1.0;
+    std::string seenWhy = "no_result", seenCand;
+    for (const auto& c : cands) {
+        if (c.url.empty() || c.name.empty()) continue;
+        double d = 0.0;
+        bool a = false;
+        std::string w;
+        if (!cover_name_verdict(job.name, job.artist, c.name, c.artists, d, a, w)) {
+            if (d > seenDice) { seenDice = d; seenWhy = w; seenCand = c.name; }
+            continue;
+        }
+        const double score = d + (a ? 0.5 : 0.0);
+        if (score > bestScore) {
+            bestScore = score;
+            best.found = true;
+            best.url = c.url;
+            best.mid = c.mid;
+            best.cand = c.name;
+            best.dice = d;
+            best.artistHit = a;
+            best.why = a ? "name+artist" : "name";
+        }
+    }
+    if (!best.found) {
+        best.dice = seenDice < 0.0 ? 0.0 : seenDice;
+        best.why = seenDice < 0.0 ? "no_result" : seenWhy;
+        best.cand = seenCand;
+    }
+    return best;
+}
+
+// 两跳查询词（与网易同口径）：①「专辑名 艺术家」 ② 只「专辑名」。
+static std::vector<std::string> cover_terms(const CoverJob& job) {
+    std::vector<std::string> t;
+    if (!job.term.empty()) t.push_back(job.term);
+    if (!job.name.empty() && job.name != job.term) t.push_back(job.name);
+    return t;
+}
+
+// QQ 搜索回包解析（GET client_search_cp?format=json 的 data.song.list）：
+//   albummid + albumname + singer[].name；封面 = https://y.gtimg.cn/music/photo_new/T002R500x500M000<mid>.jpg
+// （2026-10-26 实测：盈月纪年2 albummid=0036Uxug3EjvHO → 109603 B，magic FF D8 FF。）
+static std::vector<CoverCand> cover_parse_qq(const std::string& js, bool& looksSearch) {
+    std::vector<CoverCand> out;
+    looksSearch = js.find("\"song\"") != std::string::npos;      // 形状自检（防被塞一张错误页）
+    const rta::net::Json j = rta::net::json_parse(js);
+    const rta::net::Json& list = j["data"]["song"]["list"];
+    if (list.type != rta::net::Json::Arr) return out;
+    const std::string img = cover_env_img_qq();
+    std::set<std::string> seenMid;
+    for (size_t i = 0; i < list.size(); ++i) {
+        const rta::net::Json& c = list.at(i);
+        std::string mid = c["albummid"].s();
+        if (mid.size() < 8 || mid.size() > 32) continue;            // albummid 实测 14 位字母数字
+        bool okch = true;
+        for (unsigned char ch : mid) if (!std::isalnum(ch)) { okch = false; break; }
+        if (!okch) continue;
+        if (!seenMid.insert(mid).second) continue;                  // 同一张碟多首 ⟹ 只留一条
+        CoverCand d;
+        d.name = c["albumname"].s();
+        if (d.name.empty()) continue;
+        d.mid = mid;
+        d.url = img + "/music/photo_new/T002R500x500M000" + mid + ".jpg";
+        const rta::net::Json& sg = c["singer"];
+        for (size_t k = 0; k < sg.size(); ++k) {
+            const std::string nm = sg.at(k)["name"].s();
+            if (!nm.empty()) d.artists.push_back(nm);
+        }
+        out.push_back(std::move(d));
+    }
+    return out;
+}
+
+// QQ 源：GET <host>/soso/fcgi-bin/client_search_cp?p=1&n=10&w=<词>&format=json（实测 200 + JSON）。
+// 头必须带 Referer: https://y.qq.com/（实测缺了常见 403）。
+static CoverSrcResult cover_try_qq(const CoverJob& job, CoverTermCache& tc, int hopMs) {
+    CoverSrcResult r;
+    const std::string host = cover_env_host_qq();
+    const std::vector<std::string> hdr = {
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36",
+        "Referer: https://y.qq.com/",
+    };
+    double seenDice = -1.0;
+    std::string seenWhy = "no_result", seenCand;
+    const std::vector<std::string> terms = cover_terms(job);
+    if (terms.empty()) { r.err = "搜索词为空（专辑名与艺术家都没有）"; return r; }
+    for (const auto& term : terms) {
+        std::vector<CoverCand> cands;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lk(tc.mtx);
+            auto it = tc.qq.find(term);
+            if (it != tc.qq.end()) { cands = it->second; have = true; }
+        }
+        if (!have) {
+            const std::string url = host + "/soso/fcgi-bin/client_search_cp?p=1&n=10&w=" +
+                                    artistimg_pct(term) + "&format=json";
+            auto sr = rta::net::http_get(url, hdr, hopMs);
+            if (!sr.ok || sr.status != 200) {
+                r.transient = (sr.status == 0);
+                r.err = "qq search HTTP " + std::to_string(sr.status) + " " + sr.error;
+                return r;
+            }
+            const std::string js(sr.body.begin(), sr.body.end());
+            bool looks = false;
+            cands = cover_parse_qq(js, looks);
+            if (!looks && cands.empty()) {                          // 不是搜索结果（防盗链/验证页）
+                r.transient = true;
+                r.err = "qq search 响应不像搜索结果（" + std::to_string(js.size()) + "B）";
+                return r;
+            }
+            {
+                std::lock_guard<std::mutex> lk(tc.mtx);
+                if (tc.qq.size() < 8192) tc.qq[term] = cands;
+            }
+        }
+        const CoverPick p = cover_pick_best(cands, job);
+        if (p.found) { r.pick = p; return r; }
+        if (p.dice > seenDice) { seenDice = p.dice; seenWhy = p.why; seenCand = p.cand; }
+    }
+    if (seenDice >= 0.0) { r.pick.dice = seenDice; r.pick.why = seenWhy; r.pick.cand = seenCand; }
+    else r.pick.why = "no_result";
+    return r;
+}
+
+// DizzyLab 源：站点是服务端渲染的搜索页（/search/?s=<词>），用 provider.h 里已验证的纯解析器
+// （parse_dizzylab_search → dl_parse_work_cards：只取「作品」段，卡片第一个 h1=作品名、h3=社团名），
+// 封面按 catalog 拼 https://cdn.dizzylab.net/media/cover/<catalog>.jpg（实测 200）。
+// ⚠️ 未实现：登录/付费内容 —— 本函数只看公开搜索页，不带任何登录态。
+static CoverSrcResult cover_try_dizzy(const CoverJob& job, CoverTermCache& tc, int hopMs) {
+    CoverSrcResult r;
+    const std::string host = cover_env_base("RLPLAYER_COVER_HOST_DIZZY");
+    const std::vector<std::string> hdr = {
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36",
+        "Referer: https://www.dizzylab.net/",
+    };
+    const std::string img = cover_env_img_dl();
+    double seenDice = -1.0;
+    std::string seenWhy = "no_result", seenCand;
+    const std::vector<std::string> terms = cover_terms(job);
+    if (terms.empty()) { r.err = "搜索词为空（专辑名与艺术家都没有）"; return r; }
+    for (const auto& term : terms) {
+        std::vector<CoverCand> cands;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lk(tc.mtx);
+            auto it = tc.dl.find(term);
+            if (it != tc.dl.end()) { cands = it->second; have = true; }
+        }
+        if (!have) {
+            // 生产路径用 provider.h 里那条已测过的 URL 构造（百分号编码口径一致）；测试用环境变量换主机。
+            const std::string url = host.empty() ? rta::meta::dizzylab_build_search_url(term)
+                                                 : (host + "/search/?s=" + rta::meta::percent_enc_utf8(term));
+            auto sr = rta::net::http_get(url, hdr, hopMs);
+            if (!sr.ok || sr.status != 200) {
+                r.transient = (sr.status == 0);
+                r.err = "dizzylab search HTTP " + std::to_string(sr.status) + " " + sr.error;
+                return r;
+            }
+            const std::string html(sr.body.begin(), sr.body.end());
+            std::string perr;
+            const std::vector<rta::meta::Candidate> cs = rta::meta::parse_dizzylab_search(html, perr);
+            if (!perr.empty()) {                                    // 页面不像 dizzylab（改版/网关页）
+                r.transient = true;
+                r.err = perr;
+                return r;
+            }
+            for (const auto& c : cs) {
+                if (c.albumId.empty() || c.title.empty()) continue;
+                CoverCand d;
+                d.name = c.title;
+                d.mid = c.albumId;
+                d.url = img.empty() ? c.coverUrl : (img + "/media/cover/" + c.albumId + ".jpg");
+                if (!c.artist.empty()) d.artists.push_back(c.artist);
+                cands.push_back(std::move(d));
+            }
+            {
+                std::lock_guard<std::mutex> lk(tc.mtx);
+                if (tc.dl.size() < 8192) tc.dl[term] = cands;
+            }
+        }
+        const CoverPick p = cover_pick_best(cands, job);
+        if (p.found) { r.pick = p; return r; }
+        if (p.dice > seenDice) { seenDice = p.dice; seenWhy = p.why; seenCand = p.cand; }
+    }
+    if (seenDice >= 0.0) { r.pick.dice = seenDice; r.pick.why = seenWhy; r.pick.cand = seenCand; }
+    else r.pick.why = "no_result";
+    return r;
+}
+
 // 后台专用：真正去网上取一张封面并落盘。
 // 返回值只用于统计：Hit = 拿到并写盘；Miss = 服务器确实没有（写 .none）；Fail = 瞬态失败（不写 .none）。
 enum class CoverOutcome { Hit, Miss, Fail };
 
+// 下载 + 落盘（三源共用一道闸）。语义同 CoverOutcome：
+//   Hit = 拿到并写盘；Miss = 图床明确回错（非图片/太小/4xx）；Fail = 网络层失败（瞬态，不写负缓存）。
+static CoverOutcome cover_download_store(const CoverPaths& pp, const std::string& url,
+                                         const std::vector<std::string>& hdr, int toMs,
+                                         std::string& err, long long* bytesOut) {
+    auto ir = rta::net::http_get(url, hdr, toMs);
+    if (ir.ok && ir.status == 200 && ir.body.size() > kCoverSoftMaxBytes) {
+        err = "图片过大 " + std::to_string(ir.body.size()) + "B（上限 " + std::to_string(kCoverSoftMaxBytes) + "）";
+        return CoverOutcome::Miss;   // 换下一个源；不写负缓存也不写真缓存
+    }
+    if (!(ir.ok && ir.status == 200 && ir.body.size() >= kCoverMinBytes && cover_looks_like_image(ir.body))) {
+        if (ir.status == 0) return CoverOutcome::Fail;
+        if (ir.ok && ir.status == 200) {
+            err = ir.body.size() < kCoverMinBytes
+                      ? ("图片太小 " + std::to_string(ir.body.size()) + "B")
+                      : ("不是图片（首字节 " + std::to_string(ir.body.empty() ? 0 : (int)ir.body[0]) + "）");
+            return CoverOutcome::Miss;
+        }
+        err = "download HTTP " + std::to_string(ir.status) + " " + ir.error;
+        return CoverOutcome::Miss;
+    }
+    std::error_code ec;
+    fs::create_directories(fs::u8path(pp.dir), ec);
+    // 先写 .part 再原子改名：读侧永远看不到半张图
+    const std::string tmp = pp.jpg + ".part";
+    {
+        std::ofstream f(fs::u8path(tmp), std::ios::binary | std::ios::trunc);
+        if (!f) throw std::runtime_error("无法写入 covercache（目录/权限？）");
+        f.write(reinterpret_cast<const char*>(ir.body.data()), (std::streamsize)ir.body.size());
+        f.flush();
+        if (!f) throw std::runtime_error("covercache 写入失败（磁盘满？）");
+    }
+    if (!MoveFileExW(widen(tmp).c_str(), widen(pp.jpg).c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        std::error_code em;
+        fs::rename(fs::u8path(tmp), fs::u8path(pp.jpg), em);
+        fs::remove(fs::u8path(tmp), em);
+    }
+    std::error_code el;
+    fs::remove(fs::u8path(pp.none), el);     // 有图了，旧负缓存作废
+    if (bytesOut) *bytesOut = (long long)ir.body.size();
+    return CoverOutcome::Hit;
+}
+
+// 日志用：dice 三位小数
+static std::string cover_dice_str(double d) {
+    char b[16];
+    std::snprintf(b, sizeof(b), "%.3f", d);
+    return std::string(b);
+}
+
+// 后台专用：真正去网上取一张封面并落盘（图源链 网易 → QQ → DizzyLab，见上「图源链」注释）。
+// 前一个源 miss 才走下一个；命中即落盘并打 COVSRC 日志。
+// 返回：Hit = 有源拿到并写盘；Miss = **所有**源都明确说没有（写 .none）；Fail = 至少一个源瞬态失败（不写）。
 static CoverOutcome cover_fetch(const CoverJob& job, CoverTermCache& tc,
                                 std::string* detail, long long* bytesOut) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -4681,100 +5030,171 @@ static CoverOutcome cover_fetch(const CoverJob& job, CoverTermCache& tc,
                    std::chrono::steady_clock::now() - t0).count();
     };
     const CoverPaths pp = cover_paths(job.key);
-    std::string pic, err;
-    bool transient = false;      // 瞬态失败（超时/断网/异常）⟹ 不写 7 天负缓存
+    std::string err, trace;
+    bool transient = false;      // 任一源瞬态失败（超时/断网/异常页）⟹ 不写 7 天负缓存
+
+    // 每个源的判定都留一句人话，拼进 COVERBG miss 的 detail（报告要能逐张解释为什么没补上）
+    auto note = [&](const std::string& s) { if (!trace.empty()) trace += ';'; trace += s; };
+    // 网易的拒绝原因：Dice 只有数字，原因由阈值反推（<0.72 = 名字不符，否则 = 艺术家佐证缺失）
+    auto netease_why = [](double d) {
+        if (d <= 0.0) return std::string("no_result");
+        return d < 0.72 ? std::string("name_mismatch") : std::string("artist_mismatch");
+    };
 
     try {
-        // 两跳搜索（见函数头注释）：① "专辑名 艺术家"  ② 只 "专辑名"。
-        // 为什么要第二跳：artist 是目录名/同人社团名时，把艺术家拼进去会**降低**召回 ——
-        //   实测 172 张无封面专辑里，带艺术家搜索命中 61，只按专辑名搜索能命中 66 张"完全同名"
-        //   （慈善套餐A / 春秋歷命序 / Swallow's Lies / 遠景Landscape 都是这样找回来的）。
-        struct Try { std::string term, note; };
-        std::vector<Try> tries;
-        if (!job.term.empty()) tries.push_back({job.term, "album+artist"});
-        if (!job.name.empty() && job.name != job.term) tries.push_back({job.name, "album"});
-        std::string host = cover_env_host();
-        if (host.empty()) host = "https://music.163.com";
-        const std::string surl = host + "/api/search/get";
-        const std::vector<std::string> hdr = {
-            "User-Agent: Mozilla/5.0",
-            "Referer: https://music.163.com/",
-        };
-        if (tries.empty()) err = "搜索词为空（专辑名与艺术家都没有）";
-        for (const auto& at : tries) {
-            const int remain = kCoverBudgetMs - elapsed_ms();
-            if (remain <= 0) { err = "预算耗尽（搜索前）"; transient = true; break; }
-            bool have = false;
-            std::string cached;
-            {
-                std::lock_guard<std::mutex> lk(tc.mtx);
-                auto it = tc.pic.find(at.term);
-                if (it != tc.pic.end()) { cached = it->second; have = true; }
-            }
-            if (have) {
-                if (!cached.empty()) { pic = cached; break; }
-                err = "search(" + at.note + ") 无 picUrl";
-                continue;
-            }
-            const int to = remain < kCoverSearchMs ? remain : kCoverSearchMs;
-            const std::string body = "s=" + artistimg_pct(at.term) + "&type=10&limit=5&offset=0";
-            auto sr = rta::net::http_post(surl, body, hdr, "application/x-www-form-urlencoded", to);
-            if (sr.ok && sr.status == 200) {
-                const std::string js(sr.body.begin(), sr.body.end());
-                const std::string got = cover_pick_pic(js, job.name, job.artist);
+        // ---------- ① 网易云音乐（type=10 专辑搜索）：原逻辑原样保留（两跳搜索 + 词缓存）----------
+        std::string pic, cand;
+        double dice = 0.0;
+        {
+            struct Try { std::string term, note; };
+            std::vector<Try> tries;
+            if (!job.term.empty()) tries.push_back({job.term, "album+artist"});
+            if (!job.name.empty() && job.name != job.term) tries.push_back({job.name, "album"});
+            const std::string surl = cover_env_host() + "/api/search/get";
+            const std::vector<std::string> hdr = {
+                "User-Agent: Mozilla/5.0",
+                "Referer: https://music.163.com/",
+            };
+            if (tries.empty()) err = "搜索词为空（专辑名与艺术家都没有）";
+            for (const auto& at : tries) {
+                const int remain = kCoverBudgetMs - elapsed_ms();
+                if (remain <= 0) { err = "预算耗尽（搜索前）"; transient = true; break; }
+                bool have = false;
+                std::string cached;
                 {
                     std::lock_guard<std::mutex> lk(tc.mtx);
-                    if (tc.pic.size() < 8192) tc.pic[at.term] = got;
+                    auto it = tc.pic.find(at.term);
+                    if (it != tc.pic.end()) { cached = it->second; have = true; }
                 }
-                if (!got.empty()) { pic = got; break; }
-                err = "search(" + at.note + ") 无 picUrl";
-            } else {
-                err = "search(" + at.note + ") HTTP " + std::to_string(sr.status) + " " + sr.error;
-                transient = (sr.status == 0);
-                if (transient) break;      // 断网/超时：第二跳也一定失败，别再浪费一个超时
+                if (have) {
+                    if (!cached.empty()) { pic = cached; break; }
+                    err = "search(" + at.note + ") 无 picUrl";
+                    continue;
+                }
+                const int to = remain < kCoverSearchMs ? remain : kCoverSearchMs;
+                const std::string body = "s=" + artistimg_pct(at.term) + "&type=10&limit=5&offset=0";
+                auto sr = rta::net::http_post(surl, body, hdr, "application/x-www-form-urlencoded", to);
+                if (sr.ok && sr.status == 200) {
+                    const std::string js(sr.body.begin(), sr.body.end());
+                    double gotDice = 0.0;
+                    std::string gotName;
+                    const std::string got = cover_pick_pic(js, job.name, job.artist, &gotDice, &gotName);
+                    {
+                        std::lock_guard<std::mutex> lk(tc.mtx);
+                        if (tc.pic.size() < 8192) tc.pic[at.term] = got;
+                    }
+                    if (!got.empty()) { pic = got; dice = gotDice; cand = gotName; break; }
+                    if (gotDice > dice) { dice = gotDice; cand = gotName; }
+                    err = "search(" + at.note + ") 无 picUrl";
+                    if (remain < kCoverSearchMs) transient = true;   // 预算被压到很短时的超时不作数
+                } else {
+                    err = "search(" + at.note + ") HTTP " + std::to_string(sr.status) + " " + sr.error;
+                    transient = (sr.status == 0);
+                    if (transient) break;      // 断网/超时：第二跳也一定失败，别再浪费一个超时
+                }
             }
         }
         if (!pic.empty()) {
             const int remain = kCoverBudgetMs - elapsed_ms();
-            if (remain > 0) {
+            if (remain <= 0) { err = "预算耗尽（下载前）"; transient = true; note("netease budget_exhausted"); }
+            else {
                 const int to = remain < kCoverDownloadMs ? remain : kCoverDownloadMs;
-                auto ir = rta::net::http_get(pic,
-                                             {"User-Agent: Mozilla/5.0", "Referer: https://music.163.com/"}, to);
-                if (ir.ok && ir.status == 200 && ir.body.size() >= kCoverMinBytes &&
-                    cover_looks_like_image(ir.body)) {
-                    std::error_code ec;
-                    fs::create_directories(fs::u8path(pp.dir), ec);
-                    // 先写 .part 再原子改名：读侧永远看不到半张图
-                    const std::string tmp = pp.jpg + ".part";
-                    {
-                        std::ofstream f(fs::u8path(tmp), std::ios::binary | std::ios::trunc);
-                        if (!f) throw std::runtime_error("无法写入 covercache（目录/权限？）");
-                        f.write(reinterpret_cast<const char*>(ir.body.data()), (std::streamsize)ir.body.size());
-                        f.flush();
-                        if (!f) throw std::runtime_error("covercache 写入失败（磁盘满？）");
-                    }
-                    if (!MoveFileExW(widen(tmp).c_str(), widen(pp.jpg).c_str(), MOVEFILE_REPLACE_EXISTING)) {
-                        std::error_code em;
-                        fs::rename(fs::u8path(tmp), fs::u8path(pp.jpg), em);
-                        fs::remove(fs::u8path(tmp), em);
-                    }
-                    std::error_code el;
-                    fs::remove(fs::u8path(pp.none), el);     // 有图了，旧负缓存作废
+                std::string derr;
+                long long got = 0;
+                const CoverOutcome oc = cover_download_store(
+                    pp, pic, {"User-Agent: Mozilla/5.0", "Referer: https://music.163.com/"}, to, derr, &got);
+                if (oc == CoverOutcome::Hit) {
+                    play_log("COVSRC src=netease name=" + job.name + " bytes=" + std::to_string(got) +
+                             " dice=" + cover_dice_str(dice) + " cand=" + cand + " url=" + pic);
                     if (detail) *detail = pic;
-                    if (bytesOut) *bytesOut = (long long)ir.body.size();
+                    if (bytesOut) *bytesOut = got;
                     return CoverOutcome::Hit;
                 }
-                if (ir.ok && ir.status == 200) {
-                    err = ir.body.size() < kCoverMinBytes
-                              ? ("图片太小 " + std::to_string(ir.body.size()) + "B")
-                              : ("不是图片（首字节 " + std::to_string(ir.body.empty() ? 0 : (int)ir.body[0]) + "）");
+                if (oc == CoverOutcome::Fail) transient = true;
+                play_log("COVSRC src=netease name=" + job.name + " bytes=0 miss why=download " +
+                         derr + " url=" + pic);
+                note("netease dl_fail(" + derr + ")");
+            }
+        } else {
+            // 网络失败与"服务器说没有"必须分开写：前者 transient（不写负缓存），后者才是定论
+            note(!err.empty() ? ("netease " + err)
+                              : ("netease " + (dice > 0.0 ? ("why=" + netease_why(dice) + " dice=" + cover_dice_str(dice))
+                                                          : std::string("no_result"))));
+        }
+
+        // ---------- ② QQ 音乐（2026-10-26 新增：同人碟覆盖优于网易）----------
+        {
+            const int remain = kCoverBudgetMs - elapsed_ms();
+            if (remain <= 400) { transient = true; note("qq budget_exhausted"); }
+            else {
+                const int hop = remain < kCoverSearchMs ? remain : kCoverSearchMs;
+                const CoverSrcResult q = cover_try_qq(job, tc, hop);
+                if (q.transient) transient = true;
+                if (q.pick.found) {
+                    const int remain2 = kCoverBudgetMs - elapsed_ms();
+                    const int to = remain2 < kCoverDownloadMs ? (remain2 > 0 ? remain2 : 1) : kCoverDownloadMs;
+                    std::string derr;
+                    long long got = 0;
+                    const CoverOutcome oc = cover_download_store(
+                        pp, q.pick.url, {"User-Agent: Mozilla/5.0", "Referer: https://y.qq.com/"}, to, derr, &got);
+                    if (oc == CoverOutcome::Hit) {
+                        play_log("COVSRC src=qq name=" + job.name + " mid=" + q.pick.mid + " bytes=" +
+                                 std::to_string(got) + " dice=" + cover_dice_str(q.pick.dice) +
+                                 " cand=" + q.pick.cand);
+                        if (detail) *detail = q.pick.url;
+                        if (bytesOut) *bytesOut = got;
+                        return CoverOutcome::Hit;
+                    }
+                    if (oc == CoverOutcome::Fail) transient = true;
+                    play_log("COVSRC src=qq name=" + job.name + " mid=" + q.pick.mid +
+                             " bytes=0 miss why=download " + derr);
+                    note("qq dl_fail(" + derr + ")");
                 } else {
-                    err = "download HTTP " + std::to_string(ir.status) + " " + ir.error;
-                    transient = (ir.status == 0);
+                    if (q.pick.dice > 0.0)
+                        play_log("COVSRC src=qq name=" + job.name + " why=" + q.pick.why +
+                                 " dice=" + cover_dice_str(q.pick.dice) + " cand=" + q.pick.cand);
+                    note(q.transient ? ("qq fail(" + q.err + ")")
+                                     : ("qq " + (q.pick.dice > 0.0 ? ("why=" + q.pick.why + " dice=" + cover_dice_str(q.pick.dice))
+                                                                   : std::string("no_result"))));
                 }
-            } else {
-                err = "预算耗尽（下载前）";
-                transient = true;
+            }
+        }
+
+        // ---------- ③ DizzyLab（同人第一手目录；网页搜索页 + catalog 拼封面）----------
+        {
+            const int remain = kCoverBudgetMs - elapsed_ms();
+            if (remain <= 400) { transient = true; note("dizzylab budget_exhausted"); }
+            else {
+                const int hop = remain < kCoverSearchMs ? remain : kCoverSearchMs;
+                const CoverSrcResult d = cover_try_dizzy(job, tc, hop);
+                if (d.transient) transient = true;
+                if (d.pick.found) {
+                    const int remain2 = kCoverBudgetMs - elapsed_ms();
+                    const int to = remain2 < kCoverDownloadMs ? (remain2 > 0 ? remain2 : 1) : kCoverDownloadMs;
+                    std::string derr;
+                    long long got = 0;
+                    const CoverOutcome oc = cover_download_store(
+                        pp, d.pick.url, {"User-Agent: Mozilla/5.0", "Referer: https://www.dizzylab.net/"}, to, derr, &got);
+                    if (oc == CoverOutcome::Hit) {
+                        play_log("COVSRC src=dizzylab name=" + job.name + " mid=" + d.pick.mid + " bytes=" +
+                                 std::to_string(got) + " dice=" + cover_dice_str(d.pick.dice) +
+                                 " cand=" + d.pick.cand);
+                        if (detail) *detail = d.pick.url;
+                        if (bytesOut) *bytesOut = got;
+                        return CoverOutcome::Hit;
+                    }
+                    if (oc == CoverOutcome::Fail) transient = true;
+                    play_log("COVSRC src=dizzylab name=" + job.name + " mid=" + d.pick.mid +
+                             " bytes=0 miss why=download " + derr);
+                    note("dizzylab dl_fail(" + derr + ")");
+                } else {
+                    if (d.pick.dice > 0.0)
+                        play_log("COVSRC src=dizzylab name=" + job.name + " why=" + d.pick.why +
+                                 " dice=" + cover_dice_str(d.pick.dice) + " cand=" + d.pick.cand);
+                    note(d.transient ? ("dizzylab fail(" + d.err + ")")
+                                     : ("dizzylab " + (d.pick.dice > 0.0 ? ("why=" + d.pick.why + " dice=" + cover_dice_str(d.pick.dice))
+                                                                         : std::string("no_result"))));
+                }
             }
         }
     } catch (const std::exception& e) {
@@ -4792,7 +5212,14 @@ static CoverOutcome cover_fetch(const CoverJob& job, CoverTermCache& tc,
             std::ofstream f(fs::u8path(pp.none), std::ios::binary | std::ios::trunc);
         } catch (...) {}
     }
-    if (detail) *detail = err + " ms=" + std::to_string(elapsed_ms());
+    if (detail) {
+        // err 是网易那一跳的原始错误串，trace 里已经带了同一句（note("netease " + err)）⟹ 去重，
+        // 否则断网日志会变成 "search(…) HTTP 0 …; netease search(…) HTTP 0 …" 两句一样的。
+        std::string d = trace;
+        if (!err.empty() && trace.find(err) == std::string::npos) d = err + "; " + trace;
+        if (d.empty()) d = err;
+        *detail = d + (transient ? " [transient]" : "") + " ms=" + std::to_string(elapsed_ms());
+    }
     return transient ? CoverOutcome::Fail : CoverOutcome::Miss;
 }
 
@@ -4872,7 +5299,8 @@ static bool cover_bg_start(std::vector<CoverJob> jobs) {
 
 // 待抓名单（**请求线程**里构建：只读库 + 读目录，不发网络、不下载）。
 // 已有正缓存 / 负缓存未过期 的专辑直接跳过 ⟹ queued 与 total 就是"真的还要联网"的张数。
-static std::vector<CoverJob> cover_build_queue(const std::vector<std::string>& onlyKeys) {
+// all=true ⟹ 忽略 .none（见端点注释：加了新图源后，旧负缓存必须能被重试）。
+static std::vector<CoverJob> cover_build_queue(const std::vector<std::string>& onlyKeys, bool ignoreNeg) {
     std::vector<CoverJob> out;
     auto& lib = Library::instance();
     if (!onlyKeys.empty()) {
@@ -4886,7 +5314,7 @@ static std::vector<CoverJob> cover_build_queue(const std::vector<std::string>& o
     }
     for (const auto& t : lib.albumsWithoutCover()) {
         if (cover_has_disk(t.key)) continue;           // 已经抓到了
-        if (cover_neg_fresh(t.key)) continue;          // 7 天内确认为"没有"，别每天重打
+        if (!ignoreNeg && cover_neg_fresh(t.key)) continue;   // 7 天内确认为"没有"，别每天重打
         out.push_back({t.key, t.name, t.artist, t.term});
     }
     return out;
@@ -4946,6 +5374,15 @@ static const char* kApiHostAllow[] = {
     "*.bcbits.com",                   // Bandcamp 图片（同人碟主场之一）
     "*.bandcamp.com",
     "*.discogs.com",                  // Discogs 图片
+  // 2026-10-26 (261026-05 #2/#3): QQ Music + DizzyLab. Previously only netease domains were allowed,
+  // so even a correct QQ cover URL from the model was rejected as host_not_allowed.
+  "y.gtimg.cn",
+  "*.gtimg.cn",
+  "*.y.qq.com",
+  "*.qq.com",
+  "www.dizzylab.net",
+  "*.dizzylab.net",
+  "dizzylab.net",
 };
 
 // 日志安全：把 key 与任何形如 sk-xxx 的片段换成 sk-****（模型/服务端偶尔会把 key 回显进错误文本）。
@@ -7418,18 +7855,27 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         // ---- 封面预热（POST；副作用端点，见 kNeedPost）----
         // 立刻返回，网络/下载全在后台 2 线程（见文件中部「专辑封面在线抓取」注释）。
         if (rq.path.rfind("/api/lib/cover/prefetch", 0) == 0) {
-            std::string rawK;
-            const size_t q = rq.path.find("?k=");
-            if (q != std::string::npos) rawK = urlDecode(rq.path.substr(q + 3));
-            if (rawK.empty()) {   // 也接受表单体 k=<键,键>
-                const size_t f = rq.body.find("k=");
-                if (f != std::string::npos) {
-                    std::string v = rq.body.substr(f + 2);
-                    const size_t amp = v.find('&');
-                    if (amp != std::string::npos) v = v.substr(0, amp);
-                    rawK = urlDecode(v);
+            // 查询参数按名取（旧代码写死 "?k=" ⟹ 一旦加上 all=1 前缀就再也取不到 k）
+            auto qp_get = [](const std::string& raw, const char* name) {
+                const std::string pat = std::string(name) + "=";
+                size_t i = 0;
+                while ((i = raw.find(pat, i)) != std::string::npos) {
+                    const bool lead = (i == 0) || raw[i - 1] == '?' || raw[i - 1] == '&' || raw[i - 1] == ';';
+                    if (lead) {
+                        const size_t b = i + pat.size();
+                        size_t e = raw.find_first_of("&;#", b);
+                        if (e == std::string::npos) e = raw.size();
+                        return urlDecode(raw.substr(b, e - b));
+                    }
+                    i += pat.size();
                 }
-            }
+                return std::string();
+            };
+            std::string rawK = qp_get(rq.path, "k");
+            if (rawK.empty()) rawK = qp_get(rq.body, "k");   // 也接受表单体 k=<键,键>
+            const std::string rawAll = qp_get(rq.path, "all").empty() ? qp_get(rq.body, "all")
+                                                                     : qp_get(rq.path, "all");
+            const bool all = (rawAll == "1" || rawAll == "true" || rawAll == "yes");
             std::vector<std::string> keys;
             {
                 std::string cur;
@@ -7446,16 +7892,23 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 }
                 flush();
             }
-            const auto jobs = cover_build_queue(keys);      // 只读库 + stat，不发网络
+            const auto t0p = std::chrono::steady_clock::now();
+            const auto jobs = cover_build_queue(keys, all);      // 只读库 + stat，不发网络
             const size_t total = jobs.size();
             const bool started = cover_bg_start(std::move(jobs));
+            const double msp = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - t0p).count();
             play_log("COVERBG prefetch queued=" + std::to_string(started ? total : 0) +
                      " candidates=" + std::to_string(total) +
-                     " source=" + (keys.empty() ? "library" : "keys"));
+                     " source=" + (keys.empty() ? "library" : "keys") +
+                     " all=" + std::to_string(all ? 1 : 0) +
+                     " ms=" + std::to_string((long long)msp));
             std::ostringstream j;
             j << "{\"ok\":true,\"queued\":" << (started ? total : 0)
               << ",\"candidates\":" << total
-              << ",\"running\":" << (started ? "true" : "false") << "}";
+              << ",\"all\":" << (all ? "true" : "false")
+              << ",\"running\":" << (started ? "true" : "false")
+              << ",\"ms\":" << (long long)msp << "}";
             return j.str();
         }
         // ---- 一张封面（只读；零网络，见文件中部「专辑封面在线抓取」注释）----
@@ -7577,6 +8030,31 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 bytes.clear();
                 mime = "image/jpeg";
                 if (cover_read_cached(key, bytes)) { src = "net"; mime = cover_mime_of(bytes); }
+                // 2026-10-26 (261026-05): album key formula changed. If the new key has no
+                // cached cover, look up the LEGACY key and migrate the file in place, so users
+                // who already downloaded covers do not lose them after upgrading.
+                if (src == std::string("none")) {
+                    rta::net::LibAlbum la;
+                    if (lib.album(key, la) && !la.legacyKey.empty() && la.legacyKey != key) {
+                        std::vector<unsigned char> lbytes;
+                        if (cover_read_cached(la.legacyKey, lbytes)) {
+                            const CoverPaths pn = cover_paths(key);
+                            std::error_code ec2;
+                            fs::create_directories(fs::u8path(pn.dir), ec2);
+                            const std::string tmp = pn.jpg + ".part";
+                            {
+                                std::ofstream wf(fs::u8path(tmp), std::ios::binary | std::ios::trunc);
+                                if (wf) { wf.write(reinterpret_cast<const char*>(lbytes.data()), (std::streamsize)lbytes.size()); }
+                            }
+                            if (!MoveFileExW(widen(tmp).c_str(), widen(pn.jpg).c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                                std::error_code em; fs::rename(fs::u8path(tmp), fs::u8path(pn.jpg), em); fs::remove(fs::u8path(tmp), em);
+                            }
+                            fs::remove(fs::u8path(pn.none), ec2);
+                            bytes.swap(lbytes); src = "net"; mime = cover_mime_of(bytes);
+                            play_log("COVSRC legacy-migrate k=" + key + " from=" + la.legacyKey + " bytes=" + std::to_string((unsigned long long)bytes.size()));
+                        }
+                    }
+                }
             }
             const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - t0).count();
