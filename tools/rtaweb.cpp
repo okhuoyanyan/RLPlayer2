@@ -4594,6 +4594,61 @@ static void cover_utf8_cp(const std::string& s, std::vector<uint32_t>& out) {
 // 规范化：全角 ASCII → 半角、ASCII 小写、丢掉标点/空白/引号、丢掉括号（含全角括号）里的内容、
 // 丢掉带音符的拉丁字母（Promúsica → Promsica，不影响 Dice 判断）。
 // 保留：ASCII 字母数字、CJK 汉字、假名、谚文。
+// 2026-10-26 (261026-06)：繁→简归一。
+// 实测：「盈月纪年2」（我们标签里的**简体**"纪" = U+7EAA）与网易返回的
+// 「盈月紀年2 ~ others have their destiny, we have our own」（**繁体**"紀" = U+7D00 + 长英文副标题）
+// 被判成不匹配，于是网易明明有结果却被丢弃。这里覆盖常见繁简异体（同人/东方碟几乎都在这批里），
+// 不做完整转换表 —— 目的是让"同一个名字的不同写法"落到同一个 key，而不是做通用繁简转换。
+static uint32_t cover_cp_simplify(uint32_t cp) {
+    switch (cp) {
+        case 0x7D00: return 0x7EAA;   // 紀→纪
+        case 0x7D93: return 0x7ECF;   // 經→经
+        case 0x8AAA: return 0x8BF4;   // 說→说
+        case 0x6771: return 0x4E1C;   // 東→东
+        case 0x9EDE: return 0x70B9;   // 點→点
+        case 0x6703: return 0x4F1A;   // 會→会
+        case 0x8A5E: return 0x8BCD;   // 詞→词
+        case 0x8A9E: return 0x8BED;   // 語→语
+        case 0x6975: return 0x6781;   // 極→极
+        case 0x6A02: return 0x4E50;   // 樂→乐
+        case 0x9B31: return 0x90C1;   // 鬱→郁
+        case 0x9B25: return 0x6597;   // 鬥→斗
+        case 0x96BB: return 0x53EA;   // 隻→只
+        case 0x8B58: return 0x8BC6;   // 識→识
+        case 0x8B70: return 0x8BAE;   // 議→议
+        case 0x8B49: return 0x8BC1;   // 證→证
+        case 0x9AD4: return 0x4F53;   // 體→体
+        case 0x9A57: return 0x9A8C;   // 驗→验
+        case 0x5340: return 0x533A;   // 區→区
+        case 0x570B: return 0x56FD;   // 國→国
+        case 0x5718: return 0x56E2;   // 團→团
+        case 0x5713: return 0x5706;   // 圓→圆
+        case 0x8F49: return 0x8F6C;   // 轉→转
+        case 0x8B8A: return 0x53D8;   // 變→变
+        case 0x9593: return 0x95F4;   // 間→间
+        case 0x9592: return 0x95F2;   // 閒→闲
+        case 0x88DD: return 0x88C5;   // 裝→装
+        case 0x88E1: return 0x91CC;   // 裏→里
+        case 0x7D55: return 0x7EDD;   // 絕→绝
+        case 0x9F4A: return 0x9F50;   // 齊→齐
+        case 0x9EBC: return 0x4E48;   // 麼→么
+        case 0x6A19: return 0x6807;   // 標→标
+        case 0x984C: return 0x9898;   // 題→题
+        case 0x5E36: return 0x5E26;   // 帶→带
+        case 0x5C0E: return 0x5BFC;   // 導→导
+        case 0x5F8C: return 0x540E;   // 後→后
+        case 0x88FD: return 0x5236;   // 製→制
+        case 0x767C: return 0x53D1;   // 發→发
+        case 0x5EE3: return 0x5E7F;   // 廣→广
+        case 0x8FBA: return 0x8FB9;   // 邊→边
+        case 0x969B: return 0x9645;   // 際→际
+        case 0x92B7: return 0x9500;   // 銷→销
+        case 0x7D5E: return 0x7EDE;   // 絞→绞
+        case 0x8B77: return 0x62A4;   // 護→护
+        default: return cp;
+    }
+}
+
 static std::vector<uint32_t> cover_name_key(const std::string& s) {
     std::vector<uint32_t> raw, out;
     cover_utf8_cp(s, raw);
@@ -4613,7 +4668,7 @@ static std::vector<uint32_t> cover_name_key(const std::string& s) {
         if (cp >= 0xFF00 && cp <= 0xFF0F) continue;
         if (cp >= 0xFF1A && cp <= 0xFF20) continue;
         if (cp >= 0xFF3B && cp <= 0xFF40) continue;
-        out.push_back(cp);                                     // 汉字 / 假名 / 谚文 / 拉丁字母
+        out.push_back(cover_cp_simplify(cp));                  // 繁→简后再入 key
     }
     return out;
 }
@@ -4848,6 +4903,41 @@ static std::vector<CoverCand> cover_parse_qq(const std::string& js, bool& looksS
 
 // QQ 源：GET <host>/soso/fcgi-bin/client_search_cp?p=1&n=10&w=<词>&format=json（实测 200 + JSON）。
 // 头必须带 Referer: https://y.qq.com/（实测缺了常见 403）。
+static std::string apifill_read_key_file(const std::string& p) {
+    std::ifstream f(fs::u8path(p), std::ios::binary);
+    if (!f) return std::string();
+    std::string line;
+    if (!std::getline(f, line)) return std::string();
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    size_t b = 0, e = line.size();
+    while (b < e && (unsigned char)line[b] <= 0x20) ++b;
+    while (e > b && (unsigned char)line[e - 1] <= 0x20) --e;
+    const std::string k = line.substr(b, e - b);
+    if (k.size() < 8 || k.size() > 512) return std::string();
+    if (k.rfind("sk-", 0) != 0) return std::string();          // 明显不是 key：不当 key 用
+    for (unsigned char c : k) if (c <= 0x20 || c == 0x7F) return std::string();
+    return k;
+}
+static rta::meta::LlmConfig apifill_llm_cfg() {
+    // 路径口径与设置页 /api/llm 完全一致：exe 同目录，不随进程工作目录漂移。
+    //（不直接调 llm_conf_path()：它定义在本文件更后面，这里提前用会编译失败。）
+    rta::meta::LlmConfig cfg = rta::meta::llm_config_load(path_in_exe_dir("rlplayer-llm.conf"));
+    if (!cfg.apiKey.empty()) return cfg;
+    std::string dir = path_in_exe_dir(nullptr);
+    if (!dir.empty() && (dir.back() == '\\' || dir.back() == '/')) dir.pop_back();
+    play_log("LLMKEY base_dir=[" + dir + "]");
+    for (int up = 0; up < 3 && !dir.empty(); ++up) {
+        const std::string kp = dir + "\\KEY.txt";
+        const std::string k = apifill_read_key_file(kp);
+        play_log("LLMKEY try [" + kp + "] got=" + (k.empty() ? std::string("NO") : std::string("YES")));
+        if (!k.empty()) { cfg.apiKey = k; break; }
+        const size_t slash = dir.find_last_of("\\/");
+        if (slash == std::string::npos || slash < 3) break;
+        dir = dir.substr(0, slash);
+    }
+    return cfg;
+}
+
 static CoverSrcResult cover_try_qq(const CoverJob& job, CoverTermCache& tc, int hopMs) {
     CoverSrcResult r;
     const std::string host = cover_env_host_qq();
@@ -4873,9 +4963,14 @@ static CoverSrcResult cover_try_qq(const CoverJob& job, CoverTermCache& tc, int 
                                     artistimg_pct(term) + "&format=json";
             auto sr = rta::net::http_get(url, hdr, hopMs);
             if (!sr.ok || sr.status != 200) {
-                r.transient = (sr.status == 0);
+                // 2026-10-26 (261026-06): 5xx 是服务端限流/故障，**不是**"没有这张专辑"。
+                // 旧代码只把 status==0 当 transient，于是 HTTP 500 被归类成"查过没有"并写进 .none，
+                // 用户永远看不到封面（实机日志：qq no_result 写死了 .none）。
+                r.transient = (sr.status == 0 || sr.status >= 500 || sr.status == 429);
                 r.err = "qq search HTTP " + std::to_string(sr.status) + " " + sr.error;
-                return r;
+                // 2026-10-26 (261026-06): 不要在这里 return —— 搜索接口 500 时，下面的分享页备援仍可能拿到 mid。
+                // 之前直接 return，导致备援代码永远不执行（实机：盈月纪年2 一直空白）。
+                break;
             }
             const std::string js(sr.body.begin(), sr.body.end());
             bool looks = false;
@@ -4896,7 +4991,43 @@ static CoverSrcResult cover_try_qq(const CoverJob& job, CoverTermCache& tc, int 
     }
     if (seenDice >= 0.0) { r.pick.dice = seenDice; r.pick.why = seenWhy; r.pick.cand = seenCand; }
     else r.pick.why = "no_result";
-    return r;
+    // (return 移到分享页备援之后)
+    // 2026-10-26 (261026-06): share-link fallback.
+    // The search API (client_search_cp) rate-limits us with HTTP 500 on many networks, but the
+    // public share page still resolves: c6.y.qq.com/base/fcgi-bin/u?__=<token> redirects to
+    // y.qq.com/n/ryqq_v2/albumDetail/<id>, and the 53 KB HTML contains the albumMid we need.
+    // This is how "盈月纪年2" gets its cover when search is blocked (verified: albumMid
+    // 0036Uxug3EjvHO -> y.gtimg.cn T002R500x500M0000036Uxug3EjvHO.jpg, 109603 B JPEG).
+    if (!r.pick.found) {   // 搜索接口失败(transient)时也要试分享页
+        for (const auto& term : terms) {
+            const std::string su = std::string("https://c6.y.qq.com/base/fcgi-bin/u?__=") + artistimg_pct(term);
+            auto hr = rta::net::http_get(su, hdr, hopMs);
+            if (!hr.ok || hr.status != 200) continue;
+            const std::string html(hr.body.begin(), hr.body.end());
+            // albumMid appears as 14-char alnum tokens near "T002R" or in the redirect path
+            std::string mid;
+            for (size_t i = 0; i + 14 <= html.size(); ++i) {
+                bool okc = true;
+                for (size_t k2 = 0; k2 < 14; ++k2) {
+                    const unsigned char c = (unsigned char)html[i + k2];
+                    if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) { okc = false; break; }
+                }
+                if (!okc) continue;
+                const std::string tok = html.substr(i, 14);
+                bool hasDigit = false, hasAlpha = false;
+                for (char cc : tok) { if (cc >= '0' && cc <= '9') hasDigit = true; else hasAlpha = true; }
+                if (hasDigit && hasAlpha && tok.compare(0, 2, "00") == 0) { mid = tok; break; }
+            }
+            if (mid.empty()) continue;
+            // (mid 只是日志用；真正下载走 url)
+            r.pick.mid   = mid;
+            r.pick.url   = "https://y.gtimg.cn/music/photo_new/T002R500x500M000" + mid + ".jpg";
+            r.pick.found = true; r.pick.dice = 1.0; r.pick.cand = job.name; r.pick.why.clear();
+            play_log("COVSRC src=qq-share name=" + job.name + " mid=" + mid);
+            return r;
+        }
+    }
+    return r;   // 备援也没找到：返回原始结果(含 transient 标记)
 }
 
 // DizzyLab 源：站点是服务端渲染的搜索页（/search/?s=<词>），用 provider.h 里已验证的纯解析器
@@ -5194,6 +5325,176 @@ static CoverOutcome cover_fetch(const CoverJob& job, CoverTermCache& tc,
                     note(d.transient ? ("dizzylab fail(" + d.err + ")")
                                      : ("dizzylab " + (d.pick.dice > 0.0 ? ("why=" + d.pick.why + " dice=" + cover_dice_str(d.pick.dice))
                                                                          : std::string("no_result"))));
+                }
+            }
+        }
+
+        // ---------- ④ DeepSeek 联网检索 + og:image（2026-10-26 新增，261026-06）----------
+        // 为什么需要这一段：QQ 搜索接口会间歇性返回 HTTP 500（本机实测），网易对同人碟召回差，
+        // DizzyLab 只覆盖自己站内的碟。而 llm.h 里早就有 ds_search（联网检索），这一轮才用上 ——
+        // 搜索结果页的 og:image 直接就是专辑封面，不用猜任何 token 或 catalog 号。
+        // 实测：「盈月纪年2」经豆瓣音乐页 og:image 拿到 540x405 JPEG（45191 B，肉眼确认是真封面）。
+        // 注意：不要用 ds_fetch —— 它返回的是剥掉图片的 Markdown（实测 2271B 里 0 个图片 URL）。
+        // ---------- ③b 豆瓣音乐（2026-10-26 261026-06：不需要 API key，稳定带 og:image）----------
+        // 实测：GET https://music.douban.com/subject_search?search_text=<专辑名>
+        //   → 页面里有 /subject/<id> → GET /subject/<id>/ → <meta property="og:image"> 就是封面。
+        // 这条路比"让模型挑页面"可靠得多（模型搜索结果每次不同，常给出无 og:image 的论坛帖）。
+        {
+            const int remain = kCoverBudgetMs - elapsed_ms();
+            if (remain > 800) {
+                const int hop_q = remain < kCoverSearchMs ? remain : kCoverSearchMs;
+                const std::string du = "https://music.douban.com/subject_search?search_text=" + artistimg_pct(job.name);
+                auto dr = rta::net::http_get(du,
+                    {"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36", "Referer: https://music.douban.com/"}, hop_q);
+                if (dr.ok && dr.status == 200) {
+                    const std::string dh(dr.body.begin(), dr.body.end());
+                    std::string sid;
+                    {
+                        size_t at = dh.find("music.douban.com/subject/");
+                        if (at != std::string::npos) {
+                            size_t p2 = at + std::strlen("music.douban.com/subject/");
+                            size_t e2 = p2;
+                            while (e2 < dh.size() && dh[e2] >= '0' && dh[e2] <= '9') ++e2;
+                            if (e2 > p2) sid = dh.substr(p2, e2 - p2);
+                        }
+                    }
+                    if (!sid.empty()) {
+                        const std::string su = "https://music.douban.com/subject/" + sid + "/";
+                        auto sr2 = rta::net::http_get(su,
+                            {"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36", "Referer: https://music.douban.com/"}, hop_q);
+                        if (sr2.ok && sr2.status == 200) {
+                            const std::string sh(sr2.body.begin(), sr2.body.end());
+                            std::string img;
+                            size_t at2 = sh.find("og:image");
+                            if (at2 != std::string::npos) {
+                                const size_t cs2 = sh.find("content=\"", at2);
+                                const size_t ce2 = (cs2 == std::string::npos) ? std::string::npos : sh.find('"', cs2 + 9);
+                                if (cs2 != std::string::npos && ce2 != std::string::npos) {
+                                    const std::string v = sh.substr(cs2 + 9, ce2 - cs2 - 9);
+                                    if (v.rfind("http", 0) == 0) img = v;
+                                }
+                            }
+                            if (!img.empty()) {
+                                std::string derr2;
+                                long long got2 = 0;
+                                const int remainD2 = kCoverBudgetMs - elapsed_ms();
+                                const int to2 = remainD2 < kCoverDownloadMs ? (remainD2 > 0 ? remainD2 : 1) : kCoverDownloadMs;
+                                const CoverOutcome oc2 = cover_download_store(pp, img,
+                                    {"User-Agent: Mozilla/5.0", "Referer: " + su}, to2, derr2, &got2);
+                                if (oc2 == CoverOutcome::Hit) {
+                                    play_log("COVSRC src=douban name=" + job.name + " id=" + sid +
+                                             " bytes=" + std::to_string(got2) + " img=" + img);
+                                    if (detail) *detail = img;
+                                    if (bytesOut) *bytesOut = got2;
+                                    return CoverOutcome::Hit;
+                                }
+                                if (oc2 == CoverOutcome::Fail) transient = true;
+                            } else {
+                                note("douban no_og id=" + sid);
+                            }
+                        }
+                    } else {
+                        note("douban no_result");
+                    }
+                } else if (dr.status == 0) {
+                    transient = true;
+                    note("douban fail");
+                }
+            }
+        }
+
+        // ---------- ④ DeepSeek 联网检索 + og:image（兜底）----------
+        {
+            const int remain = kCoverBudgetMs - elapsed_ms();
+            if (remain > 800) {
+                const rta::meta::LlmConfig lcfg = apifill_llm_cfg();   // 含 KEY.txt 回退（见其实现）
+                if (lcfg.apiKey.empty()) {
+                    note("ds-web no_key");
+                } else {
+                    const int hop = remain < 6000 ? remain : 6000;
+                    // 2026-10-26 (261026-06): 查询词与策略。
+                    // 实测：(a) 加"封面"会得到一堆论坛帖（无 og:image）；(b) 只用"专辑"时结果**每次不同**，
+                    // 有时豆瓣页在第 3 位、有时整页都是论坛 ⟹ 单次搜索不可靠。
+                    // 所以先做一次**限定站内**的搜索（site: 语法被 DeepSeek 检索接受），
+                    // 失败再把不带限定的结果作为补充。两条结果合并后再按站点分档排序。
+                    rta::meta::DsSearchReply sr = rta::meta::ds_search(
+                        lcfg, job.name + " 专辑 site:music.douban.com", 5);
+                    if (!sr.ok || sr.hits.empty()) {
+                        sr = rta::meta::ds_search(lcfg, job.name + " 专辑", 6);
+                    }
+                    if (!sr.ok) {
+                        note("ds-web fail(" + sr.error + ")");
+                    } else {
+                        // 2026-10-26 (261026-06): 分三档排序。实测只有豆瓣 subject 页稳定带 og:image，
+                        // 百科/THBWiki 多数**没有** og:image，论坛/视频/直播一律没有。
+                        // 之前把百科和豆瓣同级，5 次配额被百科耗光 ⟹ 盈月纪年2 明明有豆瓣页却抓不到。
+                        std::vector<std::string> ordered;
+                        for (int pass = 0; pass < 3; ++pass) {
+                            for (const auto& h : sr.hits) {
+                                if (h.url.rfind("http", 0) != 0) continue;
+                                int tier = 2;
+                                if (h.url.find("douban.com/subject") != std::string::npos ||
+                                    h.url.find("musicbrainz.org/release") != std::string::npos ||
+                                    h.url.find("discogs.com/") != std::string::npos ||
+                                    h.url.find("dizzylab.net/d/") != std::string::npos) tier = 0;   // 实测带 og:image
+                                else if (h.url.find("baike.baidu.com/item") != std::string::npos ||
+                                         h.url.find("thwiki.cc") != std::string::npos) tier = 1;
+                                if (tier == pass) ordered.push_back(h.url);
+                            }
+                        }
+                        int tried = 0;
+                        for (size_t i = 0; i < ordered.size() && tried < 5; ++i) {
+                            const std::string pageUrl = ordered[i];
+                            if (kCoverBudgetMs - elapsed_ms() <= 400) break;
+                            if (kCoverBudgetMs - elapsed_ms() <= 400) break;
+                            ++tried;
+                            auto pr = rta::net::http_get(pageUrl,
+                                {"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                 "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}, hop);
+                            if (!pr.ok || pr.status != 200) continue;
+                            const std::string html(pr.body.begin(), pr.body.end());
+                            std::string img;
+                            {
+                                size_t at = html.find("og:image");
+                                for (int guard = 0; guard < 3 && at != std::string::npos && img.empty(); ++guard) {
+                                    const size_t cs = html.find("content=\"", at);
+                                    if (cs == std::string::npos) break;
+                                    const size_t ce = html.find('"', cs + 9);
+                                    if (ce == std::string::npos) break;
+                                    const std::string v = html.substr(cs + 9, ce - cs - 9);
+                                    if (v.rfind("http", 0) == 0) img = v;
+                                    at = html.find("og:image", at + 8);
+                                }
+                            }
+                            play_log("DSWEB page=" + pageUrl + " htmlLen=" + std::to_string(html.size()) +
+                                     " ogImage=[" + img + "]");
+                            if (img.empty()) continue;
+                            const bool looksImg = img.find(".jpg") != std::string::npos ||
+                                                  img.find(".jpeg") != std::string::npos ||
+                                                  img.find(".png") != std::string::npos ||
+                                                  img.find(".webp") != std::string::npos ||
+                                                  img.find("doubanio.com") != std::string::npos ||
+                                                  img.find("bcebos.com") != std::string::npos;
+                            if (!looksImg) continue;
+                            const int remainD = kCoverBudgetMs - elapsed_ms();
+                            const int to = remainD < kCoverDownloadMs ? (remainD > 0 ? remainD : 1) : kCoverDownloadMs;
+                            std::string derr;
+                            long long got = 0;
+                            const CoverOutcome oc = cover_download_store(pp, img,
+                                {"User-Agent: Mozilla/5.0", "Referer: " + pageUrl}, to, derr, &got);
+                            if (oc == CoverOutcome::Hit) {
+                                play_log("COVSRC src=ds-web name=" + job.name + " bytes=" + std::to_string(got) +
+                                         " page=" + pageUrl + " img=" + img);
+                                if (detail) *detail = img;
+                                if (bytesOut) *bytesOut = got;
+                                return CoverOutcome::Hit;
+                            }
+                            if (oc == CoverOutcome::Fail) transient = true;
+                        }
+                        note("ds-web tried=" + std::to_string(tried));
+                    }
                 }
             }
         }
@@ -5565,38 +5866,6 @@ static ApiFillAnswer apifill_parse_answer(const std::string& content) {
 //   ① exe 同目录 rlplayer-llm.conf 的 api_key（与设置页 /api/llm 写的同一份，正常路径）；
 //   ② 兜底：exe 目录及上两级目录下的 KEY.txt（用户 2026-10-26 反馈里 key 就放在仓库根这个文件）。
 // ②只在 ① 为空时生效；两份内容都**绝不打印**，日志里一律 sk-****。
-static std::string apifill_read_key_file(const std::string& p) {
-    std::ifstream f(fs::u8path(p), std::ios::binary);
-    if (!f) return std::string();
-    std::string line;
-    if (!std::getline(f, line)) return std::string();
-    if (!line.empty() && line.back() == '\r') line.pop_back();
-    size_t b = 0, e = line.size();
-    while (b < e && (unsigned char)line[b] <= 0x20) ++b;
-    while (e > b && (unsigned char)line[e - 1] <= 0x20) --e;
-    const std::string k = line.substr(b, e - b);
-    if (k.size() < 8 || k.size() > 512) return std::string();
-    if (k.rfind("sk-", 0) != 0) return std::string();          // 明显不是 key：不当 key 用
-    for (unsigned char c : k) if (c <= 0x20 || c == 0x7F) return std::string();
-    return k;
-}
-
-static rta::meta::LlmConfig apifill_llm_cfg() {
-    // 路径口径与设置页 /api/llm 完全一致：exe 同目录，不随进程工作目录漂移。
-    //（不直接调 llm_conf_path()：它定义在本文件更后面，这里提前用会编译失败。）
-    rta::meta::LlmConfig cfg = rta::meta::llm_config_load(path_in_exe_dir("rlplayer-llm.conf"));
-    if (!cfg.apiKey.empty()) return cfg;
-    std::string dir = path_in_exe_dir(nullptr);
-    if (!dir.empty() && (dir.back() == '\\' || dir.back() == '/')) dir.pop_back();
-    for (int up = 0; up < 3 && !dir.empty(); ++up) {
-        const std::string k = apifill_read_key_file(dir + "\\KEY.txt");
-        if (!k.empty()) { cfg.apiKey = k; break; }
-        const size_t slash = dir.find_last_of("\\/");
-        if (slash == std::string::npos || slash < 3) break;
-        dir = dir.substr(0, slash);
-    }
-    return cfg;
-}
 
 // 目录侧小工具（请求线程只用 stat）
 static bool cover_neg_exists(const std::string& key) {
