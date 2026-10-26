@@ -7914,6 +7914,9 @@ static void roomcorr_worker(RoomCorrRequest req) {
             cfg.captureDeviceId = req.capDev;
             cfg.channels = req.layout.chCount;
             real = std::make_unique<rta::dsp::WasapiRoomTransport>(cfg);
+            // 2026-10-26（261026-08 #8/#9）：把 dsp 层日志接回 rlplayer-playback.log，
+            // 便于实机核验「本次测的是哪一路、输出端开了几个声道」。
+            real->log = [](const std::string& s) { play_log(s); };
             tx = real.get();
         }
         tx->cancelled = [] { return g_roomcorr.cancelled.load() || g_shutdown.load(); };

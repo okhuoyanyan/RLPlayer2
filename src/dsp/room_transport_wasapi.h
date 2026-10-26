@@ -18,6 +18,7 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -43,6 +44,8 @@ public:
 
     bool lastOk() const { return ok_; }
     const std::string& lastError() const { return err_; }
+    // 日志注入（dsp 层不依赖 rtaweb 的 play_log；由调用方接 rlplayer-playback.log）
+    std::function<void(const std::string&)> log;
     size_t capturedSamples() const { return captured_; }
     double captureRate() const { return rate_; }
     const std::string& playName() const { return playName_; }
@@ -53,9 +56,12 @@ public:
         if (out.empty()) { err_ = "扫频信号为空"; return {}; }
 
         // 1) 播放端点（共享模式：不独占、不静音系统声音，测量时可听）
+        // 2026-10-26（261026-08 #8，用户接入 5.1 虚拟端点 VBMatrix In 2 = 6ch）：
+        // 输出端点要按**布局声道数**打开，不能硬编码 2 —— 否则 5.1/7.1 布局根本打不开 6 声道流。
         auto spk = std::make_shared<rta::audio::WasapiSharedOutput>();
         const uint32_t wantRate = 48000;
-        if (!spk->open(cfg_.playDeviceId, wantRate, 2, 32, 200.0)) {
+        const int reqCh = (cfg_.channels > 0) ? cfg_.channels : 2;
+        if (!spk->open(cfg_.playDeviceId, wantRate, reqCh, 32, 200.0)) {
             err_ = "打开播放端点失败：" + spk->last_error();
             return {};
         }
@@ -106,7 +112,19 @@ public:
         // 3) 预录
         waitUntil(preN);
 
-        // 4) 边播边录（单声道扫频铺到所有声道）
+        // 4) 边播边录：扫频只铺到**当前被测声道**。
+        //    原先把同一段扫频铺到所有声道 —— 那样 5.1 测出来是"全场合奏"，分不清是哪一路，
+        //    多声道校正就失去意义。MeasurementSession 是**逐声道顺序调用**本函数，
+        //    所以用调用计数轮转声道即可（不依赖会话层改接口）。
+        const int activeCh = (playCh > 0) ? (curCh_ % playCh) : 0;
+        if (log) log("ROOMTX play dev=" + (cfg_.playDeviceId.empty() ? std::string("<default>") : cfg_.playDeviceId) +
+                     " ch=" + std::to_string(playCh) + " active=" + std::to_string(activeCh));
+        ++curCh_;
+        // ★ 2026-10-26（261026-08 实机发现）：节奏必须严格 1:1。
+        //   旧代码写的是 waitUntil(preN + written / 2) —— 每写 1 帧只等 0.5 帧，
+        //   于是播放远快于实时、录音却按实时走，两者错位。实测后果：3 秒扫频却在
+        //   peakMs=10049 ms 处出峰（多了 7 秒），LFE 对齐算出 subDelay=-41020。
+        //   正确做法：写完多少帧，就等采集也到这么多帧（1:1），并处理 write 的部分写入。
         std::vector<float> blk((size_t)playCh * 480);
         size_t written = 0;
         while (written < out.size()) {
@@ -114,13 +132,21 @@ public:
             const size_t n = std::min<size_t>(480, out.size() - written);
             for (size_t i = 0; i < n; ++i) {
                 const float v = (float)out[written + i];
-                for (int c = 0; c < playCh; ++c) blk[i * (size_t)playCh + (size_t)c] = v;
+                for (int c = 0; c < playCh; ++c)
+                    blk[i * (size_t)playCh + (size_t)c] = (c == activeCh) ? v : 0.0f;
             }
-            spk->write_available_f32(blk.data(), n);
+            // 共享输出是非阻塞写，可能只吃下一部分；必须循环写满，否则实际播放序列短于参考
+            size_t wrote = 0;
+            while (wrote < n) {
+                if (cancelled && cancelled()) break;
+                const size_t got = spk->write_available_f32(blk.data() + wrote * (size_t)playCh, n - wrote);
+                if (got > 0) { wrote += got; continue; }
+                drain();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
             written += n;
             drain();
-            waitUntil(preN + written / 2);   // 大致跟上实时节奏即可，不追求精确
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            waitUntil(preN + written);       // 严格 1:1：采集追上播放进度
         }
 
         // 5) 尾音
@@ -145,6 +171,7 @@ private:
     std::string err_;
     size_t captured_ = 0;
     double rate_ = 0.0;
+    int curCh_ = 0;                  // 逐声道轮转（每次 play_and_capture = 测下一个声道）
     std::string playName_, capName_;
 };
 
