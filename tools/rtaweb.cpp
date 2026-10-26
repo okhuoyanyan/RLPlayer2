@@ -9840,8 +9840,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         {
             std::string cdLetter; int cdTrack = 0;
             if (rta::audio::CdaMciPlayer::parseCdaPath(p.file, cdLetter, cdTrack)) {
-                std::lock_guard<std::mutex> lk(g_cdMx);
-                const std::string ce = g_cdPlayer.play(p.file);
+                const std::string ce = g_cdPlayer.play(p.file);   // 内部投到 MCI 工作线程
                 if (!ce.empty()) {
                     play_log("CDPLAY_FAIL file=" + p.file + " " + ce);
                     return std::string("{\"ok\":false,\"cd\":true,\"error\":\"") + jesc(ce) + "\"}";
@@ -12618,8 +12617,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         ct = "application/json; charset=utf-8";
         // CD 音轨：MCI 停播 + 关设备，然后照常走下面的管线停止（两条路互不干扰）
         if (g_cdActive.exchange(false)) {
-            std::lock_guard<std::mutex> lk(g_cdMx);
-            g_cdPlayer.close();
+            g_cdPlayer.close();   // 内部投到 MCI 工作线程
             play_log("CDSTOP mci");
         }
         ps.stop.store(true);
@@ -12665,14 +12663,15 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         int   cdTracks = 0, cdTrackNo = 0;
         static std::string cdRawMode, cdRawPos;
         if (cdMode) {
-            std::lock_guard<std::mutex> lk(g_cdMx);
-            cdPlaying = g_cdPlayer.playing();
-            cdPosMs   = g_cdPlayer.positionMs();
-            cdLenMs   = g_cdPlayer.lengthMs();
-            cdTracks  = g_cdPlayer.trackCount();
-            cdTrackNo = g_cdPlayer.track();
-            cdRawMode = g_cdPlayer.rawMode();
-            cdRawPos  = g_cdPlayer.rawPosition();
+            // state() 内部把查询投到 MCI 工作线程（alias 是线程局部的，不能在 HTTP 线程直接查）
+            const rta::audio::CdaState cs = g_cdPlayer.state();
+            cdPlaying = cs.playing;
+            cdPosMs   = cs.posMs;
+            cdLenMs   = cs.lenMs;
+            cdTracks  = cs.tracks;
+            cdTrackNo = cs.track;
+            cdRawMode = cs.rawMode;
+            cdRawPos  = cs.rawPos;
         }
         const double pos = cdMode ? (double)cdPosMs / 1000.0
                                     : (castMode ? castSt.positionSec
