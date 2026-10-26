@@ -1314,8 +1314,11 @@ function artaPoll() {
 }
 
 /* ---------------- 艺术家 ---------------- */
-function loadArtists() {
+// 2026-10-26（261026-05 #1）：支持按关键词过滤（搜索栏在艺术家页搜索时用）。
+// q 为空 = 全部；非空 = 只保留名字包含关键词的艺术家（不区分大小写）。
+function loadArtists(q) {
   S.view = 'artists';
+  var kw = String(q || '').trim().toLowerCase();
   artaStop();
   head('艺术家', '加载中…', '');
   // 2026-10-26（261026-01 #1）：艺术家头像走外部源，但**抓取必须后台做** ——
@@ -1334,7 +1337,12 @@ function loadArtists() {
       if (a.cv) m[k].cv = true, m[k].key = a.k;
     });
     order.sort(function (x, y) { return x.localeCompare(y, 'zh'); });
-    head('艺术家', order.length + ' 位', '');
+    if (kw) {
+      order = order.filter(function (k) { return String(k).toLowerCase().indexOf(kw) >= 0; });
+      head('艺术家', order.length + ' 位（搜索：' + q + '）', '');
+    } else {
+      head('艺术家', order.length + ' 位', '');
+    }
     if (!order.length) { D('list').innerHTML = '<div class=empty>库里还没有音乐</div>'; return; }
     var h = '<div id=artProgWrap></div>';
     h += '<div class=grid style="grid-template-columns:repeat(auto-fill,minmax(150px,1fr))">';
@@ -3132,8 +3140,20 @@ D('q').oninput = function () {
   updateSearchClearBtn();
   clearTimeout(searchTimer);
   searchTimer = setTimeout(function () {
-    if (v) { setView('tracks'); loadTracks(v); }
-    else if (S.view === 'tracks') loadAlbums('');
+    // ★ 2026-10-26（261026-05 #1）：**按当前视图分派**搜索。
+    // 旧实现无条件 setView('tracks') + loadTracks(v) ⟹ 在专辑页/艺术家页搜索任何东西都会
+    // 被强行跳到曲目页，表现为"搜不到专辑和艺术家"。
+    if (!v) {
+      if (S.view === 'tracks') loadAlbums('');
+      else if (S.view === 'albums') loadAlbums('');
+      else if (S.view === 'artists') loadArtists();
+      return;
+    }
+    if (S.view === 'artists') { loadArtists(v); return; }
+    if (S.view === 'albums' || S.view === 'folder') { loadAlbums(v); return; }
+    // tracks 及其它视图：保持原行为（全局搜曲目是合理的默认）
+    setView('tracks');
+    loadTracks(v);
   }, 260);
 };
 D('q').onkeydown = function (e) {
