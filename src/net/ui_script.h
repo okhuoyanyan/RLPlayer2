@@ -507,9 +507,12 @@ function albumCardHtml(a, i) {
 var COVP = { timer: 0 };
 function startCoverPrefetch() {
   api('/api/lib/cover/prefetch', '').then(function (j) {
-    if (!j || !j.ok || !j.running || !j.queued) return;
-    toast('正在抓取封面：共 ' + j.queued + ' 张缺图');
-    pollCoverProgress();
+    if (j && j.ok && j.queued) toast('正在抓取封面：共 ' + j.queued + ' 张缺图');
+    // 2026-10-26 (261026-05): always poll while the backend is running.
+    // Previously polling only started when THIS call queued something, so a job started
+    // elsewhere (prefetch?all=1, or a still-running batch) finished without repainting the grid,
+    // leaving covers blank even though the server had them.
+    if (j && j.ok && j.running) pollCoverProgress();
   }).catch(function () { });
 }
 function pollCoverProgress() {
