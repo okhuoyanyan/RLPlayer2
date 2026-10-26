@@ -12,6 +12,13 @@
 //   开采集 → 预录 preRollMs（吃本底噪声）→ 边播边录 → 播完再录 tailMs（混响尾巴）→ 双双关闭。
 //   采集比播放早开晚关，保证直达声与尾音都在录音里。
 //
+// ★ 实测教训（2026-10-27，261026-08 #8/#9）：
+//   测量电平太低会造成**假阴性**。同一套 5.1 系统：
+//     -30 dBFS：L/R/C/LFE/Rs 峰位正常（533~594 ms），但 **Ls 峰位 10498 ms**（噪声主导，反卷积找错峰）
+//     -20 dBFS：六声道全部正常，SNR 12.5~34.5 dB，峰位 535~586 ms
+//   所以「峰位异常」先查电平与 SNR，不要急着判"音箱没接"。
+//   质检（room_measurement）的 SNR 告警就是干这个用的：SNR 低 ⟹ 结论不可信，提高电平或降噪后重测。
+//
 // 已知限制（如实）：
 //   · 共享模式播放 ⟹ 系统其它声音会混进录音。正式测量时请静音其它程序；UI 会提示。
 //   · 每声道单独跑一遍（单声道扫频铺到所有声道），不做多声道同时扫频（那需要每声道独立扫频序列）。
@@ -35,6 +42,9 @@ struct RoomTxConfig {
     int         channels = 2;      // 参与测量的声道数
     double      tailMs = 800.0;    // 播放结束后继续录多久（房间混响）
     double      preRollMs = 300.0; // 播放前先录多久（本底噪声，质检用）
+    // 停滞上限（2026-10-27 实机教训：设备被占用时不能无限等，否则整条测量链挂死）
+    double      writeStallMs = 3000.0;    // 播放端点连续写不进超过这么多久 -> 中止
+    double      captureStallMs = 5000.0;  // 采集端点连续无新数据超过这么多久 -> 中止
 };
 
 class WasapiRoomTransport : public MeasurementTransport {
@@ -99,18 +109,25 @@ public:
             }
         };
         auto frames = [&]() { return rec.size() / (size_t)capCh; };
-        auto waitUntil = [&](size_t want) {
-            const int spins = 4000;
+        // 返回 false = 超时（采集端没有推进），调用方必须中止而不是继续等
+        auto waitUntil = [&](size_t want, double limitMs) -> bool {
+            const int spins = (int)(limitMs / 2.0);
             for (int i = 0; i < spins && frames() < want; ++i) {
                 drain();
-                if (frames() >= want) break;
-                if (cancelled && cancelled()) return;
+                if (frames() >= want) return true;
+                if (cancelled && cancelled()) return true;   // 取消由调用方判断
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
+            return frames() >= want;
         };
 
         // 3) 预录
-        waitUntil(preN);
+        if (!waitUntil(preN, cfg_.captureStallMs)) {
+            err_ = "采集端点无数据（预录阶段），检查采集设备是否可用";
+            if (log) log("ROOMTX " + err_);
+            spk->close(); cap->close(); ok_ = false; captured_ = 0;
+            return {};
+        }
 
         // 4) 边播边录：扫频只铺到**当前被测声道**。
         //    原先把同一段扫频铺到所有声道 —— 那样 5.1 测出来是"全场合奏"，分不清是哪一路，
@@ -136,21 +153,44 @@ public:
                     blk[i * (size_t)playCh + (size_t)c] = (c == activeCh) ? v : 0.0f;
             }
             // 共享输出是非阻塞写，可能只吃下一部分；必须循环写满，否则实际播放序列短于参考
+            // ★ 2026-10-27 实机抓到：设备被其它程序占用时 write_available_f32 恒返回 0，
+            //   这个 while 会无限阻塞（实测 270 秒只走完 1/6 声道，running 永远 true）。
+            //   必须给「写不进」和「采集没动静」都设上限，宁可报错也不能把测量线程挂死。
             size_t wrote = 0;
+            int stallMs = 0;
             while (wrote < n) {
                 if (cancelled && cancelled()) break;
                 const size_t got = spk->write_available_f32(blk.data() + wrote * (size_t)playCh, n - wrote);
-                if (got > 0) { wrote += got; continue; }
+                if (got > 0) { wrote += got; stallMs = 0; continue; }
                 drain();
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (++stallMs > (int)cfg_.writeStallMs) {
+                    err_ = "播放端点写不进数据超过 " + std::to_string((int)cfg_.writeStallMs) +
+                           " ms（设备可能被独占或被其它程序占用），已中止本次测量";
+                    if (log) log("ROOMTX " + err_);
+                    spk->close(); cap->close();
+                    ok_ = false; captured_ = 0;
+                    return {};
+                }
             }
+            if (cancelled && cancelled()) break;
             written += n;
             drain();
-            waitUntil(preN + written);       // 严格 1:1：采集追上播放进度
+            // 采集也必须设上限：否则采集端点不出数据时会在这里挂死
+            if (!waitUntil(preN + written, cfg_.captureStallMs)) {
+                err_ = "采集端点超过 " + std::to_string((int)cfg_.captureStallMs) +
+                       " ms 没有新数据，已中止本次测量";
+                if (log) log("ROOMTX " + err_);
+                spk->close(); cap->close();
+                ok_ = false; captured_ = 0;
+                return {};
+            }
         }
 
-        // 5) 尾音
-        waitUntil(preN + out.size() + tailN);
+        // 5) 尾音（超时不算失败：尾巴录不全只是混响短一点，不该判整轮作废）
+        if (!waitUntil(preN + out.size() + tailN, cfg_.captureStallMs)) {
+            if (log) log("ROOMTX 尾音阶段采集停滞，按已录样本继续（房间混响可能录不全）");
+        }
         drain();
 
         spk->close();

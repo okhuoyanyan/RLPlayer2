@@ -167,6 +167,36 @@ inline std::string rta_ui_page() {
     h += ".nav:hover{background:var(--hov);color:var(--txt)}";
     h += ".nav.on{background:var(--nav-on);color:var(--nav-on-text)}";
     h += ".nav svg{flex:none}.sec{margin:16px 12px 6px;font-size:10px;letter-spacing:1.2px;color:var(--mut2);font-weight:600}";
+    // 保存的队列（261026-08 #6）：缩进的二级条目，悬停露出「改名 / 删除」两个小按钮
+    h += ".sqlist{display:flex;flex-direction:column}";
+    h += ".sqlist .sqhd{padding:6px 12px 2px 22px;font-size:10px;letter-spacing:.6px;color:var(--mut2)}";
+    h += ".sqlist .sqrow{padding:6px 8px 6px 22px;font-size:12px;gap:6px}";
+    h += ".sqlist .sqn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
+    h += ".sqlist .sqb{width:20px;height:20px;border-radius:5px;display:grid;place-items:center;font-size:12px;line-height:1;color:var(--mut2);flex:none;opacity:0;transition:.12s}";
+    h += ".sqlist .sqrow:hover .sqb{opacity:1}";
+    h += ".sqlist .sqb:hover{background:var(--hov2);color:var(--txt)}";
+    h += ".sqlist .sqb.del:hover{color:var(--danger)}";
+    // 我的最爱 / 播放列表页里的「保存的队列」区块 + 行
+    h += ".sqsec{border-top:1px solid var(--line);margin:22px 10px 6px;padding-top:14px}";
+    h += ".sechd{display:flex;align-items:center;gap:10px;padding:0 10px 8px;font-size:11px;letter-spacing:.6px;color:var(--mut2)}";
+    h += ".sqitem{display:flex;align-items:center;gap:10px;padding:9px 20px;border-radius:8px;font-size:12.5px}";
+    h += ".sqitem:hover{background:var(--hov)}";
+    h += ".sqitem .sqt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
+    h += ".sqitem .sqn2{color:var(--mut2);font-size:11px;flex:none}";
+    h += ".sqitem .btn{padding:3px 10px;font-size:11px}";
+    // 播放列表页（#3）
+    h += ".plrow{display:flex;align-items:center;gap:10px;padding:10px 20px;border-bottom:1px solid var(--line);font-size:12.5px}";
+    h += ".plrow:hover{background:var(--hov)}";
+    h += ".plrow .pln{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}";
+    h += ".plrow .plc{color:var(--mut2);font-size:11px;flex:none}";
+    h += ".plrow .btn{padding:3px 10px;font-size:11px}";
+    h += ".pltracks{padding:2px 0 8px 34px}";
+    h += ".pltracks .plt{display:flex;align-items:center;gap:8px;padding:5px 12px;font-size:12px;color:var(--txt2);border-radius:7px}";
+    h += ".pltracks .plt:hover{background:var(--hov)}";
+    h += ".pltracks .plt .ptn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
+    h += ".pltracks .plt .qdel{width:22px;height:22px;border-radius:5px;color:var(--mut2);flex:none;opacity:0}";
+    h += ".pltracks .plt:hover .qdel{opacity:1}";
+    h += ".pltracks .plt .qdel:hover{background:var(--hov2);color:var(--danger)}";
     // 主区
     h += "#app.setmode .crumb{display:none}";
     h += ".main{overflow:auto;position:relative}";
@@ -800,6 +830,13 @@ h += "#npPage .npedge{display:none}";
     h += "<div class=sec>播放</div>";
     h += "<div class=nav data-v=queue><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M4 6h10M4 12h10M4 18h7'/><path d='M17 15.5V7l4-1v8.5'/><circle cx='16' cy='16.5' r='1.6' fill='currentColor' stroke='none'/><circle cx='20' cy='15' r='1.6' fill='currentColor' stroke='none'/></svg>播放队列</div>";
     h += "<div class=nav data-v=recent><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><circle cx='12' cy='12' r='8.5'/><path d='M12 7.2V12l3.2 2'/></svg>最近播放</div>";
+    // 2026-10-26（用户 261026-08 #5）：我的最爱 = 红心收藏（数据源就是既有的 /api/fav 机制）。
+    h += "<div class=nav data-v=favs><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z'/></svg>我的最爱</div>";
+    // 2026-10-26（用户 261026-08 #6）：保存的具名队列**显示在我的最爱下面**。
+    // 容器由 renderSavedQueues() 填充：每项 = 名字 + 改名 + 删除，点名字进详情页（含播放）。
+    h += "<div id=sqList class=sqlist></div>";
+    // 2026-10-26（用户 261026-08 #3）：自定义播放列表（/api/pl）——这个功能以前**没有前端入口**。
+    h += "<div class=nav data-v=pl><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M4 6h11M4 12h11M4 18h7'/><path d='M18 5v9'/><circle cx='16.2' cy='15.6' r='2.2'/></svg>播放列表</div>";
     h += "<div class=sp></div>";
     h += "<div class=sec>系统</div>";
     h += "<div class=nav data-v=settings><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><circle cx='12' cy='12' r='3.2'/><path d='M12 3.5v2.2M12 18.3v2.2M4.4 7.9l1.9 1.1M17.7 15l1.9 1.1M4.4 16.1l1.9-1.1M17.7 9l1.9-1.1'/></svg>设置</div>";
@@ -848,7 +885,12 @@ h += "#npPage .npedge{display:none}";
     h += "<input type=checkbox id=sLoud><input type=checkbox id=sIsp checked><input type=checkbox id=s2s checked>";
     h += "<select id=sGpu><option value=auto>自动</option><option value=amd>AMD</option><option value=nvidia>NVIDIA</option><option value=off>关闭</option></select>";
     h += "<input type=checkbox id=sShuf>";
-    h += "<select id=sRep><option value=0>关闭</option><option value=1>列表循环</option><option value=2>单曲循环</option></select>";
+    // 2026-10-26（用户 261026-08 #2）：循环 + 随机合并成**一个四态模式**。
+    // #sRep 是唯一真相源，取值与后端 g_q.repeat 同一套编号：
+    //   0=关闭循环（顺序播完停止） 1=专辑/列表循环 2=单曲循环 3=随机播放（打乱后循环）
+    h += "<select id=sRep><option value=0>关闭循环（顺序播完停止）</option>"
+         "<option value=1>专辑/列表循环</option><option value=2>单曲循环</option>"
+         "<option value=3>随机播放</option></select>";
     h += "<input id=sRoot>";
     h += "<button id=bAddRoot></button><button id=bRescan></button>";
     h += "<div id=roots2></div>";
@@ -865,9 +907,12 @@ h += "#npPage .npedge{display:none}";
     // 2026-10-23（用户 261023-04 #1）：它**不能**再作为底栏 grid 的第 4 个子项（那会把控制组挤到最右、
     // 把右侧状态簇挤到第二行）。现在作为紧凑 chip 收进 .vol 状态簇，由 CSS 控制显隐与配色。
     h += "<div class=ctr><div class=keys>";
-    // 循环方式（关 / 列表 / 单曲）：放在播放键左边，凑齐五个键
-    h += "<button class=k id=bRep title='循环方式'><svg width=17 height=17 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2>";
-    h += "<path d='M4 9V7a2 2 0 012-2h11'/><path d='M14 2.5L17.5 5 14 7.5'/><path d='M20 15v2a2 2 0 01-2 2H7'/><path d='M10 21.5L6.5 19 10 16.5'/></svg>";
+    // 播放模式（四态，用户 261026-08 #2）：循环与随机合并成**这一个**按钮。
+    // 图标由 JS 的 repIconHtml(mode) 按当前模式重画（单曲带 1 / 纯循环 / 斜杠划掉 / 交叉双箭头），
+    // title 与 aria-label 都写清"当前是什么模式"——只改图标不改行为是本项目明令禁止的假修。
+    h += "<button class=k id=bRep title='播放模式' aria-label='播放模式' data-mode=0><span id=repIco>";
+    h += "<svg width=17 height=17 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2>";
+    h += "<path d='M4 9V7a2 2 0 012-2h11'/><path d='M14 2.5L17.5 5 14 7.5'/><path d='M20 15v2a2 2 0 01-2 2H7'/><path d='M10 21.5L6.5 19 10 16.5'/></svg></span>";
     h += "<span id=repOne style='position:absolute;font-size:9px;font-weight:700;display:none'>1</span></button>";
     h += "<button class=k id=bPrev title='上一首'><svg width=17 height=17 viewBox='0 0 24 24' fill=currentColor><path d='M6 5h2v14H6zM20 5v14l-11-7z'/></svg></button>";
     h += "<button class='k big' id=bPause title='暂停 / 继续'><svg width=15 height=15 viewBox='0 0 24 24' fill=currentColor><path id=icP d='M7 5h4v14H7zM13 5h4v14h-4z'/></svg></button>";
@@ -929,8 +974,10 @@ h += "#npPage .npedge{display:none}";
     // 左组：循环方式 + 上一首。循环按钮直接把 #sRep 的值改掉并下发（唯一真相源，
     // 见 ui_script 的 cycleRep()——整页与底栏/设置页共用同一个值，不各存一份）。
     h += "<div class='grp l'>";
-    h += "<button class=k id=npRep title='循环方式'><svg width='18' height='18' viewBox='0 0 24 24' fill=none stroke='currentColor' stroke-width='2'>";
-    h += "<path d='M4 9V7a2 2 0 012-2h11'/><path d='M14 2.5L17.5 5 14 7.5'/><path d='M20 15v2a2 2 0 01-2 2H7'/><path d='M10 21.5L6.5 19 10 16.5'/></svg>";
+    // 同一个四态播放模式按钮（整页镜像；#npRep 与 #bRep 共用 applyRep，不各存一份状态）
+    h += "<button class=k id=npRep title='播放模式' aria-label='播放模式' data-mode=0><span id=npIco>";
+    h += "<svg width='18' height='18' viewBox='0 0 24 24' fill=none stroke='currentColor' stroke-width='2'>";
+    h += "<path d='M4 9V7a2 2 0 012-2h11'/><path d='M14 2.5L17.5 5 14 7.5'/><path d='M20 15v2a2 2 0 01-2 2H7'/><path d='M10 21.5L6.5 19 10 16.5'/></svg></span>";
     h += "<span id=npRepOne style='position:absolute;font-size:10px;font-weight:700;display:none;margin-top:-18px;margin-left:22px'>1</span></button>";
     h += "<button class=k id=npPrev title='上一首'><svg width='18' height='18' viewBox='0 0 24 24' fill='currentColor'><path d='M6 5h2v14H6zM20 5v14l-11-7z'/></svg></button>";
     h += "</div>";

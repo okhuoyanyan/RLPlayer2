@@ -7114,6 +7114,78 @@ static void apply_play_mode_locked(int mode) {
     if (g_q.index >= g_q.items.size()) g_q.index = g_q.items.empty() ? 0 : g_q.items.size() - 1;
 }
 
+// ---------------- 具名保存队列（用户 261026-08 #6「保存队列 + 重命名」）----------------
+// 为什么不复用 playlists\*.m3u8（/api/pl）：m3u8 装不下 CUE 区间，"保存队列"要求**原样还原整列**
+//   （顺序 + cue 区间都要在），所以单独存一份带区间的 conf；风格与 rlplayer-playlist.txt 一致：
+//   纯文本 / 每行 key=value / # 开头是注释 / UTF-8。
+// 落盘：exe 同目录 rlplayer-savedqueues.conf ⟹ 重启后仍在（本项目全部配置都是这个规矩）。
+struct SavedQueue {
+    std::string name;
+    std::vector<QItem> items;
+};
+static std::mutex g_sqMu;
+static std::vector<SavedQueue> g_sqList;
+static bool g_sqLoaded = false;
+
+static std::string saved_queues_path() { return path_in_exe_dir("rlplayer-savedqueues.conf"); }
+
+static void sq_load_if_needed() {
+    std::lock_guard<std::mutex> lk(g_sqMu);
+    if (g_sqLoaded) return;
+    g_sqLoaded = true;
+    std::ifstream f(fs::u8path(saved_queues_path()), std::ios::binary);
+    if (!f) return;
+    SavedQueue cur;
+    bool open = false;
+    auto flush = [&] {
+        if (open && !cur.name.empty()) g_sqList.push_back(cur);
+        cur = SavedQueue{};
+        open = false;
+    };
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        if (line.rfind("name=", 0) == 0) {
+            flush();
+            cur.name = line.substr(5);
+            open = true;
+        } else if (line.rfind("item=", 0) == 0 && open) {
+            cur.items.push_back(item_from_line(line.substr(5)));
+        }
+    }
+    flush();
+}
+
+// 原子写（tmp + rename）：与 fav_save_locked 同一套理由 ——
+// 直写 trunc 在进程中断/杀软占用时会留半截文件，下次读就是"队列全丢"。
+static bool sq_save_locked() {
+    const std::string path = saved_queues_path();
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(fs::u8path(tmp), std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        f << "# RLPlayer saved queues v1\n";
+        for (const auto& q : g_sqList) {
+            f << "name=" << q.name << "\n";
+            for (const auto& it : q.items) {
+                f << "item=" << it.path;
+                if (it.isCue()) {
+                    char cb[80];
+                    std::snprintf(cb, sizeof(cb), "\t%.6f\t%.6f", it.cs, it.ce);
+                    f << cb;
+                }
+                f << "\n";
+            }
+        }
+        if (!f.good()) return false;
+    }
+    std::error_code ec;
+    fs::rename(fs::u8path(tmp), fs::u8path(path), ec);
+    if (ec) { std::error_code ec2; fs::remove(fs::u8path(tmp), ec2); return false; }
+    return true;
+}
+
 // ---- 预解码槽：当前曲播放的同时，后台把下一曲解码进内存 ----
 struct PreSlot {
     std::mutex mtx;
@@ -8143,6 +8215,8 @@ static bool is_side_effect_path(const std::string& p) {
         "/api/writeback", "/api/enrich", "/api/peq", "/api/opra/apply", "/api/cast/start",
         "/api/cast/stop", "/api/upnp", "/api/src", "/api/input/start", "/api/input/stop",
         "/api/buffer/reset", "/api/upload",
+        // 261026-08 #2/#5/#6：播放模式（写队列 conf）、整列替换队列、具名保存队列（写 conf）
+        "/api/playmode", "/api/queue/set", "/api/sq",
         // 三档预设的 apply 会写 rlplayer-settings.conf（副作用）；caps 是只读查询，不进这张表
         "/api/preset/apply",
         // 艺术家头像预热：会落盘缓存 + 打网络（副作用端点，只接受 POST；GET 端点是 /api/artist/image）
@@ -8175,6 +8249,9 @@ static bool is_side_effect_path(const std::string& p) {
 static bool is_side_effect_exempt(const std::string& p) {
     static const char* kGetOk[] = {
         "/api/fav/list", "/api/pl/load", "/api/writeback/status", "/api/writeback/dry", "/api/src/browse",
+        // /api/sq/list 与 /api/sq/info 是纯只读（枚举/查看具名队列），
+        // 其余 /api/sq/* 都是副作用（已在上表里 ⟹ 必须 POST）
+        "/api/sq/list", "/api/sq/info",
         "/api/src/search", "/api/src/cover", "/api/lib/status", "/api/lib/stats",
         "/api/lib/albums", "/api/lib/album", "/api/lib/search", "/api/lib/cover",
         // /api/llm：GET = 读配置状态（已配置 + 掩码），POST = 保存；状态读取必须允许 GET。
@@ -9292,6 +9369,188 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return j.str();
     }
 
+    // ---------------- 具名保存队列 /api/sq（用户 261026-08 #6）----------------
+    //   POST /api/sq/save?name=X        把**当前队列**存成具名队列（同名覆盖）
+    //   GET  /api/sq/list               {"queues":[{name,n}]}
+    //   POST /api/sq/rename?from=A&to=B 改名（目标已存在则拒绝）
+    //   POST /api/sq/delete?name=X      删除
+    //   POST /api/sq/play?name=X&i=0    装进当前队列（前端随后 /api/play 起播第一首）
+    if (rq.path.rfind("/api/sq", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        sq_load_if_needed();
+        auto sqp = [&](const char* key) -> std::string {
+            // 同 /api/pl 的坑：第 2 个参数起是 "&key="，必须整段解析 query 才不会漏
+            const size_t qp = rq.path.find('?');
+            if (qp != std::string::npos) {
+                std::istringstream qs(rq.path.substr(qp + 1));
+                std::string q;
+                while (std::getline(qs, q, '&')) {
+                    const size_t eq = q.find('=');
+                    if (eq == std::string::npos) continue;
+                    if (urlDecode(q.substr(0, eq)) == key) return urlDecode(q.substr(eq + 1));
+                }
+            }
+            std::istringstream is(rq.body);
+            std::string tok;
+            while (std::getline(is, tok, '&')) {
+                const size_t eq = tok.find('=');
+                if (eq == std::string::npos) continue;
+                if (urlDecode(tok.substr(0, eq)) == key) return urlDecode(tok.substr(eq + 1));
+            }
+            return std::string();
+        };
+        // 名字消毒：conf 是行格式，唯一硬要求是**不能带换行/TAB**（否则整份文件结构会被用户输入破坏）；
+        // 另外去掉首尾空白、限 60 字（按 UTF-8 边界截断，别劈开汉字）。
+        auto sqName = [](std::string n) {
+            std::string o;
+            for (char c : n) {
+                if (c == '\n' || c == '\r' || c == '\t') continue;
+                o.push_back(c);
+            }
+            while (!o.empty() && o.front() == ' ') o.erase(o.begin());
+            while (!o.empty() && o.back() == ' ') o.pop_back();
+            if (o.size() > 60) {
+                size_t cut = 60;
+                while (cut > 0 && ((unsigned char)o[cut] & 0xC0) == 0x80) --cut;
+                o.resize(cut);
+            }
+            return o;
+        };
+
+        if (rq.path.rfind("/api/sq/list", 0) == 0) {
+            std::ostringstream j;
+            j << "{\"ok\":true,\"queues\":[";
+            {
+                std::lock_guard<std::mutex> lk(g_sqMu);
+                bool first = true;
+                for (const auto& q : g_sqList) {
+                    if (!first) j << ",";
+                    first = false;
+                    j << "{\"name\":\"" << jesc(q.name) << "\",\"n\":" << q.items.size() << "}";
+                }
+            }
+            j << "]}";
+            return j.str();
+        }
+        if (rq.path.rfind("/api/sq/info", 0) == 0) {
+            // 只读：某个具名队列的曲目明细（详情页要用；不碰当前队列）
+            const std::string name = sqName(sqp("name"));
+            std::vector<QItem> items;
+            {
+                std::lock_guard<std::mutex> lk(g_sqMu);
+                bool found = false;
+                for (const auto& q : g_sqList) if (q.name == name) { items = q.items; found = true; break; }
+                if (!found) return "{\"ok\":false,\"error\":\"队列不存在\"}";
+            }
+            std::ostringstream j;
+            j << "{\"ok\":true,\"name\":\"" << jesc(name) << "\",\"items\":[";
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (i) j << ",";
+                j << "{\"file\":\"" << jesc(items[i].path) << "\",\"cs\":" << items[i].cs
+                  << ",\"ce\":" << items[i].ce << "}";
+            }
+            j << "]}";
+            return j.str();
+        }
+        if (rq.path.rfind("/api/sq/save", 0) == 0) {
+            const std::string name = sqName(sqp("name"));
+            if (name.empty()) return "{\"ok\":false,\"error\":\"缺少队列名字\"}";
+            std::vector<QItem> items;
+            { std::lock_guard<std::mutex> lk(g_q.mtx); items = g_q.items; }   // 先拷出，再取 g_sqMu（锁序固定）
+            if (items.empty()) return "{\"ok\":false,\"error\":\"当前队列是空的，没有可保存的内容\"}";
+            size_t count = 0;
+            bool saved = false;
+            {
+                std::lock_guard<std::mutex> lk(g_sqMu);
+                bool replaced = false;
+                for (auto& q : g_sqList) {
+                    if (q.name == name) { q.items = items; replaced = true; break; }
+                }
+                if (!replaced) g_sqList.push_back(SavedQueue{name, items});
+                count = items.size();
+                saved = sq_save_locked();
+            }
+            std::ostringstream j;
+            j << "{\"ok\":" << (saved ? "true" : "false") << ",\"name\":\"" << jesc(name)
+              << "\",\"count\":" << count;
+            if (!saved) j << ",\"error\":\"队列已生效但写入磁盘失败（目录不可写？），重启后可能丢失\"";
+            j << "}";
+            return j.str();
+        }
+        if (rq.path.rfind("/api/sq/rename", 0) == 0) {
+            const std::string from = sqName(sqp("from"));
+            const std::string to   = sqName(sqp("to"));
+            if (from.empty() || to.empty()) return "{\"ok\":false,\"error\":\"缺少 from/to 参数\"}";
+            bool found = false, dup = false, saved = false;
+            {
+                std::lock_guard<std::mutex> lk(g_sqMu);
+                for (const auto& q : g_sqList) {
+                    if (q.name == from) found = true;
+                    else if (q.name == to) dup = true;
+                }
+                if (found && !dup && from != to) {
+                    for (auto& q : g_sqList) if (q.name == from) { q.name = to; break; }
+                    saved = sq_save_locked();
+                } else if (found && from == to) {
+                    saved = true;
+                }
+            }
+            if (!found) return "{\"ok\":false,\"error\":\"队列不存在\"}";
+            if (dup && from != to) return "{\"ok\":false,\"error\":\"同名队列已存在\"}";
+            std::ostringstream j;
+            j << "{\"ok\":" << (saved ? "true" : "false") << ",\"from\":\"" << jesc(from)
+              << "\",\"to\":\"" << jesc(to) << "\"";
+            if (!saved) j << ",\"error\":\"写入磁盘失败\"";
+            j << "}";
+            return j.str();
+        }
+        if (rq.path.rfind("/api/sq/delete", 0) == 0) {
+            const std::string name = sqName(sqp("name"));
+            if (name.empty()) return "{\"ok\":false,\"error\":\"缺少 name 参数\"}";
+            bool found = false, saved = false;
+            {
+                std::lock_guard<std::mutex> lk(g_sqMu);
+                for (size_t i = 0; i < g_sqList.size(); ++i) {
+                    if (g_sqList[i].name != name) continue;
+                    g_sqList.erase(g_sqList.begin() + (long long)i);
+                    found = true;
+                    break;
+                }
+                if (found) saved = sq_save_locked();
+            }
+            if (!found) return "{\"ok\":false,\"error\":\"队列不存在\"}";
+            return std::string("{\"ok\":") + (saved ? "true" : "false") + ",\"name\":\"" + jesc(name) + "\"}";
+        }
+        if (rq.path.rfind("/api/sq/play", 0) == 0) {
+            const std::string name = sqName(sqp("name"));
+            const std::string idxS = sqp("i");
+            std::vector<QItem> items;
+            {
+                std::lock_guard<std::mutex> lk(g_sqMu);
+                bool found = false;
+                for (const auto& q : g_sqList) if (q.name == name) { items = q.items; found = true; break; }
+                if (!found) return "{\"ok\":false,\"error\":\"队列不存在\"}";
+            }
+            if (items.empty()) return "{\"ok\":false,\"error\":\"这个队列是空的\"}";
+            size_t idx = idxS.empty() ? 0 : (size_t)std::max(0, atoi(idxS.c_str()));
+            if (idx >= items.size()) idx = 0;
+            size_t cnt = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_q.mtx);
+                g_q.items = std::move(items);
+                g_q.index = idx;
+                g_q.base.clear();
+                cnt = g_q.items.size();
+            }
+            queue_save();
+            std::ostringstream j;
+            j << "{\"ok\":true,\"name\":\"" << jesc(name) << "\",\"count\":" << cnt
+              << ",\"index\":" << idx << "}";
+            return j.str();
+        }
+        return "{\"ok\":false,\"error\":\"未知的 /api/sq 子端点\"}";
+    }
+
     // ---------------- 播放列表 ----------------
     // 注意：不能写成 rfind("/api/pl",0)，否则 /api/play 会被这里截走（本轮真踩到）
     if (rq.path.rfind("/api/pl/", 0) == 0 || rq.path == "/api/pl") {
@@ -9315,54 +9574,223 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         std::error_code ec;
         fs::create_directories(plDir(), ec);
 
-        if (rq.path.rfind("/api/pl/save", 0) == 0) {
-            std::string name;
+        // ---- 用户 261026-08 #3「自定义播放列表」：这套端点原来自带 save/load/delete/list，
+        //      但**前端从来没有入口**（见 ui_script.h 里"播放列表（UI 已并入播放队列）"那句注释，
+        //      git 全历史检索 /api/pl 在 ui_script.h 里 0 命中 ⟹ 是"从来没做过"，不是被藏起来）。
+        //      本轮补最小可用集：create / rename / add / remove / play（= load + 前端起播）。
+        // ---- 名字消毒：文件名级（ / : * ? " < > | 全换成 _），限 80 字，空名字兜底。
+        auto cleanName = [](std::string name) {
+            while (!name.empty() && (name.front() == ' ' || name.front() == '\t')) name.erase(name.begin());
+            while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
+            if (name.empty()) name = "未命名播放列表";
+            for (auto& c : name)
+                if (c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' || c == '"' ||
+                    c == '<' || c == '>' || c == '|' || c == '\n' || c == '\r' || c == '\t') c = '_';
+            if (name.size() > 80) {
+                // 按 UTF-8 边界截断，不要劈开一个汉字（否则文件名变乱码）
+                size_t cut = 80;
+                while (cut > 0 && ((unsigned char)name[cut] & 0xC0) == 0x80) --cut;
+                name.resize(cut);
+            }
+            return name;
+        };
+        // ---- 取参数：先解析 query，再看 body 里的 key=（前端统一 POST，两种写法都认）
+        // ⚠️ 不能只找 "?key="：第 2 个参数起是 "&key="（本轮实测踩到 —— file/i 全被漏掉）。
+        auto qparam = [&](const char* key) -> std::string {
+            const size_t qp = rq.path.find('?');
+            if (qp != std::string::npos) {
+                std::istringstream qs(rq.path.substr(qp + 1));
+                std::string tok;
+                while (std::getline(qs, tok, '&')) {
+                    const size_t eq = tok.find('=');
+                    if (eq == std::string::npos) continue;
+                    if (urlDecode(tok.substr(0, eq)) == key) return urlDecode(tok.substr(eq + 1));
+                }
+            }
             std::istringstream is(rq.body);
             std::string tok;
-            while (std::getline(is, tok, (char)38)) {
-                const size_t e = tok.find((char)61);
-                if (e == std::string::npos) continue;
-                if (urlDecode(tok.substr(0, e)) == "name") name = urlDecode(tok.substr(e + 1));
+            while (std::getline(is, tok, '&')) {
+                const size_t eq = tok.find('=');
+                if (eq == std::string::npos) continue;
+                if (urlDecode(tok.substr(0, eq)) == key) return urlDecode(tok.substr(eq + 1));
             }
-            if (name.empty()) name = "未命名播放列表";
-            for (auto& c : name) if (c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') c = '_';
-            std::vector<QItem> items;
-            { std::lock_guard<std::mutex> lk(g_q.mtx); items = g_q.items; }
-            std::ofstream f(plDir() / (name + ".m3u8"), std::ios::binary | std::ios::trunc);
-            if (!f) return "{\"ok\":false,\"error\":\"写文件失败\"}";
-            f << "#EXTM3U\n";
-            // ⚠️ 已知限制（如实标注）：m3u8 没有"文件内区间"这一概念，CUE 分轨项只写路径。
-            //    载入播放列表后这些曲目会按整首播（区间信息在队列文件 rlplayer-playlist.txt 里才保留）。
-            for (auto& it : items) f << it.path << "\n";
-            return "{\"ok\":true,\"count\":" + std::to_string(items.size()) + "}";
-        }
-        if (rq.path.rfind("/api/pl/load", 0) == 0) {
-            std::string name;
-            const size_t q = rq.path.find("?name=");
-            if (q != std::string::npos) name = urlDecode(rq.path.substr(q + 6));
-            std::ifstream f(plDir() / (name + ".m3u8"));
-            if (!f) return "{\"ok\":false,\"error\":\"播放列表不存在\"}";
-            std::vector<QItem> items;
+            return std::string();
+        };
+        // ---- 子端点**精确**匹配：/api/pl/add 是 /api/pl/addmany 的前缀，
+        //      只按前缀判会把 addmany 的处理抢走（本轮实测踩到）。规则：
+        //      路径 == "/api/pl/<sub>" 或 "/api/pl/<sub>?..."
+        auto isPl = [&](const char* sub) {
+            const std::string base = std::string("/api/pl/") + sub;
+            if (rq.path == base) return true;
+            return rq.path.rfind(base + "?", 0) == 0;
+        };
+        // ---- 列表文件路径：**必须走 fs::u8path**（名字是 UTF-8，中文名直接拼窄串会按 ACP 解，
+        //      落盘文件名变乱码且 list 时对不上）。下面 load/save/add/remove 全部共用。
+        auto plFile = [&](const std::string& name) { return plDir() / fs::u8path(name + ".m3u8"); };
+        // ---- 读：`#RTA-CUE <cs> <ce>` 是"下一项的 CUE 区间"注释行。
+        //      m3u8 标准把 # 开头当注释 ⟹ 第三方播放器/老版本读同一份文件只会忽略区间，
+        //      路径照旧能播（这是把区间塞进来的唯一不破坏兼容的写法）。
+        //      ⚠️ 已知限制：导出给第三方播放器时区间丢失（按整首播），代码里如实标注。
+        auto loadList = [&](const std::string& name, std::vector<QItem>& out) -> bool {
+            std::ifstream f(plFile(name), std::ios::binary);
+            if (!f) return false;
+            out.clear();
             std::string line;
+            double pendCs = -1.0, pendCe = -1.0;
             while (std::getline(f, line)) {
                 if (!line.empty() && line.back() == '\r') line.pop_back();
-                if (line.empty() || line[0] == '#') continue;
-                items.emplace_back(line);      // m3u8 只有路径 ⟹ 按整首播（见 pl/save 的限制注）
+                if (line.empty()) continue;
+                if (line.rfind("#RTA-CUE ", 0) == 0) {
+                    const char* s = line.c_str() + 9;
+                    char* e2 = nullptr;
+                    pendCs = std::strtod(s, &e2);
+                    pendCe = (e2 && *e2) ? std::strtod(e2, nullptr) : -1.0;
+                    continue;
+                }
+                if (line[0] == '#') continue;
+                out.push_back(QItem(line, pendCs, pendCe));
+                pendCs = -1.0; pendCe = -1.0;
             }
+            return true;
+        };
+        auto saveList = [&](const std::string& name, const std::vector<QItem>& items) -> bool {
+            std::ofstream f(plFile(name), std::ios::binary | std::ios::trunc);
+            if (!f) return false;
+            f << "#EXTM3U\n";
+            for (const auto& it : items) {
+                if (it.isCue()) {
+                    char cb[96];
+                    std::snprintf(cb, sizeof(cb), "#RTA-CUE %.6f %.6f\n", it.cs, it.ce);
+                    f << cb;
+                }
+                f << it.path << "\n";
+            }
+            f.flush();
+            return f.good();
+        };
+
+        if (isPl("save")) {
+            // 用当前队列覆盖同名列表（"新建"最自然的动作 = 把现在这一列存下来）
+            const std::string name = cleanName(qparam("name"));
+            std::vector<QItem> items;
+            { std::lock_guard<std::mutex> lk(g_q.mtx); items = g_q.items; }
+            if (!saveList(name, items)) return "{\"ok\":false,\"error\":\"写文件失败\"}";
+            return "{\"ok\":true,\"name\":\"" + jesc(name) + "\",\"count\":" +
+                   std::to_string(items.size()) + "}";
+        }
+        if (isPl("create")) {
+            // 新建空列表（已存在则明确回报，不静默清空用户的东西）
+            const std::string name = cleanName(qparam("name"));
+            std::error_code ec2;
+            const bool exists = fs::exists(plFile(name), ec2);
+            if (!exists && !saveList(name, {})) return "{\"ok\":false,\"error\":\"写文件失败\"}";
+            return std::string("{\"ok\":true,\"name\":\"") + jesc(name) +
+                   "\",\"existed\":" + (exists ? "true" : "false") + ",\"count\":0}";
+        }
+        if (isPl("rename")) {
+            const std::string from = cleanName(qparam("from"));
+            const std::string to   = cleanName(qparam("to"));
+            std::error_code ec2;
+            if (!fs::exists(plFile(from), ec2)) return "{\"ok\":false,\"error\":\"播放列表不存在\"}";
+            if (from != to && fs::exists(plFile(to), ec2)) return "{\"ok\":false,\"error\":\"目标名字已存在\"}";
+            if (from != to) {
+                fs::rename(plFile(from), plFile(to), ec2);
+                if (ec2) return "{\"ok\":false,\"error\":\"改名失败\"}";
+            }
+            return "{\"ok\":true,\"from\":\"" + jesc(from) + "\",\"to\":\"" + jesc(to) + "\"}";
+        }
+        if (isPl("add")) {
+            // 单曲加进列表（带 CUE 区间）；列表不存在时自动建
+            const std::string name = cleanName(qparam("name"));
+            const std::string file = qparam("file");
+            if (file.empty()) return "{\"ok\":false,\"error\":\"缺少 file 参数\"}";
+            if (!valid_utf8(file)) return utf8_path_reject(file);
+            const std::string csS = qparam("cue_start");
+            const std::string ceS = qparam("cue_end");
+            QItem it(file, csS.empty() ? -1.0 : std::atof(csS.c_str()),
+                           ceS.empty() ? -1.0 : std::atof(ceS.c_str()));
+            std::vector<QItem> items;
+            loadList(name, items);          // 不存在 → out 为空，等价于新建
+            items.push_back(it);
+            if (!saveList(name, items)) return "{\"ok\":false,\"error\":\"写文件失败\"}";
+            return "{\"ok\":true,\"name\":\"" + jesc(name) + "\",\"count\":" +
+                   std::to_string(items.size()) + "}";
+        }
+        if (isPl("addmany")) {
+            // 批量加曲（"把当前队列全部加入此列表"）：body files= 多行，格式同 /api/queue/set
+            const std::string name = cleanName(qparam("name"));
+            const std::string files = qparam("files");
+            if (files.empty()) return "{\"ok\":false,\"error\":\"缺少 files 参数\"}";
+            std::vector<QItem> items;
+            loadList(name, items);                        // 不存在 → 等价于新建
+            size_t added = 0;
+            {
+                std::istringstream ls(files);
+                std::string line;
+                while (std::getline(ls, line)) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    if (line.empty()) continue;
+                    items.push_back(item_from_line(line));
+                    ++added;
+                }
+            }
+            if (!saveList(name, items)) return "{\"ok\":false,\"error\":\"写文件失败\"}";
+            return "{\"ok\":true,\"name\":\"" + jesc(name) + "\",\"added\":" + std::to_string(added) +
+                   ",\"count\":" + std::to_string(items.size()) + "}";
+        }
+        if (isPl("remove")) {
+            const std::string name = cleanName(qparam("name"));
+            const std::string idxS = qparam("i");
+            if (idxS.empty()) return "{\"ok\":false,\"error\":\"缺少 i 参数\"}";
+            const size_t idx = (size_t)std::max(0, atoi(idxS.c_str()));
+            std::vector<QItem> items;
+            if (!loadList(name, items)) return "{\"ok\":false,\"error\":\"播放列表不存在\"}";
+            if (idx >= items.size()) return "{\"ok\":false,\"error\":\"下标越界\"}";
+            items.erase(items.begin() + (long long)idx);
+            if (!saveList(name, items)) return "{\"ok\":false,\"error\":\"写文件失败\"}";
+            return "{\"ok\":true,\"name\":\"" + jesc(name) + "\",\"count\":" +
+                   std::to_string(items.size()) + "}";
+        }
+        if (isPl("load")) {
+            // 载入 = 把整列换成这份列表（前端随后调 /api/play?file=第一首 起播，见 loadFavs 同款做法）
+            const std::string name = cleanName(qparam("name"));
+            std::vector<QItem> items;
+            if (!loadList(name, items)) return "{\"ok\":false,\"error\":\"播放列表不存在\"}";
             {
                 std::lock_guard<std::mutex> lk(g_q.mtx);
                 g_q.items = items;
                 g_q.index = 0;
+                g_q.base.clear();
             }
             queue_save();
-            return "{\"ok\":true,\"count\":" + std::to_string(items.size()) + "}";
+            return "{\"ok\":true,\"name\":\"" + jesc(name) + "\",\"count\":" +
+                   std::to_string(items.size()) + "}";
         }
-        if (rq.path.rfind("/api/pl/delete", 0) == 0) {
-            std::string name;
-            const size_t q = rq.path.find("?name=");
-            if (q != std::string::npos) name = urlDecode(rq.path.substr(q + 6));
-            fs::remove(plDir() / (name + ".m3u8"), ec);
-            return std::string("{\"ok\":") + (ec ? "false" : "true") + "}";
+        if (isPl("delete")) {
+            const std::string raw = qparam("name");
+            if (raw.empty()) return "{\"ok\":false,\"error\":\"缺少 name 参数\"}";
+            const std::string name = cleanName(raw);
+            std::error_code ec3;
+            if (!fs::exists(plFile(name), ec3)) return "{\"ok\":false,\"error\":\"播放列表不存在\"}";
+            fs::remove(plFile(name), ec3);
+            return std::string("{\"ok\":") + (ec3 ? "false" : "true") + ",\"name\":\"" + jesc(name) + "\"}";
+        }
+        if (isPl("info")) {
+            // 单份列表的曲目明细（前端展开/删除单曲要用）。只读语义，但仍在 /api/pl 前缀下 ⟹ 只收 POST。
+            const std::string raw = qparam("name");
+            if (raw.empty()) return "{\"ok\":false,\"error\":\"缺少 name 参数\"}";
+            const std::string name = cleanName(raw);
+            std::vector<QItem> items;
+            if (!loadList(name, items)) return "{\"ok\":false,\"error\":\"播放列表不存在\"}";
+            std::ostringstream j;
+            j << "{\"ok\":true,\"name\":\"" << jesc(name) << "\",\"items\":[";
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (i) j << ",";
+                j << "{\"file\":\"" << jesc(items[i].path) << "\",\"cs\":" << items[i].cs
+                  << ",\"ce\":" << items[i].ce << "}";
+            }
+            j << "]}";
+            return j.str();
         }
         // 列表
         std::ostringstream j;
@@ -9383,7 +9811,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return j.str();
     }
 
-    if (rq.path.rfind("/api/play", 0) == 0) {
+    // ⚠️ 不能写成 rfind("/api/play",0)：那是 /api/playmode 的前缀（本轮实测踩到 ——
+    //    /api/playmode 的请求被播放端点截走，返回"未指定文件"，模式永远改不掉）。
+    if (rq.path == "/api/play" || rq.path.rfind("/api/play?", 0) == 0) {
         ct = "application/json; charset=utf-8";
         PlayParams p = parseForm(rq.body);   // 非 const：远程曲目会把 p.file 换成缓存路径
         // 远程曲目：先把原始文件完整下载到缓存，再走与本地完全相同的解码与 DSP 路径
@@ -10382,9 +10812,16 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         ct = "application/json; charset=utf-8";
         int mode = -1;
         auto gv = [&](const char* key) -> int {
-            const std::string k = std::string(key) + "=";
-            size_t p = rq.path.find("?" + k);
-            if (p != std::string::npos) return atoi(rq.path.c_str() + p + 1 + k.size());
+            const size_t qp = rq.path.find('?');
+            if (qp != std::string::npos) {
+                std::istringstream qs(rq.path.substr(qp + 1));
+                std::string q;
+                while (std::getline(qs, q, '&')) {
+                    const size_t eq = q.find('=');
+                    if (eq == std::string::npos) continue;
+                    if (urlDecode(q.substr(0, eq)) == key) return atoi(urlDecode(q.substr(eq + 1)).c_str());
+                }
+            }
             if (!rq.body.empty()) {
                 std::istringstream is(rq.body);
                 std::string tok;
@@ -10432,8 +10869,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return j.str();
     }
     // ---------------- 整列替换队列（#5 播放全部 / 具名队列播放共用）----------------
-    // POST /api/queue/set  body: files=<urlencoded>
- 每行一项：<路径>[<TAB>cs<TAB>ce]
+    // POST /api/queue/set  body: files=<urlencoded>，值为多行文本，每行一项：
+    //   普通曲目 = <路径>；CUE 分轨 = <路径><TAB><cs><TAB><ce>（与 rlplayer-playlist.txt 同格式）
     // 为什么要一个"整列替换"：先 /api/clear 再 N 次 /api/add 会留下中间态
     // （播放线程可能抢到空队列/半截队列），而"播放全部"必须一次到位。
     if (rq.path.rfind("/api/queue/set", 0) == 0) {

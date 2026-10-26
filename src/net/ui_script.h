@@ -31,6 +31,8 @@ function openExternal(u) {
 var S = {
   view: 'albums', albums: [], album: null, files: [], remote: [],
   q: { items: [], index: 0 }, cur: '', playing: false, paused: false,
+  // 261026-08 #5/#6/#3：我的最爱 / 保存的队列 / 播放列表 的视图状态
+  favs: [], sqs: [], sqName: '', pls: [], plOpen: '', plItems: {},
   vol: 0, loud: false, lastCur: '', roots: [], scanning: false, dur: 0, pos: 0,
   volDb: 0, startDb: 0, theme: 'dark', queueHidden: false,
   // 261024-04 #8：GUP 相关的两个运行时状态（gpuOn = 有 GPU；gpuUsed = 本次播放真的用了 GPU）
@@ -2157,6 +2159,479 @@ function loadRecent() {
   });
 }
 
+/* ---------------- 我的最爱 / 保存的队列 / 播放列表（用户 261026-08 #3/#5/#6）----------------
+   数据源：
+     #5 我的最爱   = 既有收藏机制（/api/fav 红心，落盘 rlplayer-favs.json）
+                     + meta=1 从库索引补标题/艺术家/专辑（库里没有就退回文件名）
+     #6 保存的队列 = rlplayer-savedqueues.conf（原子写，重启后仍在）
+     #3 播放列表   = playlists\*.m3u8（/api/pl，本轮补 create/rename/add/addmany/remove/info）
+   为什么三个东西分行放：它们各自的后端与持久化形态不同，混在一起以后必然又变成"两处真相"。 */
+
+// 通用文本输入弹窗。为什么不用 window.prompt：WebView2 里 JS 对话框要宿主实现
+// ScriptDialogOpening，且 CDP 自检时对话框会把页面挂住（拿不到 DOM 就无法断言）。统一走 #modal。
+function askText(o) {
+  o = o || {};
+  var m = D('modal'); if (!m) return;
+  D('mtitle').textContent = o.title || '输入';
+  D('mbody').innerHTML =
+    '<div style="padding:2px 0 14px"><input id=askIn style="width:100%;padding:9px 11px;border-radius:9px;' +
+    'border:1px solid var(--line);background:var(--field);color:var(--txt);font-size:13px" value="' +
+    esc(o.value || '') + '" placeholder="' + esc(o.placeholder || '') + '"></div>' +
+    (o.hint ? '<div class=hint style="margin:-8px 0 12px">' + esc(o.hint) + '</div>' : '') +
+    '<div style="display:flex;gap:8px;justify-content:flex-end">' +
+    '<button class=btn id=askCancel>取消</button>' +
+    '<button class="btn pri" id=askOk>' + esc(o.ok || '确定') + '</button></div>';
+  m.classList.add('on');
+  var inp = D('askIn');
+  D('askOk').onclick = function () {
+    var v = (D('askIn').value || '').trim();
+    if (!v) { toast('名字不能为空'); return; }
+    m.classList.remove('on');
+    if (o.onOk) o.onOk(v);
+  };
+  D('askCancel').onclick = function () { m.classList.remove('on'); };
+  if (inp) {
+    inp.onkeydown = function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); D('askOk').click(); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); D('askCancel').click(); }
+    };
+    setTimeout(function () { try { inp.focus(); inp.select(); } catch (e) {} }, 30);
+  }
+}
+
+// 路径里的上级目录名（本地实现，不走 parentFolder：那个函数是给 Windows 单反斜杠路径写的旧实现）
+function folderOf(p) {
+  var s = String(p || '');
+  var i = Math.max(s.lastIndexOf(String.fromCharCode(92)), s.lastIndexOf('/'));
+  if (i <= 0) return '';
+  var head = s.slice(0, i);
+  var j = Math.max(head.lastIndexOf(String.fromCharCode(92)), head.lastIndexOf('/'));
+  return head.slice(j + 1);
+}
+
+/* ---------------- 整列起播（#5 播放全部 / #6 队列播放 / #3 播放整列 共用） ----------------
+   语义（用户原话）：点了从第一首开始顺序播放整个列表。
+   实现：一次性替换队列（/api/queue/set）→ 从第 1 首起播（/api/play 会在队列里就地定位 index）。
+   关键点：单曲循环会让"播放全部"只播第一首 ⟹ 先退到专辑循环。**这是行为保证，不是只改图标**。 */
+function ensureSequentialMode(cb) {
+  var cur = parseInt(D('sRep') ? D('sRep').value : 0, 10) || 0;
+  if (cur !== 2) { cb(); return; }
+  D('sRep').value = '1';
+  api('/api/playmode?mode=1').then(function () { applyRep(1); cb(); }).catch(function () { cb(); });
+}
+function playWholeList(files, label) {
+  files = (files || []).filter(function (f) { return !!f; });
+  if (!files.length) { toast('这个列表是空的'); return; }
+  ensureSequentialMode(function () {
+    api('/api/queue/set', 'files=' + encodeURIComponent(files.join(String.fromCharCode(10)))).then(function (j) {
+      if (!j || j.ok === false) { toast((j && j.error) || '建立队列失败'); return; }
+      playPath(files[0]);
+      toast('开始播放' + (label ? ('：' + label) : '') + '（' + files.length + ' 首）');
+      if (S.view === 'queue') renderQueuePage();
+    }).catch(function (e) { toast('播放失败: ' + e); });
+  });
+}
+
+/* ---------------- 我的最爱（#5） ---------------- */
+function loadFavs() {
+  S.view = 'favs';
+  head('我的最爱', '加载中…', '');
+  // 收藏与"保存的队列"**必须一起取**：页面底部那段用的就是 S.sqs，
+  // 只取一半会出现"左栏有队列、页面里却空着"（自检时实测踩到）。
+  Promise.all([api('/api/fav/list?meta=1'), api('/api/sq/list')]).then(function (res) {
+    var j = res[0] || {};
+    S.sqs = (res[1] && res[1].queues) || [];
+    paintSavedQueues();
+    if (S.view !== 'favs') return;
+    var raw = (j && j.files) || [];
+    S.favs = raw.map(function (x) { return (typeof x === 'string') ? { file: x } : x; });
+    FAV_SET = new Set(S.favs.map(function (x) { return x.file; }));
+    var n = S.favs.length;
+    // 顶部「播放全部」：用户要求"一键、从第一首开始顺序播放整个最爱列表"
+    head('我的最爱', n ? (n + ' 首') : '', n
+      ? '<button class="btn pri" id=favPlayAll title="从第一首开始顺序播放整个最爱列表">▶ 播放全部</button>' : '');
+    if (!n) {
+      D('list').innerHTML = '<div class=empty>还没有收藏<br><span style="font-size:11.5px">在曲目行或单曲页点心形，就会出现在这里</span></div>'
+        + savedQueuesSectionHtml();
+      bindSavedQueueSection();
+      return;
+    }
+    var h = '<div style="padding:6px 0 6px">';
+    S.favs.forEach(function (x, i) {
+      var f = x.file || '';
+      var t = x.title || nam(f);
+      var ar = x.artist || '';
+      var al = x.album || folderOf(f);
+      h += '<div class="trow favrow" data-i=' + i + ' style="grid-template-columns:34px 1fr 180px 200px 34px">' +
+           '<div class=n>' + (i + 1) + '</div>' +
+           '<div class=tt title="' + esc(f) + '">' + esc(t) + '</div>' +
+           '<div class=ar title="' + esc(ar) + '">' + esc(ar) + '</div>' +
+           '<div class=du title="' + esc(al) + '" style="text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(al) + '</div>' +
+           '<div style="display:flex;justify-content:flex-end">' + favIconHtml(f, true) + '</div></div>';
+    });
+    h += '</div>' + savedQueuesSectionHtml();
+    D('list').innerHTML = h;
+    if (D('favPlayAll')) D('favPlayAll').onclick = playAllFavs;
+    Array.prototype.forEach.call(D('list').querySelectorAll('.favrow'), function (e) {
+      var x = S.favs[+e.dataset.i]; if (!x) return;
+      e.onclick = function (ev) { if (ev.target.closest && ev.target.closest('.fav-btn')) return; playPath(x.file); };
+      e.oncontextmenu = function (ev) { ev.preventDefault(); showTrackMenu(ev.clientX, ev.clientY, { path: x.file }); };
+      var b = e.querySelector('.fav-btn');
+      if (b) b.onclick = function (ev) { unfavFromFavs(x.file, ev); };
+    });
+    bindSavedQueueSection();
+  }).catch(function (e) { renderPanelError('favs', loadFavs, e); });
+}
+function playAllFavs() {
+  playWholeList((S.favs || []).map(function (x) { return x.file; }), '我的最爱');
+}
+function unfavFromFavs(file, ev) {
+  if (ev) { ev.stopPropagation(); ev.preventDefault(); }
+  api('/api/fav?file=' + encodeURIComponent(file) + '&on=0').then(function (j) {
+    if (!j || !j.ok) { toast((j && j.error) || '取消收藏失败'); return; }
+    FAV_SET.delete(file);
+    toast('已取消收藏');
+    if (S.view === 'favs') loadFavs();
+  }).catch(function (e) { toast('取消收藏失败: ' + e); });
+}
+
+// 确认弹窗（同样不用 window.confirm：WebView2/CDP 里原生对话框会挂住页面，测不了也点不动）
+function askConfirm(o) {
+  o = o || {};
+  var m = D('modal'); if (!m) return;
+  D('mtitle').textContent = o.title || '确认';
+  D('mbody').innerHTML =
+    '<div style="padding:2px 0 16px;font-size:12.5px;line-height:1.7;color:var(--txt2)">' + esc(o.text || '') + '</div>' +
+    '<div style="display:flex;gap:8px;justify-content:flex-end">' +
+    '<button class=btn id=cfNo>取消</button>' +
+    '<button class="btn pri" id=cfYes>' + esc(o.ok || '确定') + '</button></div>';
+  m.classList.add('on');
+  D('cfNo').onclick = function () { m.classList.remove('on'); };
+  D('cfYes').onclick = function () { m.classList.remove('on'); if (o.onOk) o.onOk(); };
+}
+
+/* ---------------- 保存的队列（#6） ----------------
+   后端 /api/sq/*，落盘 rlplayer-savedqueues.conf（原子写）。
+   展示位置：左栏「我的最爱」**下面**（renderSavedQueues）+ 我的最爱页底部同一份区块。 */
+function savedQueuesSectionHtml() {
+  var qs = S.sqs || [];
+  var h = '<div class=sqsec><div class=sechd><span>保存的队列</span><span class=sp></span>' +
+          '<button class=btn id=sqSaveBtn title="把当前播放队列存成具名队列（重启后仍在）">保存当前队列</button></div>';
+  if (!qs.length) h += '<div class=empty style="padding:10px 20px;text-align:left">还没有保存的队列</div>';
+  qs.forEach(function (q, i) {
+    h += '<div class=sqitem data-i=' + i + '>' +
+         '<span class=sqt title="' + esc(q.name) + '">' + esc(q.name) + '</span>' +
+         '<span class=sqn2>' + q.n + ' 首</span>' +
+         '<button class="btn sqplay" data-i=' + i + '>播放</button>' +
+         '<button class="btn sqren" data-i=' + i + '>改名</button>' +
+         '<button class="btn sqdel" data-i=' + i + '>删除</button></div>';
+  });
+  return h + '</div>';
+}
+function bindSavedQueueSection() {
+  if (D('sqSaveBtn')) D('sqSaveBtn').onclick = function () { saveQueueDialog(); };
+  Array.prototype.forEach.call(document.querySelectorAll('.sqitem'), function (e) {
+    var q = (S.sqs || [])[+e.dataset.i]; if (!q) return;
+    var b = e.querySelector('.sqplay'); if (b) b.onclick = function () { playSavedQueue(q.name, 0); };
+    b = e.querySelector('.sqren'); if (b) b.onclick = function () { renameQueueDialog(q.name); };
+    b = e.querySelector('.sqdel'); if (b) b.onclick = function () { deleteSavedQueue(q.name); };
+  });
+}
+// 左栏列表（我的最爱下面）：两段式 —— 取数（renderSavedQueues）/ 上屏（paintSavedQueues）。
+// 拆开是因为「我的最爱」页要用同一份 S.sqs 渲染页面底部的区块，
+// 若两处各自取数，就会出现"左栏有、页面里没有"的假象（自检时实测踩到）。
+function renderSavedQueues() {
+  api('/api/sq/list').then(function (j) {
+    S.sqs = (j && j.queues) || [];
+    paintSavedQueues();
+  }).catch(function () {});
+}
+function paintSavedQueues() {
+  {
+    var box = D('sqList'); if (!box) return;
+    var h = '';
+    if (S.sqs.length) h += '<div class=sqhd>保存的队列</div>';
+    S.sqs.forEach(function (q, i) {
+      h += '<div class="nav sqrow" data-v=sq data-sq="' + esc(q.name) + '" data-i=' + i + '>' +
+           '<span class=sqn title="' + esc(q.name) + '">' + esc(q.name) + '</span>' +
+           '<span class="sqb ren" title="重命名">✎</span>' +
+           '<span class="sqb del" title="删除">×</span></div>';
+    });
+    box.innerHTML = h;
+    Array.prototype.forEach.call(box.querySelectorAll('.sqrow'), function (e) {
+      var q = S.sqs[+e.dataset.i]; if (!q) return;
+      e.onclick = function (ev) {
+        if (ev.target.classList.contains('sqb')) return;
+        renderSavedQueuePage(q.name);
+      };
+      var r1 = e.querySelector('.ren'); if (r1) r1.onclick = function (ev) { ev.stopPropagation(); renameQueueDialog(q.name); };
+      var r2 = e.querySelector('.del'); if (r2) r2.onclick = function (ev) { ev.stopPropagation(); deleteSavedQueue(q.name); };
+    });
+  }
+}
+function renderSavedQueuePage(name) {
+  if (!name) return;
+  S.view = 'sq'; S.sqName = name;
+  head(name, '加载中…', '');
+  api('/api/sq/info?name=' + encodeURIComponent(name)).then(function (j) {
+    if (S.view !== 'sq' || S.sqName !== name) return;
+    if (!j || !j.ok) {
+      head(name, '', '');
+      D('list').innerHTML = '<div class=empty>队列不存在（可能已被删除）</div>';
+      return;
+    }
+    var it = j.items || [];
+    S.sqItems = it;
+    head(name, it.length + ' 首',
+      '<button class="btn pri" id=sqPlayAll>▶ 播放整列</button>' +
+      '<button class=btn id=sqRen>重命名</button>' +
+      '<button class=btn id=sqDel>删除</button>');
+    Array.prototype.forEach.call(document.querySelectorAll('.sqlist .sqrow'), function (e) {
+      e.classList.toggle('on', e.dataset.sq === name);
+    });
+    if (!it.length) { D('list').innerHTML = '<div class=empty>这个队列是空的</div>'; return; }
+    var h = '<div style="padding:6px 0 24px">';
+    it.forEach(function (x, i) {
+      h += '<div class="trow sqtrow" data-i=' + i + ' style="grid-template-columns:34px 1fr 240px">' +
+           '<div class=n>' + (i + 1) + '</div>' +
+           '<div class=tt title="' + esc(x.file) + '">' + esc(nam(x.file)) + '</div>' +
+           '<div class=ar style="text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(folderOf(x.file)) + '</div></div>';
+    });
+    D('list').innerHTML = h + '</div>';
+    if (D('sqPlayAll')) D('sqPlayAll').onclick = function () { playSavedQueue(name, 0); };
+    if (D('sqRen')) D('sqRen').onclick = function () { renameQueueDialog(name); };
+    if (D('sqDel')) D('sqDel').onclick = function () { deleteSavedQueue(name); };
+    Array.prototype.forEach.call(D('list').querySelectorAll('.sqtrow'), function (e) {
+      var i = +e.dataset.i;
+      e.onclick = function () { playSavedQueue(name, i); };
+    });
+  }).catch(function (e) { renderPanelError('sq', function () { renderSavedQueuePage(name); }, e); });
+}
+function playSavedQueue(name, i) {
+  i = i || 0;
+  ensureSequentialMode(function () {
+    api('/api/sq/play?name=' + encodeURIComponent(name) + '&i=' + i).then(function (j) {
+      if (!j || !j.ok) { toast((j && j.error) || '载入失败'); return; }
+      api('/api/sq/info?name=' + encodeURIComponent(name)).then(function (info) {
+        var it = (info && info.items) || [];
+        var k = Math.min(Math.max(0, i), Math.max(0, it.length - 1));
+        if (it[k]) playPath(it[k].file, it[k].cs, it[k].ce);
+        toast('播放队列：' + name + '（' + it.length + ' 首）');
+        loadQ();
+      });
+    }).catch(function (e) { toast('播放失败: ' + e); });
+  });
+}
+function saveQueueDialog() {
+  var n = (S.q && S.q.items) ? S.q.items.length : 0;
+  if (!n) { toast('队列是空的，先加几首歌再保存'); return; }
+  askText({ title: '保存当前队列', ok: '保存', value: S.sqName || '',
+    placeholder: '例如 夜深人静',
+    hint: '把现在这 ' + n + ' 首（含顺序与 CUE 区间）存成具名队列；写入 rlplayer-savedqueues.conf，重启后仍在',
+    onOk: function (name) {
+      api('/api/sq/save?name=' + encodeURIComponent(name)).then(function (j) {
+        if (!j || !j.ok) { toast((j && j.error) || '保存失败'); return; }
+        toast('已保存队列：' + j.name + '（' + j.count + ' 首）');
+        renderSavedQueues();
+        if (S.view === 'favs') loadFavs();
+        else if (S.view === 'sq') renderSavedQueuePage(j.name);
+      }).catch(function (e) { toast('保存失败: ' + e); });
+    } });
+}
+function renameQueueDialog(name) {
+  askText({ title: '重命名队列', ok: '改名', value: name,
+    hint: '改名后立刻写入 rlplayer-savedqueues.conf（重启后是新名字）',
+    onOk: function (to) {
+      api('/api/sq/rename?from=' + encodeURIComponent(name) + '&to=' + encodeURIComponent(to)).then(function (j) {
+        if (!j || !j.ok) { toast((j && j.error) || '改名失败'); return; }
+        toast('已改名为：' + j.to);
+        if (S.sqName === name) S.sqName = j.to;
+        renderSavedQueues();
+        if (S.view === 'sq') renderSavedQueuePage(j.to);
+        else if (S.view === 'favs') loadFavs();
+      }).catch(function (e) { toast('改名失败: ' + e); });
+    } });
+}
+function deleteSavedQueue(name) {
+  askConfirm({ title: '删除队列', ok: '删除',
+    text: '删除队列「' + name + '」？只删这份保存的队列，不动当前播放队列。',
+    onOk: function () {
+      api('/api/sq/delete?name=' + encodeURIComponent(name)).then(function (j) {
+        if (!j || !j.ok) { toast((j && j.error) || '删除失败'); return; }
+        toast('已删除：' + name);
+        if (S.sqName === name) S.sqName = '';
+        renderSavedQueues();
+        if (S.view === 'sq') { setView('favs'); loadFavs(); }
+        else if (S.view === 'favs') loadFavs();
+      }).catch(function (e) { toast('删除失败: ' + e); });
+    } });
+}
+
+/* ---------------- 播放列表（#3；后端 /api/pl，文件 playlists\*.m3u8） ----------------
+   历史（本轮查清，写进注释免得后人再猜）：这套 /api/pl 端点从 1.0.8 起就在，
+   但 ui_script.h 里从来没有过任何调用点（git 全历史 -S'/api/pl/save' 零命中），
+   注释里那句「播放列表（UI 已并入播放队列）」是**当初就没做**，不是被藏起来或被删。 */
+function loadPlaylists() {
+  S.view = 'pl';
+  head('播放列表', '加载中…', '');
+  api('/api/pl').then(function (j) {
+    if (S.view !== 'pl') return;
+    S.pls = (j && j.lists) || [];
+    var n = S.pls.length;
+    head('播放列表', n ? (n + ' 个') : '',
+      '<button class="btn pri" id=plNew title="把当前播放队列存成一个新播放列表">＋ 新建（用当前队列）</button>');
+    var h = '<div style="padding:12px 20px 8px;font-size:11.5px;color:var(--mut2);line-height:1.7">' +
+            '存在 playlists\\ 下的 *.m3u8（第三方播放器也认）；CUE 分轨区间记在 #RTA-CUE 注释行。' +
+            '「我的最爱」下面的<b>保存的队列</b>是另一份（带区间、落 rlplayer-savedqueues.conf）。</div>';
+    if (!n) h += '<div class=empty>还没有播放列表<br><span style="font-size:11.5px">点右上「新建」；或在任意曲目上右键「加入播放列表…」</span></div>';
+    S.pls.forEach(function (p, i) {
+      h += '<div class=plrow data-i=' + i + '>' +
+           '<span class=pln title="' + esc(p.name) + '">' + esc(p.name) + '</span>' +
+           '<span class=plc>' + p.n + ' 首</span>' +
+           '<button class="btn plplay" data-i=' + i + '>播放整列</button>' +
+           '<button class="btn pladd" data-i=' + i + '>加曲（当前队列）</button>' +
+           '<button class="btn plren" data-i=' + i + '>改名</button>' +
+           '<button class="btn pldel" data-i=' + i + '>删除</button>' +
+           '<button class="btn plopen" data-i=' + i + '>曲目</button></div>';
+      if (S.plOpen === p.name && S.plItems[p.name]) {
+        h += '<div class=pltracks>';
+        S.plItems[p.name].forEach(function (x, k) {
+          h += '<div class=plt data-k=' + k + ' data-name="' + esc(p.name) + '">' +
+               '<span class=ptn title="' + esc(x.file) + '">' + (k + 1) + '. ' + esc(nam(x.file)) + '</span>' +
+               '<button class=qdel data-k=' + k + ' title="从这个播放列表移除">×</button></div>';
+        });
+        h += '</div>';
+      }
+    });
+    D('list').innerHTML = h;
+    bindPlaylistPage();
+  }).catch(function (e) { renderPanelError('pl', loadPlaylists, e); });
+}
+function bindPlaylistPage() {
+  if (D('plNew')) D('plNew').onclick = function () {
+    var qn = (S.q && S.q.items) ? S.q.items.length : 0;
+    askText({ title: '新建播放列表', ok: '新建', value: '', placeholder: '例如 车里听',
+      hint: qn ? ('把当前队列的 ' + qn + ' 首存成新播放列表') : '当前队列是空的 —— 会建一个空列表，之后用「加曲」或右键曲目加入',
+      onOk: function (name) {
+        api('/api/pl/save', 'name=' + encodeURIComponent(name)).then(function (r) {
+          if (!r || !r.ok) { toast((r && r.error) || '新建失败'); return; }
+          toast('已新建播放列表：' + r.name + '（' + r.count + ' 首）');
+          S.plOpen = r.name; togglePlaylist(r.name, true);
+        }).catch(function (e) { toast('新建失败: ' + e); });
+      } });
+  };
+  Array.prototype.forEach.call(document.querySelectorAll('.plrow'), function (e) {
+    var p = (S.pls || [])[+e.dataset.i]; if (!p) return;
+    var b = e.querySelector('.plplay'); if (b) b.onclick = function () { playPlaylist(p.name, 0); };
+    b = e.querySelector('.pladd'); if (b) b.onclick = function () { addQueueToPlaylist(p.name); };
+    b = e.querySelector('.plren'); if (b) b.onclick = function () { renamePlaylist(p.name); };
+    b = e.querySelector('.pldel'); if (b) b.onclick = function () { deletePlaylist(p.name); };
+    b = e.querySelector('.plopen'); if (b) b.onclick = function () { togglePlaylist(p.name); };
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('.pltracks .plt'), function (e) {
+    var name = e.dataset.name, k = +e.dataset.k;
+    var d = e.querySelector('.qdel');
+    if (d) d.onclick = function (ev) {
+      ev.stopPropagation();
+      api('/api/pl/remove?name=' + encodeURIComponent(name) + '&i=' + k).then(function (j) {
+        if (!j || !j.ok) { toast((j && j.error) || '移除失败'); return; }
+        toast('已移除');
+        togglePlaylist(name, true);
+      }).catch(function (er) { toast('移除失败: ' + er); });
+    };
+    e.onclick = function (ev) { if (ev.target.classList.contains('qdel')) return; playPlaylist(name, k); };
+  });
+}
+function playPlaylist(name, k) {
+  k = k || 0;
+  api('/api/pl/info', 'name=' + encodeURIComponent(name)).then(function (j) {
+    if (!j || !j.ok) { toast((j && j.error) || '播放列表不存在'); return; }
+    var it = j.items || [];
+    if (!it.length) { toast('这个播放列表还是空的'); return; }
+    api('/api/pl/load', 'name=' + encodeURIComponent(name)).then(function (r) {
+      if (!r || !r.ok) { toast((r && r.error) || '载入失败'); return; }
+      ensureSequentialMode(function () {
+        var kk = Math.min(Math.max(0, k), it.length - 1);
+        playPath(it[kk].file, it[kk].cs, it[kk].ce);
+        toast('播放整列：' + name + '（' + it.length + ' 首）');
+      });
+    });
+  }).catch(function (e) { toast('播放失败: ' + e); });
+}
+function togglePlaylist(name, force) {
+  if (!force && S.plOpen === name) { S.plOpen = ''; loadPlaylists(); return; }
+  api('/api/pl/info', 'name=' + encodeURIComponent(name)).then(function (j) {
+    if (!j || !j.ok) { toast((j && j.error) || '读取失败'); return; }
+    S.plItems[name] = j.items || [];
+    S.plOpen = name;
+    loadPlaylists();
+  }).catch(function (e) { toast('读取失败: ' + e); });
+}
+function addQueueToPlaylist(name) {
+  var items = (S.q && S.q.items) || [];
+  if (!items.length) { toast('当前队列是空的'); return; }
+  var cues = (S.q && S.q.cues) || [];
+  var TAB = String.fromCharCode(9);
+  var lines = items.map(function (f, i) {
+    var c = cues[i] || [-1, -1];
+    return (c[0] >= 0) ? (f + TAB + c[0] + TAB + c[1]) : f;
+  });
+  api('/api/pl/addmany', 'name=' + encodeURIComponent(name) + '&files=' + encodeURIComponent(lines.join(String.fromCharCode(10))))
+    .then(function (j) {
+      if (!j || !j.ok) { toast((j && j.error) || '加曲失败'); return; }
+      toast('已加入 ' + j.added + ' 首，现在共 ' + j.count + ' 首');
+      if (S.plOpen === name) togglePlaylist(name, true); else loadPlaylists();
+    }).catch(function (e) { toast('加曲失败: ' + e); });
+}
+function renamePlaylist(name) {
+  askText({ title: '重命名播放列表', ok: '改名', value: name,
+    onOk: function (to) {
+      api('/api/pl/rename?from=' + encodeURIComponent(name) + '&to=' + encodeURIComponent(to)).then(function (j) {
+        if (!j || !j.ok) { toast((j && j.error) || '改名失败'); return; }
+        toast('已改名为：' + j.to);
+        if (S.plOpen === name) S.plOpen = j.to;
+        loadPlaylists();
+      }).catch(function (e) { toast('改名失败: ' + e); });
+    } });
+}
+function deletePlaylist(name) {
+  askConfirm({ title: '删除播放列表', ok: '删除',
+    text: '删除播放列表「' + name + '」？只删 playlists\\ 下这个 .m3u8 文件，不动当前队列。',
+    onOk: function () {
+      api('/api/pl/delete?name=' + encodeURIComponent(name)).then(function (j) {
+        if (!j || !j.ok) { toast((j && j.error) || '删除失败'); return; }
+        toast('已删除：' + name);
+        if (S.plOpen === name) S.plOpen = '';
+        loadPlaylists();
+      }).catch(function (e) { toast('删除失败: ' + e); });
+    } });
+}
+// 曲目右键 → 加入播放列表（列表为空时可直接新建）
+function pickPlaylist(cb) {
+  api('/api/pl').then(function (j) {
+    var lists = (j && j.lists) || [];
+    var m = D('modal'); if (!m) return;
+    D('mtitle').textContent = '加入播放列表';
+    var h = '<div class=hint style="margin-bottom:10px">选一个播放列表（没有就先新建一个）</div>';
+    lists.forEach(function (p, i) {
+      h += '<div class="castpick-row plpick" data-i=' + i + '><span>' + esc(p.name) +
+           '</span><span style="color:var(--mut2);font-size:11px">' + p.n + ' 首</span></div>';
+    });
+    h += '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">' +
+         '<button class=btn id=pickNew>新建列表并加入</button></div>';
+    D('mbody').innerHTML = h;
+    m.classList.add('on');
+    Array.prototype.forEach.call(D('mbody').querySelectorAll('.plpick'), function (e) {
+      e.onclick = function () { m.classList.remove('on'); cb(lists[+e.dataset.i].name); };
+    });
+    D('pickNew').onclick = function () {
+      m.classList.remove('on');
+      askText({ title: '新建播放列表', ok: '新建并加入', value: '',
+        onOk: function (name) { cb(name); } });
+    };
+  }).catch(function (e) { toast('读取播放列表失败: ' + e); });
+}
+
 /* ---------------- 播放控制 ---------------- */
 /* CUE 分轨（2026-10-25）：cue 把整轨切成 N 首，这 N 首的 path 完全相同，
    只有 cue_start/cue_end（秒）能区分。cs < 0 = 整首（旧行为，负向对照就走这条）。
@@ -2197,6 +2672,15 @@ function showTrackMenu(x, y, tk) {
   }
   item('立即播放', function () { playPath(tk.path, tk.cs, tk.ce); });
   item('加入播放队列', function () { addPathCue(tk.path, tk.cs, tk.ce); });
+  // #3（261026-08）：把这一首加进「播放列表」（/api/pl/add，带 CUE 区间）
+  item('加入播放列表…', function () {
+    pickPlaylist(function (name) {
+      api('/api/pl/add?name=' + encodeURIComponent(name) + '&file=' + encodeURIComponent(tk.path) + cueQuery(tk.cs, tk.ce))
+        .then(function (j) {
+          toast((j && j.ok) ? ('已加入播放列表：' + name + '（' + j.count + ' 首）') : ((j && j.error) || '加入失败'));
+        }).catch(function (e) { toast('加入失败: ' + e); });
+    });
+  });
   document.body.appendChild(m);
   _activeCtxMenu = m;
   // 贴边回推（菜单比窗口大时也不会跑到屏幕外）
@@ -2321,7 +2805,9 @@ function loadQ() {
     // cues 与 items 逐项对齐的 [起,止] 秒数组（后端 /api/queue；[-1,-1] = 整首）
     S.q = { items: j.items || [], cues: j.cues || [], index: j.index || 0 };
     if (D('sShuf')) D('sShuf').checked = !!j.shuffle;
-    if (D('sRep') && j.repeat !== undefined) { D('sRep').value = String(j.repeat); applyRep(j.repeat); }
+    // #2：mode 与 repeat 是同一个值（0关/1列表/2单曲/3随机）；老后端没有 mode 时退回 repeat
+    var pmd = (j.mode !== undefined) ? j.mode : j.repeat;
+    if (D('sRep') && pmd !== undefined) { D('sRep').value = String(pmd); applyRep(pmd); }
     D('rcnt').textContent = '共 ' + S.q.items.length + ' 首';
     updateNextTrackInfo();
     if (!S.q.items.length) {
@@ -3087,7 +3573,10 @@ function setView(v) {
   // 作品页入口收进单曲页后，仍在内部使用 works 视图；离开 works 时清掉"从正在播放返回"的标记
   if (v !== 'works') S.worksFrom = '';
   Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
-    e.classList.toggle('on', e.dataset.v === v || (v === 'artist' && e.dataset.v === 'artists') || (v === 'work' && e.dataset.v === 'works'));
+    var on = e.dataset.v === v || (v === 'artist' && e.dataset.v === 'artists') || (v === 'work' && e.dataset.v === 'works');
+    // #6：保存的队列是左栏的**二级条目**，只能亮当前那一个（否则所有 sqrow 会一起高亮）
+    if (e.dataset.sq) on = (v === 'sq' && e.dataset.sq === S.sqName);
+    e.classList.toggle('on', on);
   });
   var isSet = (v === 'settings');
   // 设置页占满整屏：右栏（队列/歌词）在这里没有意义，直接藏掉。
@@ -3120,6 +3609,10 @@ Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
     else if (v === 'remote') loadRemote('');
     else if (v === 'queue') { renderQueuePage(); }
     else if (v === 'recent') loadRecent();
+    // 261026-08：#5 我的最爱 / #6 保存的队列详情 / #3 播放列表
+    else if (v === 'favs') { loadFavs(); }
+    else if (v === 'pl') { loadPlaylists(); }
+    else if (v === 'sq') { renderSavedQueuePage(S.sqName || ''); }
   };
 });
 
@@ -3201,26 +3694,58 @@ D('npPrev').onclick = function () { api('/api/skip?dir=-1', '').then(loadQ); };
 D('npNext').onclick = function () { api('/api/skip?dir=1', '').then(loadQ); };
 D('npPlay').onclick = playOrPause;
 D('npStop').onclick = function () { api('/api/stop', '').then(loadQ); };
-// ---- 循环方式：整页按钮与底栏 #bRep、设置页 #sp_rep 共用 #sRep 的值（唯一真相源）----
-// 为什么不自己存一份：历史上"两处各有一份"必然不一致（HANDOVER §4.5 的规矩）。
+// ---- 播放模式（四态）：底栏 #bRep、整页 #npRep、设置页 #sp_rep 共用 #sRep 的值（唯一真相源）----
+// 2026-10-26（用户 261026-08 #2）：**循环与随机合并成同一个按钮**，共 4 态：
+//   0 = 关闭循环（顺序播完停止）   1 = 专辑/列表循环
+//   2 = 单曲循环                  3 = 随机播放（打乱后循环）
+// 点击顺序（用户钦定）：单曲循环 → 专辑循环 → 关闭循环 → 随机播放 → 回单曲循环
+// 为什么用一个字段而不是两个开关：两个开关能组合出 6 态，图标根本没法诚实表达，
+// 而且"图标说随机、行为却是单曲"这类假修历史上真的发生过。
+var PM_ORDER = [2, 1, 0, 3];
+var PM_LABEL = ['关闭循环（顺序播完停止）', '专辑/列表循环', '单曲循环', '随机播放'];
+// 四种图标各画各的（内联 SVG，风格与既有图标一致：24x24 视框 + stroke=currentColor）：
+//   单曲 = 循环箭头 + 数字 1；专辑循环 = 纯循环箭头；关闭 = 循环箭头 + 斜杠划掉；随机 = 交叉双箭头
+function repIconHtml(mode, size) {
+  mode = parseInt(mode, 10); if (isNaN(mode)) mode = 0;
+  var sz = size || 17;
+  var head = '<svg width="' + sz + '" height="' + sz + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">';
+  if (mode === 3) {
+    return head + '<path d="M3 6.5h3.5l10 11H21"/><path d="M18.2 3.5L21 6l-2.8 2.5"/>' +
+                  '<path d="M3 17.5h3.5l10-11H21"/><path d="M18.2 14.5L21 17.5l-2.8 2.5"/></svg>';
+  }
+  var body = '<path d="M4 9V7a2 2 0 012-2h11"/><path d="M14 2.5L17.5 5 14 7.5"/>' +
+             '<path d="M20 15v2a2 2 0 01-2 2H7"/><path d="M10 21.5L6.5 19 10 16.5"/>';
+  if (mode === 2) return head + body + '<text x="12" y="15.6" font-size="9.5" font-weight="700" fill="currentColor" stroke="none" text-anchor="middle">1</text></svg>';
+  if (mode === 0) return head + body + '<path d="M3.2 3.2l17.6 17.6"/></svg>';
+  return head + body + '</svg>';
+}
 function applyRep(v) {
   v = parseInt(v, 10) || 0;
   ['repOne', 'npRepOne'].forEach(function (id) {
     var e = D(id); if (e) e.style.display = (v === 2) ? '' : 'none';
   });
+  var i1 = D('repIco'); if (i1) i1.innerHTML = repIconHtml(v, 17);
+  var i2 = D('npIco');  if (i2) i2.innerHTML = repIconHtml(v, 18);
   ['bRep', 'npRep'].forEach(function (id) {
-    var e = D(id); if (e) e.style.color = v ? 'var(--acc-text)' : '';
+    var e = D(id); if (!e) return;
+    e.style.color = (v === 0) ? '' : 'var(--acc-text)';
+    e.dataset.mode = String(v);                       // 自检/脚本可读的机器可判据
+    e.title = '播放模式：' + PM_LABEL[v] + '（点击切换）';
+    e.setAttribute('aria-label', '播放模式：' + PM_LABEL[v]);
   });
 }
 function cycleRep() {
   var cur = parseInt(D('sRep').value, 10) || 0;
-  var next = (cur + 1) % 3;
+  var i = PM_ORDER.indexOf(cur); if (i < 0) i = 0;
+  var next = PM_ORDER[(i + 1) % 4];
   D('sRep').value = String(next);
-  api('/api/repeat', 'rate=' + next);
+  // 单入口：后端 /api/playmode 把 repeat + shuffle 一次收敛 ⟹ 图标与行为不可能分叉。
+  api('/api/playmode?mode=' + next);
   applyRep(next);
   var sp = D('sp_rep');            // 设置页渲染中时一起同步（它只是同一值的镜像）
   if (sp) sp.value = String(next);
-  toast(['循环：关', '循环：列表', '循环：单曲'][next]);
+  var sh = D('sp_shuf'); if (sh) sh.checked = (next === 3);
+  toast('播放模式：' + PM_LABEL[next]);
   return next;
 }
 // ---- 音量：整页滑块是 #vol 的镜像，两边都只改 S.vol + 下发 /api/volume ----
@@ -3252,8 +3777,22 @@ D('tq').onclick = function () {
   S.queueHidden = !S.queueHidden;
   D('app').classList.toggle('noq', S.queueHidden || S.view === 'settings');
 };
-D('sRep').onchange = function () { api('/api/repeat', 'rate=' + this.value); };
-D('sShuf').onchange = function () { api('/api/shuffle?on=' + (this.checked ? 1 : 0), '').then(loadQ); };
+// #2：唯一写入口 = /api/playmode（0关/1专辑循环/2单曲循环/3随机）。
+D('sRep').onchange = function () {
+  var v = parseInt(this.value, 10) || 0;
+  D('sShuf').checked = (v === 3);
+  api('/api/playmode?mode=' + v);
+  applyRep(v);
+};
+// sShuf 现在只是"模式=随机"的镜像复选框（保留它是为了不破坏既有调用点/自检脚本），
+// 勾上 = 随机，取消 = 回到专辑循环（不再是"第五种组合"）。
+D('sShuf').onchange = function () {
+  var m = this.checked ? 3 : 1;
+  D('sRep').value = String(m);
+  api('/api/playmode?mode=' + m).then(loadQ);
+  applyRep(m);
+  var sp = D('sp_rep'); if (sp) sp.value = String(m);
+};
 D('vol').oninput = function () {
   S.vol = parseFloat(this.value);
   if (typeof syncVolUi === 'function') syncVolUi();   // 整页滑块是镜像，必须一起动
@@ -5048,8 +5587,11 @@ function renderSettingsPage() {
        + num({id:'sp_scanthreads', label:'扫描线程数'}, ADV.scanThreads || 0, 0, 32, 1, '0 = 自动（默认 min(CPU, 8)）')
        + '<div class="sfld wide"><div id=sp_roots class=rootlist></div></div>')
      + sgroup('播放', '',
-         sel('sp_rep', '循环模式', D('sRep').innerHTML, '')
-       + chk('sp_shuf', '随机播放', D('sShuf').checked, '关掉会恢复原顺序')
+         // #2：循环 + 随机合并成一个「播放模式」下拉（四个选项就是四态；与底栏那一个按钮同源）。
+         sel('sp_rep', '播放模式', D('sRep').innerHTML, '单曲循环 / 专辑循环 / 关闭循环 / 随机播放 —— 与底栏那个按钮是同一份状态')
+       // 兼容壳（如实标注）：tools/uicheck.js 的 needBind 清单里还有 sp_shuf，所以保留一个**隐藏镜像**。
+       // 它不再是第二份真相 —— 勾选状态完全由 sp_rep 派生，用户可见入口只有上面那个下拉 + 底栏按钮。
+       + '<div style="display:none">' + chk('sp_shuf', '随机播放', false, '由播放模式决定') + '</div>'
        + chk('sp_loud', '等响度补偿', D('sLoud').checked, '音量越低低频提升越多'))
      + '</div>';
 
@@ -5203,6 +5745,17 @@ function renderSettingsPage() {
       }
     } else { a.value = b.value; }
   });
+  // #2（261026-08）兼容壳：#sp_shuf 现在是「播放模式」的镜像（用户可见入口只有 #sp_rep + 底栏一个按钮），
+  // 但旧自检脚本（tools/uicheck.js 的 needBind 清单）要求这个 id 存在**且有事件处理**，所以保留绑定：
+  // 勾上 = 随机(3)，取消 = 专辑循环(1)，写的是同一个字段 g_q.repeat，不存在第二份真相。
+  if (D('sp_shuf')) D('sp_shuf').onchange = function () {
+    var m = this.checked ? 3 : 1;
+    if (D('sp_rep')) D('sp_rep').value = String(m);
+    if (D('sRep')) D('sRep').value = String(m);
+    D('sShuf').checked = (m === 3);
+    applyRep(m);
+    api('/api/playmode?mode=' + m);
+  };
 
   // 先把 DSD 三个控件的当前值从隐藏状态同步过来
   if (D('sp_outmode')) D('sp_outmode').value = outModeOf();
@@ -6875,13 +7428,14 @@ function collectSettings() {
   D('sIsp').checked = D('sp_isp').checked;
   D('s2s').checked = D('sp_2s').checked;
   D('sRep').value = D('sp_rep').value;
-  D('sShuf').checked = D('sp_shuf').checked;
   D('sLoud').checked = D('sp_loud').checked;
   S.loud = D('sLoud').checked;
-  // 行为类参数立即下发
-  api('/api/repeat', 'rate=' + D('sRep').value);
-  applyRep(D('sRep').value);      // 循环图标/数字跟着设置页的选择走（同一真相源）
-  api('/api/shuffle?on=' + (D('sShuf').checked ? 1 : 0), '');
+  // #2：sShuf 是派生量（模式==3 就是随机），不再从第二个控件读、也不再单独发 /api/shuffle。
+  // 旧实现这里分两条请求（repeat + shuffle），中间态会让"图标/行为"短暂不一致。
+  D('sShuf').checked = (parseInt(D('sRep').value, 10) === 3);
+  // 行为类参数立即下发（唯一入口）
+  api('/api/playmode?mode=' + D('sRep').value);
+  applyRep(D('sRep').value);      // 图标/角标跟着设置页的选择走（同一真相源）
 }
 
 function applySettings() {
@@ -6958,7 +7512,10 @@ function renderQueuePage() {
     if (S.view !== 'queue') return;   // 已切走 → 丢弃，别覆写当前页面
     S.q = { items: j.items || [], index: j.index || 0 };
     var n = S.q.items.length;
-    head('播放队列', n ? (n + ' 首') : '', n ? '<button class=btn id=qClrAll>清空队列</button>' : '');
+    // #6（261026-08）：队列页顶部就能「保存为队列」（写到 rlplayer-savedqueues.conf）
+    head('播放队列', n ? (n + ' 首') : '',
+      (n ? '<button class=btn id=qSaveSq title="把当前队列存成具名队列（重启后仍在）">保存为队列</button>' : '') +
+      (n ? '<button class=btn id=qClrAll>清空队列</button>' : ''));
     if (!n) {
       D('list').innerHTML = '<div class=empty>队列是空的<br><span style="font-size:11.5px">把文件拖进窗口，或右键专辑/曲目「加入队列」</span></div>';
       return;
@@ -6990,6 +7547,7 @@ function renderQueuePage() {
         api('/api/qdel?i=' + i, '').then(function () { toast('已移除'); renderQueuePage(); loadQ(); });
       };
     });
+    if (D('qSaveSq')) D('qSaveSq').onclick = function () { saveQueueDialog(); };
     if (D('qClrAll')) D('qClrAll').onclick = function () {
       api('/api/clear', '').then(function () { toast('队列已清空'); renderQueuePage(); loadQ(); });
     };
@@ -7971,6 +8529,8 @@ if (D('sRep')) D('sRep').addEventListener('change', function () { applyRep(this.
 
 /* ---------------- 启动 ---------------- */
 initFavs();
+// #6（261026-08）：左栏「保存的队列」列表（我的最爱下面）启动就渲染，重启后能立刻看到
+renderSavedQueues();
 if (D('npFavBtn')) D('npFavBtn').onclick = function (ev) { if (S.lastCur) toggleFav(S.lastCur, ev); };
 loadLibStats();
 loadSettings();

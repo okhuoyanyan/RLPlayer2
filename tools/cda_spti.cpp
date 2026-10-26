@@ -14,6 +14,9 @@ static uint32_t msfToLba(const UCHAR* a) {
     return ((uint32_t)a[1] * 60 + a[2]) * 75 + a[3];
 }
 
+// 通用 SPTI 调用
+static bool spti(HANDLE h, const uint8_t* cdb, int cdbLen, void* data, size_t dataLen, int timeoutSec);
+
 // 用 READ CD (0xBE) 读 [lba, lba+sectors) 的原始音频（2352 B/扇区）
 static bool readCdda(HANDLE h, uint32_t lba, uint16_t sectors, std::vector<uint8_t>& out) {
     out.assign((size_t)sectors * 2352, 0);
@@ -59,10 +62,44 @@ static bool readCdda(HANDLE h, uint32_t lba, uint16_t sectors, std::vector<uint8
     return true;
 }
 
+// READ(10) 变体：cdb[0]=0x28，对音频 CD 某些光驱更兼容
+static bool readCdda10(HANDLE h, uint32_t lba, uint16_t sectors, std::vector<uint8_t>& out) {
+    out.assign((size_t)sectors * 2352, 0);
+    const size_t dataLen = out.size();
+    std::vector<uint8_t> buf(sizeof(SCSI_PASS_THROUGH_DIRECT) + dataLen);
+    auto* spt = reinterpret_cast<SCSI_PASS_THROUGH_DIRECT*>(buf.data());
+    std::memset(spt, 0, sizeof(SCSI_PASS_THROUGH_DIRECT));
+    spt->Length = sizeof(SCSI_PASS_THROUGH_DIRECT);
+    spt->CdbLength = 10;
+    spt->DataTransferLength = (ULONG)dataLen;
+    spt->DataBuffer = out.data();
+    spt->TimeOutValue = 20;
+    spt->Cdb[0] = 0x28;
+    spt->Cdb[2] = (uint8_t)(lba >> 24);
+    spt->Cdb[3] = (uint8_t)(lba >> 16);
+    spt->Cdb[4] = (uint8_t)(lba >> 8);
+    spt->Cdb[5] = (uint8_t)(lba);
+    spt->Cdb[7] = (uint8_t)(sectors >> 8);
+    spt->Cdb[8] = (uint8_t)(sectors);
+    DWORD ret = 0;
+    if (!DeviceIoControl(h, IOCTL_SCSI_PASS_THROUGH_DIRECT, spt, (DWORD)buf.size(),
+                         spt, (DWORD)buf.size(), &ret, nullptr)) {
+        std::printf("    READ10 DeviceIoControl err=%lu\n", GetLastError());
+        return false;
+    }
+    if (spt->ScsiStatus != 0) {
+        std::printf("    READ10 SCSI=0x%02X transferred=%lu\n", spt->ScsiStatus,
+                    (unsigned long)spt->DataTransferLength);
+        return false;
+    }
+    std::printf("    READ10 成功 transferred=%lu\n", (unsigned long)spt->DataTransferLength);
+    return true;
+}
+
 int main(int argc, char** argv) {
     const char* letter = (argc > 1) ? argv[1] : "H";
     const std::string dev = std::string("\\\\.\\") + letter + ":";
-    HANDLE h = CreateFileA(dev.c_str(), GENERIC_READ,
+    HANDLE h = CreateFileA(dev.c_str(), GENERIC_READ | GENERIC_WRITE,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
@@ -92,8 +129,12 @@ int main(int argc, char** argv) {
 
     // 读 Track01 前 8 个扇区
     std::vector<uint8_t> pcm;
-    const bool ok = readCdda(h, b[0], 8, pcm);
-    std::printf("READ CD 8 扇区 -> %s\n", ok ? "成功" : "失败");
+    bool ok = readCdda(h, b[0], 8, pcm);
+    std::printf("READ CD (0xBE) 8 扇区 -> %s\n", ok ? "成功" : "失败");
+    if (!ok) {
+        ok = readCdda10(h, b[0], 8, pcm);
+        std::printf("READ(10)   8 扇区 -> %s\n", ok ? "成功" : "失败");
+    }
     if (ok) {
         long long nz = 0; int peak = 0;
         for (size_t i = 0; i + 1 < pcm.size(); i += 2) {
