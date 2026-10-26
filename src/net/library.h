@@ -936,19 +936,30 @@ inline void Library::load() {
                 if (!up1.empty()) { dirs.push_back(up1); dirs.push_back(up1 + "\\data"); }
                 if (!up2.empty()) dirs.push_back(up2);
                 // 扫 dist 下其它版本目录（最多 40 个，按名字倒序 = 版本从新到旧）
+                // ★ 必须遍历 **up1（exe 的父目录，即 dist）** 下的兄弟版本目录，
+                // 而不是 up2（dist 的父目录）—— 后者下面没有 RLPlayer-*，
+                // 这就是"全新安装只看到 4 张专辑"的直接原因（真机截图证实）。
                 std::error_code ec2;
-                if (!up2.empty()) {
+                if (!up1.empty()) {
                     std::vector<std::string> vers;
-                    for (auto it = fsx::directory_iterator(p8(up2), ec2);
+                    for (auto it = fsx::directory_iterator(p8(up1), ec2);
                          !ec2 && it != fsx::directory_iterator(); it.increment(ec2)) {
                         const std::string nm = u8s(it->path().filename().u8string());
                         if (nm.rfind("RLPlayer-", 0) == 0) vers.push_back(u8s(it->path().u8string()));
                     }
+                    // 排除自己；按名字倒序（1.5.3 > 1.5.2 > ...），优先沿用较新的旧版本配置
+                    vers.erase(std::remove_if(vers.begin(), vers.end(),
+                                  [&](const std::string& v) {
+                                      std::string a2 = v, b2 = self;
+                                      while (!a2.empty() && (a2.back() == '\\' || a2.back() == '/')) a2.pop_back();
+                                      while (!b2.empty() && (b2.back() == '\\' || b2.back() == '/')) b2.pop_back();
+                                      return a2 == b2;
+                                  }),
+                               vers.end());
                     std::sort(vers.begin(), vers.end(), std::greater<std::string>());
                     if (vers.size() > 40) vers.resize(40);
                     for (auto& v : vers) { dirs.push_back(v); dirs.push_back(v + "\\data"); }
                 }
-                std::fprintf(stderr, "LIBROOTMIG self=[%s] candidates=%zu\n", self.c_str(), dirs.size());
                 for (const auto& d : dirs) {
                     if (d == self) continue;
                     const std::string cf = d + "\\rlplayer-library.conf";
@@ -967,6 +978,8 @@ inline void Library::load() {
                     if (!roots_.empty()) {
                         confMigrated_ = true;
                         confMigratedFrom_ = cf;
+                        // 迁移后**必须落盘**：否则下次启动又要重新找一遍（真机踩到：NO CONF）。
+                        saveRootsLocked();
                         break;
                     }
                 }
