@@ -617,3 +617,39 @@ add_test(NAME tags_native COMMAND test_tags_native)
 add_executable(test_preset_profiles tests/test_preset_profiles.cpp)
 target_include_directories(test_preset_profiles PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME preset_profiles COMMAND test_preset_profiles)
+
+# ================= 音频域六包（外部评审会话 audio-health，2026-10-26 交接）=================
+# A 包：GPU 精度探针（依赖本机 GPU，不注册 add_test；无卡机器会打印"不可用"并 exit 2）
+add_executable(gpu_precision tools/gpu_precision.cpp)
+target_include_directories(gpu_precision PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# B1a：动态测量（TT DR / BS.1770-4 LUFS / LRA）+ 假无损检测
+add_executable(test_dynamics tests/test_dynamics.cpp)
+target_include_directories(test_dynamics PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME dynamics COMMAND test_dynamics)
+
+add_executable(test_fake_lossless tests/test_fake_lossless.cpp)
+target_include_directories(test_fake_lossless PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME fake_lossless COMMAND test_fake_lossless)
+
+# B1b：体检编排 + 缓存 + CLI
+add_executable(rtahealth tools/rtahealth.cpp)
+target_link_libraries(rtahealth PRIVATE rtadsp)
+target_include_directories(rtahealth PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(test_track_health tests/test_track_health.cpp)
+target_link_libraries(test_track_health PRIVATE rtadsp)
+target_include_directories(test_track_health PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME track_health COMMAND test_track_health)
+
+# C1：房间校正算法核心
+add_executable(test_room_correction tests/test_room_correction.cpp)
+target_link_libraries(test_room_correction PRIVATE rtadsp)
+target_include_directories(test_room_correction PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME room_correction COMMAND test_room_correction)
+
+# C2：测量会话编排（传输接口注入）
+add_executable(test_room_measurement tests/test_room_measurement.cpp)
+target_link_libraries(test_room_measurement PRIVATE rtadsp)
+target_include_directories(test_room_measurement PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME room_measurement COMMAND test_room_measurement)

@@ -249,6 +249,42 @@ inline const std::vector<FilterPreset>& filter_presets() {
         { "poly-sinc-xla",          1048575,    0.010, 220, WindowKind::Kaiser,         PhaseKind::Linear,       true,  false, 64 },
         { "poly-sinc-xtr",          1048575,    0.008, 230, WindowKind::Kaiser,         PhaseKind::Linear,       true,  false, 64 },
 
+
+        // ---- 2026-10-26（261026-06 用户要求）：补齐 HQPlayer 手册里其余家族变体 ----
+        // 依据 HQPlayer 手册「poly-sinc 家族」命名规则：
+        //   -short≈4k / 基准≈32k / -long≈262k / -xl≈1M 抽头；-lp 线性、-mp 最小、-ip 中间相位；
+        //   -2s 两段式；-hires 高码率优化（过渡带更宽）；-mqa/mp3 为有损源优化（过渡带更宽）。
+        // 与已有条目**同一算法**，只是参数不同 —— 逐条验证频响即可，不需要新代码路径。
+        // 字段序：name, taps, transition, attenDb, window, phase, forNx, twoStage, stage2Taps,
+        //         apodizing, apodF1, apodF2, tapsPerInput
+        { "poly-sinc-ext2-short",      32767,  0.06,  180, WindowKind::BlackmanHarris, PhaseKind::Linear,       false, false, 64, false, 0.0,  0.0,  0 },
+        { "poly-sinc-ext2-medium",    131071,  0.03,  200, WindowKind::BlackmanHarris, PhaseKind::Linear,       false, false, 64, false, 0.0,  0.0,  0 },
+        { "poly-sinc-ext2-long",      524287,  0.015, 220, WindowKind::BlackmanHarris, PhaseKind::Linear,       true,  false, 64, false, 0.0,  0.0,  0 },
+        { "poly-sinc-ext2-hires-lp",   32767,  0.08,  160, WindowKind::BlackmanHarris, PhaseKind::Linear,       false, false, 64, false, 0.0,  0.0,  0 },
+        { "poly-sinc-ext2-hires-ip",   32767,  0.08,  160, WindowKind::BlackmanHarris, PhaseKind::Intermediate, false, false, 64, false, 0.0,  0.0,  0 },
+        { "poly-sinc-ext2-hires-mp",   32767,  0.08,  160, WindowKind::BlackmanHarris, PhaseKind::Minimum,      false, false, 64, false, 0.0,  0.0,  0 },
+        { "poly-sinc-xtr-lp",         524287,  0.008, 230, WindowKind::Kaiser,         PhaseKind::Linear,       true,  false, 64, false, 0.0,  0.0,  0 },
+        { "poly-sinc-xtr-mp",         524287,  0.008, 230, WindowKind::Kaiser,         PhaseKind::Minimum,      true,  false, 64, false, 0.0,  0.0,  0 },
+        { "poly-sinc-xtr-short-lp",    16383,  0.10,  140, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64, false, 0.0,  0.0,  0 },
+        { "poly-sinc-xtr-short-mp",    16383,  0.10,  140, WindowKind::Kaiser,         PhaseKind::Minimum,      false, false, 64, false, 0.0,  0.0,  0 },
+        { "poly-sinc-gauss-medium",    16383,  0.08,  150, WindowKind::Gaussian,       PhaseKind::Linear,       false, false, 64, false, 0.0,  0.0,  0 },
+        { "poly-sinc-gauss-halfband",   8191,  0.06,  120, WindowKind::Gaussian,       PhaseKind::Linear,       false, false, 64, true,  0.44, 0.50, 0 },
+        { "poly-sinc-gauss-halfband-s", 4095,  0.08,  110, WindowKind::Gaussian,       PhaseKind::Linear,       false, false, 64, true,  0.42, 0.50, 0 },
+        { "poly-sinc-hb-xs",            2047,  0.16,  100, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64, false, 0.0,  0.0,  0 },
+        { "poly-sinc-ext",             65535,  0.025, 190, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64, false, 0.0,  0.0,  0 },
+        { "poly-sinc-mqa/mp3-lp",       8191,  0.14,  110, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64, false, 0.0,  0.0,  0 },
+        { "poly-sinc-mqa/mp3-mp",       8191,  0.14,  110, WindowKind::Kaiser,         PhaseKind::Minimum,      false, false, 64, false, 0.0,  0.0,  0 },
+        { "sinc-short",                 8191,  0.10,  150, WindowKind::BlackmanHarris, PhaseKind::Linear,       false, false, 64, false, 0.0,  0.0,  0 },
+        { "sinc-medium",               32767,  0.05,  180, WindowKind::BlackmanHarris, PhaseKind::Linear,       false, false, 64, false, 0.0,  0.0,  0 },
+        { "sinc-long",                131071,  0.02,  210, WindowKind::BlackmanHarris, PhaseKind::Linear,       true,  false, 64, false, 0.0,  0.0,  0 },
+        { "sinc-long-h",              131071,  0.02,  210, WindowKind::BlackmanHarris, PhaseKind::Linear,       true,  false, 64, true,  0.45, 0.50, 0 },
+        { "sinc-Mx",                  524287,  0.012, 220, WindowKind::BlackmanHarris, PhaseKind::Linear,       true,  false, 64, false, 0.0,  0.0,  0 },
+        { "sinc-MGa",                 524287,  0.015, 215, WindowKind::Gaussian,       PhaseKind::Linear,       true,  false, 64, false, 0.0,  0.0,  0 },
+        { "sinc-Ls",                  262143,  0.03,  200, WindowKind::BlackmanHarris, PhaseKind::Linear,       true,  false, 64, false, 0.0,  0.0,  0 },
+        { "sinc-Lm",                  262143,  0.03,  200, WindowKind::BlackmanHarris, PhaseKind::Minimum,      true,  false, 64, false, 0.0,  0.0,  0 },
+        { "sinc-Lh",                  262143,  0.03,  200, WindowKind::BlackmanHarris, PhaseKind::Linear,       true,  false, 64, true,  0.45, 0.50, 0 },
+        { "minringFIR-lp",              4095,  0.12,  120, WindowKind::Kaiser,         PhaseKind::Linear,       false, false, 64, false, 0.0,  0.0,  0 },
+
         // ---- 2. 高斯高分辨率与变体（poly-sinc-gauss 家族，高斯窗）----
         { "poly-sinc-gauss-short",     4095,    0.12,  120, WindowKind::Gaussian,       PhaseKind::Linear,       false, false, 64 },
         { "poly-sinc-gauss-long",     32767,    0.05,  180, WindowKind::Gaussian,       PhaseKind::Linear,       false, false, 64 },
