@@ -313,9 +313,27 @@ public:
                 st.maxDelaySamples = std::max(st.maxDelaySamples, cp.delaySamples);
             }
             if (!cp.ir.empty()) {
-                // 优先走 GPU（整块卷积）；不可用或失败则自动退回 CPU 分块 FFT
+                // ★ 2026-10-26（261026-07，主线独立复测确认）：GPU 卷积路径在**流式**语义下是错的，已停用。
+                //
+                // 根因：rta_gpu_convolve 无跨调用状态（每次调用从零做 OLA，且只写 out[0..n)），
+                // 而本管线每块只喂 kChunk(=4096) 样 ⟹ "上一块对本块的 IR 拖尾贡献"无处可来，
+                // 每个块边界都断裂。它不是音质劣化，是算法性错误。
+                //
+                // 主线自写探针 tools/gpu_stream_verify.cpp 实测（262144 样、同一 IR，与 CPU 整块比）：
+                //   IR=1024   CPU 流 −3047.0 dB(max|Δ|=0) | GPU 流  +2.3 dB(max|Δ|=1.70)
+                //   IR=8192   CPU 流 −3056.2 dB(max|Δ|=0) | GPU 流  +2.1 dB(max|Δ|=3.80)
+                //   IR=65536  CPU 流 −3063.8 dB(max|Δ|=0) | GPU 流  +3.4 dB(max|Δ|=11.7)
+                //   IR=262144 CPU 流 −3073.0 dB(max|Δ|=0) | GPU 流  +1.7 dB(max|Δ|=25.2)
+                // 误差能量超过信号本身，且 IR=1024 就已经错 —— 不是"只有长 IR 才出问题"。
+                // CPU 的 StreamingConvolver 与整块逐位一致（max|Δ|=0），所以 CPU 路径是对的。
+                //
+                // 保留 DLL 不删：整块/离线用途（离线转换、大块批处理）在整块语义下是正确的。
+                // 治本方向：DLL 增加带跨调用状态的流式入口（保留 irLen−1 个历史输入 + OLA 尾巴延续），
+                // 修好后把 kGpuConvEnabled 置 true，并用 tools/gpu_stream_verify.cpp 做门禁
+                // （判据：流式 GPU vs 流式 CPU 相对 RMS ≤ −120 dB、max|Δ| ≤ 1e-6，三档 IR）。
+                constexpr bool kGpuConvEnabled = false;
                 bool done = false;
-                if (cp.useGpu) {
+                if (kGpuConvEnabled && cp.useGpu) {
                     auto& gb = dsp::GpuBridge::instance();
                     st.gpuStatus = gb.status();
                     if (gb.available()) {

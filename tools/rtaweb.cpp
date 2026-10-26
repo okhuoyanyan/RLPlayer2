@@ -3726,6 +3726,11 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             // 必须先复位再起生产者/渲染线程，否则它们会把上一曲的 true 当成本次的事实。
             ps.gpu = false;
             ps.gpuConvUsed.store(false);
+            // 2026-10-26（261026-07 追问「信息链显示是否准确」）：RQ.gpu 也必须每曲复位。
+            // 旧代码只复位了 ps.gpu，而 ps.gpu 是由 render_loop 在**RQ.gpu 为真时**写 true 的，
+            // 于是 RQ.gpu 一旦被某首升频曲抬成 true 就永不复位 ⟹ 之后所有曲（哪怕不升频）
+            // /api/status 都报 gpuResample=true。复位 ps.gpu 等于没修好。
+            RQ.gpu.store(false);
         }
         ps.startDb.store(p.volume);
         dlog("stage sig-ok");
@@ -3809,7 +3814,11 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                         play_log(mem_line("dsp-first-block", b));
                     }
                     if (pst.usedGpuConvolution) ps.gpuConvUsed.store(true);
-                    if (!RQ.gpu.load()) RQ.gpu.store(pl->gpuResampleActive());
+                    // 2026-10-26（261026-07）：无条件按实测同步，不再"只升不降"。
+                    // gpuResampleActive() = 重采样器本次是否真的跑在 GPU 上；
+                    // 不升频时管线根本不进阶段 5（pipeline.h:366 的 outRate != in.rate 守卫），
+                    // 这里读到的就是 false —— 这才是"本次到底用没用 GPU 升频"的事实。
+                    RQ.gpu.store(pl->gpuResampleActive());
                     if (skipOut > 0 && !o.raw.empty()) {
                         const size_t d = std::min(skipOut, o.frames());
                         o.raw.erase(o.raw.begin(), o.raw.begin() + (long long)(d * (size_t)o.channels));

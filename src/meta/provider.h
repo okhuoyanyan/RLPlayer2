@@ -1486,6 +1486,12 @@ inline const std::vector<ProviderDesc>& provider_registry() {
         { "netease",  "网易云",       true,  true,  search_netease,  lyric_netease_entry, nullptr               },
         { "itunes",   "iTunes",      true,  false, search_itunes,   nullptr,             nullptr               },
         { "lrclib",   "lrclib 歌词",  false, true,  nullptr,         lyric_lrclib_entry,  nullptr               },
+        // 2026-10-26（用户指出「元数据不是应该有 6 个数据库么」）：
+        // Discogs 一直在元数据补全链里干活（enrich.h §6.5，genre 的 backfill 来源），
+        // 但它**没有注册进本表** ⟹ 设置页看不到、/api/providers 不返回、用户也关不掉。
+        // 它是纯开关型数据源（不做曲目搜索、无歌词接口），所以 canSearch/canLyric 都 false，
+        // 上面两处遍历都有 canSearch / canLyric 守卫，加在这里不会改变既有搜索与歌词优先级。
+        { "discogs",  "Discogs",    false, false, nullptr,         nullptr,             nullptr               },
     };
     return reg;
 }

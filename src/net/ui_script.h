@@ -5138,7 +5138,7 @@ function renderSettingsPage() {
   h += '<div class=spane data-g=meta>'
      + sgroup('元数据补全', '播放时后台补全标签 / 封面 / 歌词，结果落在本地库',
          chk('sp_metaon', '自动补全（不用 AI）', META.on == 1,
-             '只用公开数据源（QQ音乐 / 网易云 / iTunes / dizzylab / lrclib）补全标签、封面、歌词；全程不调用 AI，不产生费用', true)
+             '只用公开数据源（QQ音乐 / 网易云 / iTunes / dizzylab / lrclib / Discogs）补全标签、封面、歌词；全程不调用 AI，不产生费用', true)
        + chk('sp_metallm', 'AI 增强（DeepSeek）', aiOn,
              '联网调用 DeepSeek（按次计费）：解析无标签文件、并在艺术家 / 专辑 / 单曲页整理简介并缓存（7 天有效）。' +
              '关闭后两项都停，本地与公开数据源照常工作', true)

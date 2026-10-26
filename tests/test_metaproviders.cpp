@@ -466,7 +466,15 @@ int main() {
         // dizzylab 的全部用例在 tests/test_dizzylab.cpp;这里只守住「注册表契约」本身:
         // 顺序、can* 标志与函数指针的一致性 —— 加源最容易漏的就是这条。
         const std::vector<ProviderDesc>& reg = provider_registry();
-        ck(reg.size() == 5, "注册表 5 项(四源 + dizzylab)", std::to_string(reg.size()));
+        // 2026-10-26（261026-07）：Discogs 已注册为**纯开关型**数据源（canSearch/canLyric 都为 false），
+    // 让它在设置页可见、/api/providers 可返回、用户可关闭 —— 之前它在 enrich 里干活但完全不可见。
+    ck(reg.size() == 6, "注册表 6 项(四源 + dizzylab + discogs)", std::to_string(reg.size()));
+    {
+        const ProviderDesc* dg = nullptr;
+        for (const auto& d : reg) if (std::string(d.id) == "discogs") { dg = &d; break; }
+        ck(dg != nullptr, "Discogs 已在注册表内");
+        if (dg) ck(!dg->canSearch && !dg->canLyric, "Discogs 为纯开关型（不参与搜索/歌词遍历）");
+    }
         if (reg.size() == 5) {
             ck(std::string(reg[0].id) == "dizzylab" && std::string(reg[1].id) == "qq" &&
                std::string(reg[2].id) == "netease" && std::string(reg[3].id) == "itunes" &&

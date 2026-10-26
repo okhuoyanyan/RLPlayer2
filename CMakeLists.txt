@@ -653,3 +653,10 @@ add_executable(test_room_measurement tests/test_room_measurement.cpp)
 target_link_libraries(test_room_measurement PRIVATE rtadsp)
 target_include_directories(test_room_measurement PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME room_measurement COMMAND test_room_measurement)
+
+# GPU 卷积流式正确性（261026-07）：CPU 流式必须与整块逐位一致；GPU 部分只诊断。
+# 无卡/无 rtagpu.dll 的机器 GPU 段自动 SKIP，CPU 判据照跑。
+add_executable(test_gpu_stream tests/test_gpu_stream.cpp)
+target_link_libraries(test_gpu_stream PRIVATE rtadsp)
+target_include_directories(test_gpu_stream PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME gpu_stream COMMAND test_gpu_stream)

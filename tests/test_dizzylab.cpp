@@ -529,7 +529,8 @@ int main() {
     std::printf("-- 注册表 / 采纳门槛 --\n");
     {
         const std::vector<ProviderDesc>& reg = provider_registry();
-        ck(reg.size() == 5, "注册表 5 项(新增 dizzylab)", std::to_string(reg.size()));
+        // 2026-10-26（261026-07）：+Discogs 纯开关型源 ⟹ 6 项。
+    ck(reg.size() == 6, "注册表 6 项(新增 dizzylab + discogs)", std::to_string(reg.size()));
         ck(std::string(reg[0].id) == "dizzylab", "dizzylab 排第一(同人第一优先)",
            std::string(reg[0].id));
         ck(reg[0].canSearch && !reg[0].canLyric,
