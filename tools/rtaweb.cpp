@@ -43,6 +43,7 @@ extern "C" __declspec(dllimport) unsigned int __stdcall timeEndPeriod(unsigned i
 #include "audio/media_info.h"
 #include "audio/wasapi_out.h"
 #include "audio/wasapi_shared.h"   // WASAPI 共享后端(VM/独占不可用兜底,2026-10-22 事故热修)
+#include "audio/cda_mci.h"
 #include "audio/wasapi_capture.h"  // WASAPI 采集核心 (ROADMAP P4b)
 #include "audio/render_loop.h"     // 渲染主循环(含 RENDERFAIL 遥测;测试与 rtaweb 共用同一份)
 #include "audio/buffer_policy.h"   // C1 独占缓冲策略(尊重设置/学习缓存/L1 预检;测试与生产同一份)
@@ -7720,6 +7721,13 @@ struct RoomCorrState {
 };
 static RoomCorrState g_roomcorr;
 
+// ---- CD 音轨播放（2026-10-27，261026-08 #1）----
+// 用 MCI 而不是 SPTI 抓轨：后者会把本机 USB 光驱搞掉线（见 AGENTS.md 铁律 12）。
+// 代价是 CD 音频由 Windows 直接送默认输出，**不经过 DSP**（音量/EQ/升频全无效），UI 必须如实标注。
+static rta::audio::CdaMciPlayer g_cdPlayer;
+static std::mutex            g_cdMx;
+static std::atomic<bool>     g_cdActive{false};
+
 // 落盘位置：<exe>\data\roomcorr\correction-<layout>.json（与 data\opra_index.json 同一约定）。
 // 独立 build 目录 = 完全隔离，测试不会碰到真实安装目录。
 static std::string roomcorr_dir() { return path_in_exe_dir("data\\roomcorr"); }
@@ -9825,6 +9833,26 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             p.file = local;
         }
         if (p.file.empty()) return "{\"ok\":false,\"error\":\"未指定文件\"}";
+        // ---- CD 音轨（.cda）：走 MCI，不起解码/DSP 管线 ----
+        // .cda 是 44 字节索引文件，不含音频；音频在 CDDA 轨道里。
+        // 为什么不起管线：抓轨需要 SPTI，本机实测会把 USB 光驱搞掉线（铁律 12）。
+        // MCI 由 Windows 内部处理光驱，我们不发原生 SCSI 命令，实测稳定。
+        {
+            std::string cdLetter; int cdTrack = 0;
+            if (rta::audio::CdaMciPlayer::parseCdaPath(p.file, cdLetter, cdTrack)) {
+                std::lock_guard<std::mutex> lk(g_cdMx);
+                const std::string ce = g_cdPlayer.play(p.file);
+                if (!ce.empty()) {
+                    play_log("CDPLAY_FAIL file=" + p.file + " " + ce);
+                    return std::string("{\"ok\":false,\"cd\":true,\"error\":\"") + jesc(ce) + "\"}";
+                }
+                g_cdActive.store(true);
+                play_log("CDPLAY mci file=" + p.file + " track=" + std::to_string(cdTrack) +
+                         " note=MCI直通(不经过DSP)");
+                return std::string("{\"ok\":true,\"cd\":true,\"track\":") + std::to_string(cdTrack) +
+                       R"(,"message":"CD 音轨通过 Windows 播放（不经过 DSP：音量/EQ/升频对它无效）"})";
+            }
+        }
         // F1：file 会进队列 → 播放线程 recent_add/meta_on_play/fs::u8path 全链消费，
         // 非法字节在这里挡下（播放线程里抛异常没有兜底，等于整进程退出）。
         if (!valid_utf8(p.file)) return utf8_path_reject(p.file);
@@ -12588,6 +12616,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
 
     if (rq.path.rfind("/api/stop", 0) == 0) {
         ct = "application/json; charset=utf-8";
+        // CD 音轨：MCI 停播 + 关设备，然后照常走下面的管线停止（两条路互不干扰）
+        if (g_cdActive.exchange(false)) {
+            std::lock_guard<std::mutex> lk(g_cdMx);
+            g_cdPlayer.close();
+            play_log("CDSTOP mci");
+        }
         ps.stop.store(true);
         ps.pauseReq.store(false);
         ps.seekReq.store(-1.0);
@@ -12625,16 +12659,34 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         std::lock_guard<std::mutex> lk(ps.mtx);
         std::ostringstream j;
         const size_t pl2 = ps.played.load(), tt = ps.total.load();
-        const double pos = castMode ? castSt.positionSec
-                                    : (ps.outRate > 0 ? (double)pl2 / ps.outRate : 0.0);
-        const double dur = castMode ? castSt.durationSec
-                                    : (ps.outRate > 0 ? (double)tt / ps.outRate : 0.0);
-        const bool playingStat = castMode ? true : ps.playing.load();
+        // CD 音轨（MCI）模式：状态全部来自 MCI，不能拿上一首本地播放的残留值冒充
+        const bool cdMode = g_cdActive.load();
+        bool  cdPlaying = false; long long cdPosMs = 0, cdLenMs = 0;
+        int   cdTracks = 0, cdTrackNo = 0;
+        static std::string cdRawMode, cdRawPos;
+        if (cdMode) {
+            std::lock_guard<std::mutex> lk(g_cdMx);
+            cdPlaying = g_cdPlayer.playing();
+            cdPosMs   = g_cdPlayer.positionMs();
+            cdLenMs   = g_cdPlayer.lengthMs();
+            cdTracks  = g_cdPlayer.trackCount();
+            cdTrackNo = g_cdPlayer.track();
+            cdRawMode = g_cdPlayer.rawMode();
+            cdRawPos  = g_cdPlayer.rawPosition();
+        }
+        const double pos = cdMode ? (double)cdPosMs / 1000.0
+                                    : (castMode ? castSt.positionSec
+                                                : (ps.outRate > 0 ? (double)pl2 / ps.outRate : 0.0));
+        const double dur = cdMode ? (double)cdLenMs / 1000.0
+                                    : (castMode ? castSt.durationSec
+                                                : (ps.outRate > 0 ? (double)tt / ps.outRate : 0.0));
+        const bool playingStat = cdMode ? cdPlaying : (castMode ? true : ps.playing.load());
         const bool pausedStat = castMode ? castSt.paused : ps.paused.load();
         const std::string curStat = castMode ? castSt.sourceFile : ps.current;
         const std::string errStat = castMode ? castSt.error : ps.error;
-        const uint32_t rateStat = castMode ? castSt.sampleRate : ps.outRate;
-        const int bitsStat = castMode ? castSt.bits : ps.outBits;
+        // CD 是红皮书标准：44100 Hz / 16 bit / 2ch
+        const uint32_t rateStat = cdMode ? 44100u : (castMode ? castSt.sampleRate : ps.outRate);
+        const int bitsStat = cdMode ? 16 : (castMode ? castSt.bits : ps.outBits);
         // 2026-10-24（用户 261024-04 #8）：GPU 语义拆分。组合语义的唯一事实源 =
         // rta::meta::playback_gpu_flags（src/meta/statusflags.h，带真值表与单测）：
         //   gpu         = GPU 可用性（与本次播放无关，旧字段名保留）
@@ -12652,6 +12704,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
           << ",\"wsMb\":" << memNow.wsMb
           << ",\"wsPeakMb\":" << memNow.peakMb
           << ",\"playing\":" << (playingStat ? "true" : "false")
+          << ",\"cd\":" << (cdMode ? "true" : "false")
+          << ",\"cdTrack\":" << cdTrackNo
+          << ",\"cdTracks\":" << cdTracks
+          << ",\"cdNoDsp\":" << (cdMode ? "true" : "false")
+          << ",\"cdRawMode\":\"" << jesc(cdRawMode) << "\""
+          << ",\"cdRawPos\":\"" << jesc(cdRawPos) << "\""
           << ",\"current\":\"" << jesc(curStat) << "\""
           << ",\"error\":\"" << jesc(errStat) << "\""
           << ",\"info\":\"" << jesc(ps.info) << "\""

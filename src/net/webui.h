@@ -258,7 +258,14 @@ inline void WebUi::handle(SOCKET c) {
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 const size_t colon = line.find(':');
                 if (colon == std::string::npos) continue;
-                if (trim(line.substr(0, colon)) != "Content-Length") continue;
+                // 2026-10-27（261026-08）：HTTP 头名**大小写不敏感**（RFC 7230 §3.2）。
+                // 旧代码只认规范大小写 "Content-Length"，而 Node fetch/undici 发的是
+                // "content-length" ⟹ body 被当成 0 字节，参数静默丢失（子代理第一版自检就踩到）。
+                // Chromium/WebView2 发规范大小写所以现网没暴露，但任何脚本/代理/HTTP 客户端
+                // 带 body 调 API 都会中招。这里按 RFC 折叠成小写比较。
+                std::string hname = trim(line.substr(0, colon));
+                for (auto& hc : hname) hc = (char)std::tolower((unsigned char)hc);
+                if (hname != "content-length") continue;
                 const std::string v = trim(line.substr(colon + 1));
                 if (v.empty() || v.find_first_not_of("0123456789") != std::string::npos) { clBad = true; break; }
                 want = (size_t)strtoull(v.c_str(), nullptr, 10);

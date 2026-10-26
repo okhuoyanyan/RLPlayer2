@@ -144,6 +144,7 @@ public:
         // 卷积器按 IR 长度分块，跳转时用同一个 IR 重新装载即可清空历史
         for (size_t c = 0; c < ss_.conv.size(); ++c) {
             if (!ss_.conv[c]) continue;
+            if (c < ss_.convGpu.size() && ss_.convGpu[c]) ss_.convGpu[c]->reset(cfg_.channel[c].ir);
             if (c < cfg_.channel.size() && !cfg_.channel[c].ir.empty())
                 ss_.conv[c]->reset(cfg_.channel[c].ir);
         }
@@ -331,25 +332,29 @@ public:
                 // 治本方向：DLL 增加带跨调用状态的流式入口（保留 irLen−1 个历史输入 + OLA 尾巴延续），
                 // 修好后把 kGpuConvEnabled 置 true，并用 tools/gpu_stream_verify.cpp 做门禁
                 // （判据：流式 GPU vs 流式 CPU 相对 RMS ≤ −120 dB、max|Δ| ≤ 1e-6，三档 IR）。
-                constexpr bool kGpuConvEnabled = false;
-                bool done = false;
-                if (kGpuConvEnabled && cp.useGpu) {
+                // 2026-10-27（261026-08 #7）：GPU 卷积改用**带跨调用状态的流式会话**
+                // （GpuStreamConvolver，latency()==block，与 CPU StreamingConvolver 同一条 FIFO）。
+                // 261026-07 的缺陷（每 4096 样边界断裂、误差超过信号能量）已由 DLL 的
+                // rta_gpu_convolve_create/_stream/_destroy 修掉，实测逐位一致（max|Δ|=0）。
+                //
+                // 门控按 IR 长度：实测（262144 样 / 64 块）CPU vs GPU 流式耗时
+                //   IR=1024 12.6/32.2ms、8192 14.0/32.3、32768 24.7/32.0、
+                //   65536 36.3/33.2、131072 61.4/35.3、262144 108.7/36.6
+                // ⟹ IR >= 65536 才有收益（打平到 3 倍快），短 IR 反而慢 1.3~2.9 倍
+                //   （真因：每次 kernel 提交+同步约 79 µs 固定开销）。
+                constexpr size_t kGpuConvMinIrLen = 65536;
+                if (cp.useGpu && cp.ir.size() >= kGpuConvMinIrLen) {
                     auto& gb = dsp::GpuBridge::instance();
                     st.gpuStatus = gb.status();
-                    if (gb.available()) {
+                    if (c < (int)ss_.convGpu.size() && ss_.convGpu[(size_t)c]) {
                         std::vector<double> tmp(w.size(), 0.0);
-                        if (gb.convolve(w.data(), w.size(), cp.ir.data(), cp.ir.size(),
-                                        tmp.data(), (int)cfg_.convBlock) == 0) {
-                            w.swap(tmp);
-                            done = true;
-                            st.usedGpuConvolution = true;
-                        }
+                        ss_.convGpu[(size_t)c]->process(w.data(), tmp.data(), w.size());
+                        w.swap(tmp);
+                        st.usedGpuConvolution = ss_.convGpu[(size_t)c]->on_gpu();
+                        st.usedConvolution = true;
+                        st.maxIrLength = std::max(st.maxIrLength, (int)cp.ir.size());
+                        continue;                  // 该声道处理完毕（GPU 会话，内部失败会自己回退 CPU）
                     }
-                }
-                if (done) {
-                    st.usedConvolution = true;
-                    st.maxIrLength = std::max(st.maxIrLength, (int)cp.ir.size());
-                    continue;                      // 该声道处理完毕（GPU 路径）
                 }
                 // ★ CPU 路径：持久流式卷积器（跨调用保持状态，任意分块一致）
                 if (c < (int)ss_.conv.size() && ss_.conv[(size_t)c]) {
@@ -433,7 +438,12 @@ private:
         std::vector<dsp::Biquad>                 eq;      // 按输出声道展开的级联
         std::vector<size_t>                      eqPerCh; // 每声道的双二阶个数
         std::vector<dsp::Quantizer>              quant;
-        std::vector<std::unique_ptr<dsp::StreamingConvolver>> conv;   // 每输出声道
+        std::vector<std::unique_ptr<dsp::StreamingConvolver>> conv;   // 每输出声道（CPU 兜底）
+    // 2026-10-27（261026-08 #7）：GPU 流式卷积会话，每输出声道一个。
+    // 与 CPU conv 二选一：GPU 可用且 IR 够长时用它，否则用 conv。
+    // 它内部带跨调用状态（latency()==block，与 CPU StreamingConvolver 同一条 FIFO 实现），
+    // 所以**不会**再出现 261026-07 那种每 4096 样断裂的问题。
+    std::vector<std::unique_ptr<dsp::GpuStreamConvolver>> convGpu;
         std::vector<std::unique_ptr<dsp::Loudness>> loud;             // 每声道（各自持有滤波状态）
         // 每输出声道延迟线（2026-10-25 修复：原先每块新建 ⟹ 每块丢 delaySamples 个样本）
         std::vector<dsp::DelayLine> delay;
@@ -474,6 +484,8 @@ private:
         }
         ss_.conv.clear();
         ss_.conv.resize((size_t)outCh);      // unique_ptr 不可拷贝，不能用 assign(n, nullptr)
+        ss_.convGpu.clear();
+        ss_.convGpu.resize((size_t)outCh);
         // 延迟线按输出声道各一条（长度在首次 process 时按 cfg_.channel[c].delaySamples 定长）
         ss_.delay.assign((size_t)outCh, dsp::DelayLine{});
 
@@ -491,6 +503,13 @@ private:
                 size_t blk = cfg_.convBlock;
                 if (blk == 0 || (blk & (blk - 1)) != 0) blk = 1024;
                 ss_.conv[(size_t)c] = std::make_unique<dsp::StreamingConvolver>(cfg_.channel[(size_t)c].ir, blk);
+                // GPU 流式会话：只在用户勾了 useGpu 且 IR 够长时建（DLL 缺符号/建不起来就留空，
+                // 播放时自然走上面的 CPU conv —— GpuStreamConvolver 内部也自带 CPU 兜底）
+                if (cfg_.channel[(size_t)c].useGpu && cfg_.channel[(size_t)c].ir.size() >= 65536) {
+                    ss_.convGpu[(size_t)c] =
+                        std::make_unique<dsp::GpuStreamConvolver>(cfg_.channel[(size_t)c].ir, blk);
+                    if (!ss_.convGpu[(size_t)c]->on_gpu()) ss_.convGpu[(size_t)c].reset();
+                }
             }
         }
         ss_.eqPerCh.assign((size_t)outCh, 0);

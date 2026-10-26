@@ -1,16 +1,17 @@
-// tests/test_gpu_stream.cpp —— GPU 卷积流式正确性门禁（261026-07）
+// tests/test_gpu_stream.cpp —— GPU 卷积流式正确性门禁（261026-07/08）
 //
 // 背景：261026-07 报告指控「GPU 卷积逐块调用无跨调用状态 ⟹ IR 拖尾丢失」。
-// 主线用自写探针独立复测（tools/gpu_stream_verify.cpp），结论：指控成立且更严重 ——
-// 误差 +1.7~+3.4 dB（超过信号能量），且 IR=1024 就已经错，不是只有长 IR 出问题。
-// 因此生产管线已停用 GPU 卷积（pipeline.h 的 kGpuConvEnabled=false）。
+// 主线用自写探针独立复测确认指控成立（误差 +1.7~+3.4 dB，超过信号能量，且 IR=1024 就错），
+// 生产管线随即停用 GPU 卷积兜底。
 //
-// 本测试的两条职责：
-//   1) 【必须通过】CPU 流式卷积与整块卷积逐位一致 —— 这是管线现在唯一在用的路径，
-//      任何分块边界回归都会在这里红。
-//   2) 【只诊断不判红】若 rtagpu.dll 可用，输出 GPU 流式与 CPU 流式的误差量级。
-//      在 DLL 修好（增加带跨调用状态的流式入口）之前，这个数字预期是 +2 dB 量级；
-//      修好之后它会掉到 −120 dB 以下，届时把下面 kGpuStreamIsFixed 置 true 即可升级为硬门禁。
+// 261026-08：rtagpu.dll 增加**带跨调用状态的流式入口**
+// （rta_gpu_convolve_create / _stream / _destroy，latency()==block，
+//   与 CPU StreamingConvolver 是同一条 FIFO 实现），本测试升级为**硬门禁**：
+//
+//   判据：GpuStreamConvolver（走 GPU 时）与 CPU StreamingConvolver
+//         逐样本 max|Δ| ≤ 1e-6 且相对 RMS ≤ −120 dB，三档 IR 全过。
+//
+// 无卡 / 无 DLL / 老 DLL（无流式符号）时 GPU 段自动 SKIP，CPU 判据照跑。
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -61,23 +62,26 @@ Diff diffOf(const std::vector<double>& a, const std::vector<double>& b, size_t s
 }  // namespace
 
 int main() {
-    std::printf("=== GPU 卷积流式正确性（261026-07）===\n");
+    std::printf("=== GPU 卷积流式正确性（261026-07 缺陷 / 261026-08 修复）===\n");
     const size_t N = 262144, CHUNK = 4096, BLOCK = 1024;
     const auto sig = make_signal(N, 12345u);
-    // DLL 修好后把它置 true：GPU 流式必须与 CPU 流式等价
-    constexpr bool kGpuStreamIsFixed = false;
 
     auto& gb = rta::dsp::GpuBridge::instance();
     const bool gpuAvail = gb.available();
-    std::printf("  rtagpu.dll: %s%s\n", gpuAvail ? "可用" : "不可用（无卡/无 DLL，GPU 部分 SKIP）",
-                gpuAvail ? (" — " + gb.status()).c_str() : "");
+    const bool streamOk = gb.stream_supported();
+    std::printf("  rtagpu.dll: %s\n", gpuAvail ? "可用" : "不可用");
+    std::printf("  流式符号 : %s\n", streamOk ? "齐全" : "缺失（老 DLL 或非本机卡 ⟹ GPU 段 SKIP）");
+    std::printf("  status   : %s\n", gb.status().c_str());
 
     for (size_t irLen : { size_t(1024), size_t(8192), size_t(65536) }) {
         const auto ir = make_ir(irLen);
+
+        // 参考 1：CPU 整块喂
         rta::dsp::StreamingConvolver whole(ir, BLOCK);
         std::vector<double> outWhole(N, 0.0);
         whole.process(sig.data(), outWhole.data(), N);
 
+        // 参考 2：CPU 分块喂（与生产同形态）
         rta::dsp::StreamingConvolver cpu(ir, BLOCK);
         std::vector<double> outCpu(N, 0.0);
         for (size_t p = 0; p < N; p += CHUNK) {
@@ -89,25 +93,23 @@ int main() {
         check(dCpu.maxAbs == 0.0, "CPU 流式与整块逐位一致",
               "max|d|=" + std::to_string(dCpu.maxAbs) + " relRMS=" + std::to_string(dCpu.relDb) + " dB");
 
-        if (!gpuAvail) continue;
+        if (!streamOk) { std::printf("  [SKIP] GPU 流式（无流式符号）\n"); continue; }
+
+        // 被测：GpuStreamConvolver（内部自动回退 CPU；on_gpu() 告诉实情）
+        rta::dsp::GpuStreamConvolver gsc(ir, BLOCK);
         std::vector<double> outGpu(N, 0.0);
-        bool ok = true;
-        for (size_t p = 0; p < N && ok; p += CHUNK) {
+        for (size_t p = 0; p < N; p += CHUNK) {
             const size_t n = (p + CHUNK <= N) ? CHUNK : (N - p);
-            std::vector<double> tmp(n, 0.0);
-            if (gb.convolve(sig.data() + p, n, ir.data(), ir.size(), tmp.data(), (int)BLOCK) != 0) { ok = false; break; }
-            for (size_t i = 0; i < n; ++i) outGpu[p + i] = tmp[i];
+            gsc.process(sig.data() + p, outGpu.data() + p, n);
         }
-        if (!ok) { std::printf("  [SKIP] GPU 调用失败\n"); continue; }
+        if (!gsc.on_gpu()) {
+            std::printf("  [SKIP] GPU 流式（会话建不起来，已回退 CPU）\n");
+            continue;
+        }
         const Diff dGpu = diffOf(outCpu, outGpu, BLOCK * 4);
-        if (kGpuStreamIsFixed) {
-            check(dGpu.relDb <= -120.0 && dGpu.maxAbs <= 1e-6, "GPU 流式与 CPU 流式等价（修好后应满足）",
-                  "relRMS=" + std::to_string(dGpu.relDb) + " dB max|d|=" + std::to_string(dGpu.maxAbs));
-        } else {
-            // 已知缺陷：只诊断，不判红。管线已停用 GPU 卷积，所以不影响生产正确性。
-            std::printf("  [KNOWN] GPU 流式误差 relRMS=%.1f dB max|d|=%.3e（DLL 无跨调用状态，管线已停用该路径）\n",
-                        dGpu.relDb, dGpu.maxAbs);
-        }
+        check(dGpu.relDb <= -120.0 && dGpu.maxAbs <= 1e-6,
+              "GPU 流式与 CPU 流式等价（判据 relRMS<=-120dB 且 max|d|<=1e-6）",
+              "relRMS=" + std::to_string(dGpu.relDb) + " dB max|d|=" + std::to_string(dGpu.maxAbs));
     }
 
     std::printf("\n%s (失败项 %d)\n", g_fail == 0 ? "全部通过" : "存在失败", g_fail);
