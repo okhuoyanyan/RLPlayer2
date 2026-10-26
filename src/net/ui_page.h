@@ -630,7 +630,9 @@ h += "#npPage .npedge{display:none}";
     h += ".rcnote code{font-family:ui-monospace,Consolas,monospace;font-size:11px;background:var(--field);border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--txt2)}";
     h += "#roomWiz{position:fixed;inset:0;z-index:120;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.55);padding:24px}";
     h += "#roomWiz.on{display:flex}";
-    h += ".rw-card{width:min(600px,94vw);max-height:86vh;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 64px var(--shadow);padding:20px 22px}";
+    // 2026-10-26（用户实机反馈）：--card 这个变量整个项目里**没有定义**，background:var(--card) 等于空，
+    // 卡片就是透明的，底下 EQ 表格的字直接透上来，很难看清。改用有定义的不透明底色 --bg3。
+    h += ".rw-card{width:min(620px,94vw);max-height:86vh;overflow:auto;background:var(--bg3);border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 64px rgba(0,0,0,.72);padding:20px 22px}";
     h += ".rw-head{display:flex;align-items:center;gap:9px;font-size:14px;font-weight:650;color:var(--txt)}";
     h += ".rw-head .sp{flex:1}";
     h += ".rw-x{background:none;border:0;color:var(--mut2);font-size:18px;line-height:1;padding:4px;cursor:pointer;border-radius:6px}";

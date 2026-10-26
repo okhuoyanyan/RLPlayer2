@@ -5777,7 +5777,9 @@ function eqSettingsHtml() {
    （/api/roomcorr/* 不存在）⟹ 前端无法真的开始测量。按铁律 4「如实记录未解决问题」，
    这张向导只做流程演示：第 1 步第一句就写明「需要后端接线，当前版本为预览」，
    按钮带「预览」角标，点「完成」不改任何播放状态、不发任何请求。 */
-var RCW = { step: 1, total: 7, layout: '2.0' };
+// seconds/levelDb 必须有初值：面板直接用 RCW.seconds / RCW.levelDb 渲染，
+// 漏了就会显示 undefined（实机截图抓到的 bug）。
+var RCW = { step: 1, total: 7, layout: '2.0', seconds: 10, levelDb: -20, target: 'flat', done: false };
 // 与 room_correction.h::room_layouts() 一一对应（2.0/2.1/5.1/7.1/5.1.2/7.1.4）
 var RC_LAYOUTS = ['2.0', '2.1', '5.1', '7.1', '5.1.2', '7.1.4'];
 var RC_STEPS = [
