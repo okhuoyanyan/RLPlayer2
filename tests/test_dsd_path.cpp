@@ -15,6 +15,8 @@
 #include "dsp/dop.h"
 #include "dsp/fft.h"
 #include "dsp/modulator.h"
+#include "dsp/dsd_rate_convert.h"
+#include "engine/pipeline.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -450,6 +452,33 @@ int main() {
                   std::string(integrator_name(k)) + " 也支持 XFi 通带",
                   std::to_string(cfg.passbandHz) + " Hz");
         }
+    }
+
+    printf("\n=== 7. DSD 异速率支路（engine/pipeline.h: dsd_rate_branch）===\n");
+    {
+        // 判据只钉"支路接线正确"：决策（同速率/可转换/拒绝）与一条端到端（位数×2 + DoP 合法）。
+        // 完整判据（THD+N / 平坦度 / 折叠残留 / 级联 / 满幅恢复）在 tests/test_dsd_rate_convert.cpp。
+        const auto d1 = rta::engine::dsd_rate_branch(fs, fs);
+        check(!d1.handled, "同速率不进异速率支路（仍走 DirectSDM 直通）", d1.why);
+        const auto d2 = rta::engine::dsd_rate_branch(fs, fs * 2u);
+        check(d2.handled && d2.supported, "DSD64→DSD128 支路可用", d2.why);
+        const auto d3 = rta::engine::dsd_rate_branch(fs, 3072000u);
+        check(d3.handled && !d3.supported && d3.why.find("19200") != std::string::npos,
+              "跨族（44.1k→48k）明确拒绝，且原因带数字", d3.why.substr(0, 60));
+
+        DsdStream s1 = modulate(fs, 2, (size_t)(0.1 * (double)fs), 1000.0, 0.4, 5);
+        DsdStream o1;
+        const rta::engine::DsdRateBranchResult r =
+            rta::engine::dsd_rate_convert(s1, fs * 2u, rta::dsp::DsdRateConvertConfig{}, o1);
+        check(r.ok && o1.rate == fs * 2u && o1.bits == s1.bits * 2ull,
+              "支路整段转换：位数 ×2、位率标注正确",
+              std::to_string(o1.bits) + " 位 @" + std::to_string(o1.rate));
+        std::vector<int32_t> pk;
+        DopPackState dps;
+        const size_t g = dsd_to_dop(o1, pk, dps);
+        DsdStream back1;
+        check(dop_to_dsd_bits(pk.data(), g, 2, back1), "支路输出装 DoP 后标记合法（可交既有输出链）",
+              std::to_string(g) + " 帧/声道");
     }
 
     printf("\n%s (失败项 %d)\n", fails == 0 ? "全部通过" : "存在失败", fails);

@@ -106,22 +106,78 @@ struct ProviderQuery {
     std::string dirName;    // 父目录名（如「专辑名 @ 社团」）
 };
 
-// 数据源描述符(P1.5 / E-17): 新增数据源 = 往 provider_registry() 注册一项 + 实现函数,零接线。
+// ---------------------------------------------------------------------------
+// 能力矩阵(2026-10-27,用户 261026-05/06、261025-02)：「谁能干什么」由数据源
+// **真实支持的接口**声明,不再由「某人当初实现了哪个函数」硬编码。
+//
+// 用户原话：「我们的所有接入的数据源，应该是通用于封面、头像、歌词、艺术家等等所有
+// 内容收集，不存在某个源只提供一种信息的情况。」⟹ 这里把 5 类内容 + 搜索做成能力位,
+// 每一类候选列表(封面/头像/歌词/简介)都由本矩阵**派生**(artwork.h 的 art_*_sources),
+// 以后新增一个源只改 provider_registry() 一处。
+//
+// 每一项的填写依据(真实接口 + 实测,证据见各行注释与 docs/261027-01-全信源调度.md):
+//   * Cover       专辑封面 URL(可直接 GET)
+//   * ArtistImage 艺人/社团头像(不是专辑封面顶替 —— 用户 2026-10-25 钦定「取不到就留空」)
+//   * Lyrics      歌词文本
+//   * ArtistBio   艺人简介正文
+//   * ArtistLink  艺人外链(可点开的艺人页)
+//   * TrackMeta   曲目元数据(标题/艺人/专辑/时长/流派/年份 —— 搜索链产出)
+//   * Search      参与 enrich 的曲目搜索链(search 指针非空)
+// ---------------------------------------------------------------------------
+enum class ArtCap : unsigned {
+    None        = 0u,
+    Cover       = 1u << 0,
+    ArtistImage = 1u << 1,
+    Lyrics      = 1u << 2,
+    ArtistBio   = 1u << 3,
+    ArtistLink  = 1u << 4,
+    TrackMeta   = 1u << 5,
+    Search      = 1u << 6,
+};
+
+// ArtCap 的枚举值**本身就是位**(1u<<0 … 1u<<6)，这里只做类型转换。
+// ⚠️ 千万别写成 1u << (unsigned)c —— 那会把 ArtistImage(0x02) 再左移成 0x04，
+//    整张矩阵会静默错位(2026-10-27 自查踩到过:值看着像模像样，能力却全串了)。
+inline constexpr unsigned pv_cap_bit(ArtCap c) { return (unsigned)c; }
+
+// 可变参版本: pv_caps(ArtCap::Cover, ArtCap::Search) —— 常量表达式,注册表里直接可读。
+template <class... Cs>
+inline constexpr unsigned pv_caps(Cs... cs) {
+    unsigned m = 0u;
+    ((m |= (unsigned)cs), ...);
+    return m;
+}
+
+inline constexpr bool pv_has_cap(unsigned m, ArtCap c) { return (m & pv_cap_bit(c)) != 0u; }
+
+// 数据源描述符(P1.5 / E-17 / 能力矩阵 2026-10-27): 新增数据源 = 往
+// provider_registry() 注册一项 + 实现函数,零接线。
 //   id          设置键后缀与溯源名("qq"/"netease"/"itunes"/"lrclib"/"dizzylab")
 //   name        设置页显示名("QQ音乐"/"网易云"/"iTunes"/"lrclib 歌词"/"dizzylab")
-//   canSearch   参与标签/封面搜索(true 才会被搜索链调用,search 才非空)
-//   canLyric    参与歌词链(true 才会被歌词链调用,lyric 才非空)
+//   caps        能力矩阵 —— **唯一事实源**(见上面的 ArtCap)
 //   search      传统单字符串签名 std::vector<Candidate> (*)(const std::string& query, std::string& err)
 //   lyric       LyricResult (*)(const LyricRequest&, std::string& err) —— 统一歌词入口
 //   searchQuery 支持扩展上下文的可选签名（E-17，若非空优先调用，其它源保持 nullptr）
+//   canSearch / canLyric  由 caps **派生**的只读视图,保留是因为 enrich.h 与 rtaweb.cpp
+//                         已经有 6 处读它们;构造时一致,不存在第二份事实源
+//                         (tests/test_metaproviders.cpp 有「caps ⇔ 指针 ⇔ 派生位」一致性断言)。
 struct ProviderDesc {
     const char* id;
     const char* name;
+    unsigned    caps;
+    std::vector<Candidate> (*search)(const std::string&, std::string&);
+    LyricResult (*lyric)(const LyricRequest&, std::string& err);
+    std::vector<Candidate> (*searchQuery)(const ProviderQuery&, std::string&);
     bool canSearch;
     bool canLyric;
-    std::vector<Candidate> (*search)(const std::string&, std::string&);   // canSearch 才非空
-    LyricResult (*lyric)(const LyricRequest&, std::string& err);          // canLyric 才非空
-    std::vector<Candidate> (*searchQuery)(const ProviderQuery&, std::string&) = nullptr;
+
+    constexpr ProviderDesc(const char* i, const char* n, unsigned c,
+                           std::vector<Candidate> (*s)(const std::string&, std::string&),
+                           LyricResult (*l)(const LyricRequest&, std::string&),
+                           std::vector<Candidate> (*sq)(const ProviderQuery&, std::string&) = nullptr)
+        : id(i), name(n), caps(c), search(s), lyric(l), searchQuery(sq),
+          canSearch(pv_has_cap(c, ArtCap::Search) && s != nullptr),
+          canLyric(pv_has_cap(c, ArtCap::Lyrics) && l != nullptr) {}
 };
 
 // ---------------------------------------------------------------------------
@@ -1480,18 +1536,82 @@ inline LyricResult lyric_lrclib_entry(const LyricRequest& rq, std::string& err) 
 // lrclib 挪到表尾后歌词链逆序仍是 lrclib→netease→qq(dizzylab canLyric=false 自动跳过),
 // 与 P1 的固定歌词顺序完全一致 —— tests/test_metaproviders.cpp 有该顺序断言。
 inline const std::vector<ProviderDesc>& provider_registry() {
+    // 能力位(第三列)每一项都有实测依据,写在条目上方的注释里;填 false 的一律注明
+    // 「未找到公开接口/实测无该字段」—— 不许拍脑袋填 true(用户 2026-10-27 要求核查)。
     static const std::vector<ProviderDesc> reg = {
-        { "dizzylab", "dizzylab",   true,  false, search_dizzylab, nullptr,             search_dizzylab_query },
-        { "qq",       "QQ音乐",      true,  true,  search_qq,       lyric_qq_entry,      nullptr               },
-        { "netease",  "网易云",       true,  true,  search_netease,  lyric_netease_entry, nullptr               },
-        { "itunes",   "iTunes",      true,  false, search_itunes,   nullptr,             nullptr               },
-        { "lrclib",   "lrclib 歌词",  false, true,  nullptr,         lyric_lrclib_entry,  nullptr               },
+        // ---- dizzylab(同人第一优先)----
+        //   Cover ✅ cdn.dizzylab.net/media/cover/<catalog>.jpg!cover(本文件 616 行拼 URL)
+        //   ArtistImage ✅ 2026-10-27 实测:GET /search/?s=<艺人> 的「用户」段卡片直接给
+        //       cdn.dizzylab.net/media/avatars/<file>!cover(Khrisma → 68,713 B;AnnyJuly/熊青嵐/
+        //       异象聚合 同样精确命中)。⚠️ 必须精确名匹配:炒饭→「铁棍山药炒饭」、
+        //       MhT→「MHTWSNBB666」、洛天依→「超绝可爱洛天依」都是别人/粉丝号。
+        //   ArtistBio ✅ 同一张卡片里的简介(实测 Khrisma:「月華社所属。东方/编曲/音游/…」)
+        //   ArtistLink ✅ https://dizzylab.net/u/<id>
+        //   Lyrics ❌ 站点无歌词接口(本文件头注已如实标注)
+        //   TrackMeta ✅ 曲目表 title/artist/duration(parse_dizzylab_album)
+        { "dizzylab", "dizzylab",
+          pv_caps(ArtCap::Search, ArtCap::Cover, ArtCap::ArtistImage, ArtCap::ArtistBio,
+                  ArtCap::ArtistLink, ArtCap::TrackMeta),
+          search_dizzylab, nullptr, search_dizzylab_query },
+
+        // ---- QQ 音乐 ----
+        //   Cover ✅ y.gtimg.cn/music/photo_new/T002R800x800M000<album.mid>.jpg(281 行)
+        //   ArtistImage ✅ 2026-10-27 实测:POST musicu.fcg search_type=1 歌手搜索 →
+        //       singerMID + singerPic(蔡琴 17,197 B / TAMUSIC 49,625 B / 初音未来 23,951 B);
+        //       singerPic 是 T001R150x150,换成 T001R300x300 同 id 可取更大图(实测 200)
+        //   Lyrics ✅ GetPlayLyricInfo(已端到端验证,见 lyric_qq 上方注释)
+        //   ArtistBio ❌ 无公开简介接口(歌手页只有 HTML,不含结构化简介)
+        //   ArtistLink ✅ https://y.qq.com/n/ryqq/singer/<singerMID>
+        { "qq", "QQ音乐",
+          pv_caps(ArtCap::Search, ArtCap::Cover, ArtCap::ArtistImage, ArtCap::Lyrics,
+                  ArtCap::ArtistLink, ArtCap::TrackMeta),
+          search_qq, lyric_qq_entry, nullptr },
+
+        // ---- 网易云 ----
+        //   Cover ✅ album.picUrl(330 行)
+        //   ArtistImage ✅ POST /api/search/get type=100 → artists[].picUrl(2026-10-27 实测:
+        //       蔡琴 → p1.music.126.net/...jpg)。⚠️ 首个结果可能是粉丝号(「周杰伦.」有
+        //       accountId),必须按名字精确匹配后再取图。
+        //   Lyrics ✅ /api/song/lyric
+        //   ArtistBio ❌ /api/artist/{id} 的 briefDesc 字段实测为空(周杰伦 id=6452 → "")，
+        //       正文要 weapi 加密登录态 ⟹ 未找到公开接口,如实填 false
+        //   ArtistLink ✅ https://music.163.com/#/artist?id=<id>
+        { "netease", "网易云",
+          pv_caps(ArtCap::Search, ArtCap::Cover, ArtCap::ArtistImage, ArtCap::Lyrics,
+                  ArtCap::ArtistLink, ArtCap::TrackMeta),
+          search_netease, lyric_netease_entry, nullptr },
+
+        // ---- iTunes ----
+        //   Cover ✅ artworkUrl100 → 1200x1200bb(386 行)
+        //   ArtistImage ❌ 2026-10-27 实测 entity=musicArtist 的结果只有 artistName/
+        //       artistLinkUrl/artistId/primaryGenreName,**没有 artwork 字段** ⟹ 填 false
+        //   Lyrics ❌ 无歌词接口
+        //   ArtistBio ❌ 无简介字段
+        //   ArtistLink ✅ artistLinkUrl(实测 https://music.apple.com/us/artist/...)
+        { "itunes", "iTunes",
+          pv_caps(ArtCap::Search, ArtCap::Cover, ArtCap::ArtistLink, ArtCap::TrackMeta),
+          search_itunes, nullptr, nullptr },
+
+        // ---- lrclib ----
+        //   只有歌词:无封面/无艺人图/无简介/无外链/无曲目搜索(不参与 Search 链)
+        { "lrclib", "lrclib 歌词", pv_caps(ArtCap::Lyrics),
+          nullptr, lyric_lrclib_entry, nullptr },
+
         // 2026-10-26（用户指出「元数据不是应该有 6 个数据库么」）：
         // Discogs 一直在元数据补全链里干活（enrich.h §6.5，genre 的 backfill 来源），
         // 但它**没有注册进本表** ⟹ 设置页看不到、/api/providers 不返回、用户也关不掉。
-        // 它是纯开关型数据源（不做曲目搜索、无歌词接口），所以 canSearch/canLyric 都 false，
-        // 上面两处遍历都有 canSearch / canLyric 守卫，加在这里不会改变既有搜索与歌词优先级。
-        { "discogs",  "Discogs",    false, false, nullptr,         nullptr,             nullptr               },
+        // 2026-10-27 补全能力位(全部匿名实测):
+        //   Cover ✅ GET /releases/{id} → images[].uri
+        //   ArtistImage ✅ GET /artists/{id} → images[0].uri(蔡琴 600x600 / Liz Mitchell)
+        //   ArtistBio ✅ 同一响应里的 profile(蔡琴:「Tsai Chin (Pinyin: Cài Qín) is a pop…」)
+        //   ArtistLink ✅ uri(https://www.discogs.com/artist/<id>-<name>)
+        //   TrackMeta ✅ release 的 title/year/label/format/genre/style
+        //   Lyrics ❌；Search ❌(不做曲目搜索;/database/search 只在 discogs_versions 内部用)
+        //   ⚠️ 匿名限频约 25 req/min ⟹ artwork.h 对 Discogs 单列节流,排在头像链最后
+        { "discogs", "Discogs",
+          pv_caps(ArtCap::Cover, ArtCap::ArtistImage, ArtCap::ArtistBio, ArtCap::ArtistLink,
+                  ArtCap::TrackMeta),
+          nullptr, nullptr, nullptr },
     };
     return reg;
 }

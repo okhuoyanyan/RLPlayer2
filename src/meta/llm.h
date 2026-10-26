@@ -1,10 +1,13 @@
-// llm.h — DeepSeek 客户端（chat / search / fetch）
+// llm.h — DeepSeek 客户端（chat / search / fetch / function calling）
 //
-// 用途（docs/元数据补全调研与规划.md §1.4 / §3）：
+// 用途（官方文档 https://api-docs.deepseek.com/guides/search/ ，
+//       本地调研记录 docs/元数据补全调研与规划.md §1.4 / §3）：
 //   * POST {base}/chat/completions — 标签解析兜底、结构化输出（model 默认 deepseek-flash）
-//   * POST {base}/v1/tools/search  — 联网检索（results[]: title/url/snippet/summary/
-//                                    rerank_score/authority/date；过滤策略在调用方做）
+//   * POST {base}/v1/tools/search  — 联网检索（results[]: title/url/snippet/summary/content/
+//                                    rerank_score/authority/date/site_name；过滤策略在调用方做）
 //   * POST {base}/v1/tools/fetch   — 拉取网页正文（title + Markdown）
+//   * tools / tool_calls           — 上面两个端点以 function calling 形式交给模型自取
+//                                    （llm_chat_tool_loop，2026-10-26 用户 261026-06 #2）
 //
 // 设计要点：
 //   * api_key 只用于 Authorization 请求头。任何错误消息在返回前都过一遍 llm_redact()，
@@ -702,29 +705,91 @@ inline bool llm_check_cap(const LlmConfig& cfg, const std::string& month = "", s
 // chat completions
 // ---------------------------------------------------------------------------
 
-struct LlmMessage { std::string role, content; };
+// ---------------------------------------------------------------------------
+// function calling（2026-10-26，用户 261026-06 #2）
+//
+// 官方文档：https://api-docs.deepseek.com/guides/search/
+//   「Search 接口和 Fetch 接口为 Agent 与 RAG 应用提供实时网页内容……两者都是原始 JSON API」
+// 即：/v1/tools/search、/v1/tools/fetch 是**独立端点**，不是 chat 内建工具；
+// 但 chat/completions 是 OpenAI 兼容的，支持 tools / tool_calls。
+// 所以「让 AI 自己搜」的正确接法 = 把这两个端点包成两个 function 交给模型，
+// 由本文件当执行器（llm_execute_web_tool）把结果回填成 role="tool" 消息 —— 见 llm_chat_tool_loop。
+// ---------------------------------------------------------------------------
+
+struct LlmToolCall { std::string id, name, arguments; };   // arguments 是 JSON 字符串（不是对象）
+using LlmToolCalls = std::vector<LlmToolCall>;
+
+struct LlmMessage {
+    std::string role, content;
+    // role=="assistant" 且模型要调工具时：回填用的 tool_calls JSON 数组（原样发给服务端）
+    std::string toolCallsJson;
+    // role=="tool" 时必填：对应哪一个 tool_call
+    std::string toolCallId;
+};
+
+// 把解析出来的工具调用重新拼成回填用的 JSON 数组（arguments 本身是字符串，要再转义一层）
+inline std::string llm_tool_calls_to_json(const LlmToolCalls& calls) {
+    std::ostringstream o;
+    o << "[";
+    for (size_t i = 0; i < calls.size(); ++i) {
+        if (i) o << ",";
+        o << "{\"id\":\"" << llm_esc(calls[i].id) << "\",\"type\":\"function\","
+             "\"function\":{\"name\":\"" << llm_esc(calls[i].name) << "\","
+             "\"arguments\":\"" << llm_esc(calls[i].arguments) << "\"}}";
+    }
+    o << "]";
+    return o.str();
+}
+
+// 一条工具结果消息（role="tool"）
+inline LlmMessage llm_tool_result_message(const std::string& callId, const std::string& content) {
+    LlmMessage m;
+    m.role = "tool";
+    m.toolCallId = callId;
+    m.content = content;
+    return m;
+}
+
 struct LlmReply {
     bool ok = false;
     std::string content, error;
     int totalTokens = 0;
+    // 模型要求调用工具时非空（此时 content 通常为空、finish_reason=="tool_calls"）
+    LlmToolCalls toolCalls;
+    std::string finishReason;
 };
 
 // 完整请求体（含 model），llm_chat / llm_chat_stream 共用。
 // stream=true 追加 "stream":true（流式）；deepseek 模型再加 stream_options.include_usage，
 // 让最后一个 chunk 带上 usage —— 该参数可用 RLPLAYER_LLM_STREAM_USAGE=0 关掉
 //（未联网验证：若某兼容端点因此 400，这一行是唯一要回退的地方）。
+// toolsJson 非空 → 追加 "tools":[…],"tool_choice":"auto"（function calling）。
+// 消息里的 toolCallsJson / toolCallId 也在这里落地：
+//   assistant + toolCallsJson → {"role":"assistant","content":null|"…","tool_calls":[…]}
+//   tool                      → {"role":"tool","tool_call_id":"…","content":"…"}
 inline std::string llm_build_chat_body(const std::string& model,
                                        const std::vector<LlmMessage>& msgs,
                                        int maxTokens, float temperature, bool jsonObject,
-                                       bool stream = false) {
+                                       bool stream = false,
+                                       const std::string& toolsJson = std::string()) {
     std::ostringstream o;
     o << "{";
     if (!model.empty()) o << "\"model\":\"" << llm_esc(model) << "\",";
     o << "\"messages\":[";
     for (size_t i = 0; i < msgs.size(); ++i) {
         if (i) o << ",";
-        o << "{\"role\":\"" << llm_esc(msgs[i].role)
-          << "\",\"content\":\"" << llm_esc(llm_sanitize_utf8(msgs[i].content)) << "\"}";
+        if (msgs[i].role == "assistant" && !msgs[i].toolCallsJson.empty()) {
+            o << "{\"role\":\"assistant\",";
+            if (msgs[i].content.empty()) o << "\"content\":null,";
+            else o << "\"content\":\"" << llm_esc(llm_sanitize_utf8(msgs[i].content)) << "\",";
+            o << "\"tool_calls\":" << msgs[i].toolCallsJson << "}";
+        } else if (msgs[i].role == "tool") {
+            o << "{\"role\":\"tool\",\"tool_call_id\":\"" << llm_esc(msgs[i].toolCallId)
+              << "\",\"content\":\"" << llm_esc(llm_sanitize_utf8(msgs[i].content)) << "\"}";
+        } else {
+            o << "{\"role\":\"" << llm_esc(msgs[i].role)
+              << "\",\"content\":\"" << llm_esc(llm_sanitize_utf8(msgs[i].content)) << "\"}";
+        }
     }
     o << "],\"max_tokens\":" << maxTokens;
     // 2026-10-24（用户 261024-01 #1）：思考强度设 LOW 以提升速度。
@@ -744,6 +809,8 @@ inline std::string llm_build_chat_body(const std::string& model,
     std::snprintf(tb, sizeof(tb), "%.2f", (double)temperature);   // 保留 2 位小数
     o << ",\"temperature\":" << tb;
     if (jsonObject) o << ",\"response_format\":{\"type\":\"json_object\"}";
+    // function calling：模型自己决定搜什么/抓哪页（见 llm_chat_tool_loop）
+    if (!toolsJson.empty()) o << ",\"tools\":" << toolsJson << ",\"tool_choice\":\"auto\"";
     if (stream) {
         o << ",\"stream\":true";
         if (model.find("deepseek") != std::string::npos) {
@@ -759,8 +826,9 @@ inline std::string llm_build_chat_body(const std::string& model,
 // 纯函数（可测）：不含 model 的请求体，model 由 llm_chat 注入
 inline std::string llm_build_chat_body(const std::vector<LlmMessage>& msgs,
                                        int maxTokens = 800, float temperature = 0.2f,
-                                       bool jsonObject = false, bool stream = false) {
-    return llm_build_chat_body(std::string(), msgs, maxTokens, temperature, jsonObject, stream);
+                                       bool jsonObject = false, bool stream = false,
+                                       const std::string& toolsJson = std::string()) {
+    return llm_build_chat_body(std::string(), msgs, maxTokens, temperature, jsonObject, stream, toolsJson);
 }
 
 // 纯函数（可测）：解析 /chat/completions 响应。错误分三类：非法 JSON / 服务端 error / 缺 choices
@@ -776,7 +844,25 @@ inline LlmReply llm_parse_chat_response(const std::string& text) {
         return r;
     }
     if (!j.has("choices") || j["choices"].size() == 0) { r.error = "响应缺少 choices"; return r; }
-    r.content = j["choices"].at(0)["message"]["content"].s();
+    const rta::net::Json& ch0 = j["choices"].at(0);
+    const rta::net::Json& msgj = ch0["message"];
+    r.content = msgj["content"].s();
+    r.finishReason = ch0["finish_reason"].s();
+    // function calling：模型要求调工具时 message.content 通常为 null、finish_reason="tool_calls"。
+    // 这里只做解析，执行与回填在 llm_chat_tool_loop 里（纯函数便于离线断言）。
+    if (msgj.has("tool_calls") && msgj["tool_calls"].type == rta::net::Json::Arr) {
+        const rta::net::Json& tc = msgj["tool_calls"];
+        for (size_t i = 0; i < tc.size(); ++i) {
+            const rta::net::Json& c = tc.at(i);
+            LlmToolCall call;
+            call.id = c["id"].s();
+            call.name = c["function"]["name"].s();
+            call.arguments = c["function"]["arguments"].s();
+            if (call.name.empty()) continue;          // 无名调用无法执行，直接丢弃
+            if (call.id.empty()) call.id = "call_" + std::to_string(i);
+            r.toolCalls.push_back(std::move(call));
+        }
+    }
     if (j.has("usage")) r.totalTokens = (int)j["usage"]["total_tokens"].n();
     r.ok = true;
     return r;
@@ -784,7 +870,8 @@ inline LlmReply llm_parse_chat_response(const std::string& text) {
 
 // POST {base}/chat/completions，超时 60s，单次调用不重试
 inline LlmReply llm_chat(const LlmConfig& cfg, const std::vector<LlmMessage>& msgs,
-                         int maxTokens = 800, float temperature = 0.2f, bool jsonObject = false) {
+                         int maxTokens = 800, float temperature = 0.2f, bool jsonObject = false,
+                         const std::string& toolsJson = std::string()) {
     LlmReply r;
     if (cfg.apiKey.empty()) { r.error = "未配置 api_key（rlplayer-llm.conf）"; return r; }
 
@@ -795,7 +882,8 @@ inline LlmReply llm_chat(const LlmConfig& cfg, const std::vector<LlmMessage>& ms
         return r;
     }
 
-    const std::string body = llm_build_chat_body(cfg.model, msgs, maxTokens, temperature, jsonObject);
+    const std::string body = llm_build_chat_body(cfg.model, msgs, maxTokens, temperature, jsonObject,
+                                                 /*stream=*/false, toolsJson);
     const std::string url = llm_base_url(cfg.baseUrl) + "/chat/completions";
     const std::vector<std::string> headers = { "Authorization: Bearer " + cfg.apiKey };
 
@@ -1151,16 +1239,56 @@ inline LlmStreamReply llm_chat_stream(const LlmConfig& cfg, const std::vector<Ll
 
 struct DsHit {
     std::string title, url, snippet, summary;
-    double rerankScore = 0;
-    int authority = -1;
-    std::string date;
+    // 2026-10-26：官方 need_content=true 时 inline 返回正文（省一次 fetch 请求，
+    // Search/Fetch 各按次计费 ¥5/千次，见 https://api-docs.deepseek.com/guides/search/ ）
+    std::string content;
+    std::string siteName;      // site_name，可能为空
+    double rerankScore = 0;    // 0~3，>=1.5 为优质
+    int authority = -1;        // 0~4（-1 = 未知），>=3 极权威
+    std::string date;          // RFC3339（UTC），可能为空
 };
 struct DsSearchReply { bool ok = false; std::string error; std::vector<DsHit> hits; };
 struct DsFetchReply  { bool ok = false; std::string title, content, error; };
 
+// 官方请求字段（guides/search「请求字段」表）：query / count / ori_question / localization / need_content
+struct DsSearchOptions {
+    int count = 8;                 // 1~50，默认 10（这里默认 8，与检索层一致）
+    bool needContent = false;      // true → results[].content 直接带回正文
+    std::string oriQuestion;       // 触发搜索的用户原始问题（≤128），帮助理解意图
+    std::string siteRestrict;      // 追加 "site:a OR site:b"（官方支持的搜索语法）
+};
+
 inline std::string ds_build_search_body(const std::string& query, int count) {
     std::ostringstream o;
     o << "{\"query\":\"" << llm_esc(query) << "\",\"count\":" << count << "}";
+    return o.str();
+}
+
+inline std::string ds_build_search_body(const std::string& query, const DsSearchOptions& opts) {
+    std::string q = query;
+    if (!opts.siteRestrict.empty() && q.find("site:") == std::string::npos) {
+        q += " " + opts.siteRestrict;
+    }
+    // 官方限制 query 1~128 Unicode 字符（按码点算，不是字节）→ 超出就截断，避免 400
+    {
+        size_t cp = 0, i = 0;
+        while (i < q.size()) {
+            const unsigned char c = (unsigned char)q[i];
+            size_t adv = (c < 0x80) ? 1 : ((c >> 5) == 0x6 ? 2 : ((c >> 4) == 0xE ? 3 : 4));
+            if (++cp > 128) { q.resize(i); break; }
+            i += adv;
+        }
+        // 截断后去掉末尾残缺的空白
+        while (!q.empty() && (q.back() == ' ' || q.back() == '\t')) q.pop_back();
+    }
+    std::ostringstream o;
+    o << "{\"query\":\"" << llm_esc(q) << "\",\"count\":" << opts.count;
+    if (!opts.oriQuestion.empty()) {
+        std::string oq = opts.oriQuestion.size() > 128 * 3 ? opts.oriQuestion.substr(0, 128 * 3) : opts.oriQuestion;
+        o << ",\"ori_question\":\"" << llm_esc(oq) << "\"";
+    }
+    if (opts.needContent) o << ",\"need_content\":true";
+    o << "}";
     return o.str();
 }
 
@@ -1192,6 +1320,8 @@ inline DsSearchReply ds_parse_search_response(const std::string& text) {
         hit.url         = h["url"].s();
         hit.snippet     = h["snippet"].s();
         hit.summary     = h["summary"].s();
+        hit.content     = h["content"].s();
+        hit.siteName    = h["site_name"].s();
         hit.rerankScore = h["rerank_score"].n();
         hit.authority   = h["authority"].ok() ? (int)h["authority"].n() : -1;
         hit.date        = h["date"].s();
@@ -1228,7 +1358,7 @@ inline std::string ds_http_error(const std::string& apiKey, int status, const st
 }
 
 // POST {base}/v1/tools/search，超时 60s，单次调用不重试
-inline DsSearchReply ds_search(const LlmConfig& cfg, const std::string& query, int count = 5) {
+inline DsSearchReply ds_search(const LlmConfig& cfg, const std::string& query, const DsSearchOptions& opts) {
     DsSearchReply r;
     if (cfg.apiKey.empty()) { r.error = "未配置 api_key（rlplayer-llm.conf）"; return r; }
 
@@ -1239,7 +1369,10 @@ inline DsSearchReply ds_search(const LlmConfig& cfg, const std::string& query, i
         return r;
     }
 
-    const std::string body = ds_build_search_body(query, count);
+    DsSearchOptions o = opts;
+    if (o.count < 1) o.count = 1;
+    if (o.count > 50) o.count = 50;      // 官方上限 50
+    const std::string body = ds_build_search_body(query, o);
     const std::string url = llm_base_url(cfg.baseUrl) + "/v1/tools/search";
     const std::vector<std::string> headers = { "Authorization: Bearer " + cfg.apiKey };
 
@@ -1265,6 +1398,13 @@ inline DsSearchReply ds_search(const LlmConfig& cfg, const std::string& query, i
         llm_record_usage(m, "search", cfg.usagePath);
     }
     return r;
+}
+
+// 老签名（count 版）保留：现有调用点与测试都按 count 传参
+inline DsSearchReply ds_search(const LlmConfig& cfg, const std::string& query, int count = 5) {
+    DsSearchOptions o;
+    o.count = count;
+    return ds_search(cfg, query, o);
 }
 
 // POST {base}/v1/tools/fetch，单次调用不重试。timeout_ms 默认 60s；
@@ -1306,6 +1446,221 @@ inline DsFetchReply ds_fetch(const LlmConfig& cfg, const std::string& url, int t
         const std::string m = cfg.monthOverride.empty() ? llm_current_month() : cfg.monthOverride;
         llm_record_usage(m, "fetch", cfg.usagePath);
     }
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// function calling 执行器：把 /v1/tools/search、/v1/tools/fetch 包成两个 function
+//
+// 2026-10-26（用户 261026-06 #2「Search 和 Fetch 是给你用的，他们两个负责搜索，给你返回」）：
+//   旧实现只在检索层里「我们自己决定 query → 调 search → 调 fetch」，
+//   模型全程只看到最后拼好的材料，无法在「材料不够」时自己再查一次 ——
+//   于是遇到 QQ 音乐 / dizzylab 这类只有平台页、没有百科条目的专辑，就只能说「找不到」。
+//   这里补上工具环路：模型 → tool_calls → 本地执行 search/fetch → role="tool" 结果回填 → 模型继续。
+//
+// 纪律：
+//   * 只暴露 web_search / web_fetch 两个只读工具，不给写操作；
+//   * 每次工具调用都走 llm_check_cap（月度上限）与超时，失败只回 {"ok":false,...} 给模型，
+//     不抛异常、不阻塞主流程（总预算 budgetMs 到点即收手，返回已拿到的内容）；
+//   * 工具结果回填前按 UTF-8 边界截断，避免把十万字符塞回上下文（既贵又慢）。
+// ---------------------------------------------------------------------------
+
+// 按 UTF-8 字符边界截断（不切半个多字节字符）
+inline std::string llm_truncate_utf8(const std::string& s, size_t maxBytes) {
+    if (s.size() <= maxBytes) return s;
+    size_t n = maxBytes;
+    while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) --n;
+    return s.substr(0, n);
+}
+
+// 工具声明（OpenAI / DeepSeek 兼容的 tools 数组）。description 是给模型看的，
+// 里面明确写了「外部事实必须先查」与 site: 语法 —— 这是压住「凭记忆编造」的关键。
+inline std::string llm_web_tools_json() {
+    return std::string(
+        "[{\"type\":\"function\",\"function\":{"
+        "\"name\":\"web_search\","
+        "\"description\":\"联网搜索网页，返回标题/链接/摘要/正文片段。凡涉及专辑发行信息、曲目、艺人简介、"
+        "发行年份、厂牌、制作人员等外部事实，且下方材料没有明确给出时，必须先调用本工具，不要凭记忆作答。"
+        "query 支持 site:/lang:/after: 语法。\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"query\":{\"type\":\"string\",\"description\":\"搜索词，1~128 字符；可用 site:y.qq.com OR site:dizzylab.net 限定站点\"},"
+        "\"count\":{\"type\":\"integer\",\"description\":\"返回条数 1~10，默认 6\"},"
+        "\"site\":{\"type\":\"string\",\"description\":\"可选，限定站点（不含 site: 前缀），如 y.qq.com\"}"
+        "},\"required\":[\"query\"]}}},"
+        "{\"type\":\"function\",\"function\":{"
+        "\"name\":\"web_fetch\","
+        "\"description\":\"抓取单个网页并以 Markdown 正文返回。搜索结果里有目标页面时用它读取全文（如 QQ 音乐专辑页、dizzylab 作品页）。\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"url\":{\"type\":\"string\",\"description\":\"要抓取的 http/https 页面地址\"}"
+        "},\"required\":[\"url\"]}}}]");
+}
+
+// 执行一次工具调用，返回给模型看的 JSON 字符串（永远是合法 JSON，失败也是 {"ok":false,...}）
+inline std::string llm_execute_web_tool(const LlmConfig& cfg, const std::string& name,
+                                        const std::string& argsJson, int timeoutMs,
+                                        bool* okOut = nullptr) {
+    if (okOut) *okOut = false;
+    const rta::net::Json a = rta::net::json_parse(argsJson);
+    if (a.type != rta::net::Json::Obj) {
+        return std::string("{\"ok\":false,\"error\":\"工具参数不是合法 JSON 对象\"}");
+    }
+    std::ostringstream o;
+    if (name == "web_search") {
+        std::string q = a["query"].s();
+        if (q.empty()) q = a["q"].s();
+        if (q.empty()) return std::string("{\"ok\":false,\"error\":\"web_search 缺少 query\"}");
+        DsSearchOptions opts;
+        const int cnt = (int)a["count"].n();
+        opts.count = (cnt >= 1 && cnt <= 10) ? cnt : 6;
+        opts.needContent = true;                 // 一次调用就带回正文，省一次 fetch 计费
+        opts.oriQuestion = a["ori_question"].s();
+        // 模型给的 site 是裸域名（如 dizzylab.net）；官方语法要求 site: 前缀，这里补上
+        std::string site = llm_trim(a["site"].s());
+        if (!site.empty()) {
+            if (site.compare(0, 5, "site:") != 0) site = "site:" + site;
+            opts.siteRestrict = site;
+        }
+        const DsSearchReply rep = ds_search(cfg, q, opts);
+        if (!rep.ok) return std::string("{\"ok\":false,\"error\":\"") + llm_esc(rep.error) + "\"}";
+        o << "{\"ok\":true,\"query\":\"" << llm_esc(q) << "\",\"count\":" << rep.hits.size() << ",\"results\":[";
+        for (size_t i = 0; i < rep.hits.size(); ++i) {
+            const DsHit& h = rep.hits[i];
+            if (i) o << ",";
+            o << "{\"title\":\"" << llm_esc(h.title) << "\",\"url\":\"" << llm_esc(h.url) << "\"";
+            if (!h.date.empty())  o << ",\"date\":\"" << llm_esc(h.date) << "\"";
+            o << ",\"authority\":" << h.authority;
+            char sb[32]; std::snprintf(sb, sizeof(sb), "%.2f", h.rerankScore);
+            o << ",\"rerank_score\":" << sb;
+            if (!h.siteName.empty()) o << ",\"site\":\"" << llm_esc(h.siteName) << "\"";
+            if (!h.snippet.empty())  o << ",\"snippet\":\"" << llm_esc(llm_truncate_utf8(h.snippet, 400)) << "\"";
+            if (!h.summary.empty())  o << ",\"summary\":\"" << llm_esc(llm_truncate_utf8(h.summary, 900)) << "\"";
+            if (!h.content.empty())  o << ",\"content\":\"" << llm_esc(llm_truncate_utf8(h.content, 1500)) << "\"";
+            o << "}";
+        }
+        o << "]}";
+        if (okOut) *okOut = true;
+        return o.str();
+    }
+    if (name == "web_fetch") {
+        const std::string url = a["url"].s();
+        if (url.empty()) return std::string("{\"ok\":false,\"error\":\"web_fetch 缺少 url\"}");
+        const DsFetchReply rep = ds_fetch(cfg, url, timeoutMs);
+        if (!rep.ok) return std::string("{\"ok\":false,\"url\":\"") + llm_esc(url) + "\",\"error\":\"" + llm_esc(rep.error) + "\"}";
+        o << "{\"ok\":true,\"url\":\"" << llm_esc(url) << "\",\"title\":\"" << llm_esc(rep.title)
+          << "\",\"content\":\"" << llm_esc(llm_truncate_utf8(rep.content, 4000)) << "\"}";
+        if (okOut) *okOut = true;
+        return o.str();
+    }
+    return std::string("{\"ok\":false,\"error\":\"未知工具: ") + llm_esc(name) + "\"}";
+}
+
+struct LlmToolTrace {
+    std::string name, args, result;
+    bool ok = false;
+    long long ms = 0;
+};
+
+struct LlmToolLoopResult {
+    bool ok = false;
+    std::string content;          // 模型最终回答（ok==true 时可用）
+    std::string error;
+    int rounds = 0;               // 实际发起的 chat 轮数
+    int toolCalls = 0;            // 实际执行的工具调用次数
+    int totalTokens = 0;
+    std::vector<LlmToolTrace> trace;
+    bool finalized = false;       // true = 轮数用尽后靠"无工具收尾调用"才拿到正文
+    std::string diag;             // "rounds=2 calls=3 tool=1830ms total=6120ms"
+};
+
+// 带工具的多轮 chat：模型要工具就执行并回填，直到它给出最终文本或用完轮数/预算。
+// 失败降级：任一轮网络失败 → ok=false + error（不重试，重试归上层）；
+//           预算耗尽 → 立即收手（不阻塞主流程，最多等 budgetMs）。
+inline LlmToolLoopResult llm_chat_tool_loop(const LlmConfig& cfg,
+                                            std::vector<LlmMessage> msgs,
+                                            int maxTokens = 1200,
+                                            float temperature = 0.2f,
+                                            int maxRounds = 4,
+                                            int budgetMs = 25000,
+                                            int toolTimeoutMs = 12000) {
+    LlmToolLoopResult r;
+    if (cfg.apiKey.empty()) { r.error = "未配置 api_key（rlplayer-llm.conf）"; return r; }
+    const std::string tools = llm_web_tools_json();
+    const auto t0 = std::chrono::steady_clock::now();
+    auto ms_since = [&t0]() {
+        return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+    };
+    long long toolMs = 0;
+    if (maxRounds < 1) maxRounds = 1;
+
+    for (int round = 0; round < maxRounds; ++round) {
+        if (ms_since() > budgetMs) { r.error = "工具调用超出总预算(" + std::to_string(budgetMs) + "ms)"; break; }
+        const LlmReply rep = llm_chat(cfg, msgs, maxTokens, temperature, /*jsonObject=*/false, tools);
+        r.rounds = round + 1;
+        r.totalTokens += rep.totalTokens;
+        if (!rep.ok) { r.error = rep.error; break; }
+        if (rep.toolCalls.empty()) {                 // 模型给出最终文本
+            r.ok = true;
+            r.content = rep.content;
+            break;
+        }
+        // 服务端要求：tool 消息必须紧跟对应的 assistant 调用，所以先回填 assistant
+        LlmMessage asst;
+        asst.role = "assistant";
+        asst.content = rep.content;
+        asst.toolCallsJson = llm_tool_calls_to_json(rep.toolCalls);
+        msgs.push_back(asst);
+        for (const LlmToolCall& call : rep.toolCalls) {
+            LlmToolTrace tr;
+            tr.name = call.name;
+            tr.args = call.arguments;
+            // 单次工具超时不能超过剩余预算：WinHTTP 的超时是"按阶段"算的，一个慢页面
+            // 实际可能耗掉 1.5 倍，所以这里按剩余预算再压一次（总时长可控）。
+            int callTimeout = toolTimeoutMs;
+            {
+                const long long remain = (long long)budgetMs - ms_since();
+                if (remain > 0 && remain < callTimeout) callTimeout = (int)remain;
+                if (callTimeout < 800) callTimeout = 800;
+            }
+            const auto tc0 = std::chrono::steady_clock::now();
+            std::string result;
+            try {
+                bool okCall = false;
+                result = llm_execute_web_tool(cfg, call.name, call.arguments, callTimeout, &okCall);
+                tr.ok = okCall;
+            } catch (const std::exception& e) {
+                result = std::string("{\"ok\":false,\"error\":\"工具执行异常: ") + llm_esc(e.what()) + "\"}";
+            } catch (...) {
+                result = std::string("{\"ok\":false,\"error\":\"工具执行异常\"}");
+            }
+            tr.ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tc0).count();
+            toolMs += tr.ms;
+            tr.result = result;
+            r.trace.push_back(tr);
+            ++r.toolCalls;
+            msgs.push_back(llm_tool_result_message(call.id, result));
+        }
+    }
+    // 轮数用完但模型还在要工具（实测常见：一轮里发 2~6 个 search，3 轮就没了）：
+    // 再补一次**不带工具**的收尾调用，逼它用已拿到的结果作答 —— 否则整条链路白跑，
+    // 上层只能退回"AI 凭记忆"，这正好复现用户抱怨的「明明有却说找不到」。
+    if (!r.ok && r.rounds >= maxRounds && r.toolCalls > 0 && ms_since() <= budgetMs) {
+        msgs.push_back(LlmMessage{ "user",
+            "已达到检索次数上限。请只用上面工具返回的内容直接作答（不要再调用工具）；"
+            "查不到的写「未查到」，不要用记忆补。" });
+        const LlmReply fin = llm_chat(cfg, msgs, maxTokens, temperature, /*jsonObject=*/false);
+        if (fin.ok && !fin.content.empty()) {
+            r.ok = true;
+            r.content = fin.content;
+            r.totalTokens += fin.totalTokens;
+            r.finalized = true;
+        }
+    }
+    if (r.ok && r.content.empty()) { r.ok = false; r.error = "模型返回了空内容"; }
+    if (!r.ok && r.error.empty()) r.error = "工具调用未收敛（轮数上限 " + std::to_string(maxRounds) + "）";
+    r.diag = "rounds=" + std::to_string(r.rounds) + " calls=" + std::to_string(r.toolCalls) +
+             " tool=" + std::to_string(toolMs) + "ms total=" + std::to_string(ms_since()) + "ms";
     return r;
 }
 

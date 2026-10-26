@@ -23,6 +23,8 @@
 #include "dsp/gpu_bridge.h"
 #include "dsp/loudness.h"
 #include "dsp/peq.h"          // 261024-02 #6：20 段参数均衡（输入采样率、现有文件 EQ 之前）
+#include "dsp/dsd_rate_convert.h"   // 2026-10-27：DSD 异速率支路（DSD64→128/256…），PCM 路径不引用它
+#include "dsp/replaygain.h"         // 2026-10-27：ReplayGain 增益（只用 apply_gain / loudness_volume_db，纯头文件）
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -81,6 +83,14 @@ struct PipelineConfig {
     // 由 rtaweb 持有同一个 shared_ptr，UI 改参数时热更新（引擎内部交叉淡入）。
     std::shared_ptr<dsp::PeqEngine> peq;
 
+    // ---- ReplayGain（261027-01 #2；判据与顺序见 dsp/replaygain.h 文件头）----
+    // 一级常数增益，乘在【解交错之后、PEQ/EQ/卷积/升频之前】：
+    //   a) 防削波判据用的是源信号峰值（标签里的 peak 就是源峰值），放到升频之后
+    //      -peak_dBFS 这条界就不成立了（插值过冲已经产生）；
+    //   b) 常数增益与 LTI 处理可交换，但与【量化器不可交换】，必须在抖动/整形之前。
+    // ★ 默认 0 dB ⟹ process() 整段跳过（不乘 1.0，"直通"与"乘 1.0"在 −0.0/NaN 上不等价）。
+    double   replayGainDb  = 0.0;
+
     // ---- 音量 ----
     bool     volumeEnabled = false;   // 默认关闭，保证直通可证
     double   volumeDb      = 0.0;
@@ -103,6 +113,7 @@ struct PipelineStats {
     // 各阶段是否实际生效
     bool     usedMatrix = false, usedEq = false, usedDelay = false, usedPeq = false;
     bool     usedConvolution = false, usedResample = false, usedVolume = false;
+    bool     usedReplayGain = false;       // 本次是否乘了 ReplayGain 增益（0 dB ⟹ false，样本逐位未动）
     bool     usedGpuConvolution = false;   // 本次是否真的走了 GPU
     bool     usedChannelGain = false;      // 是否用了每声道增益
     std::string gpuStatus;                 // GPU 桥接状态说明
@@ -124,6 +135,7 @@ public:
         if (!cfg_.matrix.empty()) return true;
         if (cfg_.shaper != dsp::Shaper::None) return true;
         if (cfg_.volumeEnabled && cfg_.volumeDb != 0.0) return true;
+        if (cfg_.replayGainDb != 0.0) return true;      // ReplayGain 改样本值 ⟹ 不是直通
         for (const auto& c : cfg_.channel) {
             if (!c.eq.empty() || c.delaySamples != 0 || !c.ir.empty() || c.gainDb != 0.0) return true;
         }
@@ -226,6 +238,16 @@ public:
         for (size_t n = 0; n < nIn; ++n)
             for (int c = 0; c < inCh; ++c)
                 planes[(size_t)c][n] = in.sample(n, c);
+
+        // ---- ReplayGain（最靠输入的一级；见 PipelineConfig::replayGainDb 的三条理由）----
+        // ★ 0 dB 必须整段跳过：apply_gain() 在 gainDb==0 时直接 return，一个样本都不碰。
+        //   这既是"mode=off 逐位不变"的实现保证，也让 willBeBitPerfect 的结论仍然成立。
+        if (cfg_.replayGainDb != 0.0) {
+            std::vector<double*> ip;
+            for (auto& p2 : planes) ip.push_back(p2.data());
+            dsp::replaygain::apply_gain(cfg_.replayGainDb, ip.data(), (int)ip.size(), nIn);
+            st.usedReplayGain = true;
+        }
 
         // 过采样峰值保护（在重采样之前衰减，插值出来的峰就不会再溢出）
         if (cfg_.preAttenDb != 0.0) {
@@ -494,7 +516,9 @@ private:
             for (int c = 0; c < outCh; ++c) {
                 auto L = std::make_unique<dsp::Loudness>(cfg_.loudness);
                 L->init((double)outRate);
-                L->set_volume_db(cfg_.volumeDb);   // 提升量由音量决定
+                // 提升量由【实际听音电平】决定：音量 + ReplayGain 造成的电平变化（一次性换算，
+                // 不是反馈回路 —— 绝不要把 appliedDb 再喂回 ReplayGain，见 replaygain.h 文件头）。
+                L->set_volume_db(dsp::replaygain::loudness_volume_db(cfg_.volumeDb, cfg_.replayGainDb));
                 ss_.loud.push_back(std::move(L));
             }
         }
@@ -534,5 +558,74 @@ private:
 
     PipelineConfig cfg_;
 };
+
+
+// ====================================================================================
+// DSD 异速率支路（2026-10-27，DSD 调制专线并入主线后落地）
+//
+// 只处理「DSD 源 + 目标 DSD 位率 ≠ 源位率」这一段：
+//   源 1-bit → dsd_integrator 抽取到 midRate PCM → PolyphaseResampler 升到目标位率
+//   → SdmModulator（既有 NTF/阶数/抖动/限幅档位）调制回 1-bit → 交回既有 DoP / ASIO 原生通路。
+//
+// ★ PCM 路径一行未动：本段是纯新增的函数与结构，Pipeline::process(AudioBuffer) 不引用它，
+//   也不会因为 include 而改变任何行为（dsd_rate_convert.h 只在调用时才构造滤波器/调制器）。
+//
+// 用法（rtaweb 侧接线时）：
+//   auto d = eng::dsd_rate_branch(src.rate, targetDsdRate);
+//   if (d.supported) { ... 走本支路 ... } else if (d.handled) { ps.error = d.why; }
+// 分块流式（播放用）直接持有 rta::dsp::DsdRateConverter，逐块 process_bits()；
+// 整段（离线转换/测试）用下面的 dsd_rate_convert()。
+// ====================================================================================
+struct DsdRateBranchDecision {
+    bool handled = false;    // false = 同速率（走 DirectSDM 直通，不进本支路）
+    bool supported = false;  // false 且 handled = 明确拒绝，why 是带数字的原因
+    uint32_t srcRate = 0, dstRate = 0;
+    std::string why;
+};
+
+inline DsdRateBranchDecision dsd_rate_branch(uint32_t srcDsdRate, uint32_t dstDsdRate) {
+    DsdRateBranchDecision d;
+    d.srcRate = srcDsdRate;
+    d.dstRate = dstDsdRate;
+    if (srcDsdRate == 0 || dstDsdRate == 0) { d.why = "DSD 位率为 0（未识别）"; return d; }
+    if (srcDsdRate == dstDsdRate) {
+        d.why = "源位率 == 目标位率：走 DirectSDM 逐位直通，不重调制";
+        return d;
+    }
+    const dsp::DsdRatePlan plan = dsp::plan_dsd_rate(srcDsdRate, dstDsdRate);
+    d.handled = true;
+    d.supported = plan.ok();
+    d.why = plan.note;
+    return d;
+}
+
+struct DsdRateBranchResult {
+    bool ok = false;
+    std::string why;
+    dsp::DsdConvertResult conv;
+};
+
+// 整段转换（离线 / 测试）。返回 ok=false 时 why 就是给用户看的原因，绝不静默降级。
+inline DsdRateBranchResult dsd_rate_convert(const rta::audio::DsdStream& in, uint32_t dstRate,
+                                           const dsp::DsdRateConvertConfig& cfg,
+                                           rta::audio::DsdStream& out) {
+    DsdRateBranchResult r;
+    const DsdRateBranchDecision d = dsd_rate_branch(in.rate, dstRate);
+    if (!d.handled) {                  // 同速率：逐位搬运（与 DirectSDM 语义一致，不重调制）
+        out = in;
+        r.ok = true;
+        r.why = d.why;
+        return r;
+    }
+    if (!d.supported) { r.why = d.why; return r; }
+    try {
+        r.conv = dsp::convert_dsd_stream(in, dstRate, cfg, out);
+        r.ok = true;
+        r.why = d.why;
+    } catch (const std::exception& e) {
+        r.why = e.what();
+    }
+    return r;
+}
 
 } // namespace rta::engine

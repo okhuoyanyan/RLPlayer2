@@ -51,7 +51,9 @@ var ADV = {
   // 输入
   inBackend: 'none', inDev: '', inOffset: 0, inBuf: 100, inMonitor: 0, inSeconds: 0, inOut: '',
   // SDM（DSD 输出）专用滤波器：空 = 沿用 PCM 页那一组
-  sdmFilt: '', sdmFiltNx: ''
+  sdmFilt: '', sdmFiltNx: '',
+  // ReplayGain（261027-01 #2）：默认 off = 逐位直通；rgclip 默认开（防削波）
+  rgmode: 'off', rgclip: 1
 };
 // 元数据补全开关（P1.5 注册表化）：总开关 metaon 与 DeepSeek metallm 固定两键；
 // 数据源开关按 /api/providers（后端注册表）动态渲染，写 metasrc_<id> ——
@@ -197,6 +199,8 @@ function params() {
          '&shaper=' + encodeURIComponent(D('sShap').value) +
          '&volume=' + S.vol +
          '&loudness=' + (S.loud ? 1 : 0) +
+         // ReplayGain：off / track / album + 防削波（后端 decide() → cfg.replayGainDb）
+         '&rgmode=' + (ADV.rgmode || 'off') + '&rgclip=' + (ADV.rgclip ? 1 : 0) +
          '&isp=' + (D('sIsp').checked ? 1 : 0) +
          '&twostage=' + (D('s2s').checked ? 1 : 0) +
          '&buffer=' + D('sBuf').value +
@@ -2209,54 +2213,62 @@ function folderOf(p) {
   return head.slice(j + 1);
 }
 
-/* ---------------- 整列起播（#5 播放全部 / #6 队列播放 / #3 播放整列 共用） ----------------
-   语义（用户原话）：点了从第一首开始顺序播放整个列表。
-   实现：一次性替换队列（/api/queue/set）→ 从第 1 首起播（/api/play 会在队列里就地定位 index）。
-   关键点：单曲循环会让"播放全部"只播第一首 ⟹ 先退到专辑循环。**这是行为保证，不是只改图标**。 */
+/* ---------------- 整列起播（#6 队列播放 / #3 播放整列 / #1 我的最爱双击共用） ----------------
+   语义（用户原话）：从选中的那一首开始，顺序播放整个列表。
+   实现：一次性替换队列（/api/queue/set）→ 播第 i 首（/api/play 会在队列里就地定位 index）。
+   关键点：单曲循环会让"顺序播放"只播第一首 ⟹ 先退到专辑循环。**这是行为保证，不是只改图标**。
+   2026-10-27（261026-09 #1）：抽出带起播下标的版本 —— 我的最爱要求「双击任何一首，
+   从这首开始顺序播放整个列表」，而原来的 playWholeList 只会从第 1 首开始。 */
 function ensureSequentialMode(cb) {
   var cur = parseInt(D('sRep') ? D('sRep').value : 0, 10) || 0;
   if (cur !== 2) { cb(); return; }
   D('sRep').value = '1';
   api('/api/playmode?mode=1').then(function () { applyRep(1); cb(); }).catch(function () { cb(); });
 }
-function playWholeList(files, label) {
+function playWholeListFrom(files, start, label) {
   files = (files || []).filter(function (f) { return !!f; });
   if (!files.length) { toast('这个列表是空的'); return; }
+  var i = parseInt(start, 10) || 0;
+  if (i < 0) i = 0;
+  if (i > files.length - 1) i = files.length - 1;
   ensureSequentialMode(function () {
     api('/api/queue/set', 'files=' + encodeURIComponent(files.join(String.fromCharCode(10)))).then(function (j) {
       if (!j || j.ok === false) { toast((j && j.error) || '建立队列失败'); return; }
-      playPath(files[0]);
-      toast('开始播放' + (label ? ('：' + label) : '') + '（' + files.length + ' 首）');
+      playPath(files[i]);
+      toast('从第 ' + (i + 1) + ' 首开始顺序播放' + (label ? ('：' + label) : '') + '（共 ' + files.length + ' 首）');
       if (S.view === 'queue') renderQueuePage();
     }).catch(function (e) { toast('播放失败: ' + e); });
   });
 }
+function playWholeList(files, label) { playWholeListFrom(files, 0, label); }
 
-/* ---------------- 我的最爱（#5） ---------------- */
+/* ---------------- 我的最爱（#1：2026-10-27 用户 261026-09 重做） ----------------
+   用户原话：「我的最爱设计好丑，我的最爱不需要下面出现保存的队列，只需要展示所有点心的
+   歌曲即可，也不需要上面的播放全部按钮，双击任何一首歌，然后顺序播放即可」。
+   因此这一页现在只有一张列表，交互只有一条规则：
+     ① 列表 = 所有点过红心的曲目（序号 / 标题 / 艺术家 / 专辑 / 红心可取消）；
+     ② **双击任一首 ⟹ 整个最爱列表进队列、从这首开始顺序播放**（不是只播这一首）；
+     ③ 单击只选中（不播放）—— 否则双击会先播单曲再播整列，听起来像"卡了一下又从头"。
+   底部不再挂「我的歌单」区块（那是左栏的事），顶部不再有「▶ 播放全部」。 */
 function loadFavs() {
   S.view = 'favs';
   head('我的最爱', '加载中…', '');
-  // 收藏与"保存的队列"**必须一起取**：页面底部那段用的就是 S.sqs，
-  // 只取一半会出现"左栏有队列、页面里却空着"（自检时实测踩到）。
-  Promise.all([api('/api/fav/list?meta=1'), api('/api/sq/list')]).then(function (res) {
-    var j = res[0] || {};
-    S.sqs = (res[1] && res[1].queues) || [];
-    paintSavedQueues();
+  api('/api/fav/list?meta=1').then(function (j) {
     if (S.view !== 'favs') return;
     var raw = (j && j.files) || [];
     S.favs = raw.map(function (x) { return (typeof x === 'string') ? { file: x } : x; });
     FAV_SET = new Set(S.favs.map(function (x) { return x.file; }));
     var n = S.favs.length;
-    // 顶部「播放全部」：用户要求"一键、从第一首开始顺序播放整个最爱列表"
-    head('我的最爱', n ? (n + ' 首') : '', n
-      ? '<button class="btn pri" id=favPlayAll title="从第一首开始顺序播放整个最爱列表">▶ 播放全部</button>' : '');
+    head('我的最爱', n ? (n + ' 首') : '', '');   // #1：不要「▶ 播放全部」
     if (!n) {
-      D('list').innerHTML = '<div class=empty>还没有收藏<br><span style="font-size:11.5px">在曲目行或单曲页点心形，就会出现在这里</span></div>'
-        + savedQueuesSectionHtml();
-      bindSavedQueueSection();
+      D('list').innerHTML = '<div class=empty>还没有收藏<br><span style="font-size:11.5px">在曲目行或单曲页点心形，就会出现在这里</span></div>';
       return;
     }
-    var h = '<div style="padding:6px 0 6px">';
+    var h = '<div class=favhint><b>双击</b>任意一首，从这首开始<b>顺序播放</b>整个最爱列表（' + n + ' 首）</div>';
+    // 列标题（序号/标题/艺术家/专辑）—— 与 .trow 同一套网格参数，逐列对齐
+    h += '<div class=favhead style="grid-template-columns:34px 1fr 180px 200px 34px">' +
+         '<div class=n>#</div><div>标题</div><div>艺术家</div><div class=du>专辑</div><div></div></div>';
+    h += '<div style="padding:2px 0 6px">';
     S.favs.forEach(function (x, i) {
       var f = x.file || '';
       var t = x.title || nam(f);
@@ -2269,21 +2281,26 @@ function loadFavs() {
            '<div class=du title="' + esc(al) + '" style="text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(al) + '</div>' +
            '<div style="display:flex;justify-content:flex-end">' + favIconHtml(f, true) + '</div></div>';
     });
-    h += '</div>' + savedQueuesSectionHtml();
+    h += '</div>';
     D('list').innerHTML = h;
-    if (D('favPlayAll')) D('favPlayAll').onclick = playAllFavs;
     Array.prototype.forEach.call(D('list').querySelectorAll('.favrow'), function (e) {
-      var x = S.favs[+e.dataset.i]; if (!x) return;
-      e.onclick = function (ev) { if (ev.target.closest && ev.target.closest('.fav-btn')) return; playPath(x.file); };
+      var i = +e.dataset.i, x = S.favs[i]; if (!x) return;
+      // 单击 = 选中；双击 = 从这首起顺序播放整个最爱列表（#1 的核心行为）
+      e.onclick = function (ev) {
+        if (ev.target.closest && ev.target.closest('.fav-btn')) return;
+        Array.prototype.forEach.call(D('list').querySelectorAll('.favrow'), function (y) {
+          y.classList.toggle('fsel', y === e);
+        });
+      };
+      e.ondblclick = function (ev) {
+        if (ev.target.closest && ev.target.closest('.fav-btn')) return;
+        playWholeListFrom((S.favs || []).map(function (y) { return y.file; }), i, '我的最爱');
+      };
       e.oncontextmenu = function (ev) { ev.preventDefault(); showTrackMenu(ev.clientX, ev.clientY, { path: x.file }); };
       var b = e.querySelector('.fav-btn');
       if (b) b.onclick = function (ev) { unfavFromFavs(x.file, ev); };
     });
-    bindSavedQueueSection();
   }).catch(function (e) { renderPanelError('favs', loadFavs, e); });
-}
-function playAllFavs() {
-  playWholeList((S.favs || []).map(function (x) { return x.file; }), '我的最爱');
 }
 function unfavFromFavs(file, ev) {
   if (ev) { ev.stopPropagation(); ev.preventDefault(); }
@@ -2310,36 +2327,16 @@ function askConfirm(o) {
   D('cfYes').onclick = function () { m.classList.remove('on'); if (o.onOk) o.onOk(); };
 }
 
-/* ---------------- 保存的队列（#6） ----------------
-   后端 /api/sq/*，落盘 rlplayer-savedqueues.conf（原子写）。
-   展示位置：左栏「我的最爱」**下面**（renderSavedQueues）+ 我的最爱页底部同一份区块。 */
-function savedQueuesSectionHtml() {
-  var qs = S.sqs || [];
-  var h = '<div class=sqsec><div class=sechd><span>保存的队列</span><span class=sp></span>' +
-          '<button class=btn id=sqSaveBtn title="把当前播放队列存成具名队列（重启后仍在）">保存当前队列</button></div>';
-  if (!qs.length) h += '<div class=empty style="padding:10px 20px;text-align:left">还没有保存的队列</div>';
-  qs.forEach(function (q, i) {
-    h += '<div class=sqitem data-i=' + i + '>' +
-         '<span class=sqt title="' + esc(q.name) + '">' + esc(q.name) + '</span>' +
-         '<span class=sqn2>' + q.n + ' 首</span>' +
-         '<button class="btn sqplay" data-i=' + i + '>播放</button>' +
-         '<button class="btn sqren" data-i=' + i + '>改名</button>' +
-         '<button class="btn sqdel" data-i=' + i + '>删除</button></div>';
-  });
-  return h + '</div>';
-}
-function bindSavedQueueSection() {
-  if (D('sqSaveBtn')) D('sqSaveBtn').onclick = function () { saveQueueDialog(); };
-  Array.prototype.forEach.call(document.querySelectorAll('.sqitem'), function (e) {
-    var q = (S.sqs || [])[+e.dataset.i]; if (!q) return;
-    var b = e.querySelector('.sqplay'); if (b) b.onclick = function () { playSavedQueue(q.name, 0); };
-    b = e.querySelector('.sqren'); if (b) b.onclick = function () { renameQueueDialog(q.name); };
-    b = e.querySelector('.sqdel'); if (b) b.onclick = function () { deleteSavedQueue(q.name); };
-  });
-}
-// 左栏列表（我的最爱下面）：两段式 —— 取数（renderSavedQueues）/ 上屏（paintSavedQueues）。
-// 拆开是因为「我的最爱」页要用同一份 S.sqs 渲染页面底部的区块，
-// 若两处各自取数，就会出现"左栏有、页面里没有"的假象（自检时实测踩到）。
+/* ---------------- 我的歌单（原「保存的队列」，#2：只改名，功能不变） ----------------
+   后端仍是 /api/sq/*，落盘 rlplayer-savedqueues.conf（原子写）。
+   展示位置：**只**在左栏「我的最爱」下面（renderSavedQueues / paintSavedQueues）。
+   2026-10-27（261026-09 #2）：用户「下面保存的队列改为『我的歌单』，功能不变；
+   从播放队列那里直接保存为歌单即可」。所以：
+     * 本页（我的最爱）不再挂这个区块 —— 原来那份 savedQueuesSectionHtml/bindSavedQueueSection
+       已删除（用户 #1 明确「不需要下面出现保存的队列」）；
+     * 保存入口在**播放队列页**的「保存为歌单」按钮（id=qSaveSq，见 renderQueuePage）。 */
+// 左栏列表（我的最爱下面 = 「我的歌单」）：两段式 —— 取数（renderSavedQueues）/ 上屏（paintSavedQueues）。
+// 拆开是为了保存/改名/删除后能只刷左栏、不动当前打开的页面。
 function renderSavedQueues() {
   api('/api/sq/list').then(function (j) {
     S.sqs = (j && j.queues) || [];
@@ -2349,8 +2346,12 @@ function renderSavedQueues() {
 function paintSavedQueues() {
   {
     var box = D('sqList'); if (!box) return;
-    var h = '';
-    if (S.sqs.length) h += '<div class=sqhd>保存的队列</div>';
+    // #2：标题固定为「我的歌单」（原「保存的队列」）。空列表也给一行说明，
+    // 否则用户不知道左栏这一块是干什么的、也不知道去哪儿存。
+    var h = '<div class=sqhd>我的歌单</div>';
+    if (!S.sqs.length) {
+      h += '<div class=sqempty>队列页「保存为歌单」可新建</div>';
+    }
     S.sqs.forEach(function (q, i) {
       h += '<div class="nav sqrow" data-v=sq data-sq="' + esc(q.name) + '" data-i=' + i + '>' +
            '<span class=sqn title="' + esc(q.name) + '">' + esc(q.name) + '</span>' +
@@ -2425,13 +2426,13 @@ function playSavedQueue(name, i) {
 function saveQueueDialog() {
   var n = (S.q && S.q.items) ? S.q.items.length : 0;
   if (!n) { toast('队列是空的，先加几首歌再保存'); return; }
-  askText({ title: '保存当前队列', ok: '保存', value: S.sqName || '',
+  askText({ title: '保存为歌单', ok: '保存', value: S.sqName || '',
     placeholder: '例如 夜深人静',
-    hint: '把现在这 ' + n + ' 首（含顺序与 CUE 区间）存成具名队列；写入 rlplayer-savedqueues.conf，重启后仍在',
+    hint: '把现在这 ' + n + ' 首（含顺序与 CUE 区间）存成一个歌单；写入 rlplayer-savedqueues.conf，重启后仍在',
     onOk: function (name) {
       api('/api/sq/save?name=' + encodeURIComponent(name)).then(function (j) {
         if (!j || !j.ok) { toast((j && j.error) || '保存失败'); return; }
-        toast('已保存队列：' + j.name + '（' + j.count + ' 首）');
+        toast('已存为歌单：' + j.name + '（' + j.count + ' 首）');
         renderSavedQueues();
         if (S.view === 'favs') loadFavs();
         else if (S.view === 'sq') renderSavedQueuePage(j.name);
@@ -2439,7 +2440,7 @@ function saveQueueDialog() {
     } });
 }
 function renameQueueDialog(name) {
-  askText({ title: '重命名队列', ok: '改名', value: name,
+  askText({ title: '重命名歌单', ok: '改名', value: name,
     hint: '改名后立刻写入 rlplayer-savedqueues.conf（重启后是新名字）',
     onOk: function (to) {
       api('/api/sq/rename?from=' + encodeURIComponent(name) + '&to=' + encodeURIComponent(to)).then(function (j) {
@@ -2453,8 +2454,8 @@ function renameQueueDialog(name) {
     } });
 }
 function deleteSavedQueue(name) {
-  askConfirm({ title: '删除队列', ok: '删除',
-    text: '删除队列「' + name + '」？只删这份保存的队列，不动当前播放队列。',
+  askConfirm({ title: '删除歌单', ok: '删除',
+    text: '删除歌单「' + name + '」？只删这份歌单，不动当前播放队列。',
     onOk: function () {
       api('/api/sq/delete?name=' + encodeURIComponent(name)).then(function (j) {
         if (!j || !j.ok) { toast((j && j.error) || '删除失败'); return; }
@@ -2467,170 +2468,13 @@ function deleteSavedQueue(name) {
     } });
 }
 
-/* ---------------- 播放列表（#3；后端 /api/pl，文件 playlists\*.m3u8） ----------------
-   历史（本轮查清，写进注释免得后人再猜）：这套 /api/pl 端点从 1.0.8 起就在，
-   但 ui_script.h 里从来没有过任何调用点（git 全历史 -S'/api/pl/save' 零命中），
-   注释里那句「播放列表（UI 已并入播放队列）」是**当初就没做**，不是被藏起来或被删。 */
-function loadPlaylists() {
-  S.view = 'pl';
-  head('播放列表', '加载中…', '');
-  api('/api/pl').then(function (j) {
-    if (S.view !== 'pl') return;
-    S.pls = (j && j.lists) || [];
-    var n = S.pls.length;
-    head('播放列表', n ? (n + ' 个') : '',
-      '<button class="btn pri" id=plNew title="把当前播放队列存成一个新播放列表">＋ 新建（用当前队列）</button>');
-    var h = '<div style="padding:12px 20px 8px;font-size:11.5px;color:var(--mut2);line-height:1.7">' +
-            '存在 playlists\\ 下的 *.m3u8（第三方播放器也认）；CUE 分轨区间记在 #RTA-CUE 注释行。' +
-            '「我的最爱」下面的<b>保存的队列</b>是另一份（带区间、落 rlplayer-savedqueues.conf）。</div>';
-    if (!n) h += '<div class=empty>还没有播放列表<br><span style="font-size:11.5px">点右上「新建」；或在任意曲目上右键「加入播放列表…」</span></div>';
-    S.pls.forEach(function (p, i) {
-      h += '<div class=plrow data-i=' + i + '>' +
-           '<span class=pln title="' + esc(p.name) + '">' + esc(p.name) + '</span>' +
-           '<span class=plc>' + p.n + ' 首</span>' +
-           '<button class="btn plplay" data-i=' + i + '>播放整列</button>' +
-           '<button class="btn pladd" data-i=' + i + '>加曲（当前队列）</button>' +
-           '<button class="btn plren" data-i=' + i + '>改名</button>' +
-           '<button class="btn pldel" data-i=' + i + '>删除</button>' +
-           '<button class="btn plopen" data-i=' + i + '>曲目</button></div>';
-      if (S.plOpen === p.name && S.plItems[p.name]) {
-        h += '<div class=pltracks>';
-        S.plItems[p.name].forEach(function (x, k) {
-          h += '<div class=plt data-k=' + k + ' data-name="' + esc(p.name) + '">' +
-               '<span class=ptn title="' + esc(x.file) + '">' + (k + 1) + '. ' + esc(nam(x.file)) + '</span>' +
-               '<button class=qdel data-k=' + k + ' title="从这个播放列表移除">×</button></div>';
-        });
-        h += '</div>';
-      }
-    });
-    D('list').innerHTML = h;
-    bindPlaylistPage();
-  }).catch(function (e) { renderPanelError('pl', loadPlaylists, e); });
-}
-function bindPlaylistPage() {
-  if (D('plNew')) D('plNew').onclick = function () {
-    var qn = (S.q && S.q.items) ? S.q.items.length : 0;
-    askText({ title: '新建播放列表', ok: '新建', value: '', placeholder: '例如 车里听',
-      hint: qn ? ('把当前队列的 ' + qn + ' 首存成新播放列表') : '当前队列是空的 —— 会建一个空列表，之后用「加曲」或右键曲目加入',
-      onOk: function (name) {
-        api('/api/pl/save', 'name=' + encodeURIComponent(name)).then(function (r) {
-          if (!r || !r.ok) { toast((r && r.error) || '新建失败'); return; }
-          toast('已新建播放列表：' + r.name + '（' + r.count + ' 首）');
-          S.plOpen = r.name; togglePlaylist(r.name, true);
-        }).catch(function (e) { toast('新建失败: ' + e); });
-      } });
-  };
-  Array.prototype.forEach.call(document.querySelectorAll('.plrow'), function (e) {
-    var p = (S.pls || [])[+e.dataset.i]; if (!p) return;
-    var b = e.querySelector('.plplay'); if (b) b.onclick = function () { playPlaylist(p.name, 0); };
-    b = e.querySelector('.pladd'); if (b) b.onclick = function () { addQueueToPlaylist(p.name); };
-    b = e.querySelector('.plren'); if (b) b.onclick = function () { renamePlaylist(p.name); };
-    b = e.querySelector('.pldel'); if (b) b.onclick = function () { deletePlaylist(p.name); };
-    b = e.querySelector('.plopen'); if (b) b.onclick = function () { togglePlaylist(p.name); };
-  });
-  Array.prototype.forEach.call(document.querySelectorAll('.pltracks .plt'), function (e) {
-    var name = e.dataset.name, k = +e.dataset.k;
-    var d = e.querySelector('.qdel');
-    if (d) d.onclick = function (ev) {
-      ev.stopPropagation();
-      api('/api/pl/remove?name=' + encodeURIComponent(name) + '&i=' + k).then(function (j) {
-        if (!j || !j.ok) { toast((j && j.error) || '移除失败'); return; }
-        toast('已移除');
-        togglePlaylist(name, true);
-      }).catch(function (er) { toast('移除失败: ' + er); });
-    };
-    e.onclick = function (ev) { if (ev.target.classList.contains('qdel')) return; playPlaylist(name, k); };
-  });
-}
-function playPlaylist(name, k) {
-  k = k || 0;
-  api('/api/pl/info', 'name=' + encodeURIComponent(name)).then(function (j) {
-    if (!j || !j.ok) { toast((j && j.error) || '播放列表不存在'); return; }
-    var it = j.items || [];
-    if (!it.length) { toast('这个播放列表还是空的'); return; }
-    api('/api/pl/load', 'name=' + encodeURIComponent(name)).then(function (r) {
-      if (!r || !r.ok) { toast((r && r.error) || '载入失败'); return; }
-      ensureSequentialMode(function () {
-        var kk = Math.min(Math.max(0, k), it.length - 1);
-        playPath(it[kk].file, it[kk].cs, it[kk].ce);
-        toast('播放整列：' + name + '（' + it.length + ' 首）');
-      });
-    });
-  }).catch(function (e) { toast('播放失败: ' + e); });
-}
-function togglePlaylist(name, force) {
-  if (!force && S.plOpen === name) { S.plOpen = ''; loadPlaylists(); return; }
-  api('/api/pl/info', 'name=' + encodeURIComponent(name)).then(function (j) {
-    if (!j || !j.ok) { toast((j && j.error) || '读取失败'); return; }
-    S.plItems[name] = j.items || [];
-    S.plOpen = name;
-    loadPlaylists();
-  }).catch(function (e) { toast('读取失败: ' + e); });
-}
-function addQueueToPlaylist(name) {
-  var items = (S.q && S.q.items) || [];
-  if (!items.length) { toast('当前队列是空的'); return; }
-  var cues = (S.q && S.q.cues) || [];
-  var TAB = String.fromCharCode(9);
-  var lines = items.map(function (f, i) {
-    var c = cues[i] || [-1, -1];
-    return (c[0] >= 0) ? (f + TAB + c[0] + TAB + c[1]) : f;
-  });
-  api('/api/pl/addmany', 'name=' + encodeURIComponent(name) + '&files=' + encodeURIComponent(lines.join(String.fromCharCode(10))))
-    .then(function (j) {
-      if (!j || !j.ok) { toast((j && j.error) || '加曲失败'); return; }
-      toast('已加入 ' + j.added + ' 首，现在共 ' + j.count + ' 首');
-      if (S.plOpen === name) togglePlaylist(name, true); else loadPlaylists();
-    }).catch(function (e) { toast('加曲失败: ' + e); });
-}
-function renamePlaylist(name) {
-  askText({ title: '重命名播放列表', ok: '改名', value: name,
-    onOk: function (to) {
-      api('/api/pl/rename?from=' + encodeURIComponent(name) + '&to=' + encodeURIComponent(to)).then(function (j) {
-        if (!j || !j.ok) { toast((j && j.error) || '改名失败'); return; }
-        toast('已改名为：' + j.to);
-        if (S.plOpen === name) S.plOpen = j.to;
-        loadPlaylists();
-      }).catch(function (e) { toast('改名失败: ' + e); });
-    } });
-}
-function deletePlaylist(name) {
-  askConfirm({ title: '删除播放列表', ok: '删除',
-    text: '删除播放列表「' + name + '」？只删 playlists\\ 下这个 .m3u8 文件，不动当前队列。',
-    onOk: function () {
-      api('/api/pl/delete?name=' + encodeURIComponent(name)).then(function (j) {
-        if (!j || !j.ok) { toast((j && j.error) || '删除失败'); return; }
-        toast('已删除：' + name);
-        if (S.plOpen === name) S.plOpen = '';
-        loadPlaylists();
-      }).catch(function (e) { toast('删除失败: ' + e); });
-    } });
-}
-// 曲目右键 → 加入播放列表（列表为空时可直接新建）
-function pickPlaylist(cb) {
-  api('/api/pl').then(function (j) {
-    var lists = (j && j.lists) || [];
-    var m = D('modal'); if (!m) return;
-    D('mtitle').textContent = '加入播放列表';
-    var h = '<div class=hint style="margin-bottom:10px">选一个播放列表（没有就先新建一个）</div>';
-    lists.forEach(function (p, i) {
-      h += '<div class="castpick-row plpick" data-i=' + i + '><span>' + esc(p.name) +
-           '</span><span style="color:var(--mut2);font-size:11px">' + p.n + ' 首</span></div>';
-    });
-    h += '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">' +
-         '<button class=btn id=pickNew>新建列表并加入</button></div>';
-    D('mbody').innerHTML = h;
-    m.classList.add('on');
-    Array.prototype.forEach.call(D('mbody').querySelectorAll('.plpick'), function (e) {
-      e.onclick = function () { m.classList.remove('on'); cb(lists[+e.dataset.i].name); };
-    });
-    D('pickNew').onclick = function () {
-      m.classList.remove('on');
-      askText({ title: '新建播放列表', ok: '新建并加入', value: '',
-        onOk: function (name) { cb(name); } });
-    };
-  }).catch(function (e) { toast('读取播放列表失败: ' + e); });
-}
+/* ---------------- 播放列表 UI 已撤（#2，2026-10-27 用户 261026-09） ----------------
+   用户原话：「播放队列和播放列表，这两个是重复设计，只需要播放队列、最近播放、我的最爱这三个」。
+   ⟹ 261026-08 #3 刚加的这套 /api/pl 前端（列表页 / 新建 / 加曲 / 改名 / 删除 / 右键「加入播放列表…」）
+   全部移除；左栏导航项与 setView('pl') 分支也一起去掉。
+   **后端端点保留**（/api/pl、/api/pl/save|rename|delete|add|addmany|remove|info|load 仍在 rtaweb.cpp），
+   只是不再有前端入口 —— 想恢复只需把这块 UI 接回来，不必重新设计接口。
+   「保存队列」这件事统一走「我的歌单」（/api/sq/*，落 rlplayer-savedqueues.conf，能存 CUE 区间）。 */
 
 /* ---------------- 播放控制 ---------------- */
 /* CUE 分轨（2026-10-25）：cue 把整轨切成 N 首，这 N 首的 path 完全相同，
@@ -2672,15 +2516,12 @@ function showTrackMenu(x, y, tk) {
   }
   item('立即播放', function () { playPath(tk.path, tk.cs, tk.ce); });
   item('加入播放队列', function () { addPathCue(tk.path, tk.cs, tk.ce); });
-  // #3（261026-08）：把这一首加进「播放列表」（/api/pl/add，带 CUE 区间）
-  item('加入播放列表…', function () {
-    pickPlaylist(function (name) {
-      api('/api/pl/add?name=' + encodeURIComponent(name) + '&file=' + encodeURIComponent(tk.path) + cueQuery(tk.cs, tk.ce))
-        .then(function (j) {
-          toast((j && j.ok) ? ('已加入播放列表：' + name + '（' + j.count + ' 首）') : ((j && j.error) || '加入失败'));
-        }).catch(function (e) { toast('加入失败: ' + e); });
-    });
-  });
+  // 2026-10-27（B2/B3 接线）：音质分析（19 项客观指标）与多版本对比。
+  // 两项都只读文件（/api/health 流式解码、/api/compare 对齐后分析），不开音频设备。
+  item('分析音质（19 项）', function () { openQualityModal(tk.path); });
+  item('对比版本…', function () { openCompareModal(tk.path); });
+  // #2（2026-10-27 用户 261026-09）：原来的「加入播放列表…」菜单项已随播放列表 UI 一起撤掉
+  //（播放队列 / 播放列表重复，只留队列；要留存就用队列页的「保存为歌单」）。
   document.body.appendChild(m);
   _activeCtxMenu = m;
   // 贴边回推（菜单比窗口大时也不会跑到屏幕外）
@@ -2800,6 +2641,7 @@ function updateNextTrackInfo() {
 }
 
 /* ---------------- 队列 ---------------- */
+var PM_PENDING = 0;   // 最近一次播放模式写请求的时间戳（毫秒）；loadQ 用它避开"回写旧值"竞态
 function loadQ() {
   api('/api/queue').then(function (j) {
     // cues 与 items 逐项对齐的 [起,止] 秒数组（后端 /api/queue；[-1,-1] = 整首）
@@ -2807,7 +2649,12 @@ function loadQ() {
     if (D('sShuf')) D('sShuf').checked = !!j.shuffle;
     // #2：mode 与 repeat 是同一个值（0关/1列表/2单曲/3随机）；老后端没有 mode 时退回 repeat
     var pmd = (j.mode !== undefined) ? j.mode : j.repeat;
-    if (D('sRep') && pmd !== undefined) { D('sRep').value = String(pmd); applyRep(pmd); }
+    // 2026-10-27（261026-09 实测发现）：点底栏模式按钮会先改 #sRep、再 POST /api/playmode；
+    // 这条 3 秒轮询如果恰好在这两步之间返回，就会把用户刚点的值**覆盖回旧值**
+    //（表现：点一下没反应；tools/uicheck.js 的「循环键能切换循环方式」因此偶发 0 -> 0）。
+    // 写请求后 2 秒内不采信轮询结果，让"最后一次用户操作"胜出。
+    var pmFresh = (Date.now() - PM_PENDING) < 2000;
+    if (D('sRep') && pmd !== undefined && !pmFresh) { D('sRep').value = String(pmd); applyRep(pmd); }
     D('rcnt').textContent = '共 ' + S.q.items.length + ' 首';
     updateNextTrackInfo();
     if (!S.q.items.length) {
@@ -3021,6 +2868,7 @@ function saveSettings(immediate) {
     body += p[1] + '=' + encodeURIComponent(v);
   });
   body += '&volume=' + S.vol + '&loudness=' + (D('sLoud').checked ? '1' : '0');
+  body += '&rgmode=' + (ADV.rgmode || 'off') + '&rgclip=' + (ADV.rgclip ? 1 : 0);
   body += '&theme=' + encodeURIComponent(S.theme || 'dark');
   body += '&device=' + encodeURIComponent(ADV.device || '') + '&bits=' + (ADV.bits || 0)
         + '&taps=' + (ADV.taps || 0) + '&atten=' + (ADV.atten || 0)
@@ -3119,6 +2967,9 @@ function loadSettings() {
     if (kv.sdmfilt !== undefined) ADV.sdmFilt = kv.sdmfilt || '';
     if (kv.sdmfiltnx !== undefined) ADV.sdmFiltNx = kv.sdmfiltnx || '';
     if (kv.directsdm !== undefined) ADV.directsdm = (kv.directsdm === '1') ? 1 : 0;
+    // ReplayGain（261027-01 #2）：老配置没有这两个键 ⟹ 回落 off + 防削波开（与后端默认一致）
+    if (kv.rgmode !== undefined) ADV.rgmode = (kv.rgmode === 'track' || kv.rgmode === 'album') ? kv.rgmode : 'off';
+    if (kv.rgclip !== undefined) ADV.rgclip = (kv.rgclip === '0' || kv.rgclip === 'false') ? 0 : 1;
     if (kv.dsdkind !== undefined) ADV.dsdKind = kv.dsdkind || 'fir';
     if (kv.dsdconv !== undefined) ADV.dsdConv = kv.dsdconv || 'narrow';
     if (kv.opraproduct !== undefined) ADV.opraproduct = kv.opraproduct;
@@ -3236,27 +3087,94 @@ function wbApply() {
   }
 })();
 
+/* #4（2026-10-27 用户 261026-09）：「输出设备选 VBMatrix In 2，为什么下面声道音量微调还是 2.0？
+   我这个输出在 WIN 里面应该是设置成为 5.1 的」——根因是微调行数来自固定值（跟随源时写死 2），
+   从来不问设备。现在 /api/devices 每台设备都带 channels/mixRate（GetMixFormat 只读探测，
+   不开流不出声），这里缓存成 DEVMIX，微调按 **设备实际混音声道数** 生成。 */
+var DEVMIX = {};       // deviceId -> {channels, mixRate, mixBits, fmt}
+function devMixOf(id) { return DEVMIX[id || ''] || null; }
+function devMixChannels(id) { var d = devMixOf(id); return (d && d.channels) || 0; }
+// 微调列表用的"有效声道数"（按后端分档，语义必须与播放链路一致）：
+//   wasapi-shared：共享模式输出恒等于**设备混音声道数**（系统混音器说了算），忽略设置项；
+//   wasapi（独占）  ：显式选了 2/6/8 就用它；「跟随源」(0) 用设备混音声道数做预览；
+//   upnp / null 等  ：没有本地混音格式可问，按设置项，未设置则 2。
+// 拿不到设备信息（探测失败 / 没选设备）时退回 2 —— 绝不编造数字，也不回到"永远 2"的老 bug。
+function effectiveChannels() {
+  var bk = (D('sp_backend') && D('sp_backend').value) || ADV.backend || 'wasapi';
+  var setCh = parseInt(ADV.channels, 10) || 0;
+  var devCh = devMixChannels(ADV.device);
+  // 共享模式：输出恒等于设备混音声道数（系统混音器说了算），设置项不参与。
+  if (bk === 'wasapi-shared') return devCh || setCh || 2;
+  // 独占 / Null / UPnP：显式设置优先；「跟随源」时用设备混音声道数做**预览**
+  //（拿不到设备信息才退回 2 —— 老代码无条件 2 就是用户看到的那个 bug）。
+  return setCh > 0 ? setCh : (devCh || 2);
+}
+function devMixText(id) {
+  var d = devMixOf(id);
+  if (!d || !d.channels) return '';
+  return d.channels + ' 声道 · ' + (d.mixRate ? (d.mixRate + ' Hz') : '采样率未知') +
+         (d.mixBits ? (' · ' + d.mixBits + ' bit ' + (d.fmt || '')) : '');
+}
+// 微调行数的说明行（id=sp_trimchmsg，常驻在微调网格下面）：行数与依据一起可见，
+// 免得以后再出现"设备是 5.1、界面只有两行、用户不知道看哪个"。
+function updateDevMixHint() {
+  var el = D('sp_trimchmsg'); if (!el) return;
+  var n = effectiveChannels();
+  var devCh = devMixChannels(ADV.device);
+  var t = devMixText(ADV.device);
+  var bk = (D('sp_backend') && D('sp_backend').value) || ADV.backend || 'wasapi';
+  var tail;
+  if (parseInt(ADV.channels, 10) > 0) tail = '；「输出声道数」= ' + parseInt(ADV.channels, 10) + '，以此为准';
+  else if (bk === 'wasapi-shared') tail = '；共享模式输出恒等于设备混音声道数';
+  else if (bk === 'wasapi') tail = '；「输出声道数」= 跟随源，独占播放时实际声道随源文件变化';
+  else tail = '；「输出声道数」= 跟随源';
+  el.innerHTML = '按 <b>' + n + ' 声道</b> 显示' +
+    (devCh ? ('（设备混音 ' + devCh + ' ch' + (t ? (' · ' + esc(t.replace(/^(\d+) 声道 · /, ''))) : '') + '）') : '') + tail;
+}
+// 重建微调网格（设备切换 / 声道数切换 / 后端切换都走它，保证标签与实际声道一一对应）
+// 注意：只重画 UI，**不改 ADV.channels** —— 设备报 4ch 时 sp_ch 里没有 4 这个选项，
+// 若顺手把值写回去会存成 0（用户显式设的 6 声道就被悄悄改掉了）。
+function repaintTrims() {
+  var g = document.querySelector('#setpage .trimgrid');
+  if (g) { g.innerHTML = trimFields(effectiveChannels()); bindTrims(); }
+  updateDevMixHint();
+}
+// 兼容旧调用名（parent 侧脚本/其它分支可能按这个名字找）
+function applyTrimChannels() { repaintTrims(); }
 function loadDeviceList() {
   var bk = ADV.backend || 'wasapi';
   var url = (bk === 'asio') ? '/api/asiodevices' : '/api/devices';
   api(url).then(function (j) {
-    var sel2 = D('sp_device'); if (!sel2) return;
+    var list = j.devices || j.drivers || [];
+    // 先缓存每台设备的混音格式（即使设置页还没渲染也要有，否则首屏微调行数会先错一次）
+    list.forEach(function (d) { if (d && d.id) DEVMIX[d.id] = { channels: d.channels || 0,
+      mixRate: d.mixRate || 0, mixBits: d.mixBits || 0, fmt: d.mixFmt || '' }; });
+    var sel2 = D('sp_device');
+    if (!sel2) { updateDevMixHint(); return; }
     var h = '<option value="">' +
       (bk === 'asio' ? '（第一个可用驱动）'
                      : (bk === 'wasapi' || bk === 'wasapi-shared' ? '默认设备' : '（此后端没有本地设备）')) +
       '</option>';
-    var list = j.devices || j.drivers || [];
     list.forEach(function (d) {
-      h += '<option value="' + esc(d.id) + '">' + esc(d.name) + (d.default ? '（默认）' : '') + '</option>';
+      var dm = DEVMIX[d.id];
+      h += '<option value="' + esc(d.id) + '">' + esc(d.name) +
+           (d.default ? '（默认）' : '') +
+           (dm && dm.channels ? ('  ·  ' + dm.channels + 'ch' + (dm.mixRate ? ('/' + (dm.mixRate / 1000) + 'k') : '')) : '') +
+           '</option>';
     });
     sel2.innerHTML = h;
     sel2.value = ADV.device || '';
     sel2.onchange = function () {
       ADV.device = this.value;
       if (bk === 'wasapi') loadRates();   // 只有 WASAPI 能查设备支持的采样率
+      // #4 核心：换设备 ⟹ 按该设备的 channels 重建声道微调（2 → L/R；6 → L/R/C/LFE/Ls/Rs；8 → 7.1）
+      repaintTrims();
       saveSettings();
-      toast('输出设备已选择，下次播放生效');
+      var dm = devMixOf(this.value);
+      toast(dm && dm.channels ? ('输出设备已选择（' + dm.channels + ' 声道），下次播放生效')
+                             : '输出设备已选择，下次播放生效');
     };
+    repaintTrims();      // 首屏：此时 DEVMIX 已有值，微调按设备声道数渲染
   }).catch(function () { });
 }
 
@@ -3609,9 +3527,8 @@ Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
     else if (v === 'remote') loadRemote('');
     else if (v === 'queue') { renderQueuePage(); }
     else if (v === 'recent') loadRecent();
-    // 261026-08：#5 我的最爱 / #6 保存的队列详情 / #3 播放列表
+    // 261026-08：#5 我的最爱 / #6 歌单详情；#2（261026-09）播放列表入口已撤
     else if (v === 'favs') { loadFavs(); }
-    else if (v === 'pl') { loadPlaylists(); }
     else if (v === 'sq') { renderSavedQueuePage(S.sqName || ''); }
   };
 });
@@ -3740,11 +3657,11 @@ function cycleRep() {
   var next = PM_ORDER[(i + 1) % 4];
   D('sRep').value = String(next);
   // 单入口：后端 /api/playmode 把 repeat + shuffle 一次收敛 ⟹ 图标与行为不可能分叉。
+  PM_PENDING = Date.now();
   api('/api/playmode?mode=' + next);
   applyRep(next);
-  var sp = D('sp_rep');            // 设置页渲染中时一起同步（它只是同一值的镜像）
-  if (sp) sp.value = String(next);
-  var sh = D('sp_shuf'); if (sh) sh.checked = (next === 3);
+  // #5（261026-09）：设置页的「播放模式」下拉（sp_rep）与隐藏镜像（sp_shuf）已删除 ——
+  // 底栏 #bRep / 单曲页 #npRep 就是唯一入口，不再需要往设置页同步镜像值。
   toast('播放模式：' + PM_LABEL[next]);
   return next;
 }
@@ -3781,6 +3698,7 @@ D('tq').onclick = function () {
 D('sRep').onchange = function () {
   var v = parseInt(this.value, 10) || 0;
   D('sShuf').checked = (v === 3);
+  PM_PENDING = Date.now();
   api('/api/playmode?mode=' + v);
   applyRep(v);
 };
@@ -3789,9 +3707,9 @@ D('sRep').onchange = function () {
 D('sShuf').onchange = function () {
   var m = this.checked ? 3 : 1;
   D('sRep').value = String(m);
+  PM_PENDING = Date.now();
   api('/api/playmode?mode=' + m).then(loadQ);
   applyRep(m);
-  var sp = D('sp_rep'); if (sp) sp.value = String(m);
 };
 D('vol').oninput = function () {
   S.vol = parseFloat(this.value);
@@ -4705,6 +4623,9 @@ function applyBackendState() {
   _setFieldVisible('sp_device', bk !== 'naa' && bk !== 'upnp');
   var tw = D('sp_trimwrap'); if (tw) tw.style.display = (bk === 'upnp') ? 'none' : '';
   // 261024-02 #5：投放区块已整体搬到「流媒体」页（输出页不再有它），这里不再联动隐藏。
+  // #4（261026-09）：切换后端会改变"有效声道数"（共享 = 设备混音声道数；独占 = 设置项），
+  // 所以这里也要重画一次微调网格，否则切到共享后行数还停留在 2。
+  if (typeof repaintTrims === 'function' && D('sp_trimchmsg')) repaintTrims();
 }
 
 // 261024-02 #5：推送区块的控件绑定（旧版"填文件路径 + DoP 勾选 + 开始投放"已按用户要求删掉，
@@ -5369,8 +5290,9 @@ function renderSettingsPage() {
      + '<button class=stab data-g=pcm>PCM</button>'
      + '<button class=stab data-g=sdm>SDM</button>'
      + '<button class=stab data-g=adv>高级</button>'
-     // 2026-10-23 用户 261023-04 #2：EQ 与房间校正从左侧主导航移到这里，单开一个页签。
+     // #6（2026-10-27 用户 261026-09）：EQ 页内容臃肿 ⟹ 拆成 EQ / 声音校准 两个页签。
      + '<button class=stab data-g=eq>EQ</button>'
+     + '<button class=stab data-g=cal>声音校准</button>'
      + '<button class=stab data-g=meta>元数据</button>'
      // 2026-10-24（用户 261024-01 #5）：「流媒体」从「高级」拆出来的独立页签。
      + '<button class=stab data-g=stream>流媒体</button>'
@@ -5427,10 +5349,35 @@ function renderSettingsPage() {
        + num({ id: 'sp_buffer', label: '缓冲（毫秒）' }, D('sBuf').value, 10, 500, 10, '越小延迟越低，但更容易欠载')
        + num({ id: 'sp_ramp', label: '音量渐变（毫秒）' }, ADV.ramp, 0, 2000, 10, '0 = 立即生效（可能爆音）')
        + '<div class="sfld wide"><div id=sp_backendmsg class=hint></div></div>')
-     + '<div id=sp_trimwrap>' + sgroup('声道音量微调', '按声道名标注，0 dB = 不动',
-         '<div class="sfld wide"><div class=trimgrid>'+ trimFields(CH) + '</div>' +
-         '<div class=hint>显示的是「输出声道数」对应的实际声道。2 = 左/右；5.1 = 左/右/中置/低音/左环绕/右环绕；7.1 再加左后/右后</div></div>') + '</div>'
-     + '</div>';
+     // #4（2026-10-27 用户 261026-09）：「输出设备选 VBMatrix In 2，为什么下面声道音量微调还是 2.0？」
+     // ⟹ 行数由 effectiveChannels() 决定（共享 = 设备混音声道数；独占 = 显式设置或设备混音声道数），
+     //    依据写在 id=sp_trimchmsg 那一行，用户一眼能对上 Windows 的声音设置。
+     + '<div id=sp_trimwrap>' + sgroup('声道音量微调', '按设备实际声道（Windows 混音格式）生成，0 dB = 不动',
+         '<div class="sfld wide"><div class=trimgrid>'+ trimFields(effectiveChannels()) + '</div>' +
+         '<div class=hint id=sp_trimchmsg>按 ' + effectiveChannels() + ' 声道 显示</div>' +
+         '<div class=hint>2 = 左/右；5.1 = 左/右/中置/低音/左环绕/右环绕；7.1 再加左后/右后。' +
+          '行数来自所选设备的混音声道数（/api/devices 的 GetMixFormat 只读探测，不开流不出声）</div></div>') + '</div>'
+     // #5（261026-09）：等响度补偿从「高级-播放」挪到这里 —— 它是唯一可见入口，不能随那栏一起删。
+     // 放「输出」页的理由：它跟音量/输出电平是一件事，和「声道微调」正好挨着。
+     + sgroup('音量与等响度', '等响度补偿 = 音量越低，低频按等响曲线补得越多（loudness.h）',
+         chk('sp_loud', '等响度补偿', D('sLoud').checked, '音量越低低频提升越多；写入 conf 键 loudness，下次播放生效'))
+      // 2026-10-27（261027-01 #2）：ReplayGain / Album Gain。三模式 + 防削波。
+      // 语义（唯一真相源 = src/dsp/replaygain.h 文件头）：
+      //   off   ⟹ 增益恒 0 ⟹ 管线段整段跳过 ⟹ 逐位直通（默认，必须保持）；
+      //   track ⟹ 逐曲标签/逐曲响度换算；album ⟹ 专辑标签/专辑响度（缺了才退回逐曲）。
+      //   防削波 = applied = min(gain, −peak_dBFS)，峰值取【源峰值】（所以增益乘在升频之前）。
+      + sgroup('ReplayGain', '统一不同母带的响度：按标签把每首歌拉到同一听感电平',
+         sel('sp_rgmode', '模式',
+             opt('off', '关闭（bit-perfect 直通）', ADV.rgmode || 'off')
+           + opt('track', 'ReplayGain（逐曲）', ADV.rgmode || 'off')
+           + opt('album', 'Album Gain（整专辑）', ADV.rgmode || 'off'),
+             '逐曲 = 每首歌各自归一；整专辑 = 一张专辑内保持相对响度（古典/流行专辑推荐）')
+       + chk('sp_rgclip', '防削波', ADV.rgclip != 0,
+             '把增益限到 −peak_dBFS（源峰值），保证不会因为我们加的增益而削波；源本身就过载时会反而压低', true)
+       // ⚠️ 文案常量取自 dsp/replaygain.h:146 的 kBitPerfectWarning（** 是 markdown 标记，界面不显示）
+       + '<div class="sfld wide"><div class=hint id=sp_rgwarn style="display:none;color:var(--err)">'
+       + 'ReplayGain/Album Gain 会改变样本值：开启后不是 bit-perfect（默认关闭时逐位直通）。</div></div>')
+      + '</div>';
      // 261024-02 #5：用户明确要求「输出栏位下的 UPnP 投放功能多余」⟹ 整块删除
      // （原「投放（UPnP）」快捷区 + 「投放实时状态」网格）。投放的入口统一挪到
      // 单曲页「推送到设备」按钮与设置→流媒体页的「推送到设备」区块，三处共用 /api/cast/state。
@@ -5586,17 +5533,21 @@ function renderSettingsPage() {
        + '<button class="btn" id=sp_addroot>添加目录</button> <button class="btn" id=sp_rescan>重新扫描全部</button></div>'
        + num({id:'sp_scanthreads', label:'扫描线程数'}, ADV.scanThreads || 0, 0, 32, 1, '0 = 自动（默认 min(CPU, 8)）')
        + '<div class="sfld wide"><div id=sp_roots class=rootlist></div></div>')
-     + sgroup('播放', '',
-         // #2：循环 + 随机合并成一个「播放模式」下拉（四个选项就是四态；与底栏那一个按钮同源）。
-         sel('sp_rep', '播放模式', D('sRep').innerHTML, '单曲循环 / 专辑循环 / 关闭循环 / 随机播放 —— 与底栏那个按钮是同一份状态')
-       // 兼容壳（如实标注）：tools/uicheck.js 的 needBind 清单里还有 sp_shuf，所以保留一个**隐藏镜像**。
-       // 它不再是第二份真相 —— 勾选状态完全由 sp_rep 派生，用户可见入口只有上面那个下拉 + 底栏按钮。
-       + '<div style="display:none">' + chk('sp_shuf', '随机播放', false, '由播放模式决定') + '</div>'
-       + chk('sp_loud', '等响度补偿', D('sLoud').checked, '音量越低低频提升越多'))
-     + '</div>';
-
-  // ---------- EQ 与房间校正（用户 261023-04 #2：从主导航移进设置页的独立页签）----------
+      // #5（2026-10-27 用户 261026-09）：「设置-高级-播放，这一栏全部删除，所有功能已经在外面有了」。
+      // 逐项核对结论（**不是全删**，删之前每项都查了外部入口）：
+      //   ① sp_rep「播放模式」：外部有 —— 底栏 #bRep（四态按钮）+ 单曲页 #npRep，都走同一个 cycleRep()。
+      //      删掉这里只是去掉一份镜像，功能零损失。
+      //   ② sp_shuf「随机播放」隐藏镜像：本来就由播放模式派生、无人可见 ⟹ 一起删。
+      //      （旧注释说 tools/uicheck.js 的 needBind 里有 sp_shuf —— 核对后**没有**：
+      //        清单里是隐藏源控件 #sShuf，删 sp_shuf 不影响自检。）
+      //   ③ sp_loud「等响度补偿」：**外部没有任何入口**（grep 全仓库只此一处可见控件；
+      //      #sLoud 是 display:none 的参数源，信号链页只是只读展示）⟹ 按「不许把功能删没了」
+      //      的约束**保留**，并挪到「输出」页的「音量与等响度」组（原来挂在「高级-播放」里）。
+      + '</div>';
+  // EQ       = 20 段 PEQ + 耳机 EQ（OPRA）      —— 手调，改的是"音色"
+  // 声音校准 = 房间校正向导 + 校正文件（EQ/IR） —— 测量与外部文件，改的是"系统误差"
   h += '<div class=spane data-g=eq>' + eqSettingsHtml() + '</div>';
+  h += '<div class=spane data-g=cal>' + calSettingsHtml() + '</div>';
 
   // ---------- 流媒体（用户 261024-01 #5/#6：从「高级」拆成独立页签 + 多服务器 + DLNA 归位）----------
   h += '<div class=spane data-g=stream>'
@@ -5664,6 +5615,25 @@ function renderSettingsPage() {
              'api_key / token / password 一律脱敏为 ***，rlplayer-llm.conf 本体不会被打进包。')
        + '<span style="font-size:11.5px;color:var(--mut2);margin-left:2px" id=sp_diagmsg></span></div>'
        + '<div class=hint>一个 zip 打包全部日志 / 系统信息 / 设置摘要（已脱敏），不用再到处找日志文件</div>')
+     // 2026-10-27（261027-01 #1）：诊断页从「导出诊断包」升级成「一键反馈」。
+     // 用户原话：报错要能直接发给我们 —— 不用再让他自己找日志、贴日志。
+     // 表单只收「人才能提供」的四项（类型 / 标题 / 正文 / 复现步骤），其余（版本 / 系统 / CPU /
+     // GPU / 设备 / 设置 / 日志尾 / 最近错误）由后端 feedback.h 自动采集并脱敏。
+     // ★ 提交结果必须原样列出 uploaded / status / path / sha / local / error：
+     //   无凭据时 uploaded=false 而 local 是本地文件的绝对路径 —— 不显示出来用户会以为反馈丢了。
+     + sgroup('一键反馈', '填几句话直接发给我们；同时附上版本 / 系统 / 设备 / 设置 / 日志尾（已脱敏）',
+         '<div class=sfld><label>类型</label><select id=sp_fbtype>'
+       + opt('bug', 'BUG 报错', 'bug') + opt('idea', '功能建议', 'bug') + opt('other', '其他', 'bug')
+       + '</select></div>'
+       + txt('sp_fbtitle', '标题', '', '一句话说清现象或想要什么', '例如：96k 独占播放时有电流声')
+       + '<div class="sfld wide"><label>详细描述' + tip('现象 / 什么时候开始 / 是否必现 / 期望是什么。会自动附上版本、系统、输出设备、当前设置与日志尾。') + '</label>'
+       + '<textarea id=sp_fbbody rows=4 placeholder="现象、影响、期望" style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--field);color:var(--txt);font-size:12px;font-family:inherit;line-height:1.5;resize:vertical"></textarea></div>'
+       + '<div class="sfld wide"><label>复现步骤（可选）</label>'
+       + '<textarea id=sp_fbsteps rows=3 placeholder="1. … 2. … 3. …" style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--field);color:var(--txt);font-size:12px;font-family:inherit;line-height:1.5;resize:vertical"></textarea></div>'
+       + '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
+       + '<button class="btn pri" id=sp_fbsubmit>提交反馈</button>'
+       + '<span style="font-size:11.5px;color:var(--mut2)" id=sp_fbmsg></span></div>'
+       + '<div class=hint id=sp_fbresult style="white-space:pre-wrap;word-break:break-all"></div>')
      + '</div>';
 
   // ---------- 元数据补全（排在「高级」之后）----------
@@ -5733,9 +5703,11 @@ function renderSettingsPage() {
 
   // 设置页里的下拉是复制的快捷面板 HTML，重建后浏览器会退回第一项。
   // 不同步回来，打开设置页再点保存就会把用户的选择悄悄改成第一项。
+  // #5（261026-09）：sp_rep / sp_shuf 已删（见 sgroup('播放') 处的逐项核对），
+  // 这里只剩还活着的镜像对。
   [['sp_filt', 'sFilt'], ['sp_filtNx', 'sFiltNx'], ['sp_shaper', 'sShap'],
-   ['sp_rate', 'sRate'], ['sp_rep', 'sRep'], ['sp_buffer', 'sBuf'],
-   ['sp_shuf', 'sShuf'], ['sp_loud', 'sLoud'], ['sp_isp', 'sIsp'], ['sp_2s', 's2s']].forEach(function (pair) {
+   ['sp_rate', 'sRate'], ['sp_buffer', 'sBuf'],
+   ['sp_loud', 'sLoud'], ['sp_isp', 'sIsp'], ['sp_2s', 's2s']].forEach(function (pair) {
     var a = D(pair[0]), b = D(pair[1]);
     if (!a || !b) return;
     if (a.type === 'checkbox') { a.checked = b.checked; return; }
@@ -5745,17 +5717,8 @@ function renderSettingsPage() {
       }
     } else { a.value = b.value; }
   });
-  // #2（261026-08）兼容壳：#sp_shuf 现在是「播放模式」的镜像（用户可见入口只有 #sp_rep + 底栏一个按钮），
-  // 但旧自检脚本（tools/uicheck.js 的 needBind 清单）要求这个 id 存在**且有事件处理**，所以保留绑定：
-  // 勾上 = 随机(3)，取消 = 专辑循环(1)，写的是同一个字段 g_q.repeat，不存在第二份真相。
-  if (D('sp_shuf')) D('sp_shuf').onchange = function () {
-    var m = this.checked ? 3 : 1;
-    if (D('sp_rep')) D('sp_rep').value = String(m);
-    if (D('sRep')) D('sRep').value = String(m);
-    D('sShuf').checked = (m === 3);
-    applyRep(m);
-    api('/api/playmode?mode=' + m);
-  };
+  // #5（261026-09）：sp_shuf 兼容壳已删除（没有任何外部入口，也没有自检依赖它）。
+  // 播放模式的唯一真相源仍是隐藏源控件 #sRep + 底栏 #bRep / 单曲页 #npRep。
 
   // 先把 DSD 三个控件的当前值从隐藏状态同步过来
   if (D('sp_outmode')) D('sp_outmode').value = outModeOf();
@@ -5850,8 +5813,9 @@ function renderSettingsPage() {
   D('sp_ch').onchange = function () {
     ADV.channels = parseInt(this.value, 10) || 0;
     saveSettings();
-    var g = document.querySelector('#setpage .trimgrid');
-    if (g) { g.innerHTML = trimFields(this.value); bindTrims(); }   // 标签跟着声道布局换
+    // #4（261026-09）：显式选声道数后同样走 repaintTrims —— 它按 effectiveChannels() 决定行数
+    //（独占 = 本设置；共享 = 设备混音声道数，设置项不生效）。
+    repaintTrims();
   };
   bindTrims();
   // 2026-10-24（用户 261024-01 #12）：比特率 / 封装永远可选。
@@ -5904,6 +5868,15 @@ function renderSettingsPage() {
   // 诊断页签的两个按钮（2026-10-22 功能3：从元数据迁出 + 改为一个 ZIP）
   if (D('sp_diagzip')) D('sp_diagzip').onclick = exportDiagZip;
   if (D('sp_diagjson')) D('sp_diagjson').onclick = exportDiag;
+  // 一键反馈（261027-01 #1）：提交按钮 + 回车即交（在标题框里按 Enter 不提交空表单）
+  if (D('sp_fbsubmit')) D('sp_fbsubmit').onclick = fbSubmit;
+  if (D('sp_fbtitle')) D('sp_fbtitle').addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter') { ev.preventDefault(); fbSubmit(); }
+  });
+  // ReplayGain（261027-01 #2）：模式一变立刻重画"非 bit-perfect"警告，不留到保存后才提示
+  if (D('sp_rgmode')) D('sp_rgmode').onchange = function () { ADV.rgmode = this.value || 'off'; rgWarn(); saveSettings(); };
+  if (D('sp_rgclip')) D('sp_rgclip').onchange = function () { ADV.rgclip = this.checked ? 1 : 0; saveSettings(); };
+  rgWarn();
   // 功能2：相位说明跟随 1x 滤波器与相位覆盖的选择联动
   ['sp_filt', 'sp_phase', 'sp_filtNx'].forEach(function (id) {
     var e = D(id);
@@ -5999,7 +5972,8 @@ function renderSettingsPage() {
     if (!confirm('把所有参数恢复成默认值？')) return;
     ADV = { device: '', bits: 0, taps: 0, atten: 0, transition: 0, phase: '', modcut: 0, moddith: -1, ir: '', irgpu: 0, ramp: 0, theme: S.theme, modorder: 5, modfamily: 'dsd', directsdm: 0, dsdKind: 'fir', dsdConv: 'narrow',
             backend: 'wasapi', channels: 0, naaHost: '127.0.0.1:43210',
-            inBackend: 'none', inDev: '', inOffset: 0, inBuf: 100, inMonitor: 0, inSeconds: 0, inOut: '' };
+            inBackend: 'none', inDev: '', inOffset: 0, inBuf: 100, inMonitor: 0, inSeconds: 0, inOut: '',
+            rgmode: 'off', rgclip: 1 };
     // 元数据两键的默认：自动补全开；AI 增强关（联网计费项默认关，避免「恢复默认」反而产生费用）。
     // 源开关随注册表一并全开。
     META = { on: 1, llm: 0, summary: 0 };
@@ -6214,13 +6188,16 @@ function getTargetCurveDescInfo(details, author) {
   };
 }
 
-// EQ 页签当前是否可见（设置页开着 + 选中 EQ 页签）。用于丢弃切走后的异步回调。
-function eqTabActive() {
-  var p = document.querySelector('#setpage .spane[data-g=eq]');
+// 某个设置页签当前是否可见（设置页开着 + 选中该页签）。用于丢弃切走后的异步回调。
+// #6 拆分后有两个相关页签：eq（PEQ + 耳机 EQ）、cal（声音校准）。
+function settingTabActive(g) {
+  var p = document.querySelector('#setpage .spane[data-g=' + g + ']');
   return !!(p && p.classList.contains('on'));
 }
+function eqTabActive() { return settingTabActive('eq'); }
 /* EQ 与房间校正（用户 261023-04 #2：从左侧主导航移进设置页的「EQ」页签）
-   内容沿用原来的三块：① 耳机 EQ（OPRA 校准预设）② EQ 文件（REW / AutoEq）③ 房间校正 IR（WAV + GPU 卷积）。
+   #6（2026-10-27 用户 261026-09）拆分后，这个函数只留「① 20 段 PEQ ② 耳机 EQ（OPRA）」；
+「③ 房间校正 ④ 校正文件（参数 EQ / IR）」搬到 calSettingsHtml()（声音校准页签）。
    改用设置页统一的分组卡片（sgroup），不再用原来的独立大卡片，保证页签内视觉与其它页一致。 */
 function eqSettingsHtml() {
   var h = '';
@@ -6254,34 +6231,16 @@ function eqSettingsHtml() {
     + '曲线上 <b>拖拽节点</b>：水平=频率（对数）、垂直=增益；<b>Shift+拖 / 滚轮</b>=改 Q；<b>双击节点</b>=该段复位（0 dB / Q 1.41）。'
     + '选中行后 <b>↑↓</b>=增益 0.1 dB、<b>←→</b>=频率 ±1%（Shift 加速）。修改即时生效（热更新，交叉淡入防爆音），并自动保存到 rlplayer-peq.txt。</div></div>');
 
+  // 1. 耳机 EQ（OPRA 校准预设）
+  h += opraSectionHtml();
 
-  // 1.5 房间校正（测量向导）—— 2026-10-26（261026-01 #2 用户：「房间 EQ 功能请上架 EQ 那一栏的 UI」）
-  // 位置：**紧跟 PEQ 之后**（第 2 张卡）——用户是在 EQ 页找这个功能，放在页尾等于没上架。
-  // 2026-10-26 晚（261026-06）：后端 /api/roomcorr/{layouts,status,measure,cancel,download} 已接上，
-  //   测量走真实 WASAPI（共享播放 + 采集，src/dsp/room_transport_wasapi.h），
-  //   所以「预览」角标与「不会真的出声」的免责声明全部移除 —— 留着就是在骗用户。
-  //   铁律 1 不变：向导最后一步必须弹授权横幅（设备名 / 时长 / 电平 / 会盖过系统声音）并要用户点确认，
-  //   默认电平 −20 dBFS（MeasurementSession 缺省），不做任何放大。
-  h += '<div id=roomCorrCard>' + sgroup('房间校正（测量向导）', 'Farina 对数扫频 → 反卷积 → 心理声学平滑 → 目标曲线 → 最小相位校正 FIR · 多声道 2.0~7.1.4',
-      '<div class="sfld wide"><div class="in-stat-grid" style="grid-template-columns:repeat(auto-fit,minmax(250px,1fr))">'
-    + '<div class=in-stat-item><span class=lbl>算法版本</span><span class="val sm">C1 算法 + C2 测量编排</span>' +
-      '<div class=rcsub>room_correction.h · room_measurement.h · room_transport_wasapi.h</div></div>'
-    + '<div class=in-stat-item><span class=lbl>支持声道布局</span><span class="val sm">2.0 ~ 7.1.4（6 种）</span>' +
-      '<div class=rcsub>2.0 / 2.1 / 5.1 / 7.1 / 5.1.2 / 7.1.4 · 带 .1 的 LFE 分频 80 Hz</div></div>'
-    + '<div class=in-stat-item><span class=lbl>当前状态</span><span class="val sm" id=rcStatus>未测量</span>' +
-      '<div class=rcsub id=rcStatusSub>点「开始向导」跑一次测量</div></div>'
-    + '</div></div>'
-    + '<div class="sfld wide" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
-    + '<button class="btn pri" id=bRoomWiz type=button>开始向导</button>'
-    + '<button class="btn" id=bRoomDl type=button style="display:none">下载校正集</button>'
-    + '<span class=rcnote id=rcHint>分 7 步走完一次测量（选布局 → 摆麦 → 测各声道 → 质检 → 生成校正集）。</span>'
-    + '</div>'
-    + '<div class="sfld wide"><div class=rcnote>测量结果（每声道校正 FIR，32-bit float）保存到 <code>data\\roomcorr\\</code>；'
-    + '应用后由播放链路的 FIR 卷积执行（与下面「房间校正 IR」同一个卷积器）。<br>'
-    + '测量会<strong>真的出声</strong>：每个声道一段对数扫频，默认电平 −20 dBFS，开始前会让你确认设备与时长。</div></div>'
-    ) + '</div>';
-
-  // 1. 耳机 EQ（OPRA）
+  return h;
+}
+/* ---------------- EQ 页签里的耳机 EQ（OPRA）----------------
+   单独成函数的原因：30 行的搜索框 + 型号卡片 + 预设卡片，混在 eqSettingsHtml 里会把
+   「PEQ / 耳机 EQ」和「房子校准」两种东西搅在一起 —— 那正是 #6 要拆开的。 */
+function opraSectionHtml() {
+  var h = '';
   h += sgroup('耳机 EQ（OPRA 校准预设）', '收录 6,230 款耳机专业校准滤波 · CC BY-SA 4.0',
       '<div class="sfld wide" style="display:flex;align-items:center;gap:10px">'
     + '<input id=sp_opra_search type=text placeholder="搜索耳机品牌或型号（如 Sennheiser / HD 600 / AirPods / Sony / XM5…）" autocomplete=off style="flex:1;min-width:0;width:auto;height:34px;padding:0 12px;background:var(--field);border:1px solid var(--line);border-radius:8px;font-size:12.5px;color:var(--txt);box-sizing:border-box">'
@@ -6309,18 +6268,64 @@ function eqSettingsHtml() {
     + '<div id=eqPresetCards style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px"></div>'
     + '<div id=eqTargetCurveInfo style="margin-top:16px;padding:14px 16px;background:var(--field);border:1px solid var(--line);border-radius:8px;font-size:12.5px;color:var(--txt2);line-height:1.6;display:none"></div>'
     + '</div>');
-  // 2. EQ 文件（REW / AutoEq 文本）
-  h += sgroup('EQ 文件（REW / AutoEq 文本）', '按文件里的 Filter 行生成双二阶滤波器组',
-      '<div class="sfld wide"><label>EQ 文件路径' + tip('每行形如 Filter 1: ON PK Fc 1000 Hz Gain -3.0 dB Q 1.41') + '</label>'
-    + '<input type=text id=sp_eq value="' + esc(ADV.eq || '') + '" placeholder="D:\\Music\\headphone-eq.txt"></div>');
-  // 3. 房间校正 IR（WAV 路径 + GPU 卷积开关）
-  h += sgroup('房间校正 IR（WAV 脉冲响应）', '把房间 / 耳机脉冲响应用 FIR 卷积叠进播放链路',
-      '<div class="sfld wide"><label>IR 脉冲响应卷积文件（WAV）' + tip('留空 = 不做卷积；支持立体声 / 多声道 FIR 房间校正') + '</label>'
+  return h;
+}
+/* ---------------- 声音校准（#6：2026-10-27 用户 261026-09 从 EQ 页拆出的新页签） ----------------
+   用户原话：「设置-EQ 里面的内容比较臃肿了，请拆分成 EQ 和声音校准两个不同的设置栏。
+   EQ 栏位保留 PEQ 和耳机 EQ，声音校准则放置房间校正、REW 导入、IR 导入等」。
+   ⟹ EQ 页签 = 参数均衡 PEQ（20 段）+ 耳机 EQ（OPRA）：都是"我把耳机调成什么样"。
+     声音校准页签 = 房间校正（测量向导）+ 校正文件（REW/AutoEq 参数 EQ 文本 + IR 脉冲响应 WAV）：
+        都是"用测量数据去校准这套回放系统"。
+   命名理由（也是核对结论）：EQ 页的 PEQ/OPRA 是**手调**，校准页的全是**测量/外部文件导入**；
+   原来那两个文件分组核实后**确实都是校正文件**（REW 一种软件能同时导出这两种，见下面的组标题）。 */
+function calSettingsHtml() {
+  var h = '';
+
+  // 1.5 房间校正（测量向导）—— 2026-10-26（261026-01 #2 用户：「房间 EQ 功能请上架 EQ 那一栏的 UI」）
+  // 位置：**紧跟 PEQ 之后**（第 2 张卡）——用户是在 EQ 页找这个功能，放在页尾等于没上架。
+  // 2026-10-26 晚（261026-06）：后端 /api/roomcorr/{layouts,status,measure,cancel,download} 已接上，
+  //   测量走真实 WASAPI（共享播放 + 采集，src/dsp/room_transport_wasapi.h），
+  //   所以「预览」角标与「不会真的出声」的免责声明全部移除 —— 留着就是在骗用户。
+  //   铁律 1 不变：向导最后一步必须弹授权横幅（设备名 / 时长 / 电平 / 会盖过系统声音）并要用户点确认，
+  //   默认电平 −20 dBFS（MeasurementSession 缺省），不做任何放大。
+  h += '<div id=roomCorrCard>' + sgroup('房间校正（测量向导）', 'Farina 对数扫频 → 反卷积 → 心理声学平滑 → 目标曲线 → 最小相位校正 FIR · 多声道 2.0~7.1.4',
+      '<div class="sfld wide"><div class="in-stat-grid" style="grid-template-columns:repeat(auto-fit,minmax(250px,1fr))">'
+    + '<div class=in-stat-item><span class=lbl>算法版本</span><span class="val sm">C1 算法 + C2 测量编排</span>' +
+      '<div class=rcsub>room_correction.h · room_measurement.h · room_transport_wasapi.h</div></div>'
+    + '<div class=in-stat-item><span class=lbl>支持声道布局</span><span class="val sm">2.0 ~ 7.1.4（6 种）</span>' +
+      '<div class=rcsub>2.0 / 2.1 / 5.1 / 7.1 / 5.1.2 / 7.1.4 · 带 .1 的 LFE 分频 80 Hz</div></div>'
+    + '<div class=in-stat-item><span class=lbl>当前状态</span><span class="val sm" id=rcStatus>未测量</span>' +
+      '<div class=rcsub id=rcStatusSub>点「开始向导」跑一次测量</div></div>'
+    + '</div></div>'
+    + '<div class="sfld wide" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
+    + '<button class="btn pri" id=bRoomWiz type=button>开始向导</button>'
+    + '<button class="btn" id=bRoomDl type=button style="display:none">下载校正集</button>'
+    + '<span class=rcnote id=rcHint>分 7 步走完一次测量（选布局 → 摆麦 → 测各声道 → 质检 → 生成校正集）。</span>'
+    + '</div>'
+    + '<div class="sfld wide"><div class=rcnote>测量结果（每声道校正 FIR，32-bit float）保存到 <code>data\\roomcorr\\</code>；'
+    + '应用后由播放链路的 FIR 卷积执行（与下面「校正文件 → 脉冲响应 IR」共用同一个卷积器）。<br>'
+    + '测量会<strong>真的出声</strong>：每个声道一段对数扫频，默认电平 −20 dBFS，开始前会让你确认设备与时长。</div></div>'
+    ) + '</div>';
+  // 2. 校正文件（参数 EQ 文本 + 脉冲响应 IR）—— #6 核对结论：
+  //    用户问「最下面的两个是不是都是 REW 的校正文件？」——**是同一类东西，但不只有 REW**：
+  //    ① 参数 EQ 文本（Filter 1: ON PK Fc … Gain … Q …）REW / AutoEq / 任何导出这种格式的软件都能给，
+  //       后端按 Filter 行生成双二阶滤波器组（逐段参量 EQ）；
+  //    ② 脉冲响应 IR（WAV）同样常由 REW 导出（File → Export → Export impulse response as WAV），
+  //       也可以是任何测量/仿真工具给的房间或耳机 IR，后端做 FIR 卷积。
+  //    两者都是"外部测量 → 校准文件 → 叠进播放链路"，所以合并成**一个组、两个子块**，
+  //    不再像以前那样让用户以为它们是两件互不相干的设置。
+  h += sgroup('校正文件（参数 EQ 文本 · 脉冲响应 IR）',
+      '都是外部测量软件（REW / AutoEq / 任何导出这几种格式的工具）产出的校准文件；留空 = 不做对应校正',
+      '<div class="sfld wide"><label>参数 EQ 文件（REW / AutoEq 文本）' +
+        tip('每行形如 Filter 1: ON PK Fc 1000 Hz Gain -3.0 dB Q 1.41；按 Filter 行生成双二阶滤波器组') + '</label>'
+    + '<input type=text id=sp_eq value="' + esc(ADV.eq || '') + '" placeholder="D:\\Music\\headphone-eq.txt"></div>'
+    + '<div class="sfld wide" style="margin-top:4px"><label>脉冲响应 IR 文件（WAV）' +
+        tip('留空 = 不做卷积；支持立体声 / 多声道 FIR 房间校正') + '</label>'
     + '<input type=text id=sp_ir value="' + esc(ADV.ir || '') + '" placeholder="D:\\Music\\room.wav"></div>'
-    + chk('sp_irgpu', '卷积走 GPU 硬件加速（需要 rtagpu.dll 就位）', ADV.irgpu == 1,
+    + chk('sp_irgpu', 'IR 卷积走 GPU 硬件加速（需要 rtagpu.dll 就位）', ADV.irgpu == 1,
           '房间 / 耳机 FIR 卷积交给 GPU；没有可用后端时自动退回 CPU')
-    // 评审 #11：这里原来还有一个「保存 EQ 与房间校正设置」按钮，与底部全局「保存设置」重复 → 移除；
-    // sp_eq / sp_ir / sp_irgpu 的值本来就会随 saveSettings 一起提交，不需要第二个主操作。
+    // 评审 #11：「保存 EQ 与房间校正设置」按钮与底部全局「保存设置」重复 → 不再提供第二个主操作
+    //（sp_eq / sp_ir / sp_irgpu 随 saveSettings 一起提交）。
     );
 
   return h;
@@ -6363,7 +6368,7 @@ var RC_STEPS = [
     b: '把每个声道的响应做<b>变分数倍频程平滑</b>（低频 1/6 oct → 高频 1/3 oct），减去目标曲线，' +
        '限制最大提升量，转成最小相位，再截断加窗成 8192 taps 的校正 FIR。' +
        '校正集保存到 <code>data\\roomcorr\\correction-<布局>.json</code>，可以直接下载。' +
-       '<span class=warnline>生成后还需要在下方「房间校正 IR」里把它挂进播放链路才会生效 —— 这一步本轮仍是手动的。</span>' }
+       '<span class=warnline>生成后还需要在下方「校正文件 → 脉冲响应 IR」里把它挂进播放链路才会生效 —— 这一步本轮仍是手动的。</span>' }
 ];
 function rcWizEnsure() {
   var box = D('roomWiz');
@@ -6636,14 +6641,52 @@ function peqCurveGainAt(y) {
   var t = (y - v.PADT) / (v.H - v.PADT - v.PADB);
   return Math.max(-12, Math.min(12, v.maxDb - Math.max(0, Math.min(1, t)) * (v.maxDb - v.minDb)));
 }
+/* #3（2026-10-27 用户 261026-09）：「PEQ 里面的波形和下面的表格，需要根据软件宽度自动匹配宽度」。
+   以前这里 W 写死 640、CSS 又给 .peqcv 加 max-width:720px ⟹ 1600px 的窗口右边一整片空白。
+   现在 W 由容器的真实客户区宽度算出（不是靠 CSS 把 640 拉伸 —— 那样横轴刻度会跟着变形），
+   并在宽度变化时用 ResizeObserver 重算（见下文 peqObserveWidth）。 */
+var PEQ_PTS = null;    // 最近一次曲线点（宽度变了要按新宽度重画）
+var PEQ_W = 0;         // 当前逻辑宽度（= 容器内容宽度），用于判断"值得重画"
+var PEQ_RO = null;     // ResizeObserver（只观察 #peqCurve 一个节点）
+function peqContentWidth(box) {
+  // clientWidth 含 padding；.peqcv 的左右 padding 各 10px ⟹ content = clientWidth - 20
+  var w = (box && box.clientWidth) ? (box.clientWidth - 20) : 0;
+  return Math.max(320, Math.floor(w || 0) || 640);
+}
+var PEQ_RO_BOX = null;
+function peqObserveWidth() {
+  var box = D('peqCurve'); if (!box) return;
+  // 设置页每次重渲染都会重建 #peqCurve 节点：观察者要跟着换目标，否则观察的是一个已脱离文档的旧节点
+  if (PEQ_RO && PEQ_RO_BOX === box) return;
+  if (PEQ_RO) { try { PEQ_RO.disconnect(); } catch (e) {} PEQ_RO = null; }
+  PEQ_RO_BOX = box;
+  if (!window.ResizeObserver) return;               // 老引擎：靠下面的 window resize 兜底
+  PEQ_RO = new ResizeObserver(function () {
+    var w = peqContentWidth(box);
+    if (Math.abs(w - PEQ_W) < 4) return;            // 高度由 viewBox 比例决定 ⟹ 不会自激循环
+    if (PEQ_PTS) peqDrawCurve(PEQ_PTS);
+  });
+  PEQ_RO.observe(box);
+}
+// 兜底：宿主的窗口缩放（WebView2 里 ResizeObserver 已经能覆盖，双保险不冲突）
+window.addEventListener('resize', function () { if (PEQ_PTS) peqOnResize(); });
+function peqOnResize() {
+  var box = D('peqCurve'); if (!box) return;
+  if (Math.abs(peqContentWidth(box) - PEQ_W) >= 4 && PEQ_PTS) peqDrawCurve(PEQ_PTS);
+}
 function peqDrawCurve(points) {
   var box = D('peqCurve'); if (!box) return;
   if (!points || !points.length) {
     box.innerHTML = '<div style="font-size:11.5px;color:var(--mut2);padding:12px 0">频响曲线（等待数据…）</div>';
-    PEQ_VIEW = null;
+    PEQ_VIEW = null; PEQ_PTS = null;
     return;
   }
-  var W = 640, H = 132, PADL = 36, PADR = 10, PADT = 10, PADB = 18;
+  PEQ_PTS = points;
+  var W = peqContentWidth(box);
+  // 高度跟着宽度走：宽窗不至于把曲线压成一条细带（1600px 时约 210px 高）
+  var H = Math.round(Math.min(220, Math.max(120, W * 0.19)));
+  var PADL = 36, PADR = 10, PADT = 10, PADB = 18;
+  PEQ_W = W;
   var maxDb = 6, minDb = -6;
   points.forEach(function (p) { maxDb = Math.max(maxDb, p[1]); minDb = Math.min(minDb, p[1]); });
   maxDb = Math.ceil(maxDb / 3) * 3; minDb = Math.floor(minDb / 3) * 3;
@@ -6665,7 +6708,7 @@ function peqDrawCurve(points) {
   var svg = box.querySelector('svg.peqsvg');
   if (!svg) {
     box.innerHTML =
-      '<svg class=peqsvg viewBox="0 0 ' + W + ' ' + H + '">' +
+      '<svg class=peqsvg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" data-w="' + W + '">' +
         '<g class=peqgrid></g>' +
         '<polyline class=peqline fill=none stroke="var(--acc)" stroke-width=1.8 stroke-linejoin=round stroke-linecap=round points=""/>' +
         '<g class=peqnodes></g>' +
@@ -6675,7 +6718,11 @@ function peqDrawCurve(points) {
       '<div class=peqtip id=peqTip></div>';
     svg = box.querySelector('svg.peqsvg');
     peqBindCurve();
+    peqObserveWidth();
   }
+  // 宽度变了要同步 viewBox（否则 grid 坐标与比例对不上）
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  svg.setAttribute('data-w', String(W));
   svg.querySelector('.peqgrid').innerHTML = g;
   svg.querySelector('.peqline').setAttribute('points', pts);
   peqSyncNodes();
@@ -7274,6 +7321,216 @@ function initEqViewLogic() {
   }
 }
 
+
+
+// ============================================================================
+// 音质分析 / 版本对比（B2 quality.h + B3 version_compare.h；2026-10-27 接线）
+// ----------------------------------------------------------------------------
+// 数据源：
+//   POST /api/health?file=…  → track_health_json（老字段 + quality 19 项）
+//   POST /api/compare        → {files:[…]} 逐项对比表 + 排序 + 解释
+// 全部走自绘 #modal（CDP 自检下 window.prompt/confirm 会把页面挂住）。
+// ============================================================================
+function qFmt(v, d) {
+  if (v === undefined || v === null || (typeof v === 'number' && !isFinite(v))) return '-';
+  if (typeof v !== 'number') return String(v);
+  if (v <= -299 && v > -1e6) return '不适用';   // −300 是"测不出"的哨兵值，不能显示成 −300 dB
+  return v.toFixed(d === undefined ? 2 : d);
+}
+function openQualityModal(path) {
+  if (!path) { toast('没有可分析的曲目'); return; }
+  openModal('分析音质', '<div class=empty>正在分析…（流式分块解码，曲越长越久）</div>');
+  apiRaw('/api/health?file=' + encodeURIComponent(path)).then(function (j) {
+    var h = (j && j.health) || null;
+    if (!j || !j.ok || !h) {
+      D('mbody').innerHTML = '<div class=empty>' + esc((j && j.error) || (h && h.error) || '分析失败') + '</div>';
+      return;
+    }
+    var q = h.quality || {};
+    function row(label, val, hint) {
+      return '<tr><td style="color:var(--mut);padding:3px 10px 3px 0;white-space:nowrap">' + esc(label) +
+             (hint ? tip(hint) : '') + '</td><td style="padding:3px 0;font-variant-numeric:tabular-nums">' + esc(String(val)) + '</td></tr>';
+    }
+    var html = '<div class=hint style="margin-bottom:8px">' + esc(path) + '</div>';
+    html += '<div style="display:flex;gap:18px;flex-wrap:wrap">';
+    // 失真
+    html += '<table style="font-size:12px"><tbody>'
+         +  row('THD+N（单基频）', q.thdn_available ? (qFmt(q.thdn_db) + ' dB') : ('不适用（' + (q.thdn_method || '') + '）'))
+         +  row('非谐波残留', qFmt(q.non_tonal_db) + ' dB', '16 个最强谱峰之外的能量占比 = 噪声/失真/有损残留的上界')
+         +  row('互调失真 IMD', q.imd_available ? (qFmt(q.imd_db) + ' dB') : (q.imd_note || '不适用'))
+         +  '</tbody></table>';
+    // 噪声 + 频响
+    html += '<table style="font-size:12px"><tbody>'
+         +  row('本底噪声', qFmt(q.noise_floor_dbfs) + ' dBFS', '最低 10% 的 100 ms 块电平；密集音乐是本底的上界')
+         +  row('谱最小本底', qFmt(q.spectral_min_dbfs) + ' dBFS')
+         +  row('信噪比', qFmt(q.snr_db) + ' dB')
+         +  row('谱重心', qFmt(q.centroid_hz, 0) + ' Hz')
+         +  row('谱倾斜', qFmt(q.tilt_db_per_oct) + ' dB/oct')
+         +  row('95% 滚降点', qFmt(q.rolloff95_hz, 0) + ' Hz')
+         +  row('>10 kHz 占比', qFmt(q.hf_ratio_10k_db) + ' dB')
+         +  '</tbody></table>';
+    // 削波 + 动态 + 立体声
+    html += '<table style="font-size:12px"><tbody>'
+         +  row('峰值 / RMS', qFmt(q.peak_dbfs_q) + ' / ' + qFmt(q.rms_dbfs) + ' dBFS')
+         +  row('削波样本', qFmt(q.clipped_samples, 0) + '（' + qFmt(q.clipped_pct, 4) + '%）')
+         +  row('削波段数', qFmt(q.clipped_runs, 0) + ' 段，最长 ' + qFmt(q.longest_clip_run, 0) + ' 样本')
+         +  row('峰值因子', qFmt(q.crest_db) + ' dB')
+         +  row('动态 P95−P10', qFmt(q.dyn_p95_p10_db) + ' dB')
+         +  row('动态重心', qFmt(q.dyn_centroid_dbfs) + ' dBFS')
+         +  row('静态段占比', qFmt(q.silence_pct) + ' %')
+         +  row('声道相关 / 单声道损失', q.stereo ? (qFmt(q.channel_corr, 3) + ' / ' + qFmt(q.mono_loss_db) + ' dB') : '非立体声')
+         +  '</tbody></table>';
+    html += '</div>';
+    html += '<div class=hint style="margin-top:10px">体检老字段：DR ' + qFmt(h.dr_db) + ' dB ｜ LUFS ' + qFmt(h.lufs) +
+            ' ｜ LRA ' + qFmt(h.lra) + ' ｜ 假无损 ' + (h.lossless_suspected ? '疑似' : '否') +
+            ' ｜ 截止 ' + qFmt(h.cutoff_hz, 0) + ' Hz' + (q.note ? ('<br>' + esc(q.note)) : '') + '</div>';
+    D('mbody').innerHTML = html;
+  }).catch(function (e) {
+    D('mbody').innerHTML = '<div class=empty>分析失败：' + esc(e && e.message ? e.message : e) + '</div>';
+  });
+}
+
+// ---- 版本对比：多选同目录下的音频文件 → 对比页 ----
+function openCompareModal(path) {
+  var dir = String(path || '').replace(/[\\\/][^\\\/]*$/, '');
+  if (!dir) { toast('没有可对比的曲目'); return; }
+  openModal('对比版本', '<div class=empty>正在列出可选文件…</div>');
+  apiRaw('/api/files?dir=' + encodeURIComponent(dir)).then(function (j) {
+    var fs2 = (j && j.files) || [];
+    if (!fs2.length) { D('mbody').innerHTML = '<div class=empty>该目录下没有可对比的音频文件</div>'; return; }
+    var base = String(path).replace(/^.*[\\\/]/, '');
+    var h = '<div class=hint style="margin-bottom:8px">' + esc(dir) + '：勾选 2~8 个版本（同一首曲子的不同转制/母带）</div>';
+    h += '<div style="max-height:46vh;overflow:auto;display:flex;flex-direction:column;gap:2px">';
+    fs2.forEach(function (n, i) {
+      h += '<label class=chk style="font-size:12px;display:flex;gap:8px;align-items:center">' +
+           '<input type=checkbox class=cmpck data-n="' + esc(n) + '"' + (n === base ? ' checked' : '') + '>' + esc(n) + '</label>';
+    });
+    h += '</div><div style="display:flex;gap:10px;align-items:center;margin-top:10px">' +
+         '<button class="btn pri" id=cmpGo>开始对比</button><span class=hint id=cmpMsg></span></div>';
+    h += '<div id=cmpOut></div>';
+    D('mbody').innerHTML = h;
+    D('cmpGo').onclick = function () {
+      var sel = [];
+      Array.prototype.forEach.call(document.querySelectorAll('#mbody .cmpck'), function (c) {
+        if (c.checked) sel.push(dir + '\\' + c.dataset.n);
+      });
+      if (sel.length < 2) { D('cmpMsg').textContent = '至少勾选 2 个版本'; return; }
+      D('cmpMsg').textContent = '正在对齐并分析 ' + sel.length + ' 个版本…';
+      D('cmpGo').disabled = true;
+      apiRaw('/api/compare', JSON.stringify({ files: sel })).then(function (r) {
+        D('cmpGo').disabled = false;
+        D('cmpMsg').textContent = '';
+        D('cmpOut').innerHTML = renderCompare(r);
+      }).catch(function (e) {
+        D('cmpGo').disabled = false;
+        D('cmpMsg').textContent = '对比失败：' + (e && e.message ? e.message : e);
+      });
+    };
+  }).catch(function (e) {
+    D('mbody').innerHTML = '<div class=empty>列目录失败：' + esc(e && e.message ? e.message : e) + '</div>';
+  });
+}
+function renderCompare(r) {
+  if (!r || !r.ok) return '<div class=empty>' + esc((r && r.error) || '对比失败') + '</div>';
+  var vs = r.versions || [], rows = r.rows || [];
+  var h = '<div style="margin-top:12px;font-size:12px">';
+  if (!r.sameTrack) h += '<div class=hint style="color:var(--err)">⚠ 包络相关太低，这些文件可能不是同一首曲子：结论仅供参考</div>';
+  h += '<div style="font-weight:650;margin-bottom:4px">排序（好 → 差）</div><ol style="margin:0 0 8px 18px;padding:0">';
+  // 版本号（V1/V2…）是后端给的序号，单看它认不出是哪个文件 ⟹ 一律带上文件名。
+  function vName(v, i) {
+    var base = String((v && (v.path || v.label)) || ('#' + i)).replace(/^.*[\\\/]/, '');
+    return base;
+  }
+  (r.ranking || []).forEach(function (i) {
+    var v = vs[i] || {};
+    h += '<li>' + esc(v.label || ('#' + i)) + ' <span style="color:var(--mut)">' + esc(vName(v, i)) + '</span>' +
+         ' — <b>' + qFmt(v.score, 1) + '</b> 分' +
+         (v.error ? (' <span style="color:var(--err)">' + esc(v.error) + '</span>') : '') + '</li>';
+  });
+  h += '</ol><div style="max-height:40vh;overflow:auto"><table style="font-size:11.5px;border-collapse:collapse;width:100%">';
+  h += '<thead><tr><th style="text-align:left;padding:3px 8px 3px 0">指标</th>';
+  vs.forEach(function (v, i) {
+    h += '<th style="text-align:right;padding:3px 0 3px 10px;font-weight:600">' + esc(v.label || '') +
+         '<div style="font-weight:400;color:var(--mut2);font-size:10.5px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+         esc(vName(v, i)) + '</div></th>';
+  });
+  h += '</tr></thead><tbody>';
+  rows.forEach(function (row) {
+    h += '<tr' + (row.comparable ? '' : ' style="opacity:.55"') + '><td style="padding:2px 8px 2px 0;white-space:nowrap">' +
+         esc(row.label) + (row.unit ? (' <span style="color:var(--mut2)">' + esc(row.unit) + '</span>') : '') +
+         (row.comparable ? '' : tip(row.why)) + '</td>';
+    (row.values || []).forEach(function (v, i) {
+      var best = (i === row.bestIndex && row.comparable && !row.informational);
+      h += '<td style="text-align:right;padding:2px 0 2px 10px;font-variant-numeric:tabular-nums' +
+           (best ? ';font-weight:700;color:var(--acc)' : '') + '">' + qFmt(v) + '</td>';
+    });
+    h += '</tr>';
+  });
+  h += '</tbody></table></div>';
+  h += '<div class=hint style="margin-top:8px;white-space:pre-wrap">' + esc(r.explanation || '') + '</div>';
+  h += '</div>';
+  return h;
+}
+
+// ============================================================================
+// 一键反馈（261027-01 #1；后端 = src/net/feedback.h，端点 = POST /api/feedback）
+// ----------------------------------------------------------------------------
+// 为什么不用 api()/apiRaw()：那两个帮手把超时写死 8 s，而后端的反馈总预算是 14 s
+// （取 token ≤2.5 s + HTTP ≤11 s）。用 8 s 会在"其实正在上传"时误报失败，用户会重复提交。
+// 为什么不用 window.prompt/confirm：CDP 自检下原生对话框会把页面挂住（本项目踩过），
+// 统一走自绘 #modal 与页内状态行。
+// 返回的七个字段全部原样列出：uploaded / status / path / sha / local / error / message。
+// 无凭据时 uploaded=false 且 local=<本地绝对路径> —— 界面必须显示它，否则用户以为反馈丢了。
+// ============================================================================
+function fbSubmit() {
+  var msg = D('sp_fbmsg'), out = D('sp_fbresult'), btn = D('sp_fbsubmit');
+  var payload = {
+    type:  (D('sp_fbtype')  || {}).value || 'bug',
+    title: ((D('sp_fbtitle') || {}).value || '').trim(),
+    body:  ((D('sp_fbbody')  || {}).value || '').trim(),
+    steps: ((D('sp_fbsteps') || {}).value || '').trim()
+  };
+  if (!payload.title && !payload.body) { toast('标题和详细描述至少要填一个'); return; }
+  if (out) out.textContent = '';
+  if (msg) msg.textContent = '正在打包并上传…（含日志尾，最长约 14 秒）';
+  if (btn) btn.disabled = true;
+  var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 30000);
+  fetch('/api/feedback', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload), signal: ctrl ? ctrl.signal : undefined
+  }).then(function (r) { return r.json(); }).then(function (j) {
+    clearTimeout(timer);
+    if (btn) btn.disabled = false;
+    var lines = [
+      'uploaded: ' + (j.uploaded ? 'true' : 'false'),
+      'status:   ' + (j.status === undefined ? '-' : j.status),
+      'path:     ' + (j.path || '-'),
+      'sha:      ' + (j.sha || '-'),
+      'local:    ' + (j.local || '-'),
+      'error:    ' + (j.error || '-')
+    ];
+    if (out) out.textContent = lines.join('\n') + (j.message ? ('\n\n' + j.message) : '');
+    if (msg) msg.textContent = j.uploaded ? '已上传，感谢反馈！' : (j.local ? '已存到本地（无上传凭据）' : '提交失败');
+    toast(j.message || (j.uploaded ? '反馈已上传' : '反馈已保存到本地'));
+  }).catch(function (e) {
+    clearTimeout(timer);
+    if (btn) btn.disabled = false;
+    var why = (e && e.name === 'AbortError') ? '请求超时（30 s）' : (e && e.message ? e.message : String(e));
+    if (out) out.textContent = 'error: ' + why;
+    if (msg) msg.textContent = '提交失败';
+    toast('反馈提交失败：' + why);
+  });
+}
+
+// ReplayGain 的非 bit-perfect 警告显隐（文案唯一来源：dsp/replaygain.h 的 kBitPerfectWarning）
+function rgWarn() {
+  var w = D('sp_rgwarn'), s = D('sp_rgmode');
+  if (!w || !s) return;
+  var on = (s.value === 'track' || s.value === 'album');
+  w.style.display = on ? '' : 'none';
+}
+
 // 2026-10-23 用户 261023-04 #2：EQ 已并入设置页，不再需要「前往 EQ 页面」跳转按钮的绑定。
 // ============================================================================
 // 诊断导出（用户 2026-10-22 功能3）
@@ -7408,6 +7665,8 @@ function collectSettings() {
   if (D('sp_sdmo1')) ADV.sdmFilt = D('sp_sdmo1').value || '';
   if (D('sp_sdmoNx')) ADV.sdmFiltNx = D('sp_sdmoNx').value || '';
   if (D('sp_directsdm')) ADV.directsdm = D('sp_directsdm').checked ? 1 : 0;
+  if (D('sp_rgmode')) ADV.rgmode = D('sp_rgmode').value || 'off';
+  if (D('sp_rgclip')) ADV.rgclip = D('sp_rgclip').checked ? 1 : 0;
   if (D('sp_dsdkind')) ADV.dsdKind = D('sp_dsdkind').value || 'fir';
   if (D('sp_dsdconv')) ADV.dsdConv = D('sp_dsdconv').value || 'narrow';
   applyDsd();
@@ -7427,7 +7686,7 @@ function collectSettings() {
   D('sBuf').value = D('sp_buffer').value;
   D('sIsp').checked = D('sp_isp').checked;
   D('s2s').checked = D('sp_2s').checked;
-  D('sRep').value = D('sp_rep').value;
+  // #5：设置页「播放模式」下拉已删 ⟹ 不再从它回写；#sRep 自己就是真相源（底栏按钮改的就是它）。
   D('sLoud').checked = D('sp_loud').checked;
   S.loud = D('sLoud').checked;
   // #2：sShuf 是派生量（模式==3 就是随机），不再从第二个控件读、也不再单独发 /api/shuffle。
@@ -7512,9 +7771,10 @@ function renderQueuePage() {
     if (S.view !== 'queue') return;   // 已切走 → 丢弃，别覆写当前页面
     S.q = { items: j.items || [], index: j.index || 0 };
     var n = S.q.items.length;
-    // #6（261026-08）：队列页顶部就能「保存为队列」（写到 rlplayer-savedqueues.conf）
+    // #2（261026-09）：用户「从播放队列那里直接保存为歌单即可」⟹ 队列页顶部提供
+    // 「保存为歌单」（写入 rlplayer-savedqueues.conf，含顺序与 CUE 区间，重启后仍在）。
     head('播放队列', n ? (n + ' 首') : '',
-      (n ? '<button class=btn id=qSaveSq title="把当前队列存成具名队列（重启后仍在）">保存为队列</button>' : '') +
+      (n ? '<button class="btn pri" id=qSaveSq title="把当前队列原样存成一个歌单（含顺序与 CUE 区间，重启后仍在）">保存为歌单</button>' : '') +
       (n ? '<button class=btn id=qClrAll>清空队列</button>' : ''));
     if (!n) {
       D('list').innerHTML = '<div class=empty>队列是空的<br><span style="font-size:11.5px">把文件拖进窗口，或右键专辑/曲目「加入队列」</span></div>';
@@ -7641,11 +7901,11 @@ function npEqChipsHtml() {
   var h = '';
   var eq = ADV.eq || '', ir = ADV.ir || '';
   if (eq) {
-    h += '<button class=chip id=npEqChip title="' + esc('当前 EQ：' + npFileName(eq) + '（点击打开 EQ 与房间校正）') + '">' +
+    h += '<button class=chip id=npEqChip title="' + esc('当前 EQ：' + npFileName(eq) + '（点击打开 EQ 设置）') + '">' +
          '<svg width=11 height=11 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 style="vertical-align:-1px"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>EQ</button>';
   }
   if (ir) {
-    h += '<button class=chip id=npIrChip title="' + esc('当前 IR：' + npFileName(ir) + '（点击打开 EQ 与房间校正）') + '">' +
+    h += '<button class=chip id=npIrChip title="' + esc('当前 IR：' + npFileName(ir) + '（点击打开 声音校准）') + '">' +
          '<svg width=11 height=11 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 style="vertical-align:-1px"><path d="M3 12h3l2-6 3 12 2-8 2 4h6"/></svg>IR</button>';
   }
   return h;
@@ -7653,7 +7913,8 @@ function npEqChipsHtml() {
 function npBindEqChips() {
   var eq = D('npEqChip'), ir = D('npIrChip');
   if (eq) eq.onclick = function () { closeNowPlaying(); openSettingsTab('eq'); };
-  if (ir) ir.onclick = function () { closeNowPlaying(); openSettingsTab('eq'); };
+  // #6：IR 属于「声音校准」页签，EQ 芯片进「EQ」页签（各进各的地方，不再都跳 EQ）
+  if (ir) ir.onclick = function () { closeNowPlaying(); openSettingsTab('cal'); };
 }
 function npDataReset() {
   // 261024-05 #T2：切歌 → 取消上一首所有在飞/轮询中的资料请求（旧实体的轮询不该继续打后端）

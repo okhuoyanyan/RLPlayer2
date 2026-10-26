@@ -164,7 +164,10 @@ async function gotoFiles() {
     var btn = rows[0].querySelector('.fav-btn');
     if (!btn) return { ok: false, msg: '没有心形按钮' };
     var f = btn.dataset.file;
-    await fetch('/api/fav?file=' + encodeURIComponent(f) + '&on=0');
+    // 2026-10-27（261026-09 实测）：副作用端点自 2026-10-25 起只接受 POST，GET 一律 405。
+    // 这里原来用 GET ⟹ 清理动作静默失败；用户实例上"首行本来就不是收藏"时判据空过，
+    // 换成带预置收藏的沙箱（build-ui9）才暴露出来。改为 POST（与页面里 api() 助手同一行为）。
+    await fetch('/api/fav?file=' + encodeURIComponent(f) + '&on=0', { method: 'POST' });
     var l0 = await fetch('/api/fav/list').then(r => r.json());
     if (l0.files.indexOf(f) >= 0) return { ok: false, msg: '初始清理失败' };
     btn.click();
@@ -327,8 +330,9 @@ async function gotoFiles() {
   // 2026-10-22 功能3：「诊断」独立成页，排在元数据之后。
   // 2026-10-23 用户 261023-04 #2：EQ 与房间校正从主导航移进设置页，「EQ」页签排在「高级」之后。
   // 2026-10-24 用户 261024-01 #5：「流媒体」从「高级」拆成独立页签，排在元数据之后、诊断之前。
-  ck(tabOrder === '输入/输出/PCM/SDM/高级/EQ/元数据/流媒体/诊断',
-     '设置页签顺序为 输入/输出/PCM/SDM/高级/EQ/元数据/流媒体/诊断', tabOrder);
+  // 2026-10-27（用户 261026-09 #6）：EQ 页拆成「EQ」+「声音校准」，声音校准紧跟 EQ。
+  ck(tabOrder === '输入/输出/PCM/SDM/高级/EQ/声音校准/元数据/流媒体/诊断',
+     '设置页签顺序为 输入/输出/PCM/SDM/高级/EQ/声音校准/元数据/流媒体/诊断', tabOrder);
 
   // ---- 2026-10-24 用户 261024-01 #5/#6/#8/#12 的界面契约（全部只读，不改任何设置）----
   // #5 密码框样式：旧 CSS 选择器只列了 text/number，password 落到浏览器默认样式（方角/无内边距/
@@ -637,8 +641,12 @@ async function gotoFiles() {
   // 且各自归属正确（不能互相串页签，否则又会出现重复 id / 读错控件）。
   // 2026-10-23（UI 评审 #11）：EQ 卡片里的「保存 EQ 与房间校正设置」按钮与底部全局保存重复，已删除；
   // 这里同时断言它确实不在了，避免以后又被加回来。
-  ck(await evalJs("(function(){var page=document.getElementById('setpage');var eq=document.querySelector('#setpage .spane[data-g=eq]');if(!eq)return false;var t=document.getElementById('sp_taps'),a=document.getElementById('sp_atten'),ir=document.getElementById('sp_ir'),e=document.getElementById('sp_eq'),g=document.getElementById('sp_irgpu'),dup=document.getElementById('bSaveRoomEq');return !!(t&&a&&page.contains(t)&&page.contains(a)&&ir&&e&&g&&eq.contains(ir)&&eq.contains(e)&&eq.contains(g)&&!dup);})()"),
-     '抽头/衰减在设置页，EQ 文件/IR/GPU 卷积在「EQ」页签内，且无重复保存按钮');
+  // 2026-10-27（用户 261026-09 #6）：EQ 页签拆成「EQ」+「声音校准」两个。
+  //   EQ        = 20 段 PEQ + 耳机 EQ（OPRA）
+  //   声音校准  = 房间校正（测量向导）+ 校正文件（sp_eq / sp_ir / sp_irgpu）
+  // 判据随之更新：抽头/衰减在「高级」，PEQ/OPRA 在 eq 面板，EQ 文件/IR/GPU 卷积在 cal 面板。
+  ck(await evalJs("(function(){var page=document.getElementById('setpage');var eq=document.querySelector('#setpage .spane[data-g=eq]');var cal=document.querySelector('#setpage .spane[data-g=cal]');if(!eq||!cal)return false;var t=document.getElementById('sp_taps'),a=document.getElementById('sp_atten'),ir=document.getElementById('sp_ir'),e=document.getElementById('sp_eq'),g=document.getElementById('sp_irgpu'),dup=document.getElementById('bSaveRoomEq');return !!(t&&a&&page.contains(t)&&page.contains(a)&&ir&&e&&g&&cal.contains(ir)&&cal.contains(e)&&cal.contains(g)&&eq.contains(document.getElementById('peqRows'))&&eq.contains(document.getElementById('sp_opra_search'))&&!dup);})()"),
+     '抽头/衰减在设置页，PEQ/OPRA 在「EQ」页签，EQ 文件/IR/GPU 卷积在「声音校准」页签，且无重复保存按钮');
   ck(await evalJs("document.querySelectorAll('#sp_device option').length > 1"), '输出设备下拉有内容', (await evalJs("document.querySelectorAll('#sp_device option').length")) + ' 项');
   // ---- 本轮新增：WASAPI 共享后端（选项存在 / 说明文案 / 能保存；!! 跑完必须还原，
   //      与 taps 同一原则 —— 自检不许改用户的输出后端）----

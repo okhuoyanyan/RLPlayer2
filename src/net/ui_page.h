@@ -11,6 +11,163 @@
 
 namespace rta::net {
 
+// 左上角品牌图（#7，2026-10-27 用户 261026-09：「当前软件主页左上角，没有更换新的图标」）
+//
+// 以前这里是 <div class=logo>R</div> —— 一个 CSS 渐变方块里放字母 R，**没有任何图片**。
+// 现在换成官方图标（折纸音符）：96×96 PNG 直接内嵌成 data URI，零网络请求、零静态文件依赖，
+// 打包成单 exe 也不会丢图。源图 = res/official-icon-source.png（1254×1254 官方源），
+// 用 Pillow LANCZOS 缩到 96×96 后 optimize 成 PNG（10418 字节 → base64 13892 字符）。
+// 为什么不用 <img src='/favicon.png'>：那条路要打一次 HTTP 请求，首屏会闪一下白框；
+// 而且 favicon 端点返回的是 app_icon.h 里的另一份图标，两处一旦不同步就又是"两个品牌"。
+inline const char* rta_logo_data_uri() {
+    return "data:image/png;base64,"
+           "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";
+}
+
 inline std::string rta_ui_page() {
     std::string h;
     h += "<!doctype html><html lang=zh data-theme=dark><head><meta charset=utf-8>";
@@ -135,7 +292,10 @@ inline std::string rta_ui_page() {
     // 只有 padding box 收 5px，而滚动条画在 padding box 里 ⟹ 滚动条退到 5px 内侧。
     // 元素没有背景时，透明边框区不画任何东西（父级底色透上来），视觉零变化。
     h += "html.webview2 .rz-edge-inset{border-right:var(--rzband,5px) solid transparent!important}";
-    h += ".logo{width:27px;height:27px;border-radius:8px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:grid;place-items:center;font-weight:800;font-size:13px;color:#fff;box-shadow:0 2px 14px var(--acc-weak);flex:none}";
+    // #7：.logo 现在是「装图片的框」—— 去掉品牌色渐变底（否则 8px 圆角处会露出一圈蓝边，
+    // 和图标本身的深色底打架）；尺寸/圆角/阴影保持不变，只把内容从字母换成 img。
+    h += ".logo{width:27px;height:27px;border-radius:8px;background:transparent;display:grid;place-items:center;overflow:hidden;box-shadow:0 2px 14px var(--acc-weak);flex:none}";
+    h += ".logo .logoimg{width:27px;height:27px;display:block;object-fit:contain;-webkit-user-drag:none}";
     h += ".ttl{font-weight:650;letter-spacing:.2px;flex:none}.ttl small{display:block;font-size:9px;font-weight:500;color:var(--mut2);letter-spacing:1.3px;margin-top:-3px}";
     h += ".search{flex:1;max-width:460px;margin-left:14px;position:relative}";
     h += ".search input{width:100%;padding:8px 32px 8px 32px;border-radius:9px;border:1px solid var(--line);background:var(--field);transition:.15s;font-size:12.5px}";
@@ -176,7 +336,19 @@ inline std::string rta_ui_page() {
     h += ".sqlist .sqrow:hover .sqb{opacity:1}";
     h += ".sqlist .sqb:hover{background:var(--hov2);color:var(--txt)}";
     h += ".sqlist .sqb.del:hover{color:var(--danger)}";
-    // 我的最爱 / 播放列表页里的「保存的队列」区块 + 行
+    // #2（261026-09）：「我的歌单」空态提示（左栏二级条目区里的一行灰字）
+    h += ".sqlist .sqempty{padding:4px 12px 2px 22px;font-size:10.5px;color:var(--mut2);line-height:1.5}";
+    // #1（261026-09）我的最爱：顶部一行行为提示 + 单击选中态（双击才是播放整列）
+    h += ".favhint{padding:8px 20px 2px;font-size:11.5px;color:var(--mut2);line-height:1.6}";
+    h += ".favhint b{color:var(--txt2);font-weight:600}";
+    h += ".trow.fsel{background:var(--hov)}";
+    // #1：我的最爱列表的列标题（序号/标题/艺术家/专辑）。与 .trow 用同一套 padding/margin/gap，
+    // 所以列位置逐像素对齐（本项目的列表都没有表头，这里是因为用户点名要这四列才加一行）
+    h += ".favhead{display:grid;gap:11px;align-items:center;padding:2px 20px 6px;margin:0 10px;font-size:10.5px;letter-spacing:.5px;color:var(--mut2)}";
+    h += ".favhead .n{text-align:right}.favhead .du{text-align:left}";
+    h += ".trow.fsel .n{color:var(--acc-text)}";
+    // （历史）我的最爱 / 播放列表页里的「保存的队列」区块 + 行 —— #1 已撤掉页面底部区块，
+    // 下面这两条 .sqsec/.sqitem 仅保留给以后可能的复用，当前无 DOM 使用。
     h += ".sqsec{border-top:1px solid var(--line);margin:22px 10px 6px;padding-top:14px}";
     h += ".sechd{display:flex;align-items:center;gap:10px;padding:0 10px 8px;font-size:11px;letter-spacing:.6px;color:var(--mut2)}";
     h += ".sqitem{display:flex;align-items:center;gap:10px;padding:9px 20px;border-radius:8px;font-size:12.5px}";
@@ -612,7 +784,11 @@ h += "#npPage .npedge{display:none}";
     // 为什么弃 table：th/td 的列宽由内容撑开，表头与输入框天生不同宽（用户看到的"文字没对齐"）。
     // 现在表头与每一行共用同一个【内容无关】的列模板（px + fr，没有 auto）⟹ 列位置逐像素一致。
     // 表格与曲线同宽（720px）：列宽不至于被拉成"一大片空白输入框"，也不会跟上面的曲线错位
-    h += ".peqwrap{--peqcols:36px minmax(0,1.3fr) minmax(0,1fr) minmax(0,.9fr) 96px 40px;max-width:720px}";
+    // 261026-09 #3（用户：「PEQ 里面的波形和下面的表格，需要根据软件宽度自动匹配宽度」）：
+    // 以前两处都写死 max-width:720px ⟹ 1600px 宽的窗口右边留一大片空白，900px 时又刚好顶满。
+    // 现在**取消像素上限**，改成 100% 跟随容器；列宽用 fr 分配，窄窗时表格容器横向滚动
+    //（.peqrows 的 min-width 由子行撑开，不会撑破外层 grid）。
+    h += ".peqwrap{--peqcols:36px minmax(0,1.3fr) minmax(0,1fr) minmax(0,.9fr) 96px 40px;width:100%;max-width:none}";
     h += ".peqhd,.peqr{display:grid;grid-template-columns:var(--peqcols);gap:0 8px;align-items:center}";
     // 表头必须跟数据行【同一个滚动容器、同一个内容宽度】：否则滚动条宽度 + 表头自带边框
     // 会让两边的可用宽度差 8~10px，fr 列随之变宽，逐列中心偏差线性放大到 9px（实测 1.7/4.9/7.7/9.0）。
@@ -621,6 +797,9 @@ h += "#npPage .npedge{display:none}";
     h += ".peqhd>.num,.peqc.num{text-align:right}";
     h += ".peqhd>.c,.peqc.c{text-align:center}";
     h += ".peqrows{max-height:340px;overflow:auto;border:1px solid var(--line);border-radius:8px}";
+    // #3：窄窗（容器 < 520px）时表格不压缩到看不清 —— 行保持最小宽度，容器横向滚动。
+    // 只给 peqhd/peqr 设 min-width，溢出发生在 .peqrows 内部，外层 grid 不会被撑破。
+    h += ".peqhd,.peqr{min-width:480px}";
     h += ".peqr{padding:3px 8px;border-bottom:1px solid rgba(255,255,255,.05)}";
     h += ".peqr:last-child{border-bottom:0}";
     h += ".peqr:hover{background:var(--hov)}";
@@ -634,7 +813,10 @@ h += "#npPage .npedge{display:none}";
     h += ".peqwrap .peqc input[type=text],.peqwrap .peqc input[type=number]{text-align:right}";
     h += ".peqwrap .peqc input:focus,.peqwrap .peqc select:focus{outline:0;border-color:var(--acc);box-shadow:0 0 0 2px var(--acc-weak)}";
     h += ".peqwrap .peqc input[type=checkbox]{width:14px;height:14px;min-height:0;margin:0;accent-color:var(--acc)}";
-    h += ".peqcv{position:relative;max-width:720px;background:var(--field);border:1px solid var(--line);border-radius:8px;padding:6px 10px 2px;user-select:none}";
+    // #3：波形容器同样取消 720px 上限；里面的 svg 用 width:100% + viewBox 由 JS 按实际
+    // clientWidth 重算（见 ui_script.h 的 peqDrawCurve / peqObserveWidth），所以横轴刻度
+    // 不会随窗口拉伸变形（不是靠 CSS 缩放糊上去的）。
+    h += ".peqcv{position:relative;width:100%;max-width:none;background:var(--field);border:1px solid var(--line);border-radius:8px;padding:6px 10px 2px;user-select:none;box-sizing:border-box}";
     h += ".peqcv svg.peqsvg{display:block;width:100%;height:auto;touch-action:none}";
     h += ".peqnode{fill:var(--acc);stroke:var(--bg);stroke-width:1.4;cursor:ns-resize}";
     h += ".peqnode:hover,.peqnode.on{fill:var(--acc2);stroke-width:2}";
@@ -730,7 +912,9 @@ h += "#npPage .npedge{display:none}";
     h += ".stab:hover{background:var(--hov);color:var(--txt2)}";
     h += ".stab.on{background:var(--acc-weak);color:var(--acc-text);border-color:rgba(59,130,246,.32);font-weight:600}";
     h += ".spane{display:none}.spane.on{display:block}";
-    h += ".trimgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}";
+    // 261026-09 #4：声道微调从 2 行变成 6 / 8 行之后，固定 4 列会排成 1.5 行很难看；
+    // 改成按可用宽度均分（窄窗自动落到 2 列），项数只由后端给的设备声道数决定。
+    h += ".trimgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:10px}";
     // 2026-10-24（用户 261024-01 #5）：流媒体多服务器列表 + 行内操作
     h += ".srvlist{display:flex;flex-direction:column;gap:8px}";
     h += ".srvrow{display:grid;grid-template-columns:9px minmax(0,1fr) auto;align-items:center;gap:9px 12px;padding:10px 13px;border:1px solid var(--line);border-radius:10px;background:var(--field);transition:.13s}";
@@ -801,7 +985,10 @@ h += "#npPage .npedge{display:none}";
     h += "<div id=app>";
 
     // ---------- 顶栏 ----------
-    h += "<div class=top id=topbar><div class=logo>R</div><div class=ttl>RLPlayer<small>HIGH-FIDELITY ENGINE</small></div>";
+    // #7（2026-10-27 用户 261026-09）：左上角不再是字母 R，而是官方图标（折纸音符，data URI 内嵌，零请求）
+    h += "<div class=top id=topbar><div class=logo id=brandLogo><img class=logoimg alt='RLPlayer' width=27 height=27 draggable=false src='";
+    h += rta_logo_data_uri();
+    h += "'></div><div class=ttl>RLPlayer<small>HIGH-FIDELITY ENGINE</small></div>";
     h += "<span class=hsep></span><b id=pth class=ptitle>专辑</b><span id=cnt class=pcnt></span>";
     h += "<div class=search><svg width=14 height=14 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2><circle cx='11' cy='11' r='7'/><path d='M20 20l-3.5-3.5'/></svg>";
     h += "<input id=q placeholder='搜索专辑 / 艺术家 / 曲目…' autocomplete=off spellcheck=false>";
@@ -832,11 +1019,13 @@ h += "#npPage .npedge{display:none}";
     h += "<div class=nav data-v=recent><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><circle cx='12' cy='12' r='8.5'/><path d='M12 7.2V12l3.2 2'/></svg>最近播放</div>";
     // 2026-10-26（用户 261026-08 #5）：我的最爱 = 红心收藏（数据源就是既有的 /api/fav 机制）。
     h += "<div class=nav data-v=favs><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z'/></svg>我的最爱</div>";
-    // 2026-10-26（用户 261026-08 #6）：保存的具名队列**显示在我的最爱下面**。
-    // 容器由 renderSavedQueues() 填充：每项 = 名字 + 改名 + 删除，点名字进详情页（含播放）。
+    // 2026-10-27（用户 261026-09 #2）：「播放队列 / 播放列表」是重复设计 ⟹ 左栏「播放」区
+    // 只留三项：播放队列 / 最近播放 / 我的最爱。播放列表入口（261026-08 #3 加的 /api/pl UI，
+    // 含右键「加入播放列表…」）整体撤掉；后端端点保留（见 tools/rtaweb.cpp 的 /api/pl 注释），
+    // 只是不再有前端入口 —— 用户明确说「只需要播放队列、最近播放、我的最爱这三个」。
+    // 保存的具名队列 = 「我的歌单」：显示在我的最爱下面，容器由 renderSavedQueues() 填充
+    //（每项 = 名字 + 改名 + 删除，点名字进详情页）；在播放队列页有「保存为歌单」入口。
     h += "<div id=sqList class=sqlist></div>";
-    // 2026-10-26（用户 261026-08 #3）：自定义播放列表（/api/pl）——这个功能以前**没有前端入口**。
-    h += "<div class=nav data-v=pl><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M4 6h11M4 12h11M4 18h7'/><path d='M18 5v9'/><circle cx='16.2' cy='15.6' r='2.2'/></svg>播放列表</div>";
     h += "<div class=sp></div>";
     h += "<div class=sec>系统</div>";
     h += "<div class=nav data-v=settings><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><circle cx='12' cy='12' r='3.2'/><path d='M12 3.5v2.2M12 18.3v2.2M4.4 7.9l1.9 1.1M17.7 15l1.9 1.1M4.4 16.1l1.9-1.1M17.7 9l1.9-1.1'/></svg>设置</div>";

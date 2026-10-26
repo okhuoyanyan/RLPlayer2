@@ -295,6 +295,35 @@ int main() {
         ck(r_rej.hits.empty() && r_rej.stats.dropped_whitelist == rejected_urls.size(),
            "仿冒/非白名单域名全量拒绝 (dropped_whitelist 计数准确)");
 
+        // 1.3b 用户 261026-06 #2：「明明 QQ 音乐 / dizzylab 上有这张专辑，AI 却说找不到」
+        //   → 白名单必须认同人/数字发行站点（旧白名单没有 dizzylab.net，命中会被当垃圾丢掉）。
+        {
+            const std::vector<std::string> platform_urls = {
+                "https://www.dizzylab.net/d/WSD0001/",
+                "https://y.qq.com/n/ryqq/albumDetail/000MkMni1KcC9r",
+                "https://music.163.com/#/album?id=12345",
+                "https://booth.pm/ja/items/1234567",
+            };
+            int passed = 0;
+            for (const auto& u : platform_urls) {
+                if (is_host_in_whitelist(extract_host_from_url(u), default_domain_whitelist())) ++passed;
+            }
+            ck(passed == (int)platform_urls.size(),
+               "平台页白名单：dizzylab / QQ音乐 / 网易云 / Booth 全部放行",
+               "passed=" + std::to_string(passed) + "/" + std::to_string(platform_urls.size()));
+
+            // 平台页 authority 常见 1~2、rerank 0.6~1.4：默认闸会全丢 → 站点限定补搜用放宽闸门
+            SearchHit plat;
+            plat.url = "https://www.dizzylab.net/d/WSD0001/";
+            plat.rerankScore = 0.95;
+            plat.authority = 1;
+            ck(filter_hits({ plat }, f_opts).hits.empty(), "放宽前的默认闸确实会丢掉平台页（复现用户现象）");
+            FilterOptions rel = f_opts;
+            rel.min_authority = 0;
+            rel.min_rerank_score = 0.0;
+            ck(filter_hits({ plat }, rel).hits.size() == 1, "站点限定补搜的放宽闸门能救回平台页");
+        }
+
         // 1.4 去重与排序
         SearchHit d1; d1.url = "https://zh.wikipedia.org/wiki/ZARD"; d1.rerankScore = 1.6; d1.authority = 2;
         SearchHit d2; d2.url = "https://zh.wikipedia.org/wiki/ZARD"; d2.rerankScore = 2.5; d2.authority = 4;

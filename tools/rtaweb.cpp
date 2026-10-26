@@ -23,6 +23,9 @@
 #include "net/zipstore.h"          // 最小 ZIP(STORE)打包：导出诊断 = 一个压缩包(2026-10-22 功能3)
 #include "net/http_client.h"       // /api/artist/image 打网易云音乐搜索 + 下载头像(2026-10-25)
 #include "net/json.h"              // /api/lib/cover/prefetch 解析网易 type=10 专辑搜索响应(2026-10-26)
+#include "net/feedback.h"          // 一键反馈（261027-01 #1）：诊断快照 + 用户手打文字 → 一个 JSON → 上传仓库
+#include "analysis/track_health.h"  // 曲目体检（含 quality 19 项）：/api/health 的数据源
+#include "analysis/version_compare.h"  // 版本对比（B3）：/api/compare 的数据源
 using rta::net::Library;
 using rta::net::SourceManager;
 using rta::net::SourceConfig;
@@ -59,7 +62,7 @@ using rta::render::SinkOpenOpts;
 #include "meta/retrieval.h"         // P3 资料层③ AI 综合检索(/api/entity/summary)
 #include "meta/discogs.h"           // P3 资料层④b Discogs 版本推荐(/api/entity/versions)
 #include "meta/statusflags.h"       // gpu/gpuUsed 组合语义（用户 261024-04 #8，/api/status 与 /api/signal 同源）
-#include "net/rtanet_stream.h"
+// （net/rtanet_stream.h 的 include 于 2026-10-27 删除：本文件全文零使用其符号，留着只是多一层无谓依赖。）
 #include "dsp/filter_families.h"
 #include "dsp/ir_resample.h"         // 261024-05 A2：IR 采样率与音源不同时先重采样
 #include "dsp/oversample_peak.h"
@@ -140,6 +143,11 @@ struct PlayParams {
     bool   loudness = false;
     bool   isp = true;         // 过采样峰值保护
     bool   twoStage = true;    // 两段式升频
+    // ---- ReplayGain（261027-01 #2）----
+    // rgMode: off | track | album（默认 off ⟹ 增益 0 dB ⟹ 管线整段跳过 ⟹ 逐位直通）
+    // rgClip: 防削波（applied = min(gain, -peak_dBFS)）。改样本值 ⟹ 开启后**不是 bit-perfect**。
+    std::string rgMode = "off";
+    bool   rgClip = true;
     int    dsd = 0;            // 0 = PCM；64/128/256 = DoP 封装的 DSD
     int    modOrder = 5;       // SDM 调制器阶数
     std::string modFamily = "dsd";     // SDM 调制器族：dsd | chebyshev | ec | ahm
@@ -245,6 +253,13 @@ struct PlayerState {
     std::string outFallbackWhy;
     double outRate = 0;
     int    outBits = 0;
+    // ---- ReplayGain 自证（261027-01 #2；/api/status 的 rg / rgDb / rgClip）----
+    // 为什么要报：mode=off 时用户必须能证明"输出逐位没动"，mode=track/album 时又必须能看到
+    // 实际乘了多少 dB（标签值 vs 防削波改过的值）。只有后端说出来，这两件事才可证伪。
+    std::string rgMode = "off";     // off | track | album（本次播放实际生效的模式）
+    double rgDb = 0.0;              // 本次实际乘的增益（0 = 一个样本都没碰）
+    bool   rgClip = false;          // 是否被防削波改过（clipLimited）
+    std::string rgSource;           // tag:track / compute:album / off / none…（取证用）
     // 2026-10-24（用户 261024-04 #8：bit-perfect 时信号链没绿点、右下角 GPU 图标还亮着）：
     //   gpu 只有 render_loop 在 RQ.gpu 置位时写 true（见 rtaweb.cpp 的 rl.gpuOut 接线），
     //   而 **正常播放路径从不复位它** —— 于是一旦本进程里有一首走过 GPU 升频，后面所有曲目
@@ -514,6 +529,8 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "dsdconv")  p.dsdConv = v;
         else if (k == "dsd2stage") p.dsd2Stage = (v == "1" || v == "true");
         else if (k == "loudness") p.loudness = (v == "1");
+        else if (k == "rgmode")   p.rgMode = v;
+        else if (k == "rgclip")   p.rgClip = (v == "1" || v == "true");
         else if (k == "buffer")   p.bufferMs = std::max(10, atoi(v.c_str()));
         else if (k == "device")   p.device = v;
         else if (k == "bits")     p.bits = atoi(v.c_str());
@@ -1276,23 +1293,37 @@ static bool native_dsd_precheck(const PlayParams& p, std::string& why) {
         why = "Native DSD 不做任何 PCM 处理（1-bit 流不经过 DSP 链）：请清空 " + list + "，或改用 DoP。";
         return false;
     }
-    // 升频：DSD 源解成 PCM 再升频是 DoP 路径的事；Native 按【源位率】直通，不重调制。
-    //
-    // ⚠️ 2026-10-25 修：这里原来只认 "" 和 "src"，而**设置页/conf 里「跟随源」写的是 "follow"**
-    //（ui_script.h:1942 的 sRate 第一项、rtaweb.cpp:2347 的 rateAuto 也都把 follow 当跟随源）。
-    // 后果是 GUI 用户明明选的就是「跟随源」，却被告知「请改成跟随源」——永远用不了原生 DSD。
-    // 现在三种等价写法都接受；"max"（要升频）和具体数字（要换率）仍然明确拒绝。
+    // 升频 / 变速：2026-10-27 起 **DSD→DSD 速率转换已落地**（pipeline.h 的 dsd_rate_branch /
+    // dsd_rate_convert，DSD 调制专线并入主线后接线）。所以这里的判据不再是"只能跟随源"，
+    // 而是"这条路到底走不走得通"：
+    //   · 跟随源（""/src/follow）        ⟹ 逐位直通，不用转换；
+    //   · 同族整数倍（DSD64→128/256…） ⟹ 允许，play_one_native_dsd 里先转换再直送驱动；
+    //   · 跨族 / 非整数倍 / 非标准档    ⟹ 明确拒绝，原因用 dsd_rate_branch().why（带 gcd 数字）。
+    // ⚠️ 2026-10-25 修：三种等价写法都接受（设置页/conf 里「跟随源」写的是 follow）。
     const bool rateFollowsSource = (p.rate.empty() || p.rate == "src" || p.rate == "follow");
     if (!rateFollowsSource) {
-        // 2026-10-26（用户 261025-02 #3/#5）：「Native 升频怎么设」的答案是**做不到**，
-        // 所以文案必须一次说清三件事：①这台设备的能力边界 ②想升速该走哪条路 ③现在怎么才能播。
-        // 边界（AGENTS.md §8.6）：DSD→DSD 速率转换归 DSD 调制专线；本文件只负责如实告知，
-        // 绝不在这里偷偷换率或改用 DoP（那才是"假成功"）。
-        why = "本设备原生 DSD 仅同速率直通：1-bit 流不进重采样器、也不重调制，"
-              "所以 Native 只能按源位率输出。采样率设置当前是「" + p.rate + "」。"
-              "想升速请用 DoP（PCM 源由 SDM 调制器生成目标档 1-bit，DSD 源重调制后装箱），"
-              "或等 DSD 调制专线提供 DSD→DSD 速率转换；"
-              "要现在就能播，请把「采样率」改成「跟随源」（设置 → 输出 → 采样率；等价写法 src / follow）。";
+        // 目标档位 → 目标位率需要源位率才能定族（44.1k 族 vs 48k 族），只读探测文件头即可。
+        uint32_t probeRate = 0;
+        try {
+            const DsdInfo pi = probe_dsd(p.file);
+            probeRate = pi.rate;
+        } catch (...) { probeRate = 0; }
+        if (p.dsd < 64) {
+            why = "Native DSD 需要把「输出模式」设成 DSD（SDM 页的比特率选 DSD64/128/256…）；"
+                  "当前是 PCM（dsd=0），没有 1-bit 码流可直通。";
+            return false;
+        }
+        if (probeRate == 0) {
+            why = "读不出源 DSD 位率（.dsf/.dff 文件头异常），无法判断能否做 DSD→DSD 速率转换。";
+            return false;
+        }
+        const uint32_t base = (probeRate % 48000u == 0) ? 48000u : 44100u;
+        const uint32_t want = rta::dsp::dsd_rate(p.dsd, base);
+        const eng::DsdRateBranchDecision br = eng::dsd_rate_branch(probeRate, want);
+        if (br.supported) return true;      // 转换分支：play_one_native_dsd 里先转再直送
+        why = "本设备原生 DSD 无法按请求的档位输出：" + br.why +
+              "。可用的替代：①把「采样率」改成「跟随源」（设置 → 输出 → 采样率；等价写法 src / follow）"
+              "按源位率直通；②改用 DoP 封装（PCM 载波，DSD 源照样会经 SDM 调制到目标档）。";
         return false;
     }
     return true;
@@ -1716,12 +1747,61 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
         if (src.rate == 0 || src.bits == 0 || src.channels <= 0 || src.bytesPerChannel() == 0) {
             return setErr("DSD 解码结果为空（Native DSD 需要非空 .dsf/.dff）：" + file);
         }
+        // ---------------- DSD→DSD 速率转换（2026-10-27；DSD 调制专线并入主线后接线）----------------
+        // 什么时候转：设置里的 DSD 档位 ≠ 源位率。判据全在 pipeline.h 的 dsd_rate_branch()：
+        //   同族（44.1k 族 ↔ 44.1k 族）+ 整数倍（×2/÷2…）+ 中间 PCM 率能整除目标位率。
+        // supported=false ⟹ **不转**，把 d.why（含 147:160 这类数字理由）原样带给用户，
+        // 下面的既有文案继续生效 —— 绝不静默按别的位率播（那是"假成功"）。
+        // 这里用整段接口 eng::dsd_rate_convert()：native 路径本来就把整条 1-bit 流读进内存
+        //（play_one_direct 也需要它做 DoP 回落），所以不存在"流式还是整段"的选择；
+        // DoP / PCM 路径的流式分块由 DsdRateConverter 在 dsd_rate_convert() 内部完成。
+        // ⚠️ 代价：转换期间内存 ≈ 源 + 目标两份（实测 258 MB 的 DSD64 单声道 384 s → 约 2 倍）。
+        std::string dsdRateConvNote;
+        if (p.dsd >= 64) {
+            const uint32_t base0 = (src.rate % 48000u == 0) ? 48000u : 44100u;
+            const uint32_t want0 = rta::dsp::dsd_rate(p.dsd, base0);
+            if (want0 != src.rate) {
+                const eng::DsdRateBranchDecision br = eng::dsd_rate_branch(src.rate, want0);
+                if (br.supported) {
+                    const auto tc0 = std::chrono::steady_clock::now();
+                    rta::audio::DsdStream conv;
+                    eng::DsdRateBranchResult cr = eng::dsd_rate_convert(
+                        src, want0, rta::dsp::DsdRateConvertConfig{}, conv);
+                    const double convMs = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - tc0).count();
+                    if (cr.ok && conv.rate == want0 && conv.bytesPerChannel() > 0) {
+                        play_log("DSD_RATE_CONVERT " + br.why +
+                                 " | srcBits=" + std::to_string((unsigned long long)src.bits) +
+                                 " outBits=" + std::to_string((unsigned long long)conv.bits) +
+                                 " ms=" + std::to_string((long long)(convMs + 0.5)) +
+                                 " srcPeak=" + std::to_string(cr.conv.srcPeak) +
+                                 " headroomDb=" + std::to_string(cr.conv.headroomDb));
+                        char nb[256];
+                        std::snprintf(nb, sizeof(nb),
+                            "（DSD→DSD 速率转换：%u → %u Hz，%s；转换 %.0f ms）",
+                            (unsigned)src.rate, (unsigned)want0, br.why.c_str(), convMs);
+                        dsdRateConvNote = nb;
+                        src = std::move(conv);       // 后续一切（ch/srcRate/DoP 回落）都看新流
+                    } else {
+                        char nb[320];
+                        std::snprintf(nb, sizeof(nb),
+                            "（DSD→DSD 速率转换失败：%s；已按源位率 %u Hz 输出）",
+                            cr.why.empty() ? "未知原因" : cr.why.c_str(), (unsigned)src.rate);
+                        dsdRateConvNote = nb;
+                        play_log(std::string("DSD_RATE_CONVERT_FAIL ") + dsdRateConvNote);
+                    }
+                } else {
+                    play_log("DSD_RATE_CONVERT_REJECT " + br.why);
+                }
+            }
+        }
+
         const int      ch         = src.channels;
         const uint32_t srcRate    = src.rate;
         const size_t   bytesTotal = src.bytesPerChannel();
         // 设置里选的 DSD 档位与源位率不同时：Native 按**源**位率直通（不重调制），必须写明，
         // 否则用户选了"Native 256"却按 64 播放，信号链看起来像"256 没生效"。
-        std::string rateNote;
+        std::string rateNote = dsdRateConvNote;   // 转换说明（无转换时为空）
         // 261025-02 #3/#5：native 只做**同速率**直通。用户要"DSD native 升频"时必须说清
         // "这台设备做不到什么、替代路径是什么"，而不是只丢一句"设置成跟随源"。
         // ⚠️ DSD→DSD 速率转换归 **DSD 调制专线**（AGENTS.md §8.6），这里只负责把限制讲明白。
@@ -3075,7 +3155,55 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         rta::dsp::GpuBridge::instance().reload();
         dlog("stage gpu-ok");
 
-        eng::PipelineConfig cfg;
+        eng::PipelineConfig cfg;      // 先声明：下面的 ReplayGain 判定要写 cfg.replayGainDb
+
+        // ---------------- ReplayGain（261027-01 #2；判据见 dsp/replaygain.h 文件头）----------------
+        // 这里只做「读标签 → 判定 → 写一个数」，不做任何音频运算：
+        //   * mode=off  ⟹ decide() 直接返回 active=false / appliedDb=0 ⟹ 管线收到 0 ⟹ 整段跳过；
+        //   * mode=track⟹ 逐曲标签优先，没有标签才用体检缓存里的计算值（本文件暂无缓存，留 valid=false）；
+        //   * mode=album⟹ 专辑标签/专辑响度优先，缺了才退回逐曲（decide 会把降级写进 source/note）。
+        // 峰值判据用的是【源峰值】（标签里的 REPLAYGAIN_TRACK_PEAK 就是源峰值），所以增益乘在，
+        // 且必须在升频/PEQ 之前 —— 否则 inter-sample 过冲已经产生，-peak_dBFS 这条界不成立。
+        {
+            rta::dsp::replaygain::Params rp;
+            rta::dsp::replaygain::Mode rgm = rta::dsp::replaygain::Mode::Off;
+            if (!rta::dsp::replaygain::parse_mode(p.rgMode, &rgm)) rgm = rta::dsp::replaygain::Mode::Off;
+            rp.mode = rgm;
+            rp.preventClipping = p.rgClip;
+            rta::dsp::replaygain::Track tr;
+            tr.path = file;
+            std::string rgWhy;
+            if (rgm != rta::dsp::replaygain::Mode::Off) {
+                if (!rta::dsp::replaygain::read_tags(file, &tr.tags, &rgWhy) && !rgWhy.empty())
+                    play_log("RG_TAGS 读标签未命中: " + rgWhy);
+            }
+            std::vector<rta::dsp::replaygain::AlbumInfo> albums;
+            if (rgm == rta::dsp::replaygain::Mode::Album)
+                albums = rta::dsp::replaygain::compute_albums(std::vector<rta::dsp::replaygain::Track>{tr});
+            const rta::dsp::replaygain::Decision rgd =
+                rta::dsp::replaygain::decide(tr, rp, albums.empty() ? nullptr : &albums);
+            cfg.replayGainDb = rgd.appliedDb;
+            {
+                std::lock_guard<std::mutex> lk(ps.mtx);
+                ps.rgMode   = rta::dsp::replaygain::mode_name(rgm);
+                ps.rgDb     = rgd.appliedDb;
+                ps.rgClip   = rgd.clipLimited;
+                ps.rgSource = rgd.source;
+            }
+            // 日志要能自证"这个 dB 是标签给的还是算出来的、有没有被防削波改过"
+            if (rgm != rta::dsp::replaygain::Mode::Off) {
+                std::ostringstream rs;
+                rs << "RG mode=" << rta::dsp::replaygain::mode_name(rgm)
+                   << " source=" << (rgd.source.empty() ? "-" : rgd.source)
+                   << " requested=" << rgd.requestedDb << "dB"
+                   << " applied=" << rgd.appliedDb << "dB"
+                   << " clipLimited=" << (rgd.clipLimited ? 1 : 0)
+                   << " peakDbfs=" << rgd.peakDbfs
+                   << " keyTrackGain=" << tr.tags.keyTrackGain;
+                play_log(rs.str());
+            }
+        }
+
         cfg.outBits = (p.bits > 0) ? p.bits : 24;
         if (!p.shaper.empty()) cfg.shaper = parse_shaper(p.shaper);
         cfg.volumeEnabled = true;
@@ -3651,6 +3779,10 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 << ",\"gpuVendor\":\"" << jesc(p.gpuVendor) << "\""
                 << ",\"gpuStatus\":\"" << jesc(rta::dsp::GpuBridge::instance().status()) << "\""
                 << ",\"volRamp\":" << cfg.volumeRampMs
+                // ReplayGain（261027-01 #2）：本次乘了多少 dB + 模式 + 是否被防削波改过。
+                // 信号链上必须看得见，否则"开了 RG 还是不是 bit-perfect"只能靠猜。
+                << ",\"rg\":" << cfg.replayGainDb
+                << ",\"rgMode\":\"" << jesc(p.rgMode.empty() ? std::string("off") : p.rgMode) << "\""
                 << ",\"bits\":" << outBits
                 << ",\"srcBits\":" << p.srcBits
                 << ",\"eq\":" << (eqLoaded ? "true" : "false")
@@ -3665,6 +3797,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                        if (outRate != in.rate) return std::string("no");
                        if (cfg.volumeEnabled && std::fabs(cfg.volumeDb) > 1e-9) return std::string("no");
                        if (cfg.shaper != rta::dsp::Shaper::None) return std::string("no");
+                       if (std::fabs(cfg.replayGainDb) > 1e-9) return std::string("no");   // RG 改样本值
                        // 2026-10-24（261024-02 #8）：attenDb 是**滤波器阻带衰减设计值**（如 120 dB），
                        // 不是信号增益！以前拿它判"衰减"⟹ 只要选了滤波器预设就永远非 bit-perfect（误报）。
                        // 真正的信号衰减是 preAttenDb（ISP/调制器余量预衰减）。
@@ -3679,6 +3812,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                        if (outRate != in.rate) why.push_back("重采样 " + std::to_string(in.rate) + "→" + std::to_string(outRate) + " Hz");
                        if (cfg.volumeEnabled && std::fabs(cfg.volumeDb) > 1e-9) why.push_back("音量 " + std::to_string((int)std::lround(cfg.volumeDb)) + " dB");
                        if (cfg.shaper != rta::dsp::Shaper::None) why.push_back("抖动/整形");
+                       if (std::fabs(cfg.replayGainDb) > 1e-9)
+                           why.push_back("ReplayGain " + std::to_string((int)std::lround(cfg.replayGainDb)) + " dB");
                        if (cfg.preAttenDb > 1e-9) why.push_back("预衰减");
                        if (eqLoaded) why.push_back("EQ");
                        if (convLoaded) why.push_back("IR 卷积");
@@ -3704,6 +3839,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                     if (outRate != in.rate) why.push_back("重采样 " + std::to_string(in.rate) + "→" + std::to_string(outRate) + " Hz");
                     if (cfg.volumeEnabled && std::fabs(cfg.volumeDb) > 1e-9) why.push_back("音量 " + std::to_string((int)std::lround(cfg.volumeDb)) + " dB");
                     if (cfg.shaper != rta::dsp::Shaper::None) why.push_back("抖动/整形");
+                    if (std::fabs(cfg.replayGainDb) > 1e-9)
+                        why.push_back("ReplayGain " + std::to_string((int)std::lround(cfg.replayGainDb)) + " dB");
                     if (cfg.preAttenDb > 1e-9) why.push_back("预衰减");   // 见上方口径注：attenDb 是滤波设计值
                     if (eqLoaded) why.push_back("EQ");
                     if (convLoaded) why.push_back("IR 卷积");
@@ -4109,6 +4246,10 @@ static std::string path_in_exe_dir(const char* name) {
 }
 
 // ---------------- 艺术家头像（外部来源；2026-10-25 用户钦定）----------------
+// 2026-10-27：抓取本体在 src/meta/artwork.h（能力矩阵派生 + 全信源 + 负缓存）。
+// 之所以把 include 放在这里而不是文件头：这个区块是本轮唯一改动范围（另一个代理在改
+// /api/devices，头部 include 区不动可避免冲突）。enrich.h 本来也传递引入它。
+#include "meta/artwork.h"
 // 需求原话：「不许再用专辑封面顶替，取不到就留空」。
 //
 // 端点契约（2026-10-26 第二版：请求线程绝不发网络）：
@@ -4137,7 +4278,35 @@ static std::string path_in_exe_dir(const char* name) {
 //
 // 兜底开关：环境变量 RLPLAYER_ARTISTIMG_HOST（scheme://host）可把请求指到别处
 // （自动化测试用不可达域名验证「不崩、不阻塞」；此时缓存命中不再成立 —— 缓存与来源绑定）。
-static constexpr int    kArtistImgBudgetMs   = 6000;              // 单个艺人总预算（硬上限）
+//
+// ---------------------------------------------------------------------------
+// 2026-10-27：头像改为**全信源统一调度**（用户 261026-05/06、261025-02 反复要求）
+// ---------------------------------------------------------------------------
+// 用户原话：「头像也不应该仅接入网易云一个信源，应该是全信源接入。请你核查你当前信源的
+// 使用到底是怎么回事，谁告诉你直接入一个信源的。请你不要偷懒！」
+// 第一版（下面这段历史）只打网易云 type=100 取**第一个** picUrl —— 真实库 246 位艺人里
+// 145 位只剩首字母，根因就是「谁能提供什么」被写死成了「谁当初实现了哪个函数」。
+//
+// 现在抓取本体整体搬到 src/meta/artwork.h，本文件只保留端点契约/线程/日志：
+//   * 候选源由 provider.h 的**能力矩阵**(ArtCap::ArtistImage)派生，不是这里写死的名单；
+//     顺序 = dizzylab → QQ(musicu 歌手搜索) → 网易云 → Discogs(匿名，25/min 内部节流)；
+//   * 每个源都必须**名字精确匹配**才采纳 —— 实测宽松匹配会张冠李戴：
+//       dizzylab「炒饭」→「铁棍山药炒饭」、「MhT」→「MHTWSNBB666」、
+//       「洛天依」→「超绝可爱洛天依」、QQ「Khrisma」→「Kharisma」；
+//   * 全失败就**留空**（用户 2026-10-25 钦定，绝不用专辑封面顶替）；
+//   * 负缓存逐源记录原因（<fnv>.none 变成文本：src=<id> kind=miss|fail reason=…），
+//     命中负缓存时**零网络**；瞬态失败(断网/超时)只记原因、下次仍重试；
+//   * 正缓存旁多一个 <fnv>.src 溯源文件（source/url/bytes/ts），报告与排查用。
+//
+// 历史（第一版实现，保留备查）：网易云 POST /api/search/get type=100 limit=1 → 抠 picUrl
+// → GET 图片，>1KB 收；失败写空 .none 文件；单艺人预算 6 s（搜索/下载各 3 s）。
+// 这段逻辑已被 meta::artwork 取代，唯一保留的是「取不到就留空、绝不用专辑封面顶替」。
+static constexpr int    kArtistImgTotalBudgetMs = 12000;          // 单个艺人总预算（四源链硬上限）
+// 为什么从 6 s 放宽到 12 s（2026-10-27 全信源改造）：旧版只有「网易搜索+下载」两跳；
+// 现在最多 4 个源 ×（搜索 1 跳 + 下载 1 跳），且 dizzylab 有 1 req/s 礼节限频。
+// 实测正常命中 0.4~1.2 s、四源全落空 2.5~3.5 s，12 s 只是兜底；仍在后台线程，
+// 与 WebUi 单线程 accept 无关（请求线程永远零网络）。
+[[maybe_unused]] static constexpr int kArtistImgBudgetMs = kArtistImgTotalBudgetMs;  // 兼容旧名
 static constexpr int    kArtistImgSearchMs   = 3000;              // 搜索单跳上限
 static constexpr int    kArtistImgDownloadMs = 3000;              // 下载单跳上限
 static constexpr size_t kArtistImgMinBytes   = 1024;              // 小于它当「没有头像」
@@ -4169,7 +4338,9 @@ static std::string artistimg_pct(const std::string& s) {
 }
 
 // 从 JSON 里抠 "picUrl":"..."（只用于网易搜索这一种小响应；不为它引入 JSON 库）。
-static std::string artistimg_pic_url(const std::string& js) {
+// 2026-10-27：全信源改造后抓取走 meta/artwork.h（用 net/json.h 正规解析），本函数
+// 不再被调用 —— 保留是因为旧 .none/日志里引用过它，删掉会让 review 失去对照。
+[[maybe_unused]] static std::string artistimg_pic_url(const std::string& js) {
     static const std::string kKey = "\"picUrl\"";
     size_t p = 0;
     while ((p = js.find(kKey, p)) != std::string::npos) {
@@ -4231,14 +4402,17 @@ static bool artistimg_read_file(const std::string& p, std::string& out, size_t c
 }
 
 // 落盘负缓存（空文件）。mtime 已是现在 ⟹ 之后 7 天内命中。
-static void artistimg_touch_none(const std::string& p) {
+// 2026-10-27：负缓存改由 meta/artwork.h 写（文本，逐源 kind/reason）；此函数保留备用。
+[[maybe_unused]] static void artistimg_touch_none(const std::string& p) {
     std::error_code ec;
     const size_t slash = p.find_last_of('\\');
     if (slash != std::string::npos) fs::create_directories(fs::u8path(p.substr(0, slash)), ec);
     std::ofstream f(fs::u8path(p), std::ios::binary | std::ios::trunc);
 }
 
-static std::string artistimg_env_host() {
+// 2026-10-27：域名兜底改由 meta::artwork 读环境变量（RLPLAYER_ARTISTIMG_HOST 及
+// _QQ/_DZ/_DC 四个），此函数保留以维持旧行为可查。
+[[maybe_unused]] static std::string artistimg_env_host() {
     char* v = nullptr;
     size_t n = 0;
     std::string host;
@@ -4267,83 +4441,48 @@ static std::string artist_avatar_cached(const std::string& name, bool* from_cach
 // 返回值只用于统计：ok = 拿到并写盘；miss = 确实没有（写 .none）；fail = 瞬态失败（不写 .none）。
 enum class ArtistImgOutcome { Ok, Miss, Fail };
 
+// 2026-10-27：本体改为调用 meta::artwork（全信源；候选源由能力矩阵派生）。
+// 这里只做三件事：把 rtaweb 的缓存目录/预算/阈值传下去；把结果映射回 Ok/Miss/Fail；
+// 把**逐源失败原因**塞进 detail（后台日志 ARTISTIMG bg ... 会原样落盘，便于排查）。
+// 缓存文件布局不变（<exe>\artistimg\<fnv>.jpg / .src / .none），旧缓存继续有效。
 static ArtistImgOutcome artist_avatar_fetch(const std::string& name, std::string* detail, long long* bytesOut) {
     const auto t0 = std::chrono::steady_clock::now();
     auto elapsed_ms = [&]() {
         return (int)std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::steady_clock::now() - t0).count();
     };
-    const ArtistImgPaths pp = artistimg_paths(name);
-    std::string pic;
-    std::string err;
-    bool transient = false;      // 瞬态失败（超时/断网/异常）⟹ 不写 7 天负缓存
 
+    rta::meta::ArtworkOpts o;
+    o.cacheDir      = path_in_exe_dir("artistimg");
+    o.useCache      = true;
+    o.negTtlSec     = kArtistImgNegSec;        // 7 天（与旧版同口径）
+    o.totalBudgetMs = kArtistImgTotalBudgetMs; // 四源链总预算（见常量注释）
+    o.perSourceMs   = kArtistImgSearchMs;
+    o.downloadMs    = kArtistImgDownloadMs;
+    o.minBytes      = kArtistImgMinBytes;
+    // 环境变量 RLPLAYER_ARTISTIMG_HOST（网易云）与 _QQ/_DZ/_DC 由 artwork.h 自己读，
+    // 语义与旧版一致：把请求指到别处（自动化测试用不可达域名验证「不崩、不阻塞」）。
+
+    rta::meta::ArtistImageResult r;
     try {
-        std::string host = artistimg_env_host();
-        if (host.empty()) host = "https://music.163.com";
-        const std::string surl = host + "/api/search/get";
-        const std::string body = "s=" + artistimg_pct(name) + "&type=100&limit=1&offset=0";
-        const std::vector<std::string> hdr = {
-            "User-Agent: Mozilla/5.0",
-            "Referer: https://music.163.com/",
-        };
-        int remain = kArtistImgBudgetMs - elapsed_ms();
-        if (remain > 0) {
-            const int to = remain < kArtistImgSearchMs ? remain : kArtistImgSearchMs;
-            auto sr = rta::net::http_post(surl, body, hdr, "application/x-www-form-urlencoded", to);
-            const std::string js(sr.body.begin(), sr.body.end());
-            if (sr.ok && sr.status == 200) {
-                pic = artistimg_pic_url(js);
-                if (pic.empty()) err = "search 无 picUrl";
-            } else {
-                err = "search HTTP " + std::to_string(sr.status) + " " + sr.error;
-                transient = (sr.status == 0);
-            }
-        } else {
-            err = "budget exhausted before search";
-            transient = true;
-        }
-        if (!pic.empty()) {
-            remain = kArtistImgBudgetMs - elapsed_ms();
-            if (remain > 0) {
-                const int to = remain < kArtistImgDownloadMs ? remain : kArtistImgDownloadMs;
-                auto ir = rta::net::http_get(pic,
-                                             {"User-Agent: Mozilla/5.0", "Referer: https://music.163.com/"}, to);
-                if (ir.ok && ir.status == 200 && ir.body.size() >= kArtistImgMinBytes) {
-                    std::string bytes(ir.body.begin(), ir.body.end());
-                    std::error_code ec;
-                    fs::create_directories(fs::u8path(pp.dir), ec);
-                    std::ofstream f(fs::u8path(pp.jpg), std::ios::binary | std::ios::trunc);
-                    if (f) f.write(bytes.data(), (std::streamsize)bytes.size());
-                    std::error_code el;
-                    fs::remove(fs::u8path(pp.none), el);     // 有图了，旧的负缓存作废
-                    if (detail) *detail = pic;
-                    if (bytesOut) *bytesOut = (long long)bytes.size();
-                    return ArtistImgOutcome::Ok;
-                }
-                if (ir.ok && ir.status == 200) {
-                    err = "图片太小 " + std::to_string(ir.body.size()) + "B";
-                } else {
-                    err = "download HTTP " + std::to_string(ir.status) + " " + ir.error;
-                    transient = (ir.status == 0);
-                }
-            } else {
-                err = "budget exhausted before download";
-                transient = true;
-            }
-        }
+        r = rta::meta::artwork_fetch_artist_image(name, o);
     } catch (const std::exception& e) {
-        err = std::string("exception: ") + e.what();
-        transient = true;
+        if (detail) *detail = std::string("exception: ") + e.what();
+        return ArtistImgOutcome::Fail;
     } catch (...) {
-        err = "exception: unknown";
-        transient = true;
+        if (detail) *detail = "exception: unknown";
+        return ArtistImgOutcome::Fail;
     }
 
-    if (!transient) {
-        try { artistimg_touch_none(pp.none); } catch (...) {}
+    bool transient = false;
+    for (const auto& t : r.tried) if (t.transient) transient = true;
+
+    if (r.ok) {
+        if (bytesOut) *bytesOut = (long long)r.bytes.size();
+        if (detail) *detail = r.url + " src=" + r.source + " ms=" + std::to_string(elapsed_ms());
+        return ArtistImgOutcome::Ok;
     }
-    if (detail) *detail = err + " ms=" + std::to_string(elapsed_ms());
+    if (detail) *detail = r.summary() + " ms=" + std::to_string(elapsed_ms());
     return transient ? ArtistImgOutcome::Fail : ArtistImgOutcome::Miss;
 }
 
@@ -8240,6 +8379,12 @@ static bool is_side_effect_path(const std::string& p) {
         // 房间校正：measure 会**发出可闻扫频**并写 data\roomcorr\*.json，cancel 会打断测量
         // —— 都是纯副作用，只接受 POST（只读端点是 layouts / status / download）。
         "/api/roomcorr/measure", "/api/roomcorr/cancel",
+        // 版本对比（B3）：会把 N 个文件各解码一遍（秒级 CPU）⟹ 只接受 POST，
+        // 否则一个 <img src=".../api/compare?files=..."> 就能让服务端反复满载。
+        "/api/compare",
+        // 一键反馈（261027-01 #1）：会打网络 + 往仓库写文件 ⟹ 纯副作用，只接受 POST
+        //（否则一个 <img src=".../api/feedback?title=..."> 就能替用户提交反馈）
+        "/api/feedback",
     };
     for (const char* k : kNeedPost) {
         const size_t n = std::strlen(k);
@@ -11519,7 +11664,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                                            // 元数据补全(P1.5):总开关与 LLM 固定两键;
                                            // 源开关 metasrc_<id> 按注册表动态放行(见下);
                                            // P3④b AI 综合开关 metasummary (默认0)
-                                           "metaon", "metallm", "metasummary", "llmmonthlycap", "scanthreads", "scanThreads" })
+                                           "metaon", "metallm", "metasummary", "llmmonthlycap", "scanthreads", "scanThreads",
+                                           // ReplayGain（261027-01 #2）：模式与防削波。默认 off ⟹ 直通
+                                           "rgmode", "rgclip" })
                     if (k == allow) okKey = true;
                 if (!okKey && k.rfind("metasrc_", 0) == 0) {
                     const std::string id = k.substr(8);
@@ -11627,8 +11774,33 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             if (d.state != DEVICE_STATE_ACTIVE) continue;
             if (!first) j << ",";
             first = false;
+            // 261026-09 #4：每个设备带上 **Windows 混音格式**（GetMixFormat，只读探测，不开流、
+            // 不出声）。前端用它把「声道音量微调」按设备实际声道数生成 —— 用户选了 5.1 的
+            // VBMatrix In 2，微调却只有 L/R 两行，根因就是前端只会用固定值 2。
+            // 字段：channels（混音声道数）/ mixRate（混音采样率）/ mixBits（容器位深）/ mixFmt。
+            // 探测失败的设备如实给 0，前端回退到「跟随源」的旧行为，绝不编造数字。
+            int devCh = 0, devBits = 0; uint32_t devRate = 0; std::string devFmtName = "unknown";
+            {
+                uint32_t mr = 0; int mc = 0; bool mf = false; std::string me;
+                rta::audio::SharedSampleFmt fmt = rta::audio::SharedSampleFmt::Unsupported;
+                if (WasapiSharedOutput::query_mix_format(d.id, mr, mc, mf, me, &fmt)) {
+                    devRate = mr; devCh = mc;
+                    switch (fmt) {
+                        case rta::audio::SharedSampleFmt::Float32: devBits = 32; devFmtName = "float32"; break;
+                        case rta::audio::SharedSampleFmt::Int16:   devBits = 16; devFmtName = "int16";   break;
+                        case rta::audio::SharedSampleFmt::Int24:   devBits = 24; devFmtName = "int24";   break;
+                        case rta::audio::SharedSampleFmt::Int24In32: devBits = 32; devFmtName = "int24in32"; break;
+                        case rta::audio::SharedSampleFmt::Int32:   devBits = 32; devFmtName = "int32";   break;
+                        default: devBits = 0; devFmtName = "unsupported"; break;
+                    }
+                }
+            }
             j << "{\"id\":\"" << jesc(d.id) << "\",\"name\":\"" << jesc(d.name) << "\""
-              << ",\"default\":" << (d.isDefault ? "true" : "false") << "}";
+              << ",\"default\":" << (d.isDefault ? "true" : "false")
+              << ",\"channels\":" << devCh
+              << ",\"mixRate\":" << devRate
+              << ",\"mixBits\":" << devBits
+              << ",\"mixFmt\":\"" << jesc(devFmtName) << "\"}";
         }
         // ASIO 驱动一起带出（用户 261025-02 #4）：设置页切到 ASIO 后端时**不必再单独打一个端点**，
         // 一个 /api/devices 就能把"WASAPI 端点 + ASIO 驱动 + 当前生效驱动"全部填进同一个下拉。
@@ -12434,6 +12606,174 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return j.str();
     }
 
+    // ---------------- 一键反馈（261027-01 #1；实现见 src/net/feedback.h）----------------
+    // 语义：POST 一段用户手打文字（type/title/body/steps）+ 我们自动采集的现场快照
+    //       → 打包成一个 JSON 上传到仓库 feedback/（无凭据时降级落 exe 同目录 feedback-outbox\
+    //       并把绝对路径回给界面，界面要显示它）。
+    // 为什么必须只接受 POST：本端点会打网络 + 往仓库写文件，GET 能触发的端点等于把
+    // 「谁都能替用户提交反馈」写进 URL（已进 kNeedPost，非 POST 在上游就 405）。
+    if (rq.path.rfind("/api/feedback", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        rta::feedback::LiveState lv;
+        lv.source = "rtaweb";
+        {
+            // 字段成组取自 ps（与 /api/status 同一口径）；必须持锁读，见 PlayerState::mtx 注释
+            std::lock_guard<std::mutex> lk(ps.mtx);
+            lv.playing   = ps.playing.load();
+            lv.paused    = ps.paused.load();
+            lv.track     = ps.current;
+            lv.lastError = ps.error;
+            lv.outMode   = ps.outMode;
+            lv.outRate   = (long long)ps.outRate;
+            lv.outBits   = ps.outBits;
+        }
+        // settings：把 conf 原样给出去（feedback.h 会解析→逐字段脱敏→重新序列化，
+        // token/api_key 一类键进不了 payload）。读不到就只有空对象，不影响提交。
+        {
+            std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
+            std::ostringstream sj;
+            sj << "{";
+            std::string line;
+            bool firstKv = true;
+            while (std::getline(f, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                const size_t e = line.find('=');
+                if (e == std::string::npos || e == 0) continue;
+                if (!firstKv) sj << ",";
+                firstKv = false;
+                sj << "\"" << jesc(line.substr(0, e)) << "\":\"" << jesc(line.substr(e + 1)) << "\"";
+            }
+            sj << "}";
+            lv.settingsJson = sj.str();
+        }
+        return rta::feedback::web_handler(rq.body, lv);
+    }
+
+    // ---------------- 音质分析（B2 quality.h → track_health.h 的 quality 段）----------------
+    // GET/POST /api/health?file=<绝对路径>[&whole=1]
+    // 返回 track_health_json()：老字段（dr_db/lufs/lra/peak_dbfs/cutoff_hz/fake24…）一个没动，
+    // 新增 quality 段（19 项）。默认流式分块（内存与曲长无关），whole=1 强制整曲解码（对照/排错）。
+    // 只读文件、不开任何音频设备。
+    if (rq.path.rfind("/api/health", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        std::string file;
+        bool whole = false;
+        const size_t q = rq.path.find("?file=");
+        if (q != std::string::npos) {
+            file = urlDecode(rq.path.substr(q + 6));
+            const size_t amp = file.find('&');       // 后面可能还有 &whole=1
+            if (amp != std::string::npos) file = file.substr(0, amp);
+        }
+        if (rq.path.find("whole=1") != std::string::npos) whole = true;
+        if (file.empty()) return std::string("{\"ok\":false,\"error\":\"缺少 file 参数\"}");
+        if (!valid_utf8(file)) return utf8_path_reject(file);
+        rta::analysis::TrackHealth h = whole
+            ? rta::analysis::analyze_file_whole(file)
+            : rta::analysis::analyze_file(file, rta::analysis::HealthStreamOptions{});
+        return std::string("{\"ok\":") + (h.status == "ready" ? "true" : "false") +
+               ",\"health\":" + rta::analysis::track_health_json(h) + "}";
+    }
+
+    // ---------------- 版本对比（B3 version_compare.h）----------------
+    // POST /api/compare   body: {"files":["D:\\a.flac","D:\\b.mp3", …]}   （2~8 个）
+    // 语义（判据见 version_compare.h 文件头）：先按 200 Hz 包络互相关对齐（不同母带的前导静音
+    // 不同、时长不同，不对齐就没法逐项比），再在【公共区段】上重算全部指标，最后给
+    // 「逐项对比表 + 可比性 + 排序 + 确定性解释」。不可比项（位深/采样率/声道不同）照样列数值
+    // 但 comparable=false + 中文原因，且不参与评分。
+    if (rq.path.rfind("/api/compare", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        std::vector<std::string> files;
+        {
+            const rta::net::Json j = rta::net::json_parse(rq.body);
+            const rta::net::Json& fa = j["files"];
+            for (size_t i = 0; i < fa.size(); ++i) {
+                const std::string pth = fa.at(i).s();
+                if (!pth.empty()) files.push_back(pth);
+            }
+            // 兼容表单写法 files=a&files=b / paths=| 分隔：解析器只认 JSON，这里兜一层
+            if (files.empty() && !rq.body.empty()) {
+                std::istringstream is(rq.body);
+                std::string tok;
+                while (std::getline(is, tok, '&')) {
+                    const size_t e = tok.find('=');
+                    if (e == std::string::npos) continue;
+                    const std::string k = urlDecode(tok.substr(0, e));
+                    if (k != "file" && k != "files" && k != "paths") continue;
+                    std::string v = urlDecode(tok.substr(e + 1));
+                    std::istringstream vs(v);
+                    std::string one;
+                    while (std::getline(vs, one, '|')) if (!one.empty()) files.push_back(one);
+                }
+            }
+        }
+        if (files.size() < 2)
+            return std::string("{\"ok\":false,\"error\":\"至少需要 2 个文件路径（body: "
+                               "{\\\"files\\\":[\\\"D:\\\\a.flac\\\",\\\"D:\\\\b.mp3\\\"]}）\"}");
+        if (files.size() > 8)
+            return std::string("{\"ok\":false,\"error\":\"一次最多对比 8 个版本（收到 ") +
+                   std::to_string(files.size()) + " 个）\"}";
+        for (const auto& pth : files) if (!valid_utf8(pth)) return utf8_path_reject(pth);
+        rta::analysis::CompareOptions co;
+        rta::analysis::VersionCompare vc = rta::analysis::compare_versions(files, co);
+        // compare_versions 只做「对齐 + 公共区段重算指标」；逐项对比表 / 评分 / 排序 / 解释
+        // 是 score_versions 的职责（version_compare.h:476 的注释就是这么分的）。
+        // 不调这一步 ⟹ rows/ranking/explanation 全空，界面只会看到一张空表（实测踩过）。
+        rta::analysis::score_versions(vc);
+        std::ostringstream j;
+        j << "{\"ok\":" << (vc.ok ? "true" : "false")
+          << ",\"error\":\"" << jesc(vc.error) << "\""
+          << ",\"sameTrack\":" << (vc.sameTrack ? "true" : "false")
+          << ",\"sameTrackCorr\":" << vc.sameTrackCorr
+          << ",\"windowSec\":" << vc.windowSec
+          << ",\"windowFrames\":" << (unsigned long long)vc.windowFrames
+          << ",\"enrollMs\":" << vc.enrollMs
+          << ",\"alignMs\":" << vc.alignMs
+          << ",\"analyzeMs\":" << vc.analyzeMs
+          << ",\"explanation\":\"" << jesc(vc.explanation) << "\""
+          << ",\"versions\":[";
+        for (size_t i = 0; i < vc.versions.size(); ++i) {
+            const auto& v = vc.versions[i];
+            if (i) j << ",";
+            j << "{\"path\":\"" << jesc(v.path) << "\""
+              << ",\"label\":\"" << jesc(v.label) << "\""
+              << ",\"error\":\"" << jesc(v.error) << "\""
+              << ",\"fs\":" << v.fs
+              << ",\"channels\":" << v.channels
+              << ",\"bits\":" << v.bits
+              << ",\"durationSec\":" << v.durationSec
+              << ",\"lagSec\":" << v.lagSec
+              << ",\"envCorr\":" << v.envCorr
+              << ",\"analyzed\":" << (v.analyzed ? "true" : "false")
+              << ",\"score\":" << (i < vc.scores.size() ? vc.scores[i] : 0.0)
+              << ",\"rank\":" << [&] {
+                     for (size_t r = 0; r < vc.ranking.size(); ++r) if (vc.ranking[r] == i) return (int)r + 1;
+                     return 0; }()
+              << "}";
+        }
+        j << "],\"rows\":[";
+        for (size_t i = 0; i < vc.rows.size(); ++i) {
+            const auto& row = vc.rows[i];
+            if (i) j << ",";
+            j << "{\"key\":\"" << jesc(row.key) << "\""
+              << ",\"label\":\"" << jesc(row.label) << "\""
+              << ",\"unit\":\"" << jesc(row.unit) << "\""
+              << ",\"higherBetter\":" << (row.higherBetter ? "true" : "false")
+              << ",\"informational\":" << (row.informational ? "true" : "false")
+              << ",\"comparable\":" << (row.comparable ? "true" : "false")
+              << ",\"why\":\"" << jesc(row.why) << "\""
+              << ",\"bestIndex\":" << (unsigned long long)row.bestIndex
+              << ",\"values\":[";
+            for (size_t k = 0; k < row.values.size(); ++k) { if (k) j << ","; j << row.values[k]; }
+            j << "]}";
+        }
+        j << "],\"scores\":[";
+        for (size_t i = 0; i < vc.scores.size(); ++i) { if (i) j << ","; j << vc.scores[i]; }
+        j << "],\"ranking\":[";
+        for (size_t i = 0; i < vc.ranking.size(); ++i) { if (i) j << ","; j << (unsigned long long)vc.ranking[i]; }
+        j << "]}";
+        return j.str();
+    }
+
     // 应用标识：启动器用它区分"本程序的实例"和"别的程序占了这个端口"
     if (rq.path.rfind("/api/ping", 0) == 0) {
         ct = "application/json; charset=utf-8";
@@ -12717,6 +13057,11 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
           << ",\"dur\":" << dur
           << ",\"outRate\":" << rateStat
           << ",\"outBits\":" << bitsStat
+          // ReplayGain（261027-01 #2）：rg = 模式（off/track/album），rgDb = 本次实际乘的 dB，
+          // rgClip = 是否被防削波改过。mode=off 时 rgDb 必须是 0（= 一个样本都没碰）。
+          << ",\"rg\":\"" << jesc(castMode ? std::string("off") : ps.rgMode) << "\""
+          << ",\"rgDb\":" << (castMode ? 0.0 : ps.rgDb)
+          << ",\"rgClip\":" << ((!castMode && ps.rgClip) ? "true" : "false")
           << ",\"gpu\":" << (gpuF.gpu ? "true" : "false")
           << ",\"gpuUsed\":" << (gpuF.gpuUsed ? "true" : "false")
           << ",\"gpuResample\":" << (gpuF.gpuResample ? "true" : "false")

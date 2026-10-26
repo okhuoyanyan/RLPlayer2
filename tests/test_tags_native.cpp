@@ -20,6 +20,24 @@
 //   [5] WAV 专项（261025 收尾）：MUSIC 的 71 个 WAV **逐个** A/B（0 差异）、原生命中数必须 71/71
 //       （改动前 19/71，差的 52 个就是 51 个 "id3 " 块 + 1 个 bext），并把整个 MUSIC 曲库
 //       用 Library 全量扫两遍（RLPLAYER_NATIVE_TAGS=0/1）比索引字节。
+//   [6] 261026-02 #4「问号标签智能修复」合成夹具：R1 同键择优 / R1b 等长码点拼接 / R2 只覆盖残缺值 /
+//       R3 文件名兜底 / 总开关 RLPLAYER_TAG_GUESS=0；**外加** 261027-01 的「'?' 填坑」纯函数判据
+//       （qm_has_q_run / tag_fill_from_equal_shape / qm_hole_pattern_match，各配反向样本）。
+//   [7] 真实库逐条对比（GUESS=1 vs GUESS=0）：非占位字段零改动 + 带 '?' 行数下降。
+//       **261026-02 收尾的验收基线：ASCII '?' 21 行 / 402 个字符 -> 2 行 / 9 个字符。**
+//   [8] 261027-01「'?' 填坑」真实库 A/B（RLPLAYER_TAG_FILL=0 vs =1）：
+//       零误伤（不含连续 '??' 的字段逐字节相同）+ ASCII '?' 行/字符数下降 + 全角 '？' 个数不变。
+//       **261027-01 的验收基线：ASCII '?' 2 行 / 9 个字符 -> 0 行 / 0 个字符（全角 '？' 仍 7 个）。**
+//   [9] 261027-01 阶段 2/3：外部源补全（set_online_finder 的**桩**，不联网）与文件名模式匹配的
+//       接受/拒绝判据，以及 RLPLAYER_TAG_ONLINE=0 能单独关掉外部源阶段。
+//
+// ⚠️ 261027-01 的已知边界（铁律 4，不许当成"已覆盖"）：
+//   a) 外部源阶段需要调用方注入发现者（rta::meta::native::set_online_finder）。本仓库的
+//      src/meta/enrich.h / net/library.h 里**还没有**这一行，所以线上运行时该阶段空转 ——
+//      [9] 只证明"接上就能用"。真实源（QQ/网易云/iTunes/dizzylab）到底返回什么，属外部服务可用性。
+//   b) 填坑规则只处理「连续 >= 2 个 ASCII '?'」；单个 '?' 一律不动（正常问号不可区分）。
+//   c) 「1 个 '?' = 1 个丢失字符」是写盘工具的实测行为（本库 2 个案例都成立）；若将来遇到
+//      一个 '?' 代表多个字符的文件，本规则会拒绝（宁可不修，也不会修错）。
 //
 // ⚠️ 未解决项（铁律 4）：
 //   1) WAV 的 iXML/axml 仍**主动回退** ffprobe：XML 字段到 ffprobe 键的映射没实测过，
@@ -493,7 +511,81 @@ static bool tgIsPlaceholderTag(const std::string& s) {
     // 说明：这里的函数名保留旧名，避免改动十几处调用点；语义是"这个值是不是坏的（问号占大头）"。
     return rta::meta::native::detail::tag_is_corrupt(s);
 }
-static int g_allowedImprove = 0;
+static int g_allowedImprove = 0;      // 「ffprobe 占位 -> 原生真名」的改进数
+static int g_allowedFill = 0;         // 261027-01 新增：「ffprobe 带连续 '?' -> 原生填坑补齐」的改进数
+
+// 261027-01：第二种**已解释的改进** —— ffprobe 拿到的值里有连续 '?'（写盘工具吃掉的段），
+// 原生解析把这段补上了（同文件另一份来源有完整值）。
+// 判据在这里**独立实现**（自己数码点、逐位比较），刻意不调用 tags_native.h 的 tag_fill_from_equal_shape ——
+// 用被测实现当 oracle 等于没测（铁律 3）：
+//   * ff 里至少一段连续 >= 2 个 ASCII '?'；nat 里一个 ASCII '?' 都没有；
+//   * 两者**码点数完全相等**；
+//   * 逐位：ff 是 '?' ⟹ nat 该位是实义字符（非空白/标点）；否则 ff 与 nat 相同，或两边都是标点。
+static std::vector<std::string> qmCpSplit(const std::string& s) {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = (unsigned char)s[i];
+        size_t len = 1;
+        if ((c & 0x80u) == 0) len = 1;
+        else if ((c & 0xE0u) == 0xC0u) len = 2;
+        else if ((c & 0xF0u) == 0xE0u) len = 3;
+        else if ((c & 0xF8u) == 0xF0u) len = 4;
+        if (i + len > s.size()) len = 1;
+        out.push_back(s.substr(i, len));
+        i += len;
+    }
+    return out;
+}
+static unsigned qmCpValue(const std::string& cp) {
+    if (cp.empty()) return 0xFFFFFFFFu;
+    const unsigned char c0 = (unsigned char)cp[0];
+    const size_t len = cp.size();
+    if (len == 1) return (unsigned)c0;
+    unsigned v = 0;
+    if (len == 2)      v = c0 & 0x1Fu;
+    else if (len == 3) v = c0 & 0x0Fu;
+    else               v = c0 & 0x07u;
+    for (size_t k = 1; k < len; ++k) v = (v << 6) | ((unsigned char)cp[k] & 0x3Fu);
+    return v;
+}
+// 标点/符号（ASCII 标点 + 常见中日文标点区段）。只用于「非 '?' 位允许标点差异」这一条，
+// 例如 GENESIS 那条例子里 ff 是半角 ':'、nat 是全角 '：'。
+static bool qmCpIsPunct(const std::string& cp) {
+    const unsigned v = qmCpValue(cp);
+    if (v == 0xFFFFFFFFu) return false;
+    if (v < 0x80) {
+        if ((v >= '0' && v <= '9') || (v >= 'A' && v <= 'Z') || (v >= 'a' && v <= 'z')) return false;
+        return true;
+    }
+    if (v == 0x3000 || v == 0x00A0) return true;
+    if (v >= 0x2000 && v <= 0x2BFF) return true;
+    if (v >= 0x3001 && v <= 0x303F) return true;
+    if (v >= 0xFE10 && v <= 0xFE6F) return true;
+    if (v >= 0xFF01 && v <= 0xFF20) return true;
+    if (v >= 0xFF3B && v <= 0xFF40) return true;
+    if (v >= 0xFF5B && v <= 0xFF65) return true;
+    return false;
+}
+static bool qmFillExplained(const std::string& ff, const std::string& nat) {
+    if (ff.empty() || nat.empty() || ff == nat) return false;
+    if (nat.find('?') != std::string::npos) return false;
+    // ff 里必须有一段连续 >= 2 个 '?'
+    size_t run = 0; bool hole = false;
+    for (const char c : ff) { if (c == '?') { if (++run >= 2) { hole = true; break; } } else run = 0; }
+    if (!hole) return false;
+    const std::vector<std::string> a = qmCpSplit(ff), b = qmCpSplit(nat);
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i] == "?") {
+            if (b[i] == "?" || b[i] == " " || b[i] == "\t") return false;
+            continue;
+        }
+        if (a[i] == b[i]) continue;
+        if (qmCpIsPunct(a[i]) && qmCpIsPunct(b[i])) continue;
+        return false;
+    }
+    return true;
+}
 
 // 两份索引的容错比较（2026-10-26，261025-02 #6）：除了 title 列里
 // 「ffprobe 是占位问号、原生是真名」这一类**已解释的改进**，其余必须逐字节相同。
@@ -522,6 +614,8 @@ static IndexCmp cmpIndexWithPlaceholderImprove(const std::string& a, const std::
             if (fa[k] == fb[k]) continue;
             // 3=album 4=albumArtist 5=artist 6=title：都是标签文本列，都可能出现"标签本身是问号"的文件
             if (k >= 3 && k <= 6 && tgIsPlaceholderTag(fa[k]) && !tgIsPlaceholderTag(fb[k])) { ++r.improve; continue; }
+            // 261027-01：'?' 填坑（同长同形补齐）也是"已解释的改进"，判据见 qmFillExplained
+            if (k >= 3 && k <= 6 && qmFillExplained(fa[k], fb[k])) { ++r.improve; continue; }
             okLine = false;
             r.why = "行 " + std::to_string(i) + " 列 " + std::to_string(k) + " ff=[" + fa[k] + "] nat=[" + fb[k] + "]";
             break;
@@ -548,6 +642,12 @@ static AbResult abOne(const std::string& f) {
         if (tgIsPlaceholderTag(a) && !b.empty() && !tgIsPlaceholderTag(b)) {
             ++g_allowedImprove;
             std::printf("       [IMPROVE] %s: ff 占位 -> nat=[%s]\n", n, b.c_str());
+            return;
+        }
+        // 261027-01：ffprobe 的值里有连续 '?'、原生值把那段补上了（同文件另一份来源是完好的）
+        if (qmFillExplained(a, b)) {
+            ++g_allowedFill;
+            std::printf("       [IMPROVE-FILL] %s: ff=[%s] -> nat=[%s]\n", n, a.c_str(), b.c_str());
             return;
         }
         r.diffs.push_back(std::string(n) + " ff=[" + a + "] nat=[" + b + "]");
@@ -1073,6 +1173,10 @@ static int abReal(const fs::path& root) {
     // 超过 24 说明出现了新一类差异，必须重新核对而不是当成"改进"放过（铁律 3）。
     ck(g_allowedImprove <= 24, "A/B 里「ffprobe 占位 -> 原生真名」的改进数在预期内",
        std::to_string(g_allowedImprove) + " 处（上限 24）");
+    // 261027-01：'?' 填坑这一类改进同样要有上界（本库实测 2 处：雪琥珀的标题、GENESIS 的专辑）。
+    // 超过 4 处说明出现了新一类差异，必须重新核对，不许当成"改进"放过（铁律 3）。
+    ck(g_allowedFill <= 4, "A/B 里「ffprobe 带 '?' -> 原生填坑补齐」的改进数在预期内",
+       std::to_string(g_allowedFill) + " 处（上限 4）");
     ck(compared >= 12, "A/B 覆盖的真实文件数 >= 12（理想 20：每类 5 个）", std::to_string(compared) + " 个");
     return compared;
 }
@@ -1329,6 +1433,13 @@ static void wavSpecial(const fs::path& root) {
 //   MP3 占位+文件名正常 / FLAC 占位+文件名正常 / MP3+FLAC 两边都占位（不许编造）/
 //   文件名六种形态（NN. Title / Artist - Title / 中文括号前缀 / 纯英文 / 日文 / 全角括号）。
 // ===========================================================================
+// 只数 ASCII '?'（0x3F）。为什么与 countQ 分开：全角 '？' 是合法的中日文问号（本库 8 处），
+// 「修好了没有」只能看 ASCII '?' —— 261027-01 的填坑规则也只认 ASCII '?'（见 qm_has_q_run）。
+static size_t countAsciiQ(const std::string& s) {
+    size_t n = 0;
+    for (const char c : s) if (c == '?') ++n;
+    return n;
+}
 static size_t countQ(const std::string& s) {
     size_t n = 0;
     for (size_t i = 0; i < s.size(); ++i) {
@@ -1533,6 +1644,105 @@ static void tagGuessFixtures(const fs::path& dir) {
            "开关 ON：同一条夹具被修好（证明开关真的起作用）", t3.title);
     }
 
+    // =======================================================================
+    // 261027-01：「'?' 填坑（残值补齐）」—— 纯函数判据 + 真实容器夹具
+    // 规则出处：src/meta/tags_native.h 的 qm_has_q_run / tag_fill_from_equal_shape /
+    //           qm_hole_pattern_match。每条判据都配一个**反向**样本（铁律 3：判据要能被单独否定）。
+    // =======================================================================
+    using rta::meta::native::detail::qm_has_q_run;
+    using rta::meta::native::detail::tag_fill_from_equal_shape;
+    using rta::meta::native::detail::qm_hole_pattern_match;
+    // 两条真实库原文（逐字节取自文件里的两份来源，见测试头注释 [9]/[10] 的实测记录）
+    const std::string kSnowCur  = "??? -snow amber- (Remix)";
+    const std::string kSnowGood = "\xE9\x9B\xAA\xE7\x90\xA5\xE7\x8F\x80 -snow amber- (Remix)";
+    // '??' 后面紧跟 ')' / '\'' 会被当成 trigraph 告警（C++17 已忽略，只是噪声），所以用 \x3F 写。
+    const std::string kYsCur    = "\"Ys ORIGIN\" ORIGINAL SOUND TRACK (\x3F\x3F:\x3F\x3F \x3F\x3F)";
+    const std::string kYsGood   = "\"Ys ORIGIN\" ORIGINAL SOUND TRACK (\xE4\xBC\x8A\xE8\x8B\x8F\xEF\xBC\x9A\xE8\xB5\xB7\xE6\xBA\x90 \xE5\x8E\x9F\xE5\xA3\xB0)";
+    std::string o; size_t nf = 0;
+
+    // ---- 坑的识别：连续 >= 2 个 ASCII '?'，全角 '？' 不算 ----
+    ck(qm_has_q_run(kSnowCur), "R5 坑识别：\"??? -snow amber- (Remix)\" 有坑");
+    ck(qm_has_q_run(kYsCur), "R5 坑识别：\"(\x3F\x3F:\x3F\x3F \x3F\x3F)\" 有坑");
+    ck(!qm_has_q_run("What? (Live)"), "R5 坑识别：单个 '?' **不算**坑（正常问号，不许改）");
+    ck(!qm_has_q_run("U.N.\xE3\x82\xAA\xE3\x83\xBC\xE3\x82\xA8\xE3\x83\xB3\xE3\x81\xAF\xE5\xBD\xBC\xE5\xA5\xB3\xE3\x81\xAA\xE3\x81\xAE\xE3\x81\x8B\xEF\xBC\x9F"),
+       "R5 坑识别：全角 '？' **不算**坑（合法的日文问号，本库 8 处一个字节都不许动）");
+
+    // ---- 阶段 1：同长同形补齐（确定性）----
+    ck(tag_fill_from_equal_shape(kSnowCur, kSnowGood, &o, &nf) && o == kSnowGood && nf == 3,
+       "R5 同长同形：\"??? -snow amber- (Remix)\" + 完好来源 ⟹ 补 3 个字", "nf=" + std::to_string(nf) + " o=[" + o + "]");
+    ck(tag_fill_from_equal_shape(kYsCur, kYsGood, &o, &nf) && o == kYsGood,
+       "R5 同长同形：\"(\x3F\x3F:\x3F\x3F \x3F\x3F)\" + 完好来源 ⟹ 补 6 个字（含 ':' vs '：' 的标点差异）", o);
+    ck(!tag_fill_from_equal_shape(kSnowCur, kSnowGood + " (Live)", &o),
+       "R5 同长同形反向：码点数不等 ⟹ 不补");
+    ck(!tag_fill_from_equal_shape(kSnowCur, "??? -snow amber- (Remix)", &o),
+       "R5 同长同形反向：两份一样 ⟹ 不动");
+    ck(!tag_fill_from_equal_shape(kSnowCur, "??? -snow amber- (Radio)", &o),
+       "R5 同长同形反向：实义字符不同 ⟹ 不补（不是同一句话）");
+    ck(!tag_fill_from_equal_shape("What? (Live)", "What! (Live)", &o),
+       "R5 同长同形反向：单个 '?' ⟹ 不补（否则会把正常问号换成任意字符）");
+    ck(!tag_fill_from_equal_shape(kSnowCur, kSnowCur, &o), "R5 同长同形反向：候选里还有 '?' ⟹ 不认");
+
+    // ---- 阶段 2/3：模式匹配（外部源 / 文件名）----
+    double cov = 0.0;
+    ck(qm_hole_pattern_match(kSnowCur, kSnowGood, 0.7, 12, &cov) && cov > 0.7,
+       "R6 模式匹配：外部源给出的完整标题被接受（覆盖率 0.87）", "cov=" + std::to_string(cov));
+    ck(!qm_hole_pattern_match(kSnowCur, "\xE9\x9B\xAA\xE7\x90\xA5\xE7\x8F\x80", 0.7, 12, &cov),
+       "R6 模式匹配反向：文件名只有 3 个字（覆盖率 0）⟹ 拒绝（不许拿文件名硬套）");
+    ck(!qm_hole_pattern_match("??????", kSnowGood, 0.7, 12, &cov),
+       "R6 模式匹配反向：纯占位没有字面段 ⟹ 拒绝（无身份证据时不许猜）");
+    ck(!qm_hole_pattern_match(kSnowCur, kSnowGood + " (Live)", 0.7, 12, &cov),
+       "R6 模式匹配反向：候选比原文多一截 ⟹ 拒绝（末段必须贴后缀）");
+    ck(qm_hole_pattern_match("Kokoro no Ame ~???~", "Kokoro no Ame ~\xE5\xBF\x83\xE3\x81\xAE\xE9\x9B\xA8~", 0.7, 12, &cov),
+       "R6 模式匹配：\"Kokoro no Ame ~?~\" 形态也被接受");
+
+    // ---- 真实容器：WAV 两份来源（INFO 带坑 + id3 完好）----
+    {
+        WavSpec s; s.frames = 441;
+        s.info = { {"INAM", kSnowCur} };
+        s.id3chunk = true; s.id3Title = kSnowGood;
+        const fs::path p = dir / L"qm_fill_equal.wav";
+        writeFile(p, buildWav(s));
+        _putenv_s("RLPLAYER_TAG_FILL", "0");
+        TagInfo t0;
+        ck(rta::meta::native::probe_file(U8(p), &t0, nullptr) && t0.title == kSnowCur,
+           "R5 开关 OFF：同长同形夹具保持原样（回归基线）", t0.title);
+        _putenv_s("RLPLAYER_TAG_FILL", "1");
+        TagInfo t1;
+        ck(rta::meta::native::probe_file(U8(p), &t1, nullptr) && t1.title == kSnowGood,
+           "R5 开关 ON：INFO 的坑被同一文件的 id3 值补上", t1.title);
+        // 正常值零改动（R2）：INFO / id3 都正常时，FILL 开也不许动
+        WavSpec g; g.frames = 441;
+        g.info = { {"INAM", "InfoTitle"} };
+        g.id3chunk = true; g.id3Title = "Id3Title";
+        const fs::path pg = dir / L"qm_fill_good.wav";
+        writeFile(pg, buildWav(g));
+        TagInfo tg;
+        ck(rta::meta::native::probe_file(U8(pg), &tg, nullptr) && tg.title == "InfoTitle",
+           "R2 FILL 开：正常标题仍按先到先得，一个字节都不改", tg.title);
+    }
+    {
+        WavSpec s; s.frames = 441;
+        s.info = { {"IPRD", kYsCur} };
+        s.id3chunk = true; s.id3Album = kYsGood;
+        const fs::path p = dir / L"qm_fill_ys.wav";
+        writeFile(p, buildWav(s));
+        TagInfo t; std::string why;
+        ck(rta::meta::native::probe_file(U8(p), &t, &why) && t.album == kYsGood,
+           "R5 开关 ON：GENESIS 形态（专辑 '(\x3F\x3F:\x3F\x3F \x3F\x3F)'）被 id3 的 TALB 补上", t.album + " " + why);
+    }
+    {
+        // 反向：两份都坏 ⟹ 不许编造（本夹具文件名也无信息）
+        WavSpec s; s.frames = 441;
+        s.info = { {"INAM", "??? -snow amber- (Remix)"} };
+        s.id3chunk = true; s.id3Title = "??? -snow amber- (Remix)";
+        const fs::path p = dir / L"c2.wav";
+        writeFile(p, buildWav(s));
+        TagInfo t;
+        ck(rta::meta::native::probe_file(U8(p), &t, nullptr) && t.title == "??? -snow amber- (Remix)",
+           "R5 反向：两份来源都带坑 + 文件名无信息 ⟹ 保持原样（不猜）", t.title);
+    }
+    _putenv_s("RLPLAYER_TAG_FILL", "1");
+
 }
 
 
@@ -1619,6 +1829,238 @@ static void tagGuessRealLibrary(const fs::path& root) {
        std::to_string(rowsQBefore) + " -> " + std::to_string(rowsQAfter));
     _putenv_s("RLPLAYER_TAG_GUESS", "1");
 }
+
+// ---------------------------------------------------------------------------
+// [8] 261027-01「'?' 填坑」真实库判据：FILL=0 vs FILL=1（其余开关保持一致：GUESS=1）
+// 三条互相独立的判据：
+//   1) **零误伤**：所有「不含连续 '??'」的字段，两次逐字段逐字节相同（R2 的直接证据）；
+//   2) 仍含 ASCII '?' 的行数 / 字符数必须下降 —— 逐条打印「文件 / 字段 / 改前 -> 改后」；
+//   3) 全角 '？' 的个数两次相同（合法的中日文问号一个字节都不许动）。
+// 关于「FILL=0 与上一轮完全一致」：FILL=0 走的就是 261026-02 收尾版的代码路径，[7] 已经在
+//   同一份曲库上验证了它（21 -> 2 行 / 402 -> 9 个字符）；此外交付时还做过一次**旧二进制 vs
+//   新二进制(FILL=0)** 的整库 TSV 逐行 diff（655 行 × 9 列，不同 0 行）。
+// ---------------------------------------------------------------------------
+static void tagFillRealLibrary(const fs::path& root) {
+    std::printf("\n== [8] 261027-01 '?' 填坑：真实库 A/B（FILL=0 vs FILL=1） ==\n");
+    const fs::path music = root / "MUSIC";
+    std::error_code ec;
+    std::vector<std::string> files;
+    if (fs::is_directory(music, ec)) {
+        for (auto& de : fs::recursive_directory_iterator(music, fs::directory_options::skip_permission_denied, ec)) {
+            if (!de.is_regular_file(ec)) continue;
+            const std::string e = rta::meta::native::detail::lower_ext(U8(de.path()));
+            if (e == ".flac" || e == ".wav" || e == ".wave" || e == ".mp3" || e == ".ogg") files.push_back(U8(de.path()));
+        }
+    }
+    if (files.empty()) {
+        std::printf("  [WARN] 没有 MUSIC，本节**未覆盖真实库**（铁律 4：不假装覆盖）\n");
+        return;
+    }
+    struct Row { std::string file; TagInfo off, on; };
+    std::vector<Row> rows;
+    int collateral = 0;
+    std::string firstCollateral;
+    int fwOff = 0, fwOn = 0;
+    for (const auto& f : files) {
+        _putenv_s("RLPLAYER_TAG_FILL", "0");
+        Row r; r.file = f;
+        const bool okOff = rta::meta::native::probe_file(f, &r.off, nullptr);
+        _putenv_s("RLPLAYER_TAG_FILL", "1");
+        const bool okOn = rta::meta::native::probe_file(f, &r.on, nullptr);
+        if (!okOff || !okOn) continue;                 // 回退 ffprobe 的文件不参与（本节只测原生通道）
+        auto chk = [&](const char* name, const std::string& a, const std::string& b) {
+            fwOff += (int)(countQ(a) - countAsciiQ(a));
+            fwOn  += (int)(countQ(b) - countAsciiQ(b));
+            if (a.find("??") != std::string::npos) return;         // 只检查「没有连续 ??」的字段
+            if (a == b) return;
+            ++collateral;
+            if (firstCollateral.empty())
+                firstCollateral = std::string(name) + " @ " + f + " FILL=0[" + a + "] FILL=1[" + b + "]";
+        };
+        chk("title", r.off.title, r.on.title);
+        chk("artist", r.off.artist, r.on.artist);
+        chk("album", r.off.album, r.on.album);
+        rows.push_back(std::move(r));
+    }
+    ck(collateral == 0, "零误伤：不含连续 '\x3F\x3F' 的字段在 FILL 开关两遍下逐字节相同", firstCollateral);
+    ck(fwOff == fwOn, "全角 '？'（合法中日文问号）一个都没变", std::to_string(fwOff) + " -> " + std::to_string(fwOn));
+
+    int rowsBefore = 0, rowsAfter = 0, chBefore = 0, chAfter = 0;
+    for (const auto& r : rows) {
+        const size_t a = countAsciiQ(r.off.title) + countAsciiQ(r.off.artist) + countAsciiQ(r.off.album);
+        const size_t b = countAsciiQ(r.on.title) + countAsciiQ(r.on.artist) + countAsciiQ(r.on.album);
+        if (a) ++rowsBefore;
+        if (b) ++rowsAfter;
+        chBefore += (int)a; chAfter += (int)b;
+        if (!a) continue;
+        std::printf("  %s\n", U8(fs::path(W(r.file)).filename()).c_str());
+        auto line = [&](const char* label, const std::string& x, const std::string& y) {
+            if (countAsciiQ(x) == 0) return;
+            std::printf("       %-6s [%s] -> [%s]%s\n", label, x.c_str(), y.c_str(),
+                        countAsciiQ(y) ? "   <<仍含 ASCII ?" : "");
+        };
+        line("title", r.off.title, r.on.title);
+        line("artist", r.off.artist, r.on.artist);
+        line("album", r.off.album, r.on.album);
+    }
+    std::printf("  汇总：文件 %zu；含 ASCII '?' 的行 %d -> %d；ASCII '?' 字符 %d -> %d\n",
+                rows.size(), rowsBefore, rowsAfter, chBefore, chAfter);
+    ck(rowsAfter <= rowsBefore && chAfter <= chBefore, "填坑只减不增",
+       std::to_string(chBefore) + " -> " + std::to_string(chAfter));
+    ck(rowsBefore == 0 || rowsAfter == 0, "填坑后本库不再有含 ASCII '?' 的字段（上一轮剩的 2 行已清零）",
+       std::to_string(rowsBefore) + " -> " + std::to_string(rowsAfter));
+
+    // 具体到上一轮点名留下的两个文件（名字还在才断言，改名了就不假装覆盖）
+    auto findRow = [&](const std::string& needle) -> const Row* {
+        for (const auto& r : rows) if (r.file.find(needle) != std::string::npos) return &r;
+        return nullptr;
+    };
+    {
+        const Row* r = findRow("\xE9\x9B\xAA\xE7\x90\xA5\xE7\x8F\x80.wav");   // 雪琥珀.wav
+        if (r) {
+            ck(countAsciiQ(r->off.title) > 0 && countAsciiQ(r->on.title) == 0,
+               "真实库：雪琥珀.wav 的标题被同文件 id3 的 TIT2 补齐",
+               "[" + r->off.title + "] -> [" + r->on.title + "]");
+        } else {
+            std::printf("  [SKIP] 曲库里没有 雪琥珀.wav，该条断言未覆盖\n");
+        }
+    }
+    {
+        const Row* r = findRow("GENESIS BEYOND THE BEGINNING.wav");
+        if (r) {
+            ck(countAsciiQ(r->off.album) > 0 && countAsciiQ(r->on.album) == 0,
+               "真实库：GENESIS 的专辑被同文件 id3 的 TALB 补齐",
+               "[" + r->off.album + "] -> [" + r->on.album + "]");
+        } else {
+            std::printf("  [SKIP] 曲库里没有 GENESIS BEYOND THE BEGINNING.wav，该条断言未覆盖\n");
+        }
+    }
+    _putenv_s("RLPLAYER_TAG_FILL", "1");
+}
+
+// ---------------------------------------------------------------------------
+// [9] 261027-01 阶段 2/3：外部源补全（发现者回调）+ 文件名模式匹配
+// 为什么用**桩**而不是真联网：ctest 不许依赖网络（判据要可复现、离线可跑）。桩能证明的正是
+// 「调用链 + 接受/拒绝判据 + 开关」这三件事；真实源（QQ/网易云/iTunes/dizzylab）能返回什么，
+// 属"外部服务可用性"，见交付报告的未验证项。
+// ---------------------------------------------------------------------------
+static int         g_qmOnlineCalls = 0;
+static int         g_qmOnlineUserHits = 0;
+static bool        g_qmOnlineFail = false;
+static std::string g_qmOnlineTitle, g_qmOnlineArtist, g_qmOnlineSource = "stub";
+static int         g_qmOnlineUserSentinel = 0;
+static bool qmStubFinder(void* user, const rta::meta::native::OnlineQuery& q,
+                         std::vector<rta::meta::native::OnlineCandidate>* out) {
+    ++g_qmOnlineCalls;
+    if (user == &g_qmOnlineUserSentinel) ++g_qmOnlineUserHits;
+    (void)q;
+    if (g_qmOnlineFail || !out) return false;
+    rta::meta::native::OnlineCandidate c;
+    c.title = g_qmOnlineTitle; c.artist = g_qmOnlineArtist; c.source = g_qmOnlineSource;
+    out->push_back(c);
+    return true;
+}
+static void tagOnlineFixtures(const fs::path& dir) {
+    std::printf("\n== [9] 阶段 2/3：外部源补全 + 文件名模式匹配 ==\n");
+    using rta::meta::native::set_online_finder;
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    const std::string kSnowCur  = "??? -snow amber- (Remix)";
+    const std::string kSnowGood = "\xE9\x9B\xAA\xE7\x90\xA5\xE7\x8F\x80 -snow amber- (Remix)";
+    auto probe = [&](const fs::path& p, TagInfo* t) { std::string why; return rta::meta::native::probe_file(U8(p), t, &why); };
+
+    // A 无候选（没装发现者）+ 文件名无信息 ⟹ 保持原样
+    {
+        WavSpec s; s.frames = 441; s.info = { {"INAM", kSnowCur} };
+        const fs::path p = dir / L"qm_on_a.wav";
+        writeFile(p, buildWav(s));
+        TagInfo t;
+        ck(probe(p, &t) && t.title == kSnowCur, "A 外部源阶段：没装发现者 ⟹ 不动（默认不联网）", t.title);
+    }
+    // B 装了发现者 + 候选与残值同形 ⟹ 采用
+    {
+        WavSpec s; s.frames = 441; s.info = { {"INAM", kSnowCur} };
+        const fs::path p = dir / L"qm_on_b.wav";
+        writeFile(p, buildWav(s));
+        g_qmOnlineCalls = 0; g_qmOnlineUserHits = 0; g_qmOnlineFail = false;
+        g_qmOnlineTitle = kSnowGood; g_qmOnlineArtist.clear();
+        set_online_finder(qmStubFinder, &g_qmOnlineUserSentinel);
+        ck(rta::meta::native::online_finder() == &qmStubFinder, "B 发现者已安装（online_finder() 生效）");
+        TagInfo t;
+        const bool ok = probe(p, &t);
+        ck(ok && t.title == kSnowGood, "B 外部源：候选与残值同形 ⟹ 采用候选标题", t.title);
+        ck(g_qmOnlineCalls == 1, "B 只对含坑的字段问一次（title 1 次，artist/album 不问）",
+           "calls=" + std::to_string(g_qmOnlineCalls));
+        ck(g_qmOnlineUserHits == 1, "B 发现者的 user 指针被原样传回",
+           "hits=" + std::to_string(g_qmOnlineUserHits));
+    }
+    // C 候选不相干 ⟹ 拒绝（不许把别人的曲名搬过来）
+    {
+        WavSpec s; s.frames = 441; s.info = { {"INAM", kSnowCur} };
+        const fs::path p = dir / L"qm_on_c.wav";
+        writeFile(p, buildWav(s));
+        g_qmOnlineTitle = "Totally Different Song";
+        TagInfo t;
+        ck(probe(p, &t) && t.title == kSnowCur, "C 外部源反向：候选不相干 ⟹ 拒绝，保持原样", t.title);
+    }
+    // D 外部源失败（返回 false）⟹ 退回下一阶段，不报错
+    {
+        WavSpec s; s.frames = 441; s.info = { {"INAM", kSnowCur} };
+        const fs::path p = dir / L"qm_on_d.wav";
+        writeFile(p, buildWav(s));
+        g_qmOnlineFail = true;
+        TagInfo t;
+        ck(probe(p, &t) && t.title == kSnowCur, "D 外部源失败 ⟹ 原值不变（不崩、不猜）", t.title);
+        g_qmOnlineFail = false;
+    }
+    // E RLPLAYER_TAG_ONLINE=0 ⟹ 完全不调用发现者（新开关真的能单独关掉）
+    {
+        WavSpec s; s.frames = 441; s.info = { {"INAM", kSnowCur} };
+        const fs::path p = dir / L"qm_on_e.wav";
+        writeFile(p, buildWav(s));
+        g_qmOnlineCalls = 0;
+        g_qmOnlineTitle = kSnowGood;
+        _putenv_s("RLPLAYER_TAG_ONLINE", "0");
+        TagInfo t;
+        ck(probe(p, &t) && t.title == kSnowCur, "E RLPLAYER_TAG_ONLINE=0：候选不采用", t.title);
+        ck(g_qmOnlineCalls == 0, "E RLPLAYER_TAG_ONLINE=0：发现者一次都没被调用",
+           "calls=" + std::to_string(g_qmOnlineCalls));
+        _putenv_s("RLPLAYER_TAG_ONLINE", "1");
+    }
+    // F 整段丢失（纯占位）+ 候选的艺术家与已知艺术家一致 ⟹ 采用（身份证据）
+    {
+        WavSpec s; s.frames = 441; s.info = { {"INAM", "??????"}, {"IART", "KnownArtist"} };
+        const fs::path p = dir / L"f.wav";
+        writeFile(p, buildWav(s));
+        g_qmOnlineTitle = "Real Song"; g_qmOnlineArtist = "KnownArtist";
+        TagInfo t;
+        ck(probe(p, &t) && t.title == "Real Song", "F 纯占位 + 艺术家一致 ⟹ 采用外部源标题", t.title);
+        g_qmOnlineArtist = "Somebody Else";
+        TagInfo t2;
+        ck(probe(p, &t2) && t2.title == "??????", "F 反向：艺术家不一致 ⟹ 拒绝（没有身份证据就不猜）", t2.title);
+    }
+    // G 文件名模式匹配：文件名与被修值是同一形态 ⟹ 采用；不同形态 ⟹ 拒绝
+    {
+        set_online_finder(nullptr);
+        ck(rta::meta::native::online_finder() == nullptr, "G 发现者可卸载（回到默认不联网）");
+        WavSpec s; s.frames = 441; s.info = { {"INAM", kSnowCur} };
+        const fs::path p = dir / L"qm -snow amber- (Remix).wav";
+        writeFile(p, buildWav(s));
+        TagInfo t; std::string why;
+        const bool ok = rta::meta::native::probe_file(U8(p), &t, &why);
+        ck(ok && t.title == "qm -snow amber- (Remix)",
+           "G 文件名模式匹配：文件名就是同一形态 ⟹ 采用", t.title + " " + why);
+        WavSpec s2; s2.frames = 441; s2.info = { {"INAM", kSnowCur} };
+        const fs::path p2 = dir / L"abc - def.wav";
+        writeFile(p2, buildWav(s2));
+        TagInfo t2;
+        ck(probe(p2, &t2) && t2.title == kSnowCur,
+           "G 文件名模式匹配反向：文件名不是同一形态 ⟹ 不采用（保持残值）", t2.title);
+    }
+    set_online_finder(nullptr);
+    _putenv_s("RLPLAYER_TAG_ONLINE", "1");
+    _putenv_s("RLPLAYER_TAG_FILL", "1");
+}
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     std::printf("== 原生标签快速通道验证（FLAC/WAV/MP3/OGG） ==\n");
@@ -1640,6 +2082,8 @@ int main(int argc, char** argv) {
     wavSpecial(root);
     tagGuessFixtures(tmp / "qmark");
     tagGuessRealLibrary(root);
+    tagFillRealLibrary(root);
+    tagOnlineFixtures(tmp / "qmark_online");
     throughputAndRegression(root);
 
     fs::remove_all(tmp, ec);

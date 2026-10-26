@@ -60,6 +60,9 @@ struct SearchHit {
     std::string url;
     std::string snippet;
     std::string summary;
+    // 2026-10-26：Search 带 need_content=true 时，官方直接 inline 返回正文（guides/search）。
+    // 有 content 就不再单独调 fetch —— 少一次请求（¥5/千次）也少一次 RTT。
+    std::string content;
     std::string date;
     double rerankScore = 0.0;
     int authority = -1;
@@ -130,6 +133,12 @@ inline const std::vector<std::string>& default_domain_whitelist() {
         // 旧白名单只认百科/数据库 → 这些 hit 全被丢掉（Winged Step 就是这样变成"无材料"的）。
         "tidal.com", "spotify.com", "music.apple.com", "deezer.com", "bandcamp.com", "soundcloud.com",
         "y.qq.com", "qq.com", "music.163.com", "163.com", "music.amazon.com", "amazon.com",
+        // 2026-10-26（用户 261026-06 #2）：用户报「明明 QQ 音乐 / dizzylab 上有这张专辑，AI 却说找不到」。
+        // 真因之一是本白名单**没有 dizzylab.net** —— 同人专辑的第一优先源，命中后被 filter_hits 当垃圾丢掉。
+        // 这里补上同人/数字发行站点：dizzylab（同人）、Booth、OTOTOY、mora、Qobuz、HDtracks。
+        "dizzylab.net", "booth.pm", "ototoy.jp", "mora.jp", "qobuz.com", "hdtracks.com",
+        // VGMdb：同人/游戏/动画音乐最全的数据库（实测 authority=2~3），查同人专辑必用
+        "vgmdb.net", "vgmdb.info",
         // 明日方舟 / 塞壬唱片官方
         "monster-siren.hypergryph.com", "hypergryph.com", "arknights.jp",
         // 通用（中文媒体常见）
@@ -296,10 +305,15 @@ inline bool parse_search_response(const std::string& text,
 // ---------------------------------------------------------------------------
 
 struct FilterOptions {
-    // 2026-10-24（261024-01 #1）：实测官方 /v1/tools/search 对音乐实体的 rerank 分布是 0.87~1.66，
-// 旧值 1.5 会把整批高质量结果（Tidal/豆瓣/酷我/PRTS）全过滤掉 → 永远退到 AI 记忆。
-// 降到 0.8，质量闸改由 authority>=2 + 域名白名单承担。
-    double min_rerank_score = 0.8;
+    // 2026-10-24（261024-01 #1）：实测 rerank 分布 0.87~1.66 → 降到 0.8。
+    // 2026-10-26（261026-06 #2）**实测推翻上面这条**：同一 KEY 再打官方 search，
+    //   query="Winged Step dizzylab" 的 8 条结果 rerank 只有 0.18/0.11/0.09/0.09/0.09/0.06/0.05/0.04；
+    //   0.8 的闸把 8 条全判"低相关"（实测 pass=0），整条检索链等于空转 ——
+    //   用户看到的"明明平台上有，AI 却说找不到"就是它。
+    // 官方只保证 rerank_score 落在 0~3、>=1.5 为优质，没承诺每批都有 >=0.8 的条目。
+    // ⟹ 不再拿绝对分数当硬闸（默认 0 = 不按分数砍）；质量交给 域名白名单 + authority +
+    //    条数上限 + 提示词「材料没写就不许说」四重约束，分数只用于排序。
+    double min_rerank_score = 0.0;
     int min_authority = 2;
     std::vector<std::string> whitelist; // 空则使用 default_domain_whitelist()
     size_t max_hits = 8;
@@ -1108,6 +1122,16 @@ struct RetrievalOptions {
     int max_search_hits = 8;
     int max_fetch_pages = 3;      // 最多拉取前 2~3 页正文
     int timeout_ms = 15000;
+    // 2026-10-26（用户 261026-06 #2）：主搜索一条都没过闸时，再打一次「平台站点限定」搜索。
+    // 空串 = 关闭。site: 是官方支持的查询语法（https://api-docs.deepseek.com/guides/search/ ）。
+    bool enable_site_fallback = true;
+    std::string site_fallback_sites =
+        "site:y.qq.com OR site:dizzylab.net OR site:music.163.com OR site:bandcamp.com";
+    // 2026-10-26（用户 261026-06 #2）：没有任何材料时，先让**模型自己**用 web_search/web_fetch
+    // 查一轮（function calling），再据查到的内容写简介；查不到才退回纯记忆。
+    bool enable_web_tools = true;
+    int web_tool_rounds = 3;          // 最多几轮 chat（每轮可带多个工具调用）
+    int web_tool_budget_ms = 15000;   // 工具环路总预算（超时即收手，不阻塞主流程）
     LlmConfig llm_cfg;
     FilterOptions filter_opts;
     std::string artist;           // 针对 Release 的艺术家辅助（用于 Wikipedia 与 Discogs 检索消歧）
@@ -1251,6 +1275,95 @@ inline LlmReply retrieval_chat(const LlmConfig& cfg, const std::vector<LlmMessag
 
 
 // ---------------------------------------------------------------------------
+// 工具检索取证（2026-10-26，用户 261026-06 #2）
+//
+// 场景：L2（维基/萌娘/Discogs）与 L3（固定流水线 search+fetch）都没捞到东西时，
+// 旧实现直接让模型「凭记忆写」→ 于是「明明 QQ 音乐 / dizzylab 上有这张专辑，AI 却说找不到」。
+// 这里改成先让模型自己决定搜什么、抓哪页（llm_chat_tool_loop + web_search/web_fetch），
+// 把工具返回的事实作为材料交给下一步生成；工具全挂就返回 ok=false，调用方退回纯记忆兜底。
+//
+// 纪律：预算硬上限（budget_ms），失败只写 diag、绝不抛、绝不阻塞主流程。
+// ---------------------------------------------------------------------------
+
+struct WebEvidence {
+    bool ok = false;
+    std::string text;     // 给生成阶段看的材料（模型自己写的要点 + 来源）
+    std::vector<std::string> urls;   // 工具实际命中的页面（可进 allowed_urls）
+    std::string diag;
+    std::string error;
+    int toolCalls = 0;
+};
+
+// 从工具结果 JSON 里抽 results[].url（失败返回空）
+inline std::vector<std::string> web_evidence_urls(const std::vector<LlmToolTrace>& trace) {
+    std::vector<std::string> out;
+    for (const auto& tr : trace) {
+        if (!tr.ok) continue;
+        const rta::net::Json j = rta::net::json_parse(tr.result);
+        if (j.type != rta::net::Json::Obj) continue;
+        if (j.has("results") && j["results"].type == rta::net::Json::Arr) {
+            const auto& arr = j["results"];
+            for (size_t i = 0; i < arr.size(); ++i) {
+                const std::string u = arr.at(i)["url"].s();
+                if (!u.empty() && std::find(out.begin(), out.end(), u) == out.end()) out.push_back(u);
+            }
+        }
+        const std::string self = j["url"].s();
+        if (!self.empty() && std::find(out.begin(), out.end(), self) == out.end()) out.push_back(self);
+    }
+    return out;
+}
+
+inline WebEvidence retrieval_web_evidence(const LlmConfig& cfg,
+                                          const std::string& entityName,
+                                          const std::string& kindLabel,
+                                          const std::string& lang,
+                                          int maxRounds = 3,
+                                          int budgetMs = 20000) {
+    WebEvidence ev;
+    if (cfg.apiKey.empty()) { ev.error = "未配置 api_key（rlplayer-llm.conf）"; return ev; }
+    const bool zh = (lang.empty() || lang == "zh");
+    std::string sys =
+        "你是联网检索助手。你只有两个工具：web_search（搜网页）与 web_fetch（抓网页正文）。\n"
+        "【任务】用工具查证下面这个" + kindLabel + "的客观事实：发行时间、曲目、艺术家/制作人员、出版方、"
+        "风格、简介。\n"
+        "【硬规则】\n"
+        "1. 必须先调用 web_search；查不到再换关键词（可加 site: 语法限定站点，例如 "
+        "site:y.qq.com OR site:dizzylab.net OR site:music.163.com OR site:bandcamp.com）。\n"
+        "2. 只有工具返回的内容才算事实。**不许**用你自己的记忆补年份、曲目、厂牌、销量。\n"
+        "3. 找到看起来对的平台页就用 web_fetch 读全文，再据此作答。\n"
+        "4. 最终回答：先用 3~6 条要点列出「查到的事实」，每条后面用括号写出处 URL；"
+        "确实查不到的写「未查到」。不要写与实体无关的内容。\n";
+    std::string user = std::string("实体：") + (zh ? "" : "") + "【" + entityName + "】（" + kindLabel + "）\n";
+    user += zh ? "请开始检索并给出要点。" : "Please search and report the key facts.";
+    std::vector<LlmMessage> msgs{ LlmMessage{ "system", sys }, LlmMessage{ "user", user } };
+
+    const LlmToolLoopResult loop = llm_chat_tool_loop(cfg, msgs, /*maxTokens=*/900,
+                                                      /*temperature=*/0.2f, maxRounds, budgetMs,
+                                                      /*toolTimeoutMs=*/12000);
+    ev.toolCalls = loop.toolCalls;
+    ev.diag = loop.diag;
+    ev.urls = web_evidence_urls(loop.trace);
+    if (!loop.ok) {
+        ev.error = loop.error;
+        // 即使模型没给出总结，只要工具真的返回过内容，也可以把原始片段当材料用
+        if (!ev.urls.empty()) {
+            std::string raw;
+            for (const auto& tr : loop.trace) {
+                if (!tr.ok || tr.result.empty()) continue;
+                raw += "- " + llm_truncate_utf8(tr.result, 1500) + "\n";
+            }
+            if (!raw.empty()) { ev.ok = true; ev.text = raw; }
+        }
+        return ev;
+    }
+    ev.text = llm_truncate_utf8(loop.content, 4000);
+    ev.ok = !ev.text.empty() && loop.toolCalls > 0;
+    if (!ev.ok && ev.text.empty()) ev.error = "模型未产出要点";
+    return ev;
+}
+
+// ---------------------------------------------------------------------------
 // AI 自有知识整理（无权威材料时的兜底；2026-10-23 用户 261023-04 #14/#15）
 //
 // 背景：用户实测「塞壬唱片」等实体维基没有条目 → 旧逻辑直接回「未找到权威材料，拒绝综合」，
@@ -1266,15 +1379,22 @@ inline LlmReply retrieval_chat(const LlmConfig& cfg, const std::vector<LlmMessag
 
 inline std::vector<LlmMessage> build_ai_only_prompt(const std::string& entityLabel,
                                                     const std::string& kindLabel,
-                                                    const std::string& lang) {
+                                                    const std::string& lang,
+                                                    const std::string& evidence = std::string()) {
     (void)lang;
+    const bool has_ev = !evidence.empty();
     std::string sys =
-        "你是严谨的音乐资料编辑。当前没有任何可引用的权威材料，请仅凭你已有的知识为实体写一段简短介绍。\n"
+        std::string("你是严谨的音乐资料编辑。") +
+        (has_ev ? "下面有【联网检索材料】（web_search / web_fetch 工具返回），请以材料为准写介绍。\n"
+                : "当前没有任何可引用的权威材料，请仅凭你已有的知识为实体写一段简短介绍。\n") +
+        (has_ev ? ("【联网检索材料】\n" + evidence + "\n【材料结束】\n") : std::string()) +
         "【纪律】\n"
         "1. 只写你有把握的共性信息（风格类型、大致活动年代、代表作品方向、行业位置）；\n"
         "2. 严禁编造可核查的精确数据：具体发行日期、销量数字、榜单名次、成员真实姓名、获奖年份等，"
-        "如果没有十足把握就不要写；\n"
-        "3. 不确定就写「资料有限」，不要用模糊话术凑字数；\n"
+        + std::string(has_ev
+            ? "材料里明确给出的可以写（并尽量在句末标注来源域名）；材料没给的不要补；\n"
+            : "如果没有十足把握就不要写；\n")
+        + "3. 不确定就写「资料有限」，不要用模糊话术凑字数；\n"
         "4. 只输出严格合法的 JSON 对象，不要 Markdown 代码块、不要任何解释文字。\n"
         "5. 结构化标签：输出 \"fields\" 对象（键值都是字符串），只填你有把握的字段，没把握的键直接不要出现"
         "（禁止写「未知」「暂无」「—」）。本实体可用字段（键名原样使用）：" + field_schema_for_kind(kindLabel) + "\n"
@@ -1344,9 +1464,10 @@ inline SummaryResult summary_ai_only_generate(const std::string& entityName,
                                               const std::string& kindLabel,
                                               const std::string& lang,
                                               const LlmConfig& cfg,
-                                              ProgressFn on_progress = nullptr) {
+                                              ProgressFn on_progress = nullptr,
+                                              const std::string& evidence = std::string()) {
     SummaryProgressEmitter progress(on_progress);   // 拷贝（不是 move）：嵌套兜底路径还要复用同一个回调
-    const std::vector<LlmMessage> base_msgs = build_ai_only_prompt(entityName, kindLabel, lang);
+    const std::vector<LlmMessage> base_msgs = build_ai_only_prompt(entityName, kindLabel, lang, evidence);
     SummaryResult parsed;
     std::string last_err;
     for (int attempt = 0; attempt < 2; ++attempt) {
@@ -1370,6 +1491,8 @@ inline SummaryResult summary_ai_only_generate(const std::string& entityName,
         parsed.expires_at = parsed.generated_at + 7 * 86400;
         parsed.from_cache = false;
         parsed.offline = false;
+        // 有联网检索材料时：仍然 unverified（没做逐段引用校验），但标注要如实说明「含联网检索」
+        if (!evidence.empty()) parsed.disclaimer = "AI 整理（含联网检索工具结果，未逐段校验）";
         progress.phase(SummaryPhase::Done, "ai_only ok");
     } else {
         progress.phase(SummaryPhase::Failed, last_err);
@@ -1439,6 +1562,7 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
     // 2026-10-24（261024-02 #1/#7）：分阶段计时（与专辑/艺术家路径同口径，日志可对比）
     const auto t_trk0 = std::chrono::steady_clock::now();
     long long trk_search_ms = 0, trk_fetch_ms = 0, trk_llm_ms = 0;
+    std::string trk_ev_diag;   // 工具取证这一段的诊断（261026-06 #2）
     // 2026-10-24（261024-01 #1）：歌曲级资料也走**官方 search + fetch**，
     // 而不是只凭模型记忆（用户对"AI 只会瞎编"的批评就来自这里）。
     std::vector<SearchHit> hits;
@@ -1510,8 +1634,20 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
         }
     }
     if (!sr.ok) {
-        // 检索不到材料 → 退回 AI 自有知识（仍标 unverified，UI 只显示「AI 整理」）
-        sr = summary_ai_only_generate(artist.empty() ? title : (artist + " - " + title), "歌曲", lang, cfg, on_progress);
+        // 检索不到材料 → 先让模型自己用 search/fetch 查一轮（261026-06 #2），
+        // 查到就据实写；工具挂/超时则退回 AI 自有知识（仍标 unverified，UI 只显示「AI 整理」）。
+        std::string ev_text;
+        if (opts.enable_web_tools) {
+            progress.phase(SummaryPhase::Retrieving, "web tools");
+            const WebEvidence ev = retrieval_web_evidence(
+                cfg, artist.empty() ? title : (artist + " - " + title), "歌曲", lang,
+                opts.web_tool_rounds, opts.web_tool_budget_ms);
+            trk_ev_diag = " tools={" + ev.diag + " " + (ev.ok ? "evidence=ok" : "evidence=none:" + ev.error) + "}";
+            if (ev.ok) ev_text = ev.text;
+            progress.phase(SummaryPhase::Retrieving, "generate");
+        }
+        sr = summary_ai_only_generate(artist.empty() ? title : (artist + " - " + title), "歌曲", lang,
+                                      cfg, on_progress, ev_text);
     } else {
         sr.unverified = true;   // 检索正文未做逐段引用校验 → 仍按"AI 整理"标注
         sr.disclaimer = "AI 整理";
@@ -1520,7 +1656,8 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
         sr.generated_at = (long long)std::time(nullptr);
         sr.expires_at = sr.generated_at + 7 * 86400;
         sr.diag = "search=" + std::to_string(trk_search_ms) + "ms fetch=" + std::to_string(trk_fetch_ms) +
-                  "ms llm=" + std::to_string(trk_llm_ms) + "ms hits=" + std::to_string(hits.size());
+                  "ms llm=" + std::to_string(trk_llm_ms) + "ms hits=" + std::to_string(hits.size()) +
+                  (trk_ev_diag.empty() ? std::string() : (" fallback=ai_only" + trk_ev_diag));
         summary_save_cache(baseDir, eid, lang, sr);
         progress.phase(SummaryPhase::Done, "track ok");
     } else {
@@ -1601,6 +1738,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             std::chrono::steady_clock::now() - a).count();
     };
     long long diag_knowledge_ms = 0, diag_search_ms = 0, diag_fetch_ms = 0, diag_llm_ms = 0;
+    int diag_site_fallback = 0;   // 站点限定补搜的原始命中数（0 = 没触发/没命中）
     // 3. Step 1: 拉取 L2 权威材料（Release 整合 Wikipedia 与 Discogs）
     //
     // 2026-10-24（用户 261024-04 #4「专辑页面 AI 整理资料非常慢」）：
@@ -1710,29 +1848,66 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             }
         }
 
+        // 2026-10-26（用户 261026-06 #2）：need_content=true → 正文随 search 一起回来
+        //（官方 guides/search「请求字段」），省掉「先 search 再 fetch 同一页」的第二次计费与 RTT。
+        DsSearchOptions sopt;
+        sopt.count = opts.max_search_hits > 0 ? opts.max_search_hits : 5;
+        sopt.needContent = true;
+        sopt.oriQuestion = !opts.artist.empty() ? (opts.artist + " " + name) : name;
         retrieval_rate_limiter().acquire();
-        const DsSearchReply s_rep = ds_search(cfg, query, opts.max_search_hits > 0 ? opts.max_search_hits : 5);
+        const DsSearchReply s_rep = ds_search(cfg, query, sopt);
         diag_search_ms = ms_since(t_search0);
         progress.phase(SummaryPhase::Retrieving,
                        "search hits=" + std::to_string(s_rep.hits.size()));
         if (s_rep.ok) {
-            std::vector<SearchHit> raw_hits;
-            raw_hits.reserve(s_rep.hits.size());
-            for (const auto& dh : s_rep.hits) {
-                SearchHit sh;
-                sh.title = dh.title;
-                sh.url = dh.url;
-                sh.snippet = dh.snippet;
-                sh.summary = dh.summary;
-                sh.date = dh.date;
-                sh.rerankScore = dh.rerankScore;
-                sh.authority = dh.authority;
-                raw_hits.push_back(std::move(sh));
-            }
+            auto to_hits = [](const std::vector<DsHit>& in) {
+                std::vector<SearchHit> out;
+                out.reserve(in.size());
+                for (const auto& dh : in) {
+                    SearchHit sh;
+                    sh.title = dh.title;
+                    sh.url = dh.url;
+                    sh.snippet = dh.snippet;
+                    sh.summary = dh.summary;
+                    sh.content = dh.content;
+                    sh.date = dh.date;
+                    sh.rerankScore = dh.rerankScore;
+                    sh.authority = dh.authority;
+                    out.push_back(std::move(sh));
+                }
+                return out;
+            };
+            std::vector<SearchHit> raw_hits = to_hits(s_rep.hits);
 
             // 过滤与排序
             FilterResult fr = filter_hits(raw_hits, opts.filter_opts);
             valid_hits = std::move(fr.hits);
+
+            // 2026-10-26（用户 261026-06 #2）：主搜索一条都没过闸 → 再打一次「平台站点限定」搜索。
+            // 用户报的「明明 QQ 音乐 / dizzylab 上有这张专辑，AI 却说找不到」有两个真因：
+            //   ① 白名单没有 dizzylab.net（已补）；
+            //   ② 平台页的 authority 常是 1~2、rerank 0.6~1.4，默认闸（authority>=2 & rerank>=0.8）
+            //      会把它们整批丢掉，于是永远退到「AI 整理想不起」。
+            // 这里用官方 site: 语法（guides/search「搜索语法」）直接点名平台，并放宽闸门
+            // —— 放宽是安全的：URL 已经限定在这几个站点，不存在"垃圾站混进来"。
+            if (valid_hits.empty() && opts.enable_site_fallback && !opts.site_fallback_sites.empty()) {
+                DsSearchOptions sopt2 = sopt;
+                sopt2.siteRestrict = opts.site_fallback_sites;
+                const std::string q2 = !opts.artist.empty() ? (opts.artist + " " + name) : name;
+                retrieval_rate_limiter().acquire();
+                const DsSearchReply s_rep2 = ds_search(cfg, q2, sopt2);
+                diag_search_ms = ms_since(t_search0);
+                if (s_rep2.ok && !s_rep2.hits.empty()) {
+                    FilterOptions rel = opts.filter_opts;
+                    rel.min_authority = 0;        // 平台页 authority 常见 0~2（-1=未知），不设门
+                    rel.min_rerank_score = 0.0;   // site: 已限定来源，相关性交给排序
+                    FilterResult f2 = filter_hits(to_hits(s_rep2.hits), rel);
+                    valid_hits = std::move(f2.hits);
+                    diag_site_fallback = (int)s_rep2.hits.size();
+                    progress.phase(SummaryPhase::Retrieving,
+                                   "site-fallback hits=" + std::to_string(valid_hits.size()));
+                }
+            }
 
             // Step 3: ds_fetch 取前几页正文（每实体最多 4 次 fetch；官方 fetch 返回正文质量好）。
             // 2026-10-24（261024-02 #1 速度）：4 次 fetch 串行要 4×RTT，改并行（限频器内部仍有 220ms 间隔，
@@ -1745,29 +1920,37 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
                 (size_t)std::max(1, std::min(opts.max_fetch_pages, 4)));
             const auto t_fetch0 = std::chrono::steady_clock::now();
             const LlmConfig cfg_fetch = cfg;
-            std::vector<std::future<DsFetchReply>> fetch_futs;
-            fetch_futs.reserve(fetch_count);
+            // need_content 已经带回正文的页不再 fetch（省一次计费；正文质量同级）
+            std::vector<size_t> need_fetch;
             for (size_t i = 0; i < fetch_count; ++i) {
-                const std::string fu = valid_hits[i].url;
+                if (valid_hits[i].content.empty()) need_fetch.push_back(i);
+            }
+            std::vector<std::future<DsFetchReply>> fetch_futs;
+            fetch_futs.reserve(need_fetch.size());
+            for (size_t idx : need_fetch) {
+                const std::string fu = valid_hits[idx].url;
                 fetch_futs.push_back(std::async(std::launch::async, [fu, cfg_fetch]() {
                     retrieval_rate_limiter().acquire();
                     return ds_fetch(cfg_fetch, fu, 12000);   // 12s 超时：慢页不拖累整体
                 }));
             }
-            for (size_t i = 0; i < fetch_count; ++i) {
-                SearchHit fh = valid_hits[i];
-                const DsFetchReply f_rep = fetch_futs[i].get();
+            for (size_t k = 0; k < need_fetch.size(); ++k) {
+                SearchHit& fh = valid_hits[need_fetch[k]];
+                const DsFetchReply f_rep = fetch_futs[k].get();
                 if (f_rep.ok && !f_rep.content.empty()) {
-                    fh.snippet = f_rep.content.substr(0, 1500);
+                    fh.content = f_rep.content;
                     if (!f_rep.title.empty()) fh.title = f_rep.title;
                 }
-                fetched_hits.push_back(std::move(fh));
             }
+            // 正文统一落进 snippet（提示词只读 snippet，避免为一个字段再加一路拼接）
+            for (size_t i = 0; i < fetch_count; ++i) {
+                if (!valid_hits[i].content.empty()) valid_hits[i].snippet = valid_hits[i].content.substr(0, 1500);
+            }
+            for (size_t i = 0; i < valid_hits.size(); ++i) fetched_hits.push_back(valid_hits[i]);
             diag_fetch_ms = ms_since(t_fetch0);
-            progress.phase(SummaryPhase::Retrieving, "fetch pages=" + std::to_string(fetch_count));
-            for (size_t i = fetch_count; i < valid_hits.size(); ++i) {
-                fetched_hits.push_back(valid_hits[i]);
-            }
+            progress.phase(SummaryPhase::Retrieving,
+                           "fetch pages=" + std::to_string(fetch_count) +
+                           " fetched=" + std::to_string(need_fetch.size()));
         }
     }
 
@@ -1811,14 +1994,32 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             // 2026-10-24（261024-04 #4）：这条兜底路径以前**不带 diag**，于是日志里只剩
             // "unverified=1"、看不出时间花在哪。AI 整理同样是 10~30s 的 LLM 调用，必须计时。
             const auto t_ai0 = std::chrono::steady_clock::now();
-            SummaryResult ai_res = summary_ai_only_generate(label, kind_label, lang, cfg, on_progress);
+            // 2026-10-26（用户 261026-06 #2）：先让模型自己用 search/fetch 查一轮，
+            // 查到就用查到的写（这才是「AI 会自己搜」）；工具挂/超时 → evidence 为空 → 退回纯记忆。
+            std::string ev_text;
+            std::string ev_diag;
+            if (opts.enable_web_tools) {
+                progress.phase(SummaryPhase::Retrieving, "web tools");
+                const auto t_ev0 = std::chrono::steady_clock::now();
+                const WebEvidence ev = retrieval_web_evidence(cfg, label, kind_label, lang,
+                                                              opts.web_tool_rounds, opts.web_tool_budget_ms);
+                diag_llm_ms += (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t_ev0).count();
+                ev_diag = " tools={" + ev.diag + " " + (ev.ok ? "evidence=ok" : "evidence=none:" + ev.error) + "}";
+                if (ev.ok) {
+                    ev_text = ev.text;
+                    for (const auto& u : ev.urls) allowed_urls.push_back(u);
+                }
+                progress.phase(SummaryPhase::Retrieving, "generate");
+            }
+            SummaryResult ai_res = summary_ai_only_generate(label, kind_label, lang, cfg, on_progress, ev_text);
             diag_llm_ms += (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t_ai0).count();
             if (ai_res.ok) {
                 ai_res.diag = "knowledge=" + std::to_string(diag_knowledge_ms) + "ms search=" +
                               std::to_string(diag_search_ms) + "ms fetch=" +
                               std::to_string(diag_fetch_ms) + "ms llm=" +
-                              std::to_string(diag_llm_ms) + "ms hits=0 fallback=ai_only";
+                              std::to_string(diag_llm_ms) + "ms hits=0 fallback=ai_only" + ev_diag;
                 summary_save_cache(baseDir, eid, lang, ai_res);
                 return ai_res;
             }
@@ -1928,7 +2129,8 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     parsed.diag = "knowledge=" + std::to_string(diag_knowledge_ms) + "ms search=" +
                   std::to_string(diag_search_ms) + "ms fetch=" + std::to_string(diag_fetch_ms) +
                   "ms llm=" + std::to_string(diag_llm_ms) + "ms hits=" +
-                  std::to_string(fetched_hits.size());
+                  std::to_string(fetched_hits.size()) +
+                  (diag_site_fallback > 0 ? (" sitefb=" + std::to_string(diag_site_fallback)) : std::string());
     summary_save_cache(baseDir, eid, lang, parsed);
     progress.phase(SummaryPhase::Done, "llm ok");
 

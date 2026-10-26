@@ -92,6 +92,116 @@ inline std::string lowerExt(const std::string& p) {
     return e;
 }
 
+// ===========================================================================
+// ISO 镜像识别（2026-10-27，用户 261027-01 #3）
+//
+// 为什么需要：`.iso` 以前连「识别」都没有（扩展名白名单里没有它），用户把 SACD ISO 拖进来
+// 只会看到 ffmpeg 的 "Invalid data found when processing input"。真正的解决要写 SACD 解析，
+// 这里只做**识别**这一档：分清「SACD 镜像」与「普通数据盘」，然后给出明确指引。
+//
+// 判据（只用 ISO9660 的结构，不猜内容）：
+//   ① 扇区 16（偏移 32768）起的卷描述符标识必须是 "CD001"，且能找到类型 1（主卷描述符）；
+//   ② 根目录记录（PVD 偏移 156，34 字节）给出根目录起始 LBA 与长度；
+//   ③ 在根目录里找名字含 "SACD" 的目录/文件（SACD 母盘在 ISO9660 里就是一个 SACD/ 目录，
+//      内含 TOC 与 2ch/mch 音轨区）；卷标（PVD 偏移 40，32 字节）也一并看。
+// SACD ISO 有 ISO9660 层，所以这套判据对 sacd_extract 产出的镜像成立；真 UDF-only 镜像会落到
+// 「无法识别」而不是被误判成 SACD —— 宁可说不知道，也不给错指引。
+// ===========================================================================
+enum class IsoKind {
+    NotIso,    // 打不开 / 不是 ISO9660 镜像
+    Sacd,      // 根目录（或卷标）里有 SACD 字样 ⟹ SACD 镜像
+    Data       // 是 ISO9660 镜像，但没有 SACD 目录 ⟹ 普通数据盘
+};
+
+struct IsoInfo {
+    IsoKind kind = IsoKind::NotIso;
+    std::string volumeId;     // PVD 卷标（去掉尾部空格）
+    std::string why;          // 给用户看的判断依据（卷标/根目录命中项/失败原因）
+};
+
+// 只读前 4 个卷描述符扇区；需要时才读根目录扇区。全程只读、无子进程、不开任何设备。
+inline IsoInfo iso_inspect(const std::string& path) {
+    IsoInfo out;
+    FILE* f = dsd_detail::dsd_fopen(path, L"rb", "rb");
+    if (!f) { out.why = "打不开文件"; return out; }
+    struct Guard { FILE* f; ~Guard() { if (f) std::fclose(f); } } g{ f };
+
+    // ---- ① 卷描述符：16 号扇区起连续若干张，找到类型 1（主卷描述符）为止 ----
+    uint8_t vd[2048];
+    bool havePvd = false;
+    for (int s = 16; s < 20; ++s) {
+        if (_fseeki64(f, (long long)s * 2048, SEEK_SET) != 0) break;
+        if (std::fread(vd, 1, sizeof(vd), f) != sizeof(vd)) break;
+        if (std::memcmp(vd + 1, "CD001", 5) != 0) break;   // 不是 ISO9660
+        if (vd[0] == 0x01) { havePvd = true; break; }
+        if (vd[0] == 0xFF) break;                          // 终止描述符
+    }
+    if (!havePvd) { out.why = "没有 ISO9660 主卷描述符"; return out; }
+
+    out.volumeId.assign((const char*)vd + 40, 32);
+    while (!out.volumeId.empty() && (out.volumeId.back() == ' ' || out.volumeId.back() == '\0'))
+        out.volumeId.pop_back();
+
+    // ---- ② 根目录记录：PVD 偏移 156 起 34 字节（extent LBA 小端在前 4 字节） ----
+    const uint8_t* rr = vd + 156;
+    const uint32_t rootLba = (uint32_t)rr[2] | ((uint32_t)rr[3] << 8) |
+                             ((uint32_t)rr[4] << 16) | ((uint32_t)rr[5] << 24);
+    const uint32_t rootLen = (uint32_t)rr[10] | ((uint32_t)rr[11] << 8) |
+                             ((uint32_t)rr[12] << 16) | ((uint32_t)rr[13] << 24);
+    out.kind = IsoKind::Data;                              // 到这里已是合法 ISO9660 镜像
+    out.why = "ISO9660 卷标=" + (out.volumeId.empty() ? std::string("(空)") : out.volumeId);
+
+    // ---- ③ 根目录：逐条目录记录找 SACD（大小写不敏感；带 ";1" 版本后缀的也认） ----
+    // 名字长度 0 = 到本扇区末尾（填充），直接跳下一个扇区；长度 < 34 视为坏记录，停。
+    uint8_t dir[2048];
+    std::string hits;
+    const uint32_t maxSectors = rootLen ? (rootLen + 2047u) / 2048u : 1u;
+    for (uint32_t s = 0; s < maxSectors && s < 8; ++s) {
+        if (_fseeki64(f, (long long)(rootLba + s) * 2048, SEEK_SET) != 0) break;
+        if (std::fread(dir, 1, sizeof(dir), f) != sizeof(dir)) break;
+        size_t off = 0;
+        while (off + 33 < sizeof(dir)) {
+            const uint8_t len = dir[off];
+            if (len == 0) break;                       // 本扇区剩余为填充
+            if (len < 34 || off + len > sizeof(dir)) break;
+            const uint8_t nameLen = dir[off + 32];
+            if (nameLen > 0 && (size_t)off + 33 + nameLen <= sizeof(dir)) {
+                const std::string nm((const char*)dir + off + 33, nameLen);
+                std::string up = nm;
+                for (auto& c : up) c = (char)std::toupper((unsigned char)c);
+                if (up.find("SACD") != std::string::npos) {
+                    if (hits.size() < 120) { if (!hits.empty()) hits += " "; hits += nm; }
+                    out.kind = IsoKind::Sacd;
+                }
+            }
+            off += len;
+        }
+    }
+    if (out.kind == IsoKind::Sacd) {
+        out.why = "根目录含 " + hits;
+    } else {
+        std::string up = out.volumeId;
+        for (auto& c : up) c = (char)std::toupper((unsigned char)c);
+        if (up.find("SACD") != std::string::npos) {
+            out.kind = IsoKind::Sacd;
+            out.why = "卷标含 SACD（" + out.volumeId + "）";
+        }
+    }
+    return out;
+}
+
+// 播放/解码入口对 .iso 的统一处理：给出「SACD 需转换」或「这不是音频镜像」，绝不落到 ffmpeg。
+[[noreturn]] inline void throw_for_iso(const std::string& path) {
+    const IsoInfo ii = iso_inspect(path);
+    if (ii.kind == IsoKind::Sacd)
+        throw UnsupportedFormat(msg_sacd_iso_unsupported() + "（文件=" + path + "，" + ii.why + "）");
+    if (ii.kind == IsoKind::Data)
+        throw UnsupportedFormat(msg_iso_not_audio() + "（文件=" + path + "，" + ii.why + "）");
+    throw UnsupportedFormat(
+        "这个 .iso 里没有 ISO9660 文件系统，无法判断是不是 SACD 镜像（" + ii.why + "）。"
+        "如果是 SACD ISO，请先用 sacd_extract 转成分轨 .dsf 后入库。");
+}
+
 // 播放器所在目录（分发时把 ffmpeg.exe / ffprobe.exe 放在这里就能自带解码器，
 // 不需要改 PATH）。这也是"环境齐全"的关键：程序能找到它，用户不用配环境变量。
 inline std::wstring exe_dir_w() {
@@ -430,8 +540,10 @@ inline DsdFileLayout probe_dsd_layout(const std::string& path) {
                 const uint32_t bps = rdl32(fb.data() + 20);
                 sampleCnt = rdl64(fb.data() + 24);
                 blockSize = rdl32(fb.data() + 32);
-                if (fmtId != 0) throw std::runtime_error("DSF 为 DST 压缩，暂不支持流式解码");
-                if (bps != 1) throw std::runtime_error("DSF bits per sample 非 1");
+                if (fmtId != 0) throw UnsupportedFormat(msg_dst_unsupported("DSF 流式解码，format id = " +
+                                                        std::to_string(fmtId) + "，文件=" + path));
+                if (bps != 1) throw UnsupportedFormat("DSF bits per sample 不是 1（不是标准 1-bit DSD，暂不支持）。"
+                                                      "请转成标准 .dsf 再播放。（文件=" + path + "）");
                 if (chNum < 1 || chNum > 8) throw std::runtime_error("DSF 声道数异常");
                 if (rate < 44100) throw std::runtime_error("DSF 采样率异常");
                 if (blockSize == 0 || blockSize > (1u << 20)) throw std::runtime_error("DSF 块长异常");
@@ -465,8 +577,14 @@ inline DsdFileLayout probe_dsd_layout(const std::string& path) {
         uint8_t h[16];
         if (rd(0, h, 16) != 16 || std::memcmp(h, "FRM8", 4) != 0)
             throw std::runtime_error("不是 DFF(DSDIFF) 文件: " + path);
-        if (std::memcmp(h + 12, "DSD ", 4) != 0)
-            throw std::runtime_error("DFF form type 不是 \"DSD \"（DST 不支持）");
+        if (std::memcmp(h + 12, "DSD ", 4) != 0) {
+            // form type = "DST " ⟹ 整个文件就是 DST 压缩的 DSDIFF
+            if (std::memcmp(h + 12, "DST ", 4) == 0)
+                throw UnsupportedFormat(msg_dst_unsupported("DFF form type=DST，文件=" + path));
+            throw UnsupportedFormat("DFF 的 form type 不是 \"DSD \"（为 \"" +
+                                    std::string((const char*)h + 12, 4) + "\"），暂不支持。"
+                                    "请转成标准 .dff/.dsf 再播放。（文件=" + path + "）");
+        }
         const uint64_t frm8Size = rdb64(h + 4);
         const uint64_t end = 12 + frm8Size;
         uint32_t rate = 0, declaredCh = 0;
@@ -499,13 +617,18 @@ inline DsdFileLayout probe_dsd_layout(const std::string& path) {
                 haveData = true;
                 break;
             } else if (std::memcmp(ch, "DST ", 4) == 0 || std::memcmp(ch, "DSTI", 4) == 0) {
-                throw std::runtime_error("DFF 使用 DST 压缩，暂不支持流式解码");
+                throw UnsupportedFormat(msg_dst_unsupported("DFF 含 DST 块（流式解码），文件=" + path));
             }
             off += 12 + sz + (sz & 1);
         }
         if (!haveData) throw std::runtime_error("DFF 缺少 DSD 数据块");
         if (rate == 0) throw std::runtime_error("DFF 缺少 FS");
-        if (!cmpType.empty() && cmpType != "DSD ") throw std::runtime_error("DFF 压缩类型不是 DSD");
+        if (!cmpType.empty() && cmpType != "DSD ") {
+            if (cmpType == "DST ")
+                throw UnsupportedFormat(msg_dst_unsupported("DFF CMPR=DST（流式解码），文件=" + path));
+            throw UnsupportedFormat("DFF 压缩类型不是 \"DSD \"（为 \"" + cmpType + "\"），暂不支持。"
+                                    "请转成未压缩的 .dff/.dsf 再播放。（文件=" + path + "）");
+        }
         const uint32_t ch = declaredCh ? declaredCh : 2;
         if (ch < 1 || ch > 8) throw std::runtime_error("DFF 声道数异常");
         if (L.dataSize == 0 || L.dataSize % ch != 0) throw std::runtime_error("DFF DSD 数据长度异常");
@@ -1097,6 +1220,11 @@ inline AudioBuffer read_via_ffmpeg(const std::string& path, LoadNote* note = nul
 inline AudioBuffer read_any(const std::string& path, LoadNote* note = nullptr) {
     const std::string ext = lowerExt(path);
     const auto t_any_0 = std::chrono::steady_clock::now();
+    // .iso 在**最前面**拦（2026-10-27，261027-01 #3）：ISO 镜像不是 ffmpeg 能碰的容器
+    // （随包 ffmpeg 9.0 没有 sacd/iso9660/udf demuxer），落到下面只会得到
+    // "Invalid data found when processing input" —— 用户会以为文件坏了。
+    // 这里直接给「SACD 需转换 / 这不是音频镜像」的指引。
+    if (ext == ".iso") throw_for_iso(path);
     try {
         if (ext == ".wav" || ext == ".wave" || ext.empty()) {
             AudioBuffer b = read_wav(path);
@@ -1122,6 +1250,11 @@ inline AudioBuffer read_any(const std::string& path, LoadNote* note = nullptr) {
             } catch (const std::bad_alloc& e) {
                 throw std::runtime_error(std::string("解码阶段异常: ") + e.what() +
                                          "(文件=" + path + ",阶段=read_dsd_native)");
+            } catch (const UnsupportedFormat&) {
+                // ★ 不支持 ≠ 读不了（2026-10-27，261027-01 #3）：DST 压缩 / 非标准位深这类
+                //   必须原样上抛带指引的文案，**绝不回退 ffmpeg** —— 回退只会再失败一次，
+                //   然后把 "Invalid data found when processing input" 当成结论交给用户。
+                throw;
             } catch (const std::exception& e) {
                 // 回退策略（ROADMAP P0）：读不了的文件仍走 ffmpeg，并在 note 里说明。
                 // 注意 length_error/bad_alloc 已在上面被拦截重抛 —— 不允许"vector too long"
@@ -1144,6 +1277,22 @@ inline AudioBuffer read_any(const std::string& path, LoadNote* note = nullptr) {
     } catch (const std::bad_alloc& e) {
         throw std::runtime_error(std::string("解码阶段异常: ") + e.what() +
                                  "(文件=" + path + ",阶段=read_any)");
+    } catch (const UnsupportedFormat&) {
+        throw;                                  // 已经是人话，不再包一层
+    } catch (const std::exception& e) {
+        // ffmpeg 的兜底文案对用户毫无意义（2026-10-27，261027-01 #3）：
+        // "Invalid data found when processing input" 的真实含义是「容器/编码 ffmpeg 不认识」，
+        // 用户读成「我的文件坏了」。这里只在出现这句时补上**可能的原因 + 下一步**，
+        // 其余异常原样上抛（不吞、不改类型，调用方与测试看到的仍是同一条错误）。
+        const std::string m = e.what();
+        if (m.find("Invalid data") != std::string::npos) {
+            throw UnsupportedFormat(
+                "这个文件 ffmpeg 解不了（它报的原文是 \"Invalid data found when processing input\"，"
+                "含义是容器/编码不可识别，不等于文件损坏）。常见原因是：DST 压缩的 DSD（需先转 .dsf/.dff）、"
+                "SACD ISO 镜像（需先 sacd_extract 分轨）、加密或下载不完整的文件。"
+                "（文件=" + path + "，阶段=read_any，ffmpeg 原始报错=" + m + "）");
+        }
+        throw;
     }
 }
 

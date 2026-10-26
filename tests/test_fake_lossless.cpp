@@ -68,6 +68,34 @@ static std::vector<double> brickwall(double fcHz) {
     return design_lowpass(spec);
 }
 
+
+// ---- 增量接口的比对辅助 ----
+static bool same_bits(double a, double b) {
+    if (a == b) return true;                              // 含 +0/-0
+    return std::memcmp(&a, &b, sizeof(double)) == 0;
+}
+// 逐位相同 = 五个输出字段全等（reason 按字符串逐字比较）
+static bool same_check(const LosslessCheck& a, const LosslessCheck& b) {
+    return a.suspected == b.suspected && a.fake24bit == b.fake24bit
+        && same_bits(a.cutoffHz, b.cutoffHz) && same_bits(a.confidence, b.confidence)
+        && a.reason == b.reason;
+}
+// 按 B 帧一块喂满整段；planOk 返回 planMatched()
+static LosslessCheck fed_chunked(const std::vector<std::vector<double>>& ch, size_t n, double fs,
+                                 int srcBits, size_t B, bool* planOk = nullptr) {
+    LosslessAccumulator acc;
+    acc.begin(n, (int)ch.size(), fs, srcBits);
+    for (size_t pos = 0; pos < n; pos += B) {
+        const size_t m = std::min(B, n - pos);
+        std::vector<const double*> sub(ch.size());
+        for (size_t c = 0; c < ch.size(); ++c) sub[c] = ch[c].data() + pos;
+        acc.add_planar(sub.data(), m);
+    }
+    const LosslessCheck c = acc.finalize();
+    if (planOk) *planOk = acc.planMatched();
+    return c;
+}
+
 static std::string brief(const LosslessCheck& c) {
     char b[256];
     std::snprintf(b, sizeof(b), "(cutoff %.1f Hz, conf %.3f, suspected %d, fake24 %d) %s",
@@ -175,6 +203,105 @@ int main() {
         const LosslessCheck b2 = check_lossless(p.data(), 1, kN, kFs, 24);
         printf("  5b %s\n", brief(b2).c_str());
         check(!b2.fake24bit, "加 1 LSB 抖动后 fake24bit = false");
+    }
+
+
+    printf("\n=== 6. 增量接口 vs 整段接口：逐位一致（3 种素材 × 块大小 1/1000/4096/65536/262144）===\n");
+    {
+        const std::vector<size_t> blocks = {1, 1000, 4096, 65536, 262144};
+        // 三种素材分别压不同的判据通路：判假（16k 砖墙）/ 不判假（全带）/ fake24（低 8 位恒零）
+        auto noise16k = make_noise(2, 0x12345678ull, 0.5);
+        fir_apply(noise16k[0], brickwall(16000.0));
+        fir_apply(noise16k[1], brickwall(16000.0));
+        auto flat = make_noise(2, 0xDEADBEEFull, 0.5);
+        auto q16 = make_noise(1, 0x0F0F0F0Full, 0.5);
+        for (size_t i = 0; i < kN; ++i) {
+            long long v16 = (long long)std::llround(q16[0][i] * 32767.0);
+            v16 = std::max(-32768ll, std::min(32767ll, v16));
+            q16[0][i] = (double)(v16 << 8) / 8388608.0;
+        }
+        struct Case { const char* name; const std::vector<std::vector<double>>* sig; int bits; };
+        const Case cases[] = {
+            { "16 kHz 砖墙（应判假）", &noise16k, 16 },
+            { "全带白噪（不应判假）", &flat, 16 },
+            { "16-bit<<8 装 24-bit（fake24）", &q16, 24 },
+        };
+        for (const Case& cs : cases) {
+            auto p = ptrs(*cs.sig);
+            const LosslessCheck ref = check_lossless(p.data(), (int)cs.sig->size(), kN, kFs, cs.bits);
+            bool allSame = true, allPlanned = true;
+            double maxCutDiff = 0.0, maxConfDiff = 0.0;
+            for (size_t B : blocks) {
+                bool ok = false;
+                const LosslessCheck c = fed_chunked(*cs.sig, kN, kFs, cs.bits, B, &ok);
+                allSame = allSame && same_check(ref, c);
+                allPlanned = allPlanned && ok;
+                maxCutDiff = std::max(maxCutDiff, std::fabs(c.cutoffHz - ref.cutoffHz));
+                maxConfDiff = std::max(maxConfDiff, std::fabs(c.confidence - ref.confidence));
+            }
+            char b[320];
+            std::snprintf(b, sizeof(b),
+                          "(%s: cutoff %.17g / conf %.17g / sus %d / fake24 %d, 块大小 %zu 种, max|Δcutoff| = %g, max|Δconf| = %g)",
+                          cs.name, ref.cutoffHz, ref.confidence, (int)ref.suspected, (int)ref.fake24bit,
+                          blocks.size(), maxCutDiff, maxConfDiff);
+            check(allSame && allPlanned, std::string("逐位一致: ") + cs.name, b);
+        }
+    }
+
+    printf("\n=== 7. 计划（总帧数）与实喂帧数不符 → planMatched() = false（调用方必须回退整段）===\n");
+    {
+        auto sig = make_noise(2, 0x5A5A5A5Aull, 0.5);
+        {
+            LosslessAccumulator acc;
+            acc.begin(kN, 2, kFs, 16);
+            bool ok = false;
+            const LosslessCheck c = fed_chunked(sig, kN, kFs, 16, 65536, &ok);
+            check(ok, "声明总帧数 == 实喂帧数 → planMatched() = true");
+            (void)c;
+        }
+        {
+            LosslessAccumulator acc;
+            acc.begin(kN * 2, 2, kFs, 16);      // 声明两倍（模拟"用错总长"）
+            std::vector<const double*> sub{ sig[0].data(), sig[1].data() };
+            acc.add_planar(sub.data(), kN);
+            check(!acc.planMatched(), "声明总帧数偏大 → planMatched() = false");
+            check(acc.framesSeen() == kN, "framesSeen() 如实报实喂帧数", std::to_string(acc.framesSeen()));
+        }
+        {
+            LosslessAccumulator acc;
+            acc.begin(kN, 2, kFs, 16);
+            std::vector<const double*> sub{ sig[0].data(), sig[1].data() };
+            acc.add_planar(sub.data(), kN / 2);   // 短读（截断/IO 失败）
+            check(!acc.planMatched(), "短读（帧数不足）→ planMatched() = false");
+        }
+        {
+            LosslessAccumulator acc;
+            acc.begin(0, 2, kFs, 16);             // 空素材
+            const LosslessCheck c = acc.finalize();
+            check(c.reason == std::string("样本不足，无法分析") && !acc.planMatched(),
+                  "总帧数 0 → 与整段接口同一句人话原因", c.reason);
+        }
+    }
+
+    printf("\n=== 8. 不足一个谱窗（n < 65536）× 分块 → 与整段一致 ===\n");
+    {
+        const size_t nSmall = 30011;              // 故意不是 2 的幂、也不是块大小的倍数
+        std::vector<std::vector<double>> sig(2, std::vector<double>(nSmall));
+        Rng rng(777);
+        for (int c = 0; c < 2; ++c)
+            for (size_t i = 0; i < nSmall; ++i) sig[(size_t)c][i] = 0.4 * rng.gauss();
+        auto p = ptrs(sig);
+        const LosslessCheck ref = check_lossless(p.data(), 2, nSmall, kFs, 16);
+        bool allSame = true;
+        for (size_t B : {size_t(1), size_t(997), size_t(65536)}) {
+            bool ok = false;
+            const LosslessCheck c = fed_chunked(sig, nSmall, kFs, 16, B, &ok);
+            allSame = allSame && same_check(ref, c) && ok;
+        }
+        char b[192];
+        std::snprintf(b, sizeof(b), "(n=%zu: cutoff %.17g, conf %.17g, %s)", nSmall, ref.cutoffHz,
+                      ref.confidence, ref.reason.c_str());
+        check(allSame, "单窗（n<65536）分块与整段逐位一致", b);
     }
 
     printf("\n%s (失败项 %d)\n", fails == 0 ? "全部通过" : "存在失败", fails);

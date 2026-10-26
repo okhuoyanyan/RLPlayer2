@@ -789,6 +789,156 @@ int main() {
         fs::remove_all(tmp6, ec);
     }
 
+    // =======================================================================
+    // [6] ISO 镜像：识别 + 入库 + 播放报错（2026-10-27，用户 261027-01 #3）
+    //
+    // 判据（铁律 3：每一条都能被单独否定）：
+    //   ① `.iso` 真的进了库（trackCount 说出来），并且 needsConvert()=true（= 不当可播音轨）；
+    //   ② 分得清 SACD 与普通数据盘：Library::isoKindOf() = sacd / data；
+    //   ③ 播放走 read_any 得到的是「带指引的拒绝」（SACD 提示 / 不是音频镜像），
+    //      而不是 ffmpeg 的 Invalid data（这条正是用户反馈的形态）；
+    //   ④ 重启（load 索引）后 still needsConvert() —— 标记由路径现算，不靠落盘列。
+    // 夹具是**真的 ISO9660 镜像**（主卷描述符 CD001 + 根目录记录），不是随便的文件改名。
+    // =======================================================================
+    std::printf("\n== [6] ISO 镜像识别 / 入库 / 播放报错 ==\n");
+    {
+        // 造最小可解析的 ISO9660 镜像：PVD 在 16 号扇区，根目录在 20 号扇区
+        auto makeIso = [](const fs::path& p, const std::string& volId,
+                          const std::vector<std::string>& rootNames) {
+            const size_t sectors = 40;
+            std::vector<unsigned char> img(sectors * 2048, 0);
+            auto putLe32 = [&](size_t at, unsigned int v) {
+                for (int i = 0; i < 4; ++i) img[at + (size_t)i] = (unsigned char)((v >> (8 * i)) & 0xFF);
+            };
+            auto putBe32 = [&](size_t at, unsigned int v) {
+                for (int i = 0; i < 4; ++i) img[at + (size_t)i] = (unsigned char)((v >> (8 * (3 - i))) & 0xFF);
+            };
+            const size_t pvd = (size_t)16 * 2048;
+            img[pvd] = 0x01;
+            std::memcpy(&img[pvd + 1], "CD001", 5);
+            img[pvd + 6] = 0x01;
+            std::string v = volId; v.resize(32, ' ');
+            std::memcpy(&img[pvd + 40], v.data(), 32);
+            // 根目录记录（PVD 偏移 156，34 字节）：extent LBA = 20，长度 = 2048，目录标志
+            img[pvd + 156] = 34;
+            putLe32(pvd + 156 + 2, 20);  putBe32(pvd + 156 + 6, 20);
+            putLe32(pvd + 156 + 10, 2048); putBe32(pvd + 156 + 14, 2048);
+            img[pvd + 156 + 25] = 0x02;
+            img[pvd + 156 + 32] = 1;      // 名字长度 1（.）
+            // 卷描述符终止符
+            const size_t term = (size_t)17 * 2048;
+            img[term] = 0xFF;
+            std::memcpy(&img[term + 1], "CD001", 5);
+            img[term + 6] = 0x01;
+            // 根目录条目：. / .. / 若干子项
+            size_t off = (size_t)20 * 2048;
+            unsigned int lba = 21;
+            auto addRec = [&](const std::string& name, unsigned char flags) {
+                size_t len = 33 + name.size();
+                if (len & 1) ++len;
+                img[off] = (unsigned char)len;
+                putLe32(off + 2, lba);  putBe32(off + 6, lba);
+                putLe32(off + 10, 2048); putBe32(off + 14, 2048);
+                img[off + 25] = flags;
+                img[off + 32] = (unsigned char)name.size();
+                if (!name.empty()) std::memcpy(&img[off + 33], name.data(), name.size());
+                off += len;
+            };
+            addRec(std::string(1, '\0'), 0x02);   // .
+            addRec(std::string(1, '\x01'), 0x02); // ..
+            for (auto& n : rootNames) { addRec(n, 0x02); ++lba; }
+            std::ofstream f(p, std::ios::binary | std::ios::trunc);
+            f.write((const char*)img.data(), (std::streamsize)img.size());
+        };
+
+        const fs::path tmp7 = fs::temp_directory_path() / "rta_lib_iso";
+        fs::remove_all(tmp7, ec);
+        const fs::path libG = tmp7 / "libG";
+        const fs::path rootG = tmp7 / U("音乐库G");
+        const fs::path albSacd = rootG / U("SACD镜像");
+        const fs::path albData = rootG / U("数据盘");
+        fs::create_directories(albSacd, ec);
+        fs::create_directories(albData, ec);
+        const fs::path isoSacd = albSacd / U("album.iso");
+        const fs::path isoData = albData / U("data.iso");
+        makeIso(isoSacd, "SACD_MUSIC", { "SACD", "README.TXT" });       // 根目录有 SACD/
+        makeIso(isoData, "MY_DATA_DISC", { "README.TXT", "SETUP.EXE" }); // 没有 SACD 目录
+
+        // 本节的扫描助手（[5] 节的 scanLib/trackOf 在它自己的块作用域里，这里重新给一份）
+        auto scanLib6 = [&](bool full) {
+            fs::create_directories(libG, ec);
+            _putenv_s("RLPLAYER_LIBRARY_DIR", p2u(libG).c_str());
+            _putenv_s("RLPLAYER_PORT", "");
+            for (auto r : lib.roots()) lib.removeRoot(r);
+            const auto ar = lib.addRootEx(p2u(rootG));
+            lib.load();
+            lib.startScan(full);
+            lib.joinScan();
+            return ar;
+        };
+        auto trackOf6 = [&](size_t i) { rta::net::LibTrack t; lib.trackAt(i, t); return t; };
+
+        const auto arG = scanLib6(true);
+        ck(arG.ok, ".iso 夹具：库根可加", arG.why);
+        ck(lib.trackCount() == 2, "两个 .iso 都入库了（能看见）",
+           std::to_string(lib.trackCount()) + " msg=" + lib.scanMsg());
+        ck(lib.needsConvertCount() == 2, "两首都标着「需转换」（needsConvertCount=2）",
+           std::to_string(lib.needsConvertCount()));
+        const std::string sSacd = p2u(isoSacd), sData = p2u(isoData);
+        ck(lib.isoKindOf(sSacd) == "sacd", "根目录含 SACD/ ⟹ isoKindOf = sacd", lib.isoKindOf(sSacd));
+        ck(lib.isoKindOf(sData) == "data", "没有 SACD 目录 ⟹ isoKindOf = data", lib.isoKindOf(sData));
+
+        bool flags5 = lib.trackCount() == 2;
+        std::string codecs;
+        for (size_t i = 0; flags5 && i < lib.trackCount(); ++i) {
+            const rta::net::LibTrack t = trackOf6(i);
+            if (!t.needsConvert()) flags5 = false;
+            if (t.sampleRate != 0 || t.duration != 0.0) flags5 = false;   // 不给"看起来有效"的流参数
+            codecs += t.codec + " | ";
+        }
+        ck(flags5, "入库记录：needsConvert=true、sr=0、dur=0（不当可播音轨）", codecs);
+        ck(codecs.find("SACD ISO") != std::string::npos && codecs.find("数据盘") != std::string::npos,
+           "codec 字段带出「SACD ISO（需转换）」/「ISO 数据盘（非音频镜像）」", codecs);
+        ck(lib.scanMsg().find("需转换") != std::string::npos,
+           "扫描消息里如实报「N 个 ISO 镜像需转换」", lib.scanMsg());
+
+        // ③ 播放（= read_any，/api/lib/play 的解码入口）必须是带指引的拒绝
+        {
+            std::string m1, m2;
+            bool t1 = false, t2 = false;
+            try { (void)rta::audio::read_any(sSacd, nullptr); }
+            catch (const rta::audio::UnsupportedFormat& e) { t1 = true; m1 = e.what(); }
+            catch (const std::exception& e) { m1 = e.what(); }
+            try { (void)rta::audio::read_any(sData, nullptr); }
+            catch (const rta::audio::UnsupportedFormat& e) { t2 = true; m2 = e.what(); }
+            catch (const std::exception& e) { m2 = e.what(); }
+            ck(t1 && m1.find("SACD ISO") != std::string::npos &&
+               m1.find("sacd_extract") != std::string::npos,
+               "播 SACD ISO ⟹ 「SACD ISO 镜像暂不支持直接播放…请先用 sacd_extract 转成分轨 .dsf」(UnsupportedFormat)",
+               m1);
+            ck(t2 && m2.find("不是音频镜像") != std::string::npos,
+               "播普通数据盘 ISO ⟹ 「这不是音频镜像…」（不是 SACD 提示，也不是 Invalid data）", m2);
+            ck(m1.find("Invalid data") == std::string::npos && m2.find("Invalid data") == std::string::npos,
+               "两条文案都不含 ffmpeg 的 Invalid data", m1 + " || " + m2);
+        }
+
+        // ④ 重启：标记由路径现算，旧索引（v5，没有这一列）读回来也是对的
+        lib.load();
+        ck(lib.trackCount() == 2, "重启后 .iso 仍在库里", std::to_string(lib.trackCount()));
+        bool stillFlag = lib.trackCount() == 2;
+        for (size_t i = 0; stillFlag && i < lib.trackCount(); ++i)
+            if (!trackOf6(i).needsConvert()) stillFlag = false;
+        ck(stillFlag, "重启后 needsConvert() 仍为 true（不依赖落盘列）");
+        {
+            // 索引没有 codec 列 ⟹ 重启后 trackAt 会用路径补一条内存标签，UI 的「需转换」才不会消失
+            std::string lb;
+            for (size_t i = 0; i < lib.trackCount(); ++i) lb += trackOf6(i).codec + " | ";
+            ck(lb.find("需转换") != std::string::npos,
+               "重启后 /api/lib/album 的 codec 字段仍有「需转换」（trackAt 按扩展名补，纯内存）", lb);
+        }
+        ck(lib.isoKindOf(sSacd) == "sacd", "重启后 isoKindOf 仍答 sacd（读镜像头，随时可问）");
+        fs::remove_all(tmp7, ec);
+    }
     fs::remove_all(tmp2, ec);
 
     fs::current_path(oldCwd, ec);

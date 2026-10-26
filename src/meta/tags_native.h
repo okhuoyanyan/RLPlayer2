@@ -147,6 +147,99 @@ inline bool guess_enabled() {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// 261027-01 新增：两个**独立**开关（用户要求「新增的能力必须能单独关掉，出问题能回退」）
+//
+//   RLPLAYER_TAG_FILL=0/off/false/no
+//     ⟹ 关闭「'?' 填坑（残值补齐）」这条 261027-01 新能力：同文件第二来源的同长同形补齐、
+//        外部源补全、文件名模式匹配三阶段全部不生效。行为与 261026-02 收尾版**逐字节相同**
+//        （回归判据：真实库 655 个文件逐字段 TSV 与旧二进制 diff = 0，见 tests [8]）。
+//   RLPLAYER_TAG_ONLINE=0/off/false/no
+//     ⟹ 关闭「外部源补全」这一阶段（QQ / 网易云 / iTunes / dizzylab）。
+//        默认开，但**没有安装发现者时它什么都不做**（见 set_online_finder 的注释），
+//        所以默认状态下它既不联网、也不改变任何字节。
+//
+// 为什么另开开关而不是并进 RLPLAYER_TAG_GUESS：
+//   261026-02 的 −97.8% 已经过用户验收，任何新增的「推断」都必须能单独回退；
+//   把新规则塞进已有开关就做不到「只退新的、不退旧的」。
+// ---------------------------------------------------------------------------
+// 通用的「这个环境变量是不是被设成了关」：存在且（去首尾空白、忽略大小写后）等于 0/off/false/no。
+// 实现照抄 enabled()/guess_enabled() 的口径（GetEnvironmentVariableW 而不是 _wgetenv —— 扫描是
+// 多线程，_wgetenv 返回共享缓冲）；新开关复用这一份，避免第三份复制粘贴出偏差。
+inline bool env_switch_off(const char* name) {
+#ifdef _WIN32
+    wchar_t nameW[64] = {0};
+    int nw = 0;
+    for (const char* p = name; *p && nw < 63; ++p) nameW[nw++] = (wchar_t)(unsigned char)*p;
+    wchar_t v[64] = {0};
+    const DWORD got = ::GetEnvironmentVariableW(nameW, v, 64);
+    if (got == 0 || got >= 64) return false;               // 未设置 = 开
+    std::wstring s(v, (size_t)got);
+    for (auto& c : s) c = (wchar_t)::towlower((wint_t)c);
+    const size_t a = s.find_first_not_of(L" \t\r\n");
+    if (a == std::wstring::npos) return false;             // 全空白 = 当成没设
+    const size_t b = s.find_last_not_of(L" \t\r\n");
+    s = s.substr(a, b - a + 1);
+    return s == L"0" || s == L"off" || s == L"false" || s == L"no";
+#else
+    const char* v = std::getenv(name);
+    if (!v || !*v) return false;
+    std::string s(v);
+    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+    const size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return false;
+    const size_t b = s.find_last_not_of(" \t\r\n");
+    s = s.substr(a, b - a + 1);
+    return s == "0" || s == "off" || s == "false" || s == "no";
+#endif
+}
+inline bool fill_enabled()   { return !env_switch_off("RLPLAYER_TAG_FILL"); }
+inline bool online_enabled() { return !env_switch_off("RLPLAYER_TAG_ONLINE"); }
+
+// ---------------------------------------------------------------------------
+// 261027-01：外部源补全的**发现者接口**（QQ / 网易云 / iTunes / dizzylab）
+//
+// 为什么是「回调」而不是在本文件里直接联网：
+//   本文件是解析器（每文件一次、扫描默认 8 线程）。在这里直接发 HTTP 会让
+//     a) 扫描吞吐被网络 RTT 支配（离线用户还会被超时拖死）；
+//     b) 解析器从「只读本地字节」变成「有外部依赖」，A/B 判据（native vs ffprobe）不再可复现。
+//   所以：**匹配逻辑留在本文件**（纯函数、可离线单测），**取候选的那一步由调用方注入**。
+//   注入点只需一行：rta::meta::native::set_online_finder(fn);（fn 里调 provider.h 的搜索链）。
+//   ⚠️ 截至本次交付，src/meta/enrich.h / net/library.h 里**还没有**这一行（不在本任务可改范围），
+//      所以默认状态下外部源阶段是空转的；真实库上真正生效的是阶段 1（同文件第二来源）。
+//      需要接入时见 tests/test_tags_native.cpp [9] 的 stub，照抄即可。
+// ---------------------------------------------------------------------------
+struct OnlineCandidate {
+    std::string title, artist, album;
+    std::string source;        // "qq" / "netease" / "itunes" / "dizzylab"（只进日志）
+};
+struct OnlineQuery {
+    std::string file;          // 完整路径（可能为空）
+    std::string artist, albumArtist, album, title;
+    int trackNo = 0;
+};
+// 返回 true 且 out 非空 ⟹ 拿到了候选（失败/超时返回 false —— 调用方会退到下一阶段）。
+using OnlineFinder = bool (*)(void* user, const OnlineQuery& q, std::vector<OnlineCandidate>* out);
+
+namespace detail {
+inline std::atomic<OnlineFinder>& online_finder_slot() {
+    static std::atomic<OnlineFinder> p{nullptr};
+    return p;
+}
+inline std::atomic<void*>& online_finder_user_slot() {
+    static std::atomic<void*> p{nullptr};
+    return p;
+}
+} // namespace detail
+
+// 安装/卸载发现者（启动时调一次；可传 nullptr 卸载）。
+// 线程安全：probe_file 可能在扫描线程里并发读，这里用原子量发布。
+inline void set_online_finder(OnlineFinder fn, void* user = nullptr) {
+    detail::online_finder_user_slot().store(user, std::memory_order_release);
+    detail::online_finder_slot().store(fn, std::memory_order_release);
+}
+inline OnlineFinder online_finder() { return detail::online_finder_slot().load(std::memory_order_acquire); }
+
 inline bool enabled() {
 #ifdef _WIN32
     wchar_t v[64] = {0};
@@ -877,6 +970,145 @@ inline bool tag_merge_equal_aligned(const std::string& cur, const std::string& b
     return true;
 }
 
+// ===========================================================================
+// 261027-01：「'?' 填坑（残值补齐）」—— 上一轮（261026-02）明确留下的 2 个顽固案例
+//
+// 上一轮的结论是「两份来源都坏、没有外部元数据，宁可不猜」。**这个结论是错的**：逐字节读文件后
+// 发现两份来源里 **ID3 那一份是完好的**，只是被「残缺值」判据漏掉了：
+//   雪琥珀.wav    INFO INAM = "??? -snow amber- (Remix)"         （24 码点，3 个 '?'）
+//                 id3 TIT2  = "雪琥珀 -snow amber- (Remix)"        （24 码点，位置 0/1/2 不同）
+//   GENESIS.wav   INFO IPRD = '"Ys ORIGIN" ORIGINAL SOUND TRACK (??:?? ??)'  （43 码点，6 个 '?'）
+//                 id3 TALB  = '"Ys ORIGIN" ORIGINAL SOUND TRACK (伊苏：起源 原声)'
+//                                                                  （43 码点，位置 36 是 ':' vs '：'）
+// 为什么去年的判据漏了它们：tag_is_corrupt 要求「问号占实义字符的一半」，而这两个值的 ASCII 尾巴
+// （"-snow amber- (Remix)" / "ORIGINAL SOUND TRACK"）有 20~26 个实义字符，3~6 个问号被稀释了。
+// 判据本身**不能改**（R2「正常值一个字节都不许动」已经用户验收），所以新增一条独立的规则。
+// ===========================================================================
+
+// 当前正在探测的文件路径（thread_local，只为让**解析内部**的推断日志也能带上 file=）。
+// 为什么需要：跨块合并（TagMerger）发生在 parse_wav 里，那里没有路径参数；而审计日志的格式是
+// 「TAGGUESS file=… field=… from=… value=…」，缺了 file= 事后就没法回溯到具体文件。
+// thread_local 而不是传参：扫描是「每线程一个文件」的模型，传参要改 parse_* 的签名（无收益）。
+inline std::string& qm_current_file() {
+    static thread_local std::string s;
+    return s;
+}
+
+// 连续 ASCII '?' 的个数 >= minRun ⟹ 这是「被写盘工具吃掉的整段文本」的签名。
+// 为什么要求**连续 >= 2**：正常标题里可能出现一个真问号（"Are you OK?"），
+// 单个 '?' 用「同形」去补等于允许把问号换成任意字符 —— 会改坏正常值。
+// 全角 '？' **不算坑**：它本来就是中日文里合法的问号，本库有 8 处（7 张专辑名 + 1 首日文曲名），
+// 一个字节都不许动（261026-02 已验收口径）。所以这里只认 0x3F。
+inline bool qm_has_q_run(const std::string& s, size_t minRun = 2) {
+    size_t run = 0;
+    for (const char c : s) {
+        if (c == '?') { if (++run >= minRun) return true; }
+        else run = 0;
+    }
+    return false;
+}
+
+// 两个码点「宽松相等」：完全相同，或**两边都是标点/符号**。
+// 为什么允许标点不同：写盘工具按单字节代码页落盘时全角标点会被吃成 '?'，而不同来源的全角/半角
+// 也可能不一致（实测 GENESIS.wav：INFO 里是 ASCII ':'、ID3 里是全角 '：'）。实义字符必须逐位相同，
+// 标点允许归一到 cand 的那一个 —— 这样结果就是 cand 本身，不是「拼出来的一句话」。
+inline bool qm_cp_equal_loose(const std::string& a, const std::string& b) {
+    if (a == b) return true;
+    return qm_cp_is_punct(a) && qm_cp_is_punct(b) && a != "?" && b != "?";
+}
+
+// **阶段 1：同文件第二来源的同长同形补齐**（确定性，不是猜：两边码点数完全相等、
+// 每个非 '?' 位置逐位相等，⟹ 同一个位置就是同一句话的第 N 个字）。
+// 判据（全部成立才补）：
+//   * cur 至少有一段连续 >= 2 个 ASCII '?'；cand 不含 '?'；
+//   * 两边**码点数完全相等**（1 个 '?' = 1 个丢失的字符，这是写盘工具的实测行为）；
+//   * 每个 '?' 位在 cand 里必须是**实义字符**（空白/标点/问号 ⟹ 等于没补上，判失败）；
+//   * 其余位置必须宽松相等（标点允许不同，见 qm_cp_equal_loose）；
+//   * 结果 = cand（逐位都验证过等价，所以不是拼接，而是「确认两份是同一条标签」）。
+inline bool tag_fill_from_equal_shape(const std::string& cur, const std::string& cand, std::string* out,
+                                      size_t* filled = nullptr) {
+    if (cur.empty() || cand.empty() || cur == cand) return false;
+    if (!qm_has_q_run(cur)) return false;
+    if (cand.find('?') != std::string::npos) return false;
+    const std::vector<std::string> a = qm_split_cp(cur), b = qm_split_cp(cand);
+    if (a.empty() || a.size() != b.size()) return false;
+    size_t nfill = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i] == "?") {
+            if (!qm_cp_is_substantive(b[i])) return false;   // 坑位没被实义字符填上 ⟹ 不认
+            ++nfill;
+        } else if (!qm_cp_equal_loose(a[i], b[i])) {
+            return false;                                   // 实义位置不同 ⟹ 两句话，不拼
+        }
+    }
+    if (nfill == 0) return false;
+    if (out) *out = cand;
+    if (filled) *filled = nfill;
+    return true;
+}
+
+// **阶段 2/3 的模式匹配**（可变长填坑，用于「外部源」与「文件名」这两个**猜**的阶段）。
+// cur 里每段连续 '?' 当通配符（每段吃 1..maxFill 个码点），其余是字面段，必须按顺序、
+// 贴边（首段贴前缀、末段贴后缀）地出现在 cand 里；另外要求字面段**覆盖率 >= minCover**。
+// 覆盖率是防呆：文件名 "雪琥珀" 只有 3 个码点，拿它去套 "??? -snow amber- (Remix)" 时字面段
+// 20 个码点一个都不在 cand 里 ⟹ 覆盖率 0 ⟹ 拒绝（这条判据直接否掉了「拿文件名硬套」的误伤）。
+struct QmPattern {
+    std::vector<std::vector<std::string>> segs;   // 字面段（码点数组），segs.size() = 坑数 + 1
+    size_t maxFill = 12;
+    double minCover = 0.6;
+    bool litAt(size_t seg, size_t bi, const std::vector<std::string>& b) const {
+        const std::vector<std::string>& L = segs[seg];
+        if (bi + L.size() > b.size()) return false;
+        for (size_t k = 0; k < L.size(); ++k)
+            if (!qm_cp_equal_loose(L[k], b[bi + k])) return false;
+        return true;
+    }
+    bool go(size_t seg, size_t bi, size_t cover, const std::vector<std::string>& b) const {
+        const std::vector<std::string>& L = segs[seg];
+        if (seg == 0 && !L.empty() && bi != 0) return false;                       // 首段贴前缀
+        if (seg + 1 == segs.size() && !L.empty() && bi + L.size() != b.size()) return false; // 末段贴后缀
+        if (!litAt(seg, bi, b)) return false;
+        const size_t nb = bi + L.size();
+        const size_t ncover = cover + L.size();
+        if (seg + 1 == segs.size()) {
+            if (nb != b.size() || b.empty() || ncover == 0) return false;
+            return (double)ncover / (double)b.size() >= minCover;
+        }
+        for (size_t take = 1; take <= maxFill; ++take) {
+            if (nb + take > b.size()) break;
+            if (go(seg + 1, nb + take, ncover, b)) return true;
+        }
+        return false;
+    }
+};
+inline bool qm_hole_pattern_match(const std::string& cur, const std::string& cand, double minCover,
+                                  size_t maxFill = 12, double* coverOut = nullptr) {
+    if (cur.empty() || cand.empty() || cur == cand) return false;
+    if (!qm_has_q_run(cur)) return false;
+    if (cand.find('?') != std::string::npos) return false;
+    const std::vector<std::string> a = qm_split_cp(cur), b = qm_split_cp(cand);
+    if (a.empty() || b.empty()) return false;
+    QmPattern pat;
+    pat.maxFill = maxFill ? maxFill : 12;
+    pat.minCover = minCover;
+    std::vector<std::string> seg;
+    for (size_t i = 0; i < a.size();) {
+        if (a[i] == "?") {
+            while (i < a.size() && a[i] == "?") ++i;
+            pat.segs.push_back(seg); seg.clear();
+        } else { seg.push_back(a[i]); ++i; }
+    }
+    pat.segs.push_back(seg);
+    if (pat.segs.size() < 2) return false;                 // 没有坑 ⟹ 不是本规则的事
+    if (!pat.go(0, 0, 0, b)) return false;
+    if (coverOut) {
+        size_t lit = 0;
+        for (const auto& L : pat.segs) lit += L.size();
+        *coverOut = (double)lit / (double)b.size();
+    }
+    return true;
+}
+
 inline bool tag_better_replaces(const std::string& cur, const std::string& better) {
     if (better.empty() || cur == better) return false;
     if (!tag_is_corrupt(cur)) return false;
@@ -926,10 +1158,26 @@ struct TagMerger {
                 return;
             }
             std::string merged;
+            bool merged_ = false;
             if (tag_merge_replaces(dst, cand, &merged) || tag_merge_equal_aligned(dst, cand, &merged)) {
                 std::fprintf(stderr, "TAGGUESS field=%s from=crosschunk-merge value=%s old=%s srcs=%s+%s\n",
                              field, merged.c_str(), dst.c_str(), srcOf.c_str(), from);
                 dst = merged; srcOf += "+";
+                merged_ = true;
+            }
+            // ---- 261027-01 阶段 1：同长同形补齐（独立开关 RLPLAYER_TAG_FILL；默认开）----
+            // 只在上面两条老规则都**没**修好（dst 仍含连续 '?'）时才有意义：
+            // 上面若已修好，dst 里就没有 '?' 了，本函数第一句就返回 false。
+            // ⚠️ 关掉 RLPLAYER_TAG_FILL ⟹ 这一整段不执行，行为与 261026-02 收尾版逐字节相同。
+            if (!fill_enabled()) return;
+            std::string filled;
+            size_t nfill = 0;
+            if (tag_fill_from_equal_shape(dst, cand, &filled, &nfill)) {
+                std::fprintf(stderr,
+                             "TAGGUESS file=%s field=%s from=crosschunk-fill value=%s old=%s filled=%zu srcs=%s->%s%s\n",
+                             qm_current_file().c_str(), field, filled.c_str(), dst.c_str(), nfill,
+                             srcOf.c_str(), from, merged_ ? "(after-merge)" : "");
+                dst = filled; srcOf = from;
             }
         };
         if (!acc.hasTitle && !vv.title.empty())             { acc.title = vv.title; acc.hasTitle = true; src[0] = from; }
@@ -1811,6 +2059,7 @@ inline bool probe_file(const std::string& path, TagInfo* out, std::string* why) 
         stats().fellBack.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    detail::qm_current_file() = path;      // 审计日志用（见 qm_current_file 的注释）
     detail::FileReader r;
     if (!r.open(path)) {
         if (why) *why = "文件打不开/为空";
@@ -1851,6 +2100,64 @@ inline bool probe_file(const std::string& path, TagInfo* out, std::string* why) 
         }
         // 专辑：**不做文件名推导**（文件名里从来不写专辑名，推必错）。混合占位的专辑留给日志可见性：
         // 若同目录能确认专辑目录，交由 library.h 的 lib_fill_album_disc_from_dir（它只填空字段）。
+    }
+    // ---- 261027-01 阶段 2/3：仍然含「连续 '?'」的残值 ----
+    // 触发面比上面窄得多：只认**连续 >= 2 个 ASCII '?'**（全角 '？' 一律不动，见 qm_has_q_run）。
+    // 上面 R1/R1b/R3 已经处理过的值到这里时要么没有 '?'，要么是「文件名也推不出」的，
+    // 所以这一段只做「外部源」与「文件名模式匹配」两件**新**事，且各有独立判据。
+    // ⚠️ RLPLAYER_TAG_FILL=0 ⟹ 整段不执行（回归基线）。
+    if (guess_enabled() && fill_enabled()) {
+        // 阶段 2：外部源（QQ / 网易云 / iTunes / dizzylab）。没有安装发现者时**什么都不做**。
+        auto try_online = [&](const char* field, std::string& val) {
+            if (!detail::qm_has_q_run(val)) return;
+            if (!online_enabled()) return;
+            OnlineFinder fn = online_finder();
+            if (!fn) return;
+            OnlineQuery q;
+            q.file = path;
+            q.artist = t.artist; q.albumArtist = t.albumArtist; q.album = t.album;
+            q.title = (std::strcmp(field, "title") == 0) ? val : t.title;
+            q.trackNo = t.trackNo;
+            std::vector<OnlineCandidate> cands;
+            if (!fn(detail::online_finder_user_slot().load(), q, &cands) || cands.empty()) return;
+            std::string best, bestSrc;
+            double bestCov = -1.0;
+            for (const OnlineCandidate& c : cands) {
+                const std::string& cv = (std::strcmp(field, "title") == 0) ? c.title
+                                     : (std::strcmp(field, "album") == 0 ? c.album : c.artist);
+                if (cv.empty() || cv.find('?') != std::string::npos) continue;
+                double cov = 0.0;
+                bool ok = detail::qm_hole_pattern_match(val, cv, 0.7, 12, &cov);
+                // 整段丢失（纯占位 "??????"）时字面段为空、覆盖率无从谈起：
+                // 这时只认「候选的艺术家与已知艺术家一致」这一条身份证据（不看长度、不看相似度）。
+                if (!ok && detail::tag_is_placeholder(val) && !c.artist.empty() && !t.artist.empty() &&
+                    detail::qm_lower_ascii(detail::qm_trim(c.artist)) ==
+                        detail::qm_lower_ascii(detail::qm_trim(t.artist))) {
+                    ok = true; cov = 0.0;
+                }
+                if (!ok) continue;
+                if (cov > bestCov) { bestCov = cov; best = cv; bestSrc = c.source; }
+            }
+            if (best.empty()) return;
+            const std::string from = bestSrc.empty() ? std::string("online") : bestSrc;
+            detail::qm_log_guess(path, field, from.c_str(), best, val);
+            val = best;
+        };
+        try_online("title", t.title);
+        try_online("artist", t.artist);
+        try_online("album", t.album);
+        // 阶段 3：文件名（**保守** —— 必须模式匹配通过，否则不猜）。
+        // 为什么不能无条件用文件名："解析 - 雪琥珀.wav" 的文件名里只有 3 个字，
+        // 拿它去替换 "??? -snow amber- (Remix)" 会丢掉 "-snow amber- (Remix)" 这段真信息。
+        // 只有当文件名**就是这句话的同一形态**（字面段覆盖率 >= 0.7）时才采用。
+        if (detail::qm_has_q_run(t.title)) {
+            const std::string g = detail::qm_guess_title_from_filename(path, t.artist, t.albumArtist);
+            double cov = 0.0;
+            if (!g.empty() && detail::qm_hole_pattern_match(t.title, g, 0.7, 12, &cov)) {
+                detail::qm_log_guess(path, "title", "filename-pattern", g, t.title);
+                t.title = g;
+            }
+        }
     }
     // 第 4 条：留痕 —— 修前/修后逐条可回溯（跨块覆盖的细节在 TagMerger 里已经打过）。
     if (detail::tag_is_corrupt(t.title))

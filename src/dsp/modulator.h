@@ -17,7 +17,20 @@
 //      D(z) 为模拟 Butterworth 经双线性变换展开，极点在单位圆内。5 阶在 DSD64/128/256 均稳定。
 //   2. 7 阶 Chebyshev NTF（可配带外增益/截止）：
 //      极点按 Chebyshev Type I 椭圆分布设计，提供可控的带外增益（H∞ 约 4.0~7.0 dB）与更陡峭的过渡带。
-//      带降阶保护：7 阶 1-bit 在低采样率 (< 5.6 MHz) 下因量化步长大易过载，自动降为 5 阶保护。
+//      1-bit 下不提供 7 阶：实测该族 7 阶在四档速率的带内噪声比 5 阶差 17~27 dB
+//      （|NTF|∞ 1.08~1.89，D 根半径 0.985~0.998），见 tests/test_modulator_rates.cpp。
+//
+//   ★ 2026-10-27 更正（用户 261027-01 #5）：旧注释写「7 阶 1-bit 在低采样率下因量化步长
+//     大易过载，自动降为 5 阶保护」——**这个论断是错的**。实测（0.62 工作点 + 满幅瞬态 +
+//     单样本越界，四档速率）：
+//       · EC 族（H∞ 受控，|NTF|∞=1.35）7 阶在 DSD64 完全稳定：MSSA 0.704（5 阶 0.724），
+//         瞬态后限幅增量为 0，解调 RMS 回到 0.442，无锁死；
+//       · 真正不稳的是「corner 固定为绝对频率」的 Dsd/Chebyshev 族：7 阶 @DSD64 的
+//         |NTF|∞ 分别是 1.65 / 1.89，MSSA 只有 0.243 / 0.000（低于 0.62 工作点）。
+//     所以「会不会不稳」是**设计属性**（|NTF|∞ 与极点半径），不是采样率属性。现代码按
+//     设计体检放行（sdm_1bit_ntf_ok），采样率只剩一道**质量门**：DSD64（OSR 70）上
+//     7 阶带内噪声比 5 阶差 6.5 dB，故默认仍降 5 阶；把 SdmConfig::minOsrForHighOrder
+//     置 0 即可强制 7 阶（已证明稳定，代价就是那 6.5 dB）。
 //   3. EC（误差反馈扩展消除）变体：
 //      在音频通带 [0, 20 kHz] 内按 Chebyshev 极值分布优化 NTF 零点（扩展消除频带量化噪声），
 //      显著加深带内抑制（可提升 3~17 dB SNR），同时保持严格因果误差反馈回路。
@@ -390,17 +403,50 @@ inline NtfPoly design_ec_ntf_poly(int order, double fcHz, double fs, double fBan
     return synthesize_ntf(order, fs, fBandHz, hinf);
 }
 
-// 该采样率下【实际可用】的调制器阶数（含降阶保护）
-inline int stable_sdm_order(int requested, double fs, int levels = 2, ModulatorFamily family = ModulatorFamily::Dsd) {
+// ---------- 1-bit 高阶（≥7 阶）的稳定性体检（2026-10-27 实测标定） ----------
+// 判据 = Lee 判据（|NTF|∞ 上限）+ 分母根半径（闭环极点必须留在单位圆内且有余量）。
+// 1.36 的标定依据（0.62 工作点 = sdm_headroom_db 目标；满幅 0 dBFS 50 ms 瞬态 +
+// 单样本 +5.0 越界 + 2.5 s 恢复；四档速率；见 tests/test_modulator_rates.cpp）：
+//   |NTF|∞   实测 MSSA   例
+//   1.35     0.704~0.724 EC-7（四档速率一致，零限幅，瞬态完全恢复）
+//   1.376    0.664       Chebyshev-7 @DSD128（只剩 0.3 dB 余量 ⟹ 判为不放行）
+//   1.44     0.652       Butterworth-5 @DSD64（5 阶不设门，仅作标定参照）
+//   1.51     0.532       Chebyshev-5 @DSD64（已低于工作点 0.62）
+//   1.65     0.243       Butterworth-7 @DSD64（明确不稳）
+//   1.89     0.000       Chebyshev-7 @DSD64（彻底失稳）
+// 也就是说 |NTF|∞ ≤ 1.36 ⟺ MSSA ≥ 0.66 > 0.62 工作点，与 1-bit 量化的非线性无关。
+// 根半径只当"退化设计"的安全网（各阶极点全都贴到单位圆上 = D(z) 退化成 (1-z^-1)^N）。
+// 不取 0.99：高采样率下 corner 远低于 Nyquist 时，0.994~0.998 的极点半径是合法的
+// （Butterworth-7@DSD512 实测 0.9938、MSSA 0.974；Chebyshev-7@DSD512 实测 0.9981、
+// MSSA 0.944，均稳定），用 0.99 会把这些正常设计误判成不稳。
+inline constexpr double kSdm1bitHinfMax   = 1.36;    // |NTF|∞ 上限（线性幅度）
+inline constexpr double kSdm1bitRootMax   = 0.999;   // D(z) 最大根半径上限（退化网）
+inline constexpr double kSdmHighOrderMinOsr = 128.0; // 1-bit 7 阶的质量门（OSR = fs/2fB）
+
+inline bool sdm_1bit_ntf_ok(const NtfPoly& n) {
+    return ntf_hinf_lin(n) <= kSdm1bitHinfMax && ntf_max_root_radius(n.d) <= kSdm1bitRootMax;
+}
+
+// 该采样率下【实际可用】的调制器阶数（= 构造函数内部判据的廉价预估版；权威判定在
+// SdmModulator 构造里，因为那里才知道调用方真正的 cutoff/oobGain/ntfHinf）。
+inline int stable_sdm_order(int requested, double fs, int levels = 2, ModulatorFamily family = ModulatorFamily::Dsd,
+                            double minOsrForHighOrder = kSdmHighOrderMinOsr) {
     if (requested <= 5) return requested < 1 ? 1 : requested;
-    // 1-bit 模式保护：
-    // 1. 7 阶 Chebyshev NTF 因极点阻尼比过低（Q≈130），小信号下闭环极点易移出单位圆触发极限环失稳（底噪暴增至负 SNR）；
-    // 2. 标准 Butterworth 7 阶在 DSD64 (< 5.6 MHz) 下因量化步长大易过载饱和；
-    // 均自动降为 5 阶保护
-    if (requested >= 7 && levels == 2) {
-        if (family == ModulatorFamily::Chebyshev || fs < 5.6e6) return 5;
-    }
-    return requested > 7 ? 7 : requested;
+    const int want = requested > 7 ? 7 : requested;
+    if (levels != 2) return want;                      // 多电平量化误差小，7 阶无需降阶
+    if (requested == 6) return 6;                      // 6 阶是既有档位，不设门（实测 DSD64 -95.9 dB）
+    // ① 稳定性体检（设计属性，与采样率无关）
+    //    Chebyshev 族的极点阻尼按 oobGainDb 固定，7 阶在四档速率的 |NTF|∞ 为
+    //    1.08~1.89、根半径 0.985~0.998，且带内噪声比 5 阶差 17~27 dB ⟹ 1-bit 不提供 7 阶。
+    if (family == ModulatorFamily::Chebyshev) return 5;
+    //    Dsd 族的 corner 是绝对频率（cutoffHz），|NTF|∞ 随 fs 变化，用文档默认
+    //    corner=100 kHz 预检（构造函数会用调用方实际参数再检一次）。
+    if (family == ModulatorFamily::Dsd && !sdm_1bit_ntf_ok(design_ntf_poly(want, 100000.0, fs))) return 5;
+    // ② 质量门：EC 族 |NTF|∞ 被综合钉在预算 1.35 ≤ 1.36，稳定性恒过；但实测
+    //    DSD64（OSR≈70）上 7 阶的带内噪声比 5 阶**差 6.5 dB**（-90.2 vs -96.7 dBFS），
+    //    从 DSD128 起才打平/互有胜负 ⟹ 默认只在 OSR ≥ 128 时用 7 阶。
+    if (minOsrForHighOrder > 0.0 && fs / (2.0 * 20000.0) < minOsrForHighOrder) return 5;
+    return want;
 }
 
 // 调制器前级余量（dB，<=0）
@@ -430,6 +476,16 @@ struct SdmConfig {
     // 7 阶出现 26 次轨饱和、1.50 时 5.9 万次。SNR 全线（DSD64 105 / DSD256 105 /
     // DSD512 121~127 dB）且跨速率方差最小。
     double ntfHinf      = 1.35;
+    // 诊断/测试专用：true = 跳过 1-bit 高阶降阶守卫，按请求阶数原样运行。
+    // 生产链路绝不应置 true —— 守卫的职责是不把未通过稳定性体检的 NTF 送上输出。
+    // 存在的理由是「阶数 × 速率」矩阵必须能实测被守卫拒掉的那些格子（铁律 3/4）。
+    bool   bypassOrderGuard = false;
+    // 1-bit 高阶（≥7 阶）的**质量门**：允许 7 阶的最低 OSR（= fs / 2 / 20 kHz）。
+    // 默认 128（= DSD128 及以上）。实测依据：DSD64（OSR≈70）上 7 阶的带内噪声比
+    // 5 阶差 6.5 dB（-90.2 vs -96.7 dBFS @0.62 输入，8 次实现平均），DSD128 起打平。
+    // 稳定性不是这里的理由：7 阶 @DSD64 实测稳定（MSSA 0.704、零限幅、瞬态完全恢复）。
+    // 置 0 = 关闭质量门，只保留稳定性体检 ⟹ 7 阶在 DSD64 也会被放行（用户偏好用法）。
+    double minOsrForHighOrder = 128.0;
 };
 
 class SdmModulator {
@@ -444,32 +500,71 @@ public:
             levels_ = cfg_.levels < 2 ? 2 : cfg_.levels;
         }
 
+        // NTF 设计（按族）。用 lambda 是因为降阶时要按 5 阶重新设计一次。
+        auto designNtf = [&](int ord) -> NtfPoly {
+            if (cfg_.family == ModulatorFamily::Chebyshev)
+                return design_chebyshev_ntf_poly(ord, cfg_.cutoffHz, cfg_.fs, cfg_.oobGainDb);
+            if (cfg_.family == ModulatorFamily::Ec || cfg_.ecCorrection) {
+                // H∞ 受控综合（synthesize_ntf）：corner 由预算自适应，|NTF|∞ 被钉在
+                // cfg_.ntfHinf ⟹ 稳定性随预算可控，不再依赖采样率硬门。
+                return synthesize_ntf(ord, cfg_.fs, 20000.0, cfg_.ntfHinf);
+            }
+            return design_ntf_poly(ord, cfg_.cutoffHz, cfg_.fs);
+        };
+        auto isEc = [&]() { return cfg_.family == ModulatorFamily::Ec || cfg_.ecCorrection; };
+
         effectiveOrder_ = cfg_.order;
-        if (effectiveOrder_ >= 7 && levels_ == 2) {
-            if (cfg_.family == ModulatorFamily::Chebyshev) {
+        // Chebyshev 族的极点阻尼按 oobGainDb 固定，7 阶在四档速率的实测带内噪声都比
+        // 5 阶差 17~27 dB（|NTF|∞ 1.08~1.89、D 根半径 0.985~0.998），且 -60 dBFS 小信号
+        // SNR 直接跌破 20 dB ⟹ 1-bit 下不提供 7 阶（与 stable_sdm_order 同一条规则）。
+        if (levels_ == 2 && effectiveOrder_ >= 7 && cfg_.family == ModulatorFamily::Chebyshev &&
+            !cfg_.bypassOrderGuard) {
+            effectiveOrder_ = 5;
+            steppedDown_ = true;
+            stepDownReason_ =
+                "Chebyshev 族 1-bit 7 阶：实测四档速率的带内噪声均比 5 阶差 17~27 dB"
+                "（|NTF|∞ 1.08~1.89、D 根半径 0.985~0.998），-60 dBFS 小信号 SNR < 20 dB"
+                " ⟹ 降为 5 阶（该族要 7 阶请改用 Ec 族）";
+        }
+        ntf_ = designNtf(effectiveOrder_);
+
+        // ★ 1-bit 高阶守卫（2026-10-27 重做）：从「采样率硬门」改成「设计体检 + 质量门」。
+        //   ① 体检（不可绕过，除 bypassOrderGuard）：|NTF|∞ ≤ 1.36 且 D 根半径 ≤ 0.999。
+        //      这才是「会不会不稳」的真判据 —— 同一采样率下不同族的差别比不同采样率还大：
+        //      Butterworth-7@DSD64 |NTF|∞=1.65（MSSA 0.243，真不稳），
+        //      Chebyshev-7@DSD64  |NTF|∞=1.89（MSSA 0.000，彻底失稳），
+        //      EC-7@DSD64         |NTF|∞=1.35（MSSA 0.704，稳）。
+        //   ② 质量门（可用 cfg_.minOsrForHighOrder=0 关闭）：DSD64 上 7 阶带内噪声
+        //      比 5 阶差 6.5 dB，故默认 OSR<128 时仍降 5 阶 —— 这是质量取舍，不是稳定性。
+        if (effectiveOrder_ >= 7 && levels_ == 2 && !cfg_.bypassOrderGuard) {
+            const double hinf = ntf_hinf_lin(ntf_);
+            const double rad  = ntf_max_root_radius(ntf_.d);
+            const double osr  = cfg_.fs / (2.0 * 20000.0);
+            char buf[256];
+            bool down = false;
+            if (!(hinf <= kSdm1bitHinfMax && rad <= kSdm1bitRootMax)) {
+                std::snprintf(buf, sizeof(buf),
+                    "1-bit 7 阶 NTF 未通过稳定性体检：|NTF|∞=%.3f（上限 %.2f）、D 根半径=%.4f"
+                    "（上限 %.3f）⟹ 闭环极点余量不足，降为 5 阶",
+                    hinf, kSdm1bitHinfMax, rad, kSdm1bitRootMax);
+                down = true;
+            } else if (cfg_.minOsrForHighOrder > 0.0 && osr < cfg_.minOsrForHighOrder) {
+                std::snprintf(buf, sizeof(buf),
+                    "1-bit 7 阶在 OSR=%.0f（%s）下稳定性没问题（|NTF|∞=%.3f、根半径=%.4f、"
+                    "实测 MSSA≈0.70），但带内噪声比 5 阶差约 6.5 dB ⟹ 按质量门降为 5 阶"
+                    "（置 minOsrForHighOrder=0 可强制 7 阶）",
+                    osr, cfg_.family == ModulatorFamily::Ec ? "EC 族" : "当前族",
+                    hinf, rad);
+                down = true;
+            }
+            if (down) {
                 effectiveOrder_ = 5;
                 steppedDown_ = true;
-                stepDownReason_ = "1-bit 模式下 7 阶 Chebyshev NTF 极点阻尼比过低（Q≈130），小信号下闭环极点易移出单位圆形成极限环，自动降为 5 阶保护";
-            } else if (cfg_.fs < 5.6e6) {
-                effectiveOrder_ = 5;
-                steppedDown_ = true;
-                stepDownReason_ = "采样率 (" + std::to_string((int)(cfg_.fs / 1000.0)) +
-                                  " kHz) 不足 5.6 MHz，7 阶 1-bit 环路易饱和，自动降为 5 阶保护";
+                stepDownReason_ = buf;
+                ntf_ = designNtf(5);
             }
         }
-
-        if (cfg_.family == ModulatorFamily::Chebyshev) {
-            ntf_ = design_chebyshev_ntf_poly(effectiveOrder_, cfg_.cutoffHz, cfg_.fs, cfg_.oobGainDb);
-        } else if (cfg_.family == ModulatorFamily::Ec || cfg_.ecCorrection) {
-            // 2026-10-25：H∞ 受控综合（synthesize_ntf）。旧实现固定 fcHz=100k 的极点
-            // 没有 H∞ 约束，7 阶 1-bit 稳定性只能靠 fs≥5.6M 的硬门；新设计的 corner
-            // 由预算自适应，实测 DSD256 下 EC-7 满幅/瞬态/长跑判据全绿（见
-            // tests/test_modulator_families.cpp 第 3/4 节）。
-            ntf_ = synthesize_ntf(effectiveOrder_, cfg_.fs, 20000.0, cfg_.ntfHinf);
-            hinfUsed_ = ntf_hinf_lin(ntf_);
-        } else {
-            ntf_ = design_ntf_poly(effectiveOrder_, cfg_.cutoffHz, cfg_.fs);
-        }
+        if (isEc()) hinfUsed_ = ntf_hinf_lin(ntf_);
 
         const size_t sz = (size_t)effectiveOrder_ + 1;
         eBuf_.assign(sz, 0.0);

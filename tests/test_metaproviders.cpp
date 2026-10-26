@@ -17,7 +17,15 @@
 #endif
 #include "meta/provider.h"
 #include "meta/enrich.h"         // EnrichOpts(map 形态)的注册表配套断言(P1.5)
+#include "meta/artwork.h"        // 能力矩阵派生 + 头像/封面链(2026-10-27)
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -27,6 +35,10 @@ static int g_fail = 0;
 static void ck(bool cond, const char* what, const std::string& detail = "") {
     if (cond) std::printf("  [PASS] %s\n", what);
     else { std::printf("  [FAIL] %s  %s\n", what, detail.c_str()); ++g_fail; }
+}
+// 字符串相等断言(顺序/派生名单这类「整串对齐」的判据用它，失败时两边都打出来)
+static void ck_eq(const std::string& got, const std::string& want, const char* what) {
+    ck(got == want, what, "got=[" + got + "] want=[" + want + "]");
 }
 
 int main() {
@@ -569,6 +581,440 @@ int main() {
            "剥 http:// scheme", rta::net::http_proxy_normalize("http://127.0.0.1:7897"));
         ck(rta::net::http_proxy_normalize("http://127.0.0.1:7897/") == "127.0.0.1:7897",
            "剥尾斜杠", rta::net::http_proxy_normalize("http://127.0.0.1:7897/"));
+    }
+
+    // ---------------- 10) 能力矩阵 + 全信源候选派生(2026-10-27) ----------------
+    // 判据(铁律 3)：这一节要证明的不是「函数能跑」，而是
+    //   (a) caps 是唯一事实源 —— canSearch/canLyric 必须严格等于 caps&指针；
+    //   (b) 头像/封面/歌词的候选列表**完全由矩阵派生**(没有第二份手写名单)；
+    //   (c) 精确名匹配能挡住实测中真实存在的错位(粉丝号/同名他人/拼写变体)；
+    //   (d) 负缓存命中时**零网络**(用注入计数器的 mock transport 数请求次数)。
+    // Fixture 全部来自 2026-10-27 真实响应切片(网易 type=100 / QQ musicu / dizzylab /search /
+    // Discogs 匿名)，不是拟合数据。
+    std::printf("-- 能力矩阵 / 全信源候选派生 --\n");
+    {
+        const auto& reg = provider_registry();
+        auto has = [&](const char* id, ArtCap c) {
+            for (const auto& d : reg)
+                if (std::string(d.id) == id) return pv_has_cap(d.caps, c);
+            return false;
+        };
+
+        // (a) 派生位 ⇔ 矩阵 ⇔ 指针
+        bool consistent = true;
+        std::string bad;
+        for (const auto& d : reg) {
+            if (d.canSearch != (pv_has_cap(d.caps, ArtCap::Search) && d.search != nullptr)) {
+                consistent = false; bad += std::string(d.id) + "(canSearch);";
+            }
+            if (d.canLyric != (pv_has_cap(d.caps, ArtCap::Lyrics) && d.lyric != nullptr)) {
+                consistent = false; bad += std::string(d.id) + "(canLyric);";
+            }
+        }
+        ck(consistent, "canSearch/canLyric 严格由 caps+指针派生(caps 是唯一事实源)", bad);
+
+        // (b) 五个内容类的能力位(依据写在 provider.h 注册表条目注释里)
+        ck(has("dizzylab", ArtCap::ArtistImage) && has("qq", ArtCap::ArtistImage) &&
+           has("netease", ArtCap::ArtistImage) && has("discogs", ArtCap::ArtistImage),
+           "头像能力: dizzylab/qq/netease/discogs = true(全信源,不是只有网易云)");
+        ck(!has("itunes", ArtCap::ArtistImage),
+           "iTunes 头像 = false(实测 entity=musicArtist 响应里没有 artwork 字段)");
+        ck(!has("lrclib", ArtCap::Cover) && !has("lrclib", ArtCap::ArtistImage) &&
+           !has("lrclib", ArtCap::ArtistBio),
+           "lrclib 只有歌词(封面/头像/简介 = false)");
+        ck(has("dizzylab", ArtCap::ArtistBio) && has("discogs", ArtCap::ArtistBio) &&
+           !has("netease", ArtCap::ArtistBio) && !has("qq", ArtCap::ArtistBio) &&
+           !has("itunes", ArtCap::ArtistBio),
+           "简介能力: dizzylab/discogs = true;网易 briefDesc 实测为空、QQ/iTunes 无接口 ⇒ false");
+        ck(has("qq", ArtCap::Lyrics) && has("netease", ArtCap::Lyrics) &&
+           has("lrclib", ArtCap::Lyrics) && !has("dizzylab", ArtCap::Lyrics) &&
+           !has("itunes", ArtCap::Lyrics) && !has("discogs", ArtCap::Lyrics),
+           "歌词能力: qq/netease/lrclib = true(其余 false)");
+
+        // (c) 候选列表 = 矩阵派生(顺序与改造前逐项一致)
+        std::map<std::string, bool> on;
+        auto ids = [](const std::vector<const ProviderDesc*>& v) {
+            std::string s;
+            for (const auto* p : v) { if (!s.empty()) s += ","; s += p->id; }
+            return s;
+        };
+        ck_eq(ids(art_cover_sources(on)), "dizzylab,qq,netease,itunes,discogs",
+              "封面候选源 = 矩阵 Cover 位 + 注册表正序");
+        ck_eq(ids(art_artist_sources(on)), "dizzylab,qq,netease,discogs",
+              "头像候选源 = 矩阵 ArtistImage 位 + 注册表正序");
+        ck_eq(ids(art_lyric_sources(on)), "lrclib,netease,qq",
+              "歌词链 = 矩阵 Lyrics 位 + 逆序(与改造前逐项相同)");
+
+        // 源开关仍然生效(数据驱动不等于忽略用户设置)
+        std::map<std::string, bool> off;
+        off["dizzylab"] = false;
+        ArtworkOpts offOpts;
+        offOpts.srcOn = off;
+        std::string planOff;
+        for (const ArtArtistSource* s : art_artist_image_plan(offOpts)) {
+            if (!planOff.empty()) planOff += ",";
+            planOff += s->id;
+        }
+        ck_eq(planOff, "qq,netease,discogs", "关掉 dizzylab 后头像候选自动去掉它");
+
+        // 抓取实现表 ⇔ 矩阵(两边不一致 = 有人声明了能力却没实现，或实现了却没声明)
+        size_t capCount = 0;
+        for (const auto& d : reg) if (pv_has_cap(d.caps, ArtCap::ArtistImage)) ++capCount;
+        ck(capCount == art_artist_fetchers().size(),
+           "声明 ArtistImage 的源数 == 有抓取实现的源数",
+           std::to_string(capCount) + " vs " + std::to_string(art_artist_fetchers().size()));
+        bool fetchersDeclared = true;
+        std::string undeclared;
+        for (const auto& f : art_artist_fetchers())
+            if (!has(f.id, ArtCap::ArtistImage)) { fetchersDeclared = false; undeclared += f.id; }
+        ck(fetchersDeclared, "每个抓取实现都在矩阵里声明了 ArtistImage", undeclared);
+    }
+
+    // ---------------- 11) 艺人名归一化 + 精确匹配(防错位的唯一闸门) ----------------
+    std::printf("-- 艺人名归一化 / 精确匹配 --\n");
+    {
+        ck(art_norm_name("  Khrisma  ") == "khrisma", "归一化:去首尾空白 + 小写");
+        ck(art_norm_name("ＫＨＲＩＳＭＡ") == "khrisma", "归一化:全角 ASCII 折半角");
+        ck(art_norm_name("The   Beatles") == "the beatles", "归一化:内部连续空白折叠");
+        ck(art_norm_name("周杰伦.") != art_norm_name("周杰伦"),
+           "归一化**不丢标点**:网易云粉丝号「周杰伦.」不等于「周杰伦」");
+        ck(art_name_equal("Orquesta de Camara Promusica de Malaga",
+                          "Orquesta de Cámara Promúsica de Málaga"),
+           "拉丁重音折叠:「Malaga」==「Málaga」(实测 QQ 返回的就是带音标的名字)");
+        ck(!art_name_equal("Motley Crue", "Motley Crue II"), "折叠不越过「名字不同」这条线");
+        ck(art_name_equal("洛天依", " 洛天依 "), "精确匹配:空白无关");
+        ck(!art_name_equal("超绝可爱洛天依", "洛天依"), "精确匹配:拒绝粉丝号包子名");
+        ck(art_name_fuzzy("超绝可爱洛天依", "洛天依"),
+           "宽松匹配(仅 allowFuzzy=true)会误判粉丝号 —— 这正是它默认关闭的理由");
+
+        // 网易云 type=100 真实响应切片:第一条是正主,第二条是粉丝号(带 accountId)
+        const char* neJson =
+            "{\"result\":{\"artistCount\":83,\"artists\":["
+            "{\"id\":6452,\"name\":\"周杰伦\",\"picUrl\":\"https://p1.music.126.net/NWv6/109951169164936450.jpg\","
+            "\"alias\":[\"Jay Chou\"]},"
+            "{\"id\":51128649,\"name\":\"周杰伦.\",\"picUrl\":\"https://p1.music.126.net/IovR/109951168883440426.jpg\","
+            "\"accountId\":6347778659}]}}";
+        const std::vector<ArtArtistCandidate> ne = art_parse_netease_artists(neJson);
+        ck(ne.size() == 2, "netease 解析 2 条艺人", std::to_string(ne.size()));
+        ck(ne.size() == 2 && ne[0].id == "6452" && ne[0].pageUrl.find("6452") != std::string::npos,
+           "netease 解析 id/外链");
+        ck(ne.size() == 2 && ne[1].fanAccount, "netease 把带 accountId 的识别为粉丝号");
+        const ArtArtistCandidate* pickNe = art_pick_artist(ne, "周杰伦", false);
+        ck(pickNe && pickNe->id == "6452", "netease 精确匹配挑正主,不挑粉丝号",
+           pickNe ? pickNe->id : std::string("(null)"));
+
+        // QQ musicu 真实响应切片:Khrisma 只搜到 Kharisma(拼写不同)
+        const char* qqJson =
+            "{\"code\":0,\"req\":{\"code\":0,\"data\":{\"body\":{\"singer\":{\"list\":["
+            "{\"singerID\":1173855,\"singerMID\":\"002G3B064RcufT\",\"singerName\":\"Kharisma\","
+            "\"singerPic\":\"http://y.gtimg.cn/music/photo_new/T001R150x150M000002G3B064RcufT_2.jpg\"},"
+            "{\"singerID\":8098174,\"singerMID\":\"003dYMST40KSmO\",\"singerName\":\"炒饭\","
+            "\"singerPic\":\"http://y.gtimg.cn/music/photo_new/T001R150x150M000003dYMST40KSmO_2.jpg\"}"
+            "]}}}}}";
+        const std::vector<ArtArtistCandidate> qq = art_parse_qq_singers(qqJson);
+        ck(qq.size() == 2, "QQ 解析 2 条歌手", std::to_string(qq.size()));
+        ck(qq.size() == 2 && qq[1].imageUrl.find("T001R150x150") != std::string::npos,
+           "QQ 解析 singerPic(150x150 原样保留)");
+        ck(art_pick_artist(qq, "Khrisma", false) == nullptr,
+           "QQ 精确匹配:拒绝 Kharisma(拼写不同,宁可留空)");
+        const ArtArtistCandidate* fuzzyQq = art_pick_artist(qq, "Khrisma", true);
+        ck(fuzzyQq == nullptr,
+           "QQ 即使 allowFuzzy=true 也不接受 Kharisma(不是包含关系;宁缺毋错)");
+        const ArtArtistCandidate* pickFc = art_pick_artist(qq, "炒饭", false);
+        ck(pickFc && pickFc->id == "003dYMST40KSmO", "QQ 精确匹配:炒饭 命中");
+
+        // dizzylab 真实搜索页切片(「作品」段 + 「用户」段;用户段里有同名他人)
+        const char* dzHtml =
+            "<h4 class=\"text-warning\">作品</h4>\n"
+            "<a href=\"/d/GKCD-013\">\n<div class=\"card\">\n<div class=\"card-body\">\n"
+            "<img src=\"https://cdn.dizzylab.net/media/cover/GKCD-013.jpg!cover\" />\n"
+            "<h1>ORDINARY MIRACLES</h1>\n<h3>月華社</h3>\n</div>\n</div>\n</a>\n"
+            "<hr class=\"border-1 border-dark\" />\n"
+            "<h4 class=\"text-warning\">用户</h4>\n"
+            "<a href=\"/u/1307\">\n<div class=\"card\">\n<div class=\"card-body\">\n"
+            "<img src=\"https://cdn.dizzylab.net/media/avatars/1307_dizzz.jpg!cover\" width=\"100\" />\n"
+            "<h1>铁棍山药炒饭</h1>\n<p>一个饭。</p>\n</div>\n</div>\n</a>\n"
+            "<a href=\"/u/68242\">\n<div class=\"card\">\n<div class=\"card-body\">\n"
+            "<img src=\"https://cdn.dizzylab.net/media/avatars/7B6C6FC7B3-E054-4736-BD95-B64DC1BBCE467D.png!cover\" width=\"100\" />\n"
+            "<h1>Khrisma</h1>\n<p style='margin-top:12px'>月華社所属。东方/编曲/音游/公共交通/F1。</p>\n"
+            "</div>\n</div>\n</a>\n";
+        const std::vector<ArtArtistCandidate> dz = art_parse_dizzylab_users(dzHtml);
+        ck(dz.size() == 2, "dizzylab 只解析「用户」段(作品段的卡片不算用户)",
+           std::to_string(dz.size()));
+        ck(dz.size() == 2 && dz[1].id == "68242" && dz[1].name == "Khrisma",
+           "dizzylab 解析用户 id/名字");
+        ck(dz.size() == 2 && dz[1].imageUrl ==
+               "https://cdn.dizzylab.net/media/avatars/7B6C6FC7B3-E054-4736-BD95-B64DC1BBCE467D.png!cover",
+           "dizzylab 解析头像 URL(avatars/…!cover)", dz.size() == 2 ? dz[1].imageUrl : "");
+        ck(dz.size() == 2 && dz[1].bio.find("月華社所属") == 0,
+           "dizzylab 解析简介(用户卡片的 <p>)", dz.size() == 2 ? dz[1].bio : "");
+        ck(dz.size() == 2 && dz[1].pageUrl == "https://dizzylab.net/u/68242",
+           "dizzylab 解析用户外链");
+        ck(art_pick_artist(dz, "炒饭", false) == nullptr,
+           "dizzylab 精确匹配:拒绝「铁棍山药炒饭」(实测最容易张冠李戴的一条)");
+        const ArtArtistCandidate* dzHit = art_pick_artist(dz, "Khrisma", false);
+        ck(dzHit && dzHit->id == "68242", "dizzylab 精确匹配:Khrisma 命中本人");
+
+        // 没有「用户」段 = 该名字在 dizzylab 没有用户命中(实测 蔡琴/Various Artists 就是这种)
+        ck(art_parse_dizzylab_users("<h4 class=\"text-warning\">作品</h4><a href=\"/d/X\">x</a>").empty(),
+           "无「用户」段 → 0 条(不猜)");
+
+        // Discogs 匿名真实响应切片
+        const char* dcSearch =
+            "{\"pagination\":{\"items\":1},\"results\":["
+            "{\"id\":5296077,\"type\":\"artist\",\"title\":\"蔡琴\",\"uri\":\"/artist/5296077-蔡琴\","
+            "\"resource_url\":\"https://api.discogs.com/artists/5296077\"}]}";
+        const std::vector<ArtArtistCandidate> dc = art_parse_discogs_search(dcSearch);
+        ck(dc.size() == 1 && dc[0].id == "5296077" && dc[0].name == "蔡琴",
+           "Discogs 搜索解析(type=artist 过滤 + id/name)");
+        const char* dcArtist =
+            "{\"name\":\"蔡琴\",\"id\":5296077,\"uri\":\"https://www.discogs.com/artist/5296077-蔡琴\","
+            "\"profile\":\"Tsai Chin is a pop and folk singer from Taiwan.\","
+            "\"images\":[{\"type\":\"secondary\",\"uri\":\"https://i.discogs.com/sec.jpeg\"},"
+            "{\"type\":\"primary\",\"uri\":\"https://i.discogs.com/pri.jpeg\"}]}";
+        const ArtArtistCandidate dca = art_parse_discogs_artist(dcArtist);
+        ck(dca.imageUrl == "https://i.discogs.com/pri.jpeg",
+           "Discogs 详情:优先取 images[type=primary]", dca.imageUrl);
+        ck(dca.bio.find("Tsai Chin") == 0, "Discogs 详情:profile → 简介");
+        ck(dca.pageUrl.find("discogs.com/artist") != std::string::npos, "Discogs 详情:外链");
+
+        // 图片魔数嗅探(不看 Content-Type)
+        std::string jpg(3000, (char)0x41);
+        jpg[0] = (char)0xFF; jpg[1] = (char)0xD8;
+        std::string png(3000, (char)0x41);
+        png[0] = (char)0x89; png[1] = 'P'; png[2] = 'N'; png[3] = 'G';
+        ck(art_image_magic(jpg) && art_image_magic(png), "魔数嗅探:JPEG/PNG 通过");
+        ck(!art_image_magic("<html>not an image</html>"), "魔数嗅探:HTML 报错页被拒");
+    }
+
+    // ---------------- 11b) 主艺人回退(多艺人串) ----------------
+    // 真实库 245 位里有 106 位查不到头像，绝大多数是「A, B feat. C」这种多艺人串 ——
+    // 任何源都不会有「A, B feat. C」这个艺人。取第一段(主艺人)再走同一条精确匹配链。
+    std::printf("-- 主艺人回退(多艺人串) --\n");
+    {
+        ck_eq(art_primary_artist("陈彼得/游戏科学/8082Audio"), "陈彼得", "取 '/' 前的主艺人(实测库里就有这种串)");
+        ck_eq(art_primary_artist("Colorpen & Loyde Vovo"), "Colorpen", "取 ' & ' 前的主艺人");
+        ck_eq(art_primary_artist("SinghP, Haru.jpg, 之初"), "SinghP", "取 ',' 前的主艺人");
+        ck_eq(art_primary_artist("洛天依 feat. 言和"), "洛天依", "取 ' feat. ' 前的主艺人");
+        ck(art_primary_artist("AC/DC").empty(),
+           "「AC/DC」不切(切出 AC 会贴错人) —— '/' 切分要求 ≥3 字");
+        ck(art_primary_artist("Peak( かりんと, あさぬこ").empty(),
+           "括号不配平的截断串放弃");
+        ck(art_primary_artist("蔡琴").empty(), "单艺人名不产生主艺人");
+        ck_eq(art_primary_artist("  甲 & 乙 "), "甲", "主艺人也会 trim");
+    }
+
+    // ---------------- 12) 封面候选 URL 链(修「只问第一首」) ----------------
+    std::printf("-- 封面候选 URL 链 --\n");
+    {
+        std::vector<Candidate> cs(4);
+        cs[0].source = "dizzylab"; cs[0].coverUrl = "https://a/1.jpg";
+        cs[1].source = "qq";       cs[1].coverUrl = "https://b/2.jpg";
+        cs[2].source = "netease";  cs[2].coverUrl = "https://a/1.jpg";   // 与 cs[0] 重复
+        cs[3].source = "itunes";   cs[3].coverUrl = "";                  // 没有封面
+        std::vector<Scored> sorted(4);
+        for (size_t i = 0; i < 4; ++i) { sorted[i].idx = i; sorted[i].score = 1.0 - 0.1 * (double)i; }
+        const std::vector<std::string> chain = art_cover_urls_by_score(sorted, cs);
+        ck(chain.size() == 2 && chain[0] == "https://a/1.jpg" && chain[1] == "https://b/2.jpg",
+           "封面链:按分数排序 + 去重 + 跳过空 URL", std::to_string(chain.size()));
+
+        // 逐个 URL 试:第一个 404、第二个是图片 → 成功,且把失败原因留下
+        std::vector<std::string> calls;
+        std::string jpg(3000, (char)0x41);
+        jpg[0] = (char)0xFF; jpg[1] = (char)0xD8;
+        set_artwork_http_for_test([&](const ArtHttpRequest& q) {
+            calls.push_back(q.url);
+            rta::net::HttpResponse r;
+            if (q.url == "https://b/2.jpg") {
+                r.ok = true; r.status = 200; r.body.assign(jpg.begin(), jpg.end());
+            } else {
+                r.status = 404;
+            }
+            return r;
+        });
+        ArtworkOpts covOpts;
+        covOpts.minBytes = 2049;          // 与 enrich 侧旧判据 >2048 等价
+        const CoverFetchResult cf = art_fetch_cover_urls({"https://a/1.jpg", "https://b/2.jpg"}, covOpts);
+        ck(cf.ok && cf.url == "https://b/2.jpg", "封面链:第一张 404 后自动换第二张", cf.err);
+        ck(cf.tried.size() == 1 && cf.tried[0].find("HTTP 404") != std::string::npos,
+           "封面链:失败原因逐条留痕", cf.tried.empty() ? std::string() : cf.tried[0]);
+        ck(cf.bytes.size() == 3000, "封面链:返回图片字节");
+
+        // 小于阈值的图不收(旧判据 >2KB)
+        set_artwork_http_for_test([&](const ArtHttpRequest&) {
+            rta::net::HttpResponse r;
+            r.ok = true; r.status = 200;
+            std::string small(100, (char)0x41);
+            small[0] = (char)0xFF; small[1] = (char)0xD8;
+            r.body.assign(small.begin(), small.end());
+            return r;
+        });
+        const CoverFetchResult cf2 = art_fetch_cover_urls({"https://tiny.jpg"}, covOpts);
+        ck(!cf2.ok, "封面链:<2KB 的图不采纳(与旧判据一致)");
+        set_artwork_http_for_test(nullptr);
+    }
+
+    // ---------------- 13) 头像:正缓存/负缓存/瞬态失败(零网络验证) ----------------
+    std::printf("-- 头像缓存(注入 transport 数请求次数)--\n");
+    {
+        namespace fs = std::filesystem;
+        const char* dzUserHtml =
+            "<h4 class=\"text-warning\">用户</h4>\n"
+            "<a href=\"/u/99999\">\n<div class=\"card\">\n<div class=\"card-body\">\n"
+            "<img src=\"https://cdn.dizzylab.net/media/avatars/t.png!cover\" width=\"100\" />\n"
+            "<h1>测试艺人-缓存</h1>\n<p>简介一段。</p>\n</div>\n</div>\n</a>\n";
+        const char* dzEmptyHtml = "<h4 class=\"text-warning\">作品</h4><p>无用户段</p>";
+        const char* emptyJson = "{\"result\":{\"artistCount\":0,\"artists\":[]}}";
+        const char* emptyQq = "{\"req\":{\"data\":{\"body\":{\"singer\":{\"list\":[]}}}}}";
+        const char* emptyDc = "{\"results\":[]}";
+
+        std::string jpg(3000, (char)0x41);
+        jpg[0] = (char)0xFF; jpg[1] = (char)0xD8;
+
+        std::vector<std::string> calls;
+        int mode = 0;   // 0=命中 1=全 miss 2=瞬态失败
+        auto mock = [&](const ArtHttpRequest& q) {
+            calls.push_back(q.url);
+            rta::net::HttpResponse r;
+            r.ok = true; r.status = 200;
+            if (q.url.find("cdn.dizzylab.net/media/avatars/") != std::string::npos) {
+                r.body.assign(jpg.begin(), jpg.end());
+                return r;
+            }
+            if (q.url.find("dizzylab.net/search") != std::string::npos) {
+                if (mode == 2) { r.ok = false; r.status = 0; r.error = "connect failed"; return r; }
+                if (mode == 3) {
+                    // 「甲 & 乙」全名(编码后含 %26)查不到；「甲」能查到 —— 专门验证主艺人回退
+                    if (q.url.find("%26") != std::string::npos) {
+                        r.body.assign(dzEmptyHtml, dzEmptyHtml + std::strlen(dzEmptyHtml));
+                        return r;
+                    }
+                    const char* jia =
+                        "<h4 class=\"text-warning\">用户</h4>\n"
+                        "<a href=\"/u/77777\">\n<div class=\"card\">\n<div class=\"card-body\">\n"
+                        "<img src=\"https://cdn.dizzylab.net/media/avatars/jia.png!cover\" width=\"100\" />\n"
+                        "<h1>甲</h1>\n<p>主艺人。</p>\n</div>\n</div>\n</a>\n";
+                    r.body.assign(jia, jia + std::strlen(jia));
+                    return r;
+                }
+                const std::string h = (mode == 0) ? dzUserHtml : dzEmptyHtml;
+                r.body.assign(h.begin(), h.end());
+                return r;
+            }
+            if (q.url.find("musicu.fcg") != std::string::npos) {
+                r.body.assign(emptyQq, emptyQq + std::strlen(emptyQq)); return r;
+            }
+            if (q.url.find("/api/search/get") != std::string::npos) {
+                r.body.assign(emptyJson, emptyJson + std::strlen(emptyJson)); return r;
+            }
+            if (q.url.find("api.discogs.com") != std::string::npos) {
+                r.body.assign(emptyDc, emptyDc + std::strlen(emptyDc)); return r;
+            }
+            r.status = 404; r.ok = false;
+            return r;
+        };
+        set_artwork_http_for_test(mock);
+        auto mockNow = std::chrono::steady_clock::now();
+        set_dizzylab_clock_for_test([&]() { return mockNow; });
+        dl_gate_reset_for_test();
+
+        const fs::path dir = fs::temp_directory_path() / "rlplayer_artwork_test";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        ArtworkOpts o;
+        o.cacheDir = dir.string();
+        o.totalBudgetMs = 8000;
+
+        // ① 正缓存:第 1 次真抓(搜索 1 + 头像下载 1),第 2 次零网络
+        mode = 0;
+        calls.clear();
+        const ArtistImageResult r1 = artwork_fetch_artist_image("测试艺人-缓存", o);
+        const size_t n1 = calls.size();
+        ck(r1.ok && r1.source == "dizzylab" && r1.bytes.size() == 3000,
+           "头像命中:来源=dizzylab,字节数正确", r1.summary());
+        ck(n1 == 2, "第 1 次:搜索 1 次 + 下载 1 次 = 2 个请求", std::to_string(n1));
+        calls.clear();
+        mockNow += std::chrono::seconds(5);
+        const ArtistImageResult r2 = artwork_fetch_artist_image("测试艺人-缓存", o);
+        ck(r2.ok && r2.fromCache, "第 2 次:命中磁盘正缓存", r2.summary());
+        ck(calls.empty(), "第 2 次:零网络", std::to_string(calls.size()));
+        ck(r2.source == "dizzylab" && r2.url.find("avatars/t.png") != std::string::npos,
+           "第 2 次:溯源(source/url)从 .src 读回", r2.source + " " + r2.url);
+
+        // ② 负缓存:第 1 次 4 源全 miss,第 2/3 次必须零网络
+        mode = 1;
+        calls.clear();
+        mockNow += std::chrono::seconds(5);
+        const ArtistImageResult m1 = artwork_fetch_artist_image("无图艺人-负缓存", o);
+        ck(!m1.ok, "负缓存用例:第 1 次没有头像", m1.summary());
+        ck(m1.tried.size() == 4, "负缓存用例:四个源都试过(全信源,不是只问网易云)",
+           std::to_string(m1.tried.size()));
+        const size_t nMiss1 = calls.size();
+        ck(nMiss1 >= 4, "负缓存用例:第 1 次确实打了网络", std::to_string(nMiss1));
+        calls.clear();
+        mockNow += std::chrono::seconds(5);
+        const ArtistImageResult m2 = artwork_fetch_artist_image("无图艺人-负缓存", o);
+        ck(!m2.ok && m2.fromNegCache, "负缓存用例:第 2 次走负缓存", m2.summary());
+        ck(calls.empty(), "负缓存用例:第 2 次零网络", std::to_string(calls.size()));
+        calls.clear();
+        mockNow += std::chrono::seconds(5);
+        const ArtistImageResult m3 = artwork_fetch_artist_image("无图艺人-负缓存", o);
+        ck(!m3.ok && calls.empty(), "负缓存用例:第 3 次仍零网络", std::to_string(calls.size()));
+        std::string negText;
+        {
+            std::ifstream f(fs::u8path(art_cache_paths(o.cacheDir, "无图艺人-负缓存").none), std::ios::binary);
+            std::ostringstream ss; ss << f.rdbuf(); negText = ss.str();
+        }
+        ck(negText.find("src=dizzylab") != std::string::npos &&
+           negText.find("src=qq") != std::string::npos &&
+           negText.find("src=netease") != std::string::npos &&
+           negText.find("src=discogs") != std::string::npos,
+           "负缓存文件逐源记录(src=dizzylab/qq/netease/discogs)", negText.substr(0, 120));
+        ck(negText.find("kind=miss") != std::string::npos && negText.find("reason=") != std::string::npos,
+           "负缓存文件带 kind=miss 与 reason=");
+
+        // ③ 瞬态失败不钉死:kind=fail 的源下次仍重试(只记原因)
+        mode = 2;
+        calls.clear();
+        mockNow += std::chrono::seconds(5);
+        const ArtistImageResult t1 = artwork_fetch_artist_image("抖动艺人-瞬态", o);
+        ck(!t1.ok, "瞬态用例:第 1 次没有头像");
+        calls.clear();
+        mockNow += std::chrono::seconds(5);
+        const ArtistImageResult t2 = artwork_fetch_artist_image("抖动艺人-瞬态", o);
+        const bool dizzylabRetried = std::any_of(calls.begin(), calls.end(), [](const std::string& u) {
+            return u.find("dizzylab.net/search") != std::string::npos;
+        });
+        ck(dizzylabRetried, "瞬态失败(断网)下次仍重试 dizzylab(不写死成「没有头像」)",
+           std::to_string(calls.size()) + " 个请求");
+        (void)t2;
+
+        // ④ 主艺人回退:「甲 & 乙」四源都没有,但「甲」在 dizzylab 有 -> 命中主艺人
+        mode = 3;
+        calls.clear();
+        mockNow += std::chrono::seconds(5);
+        const ArtistImageResult p1 = artwork_fetch_artist_image("甲 & 乙", o);
+        ck(p1.ok && p1.bytes.size() == 3000, "主艺人回退:全名落空后靠「甲」命中", p1.summary());
+        ck(p1.source.find("dizzylab") == 0 && p1.source.find("主艺人") != std::string::npos,
+           "主艺人回退:溯源里写明「<-主艺人 甲」", p1.source);
+        {
+            std::string meta;
+            std::ifstream f(fs::u8path(art_cache_paths(o.cacheDir, "甲 & 乙").src), std::ios::binary);
+            std::ostringstream ss; ss << f.rdbuf(); meta = ss.str();
+            ck(meta.find("primary=甲") != std::string::npos,
+               "主艺人回退:.src 里记 primary=(可核对这张脸是谁的)", meta.substr(0, 80));
+        }
+        // 关掉这条策略就不该命中(证明它是显式开关，不是隐式行为)
+        ArtworkOpts o2 = o;
+        o2.splitPrimary = false;
+        o2.cacheDir.clear();            // 不吃上面那份缓存
+        const ArtistImageResult p2 = artwork_fetch_artist_image("甲 & 乙", o2);
+        ck(!p2.ok, "splitPrimary=false 时不做主艺人回退");
+
+        set_artwork_http_for_test(nullptr);
+        set_dizzylab_clock_for_test(nullptr);
+        dl_gate_reset_for_test();
+        fs::remove_all(dir, ec);
     }
 
     // ---------------- 收尾 ----------------

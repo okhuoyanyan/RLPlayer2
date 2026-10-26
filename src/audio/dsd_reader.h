@@ -26,6 +26,37 @@
 
 namespace rta::audio {
 
+// ===========================================================================
+// 「本播放器不做这个格式」—— 必须与「文件坏了/读不了」分开的**独立类型**
+// （2026-10-27，用户 261027-01 #3）
+//
+// 为什么不能只是一句更长的错误文案：read_any 对 DSD 原生读取失败的**既定策略是回退 ffmpeg**
+// （ROADMAP P0：「读不了的文件仍走 ffmpeg」）。回退只对「读不了」成立；对「格式不支持」
+// （DST 压缩 / SACD ISO），ffmpeg 只会再失败一次，并报出
+//   "Invalid data found when processing input"
+// —— 用户看到这句只会以为文件坏了（实测就是这么反馈的）。所以：
+//   不支持 ⟹ 抛本类型 + 带指引的文案，read_any **原样上抛，绝不回退**。
+// ===========================================================================
+class UnsupportedFormat : public std::runtime_error {
+public:
+    explicit UnsupportedFormat(const std::string& what) : std::runtime_error(what) {}
+};
+
+// 文案一条一条写全：格式名 + 为什么 + 下一步怎么做。判据见 tests/test_dsd_reader.cpp（[6] 节）
+// 与 tests/test_library.cpp（[6] 节：.iso 入库 + 播放报错）。
+inline std::string msg_dst_unsupported(const std::string& where) {
+    return "DST 压缩的 DSD 暂不支持（这是 SACD 的无损压缩格式）。"
+           "请先用 sacd_extract / foobar2000 等工具转成 .dsf 或 .dff 再播放。"
+           "（位置：" + where + "）";
+}
+inline std::string msg_sacd_iso_unsupported() {
+    return "SACD ISO 镜像暂不支持直接播放。请先用 sacd_extract 转成分轨 .dsf 后入库。";
+}
+inline std::string msg_iso_not_audio() {
+    return "这不是音频镜像：这个 .iso 里没有 SACD 目录，看起来是普通数据光盘镜像。"
+           "本播放器只支持 SACD ISO（且需要先用 sacd_extract 转成分轨 .dsf 才能播放）。";
+}
+
 enum class DsdBitOrder { MsbFirst, LsbFirst };
 
 inline const char* dsd_bit_order_name(DsdBitOrder o) {
@@ -200,9 +231,12 @@ inline DsdStream read_dsf(const std::string& path) {
     const uint32_t blockSize = rdl32(b + 32);
 
     if (fmtId != 0)
-        throw std::runtime_error("DSF format id = " + std::to_string(fmtId) + "（DST 压缩）暂不支持");
+        throw UnsupportedFormat(msg_dst_unsupported("DSF format id = " + std::to_string(fmtId) +
+                                                   "，文件=" + path));
     if (bitsPerSm != 1)
-        throw std::runtime_error("DSF bits per sample = " + std::to_string(bitsPerSm) + "（应为 1）");
+        throw UnsupportedFormat("DSF bits per sample = " + std::to_string(bitsPerSm) +
+                                "（标准 DSD 必须是 1），这个文件不是标准 1-bit DSD，暂不支持。"
+                                "请转成标准 .dsf 再播放。（文件=" + path + "）");
     if (chNum < 1 || chNum > 8)
         throw std::runtime_error("DSF 声道数异常: " + std::to_string(chNum));
     if (rate < 44100)
@@ -326,15 +360,20 @@ inline DsdStream read_dff(const std::string& path) {
             dataPtr = body; dataSize = sz;
         } else if (std::memcmp(f.data() + off, "DST ", 4) == 0 ||
                    std::memcmp(f.data() + off, "DSTI", 4) == 0) {
-            throw std::runtime_error("DFF 使用 DST 压缩（DST 块），暂不支持");
+            throw UnsupportedFormat(msg_dst_unsupported("DFF 含 DST 块，文件=" + path));
         }
         off += 12 + (size_t)sz + (size_t)(sz & 1);
     }
 
     if (!dataPtr) throw std::runtime_error("DFF 缺少 DSD 数据块");
     if (rate == 0) throw std::runtime_error("DFF 缺少 FS（采样率）子块");
-    if (!cmpType.empty() && cmpType != "DSD ")
-        throw std::runtime_error("DFF 压缩类型不是 \"DSD \"（为 \"" + cmpType + "\"）");
+    if (!cmpType.empty() && cmpType != "DSD ") {
+        // CMPR = "DST " 就是 DST 压缩（有些文件没有独立的 DST 块，只靠 CMPR 声明）
+        if (cmpType == "DST ")
+            throw UnsupportedFormat(msg_dst_unsupported("DFF CMPR=DST，文件=" + path));
+        throw UnsupportedFormat("DFF 压缩类型不是 \"DSD \"（为 \"" + cmpType +
+                                "\"），暂不支持。请转成未压缩的 .dsf / .dff 再播放。");
+    }
 
     const uint32_t ch = declaredCh ? declaredCh : 2;
     if (ch < 1 || ch > 8) throw std::runtime_error("DFF 声道数异常: " + std::to_string(ch));
@@ -409,10 +448,12 @@ inline DsdInfo probe_dsd(const std::string& path) {
         i.channels = (int)rdl32(fmt + 12);
         i.rate = rdl32(fmt + 16);
         i.bits = rdl64(fmt + 24);
-        if (rdl32(fmt + 20) != 1)
-            throw std::runtime_error("DSF bits per sample 不是 1（DST 压缩？）");
         if (rdl32(fmt + 4) != 0)
-            throw std::runtime_error("DSF format id 不是 0（DST 压缩？）");
+            throw UnsupportedFormat(msg_dst_unsupported("DSF format id = " +
+                                    std::to_string(rdl32(fmt + 4)) + "，文件=" + path));
+        if (rdl32(fmt + 20) != 1)
+            throw UnsupportedFormat("DSF bits per sample 不是 1（不是标准 1-bit DSD，暂不支持）。"
+                                    "请转成标准 .dsf 再播放。（文件=" + path + "）");
         if (i.channels < 1 || i.channels > 8 || i.rate < 44100)
             throw std::runtime_error("DSF 头字段异常");
         return i;

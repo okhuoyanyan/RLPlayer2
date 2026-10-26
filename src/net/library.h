@@ -48,6 +48,21 @@ inline std::string fnv_hex(const std::string& s) {
     return std::string(b);
 }
 
+// 扩展名（含点、小写）。只用于识别，不参与"用哪个拼写去打开文件"（真名永远保留，见 lib_path_key）。
+inline std::string lib_ext_lc(const std::string& p) {
+    const size_t d = p.find_last_of('.');
+    const size_t s = p.find_last_of("\\/");
+    if (d == std::string::npos) return "";
+    if (s != std::string::npos && d < s) return "";      // 点出现在目录名里
+    std::string e = p.substr(d);
+    for (auto& c : e) c = (char)std::tolower((unsigned char)c);
+    return e;
+}
+
+// 「镜像」类文件：能识别、能入库，但**不能直接播**（2026-10-27，用户 261027-01 #3）。
+// 目前只有 .iso（SACD 镜像）。判据只看扩展名 —— 与 LibTrack::needsConvert() 同一口径。
+inline bool lib_is_iso_path(const std::string& p) { return lib_ext_lc(p) == ".iso"; }
+
 struct LibTrack {
     std::string path;         // 绝对路径（UTF-8）
     std::string title, artist, album, albumArtist, genre, codec;
@@ -74,6 +89,13 @@ struct LibTrack {
     long long   cueOff = 0;
     long long   cueLen = 0;
     bool isCueTrack() const { return !cuePath.empty(); }
+
+    // ---- 需转换（2026-10-27，用户 261027-01 #3）----
+    // SACD ISO 这类镜像：**入库、能看见、能搜索**，但不当作可播放音轨。
+    // 为什么不落盘一个 bool：它完全由路径扩展名决定，这里现算 ⟹ 旧索引（v4/v5 没有这一列）
+    // 读回来也是对的，不必升 #libIndexV 让用户整份重扫（升版本的代价见 load() 的注释）。
+    // 「SACD 还是普通数据盘」需要读镜像才知道，由 Library::isoKindOf() 现问（见那里的说明）。
+    bool needsConvert() const { return lib_is_iso_path(path); }
 };
 
 struct LibAlbum {
@@ -230,6 +252,10 @@ public:
         std::lock_guard<std::mutex> lk(mtx_);
         if (i >= tracks_.size()) return false;
         out = tracks_[i];
+        // 索引里没有 codec 这一列（v5 的 20 列里没有），所以 .iso 的「需转换」标签在**重启后**会是空的。
+        // 这里按扩展名补一条**纯内存**标签（不读盘、不占锁做 I/O）：UI 靠这个字段就能一直显示
+        // "需转换"。更细的「SACD 还是普通数据盘」要读镜像 → 用 Library::isoKindOf()（见那里的说明）。
+        if (out.codec.empty() && out.needsConvert()) out.codec = "ISO 镜像（需转换）";
         return true;
     }
     // 返回命中曲目的下标（最多 limit 条）
@@ -253,6 +279,24 @@ public:
     bool albumCoverTermTitles(const std::string& key, size_t maxTitles, LibApiCoverTerm& out) const;
     // 艺术家 → 其专辑名（去重，最多 maxAlbums 张；名字**精确**匹配库里的 artist 口径）。
     std::vector<std::string> artistAlbumNames(const std::string& artist, size_t maxAlbums = 6) const;
+
+    // ---- 需转换的镜像（2026-10-27，用户 261027-01 #3）----
+    // 库里有多少首"需转换"（SACD ISO）。给状态端点/UI 用：不读盘、只数内存里的记录。
+    size_t needsConvertCount() const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        size_t n = 0;
+        for (auto& t : tracks_) if (t.needsConvert()) ++n;
+        return n;
+    }
+    // .iso 到底是什么（"sacd" / "data" / "unknown"）。**每次调用都读镜像头**（两次 2048 字节读，
+    // 无子进程）—— 因为镜像内容不进索引，"重启后仍能答"比"省一次读"重要。
+    // 用途：UI 层把"需转换"分成「SACD，需 sacd_extract 分轨」与「这不是音频镜像」两种文案。
+    std::string isoKindOf(const std::string& path) const {
+        const rta::audio::IsoInfo ii = rta::audio::iso_inspect(path);
+        if (ii.kind == rta::audio::IsoKind::Sacd) return "sacd";
+        if (ii.kind == rta::audio::IsoKind::Data) return "data";
+        return "unknown";
+    }
 
     // ---- 扫描 ----
     void load();            // 读配置与索引
@@ -425,12 +469,15 @@ inline bool lib_has_cover_file(const std::string& trackPath) {
     return false;
 }
 
+// 「能被曲库收进来」的扩展名。注意 .iso **不是**可播放音轨（见 lib_is_iso_path /
+// LibTrack::needsConvert）：它在白名单里的含义是"要入库让用户看见"，不是"能播"。
+// 2026-10-27（261027-01 #3）：加 .iso —— 以前连识别都没有，用户把 SACD ISO 拖进来毫无反应。
 inline bool lib_is_audio(const fsx::path& p) {
     std::string ext = u8s(p.extension().u8string());
     for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
     static const char* kExt[] = { ".wav", ".wave", ".flac", ".m4a", ".alac", ".mp3", ".aac",
                                   ".ogg", ".opus", ".wma", ".ape", ".wv", ".dsf", ".dff",
-                                  ".aif", ".aiff", ".aifc", ".caf", ".mka", ".mpc" };
+                                  ".aif", ".aiff", ".aifc", ".caf", ".mka", ".mpc", ".iso" };
     for (auto* x : kExt) if (ext == x) return true;
     return false;
 }
@@ -480,6 +527,9 @@ inline bool lib_is_cue(const fsx::path& p) {
 // 变成 N 条打不开的幽灵曲目（而整轨本来也不会出现）——这正是「丢歌」的形态。
 inline bool lib_cue_audio_exists(const std::string& p) {
     if (p.empty() || !lib_valid_utf8(p)) return false;
+    // .iso 在 lib_is_audio 白名单里（为了让库收得进来），但它**不是**可播放音轨：
+    // cue 的 FILE 指向它时不能认领（认领会展开成 N 首打不开的曲目）。
+    if (lib_is_iso_path(p)) return false;
     std::error_code ec;
     try {
         const fsx::path wp = p8(p);
@@ -654,6 +704,27 @@ inline void lib_fill_album_disc_from_dir(LibTrack& t, LibDirAlbumMemo* memo = nu
     const LibDirAlbum da = memo ? memo->get(pdir, t.path) : lib_dir_album_for(t.path);
     if (t.album.empty() && !da.album.empty()) { t.album = da.album; t.albumFromDir = true; }
     if (t.discNo <= 0 && da.disc > 0)         { t.discNo = da.disc; t.discFromDir = true; }
+}
+
+// .iso 入库探测（2026-10-27，用户 261027-01 #3）
+//
+// **不进 ffprobe**：随包 ffmpeg 9.0 没有 iso9660/udf/sacd demuxer，跑一次只会失败并拖慢扫描。
+// 只读镜像的 ISO9660 结构（rta::audio::iso_inspect，两次小读）：
+//   * 根目录或卷标里有 SACD ⟹ codec = "SACD ISO（需转换）"；
+//   * 是 ISO9660 但没有 SACD 目录 ⟹ "ISO 数据盘（非音频镜像）"；
+//   * 连 ISO9660 都没有 ⟹ "ISO 未知镜像"。
+// 流参数（sr/bits/ch/dur）一律留 0：**不许给"看起来有效"的值**，否则 UI 会把它当可播曲目，
+// 用户点了才吃一条错误（那就是本轮要消灭的体验）。
+inline LibTrack lib_probe_iso(const std::string& file) {
+    LibTrack t;
+    t.path = file;
+    const rta::audio::IsoInfo ii = rta::audio::iso_inspect(file);
+    if (ii.kind == rta::audio::IsoKind::Sacd)       t.codec = "SACD ISO（需转换）";
+    else if (ii.kind == rta::audio::IsoKind::Data)  t.codec = "ISO 数据盘（非音频镜像）";
+    else                                            t.codec = "ISO 未知镜像";
+    // 封面：与普通曲目同一口径（同目录独立封面文件；ISO 没有内嵌封面可读）
+    t.hasCover = lib_has_cover_file(file) ? 1 : 0;
+    return t;
 }
 
 // 一次 ffprobe 取全部信息（比 media_info.h 的两次调用快一倍）
@@ -1682,6 +1753,9 @@ inline void Library::startScan(bool forceFull) {
                 }
                 const std::string pkey = lib_path_key(p);
                 const bool cueOwned = (cueCand.count(pkey) != 0);
+                // .iso 镜像（2026-10-27，261027-01 #3）：不进 ffprobe、不信任 mtime+size 缓存
+                // （codec 那一列不落盘，缓存复用会让"需转换"的标签在重启后消失），只读镜像结构。
+                const bool isIso = lib_is_iso_path(p);
                 auto oit = oldByPath.find(p);
                 // ★ cue 认领的文件**每次扫描都重探**（cueOwned）：末轨长度要用文件总时长，而
                 //   mtime+size 只证明"文件没变"，不证明"上次探测成功"。
@@ -1701,7 +1775,7 @@ inline void Library::startScan(bool forceFull) {
                 // 2026-10-26：旧版本索引（v4 及更早）里的标签是旧解析器写的，必须重探；
                 // 现代价只有一次（655 首约 1 s），换来标签修复与专辑归并真正生效。
                 const bool retagOld = idxIsV4;   // 只有 v4 需要"留结构、重探标签"；v5 直接复用，v3 已整份丢弃
-                if (!forceFull && !retagOld && oit != oldByPath.end()) {
+                if (!forceFull && !retagOld && !isIso && oit != oldByPath.end()) {
                     const LibTrack& o = old[oit->second];
                     if (!o.isCueTrack() && o.mtime == mt && o.size == sz) {
                         // 复用旧记录，但仍要过一遍目录回填：老代码写的索引版本头也是 v3，但 album 列空、
@@ -1716,7 +1790,7 @@ inline void Library::startScan(bool forceFull) {
                         return;
                     }
                 }
-                LibTrack t = lib_probe_one(p, ffprobe);
+                LibTrack t = isIso ? lib_probe_iso(p) : lib_probe_one(p, ffprobe);
                 t.mtime = mt;
                 t.size = sz;
                 if (t.title.empty()) {
@@ -1837,6 +1911,10 @@ inline void Library::startScan(bool forceFull) {
             }
         }
 
+        // ★ 必须在 tracks_.swap(fresh) **之前**数：swap 之后 fresh 里装的是上一份 tracks_
+        //   （2026-10-27 第一版就数错了，扫描消息因此永远报 0 个镜像 —— 判据见 test_library [6]）。
+        int isoCount = 0;
+        for (auto& t : fresh) if (t.needsConvert()) ++isoCount;
         const size_t nt = fresh.size();
         std::string text;
         {
@@ -1867,6 +1945,10 @@ inline void Library::startScan(bool forceFull) {
             if (!cueWalked.empty())
                 m += "；CUE 展开 " + std::to_string(cueOk) + " 张/" + std::to_string(cueTracks.size()) +
                      " 首" + (cueLost > 0 ? "（" + std::to_string(cueLost) + " 张退回整轨）" : "");
+            // .iso 如实报告（2026-10-27，261027-01 #3）：入库了，但**不能直接播**，
+            // 别让用户以为"扫进来 3 首就都能听"。
+            if (isoCount > 0)
+                m += "；" + std::to_string(isoCount) + " 个 ISO 镜像需转换（SACD 请用 sacd_extract 转分轨 .dsf）";
             scanMsg_ = m;
         }
         scanning_.store(false);

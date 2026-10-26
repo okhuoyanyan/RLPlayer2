@@ -34,6 +34,7 @@
 #include "meta/parse.h"
 #include "meta/llm.h"
 #include "meta/provider.h"
+#include "meta/artwork.h"      // 能力矩阵 → 封面/头像/歌词候选(2026-10-27 全信源统一调度)
 #include "meta/match.h"
 #include "meta/discogs.h"
 #include "audio/media_info.h"
@@ -435,20 +436,36 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
         }
     }
 
-    // ---- 7) 封面:记录缺封面且首选候选有 URL → 下载(>2KB 才收) ----
-    if (tm.coverRelPath.empty() && !best.coverUrl.empty()) {
-        const rta::net::HttpResponse resp = rta::net::http_get(best.coverUrl, {}, 15000);
-        if (resp.status == 200 && resp.body.size() > 2048) {
-            const std::string rel = ms.saveCover(file, resp.body.data(), resp.body.size(),
-                                                 enrich_detail::ed_cover_ext(best.coverUrl));
-            if (!rel.empty()) {
-                tm.coverRelPath = rel;
-                st.fieldsFilled.push_back("cover");
-                notes.push_back("封面已缓存(" + rel + ")");
-            } else notes.push_back("封面保存失败");
-        } else {
-            notes.push_back("封面未收(" + best.coverUrl.substr(0, 40) + "... HTTP " +
-                            std::to_string(resp.status) + " " + std::to_string(resp.body.size()) + "B)");
+    // ---- 7) 封面:记录缺封面 → 按匹配分**遍历全部候选**的 coverUrl(2026-10-27) ----
+    // 老缺陷(261025-02 提出的「封面只问第一首、缓存后永不重试」)：这里原来只取
+    // best.coverUrl 一次，首选候选的图 404/超时就等于整首没封面，别的候选(别的源)
+    // 明明有图也不用。现在候选 URL 链由 art_cover_urls_by_score 派生(纯函数)，
+    // 逐个试到第一张「>2KB 且字节魔数是图片」为止，失败原因逐条进 note。
+    // ⚠️ 边界(铁律 4)：顶层 step 1 的 skipped 早退仍然存在 —— 已经 title+artist 齐全的
+    //    记录不会为了补封面重新联网搜索(那会在每次播放时都发请求)。用户可见的专辑页封面
+    //    走的是 rtaweb 的 /api/lib/cover 链(负缓存 7 天过期 + all=1 强制重试)，
+    //    与本函数的 skipped 语义互不影响。
+    if (tm.coverRelPath.empty()) {
+        const std::vector<std::string> coverUrls = art_cover_urls_by_score(sorted, cands);
+        if (!coverUrls.empty()) {
+            ArtworkOpts aopts;
+            aopts.minBytes = 2049;      // 与旧判据 resp.body.size() > 2048 完全等价
+            aopts.downloadMs = 15000;   // 与旧单次 GET 的超时一致
+            const CoverFetchResult cf = art_fetch_cover_urls(coverUrls, aopts);
+            if (cf.ok) {
+                const std::string rel = ms.saveCover(file, (const unsigned char*)cf.bytes.data(),
+                                                     cf.bytes.size(),
+                                                     enrich_detail::ed_cover_ext(cf.url));
+                if (!rel.empty()) {
+                    tm.coverRelPath = rel;
+                    st.fieldsFilled.push_back("cover");
+                    notes.push_back("封面已缓存(" + rel + ", " + std::to_string(cf.bytes.size()) + "B)");
+                } else {
+                    notes.push_back("封面保存失败");
+                }
+            } else {
+                notes.push_back("封面未收(" + enrich_detail::ed_join_notes(cf.tried) + ")");
+            }
         }
     }
 
@@ -469,11 +486,13 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
                 if (s.idx < cands.size()) lrq.cands.push_back(cands[s.idx]);
             LyricResult lr;
             std::vector<std::string> lyrErrs;        // 各参与源的真实失败(P1 只留最后一个)
-            for (auto it = provider_registry().rbegin(); it != provider_registry().rend(); ++it) {
-                if (!it->canLyric || !it->lyric) continue;
-                if (!opts.enabled(it->id)) continue;
+            // 2026-10-27：歌词候选链由能力矩阵派生(art_lyric_sources = Lyrics 位 + 注册表逆序)，
+            // 顺序与改造前逐项相同(lrclib → netease → qq) —— tests/test_metaproviders.cpp 有断言。
+            // 以后新增一个带歌词的源，只改 provider_registry() 一处，这里零改动。
+            for (const ProviderDesc* pd : art_lyric_sources(opts.srcOn)) {
+                if (!pd->lyric) continue;
                 std::string lerr;
-                LyricResult t = it->lyric(lrq, lerr);
+                LyricResult t = pd->lyric(lrq, lerr);
                 if (t.ok) { lr = std::move(t); break; }
                 if (!t.err.empty()) lyrErrs.push_back(t.err);
             }

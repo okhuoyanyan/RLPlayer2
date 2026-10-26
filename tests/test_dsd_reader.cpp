@@ -299,6 +299,93 @@ int main() {
         check(threw, "非 DSD 扩展名拒绝处理（调用方回退 ffmpeg）");
     }
 
+    printf("\n=== 6. 不支持的格式必须说人话（2026-10-27，用户 261027-01 #3） ===\n");
+    // 判据（铁律 3：要能区分「说得清的不支持」与「假的解码失败」）：
+    //   ① 类型是 rta::audio::UnsupportedFormat —— read_any 据此**不回退 ffmpeg**；
+    //   ② 文案点名格式（DST）+ 给出下一步（sacd_extract / .dsf）；
+    //   ③ 文案里不再出现 ffmpeg 的 "Invalid data"（那是用户误判「文件坏了」的来源）。
+    {
+        auto write_all = [](const std::string& p, const std::vector<uint8_t>& b) {
+            FILE* f = std::fopen(p.c_str(), "wb");
+            if (f) { std::fwrite(b.data(), 1, b.size(), f); std::fclose(f); }
+        };
+        struct Catch { bool typed = false; std::string msg; };
+        auto catch_all = [](auto&& fn) {
+            Catch c;
+            try { fn(); }
+            catch (const UnsupportedFormat& e) { c.typed = true; c.msg = e.what(); }
+            catch (const std::exception& e) { c.msg = e.what(); }
+            return c;
+        };
+
+        // (a) DST 压缩的 DFF：FRM8("DSD ") + DST 块
+        const std::string dstDff = temp_path("rta_dsd_dst_msg.dff");
+        {
+            std::vector<uint8_t> o = { 'F','R','M','8', 0,0,0,0,0,0,0,32, 'D','S','D',' ' };
+            const char* id = "DST ";
+            for (int i = 0; i < 4; ++i) o.push_back((uint8_t)id[i]);
+            for (int i = 7; i >= 0; --i) o.push_back((uint8_t)((16ull >> (8 * i)) & 0xFF));
+            o.insert(o.end(), 16, 0);
+            write_all(dstDff, o);
+        }
+        const Catch c1 = catch_all([&] { (void)read_dsd(dstDff); });
+        check(c1.typed, "DST 的 DFF 抛 UnsupportedFormat（不是普通 runtime_error）", c1.msg);
+        check(c1.msg.find("DST") != std::string::npos, "文案点名 DST", c1.msg);
+        check(c1.msg.find("sacd_extract") != std::string::npos &&
+              c1.msg.find(".dsf") != std::string::npos,
+              "文案给出下一步：sacd_extract / 转 .dsf", c1.msg);
+        check(c1.msg.find("Invalid data") == std::string::npos,
+              "文案里没有 ffmpeg 的 Invalid data（不再让用户以为文件坏了）", c1.msg);
+        DeleteFileA(dstDff.c_str());
+
+        // (b) DST 压缩的 DSF（fmtId = 1）：probe_dsd 只读头也必须抛同一条人话
+        const std::string dstDsf = temp_path("rta_dsd_dst_msg.dsf");
+        {
+            // 头 28 字节（"DSD " + 块长 28 + 文件长 + 元数据指针）
+            std::vector<uint8_t> h(28, 0), fmt(52, 0), body;
+            std::memcpy(h.data(), "DSD ", 4);
+            h[4] = 28;
+            std::memcpy(fmt.data(), "fmt ", 4);
+            fmt[4] = 52;
+            // fmt 块体（偏移 12 起）：版本 1 / fmtId 1(DST) / chType 2 / ch 2 / rate 2822400 / bps 1 /
+            //   样本数 / blockSize 4096 / reserved 0
+            auto put32 = [](std::vector<uint8_t>& v, size_t at, uint32_t x) {
+                for (int i = 0; i < 4; ++i) v[at + (size_t)i] = (uint8_t)((x >> (8 * i)) & 0xFF);
+            };
+            auto put64 = [](std::vector<uint8_t>& v, size_t at, uint64_t x) {
+                for (int i = 0; i < 8; ++i) v[at + (size_t)i] = (uint8_t)((x >> (8 * i)) & 0xFF);
+            };
+            put32(fmt, 12, 1);          // format version
+            put32(fmt, 16, 1);          // format id = 1 ⟹ DST
+            put32(fmt, 20, 2);          // channel type
+            put32(fmt, 24, 2);          // channels
+            put32(fmt, 28, 2822400);    // sampling frequency
+            put32(fmt, 32, 1);          // bits per sample
+            put64(fmt, 36, 2822400);    // sample count
+            put32(fmt, 44, 4096);       // block size
+            std::memcpy(fmt.data(), "fmt ", 4);
+            put64(fmt, 4, 52);
+            std::vector<uint8_t> f = h;
+            f.insert(f.end(), fmt.begin(), fmt.end());
+            // data 块（内容无所谓：fmtId 检查在 data 之前）
+            std::vector<uint8_t> d(12 + 4096, 0);
+            std::memcpy(d.data(), "data", 4);
+            put64(d, 4, d.size());
+            f.insert(f.end(), d.begin(), d.end());
+            put64(f, 12, f.size());
+            write_all(dstDsf, f);
+        }
+        const Catch c2 = catch_all([&] { (void)probe_dsd(dstDsf); });
+        check(c2.typed, "DSF fmtId=1 的 probe_dsd 抛 UnsupportedFormat", c2.msg);
+        check(c2.msg.find("DST") != std::string::npos &&
+              c2.msg.find("sacd_extract") != std::string::npos,
+              "DSF 侧同样是「DST + 下一步」的人话", c2.msg);
+        const Catch c3 = catch_all([&] { (void)read_dsf(dstDsf); });
+        check(c3.typed && c3.msg.find("DST") != std::string::npos,
+              "DSF fmtId=1 的 read_dsf 抛同一条人话", c3.msg);
+        DeleteFileA(dstDsf.c_str());
+    }
+
     DeleteFileA(pDsf.c_str());
     DeleteFileA(pDff.c_str());
     printf("\n%s (失败项 %d)\n", fails == 0 ? "全部通过" : "存在失败", fails);

@@ -97,6 +97,13 @@ add_executable(httptest tools/httptest.cpp)
 target_include_directories(httptest PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(httptest PRIVATE winhttp ws2_32)
 
+# ---------------- 一键反馈自检（诊断打包 + GitHub 上传，用户 261027-01 #1）----------------
+# 与 rtaweb 共用 src/net/feedback.h —— 判据必须跑同一份代码。
+# psapi/user32：进程内存与显卡名；winhttp：GitHub Contents API 的 PUT。
+add_executable(feedback_probe tools/feedback_probe.cpp)
+target_include_directories(feedback_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(feedback_probe PRIVATE winhttp psapi user32 shell32)
+
 # ---------------- 桌面启动器（Win32 GUI，双击即用）----------------
 # 产品名：RLPlayer
 add_executable(rta_launcher WIN32 tools/launcher.cpp)
@@ -230,6 +237,11 @@ add_test(NAME modulator COMMAND test_modulator)
 add_executable(test_modulator_families tests/test_modulator_families.cpp)
 target_link_libraries(test_modulator_families PRIVATE rtadsp)
 add_test(NAME modulator_families COMMAND test_modulator_families)
+
+# 7 阶 SDM 全速率稳定（用户 261027-01 #5）：四速率 × 七阶 MSSA/噪声/THD+N + 铁律 7 恢复
+add_executable(test_modulator_rates tests/test_modulator_rates.cpp)
+target_link_libraries(test_modulator_rates PRIVATE rtadsp)
+add_test(NAME modulator_rates COMMAND test_modulator_rates)
 
 add_executable(test_filters tests/test_filters.cpp)
 target_link_libraries(test_filters PRIVATE rtadsp)
@@ -378,6 +390,13 @@ add_executable(test_metallm tests/test_metallm.cpp)
 target_include_directories(test_metallm PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_metallm PRIVATE winhttp)
 add_test(NAME metallm COMMAND test_metallm)
+
+# DeepSeek Search/Fetch 的 function calling 环路（261026-06 #2）：起一个真的本地假服务端，
+# 走 winhttp → 本机 socket 的完整往返。ws2_32 是假服务端自身的监听/收发，不是产品依赖。
+add_executable(test_llmtools tests/test_llmtools.cpp)
+target_include_directories(test_llmtools PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_llmtools PRIVATE winhttp ws2_32)
+add_test(NAME llmtools COMMAND test_llmtools)
 
 # 元数据 P1：providers / match / enrich —— 全离线（providers 只喂写死报文，enrich 只测纯函数）
 add_executable(test_metaproviders tests/test_metaproviders.cpp)
@@ -637,6 +656,28 @@ add_executable(rtahealth tools/rtahealth.cpp)
 target_link_libraries(rtahealth PRIVATE rtadsp)
 target_include_directories(rtahealth PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# B2：音质分析（THD+N / 本底噪声 / SNR / 频响 / 削波 / 立体声 / 动态细化）
+add_executable(test_quality tests/test_quality.cpp)
+target_include_directories(test_quality PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME quality COMMAND test_quality)
+
+# B3：同一首多版本对比（包络互相关对齐 / 可比性标注 / 加权排序 / 确定性解释）
+add_executable(test_version_compare tests/test_version_compare.cpp)
+target_link_libraries(test_version_compare PRIVATE rtadsp)
+target_include_directories(test_version_compare PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME version_compare COMMAND test_version_compare)
+
+# B4：AI 解释层（KEY.txt / 降级 / 脱敏；离线注入 transport，不联网）
+add_executable(test_quality_ai tests/test_quality_ai.cpp)
+target_link_libraries(test_quality_ai PRIVATE rtadsp)
+target_include_directories(test_quality_ai PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME quality_ai COMMAND test_quality_ai)
+
+# B2/B3/B4 真实曲库测量工具（不注册 add_test：依赖本机曲库与网络）
+add_executable(measure_quality_lib tests/measure_quality_lib.cpp)
+target_link_libraries(measure_quality_lib PRIVATE rtadsp)
+target_include_directories(measure_quality_lib PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 add_executable(test_track_health tests/test_track_health.cpp)
 target_link_libraries(test_track_health PRIVATE rtadsp)
 target_include_directories(test_track_health PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -660,3 +701,30 @@ add_executable(test_gpu_stream tests/test_gpu_stream.cpp)
 target_link_libraries(test_gpu_stream PRIVATE rtadsp)
 target_include_directories(test_gpu_stream PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME gpu_stream COMMAND test_gpu_stream)
+
+# ---------------- DSD→DSD 速率转换（2026-10-27，DSD 调制专线并入主线）----------------
+# 判据：THD+N / 通带平坦度 / 折叠残留 / 级联 / 满幅与单样本越界恢复 / 真实 DSF 端到端。
+# 全程离线：不开任何音频设备（铁律 1）；真实素材缺失时该节自动 SKIP。
+add_executable(test_dsd_rate_convert tests/test_dsd_rate_convert.cpp)
+target_link_libraries(test_dsd_rate_convert PRIVATE rtadsp)
+add_test(NAME dsd_rate_convert COMMAND test_dsd_rate_convert)
+
+# ================= ReplayGain / Album Gain（261027-01 #2，用户明确接受破坏 bit-perfect）=================
+# 后端：src/dsp/replaygain.h（标签读取 + RG2.0 换算 + 三模式策略 + 防削波）。
+# 独立验证程序：rg_probe（只读标签/音频，ffmpeg 解码走内存管道，不落盘、不开音频设备）。
+add_executable(rg_probe tools/rg_probe.cpp)
+target_link_libraries(rg_probe PRIVATE rtadsp)
+target_include_directories(rg_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# 门禁：容器键名实读（ffmpeg 现场写夹具 + ffprobe 交叉验证）/ 防削波 / 三模式差异 /
+# 与 loudness 串联不双倍提升 / 专辑归组 / 真实库只读统计。
+# 环境里没有 ffmpeg 时 [2] 节打印 [SKIP] 不判失败（与 writeback/ffmpeg_matrix 同类处理），
+# 其余各节（[1][3]~[7]）纯合成信号，不依赖任何外部工具。
+add_executable(test_replaygain tests/test_replaygain.cpp)
+target_link_libraries(test_replaygain PRIVATE rtadsp)
+target_include_directories(test_replaygain PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# [10] 节要用 rg_probe 做文件级端到端闭环（标签 → 解码 → 判定），路径编译期注入
+target_compile_definitions(test_replaygain PRIVATE RTA_RG_PROBE="$<TARGET_FILE:rg_probe>")
+add_dependencies(test_replaygain rg_probe)
+add_test(NAME replaygain COMMAND test_replaygain)
+
