@@ -1,0 +1,57 @@
+# 2026-10-27：行尾纪律。
+#
+# 背景（真实事故）：本轮并行开发时 tools/rtaweb.cpp(15079 行)、src/meta/artwork.h(3136)、
+# tests/test_artpage.cpp(759) 被某个 PowerShell 写入路径整体转成了 CRLF，
+# 而 HEAD 里它们全是 LF ⟹ git diff 从"几百行"膨胀到 29426 行，评审看不到真实改动。
+#
+# 规则：所有源码/文档强制 LF；只有 Windows 原生脚本保持 CRLF
+# （PowerShell 5.1 解析含中文的 .ps1 需要 UTF-8 BOM + CRLF，这条不能动）；
+# 二进制显式标记，避免被当文本处理。
+
+* text=auto eol=lf
+
+*.c       text eol=lf
+*.cc      text eol=lf
+*.cpp     text eol=lf
+*.cxx     text eol=lf
+*.h       text eol=lf
+*.hpp     text eol=lf
+*.inl     text eol=lf
+*.ts      text eol=lf
+*.js      text eol=lf
+*.json    text eol=lf
+*.xml     text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.md      text eol=lf
+*.txt     text eol=lf
+*.cmake   text eol=lf
+CMakeLists.txt text eol=lf
+.gitignore     text eol=lf
+.gitattributes text eol=lf
+
+# Windows 原生脚本：CRLF（PowerShell 5.1 + 中文需要 BOM，且不接受纯 LF 的续行）
+*.ps1     text eol=crlf
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.rc      text eol=crlf
+
+# 二进制：不做任何转换
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.webp    binary
+*.ico     binary
+*.zip     binary
+*.7z      binary
+*.dll     binary
+*.exe     binary
+*.lib     binary
+*.pdb     binary
+*.wav     binary
+*.flac    binary
+*.mp3     binary
+*.dsf     binary
+*.dff     binary
+*.iso     binary

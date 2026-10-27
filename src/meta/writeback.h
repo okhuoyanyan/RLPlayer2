@@ -411,6 +411,419 @@ inline bool writeback_detect_picture_malformed(const std::string& file, std::str
 }
 
 // ---------------------------------------------------------------------------
+// 内嵌封面写回(P2,2026-10-27 / 用户 261027-05 B7:「按你说的做,能写就写回」)
+//
+// 只做 FLAC 的 PICTURE 块与 MP3 的 ID3v2 APIC 帧,而且只补 type=3(front cover):
+//   * 这两种容器成熟、写回路径已被 PCM 逐位门禁覆盖;M4A(covr)要重排 atom、
+//     DSF/DFF 是 DSD 大文件(安全红线里本来就禁写);
+//   * 已有 front cover 的文件一律不动(不覆盖用户原有的图),非 front 图不删不改;
+//   * 默认关闭(WritebackOpts::cover=false),显式开启才写。
+//
+// 顺序与标签写回完全一致:remux 到 .rtatmp → 封面字节门 + PCM 逐位门 → 备份 → 原子替换。
+// 任一门不过:删临时、原文件一个字节都不改。
+// ---------------------------------------------------------------------------
+
+// 容器里的图片信息(FLAC PICTURE 块 / MP3 APIC 帧)。bytes 只保留第一张(type 优先 front)。
+struct WbCoverInfo {
+    bool   parsed    = false;   // 容器解析成功(不代表有图)
+    bool   present   = false;   // 至少有一张图
+    int    count     = 0;       // 图片总数
+    int    frontCount = 0;      // type==3 的张数
+    int    firstType = -1;      // 第一张图的 type
+    std::string mime;           // 第一张图的 MIME
+    std::string bytes;          // front cover 的字节(没有 front 则取第一张)
+    bool   bytesAreFront = false;
+    std::string err;            // 解析失败原因(截断/畸形)
+};
+
+// FLAC 元数据块链扫描:只读到最后一个元数据块为止(音频数据不读)。
+inline bool wb_cover_scan_flac(std::ifstream& f, WbCoverInfo& info) {
+    char magic[4] = { 0, 0, 0, 0 };
+    if (!f.read(magic, 4)) return false;
+    if (std::memcmp(magic, "fLaC", 4) != 0) return false;
+    bool last = false;
+    int guard = 0;
+    while (!last && ++guard < 512) {
+        unsigned char h[4] = { 0, 0, 0, 0 };
+        if (!f.read((char*)h, 4)) { info.err = "FLAC 元数据块头截断"; return false; }
+        last = (h[0] & 0x80) != 0;
+        const int type = h[0] & 0x7F;
+        const uint32_t len = ((uint32_t)h[1] << 16) | ((uint32_t)h[2] << 8) | (uint32_t)h[3];
+        if (len > 64u * 1024u * 1024u) { info.err = "FLAC 元数据块长度异常"; return false; }
+        if (type != 6) {
+            f.seekg((std::streamoff)len, std::ios::cur);
+            if (!f) { info.err = "FLAC 元数据块越界"; return false; }
+            continue;
+        }
+        std::string blk((size_t)len, '\0');
+        if (len > 0) f.read(&blk[0], (std::streamsize)len);
+        if ((uint32_t)f.gcount() != len || len < 8) { info.err = "FLAC PICTURE 块截断"; return false; }
+        const unsigned char* p = (const unsigned char*)blk.data();
+        const int picType = (int)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                                  ((uint32_t)p[2] << 8) | (uint32_t)p[3]);
+        const uint32_t mimeLen = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                                 ((uint32_t)p[6] << 8) | (uint32_t)p[7];
+        if (mimeLen == 0 || (size_t)mimeLen > len - 8) { info.err = "FLAC PICTURE MIME 越界"; return false; }
+        const std::string mime(blk.data() + 8, mimeLen);
+        size_t cur = 8 + (size_t)mimeLen;
+        if (cur + 4 > len) { info.err = "FLAC PICTURE 缺描述长度"; return false; }
+        const uint32_t descLen = ((uint32_t)p[cur] << 24) | ((uint32_t)p[cur + 1] << 16) |
+                                 ((uint32_t)p[cur + 2] << 8) | (uint32_t)p[cur + 3];
+        cur += 4;
+        if ((size_t)descLen > len - cur) { info.err = "FLAC PICTURE 描述越界"; return false; }
+        cur += (size_t)descLen;
+        if (cur + 20 > len) { info.err = "FLAC PICTURE 缺图片数据长度"; return false; }
+        cur += 16;                                      // w/h/depth/colors
+        const uint32_t dataLen = ((uint32_t)p[cur] << 24) | ((uint32_t)p[cur + 1] << 16) |
+                                 ((uint32_t)p[cur + 2] << 8) | (uint32_t)p[cur + 3];
+        cur += 4;
+        if ((size_t)dataLen > len - cur) { info.err = "FLAC PICTURE 数据越界"; return false; }
+        ++info.count;
+        if (info.firstType < 0) { info.firstType = picType; info.mime = mime; }
+        if (picType == 3) {
+            ++info.frontCount;
+            if (!info.bytesAreFront) {
+                info.bytes.assign(blk.data() + cur, (size_t)dataLen);
+                info.bytesAreFront = true;
+            }
+        } else if (info.bytes.empty()) {
+            info.bytes.assign(blk.data() + cur, (size_t)dataLen);
+        }
+        info.present = true;
+    }
+    info.parsed = true;
+    return true;
+}
+
+// MP3 ID3v2(v2.3/v2.4)APIC 帧扫描:只读标签区(不读音频帧)。
+inline bool wb_cover_scan_mp3(std::ifstream& f, WbCoverInfo& info) {
+    unsigned char h[10] = { 0 };
+    if (!f.read((char*)h, 10)) return false;
+    if (h[0] != 'I' || h[1] != 'D' || h[2] != '3') return false;
+    const unsigned char ver = h[3];
+    if (ver != 3 && ver != 4) { info.err = std::string("ID3v2.") + std::to_string(ver) + " 未支持"; return false; }
+    for (int i = 6; i < 10; ++i) if (h[i] & 0x80) { info.err = "ID3v2 标签长度非法"; return false; }
+    const uint32_t tagSize = ((uint32_t)(h[6] & 0x7F) << 21) | ((uint32_t)(h[7] & 0x7F) << 14) |
+                             ((uint32_t)(h[8] & 0x7F) << 7) | (uint32_t)(h[9] & 0x7F);
+    if (tagSize == 0 || tagSize > 64u * 1024u * 1024u) { info.err = "ID3v2 标签长度为 0 或异常"; return false; }
+    std::string tag((size_t)tagSize, '\0');
+    f.read(&tag[0], (std::streamsize)tagSize);
+    if ((uint32_t)f.gcount() != tagSize) { info.err = "ID3v2 标签截断"; return false; }
+    const unsigned char* p = (const unsigned char*)tag.data();
+    const bool hasExt = (h[5] & 0x40) != 0;
+    size_t pos = 0;
+    if (hasExt && tagSize >= 4) {
+        const uint32_t extSize = (ver == 4)
+            ? (((uint32_t)(p[0] & 0x7F) << 21) | ((uint32_t)(p[1] & 0x7F) << 14) |
+               ((uint32_t)(p[2] & 0x7F) << 7) | (uint32_t)(p[3] & 0x7F))
+            : (((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3]);
+        pos = 4 + (size_t)extSize;
+    }
+    while (pos + 10 <= tagSize) {
+        if (p[pos] == 0 && p[pos + 1] == 0) break;              // padding
+        const bool isApic = (p[pos] == 'A' && p[pos + 1] == 'P' && p[pos + 2] == 'I' && p[pos + 3] == 'C');
+        uint32_t fsize = 0;
+        if (ver == 4) {
+            if (!(p[pos + 4] & 0x80) && !(p[pos + 5] & 0x80) && !(p[pos + 6] & 0x80) && !(p[pos + 7] & 0x80))
+                fsize = ((uint32_t)(p[pos + 4] & 0x7F) << 21) | ((uint32_t)(p[pos + 5] & 0x7F) << 14) |
+                        ((uint32_t)(p[pos + 6] & 0x7F) << 7) | (uint32_t)(p[pos + 7] & 0x7F);
+            else if (isApic) { info.err = "APIC 帧长编码非法"; return false; }
+        } else {
+            fsize = ((uint32_t)p[pos + 4] << 24) | ((uint32_t)p[pos + 5] << 16) |
+                    ((uint32_t)p[pos + 6] << 8) | (uint32_t)p[pos + 7];
+        }
+        if (fsize == 0) break;                                   // 空帧:标签结束
+        const size_t dstart = pos + 10;
+        if (dstart + (size_t)fsize > tagSize) {
+            if (isApic) { info.err = "APIC 帧越界"; return false; }
+            break;
+        }
+        if (isApic && fsize >= 4) {
+            const unsigned char* fp = p + dstart;
+            const unsigned char enc = fp[0];
+            size_t mimeEnd = 1;
+            while (mimeEnd < (size_t)fsize && fp[mimeEnd] != 0) ++mimeEnd;
+            if (mimeEnd >= (size_t)fsize || mimeEnd == 1) { info.err = "APIC MIME 非法"; return false; }
+            const std::string mime((const char*)fp + 1, mimeEnd - 1);
+            const size_t typePos = mimeEnd + 1;
+            if (typePos >= (size_t)fsize) { info.err = "APIC 缺图片类型"; return false; }
+            const int picType = (int)fp[typePos];
+            size_t descStart = typePos + 1, descEnd = descStart;
+            if (enc == 0 || enc == 3) {                          // Latin1 / UTF-8:单字节 0 终止
+                while (descEnd < (size_t)fsize && fp[descEnd] != 0) ++descEnd;
+                if (descEnd >= (size_t)fsize) { info.err = "APIC 描述缺终止符"; return false; }
+                ++descEnd;
+            } else {                                             // UTF-16:双字节 0 终止
+                while (descEnd + 1 < (size_t)fsize && !(fp[descEnd] == 0 && fp[descEnd + 1] == 0)) descEnd += 2;
+                if (descEnd + 1 >= (size_t)fsize) { info.err = "APIC 描述缺双字节终止符"; return false; }
+                descEnd += 2;
+            }
+            if (descEnd > (size_t)fsize) { info.err = "APIC 数据区为空"; return false; }
+            ++info.count;
+            if (info.firstType < 0) { info.firstType = picType; info.mime = mime; }
+            if (picType == 3) {
+                ++info.frontCount;
+                if (!info.bytesAreFront) {
+                    info.bytes.assign(tag.data() + dstart + descEnd, (size_t)fsize - descEnd);
+                    info.bytesAreFront = true;
+                }
+            } else if (info.bytes.empty()) {
+                info.bytes.assign(tag.data() + dstart + descEnd, (size_t)fsize - descEnd);
+            }
+            info.present = true;
+        }
+        pos = dstart + (size_t)fsize;
+    }
+    info.parsed = true;
+    return true;
+}
+
+// 文件入口:按扩展名选容器扫描器。只支持 .flac/.mp3(其它返回 parsed=false)。
+// extOverride:临时文件(.rtatmp)没有可用的扩展名,由调用方把真实容器类型传进来 ——
+// 否则「remux 产物是 flac 还是 mp3」会被文件名叫成 .rtatmp 这件事骗过去(实测踩到,
+// 表现是"临时文件容器解析失败()"、err 为空,封面门禁永远不过)。
+inline WbCoverInfo writeback_cover_info(const std::string& file,
+                                        const std::string& extOverride = std::string()) {
+    WbCoverInfo info;
+    const std::string ext = extOverride.empty() ? rta::platform::lower_extension(file)
+                                                : extOverride;
+    if (ext != ".flac" && ext != ".mp3") return info;
+    std::ifstream f(meta_path_of(file), std::ios::binary);
+    if (!f) { info.err = "读不了文件"; return info; }
+    if (ext == ".flac") wb_cover_scan_flac(f, info);
+    else                wb_cover_scan_mp3(f, info);
+    return info;
+}
+
+// 封面写回支持的扩展名(其它格式只存库,不动文件)
+inline bool writeback_cover_supported(const std::string& ext) {
+    return ext == ".flac" || ext == ".mp3";
+}
+
+// 图片字节自检:只按魔数认四种常见格式(够用:enrich 缓存的图只会是 jpg/png)。
+// 为什么必须有这道门:FLAC 走 ffmpeg remux,坏图会被 ffmpeg 顶回来;而 MP3 走「ID3 拼接」
+// 不经过 ffmpeg —— 没有这道门就会把 600 字节垃圾当 APIC 写进用户的文件里(实测踩到)。
+inline bool wb_cover_image_ok(const std::string& b, std::string& mime) {
+    mime.clear();
+    if (b.size() < 256) return false;
+    const unsigned char* p = (const unsigned char*)b.data();
+    if (p[0] == 0xFF && p[1] == 0xD8 && p[2] == 0xFF) { mime = "image/jpeg"; return true; }
+    if (p[0] == 0x89 && p[1] == 'P' && p[2] == 'N' && p[3] == 'G') { mime = "image/png"; return true; }
+    if (p[0] == 'G' && p[1] == 'I' && p[2] == 'F' && p[3] == '8') { mime = "image/gif"; return true; }
+    if (b.size() > 12 && p[0] == 'R' && p[1] == 'I' && p[2] == 'F' && p[3] == 'F' &&
+        p[8] == 'W' && p[9] == 'E' && p[10] == 'B' && p[11] == 'P') { mime = "image/webp"; return true; }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// MP3 封面写回:只重写 ID3v2 标签,音频字节原样搬运(2026-10-27 实测结论)
+//
+// 为什么不能走 ffmpeg remux:本机实测(Stellaris 原声带的 LAME3.98r 文件),**即使不加
+// 封面、只写一个 title**,ffmpeg -map 0 -c copy 出来的文件解码长度也比原文件多 1066 个
+// 样本(89787702B → 89791966B):原文件的 LAME 标签带 encoder delay/padding,remux 写
+// 的新 Xing 帧把它丢了,解码器于是不再裁头尾 ⟹ PCM 逐位门禁永远不过。这条限制是
+// **既有的**(与封面无关);-write_xing 0/1、-id3v2_version 3/4、+bitexact 全试过,都不一致。
+//
+// 所以 MP3 的封面写回改成「拼接」:ID3v2 只是文件前缀 —— 换掉前缀、后面(含 Xing/LAME
+// 帧与全部 MPEG 音频帧)按字节照搬 ⟹ 音频区逐字节不变,PCM 必然一致。安全性由两道门保证:
+// ①音频区(原标签偏移之后到文件尾)必须与原件逐字节相同;②front cover 的存在/type=3/
+// 字节一致仍按 FLAC 那套门检查。
+// ---------------------------------------------------------------------------
+
+// 旧标签里的帧(id → 原始帧数据)。只认 v2.3/v2.4。
+struct WbId3Frame { std::string id; std::string data; };
+
+inline uint32_t wb_syncsafe(const unsigned char* p) {
+    return ((uint32_t)(p[0] & 0x7F) << 21) | ((uint32_t)(p[1] & 0x7F) << 14) |
+           ((uint32_t)(p[2] & 0x7F) << 7) | (uint32_t)(p[3] & 0x7F);
+}
+inline void wb_put_syncsafe(std::string& out, uint32_t v) {
+    out += (char)((v >> 21) & 0x7F);
+    out += (char)((v >> 14) & 0x7F);
+    out += (char)((v >> 7) & 0x7F);
+    out += (char)(v & 0x7F);
+}
+
+// 旧 ID3v2 标签占用多少字节(没有标签 → 0;标签被截断 → 0,按「无标签」处理)。
+inline size_t wb_id3_tag_size(const std::string& buf) {
+    if (buf.size() < 10) return 0;
+    if (buf[0] != 'I' || buf[1] != 'D' || buf[2] != '3') return 0;
+    const unsigned char* p = (const unsigned char*)buf.data();
+    for (int i = 6; i < 10; ++i) if (p[i] & 0x80) return 0;
+    const size_t sz = 10 + (size_t)wb_syncsafe(p + 6);
+    if (sz > buf.size()) return 0;
+    return sz + ((p[5] & 0x10) ? 10u : 0u);
+}
+
+inline std::vector<WbId3Frame> wb_id3_parse_frames(const std::string& buf) {
+    std::vector<WbId3Frame> out;
+    const size_t tagEnd = wb_id3_tag_size(buf);
+    if (tagEnd < 10) return out;
+    const unsigned char* p = (const unsigned char*)buf.data();
+    const unsigned char ver = p[3];
+    if (ver != 3 && ver != 4) return out;
+    const size_t limit = 10 + (size_t)wb_syncsafe(p + 6);
+    size_t pos = 10;
+    if ((p[5] & 0x40) && limit > pos + 4) {
+        uint32_t ext = 0;
+        if (ver == 4) ext = wb_syncsafe(p + pos);
+        else ext = ((uint32_t)p[pos] << 24) | ((uint32_t)p[pos + 1] << 16) |
+                   ((uint32_t)p[pos + 2] << 8) | (uint32_t)p[pos + 3];
+        pos += (ver == 4) ? (size_t)ext : (4 + (size_t)ext);
+    }
+    while (pos + 10 <= limit) {
+        if (p[pos] == 0) break;
+        std::string id((const char*)p + pos, 4);
+        uint32_t fsz = 0;
+        if (ver == 4) fsz = wb_syncsafe(p + pos + 4);
+        else fsz = ((uint32_t)p[pos + 4] << 24) | ((uint32_t)p[pos + 5] << 16) |
+                   ((uint32_t)p[pos + 6] << 8) | (uint32_t)p[pos + 7];
+        const size_t dstart = pos + 10;
+        if (fsz == 0 || dstart + (size_t)fsz > limit) break;
+        const unsigned char f2 = p[pos + 9];
+        const bool compressed = (ver == 3) ? ((f2 & 0x80) != 0) : ((f2 & 0x08) != 0);
+        if (!compressed) {
+            WbId3Frame fr;
+            fr.id = id;
+            fr.data.assign(buf, dstart, (size_t)fsz);
+            out.push_back(std::move(fr));
+        }
+        pos = dstart + (size_t)fsz;
+    }
+    return out;
+}
+
+inline std::string wb_id3_wrap(const char* id, const std::string& body) {
+    std::string f(id, 4);
+    wb_put_syncsafe(f, (uint32_t)body.size());
+    f += (char)0; f += (char)0;
+    f += body;
+    return f;
+}
+inline std::string wb_id3_text_frame(const char* id, const std::string& text) {
+    std::string body;
+    body += (char)3;                                   // encoding = UTF-8
+    body += text;
+    return wb_id3_wrap(id, body);
+}
+inline std::string wb_id3_uslt_frame(const std::string& text) {
+    std::string body;
+    body += (char)3;
+    body += "eng";
+    body += (char)0;
+    body += text;
+    return wb_id3_wrap("USLT", body);
+}
+inline std::string wb_id3_apic_frame(const std::string& mime, const std::string& bytes) {
+    std::string body;
+    body += (char)0;                                   // Latin1(MIME 是 ASCII)
+    body += mime;
+    body += (char)0;
+    body += (char)3;                                   // 图片类型 3 = front cover
+    body += (char)0;                                   // 空描述
+    body += bytes;
+    return wb_id3_wrap("APIC", body);
+}
+
+// 拼接写回。coverBytes 为空 = 只写文本字段。
+inline bool writeback_mp3_splice(const std::string& src, const std::vector<WbField>& kvs,
+                                 const std::string& coverMime, const std::string& coverBytes,
+                                 const std::string& dst, std::string& err) {
+    err.clear();
+    std::ifstream f(meta_path_of(src), std::ios::binary);
+    if (!f) { err = "读不了源文件"; return false; }
+    f.seekg(0, std::ios::end);
+    const std::streamoff total = f.tellg();
+    if (total <= 0 || total > 256ll * 1024 * 1024) { err = "文件大小异常"; return false; }
+    f.seekg(0);
+    std::string buf;
+    buf.resize((size_t)total);
+    f.read(&buf[0], (std::streamsize)total);
+    if ((std::streamoff)f.gcount() != (std::streamoff)buf.size()) { err = "源文件读取不完整"; return false; }
+
+    const size_t audioOff = wb_id3_tag_size(buf);
+    const std::vector<WbId3Frame> old = wb_id3_parse_frames(buf);
+
+    struct Map { const char* field; const char* id; };
+    static const Map kMap[] = {
+        { "title", "TIT2" }, { "artist", "TPE1" }, { "album", "TALB" },
+        { "albumArtist", "TPE2" }, { "year", "TDRC" }, { "genre", "TCON" },
+        { "trackNo", "TRCK" }, { "discNo", "TPOS" }, { "composer", "TCOM" },
+        { "conductor", "TPE3" }, { "label", "TPUB" },
+    };
+    std::string frameSet;
+    std::vector<std::string> replaced;
+    for (const Map& m : kMap) {
+        for (const WbField& kv : kvs) {
+            if (std::string(kv.field) != m.field) continue;
+            frameSet += wb_id3_text_frame(m.id, kv.value);
+            replaced.push_back(m.id);
+            break;
+        }
+    }
+    for (const WbField& kv : kvs) {
+        if (std::string(kv.field) != "lyrics") continue;
+        frameSet += wb_id3_uslt_frame(kv.value);
+        replaced.push_back("USLT");
+    }
+    const bool addPic = !coverBytes.empty();
+    if (addPic) {
+        frameSet += wb_id3_apic_frame(coverMime.empty() ? "image/jpeg" : coverMime, coverBytes);
+        replaced.push_back("APIC");
+    }
+
+    // 旧标签里没被覆盖的帧原样保留(其他图片、TXXX、COMM、POPM…):不删用户的东西
+    for (const WbId3Frame& fr : old) {
+        bool drop = false;
+        for (const std::string& id : replaced) if (id == fr.id) { drop = true; break; }
+        if (drop) continue;
+        frameSet += wb_id3_wrap(fr.id.c_str(), fr.data);
+    }
+
+    // 新标签 = 头 + 帧区 + 2048B padding(以后改标签不必重排文件)
+    std::string tag("ID3", 3);
+    tag += (char)4; tag += (char)0;
+    tag += (char)0;
+    wb_put_syncsafe(tag, (uint32_t)(frameSet.size() + 2048));
+    tag += frameSet;
+    tag.append(2048, '\0');
+
+    std::ofstream o(meta_path_of(dst), std::ios::binary | std::ios::trunc);
+    if (!o) { err = "写不了临时文件"; return false; }
+    o.write(tag.data(), (std::streamsize)tag.size());
+    if (audioOff < buf.size())
+        o.write(buf.data() + audioOff, (std::streamsize)(buf.size() - audioOff));
+    o.flush();
+    if (!o) { err = "写入临时文件失败(磁盘满?)"; return false; }
+    return true;
+}
+
+// 音频区逐字节比较:temp 的「旧标签之后」部分必须与源文件完全相同。
+inline bool wb_mp3_audio_identical(const std::string& a, const std::string& b, std::string& why) {
+    auto readAll = [](const std::string& pth, std::string& o) {
+        std::ifstream f(meta_path_of(pth), std::ios::binary);
+        if (!f) return false;
+        f.seekg(0, std::ios::end);
+        const std::streamoff n = f.tellg();
+        f.seekg(0);
+        o.resize((size_t)n);
+        f.read(&o[0], (std::streamsize)n);
+        return (std::streamoff)f.gcount() == (std::streamoff)o.size();
+    };
+    std::string x, y;
+    if (!readAll(a, x) || !readAll(b, y)) { why = "读不了文件"; return false; }
+    const size_t ao = wb_id3_tag_size(x), bo = wb_id3_tag_size(y);
+    const size_t alen = x.size() - ao, blen = y.size() - bo;
+    if (alen != blen) {
+        why = "音频区长度不同(原 " + std::to_string(alen) + "B,新 " + std::to_string(blen) + "B)";
+        return false;
+    }
+    if (std::memcmp(x.data() + ao, y.data() + bo, alen) != 0) { why = "音频区字节不同"; return false; }
+    why = "音频区逐字节相同(" + std::to_string(alen) + "B)";
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // 命令行拼装与进程执行(经 CreateProcessW 宽字符;ffmpeg 输出只用于错误消息)
 // ---------------------------------------------------------------------------
 
@@ -459,13 +872,30 @@ inline std::string wb_preview(const std::string& s, const size_t n = 32) {
 // 内部三步:remux / 解码 / 比较(独立成 inline 函数,tests/test_writeback.cpp 可函数级实测)
 // ---------------------------------------------------------------------------
 
-// remux:ffmpeg -v error -y -i src -map 0 -c copy -f <muxer>[mp3 专选项] -metadata K=V… dst
+// remux:ffmpeg -v error -y -i src [-i cover] -map 0 -c copy [-map 1:v -c:v copy -disposition …]
+//        -f <muxer>[mp3 专选项] -metadata K=V… dst
 // 返回 false 时 err 带 ffmpeg 输出尾部。dst 的扩展名是 .rtatmp,所以 -f 必须显式。
+//
+// 封面(P2,2026-10-27):只在调用方明确给了 coverPath 时加第二个输入,并把它作为
+// attached_pic 静态图打进容器(-c:v copy 原样搬运图片字节,不重编码 ⟹ 读回来能逐字节比)。
+// 已存在的图片流由 -map 0 原样带过去(不删不改);封面流下标 = 原文件图片数,
+// 所以 -metadata:s:v:N 只命中新加的那一路。
 inline bool writeback_remux(const std::string& ffmpeg, const std::string& src, const std::string& dst,
                             const std::string& muxer, const bool isMp3,
-                            const std::vector<WbField>& kvs, std::string& err) {
-    std::string cmd = "\"" + ffmpeg + "\" -v error -y -i " + wb_quoted(src) +
-                      " -map 0 -c copy -f " + wb_quoted(muxer);
+                            const std::vector<WbField>& kvs, std::string& err,
+                            const std::string& coverPath = std::string(),
+                            const int coverStreamIndex = 0) {
+    const bool withCover = !coverPath.empty();
+    std::string cmd = "\"" + ffmpeg + "\" -v error -y -i " + wb_quoted(src);
+    if (withCover) cmd += " -i " + wb_quoted(coverPath);
+    cmd += " -map 0 -c copy";
+    if (withCover) {
+        const std::string idx = std::to_string(coverStreamIndex < 0 ? 0 : coverStreamIndex);
+        cmd += " -map 1:v:0 -c:v copy -disposition:v:0 attached_pic"
+               " -metadata:s:v:" + idx + " title=\"Album cover\""
+               " -metadata:s:v:" + idx + " comment=\"Cover (front)\"";
+    }
+    cmd += " -f " + wb_quoted(muxer);
     if (isMp3) cmd += " -write_id3v2 1 -id3v2_version 4";
     for (const WbField& f : kvs)
         cmd += " -metadata " + wb_quoted(std::string(f.key) + "=" + f.value);
@@ -541,6 +971,11 @@ inline bool writeback_pcm_identical(const std::string& wavA, const std::string& 
 struct WritebackOpts {
     bool dryRun = true;   // 默认 dry-run:全流程含 PCM 校验,但不替换原文件
     bool backup = true;   // 替换前把原文件移入 <store>/backups/<hash>.<ext>
+    // ---- 内嵌封面写回(P2,2026-10-27)----
+    // 默认【关闭】:写标签是「补数据」,写封面是「往容器里塞一大块二进制」,风险更高,
+    // 由用户显式打开(Web 端 POST /api/writeback {"cover":true})。
+    bool cover = false;
+    std::string coverPath;        // 显式图片文件(CLI/测试);空 = 取 MetaStore 封面缓存
 };
 
 struct WritebackResult {
@@ -548,7 +983,9 @@ struct WritebackResult {
     bool skipped = false;                     // 不适用(DSD/未知扩展/无可写字段),不是失败
     bool dryRun = false;
     bool pcmIdentical = false;
+    bool coverWritten = false;                // 本次确实把 front cover 写进了容器
     std::string file, err, note;              // note:写了哪些键/跳过原因;err:失败原因
+    std::string coverNote;                    // 封面那条路径的结论(写/跳过/为什么)
     std::vector<std::string> writtenFields;   // 本次实际写入的字段名(TrackMeta 字段名)
 };
 
@@ -622,15 +1059,131 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
         }
     }
 
-    // ④ remux 到同目录 .rtatmp 临时文件(先清掉上次崩溃可能留下的残留)
+    // ③c 封面决策(P2):只在明确开启、且容器支持、且原文件还没有 front cover 时才加图。
+    // 取图优先级:opts.coverPath(CLI/测试显式指定) → MetaStore 封面缓存(与 /api/cover 同源)。
+    std::string coverTmp;                       // 落到临时目录的图片(remux 的第二输入)
+    std::string coverBytesWanted;               // 期望写进去的图片字节(下面的逐字节门要用)
+    std::string coverMimeStr;                   // 图片 MIME(MP3 的 APIC 要写它)
+    int coverStreamIndex = 0;
+    bool addCover = false;
+    WbCoverInfo coverBefore;
+    if (opts.cover) {
+        if (!writeback_cover_supported(ext)) {
+            r.coverNote = "封面写回只支持 FLAC/MP3;本格式(" + ext + ")只存库,不动文件";
+        } else {
+            coverBefore = writeback_cover_info(file);
+            coverStreamIndex = coverBefore.count;
+            if (!coverBefore.parsed && !coverBefore.err.empty()) {
+                r.coverNote = "容器解析失败(" + coverBefore.err + "),不改封面(宁可不动)";
+            } else if (coverBefore.frontCount > 0) {
+                r.coverNote = "已有 front cover(type=3),不覆盖、不新增";
+            } else {
+                std::string& mime = coverMimeStr;
+                std::string imgExt = ".jpg";
+                if (!opts.coverPath.empty()) {
+                    std::ifstream cf(meta_path_of(opts.coverPath), std::ios::binary);
+                    if (cf) coverBytesWanted.assign(std::istreambuf_iterator<char>(cf),
+                                                    std::istreambuf_iterator<char>());
+                    const std::string iext = rta::platform::lower_extension(opts.coverPath);
+                    if (iext == ".png") { mime = "image/png"; imgExt = ".png"; }
+                    else                 mime = "image/jpeg";
+                } else {
+                    std::vector<unsigned char> cb;
+                    if (MetaStore::instance().cover(file, cb, mime)) {
+                        coverBytesWanted.assign(cb.begin(), cb.end());
+                        imgExt = (mime == "image/png") ? ".png" : ".jpg";
+                    }
+                }
+                if (coverBytesWanted.size() < 128) {
+                    r.coverNote = "无可用封面图(MetaStore 无缓存且未指定 coverPath),跳过封面";
+                    coverBytesWanted.clear();
+                } else if (!wb_cover_image_ok(coverBytesWanted, coverMimeStr)) {
+                    // 坏图 = 上游出了问题。**整次写回放弃**,不写标签也不写封面 ——
+                    // 「用户要封面,我们却塞了张坏图/只改了标签」这两种半成品都不该出现。
+                    r.err = "封面图不是可识别的图片(不是 jpg/png/gif/webp,或小于 256 字节);"
+                            "已放弃本次写回,原文件未动";
+                    return r;
+                } else if (coverBytesWanted.size() > 32u * 1024u * 1024u) {
+                    r.coverNote = "封面图过大(>32MB),跳过封面(避免撑爆标签区)";
+                    coverBytesWanted.clear();
+                } else {
+                    coverTmp = rta::platform::temp_dir_utf8() + "rta_wbcover_" +
+                               MetaStore::hashOf(file) + imgExt;
+                    std::ofstream cf(meta_path_of(coverTmp), std::ios::binary);
+                    cf.write(coverBytesWanted.data(), (std::streamsize)coverBytesWanted.size());
+                    cf.close();
+                    if (!cf) {
+                        r.coverNote = "写临时封面图失败,跳过封面";
+                        coverBytesWanted.clear();
+                        coverTmp.clear();
+                    } else {
+                        addCover = true;
+                    }
+                }
+            }
+        }
+    }
+    auto dropCoverTmp = [&]() {
+        if (!coverTmp.empty()) rta::platform::remove_file(meta_path_of(coverTmp));
+    };
+
+    // ④ 生成临时文件(先清掉上次崩溃可能留下的残留)
+    //    MP3 + 封面:走「ID3v2 拼接」而不是 remux(理由见 writeback_mp3_splice 头注:
+    //    这些 LAME 文件的 encoder delay 一过 remux 就丢,解码长度会变 ⟹ PCM 门禁永不过)。
     const std::string temp = file + ".rtatmp";
     rta::platform::remove_file(meta_path_of(temp));
     std::string err;
-    if (!writeback_remux(ffmpeg, file, temp, muxer, ext == ".mp3", kvs, err)) {
+    bool spliced = false;
+    if (addCover && ext == ".mp3") {
+        spliced = writeback_mp3_splice(file, kvs, coverMimeStr, coverBytesWanted, temp, err);
+        if (!spliced) {
+            rta::platform::remove_file(meta_path_of(temp));
+            dropCoverTmp();
+            r.err = "MP3 标签拼接失败:" + err + ";原文件未动";
+            return r;
+        }
+    } else if (!writeback_remux(ffmpeg, file, temp, muxer, ext == ".mp3", kvs, err,
+                                addCover ? coverTmp : std::string(), coverStreamIndex)) {
         rta::platform::remove_file(meta_path_of(temp));
+        dropCoverTmp();
         r.err = err;
         return r;
     }
+
+    // ④b 封面字节门(在动原文件之前):临时文件里的 front cover 必须
+    //     ① 存在且 type==3;② 字节与期望图片逐字节相同;③ 原有非 front 图一张不少。
+    // 不满足 = remux 把图丢了/改了类型 = 直接放弃,原文件一个字节都不动。
+    if (addCover) {
+        const WbCoverInfo after = writeback_cover_info(temp, ext);
+        std::string why;
+        if (!after.parsed) {
+            why = "临时文件容器解析失败(" + after.err + ")";
+        } else if (after.frontCount < 1) {
+            why = "remux 后没有 front cover(type=3;实际图片数=" + std::to_string(after.count) +
+                  ",首图 type=" + std::to_string(after.firstType) + ")";
+        } else if (after.bytes.size() != coverBytesWanted.size() || after.bytes != coverBytesWanted) {
+            why = "front cover 字节与源图不一致(源 " + std::to_string(coverBytesWanted.size()) +
+                  "B,回读 " + std::to_string(after.bytes.size()) + "B)";
+        } else if (spliced) {
+            // MP3 拼接路径:音频区必须与原件逐字节相同(这是「PCM 必然一致」的构造性保证)
+            std::string why2;
+            if (!wb_mp3_audio_identical(file, temp, why2)) why = "MP3 音频区校验失败:" + why2;
+        }
+        if (why.empty() && after.count < coverBefore.count + 1) {
+            why = "原有图片丢失(写入前 " + std::to_string(coverBefore.count) + " 张,写入后 " +
+                  std::to_string(after.count) + " 张)";
+        }
+        if (!why.empty()) {
+            rta::platform::remove_file(meta_path_of(temp));
+            dropCoverTmp();
+            r.err = "封面写回门禁失败:" + why + ";已删除临时文件,原文件未动";
+            return r;
+        }
+        r.coverWritten = true;
+        r.coverNote = "front cover 已写入(" + std::to_string(coverBytesWanted.size()) +
+                      "B," + (after.mime.empty() ? std::string("?") : after.mime) + ")";
+    }
+    dropCoverTmp();
 
     // ⑤ PCM 门禁:两份同参数解码(pcm_s32le)逐字节比较(含长度)
     // temp_dir_utf8() 返回带尾分隔符的临时目录（语义 = GetTempPathW），下面直接后缀拼接
@@ -671,7 +1224,8 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
         r.ok = true;
         r.dryRun = true;
         r.note = "dry-run:PCM 校验通过(" + diff + ");将写 " + std::to_string(kvs.size()) +
-                 " 个字段: " + listed + (yearSkip.empty() ? "" : ";" + yearSkip);
+                 " 个字段: " + listed + (yearSkip.empty() ? "" : ";" + yearSkip) +
+                 (r.coverNote.empty() ? "" : ";封面:" + r.coverNote);
         return r;
     }
 
@@ -727,7 +1281,10 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
 
     r.ok = true;
     r.note = "已写 " + std::to_string(kvs.size()) + " 个字段: " + listed + ";PCM 逐字节一致;" +
-             backupNote + (yearSkip.empty() ? "" : ";" + yearSkip);
+             backupNote + (yearSkip.empty() ? "" : ";" + yearSkip) +
+             (r.coverNote.empty()
+                  ? std::string()
+                  : std::string(";") + (r.coverWritten ? "封面写回: " : "封面未写: ") + r.coverNote);
     return r;
 }
 

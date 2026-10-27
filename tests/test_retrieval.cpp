@@ -177,6 +177,61 @@ static std::vector<std::string> split_bytes(const std::string& s, size_t n) {
     return out;
 }
 
+// 2026-10-27（合并后回归诊断）：把"第一个不同的字段"打出来。
+// 只用于失败时定位，判据语义不变（仍是逐字段严格相等）。
+static std::string summary_core_diff(const SummaryResult& a, const SummaryResult& b) {
+    auto flag = [](bool same, const std::string& what) { return same ? std::string() : ("DIFF: " + what); };
+    if (a.ok != b.ok) return flag(false, "ok a=" + std::to_string((int)a.ok) + " b=" + std::to_string((int)b.ok));
+    if (a.ai != b.ai) return "DIFF: ai";
+    if (a.model != b.model) return "DIFF: model a=" + a.model + " b=" + b.model;
+    if (a.disclaimer != b.disclaimer) return "DIFF: disclaimer a=" + a.disclaimer + " b=" + b.disclaimer;
+    if (a.validation_ok != b.validation_ok) return "DIFF: validation_ok";
+    if (a.unverified != b.unverified) return "DIFF: unverified";
+    if (a.offline != b.offline || a.from_cache != b.from_cache) return "DIFF: offline/from_cache";
+    if (a.error != b.error) return "DIFF: error a=" + a.error + " b=" + b.error;
+    if (a.sections.size() != b.sections.size())
+        return "DIFF: sections.size a=" + std::to_string(a.sections.size()) + " b=" + std::to_string(b.sections.size());
+    for (size_t i = 0; i < a.sections.size(); ++i) {
+        if (a.sections[i].heading != b.sections[i].heading)
+            return "DIFF: sections[" + std::to_string(i) + "].heading a=" + a.sections[i].heading +
+                   " b=" + b.sections[i].heading;
+        if (a.sections[i].paragraphs.size() != b.sections[i].paragraphs.size())
+            return "DIFF: sections[" + std::to_string(i) + "].paragraphs.size";
+        for (size_t k = 0; k < a.sections[i].paragraphs.size(); ++k) {
+            if (a.sections[i].paragraphs[k].text != b.sections[i].paragraphs[k].text)
+                return "DIFF: sections[" + std::to_string(i) + "].p[" + std::to_string(k) + "].text";
+            if (a.sections[i].paragraphs[k].citations != b.sections[i].paragraphs[k].citations)
+                return "DIFF: sections[" + std::to_string(i) + "].p[" + std::to_string(k) + "].citations";
+        }
+    }
+    if (a.citations.size() != b.citations.size())
+        return "DIFF: citations.size a=" + std::to_string(a.citations.size()) + " b=" + std::to_string(b.citations.size());
+    for (size_t i = 0; i < a.citations.size(); ++i) {
+        const auto& x = a.citations[i];
+        const auto& y = b.citations[i];
+        if (x.id != y.id) return "DIFF: citations[" + std::to_string(i) + "].id";
+        if (x.title != y.title) return "DIFF: citations[" + std::to_string(i) + "].title";
+        if (x.url != y.url) return "DIFF: citations[" + std::to_string(i) + "].url";
+        if (x.source != y.source) return "DIFF: citations[" + std::to_string(i) + "].source";
+        if (x.fetched_at != y.fetched_at)
+            return "DIFF: citations[" + std::to_string(i) + "].fetched_at a=" + std::to_string(x.fetched_at) +
+                   " b=" + std::to_string(y.fetched_at) + " (id=" + x.id + ")";
+    }
+    if (a.materials_used != b.materials_used) return "DIFF: materials_used";
+    if (a.fields != b.fields) {
+        std::string d = "DIFF: fields size a=" + std::to_string(a.fields.size()) + " b=" + std::to_string(b.fields.size());
+        for (size_t i = 0; i < a.fields.size() && i < b.fields.size(); ++i) {
+            if (a.fields[i] != b.fields[i]) {
+                d += " first[" + std::to_string(i) + "] a=(" + a.fields[i].first + "=" + a.fields[i].second +
+                     ") b=(" + b.fields[i].first + "=" + b.fields[i].second + ")";
+                break;
+            }
+        }
+        return d;
+    }
+    return std::string();
+}
+
 // 逐字段比较（排除随时间的字段：generated_at / expires_at / diag / cache_ver）
 static bool summary_core_equal(const SummaryResult& a, const SummaryResult& b) {
     if (a.ok != b.ok || a.ai != b.ai || a.model != b.model || a.disclaimer != b.disclaimer) return false;
@@ -868,7 +923,8 @@ int main() {
         const SummaryResult b2 = retrieval_fetch(EntityKind::Person, name, "zh", ro);
         ck(b2.ok, "8.8 不传 ProgressFn 生成成功", b2.error);
         ck(json_calls == 1 && stream_calls == 1, "8.9 不传 ProgressFn → 走原来的非流式 llm_chat");
-        ck(summary_core_equal(a, b2), "8.10 传/不传 ProgressFn：结果逐字段相同");
+        ck(summary_core_equal(a, b2), "8.10 传/不传 ProgressFn：结果逐字段相同",
+           summary_core_diff(a, b2));
     }
 
     // ---------------- 8b) 生成失败重试：进度从 chars=0 重新开始 ----------------
@@ -1015,6 +1071,67 @@ int main() {
            "8c.2 跨线程增量拼接完整（" + std::to_string(mx) + "/" + std::to_string(synthesis3.size()) + "）");
         ck(cb_thread != std::thread::id() && cb_thread != std::this_thread::get_id(),
            "8c.3 正文回调确实发生在传输线程（不是调用线程）");
+    }
+
+    // ---------------- 8d) 纯函数性：解析层不读环境状态 ----------------
+    // 2026-10-27（父批准 #1）：8.10 只能证明"同一进程里两条路径一致"，
+    // 但绑不住"解析层读了时钟/随机数"这类缺陷（它会跨秒随机红）。这里直接锁死：
+    //   ① 同一回包解析两次 ⟹ 逐字段相等（不需要 ProgressFn 参与）；
+    //   ② 回包没写 fetched_at ⟹ 解析结果必须全是 0（解析层不许产生时间戳）；
+    //   ③ 盖章只发生在调用方 summary_stamp_citations()，且按给定时刻确定性盖章。
+    std::printf("-- 8d. 纯函数性：同一回包解析两次逐字段相同 + 解析层不产生时间戳 --\n");
+    {
+        static const char* kPure = R"json({
+  "disclaimer": "AI 整理，仅供参考",
+  "fields": {"风格": "同人电子", "曲目列表": "01 | Static World | 4:12 | Iris"},
+  "sections": [{"heading": "📀 基本信息", "paragraphs": ["某社团的会场限定盘。"]}],
+  "citations": [{"id": "c1", "title": "PureProbe", "url": "https://zh.wikipedia.org/wiki/PureProbe",
+                 "source": "wikipedia-zh", "fetched_at": 1792690000}]
+})json";
+        ProfileDecision pd;
+        pd.profile = MusicProfile::Doujin;
+        pd.reason = "unit";
+        LinkIndex idx;
+        idx.add_seed_table();
+        const SummaryResult p1 = summary_build_from_profile_reply(kPure, pd, {}, idx);
+        const SummaryResult p2 = summary_build_from_profile_reply(kPure, pd, {}, idx);
+        ck(summary_core_equal(p1, p2), "同一回包解析两次逐字段相同（解析层是纯函数）",
+           summary_core_diff(p1, p2));
+        ck(p1.ok && p1.citations.size() == 1 && p1.citations[0].fetched_at == 1792690000LL,
+           "模型给的 fetched_at 原样透传（不被时钟改写）",
+           p1.citations.empty() ? "no citations" : std::to_string(p1.citations[0].fetched_at));
+
+        // ② 边界：回包没写 fetched_at ⟹ 解析层必须留 0（以前这里会被 time() 填上）
+        static const char* kNoTs = R"json({
+  "fields": {"风格": "x"},
+  "sections": [{"heading": "简介", "paragraphs": ["y"]}],
+  "citations": [{"id": "c1", "title": "NoTs", "url": "https://zh.wikipedia.org/wiki/NoTs"}]
+})json";
+        const SummaryResult n1 = summary_build_from_profile_reply(kNoTs, pd, {}, idx);
+        bool all_zero = !n1.citations.empty();
+        for (const auto& c : n1.citations) if (c.fetched_at != 0) all_zero = false;
+        ck(n1.ok && all_zero,
+           "解析层不产生时间戳（回包没给 ⟹ fetched_at 全为 0，不是 time()）",
+           n1.citations.empty() ? "no citations" : std::to_string(n1.citations[0].fetched_at));
+        // 旧严格解析器要求段落是 {text,citations} 对象（这是它自己的契约），所以用严格形状的夹具
+        static const char* kNoTsStrict = R"json({
+  "disclaimer": "仅依据下方来源材料综合整理",
+  "fields": {"风格": "x"},
+  "sections": [{"heading": "简介", "paragraphs": [{"text": "y", "citations": ["c1"]}]}],
+  "citations": [{"id": "c1", "title": "NoTs", "url": "https://zh.wikipedia.org/wiki/NoTs"}]
+})json";
+        const SummaryResult g1 = parse_synthesis_reply(kNoTsStrict, std::vector<std::string>{"https://zh.wikipedia.org/wiki/NoTs"});
+        bool legacy_zero = g1.ok && !g1.citations.empty();
+        for (const auto& c : g1.citations) if (c.fetched_at != 0) legacy_zero = false;
+        ck(legacy_zero, "旧严格解析器同样只透传、不盖章（fetched_at 全为 0）",
+           g1.ok ? std::to_string(g1.citations.empty() ? -1 : g1.citations[0].fetched_at) : g1.error);
+
+        // ③ 盖章层：调用方给定时刻 ⟹ 逐条等于它（可复现，不依赖真实时钟）
+        SummaryResult st = n1;
+        summary_stamp_citations(st, 1800000000LL);
+        bool stamped = !st.citations.empty();
+        for (const auto& c : st.citations) if (c.fetched_at != 1800000000LL) stamped = false;
+        ck(stamped, "summary_stamp_citations() 按调用方给的时刻盖章（确定性）");
     }
 
     // ---------------- 9) 网络用例 opt-in (RTA_NET_TESTS=1) ----------------

@@ -702,6 +702,171 @@ inline bool llm_check_cap(const LlmConfig& cfg, const std::string& month = "", s
 }
 
 // ---------------------------------------------------------------------------
+// 模型列表（用户 261027-06 P1：「允许用户拉取当前模型列表，并选择使用哪个模型」）
+//
+// 端点：GET {base}/models —— OpenAI 兼容格式，DeepSeek 与各家兼容网关都实现：
+//   {"object":"list","data":[{"id":"deepseek-chat","object":"model","owned_by":"deepseek",
+//                            "created":1700000000}, ...]}
+// 兼容两种偏差（网关常见）：数组元素是纯字符串；或顶层键叫 "models" 而不是 "data"。
+// 解析与请求**分离**：parse 是纯函数（离线喂写死报文，铁律 3），fetch 才碰网络。
+//
+// 设计纪律：
+//   * 只读能力，绝不因为拉列表失败而改动 model 配置（失败优雅降级 = 界面留手填框）；
+//   * 结果进程内缓存 60 s（设置页反复打开不重复打网络），?refresh=1 可强制重拉；
+//   * 错误文本一律过 llm_redact —— 网关 401 时常把 key 回显进 message。
+//   * search / fetch 不在这里暴露任何配置（用户明确要求「fetch 和 search 保持默认」）。
+// ---------------------------------------------------------------------------
+
+struct LlmModelInfo {
+    std::string id;
+    std::string ownedBy;
+    long long created = 0;
+};
+
+struct LlmModelList {
+    bool ok = false;                    // 拉到并解析成功（models 可能为空数组）
+    bool fromCache = false;             // 命中进程内缓存
+    std::string error;                  // 人可读失败原因（已脱敏）
+    std::vector<LlmModelInfo> models;
+    long long latencyMs = 0;
+    int count() const { return (int)models.size(); }
+    bool has(const std::string& id) const {
+        for (const LlmModelInfo& m : models) if (m.id == id) return true;
+        return false;
+    }
+    std::vector<std::string> ids() const {
+        std::vector<std::string> v;
+        v.reserve(models.size());
+        for (const LlmModelInfo& m : models) v.push_back(m.id);
+        return v;
+    }
+};
+
+// 纯函数：解析 /models 响应。三种形态都认（data[] / models[] / [ "id", ... ] 顶层数组）。
+inline LlmModelList llm_parse_models_response(const std::string& text) {
+    LlmModelList r;
+    const rta::net::Json j = rta::net::json_parse(text);
+    if (j.type == rta::net::Json::Null) { r.error = "响应不是合法 JSON"; return r; }
+    if (j.type == rta::net::Json::Obj && j.has("error")) {
+        const rta::net::Json& e = j["error"];
+        std::string msg = e.has("message") ? e["message"].s() : e.s();
+        if (msg.empty()) msg = "服务端未给出 message";
+        r.error = "服务端错误: " + msg;
+        return r;
+    }
+    const rta::net::Json* arr = nullptr;
+    if (j.type == rta::net::Json::Arr) {
+        arr = &j;
+    } else if (j.type == rta::net::Json::Obj) {
+        if (j.has("data") && j["data"].type == rta::net::Json::Arr) arr = &j["data"];
+        else if (j.has("models") && j["models"].type == rta::net::Json::Arr) arr = &j["models"];
+    }
+    if (!arr) { r.error = "响应缺少 data/models 数组"; return r; }
+
+    std::set<std::string> seen;
+    for (size_t i = 0; i < arr->size(); ++i) {
+        const rta::net::Json& it = arr->at(i);
+        LlmModelInfo mi;
+        if (it.type == rta::net::Json::Str) {
+            mi.id = llm_trim(it.s());
+        } else if (it.type == rta::net::Json::Obj) {
+            if (it.has("id")) mi.id = llm_trim(it["id"].s());
+            else if (it.has("name")) mi.id = llm_trim(it["name"].s());
+            else if (it.has("model")) mi.id = llm_trim(it["model"].s());
+            if (it.has("owned_by")) mi.ownedBy = llm_trim(it["owned_by"].s());
+            if (it.has("created")) mi.created = (long long)it["created"].n();
+        }
+        if (mi.id.empty()) continue;
+        if (!seen.insert(mi.id).second) continue;      // 去重，保留服务端顺序
+        r.models.push_back(std::move(mi));
+    }
+    r.ok = true;
+    return r;
+}
+
+// 进程内缓存（60 s）。只缓存"拉取成功"的结果；失败每次都重试（网络恢复后立即好用）。
+struct LlmModelsCacheEntry {
+    std::string key;                    // base + "|" + hash(key) —— 绝不存明文 key
+    LlmModelList res;
+    std::chrono::steady_clock::time_point tp{};
+};
+inline std::mutex& llm_models_cache_mutex() {
+    static std::mutex m;
+    return m;
+}
+inline LlmModelsCacheEntry& llm_models_cache_slot() {
+    static LlmModelsCacheEntry e;
+    return e;
+}
+inline void llm_models_cache_clear() {
+    std::lock_guard<std::mutex> lk(llm_models_cache_mutex());
+    llm_models_cache_slot() = LlmModelsCacheEntry{};
+}
+
+// GET {base}/models。force=true 跳过缓存；outCached 回报这次是否来自缓存。
+inline LlmModelList llm_models_fetch(const LlmConfig& cfg, int timeoutMs = 15000,
+                                      bool force = false, bool* outCached = nullptr) {
+    LlmModelList r;
+    if (outCached) *outCached = false;
+    if (cfg.apiKey.empty()) {
+        r.error = "未配置 api_key（rlplayer-llm.conf）";
+        return r;
+    }
+    const std::string base = llm_base_url(cfg.baseUrl);
+    const std::string cacheKey = base + "|" + std::to_string(
+        (unsigned long long)std::hash<std::string>{}(cfg.apiKey));
+
+    if (!force) {
+        std::lock_guard<std::mutex> lk(llm_models_cache_mutex());
+        const LlmModelsCacheEntry& e = llm_models_cache_slot();
+        if (e.key == cacheKey && e.res.ok) {
+            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - e.tp).count();
+            if (age >= 0 && age < 60000) {
+                r = e.res;
+                r.fromCache = true;
+                r.latencyMs = 0;
+                if (outCached) *outCached = true;
+                return r;
+            }
+        }
+    }
+
+    const std::string url = base + "/models";
+    const std::vector<std::string> headers = { "Authorization: Bearer " + cfg.apiKey };
+    const auto t0 = std::chrono::steady_clock::now();
+    const rta::net::HttpResponse resp = rta::net::http_get(url, headers, timeoutMs);
+    r.latencyMs = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    if (resp.status == 0) {
+        r.error = llm_redact(cfg.apiKey, "网络请求失败: " + resp.error);
+        return r;
+    }
+    const std::string text(resp.body.begin(), resp.body.end());
+    if (resp.status < 200 || resp.status >= 300) {
+        const LlmModelList p = llm_parse_models_response(text);   // 借它提取 error.message
+        r.error = llm_redact(cfg.apiKey,
+            "HTTP " + std::to_string(resp.status) + (p.error.empty() ? "" : ": " + p.error));
+        return r;
+    }
+    r = llm_parse_models_response(text);
+    if (!r.ok) {
+        r.error = llm_redact(cfg.apiKey, r.error);
+        return r;
+    }
+    {
+        std::lock_guard<std::mutex> lk(llm_models_cache_mutex());
+        LlmModelsCacheEntry& e = llm_models_cache_slot();
+        e.key = cacheKey;
+        e.res = r;
+        e.res.fromCache = false;
+        e.tp = std::chrono::steady_clock::now();
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------------------
 // chat completions
 // ---------------------------------------------------------------------------
 

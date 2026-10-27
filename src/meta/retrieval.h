@@ -24,6 +24,7 @@
 #include "meta/entities.h"
 #include "meta/knowledge.h"
 #include "meta/llm.h"
+#include "meta/prompt_profiles.h"   // 2026-10-27（261027-06 P1/P2/P3）：分类提示词 + 不过滤解析 + 名词外链
 #include "meta/store.h"
 #include "net/http_client.h"
 #include "net/json.h"
@@ -92,6 +93,16 @@ struct SummaryCitation {
     long long fetched_at = 0;
 };
 
+// 2026-10-27（261027-06 P3）：名词 → 权威链接。只放确定性匹配出来的条目（种子表/材料 URL/页面标题），
+// 匹配不上就不出现。前端可以直接渲染成外链；正文里同时会插一条「名词（url）」，
+// 走既有 linkifyEscaped（裸 URL 变可点链接）—— 这样不改前端也能点开。
+struct SummaryLink {
+    std::string name;    // 命中的名词（原文写法）
+    std::string url;     // 权威链接
+    std::string source;  // wikipedia-zh / wikipedia-ja / wikipedia-en / moegirl / baike / discogs
+    std::string kind;    // 人物 / 团体 / 场地 / 厂牌 / 作品 / 活动
+};
+
 struct SummaryResult {
     bool ok = false;
     bool ai = true;
@@ -115,6 +126,10 @@ struct SummaryResult {
     // 2026-10-24（261024-02 #1/#7）：分阶段耗时诊断（search/fetch/llm 各多少 ms），只用于日志与 A/B。
     std::string diag;
     int cache_ver = 0;   // 从磁盘缓存加载时的格式版本（0 = 不是从缓存来的 / 旧格式）
+    // 2026-10-27（261027-06 P1/P3）：分类结果与名词外链
+    std::string profile;         // 分类 id：classical / doujin / pop / rock / metal / jazz / ...
+    std::string profile_label;   // 中文标签（古典/同人/...）
+    std::vector<SummaryLink> links;   // 名词 → 权威链接（确定性匹配）
 };
 
 // ---------------------------------------------------------------------------
@@ -585,7 +600,8 @@ inline SummaryResult parse_synthesis_reply(const std::string& text,
         c.url = item["url"].s();
         c.source = item["source"].s();
         c.fetched_at = (long long)item["fetched_at"].n();
-        if (c.fetched_at <= 0) c.fetched_at = (long long)std::time(nullptr);
+        // 2026-10-27（回归 8.10）：旧解析器同样不许读时钟 —— 模型没给就当未知（0）。
+        // 解析层是"回包的纯函数"，时间戳只由调用方在最后统一盖章（generated_at/expires_at）。
 
         if (c.id.empty()) {
             r.ok = false;
@@ -755,6 +771,278 @@ inline SummaryResult parse_synthesis_reply(const std::string& text,
     return parse_synthesis_reply(text, v, true);
 }
 
+
+// ---------------------------------------------------------------------------
+// 2026-10-27（用户 261027-06）P1「两步走 · 按类定制提示词」/ P2「输出不过滤」/ P3「名词外链」
+//
+// 旧路径的问题（用户原话「你过滤掉的信息，比展现的信息还多」）：
+//   ① 提示词把可用字段写死成 10 个标签（field_schema_for_kind），模型被迫把 20 多条信息压成 5~6 条；
+//   ② 硬门要求「每段至少 1 条引用 + 引用必须属于白名单」，一条不合规就整份资料被拒（内容全丢）；
+//   ③ 分节（📀 专辑基本信息 / 🎵 曲目列表 / 💿 补充背景与解读）在缓存里，但前端只在 fields 为空时才渲染，
+//      于是有标签时那些叙述全被丢掉。
+// 新路径：
+//   先 classify_profile（14 类）→ 按类给专用提示词并附上全部已知标签 → 模型输出什么就收什么
+//   （标签自由、段落自由、引用可选）→ 名词自动挂权威链接。
+// ---------------------------------------------------------------------------
+
+// 分节是否镜像成标签行。当前前端 renderSummaryContent 只在 fields 为空时才渲染 sections，
+// 所以必须把分节也放进 fields（标签=分节标题，值=段落文本），否则「💿 补充背景与解读」看不到。
+// ⚠️ 一旦前端改成「fields 与 sections 同时渲染」，把这里返回 false，避免同一段内容出现两次。
+inline bool summary_mirror_sections_into_fields() { return true; }
+
+// 材料块（[M1]…）—— 新旧提示词共用
+inline std::string summary_materials_block(const std::vector<KnowledgeMaterial>& materials,
+                                           const std::vector<SearchHit>& hits) {
+    std::ostringstream u;
+    int idx = 1;
+    for (const auto& m : materials) {
+        u << "\n[M" << idx << "] 来源: " << m.source
+          << " | 标题: " << m.title
+          << " | 链接: " << m.url
+          << " | 取回时间: " << m.fetched_at << "\n"
+          << "正文:\n" << m.text << "\n";
+        idx++;
+    }
+    for (const auto& h : hits) {
+        // 2026-10-27（真实调用反馈）：必须把「这是什么页」告诉模型 —— 否则它会把 VGMdb 的
+        // 组织页（/org/5044，22 条同团体目录）当成这张专辑的材料，字段全填成目录列表。
+        const int rank = pp_page_kind_rank(h.url, h.title);
+        u << "\n[M" << idx << "] 来源: search-fetch"
+          << " | 标题: " << h.title
+          << " | 链接: " << h.url
+          << " | 日期: " << h.date
+          << " | 页面类型: " << pp_page_kind_name(rank) << "\n"
+          << (rank <= -1 ? "（注意：这是组织/艺术家页，不是本实体的专辑页；只能用来确认团体名与目录前缀，"
+                           "不得把它的发行列表当成本专辑的曲目/日期/售价）\n" : "")
+          << "摘要/正文:\n" << (h.snippet.empty() ? h.summary : h.snippet) << "\n";
+        idx++;
+    }
+    return u.str();
+}
+
+// 分类信号：已知标签 + 材料正文（Discogs 的「流派与风格/乐团/指挥/厂牌」就是最好的分类线索）
+inline ProfileSignal summary_make_signal(const std::string& title,
+                                         const std::string& artist,
+                                         const std::vector<KnowledgeMaterial>& materials,
+                                         const std::vector<SearchHit>& hits,
+                                         const std::vector<std::pair<std::string, std::string>>& album_tags,
+                                         const std::vector<std::string>& track_titles,
+                                         const std::string& genre_hint) {
+    ProfileSignal sig;
+    sig.title = title;
+    sig.artist = artist;
+    sig.hint = genre_hint;
+    sig.tracks = track_titles;
+    sig.track_count = (int)track_titles.size();
+    for (const auto& kv : album_tags) {
+        const std::string k = pp_lower_ascii(kv.first);
+        if (k.find("genre") != std::string::npos || kv.first.find("流派") != std::string::npos ||
+            kv.first.find("风格") != std::string::npos) {
+            sig.genres.push_back(kv.second);
+        } else if (k.find("label") != std::string::npos || kv.first.find("厂牌") != std::string::npos ||
+                   kv.first.find("出版") != std::string::npos) {
+            if (sig.label.empty()) sig.label = kv.second;
+        } else if (k.find("catalog") != std::string::npos || kv.first.find("编号") != std::string::npos) {
+            if (sig.catalog.empty()) sig.catalog = kv.second;
+        }
+    }
+    std::ostringstream mt;
+    for (const auto& m : materials) {
+        mt << m.title << "\n" << m.text.substr(0, 4000) << "\n";
+    }
+    for (const auto& h : hits) {
+        mt << h.title << "\n" << (h.snippet.empty() ? h.summary : h.snippet).substr(0, 800) << "\n";
+    }
+    sig.material_text = mt.str();
+    return sig;
+}
+
+// 按 profile 生成的综合提示词（替代旧的固定 schema 提示词）
+inline std::vector<LlmMessage> build_profile_synthesis_prompt(
+    const ProfileDecision& dec,
+    const std::string& entity,
+    const std::string& kindLabel,
+    const std::vector<KnowledgeMaterial>& materials,
+    const std::vector<SearchHit>& hits,
+    const std::vector<std::pair<std::string, std::string>>& known_tags = {}) {
+    const ProfilePrompt pp = build_profile_prompt(dec, entity, kindLabel,
+                                                  summary_materials_block(materials, hits), known_tags);
+    return { LlmMessage{ "system", pp.system }, LlmMessage{ "user", pp.user } };
+}
+
+// ProfileDoc → SummaryResult：doc 里的每一条都进结果（不排序、不裁剪标签、不因为没引用而丢内容）
+inline SummaryResult summary_from_profile_doc(const ProfileDoc& doc, const ProfileDecision& dec) {
+    SummaryResult sr;
+    if (!doc.ok) {
+        sr.error = doc.error.empty() ? "模型输出无法解析" : doc.error;
+        return sr;
+    }
+    sr.disclaimer = doc.disclaimer.empty() ? "AI 整理，仅供参考" : doc.disclaimer;
+    sr.profile = music_profile_id(dec.profile);
+    sr.profile_label = music_profile_label(dec.profile);
+
+    sr.fields = doc.fields;
+    for (const auto& s : doc.sections) {
+        SummarySection sec;
+        sec.heading = s.heading;
+        for (const auto& p : s.paragraphs) {
+            SummaryParagraph sp;
+            sp.text = p.text;
+            sp.citations = p.citations;
+            sec.paragraphs.push_back(std::move(sp));
+        }
+        sr.sections.push_back(std::move(sec));
+    }
+    for (const auto& c : doc.citations) {
+        SummaryCitation sc;
+        sc.id = c.id;
+        sc.title = c.title;
+        sc.url = c.url;
+        sc.source = c.source;
+        // 2026-10-27（合并后回归 8.10 的真因）：**原样保留**模型给的 fetched_at；没给就是 0。
+        // 绝不在这里读时钟 —— 否则同一个回包转两次结果不同，"传/不传 ProgressFn 逐字段相同"
+        // 会跨秒随机失败（实测 a=1793108892 b=1793108894，同一次测试内两次调用）。
+        // 纪律：解析/转换层必须是**回包的纯函数**。
+        sc.fetched_at = c.fetched_at;
+        sr.citations.push_back(std::move(sc));
+    }
+    // 分节镜像成标签行（见 summary_mirror_sections_into_fields 的注释）
+    if (summary_mirror_sections_into_fields()) {
+        for (const auto& sec : sr.sections) {
+            // 曲目列表统一用「曲目列表」这个键名：前端 renderFieldGrid 在**本地有曲目**时
+            // 会 drop 掉这个键（改用本地对齐表格），不归一化就会出现「本地表格 + AI 文本」两份列表。
+            std::string label = sec.heading;
+            const bool is_tracklist =
+                (sec.heading.find("曲目列表") != std::string::npos ||
+                 sec.heading.find("収録曲") != std::string::npos ||
+                 pp_lower_ascii(sec.heading).find("tracklist") != std::string::npos ||
+                 pp_lower_ascii(sec.heading).find("track list") != std::string::npos);
+            if (is_tracklist) label = "曲目列表";
+            bool exists = false;
+            for (const auto& kv : sr.fields) {
+                if (kv.first == label) { exists = true; break; }
+            }
+            if (exists) continue;
+            std::string body;
+            for (const auto& p : sec.paragraphs) {
+                if (!body.empty()) body += "\n\n";
+                body += p.text;
+            }
+            if (body.empty()) continue;
+            sr.fields.emplace_back(label, body);
+        }
+    }
+    // 引用可选：一条都没有（或全被白名单丢掉）时如实标 unverified，UI 会写「AI 整理」。
+    // 2026-10-27（真实调用反馈）：materials_used 与 citations 语义对齐 ——
+    // 它就是「实际被引用的 URL 集合」，不能一边有 citations 一边空着。
+    {
+        std::set<std::string> used;
+        for (const auto& c : sr.citations) if (!c.url.empty()) used.insert(c.url);
+        sr.materials_used.assign(used.begin(), used.end());
+    }
+    sr.unverified = sr.citations.empty();
+    sr.validation_ok = true;
+    sr.ok = true;
+    return sr;
+}
+
+// 命中里是否有「主材料」（专辑/作品页）。全是组织/艺术家页时，材料对本实体基本没用 ——
+// 真实案例：Static World 会场限定CD 只拿到 vgmdb.net/org/5044（22 条同团体目录），
+// 模型于是把目录当内容。这里用来决定要不要再补一次「专辑页导向」的站点限定搜索。
+inline bool summary_has_primary_material(const std::vector<SearchHit>& hits) {
+    for (const auto& h : hits) {
+        if (pp_page_kind_rank(h.url, h.title) >= 2) return true;
+    }
+    return false;
+}
+
+// 链接索引：种子表（人工核对过 URL）+ 材料/检索命中的 URL 与页面标题
+inline LinkIndex summary_link_index(const std::vector<KnowledgeMaterial>& materials,
+                                    const std::vector<SearchHit>& hits) {
+    LinkIndex idx;
+    idx.add_seed_table();
+    for (const auto& m : materials) {
+        if (m.url.empty()) continue;
+        idx.add_from_url(m.url, m.title);
+        // 2026-10-27（真实调用反馈 links=[]）：材料的**页面标题**就是正文里出现的那个名词
+        //（如「Static World - VGMdb」→「Static World」），必须单独加进索引，
+        // 否则正文里的团体名/专辑名一个都连不上。标题与 URL 同源，属确定关系。
+        const std::string t = pp_strip_source_suffix(m.title);
+        if (!t.empty() && t.size() <= 60) idx.add(t, m.url, m.source.empty() ? "material" : m.source, "名词");
+        if (!m.subject.empty()) idx.add(m.subject, m.url, m.source.empty() ? "material" : m.source, "名词");
+    }
+    for (const auto& h : hits) {
+        if (h.url.empty()) continue;
+        idx.add_from_url(h.url, h.title);
+        const std::string t = pp_strip_source_suffix(h.title);
+        if (!t.empty() && t.size() <= 60) idx.add(t, h.url, "search", "名词");
+    }
+    return idx;
+}
+
+// 把结果里的名词挂上权威链接：正文插「名词（url）」，结构化的 links[] 另行回给前端。
+inline void summary_apply_links(SummaryResult& sr, const LinkIndex& idx, int max_per_field = 6) {
+    if (idx.empty()) return;
+    auto remember = [&sr](const std::vector<LinkMatch>& ms) {
+        for (const auto& m : ms) {
+            if (!m.hit) continue;
+            bool exists = false;
+            for (const auto& l : sr.links) {
+                if (l.name == m.name) { exists = true; break; }
+            }
+            if (exists) continue;
+            SummaryLink l;
+            l.name = m.name;
+            l.url = m.url;
+            l.source = m.source;
+            l.kind = m.kind;
+            sr.links.push_back(std::move(l));
+        }
+    };
+    for (auto& kv : sr.fields) {
+        // 已经是 URL 的值不再重复挂链接（「关联」「链接」这类字段本来就是网址）
+        if (kv.second.rfind("http", 0) == 0) continue;
+        std::vector<LinkMatch> ms;
+        kv.second = linkify_text(kv.second, idx, max_per_field, &ms);
+        remember(ms);
+    }
+    for (auto& sec : sr.sections) {
+        for (auto& p : sec.paragraphs) {
+            std::vector<LinkMatch> ms;
+            p.text = linkify_text(p.text, idx, 3, &ms);
+            remember(ms);
+        }
+    }
+}
+
+// 2026-10-27（父批准 #2）：**取回时刻由调用方盖章**。
+// 分层纪律：
+//   * 解析层（parse_profile_reply / summary_from_profile_doc / parse_synthesis_reply）
+//     必须是"回包的纯函数"：模型给了 fetched_at 就透传，没给就是 0，**绝不读时钟**；
+//   * 只有本函数（在 retrieval_fetch / retrieval_fetch_track 里、写缓存之前调用）才读时钟。
+// 为什么盖在**写缓存之前**：缓存存的就是用户会看到的那份结果，时间戳若留到返回后再盖，
+// 命中缓存的那次就会显示"未知取回时间"，同一张专辑两次打开看到的元数据不一致。
+// 盖上之后再入缓存 ⟹ 首次生成的取回时刻被冻结，后续缓存命中显示同一个时刻（可复现）。
+inline void summary_stamp_citations(SummaryResult& sr, long long now_sec = 0) {
+    if (sr.citations.empty()) return;
+    if (now_sec <= 0) now_sec = (long long)std::time(nullptr);
+    for (auto& c : sr.citations) {
+        if (c.fetched_at <= 0) c.fetched_at = now_sec;
+    }
+}
+
+// 一条龙：宽松解析 + 转 SummaryResult + 挂链接
+inline SummaryResult summary_build_from_profile_reply(const std::string& reply,
+                                                      const ProfileDecision& dec,
+                                                      const std::vector<std::string>& allowed_urls,
+                                                      const LinkIndex& idx) {
+    // 有白名单才校验（单曲路径没有权威材料集合，硬校验会把引用全丢掉）
+    ProfileDoc doc = parse_profile_reply(reply, allowed_urls, !allowed_urls.empty());
+    SummaryResult sr = summary_from_profile_doc(doc, dec);
+    if (sr.ok) summary_apply_links(sr, idx, 6);
+    return sr;
+}
+
 // ---------------------------------------------------------------------------
 // 缓存序列化、反序列化、落盘与路径
 // ---------------------------------------------------------------------------
@@ -772,7 +1060,9 @@ inline std::string summary_to_json(const SummaryResult& sr) {
     o << "{\n"
       // 2026-10-24（261024-01 #4）：缓存格式版本。v2 起才有结构化 fields；旧缓存（无 v 或 v<2）
       // 在读取时直接判过期，让下次请求重新生成 —— 否则升级后老用户永远看不到标签网格。
-      << "  \"v\": 3,\n"
+      // 2026-10-27（261027-06）：v4 起带 profile（分类）与 links（名词外链）。v3 缓存仍可读，
+      // 只是没有这两项 —— 不强制重生成，避免升级后把用户已付过钱的资料全部作废。
+      << "  \"v\": 4,\n"
       << "  \"ok\": " << (sr.ok ? "true" : "false") << ",\n"
       << "  \"ai\": " << (sr.ai ? "true" : "false") << ",\n"
       << "  \"model\": \"" << meta_jesc(sr.model) << "\",\n"
@@ -827,6 +1117,16 @@ inline std::string summary_to_json(const SummaryResult& sr) {
     for (size_t i = 0; i < sr.materials_used.size(); ++i) {
         if (i) o << ", ";
         o << "\"" << meta_jesc(sr.materials_used[i]) << "\"";
+    }
+    o << "],\n"
+      << "  \"profile\": \"" << meta_jesc(sr.profile) << "\",\n"
+      << "  \"profile_label\": \"" << meta_jesc(sr.profile_label) << "\",\n"
+      << "  \"links\": [";
+    for (size_t i = 0; i < sr.links.size(); ++i) {
+        const auto& l = sr.links[i];
+        o << (i ? ", " : "")
+          << "{\"name\": \"" << meta_jesc(l.name) << "\", \"url\": \"" << meta_jesc(l.url)
+          << "\", \"source\": \"" << meta_jesc(l.source) << "\", \"kind\": \"" << meta_jesc(l.kind) << "\"}";
     }
     o << "],\n"
       << "  \"from_cache\": " << (sr.from_cache ? "true" : "false") << ",\n"
@@ -926,6 +1226,26 @@ inline bool summary_from_json(const std::string& text,
             }
         }
         sr_out.sections.push_back(std::move(sec));
+    }
+
+    // profile / links（v4；v3 缓存没有这两项 → 空，前端照旧渲染）
+    sr_out.profile = j["profile"].s();
+    sr_out.profile_label = j["profile_label"].s();
+    sr_out.links.clear();
+    {
+        const rta::net::Json& larr = j["links"];
+        if (larr.type == rta::net::Json::Arr) {
+            for (size_t i = 0; i < larr.size(); ++i) {
+                const auto& item = larr.at(i);
+                if (item.type != rta::net::Json::Obj) continue;
+                SummaryLink l;
+                l.name = item["name"].s();
+                l.url = item["url"].s();
+                l.source = item["source"].s();
+                l.kind = item["kind"].s();
+                if (!l.name.empty() && !l.url.empty()) sr_out.links.push_back(std::move(l));
+            }
+        }
     }
 
     // materials_used
@@ -1125,8 +1445,10 @@ struct RetrievalOptions {
     // 2026-10-26（用户 261026-06 #2）：主搜索一条都没过闸时，再打一次「平台站点限定」搜索。
     // 空串 = 关闭。site: 是官方支持的查询语法（https://api-docs.deepseek.com/guides/search/ ）。
     bool enable_site_fallback = true;
+    // 2026-10-27（真实调用反馈）：补 vgmdb.net / vgmdb.info —— 同人与游戏音乐最全的数据库，
+    // 而且**专辑页 URL 形如 /album/<id>**，比组织页有用得多（见 pp_page_kind_rank）。
     std::string site_fallback_sites =
-        "site:y.qq.com OR site:dizzylab.net OR site:music.163.com OR site:bandcamp.com";
+        "site:vgmdb.net OR site:y.qq.com OR site:dizzylab.net OR site:music.163.com OR site:bandcamp.com";
     // 2026-10-26（用户 261026-06 #2）：没有任何材料时，先让**模型自己**用 web_search/web_fetch
     // 查一轮（function calling），再据查到的内容写简介；查不到才退回纯记忆。
     bool enable_web_tools = true;
@@ -1136,6 +1458,14 @@ struct RetrievalOptions {
     FilterOptions filter_opts;
     std::string artist;           // 针对 Release 的艺术家辅助（用于 Wikipedia 与 Discogs 检索消歧）
     std::string entity_id;        // 显式指定实体 ID（为空则自动计算）
+    // ---- 2026-10-27（用户 261027-06 P1：「把所有专辑标签都交给模型」）----
+    // 这些都是**可选**输入：rtaweb 现在只传 artist/entity_id，因此生产上标签多为空，
+    // 分类主要靠材料正文（Discogs 的『流派与风格/乐团/指挥/厂牌』）+ 标题 + 曲目名 —— 够用。
+    // 一旦调用方把本地标签接进来，分类精度与提示词信息量会再上一档。
+    bool use_profile_prompts = true;                              // false = 回退旧的固定 schema 提示词
+    std::vector<std::pair<std::string, std::string>> album_tags;  // 已知标签（流派/厂牌/目录号/…）
+    std::vector<std::string> track_titles;                        // 曲目名（同人：原曲名常在曲名里）
+    std::string genre_hint;                                       // 直接指定分类（如 "classical" / "古典"）
 };
 
 // ---------------------------------------------------------------------------
@@ -1377,6 +1707,13 @@ inline WebEvidence retrieval_web_evidence(const LlmConfig& cfg,
 //   * 结果同样写 summary 缓存（7 天），所以第二次打开不再调用 LLM。
 // ---------------------------------------------------------------------------
 
+// 2026-10-27（261027-06）：AI 自有知识路径也要按 profile 说话（分类 + 专用提示词 + 名词外链）。
+struct ProfileContext {
+    ProfileDecision decision;
+    LinkIndex links;
+    bool valid = false;
+};
+
 inline std::vector<LlmMessage> build_ai_only_prompt(const std::string& entityLabel,
                                                     const std::string& kindLabel,
                                                     const std::string& lang,
@@ -1465,9 +1802,23 @@ inline SummaryResult summary_ai_only_generate(const std::string& entityName,
                                               const std::string& lang,
                                               const LlmConfig& cfg,
                                               ProgressFn on_progress = nullptr,
-                                              const std::string& evidence = std::string()) {
+                                              const std::string& evidence = std::string(),
+                                              const ProfileContext* ctx = nullptr) {
     SummaryProgressEmitter progress(on_progress);   // 拷贝（不是 move）：嵌套兜底路径还要复用同一个回调
-    const std::vector<LlmMessage> base_msgs = build_ai_only_prompt(entityName, kindLabel, lang, evidence);
+    // 2026-10-27（261027-06）：有 ctx 就按分类提示词写（"不过滤"同样适用），没有就走旧的简短简介。
+    const bool use_profile = (ctx && ctx->valid);
+    std::vector<LlmMessage> base_msgs;
+    if (use_profile) {
+        std::string material;
+        if (!evidence.empty()) {
+            material = "\n[M1] 来源: web-tools | 标题: 联网检索（web_search/web_fetch） | 链接: \n正文:\n" + evidence + "\n";
+        }
+        const ProfilePrompt pp = build_profile_prompt(ctx->decision, entityName + (kindLabel.empty() ? "" : ("（" + kindLabel + "）")),
+                                                      kindLabel, material, {});
+        base_msgs = { LlmMessage{ "system", pp.system }, LlmMessage{ "user", pp.user } };
+    } else {
+        base_msgs = build_ai_only_prompt(entityName, kindLabel, lang, evidence);
+    }
     SummaryResult parsed;
     std::string last_err;
     for (int attempt = 0; attempt < 2; ++attempt) {
@@ -1475,13 +1826,20 @@ inline SummaryResult summary_ai_only_generate(const std::string& entityName,
         if (attempt > 0) {
             msgs.push_back(LlmMessage{ "user",
                 "上一次输出不合规（" + last_err + "）。请只输出严格 JSON：" +
-                "{\"sections\":[{\"heading\":\"简介\",\"paragraphs\":[{\"text\":\"……\"}]}]}，不要任何其它文字。" });
+                "{\"disclaimer\":\"AI 整理，仅供参考\",\"fields\":{\"标签\":\"值\"},"
+                "\"sections\":[{\"heading\":\"📀 基本信息\",\"paragraphs\":[\"……\"]}]}，不要任何其它文字。" });
         }
         retrieval_rate_limiter().acquire();
         progress.begin_attempt(attempt, "ai_only attempt=" + std::to_string(attempt));
-        const LlmReply rep = retrieval_chat(cfg, msgs, 2000, 0.3f, true, progress);
+        const LlmReply rep = retrieval_chat(cfg, msgs, use_profile ? 3200 : 2000, 0.3f, true, progress);
         if (!rep.ok) { last_err = rep.error; continue; }
-        parsed = parse_ai_only_reply(rep.content);
+        if (use_profile) {
+            ProfileDoc doc = parse_profile_reply(rep.content);
+            parsed = summary_from_profile_doc(doc, ctx->decision);
+            if (parsed.ok) summary_apply_links(parsed, ctx->links, 6);
+        } else {
+            parsed = parse_ai_only_reply(rep.content);
+        }
         if (parsed.ok) break;
         last_err = parsed.error;
     }
@@ -1493,6 +1851,7 @@ inline SummaryResult summary_ai_only_generate(const std::string& entityName,
         parsed.offline = false;
         // 有联网检索材料时：仍然 unverified（没做逐段引用校验），但标注要如实说明「含联网检索」
         if (!evidence.empty()) parsed.disclaimer = "AI 整理（含联网检索工具结果，未逐段校验）";
+        if (use_profile) parsed.unverified = true;   // 无逐段引用校验 → 必须如实标注
         progress.phase(SummaryPhase::Done, "ai_only ok");
     } else {
         progress.phase(SummaryPhase::Failed, last_err);
@@ -1589,6 +1948,10 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
             }
             FilterResult fr = filter_hits(raw, opts.filter_opts);
             hits = std::move(fr.hits);
+            // 2026-10-27（同专辑路径）：单曲也按「曲目页 > 组织/专辑页」重排，别把组织页当主材料
+            std::stable_sort(hits.begin(), hits.end(), [](const SearchHit& a, const SearchHit& b) {
+                return pp_page_kind_rank(a.url, a.title) > pp_page_kind_rank(b.url, b.title);
+            });
             const size_t fetch_count = std::min(hits.size(), (size_t)2);
             const auto t_f0 = std::chrono::steady_clock::now();
             const LlmConfig cfg_f = cfg;
@@ -1613,22 +1976,50 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
     }
 
     SummaryResult sr;
+    // 2026-10-27（用户 261027-06 P4）：单曲页也要「赏析 / 背景解读」。
+    // 单曲同样先分类（同人曲靠曲名/原曲名就能判定），提示词按类定制，并强制要求一节
+    // 「💿 补充背景与解读」；解析走宽松路径（标签自由，引用可选）。
+    ProfileSignal trk_sig;
+    trk_sig.title = title;
+    trk_sig.artist = artist;
+    trk_sig.hint = opts.genre_hint;
+    {
+        std::ostringstream mt;
+        for (const auto& h : hits) {
+            mt << h.title << "\n" << (h.snippet.empty() ? h.summary : h.snippet).substr(0, 1200) << "\n";
+        }
+        trk_sig.material_text = mt.str();
+    }
+    const ProfileDecision trk_dec = classify_profile(trk_sig);
+    const bool trk_profile = opts.use_profile_prompts;
+    LinkIndex trk_idx;
+    if (trk_profile) trk_idx = summary_link_index({}, hits);
     if (!hits.empty()) {
         std::string last_err;
+        const std::string trk_material = summary_materials_block({}, hits);
         for (int attempt = 0; attempt < 2; ++attempt) {
-            std::vector<LlmMessage> msgs = build_track_prompt(title, artist, hits, lang);
+            std::vector<LlmMessage> msgs;
+            if (trk_profile) {
+                const ProfilePrompt pp = build_profile_prompt(
+                    trk_dec, artist.empty() ? title : (artist + " - " + title), "歌曲", trk_material, opts.album_tags);
+                msgs = { LlmMessage{ "system", pp.system }, LlmMessage{ "user", pp.user } };
+            } else {
+                msgs = build_track_prompt(title, artist, hits, lang);
+            }
             if (attempt > 0) {
                 msgs.push_back(LlmMessage{ "user", "上一次输出不合规（" + last_err +
-                    "）。请只输出严格 JSON：{\"fields\":{...},\"sections\":[{\"heading\":\"简介\",\"paragraphs\":[{\"text\":\"…\"}]}]}" });
+                    "）。请只输出严格 JSON：{\"fields\":{\"标签\":\"值\"},"
+                    "\"sections\":[{\"heading\":\"💿 补充背景与解读\",\"paragraphs\":[\"……\"]}]}" });
             }
             retrieval_rate_limiter().acquire();
             progress.begin_attempt(attempt, "track llm attempt=" + std::to_string(attempt));
             const auto t_l0 = std::chrono::steady_clock::now();
-            const LlmReply rep = retrieval_chat(cfg, msgs, 2200, 0.3f, true, progress);
+            const LlmReply rep = retrieval_chat(cfg, msgs, trk_profile ? 3200 : 2200, 0.3f, true, progress);
             trk_llm_ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t_l0).count();
             if (!rep.ok) { last_err = rep.error; continue; }
-            sr = parse_ai_only_reply(rep.content);
+            sr = trk_profile ? summary_build_from_profile_reply(rep.content, trk_dec, {}, trk_idx)
+                             : parse_ai_only_reply(rep.content);
             if (sr.ok) break;
             last_err = sr.error;
         }
@@ -1646,8 +2037,14 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
             if (ev.ok) ev_text = ev.text;
             progress.phase(SummaryPhase::Retrieving, "generate");
         }
+        ProfileContext trk_ctx;
+        if (trk_profile) {
+            trk_ctx.decision = trk_dec;
+            trk_ctx.links = trk_idx;
+            trk_ctx.valid = true;
+        }
         sr = summary_ai_only_generate(artist.empty() ? title : (artist + " - " + title), "歌曲", lang,
-                                      cfg, on_progress, ev_text);
+                                      cfg, on_progress, ev_text, trk_ctx.valid ? &trk_ctx : nullptr);
     } else {
         sr.unverified = true;   // 检索正文未做逐段引用校验 → 仍按"AI 整理"标注
         sr.disclaimer = "AI 整理";
@@ -1655,9 +2052,13 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
     if (sr.ok) {
         sr.generated_at = (long long)std::time(nullptr);
         sr.expires_at = sr.generated_at + 7 * 86400;
+        summary_stamp_citations(sr, sr.generated_at);   // 父批准 #2：单曲路径同样由调用方盖章
         sr.diag = "search=" + std::to_string(trk_search_ms) + "ms fetch=" + std::to_string(trk_fetch_ms) +
                   "ms llm=" + std::to_string(trk_llm_ms) + "ms hits=" + std::to_string(hits.size()) +
-                  (trk_ev_diag.empty() ? std::string() : (" fallback=ai_only" + trk_ev_diag));
+                  (trk_ev_diag.empty() ? std::string() : (" fallback=ai_only" + trk_ev_diag)) +
+                  " profile=" + music_profile_id(trk_dec.profile) +
+                  " fields=" + std::to_string(sr.fields.size()) +
+                  " links=" + std::to_string(sr.links.size());
         summary_save_cache(baseDir, eid, lang, sr);
         progress.phase(SummaryPhase::Done, "track ok");
     } else {
@@ -1821,6 +2222,12 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     }
 
     const auto t_search0 = std::chrono::steady_clock::now();
+    // 2026-10-27（真实调用反馈 Static World 会场限定CD）：**搜索前**先分类一次。
+    // 只用标题/艺术家/本地标签（材料还没到），用来定制检索词；材料到手后再分一次（更准），
+    // 两次结果分别用于「搜什么」与「怎么写」。
+    const MusicProfile pre_profile = classify_profile(
+        summary_make_signal(name, opts.artist, {}, {}, opts.album_tags, opts.track_titles,
+                            opts.genre_hint)).profile;
     if (opts.enable_search) {
         std::string query;
         // 2026-10-24（261024-01 #1）：官方 /v1/tools/search 的召回质量与 query 强相关。
@@ -1829,13 +2236,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             std::string qTarget = !opts.artist.empty() ? (opts.artist + " " + name) : name;
             // 艺术家串里的分隔符（"塞壬唱片-MSR / Ivoris"）会稀释 query，换成空格
             for (char& ch : qTarget) if (ch == '/' || ch == '&' || ch == '|' || ch == '+') ch = ' ';
-            if (lang == "zh" || lang.empty()) {
-                query = qTarget + " EP 专辑 发行时间 曲目 制作 语种 出版方";
-            } else if (lang == "ja") {
-                query = qTarget + " EP アルバム 発売日 収録曲 制作";
-            } else {
-                query = qTarget + " EP album release date tracklist credits";
-            }
+            query = qTarget + pp_search_query_suffix(pre_profile, lang);
         } else {
             std::string qn = name;
             for (char& ch : qn) if (ch == '/' || ch == '&' || ch == '|' || ch == '+') ch = ' ';
@@ -1908,6 +2309,49 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
                                    "site-fallback hits=" + std::to_string(valid_hits.size()));
                 }
             }
+
+            // 2026-10-27（真实调用反馈第 2 轮）：命中的**全是组织/艺术家页**（没有一张专辑页）⟹
+            // 再补一次「专辑页导向」的站点限定搜索，并把结果**并入**（不是替换）。
+            // 旧逻辑只在「零命中」时补搜，于是「搜到了一条 org 页」就被当成"有材料"，
+            // 专辑页永远没机会被搜到 —— 这正是用户看到"全是同团体目录"的直接原因。
+            // 只对**专辑**这么做：艺术家的「主材料」本来就是艺术家页，再补搜专辑页纯属浪费一次搜索费。
+            if (s_rep.ok && kind == EntityKind::Release && !valid_hits.empty() &&
+                !summary_has_primary_material(valid_hits) &&
+                opts.enable_site_fallback && !opts.site_fallback_sites.empty()) {
+                DsSearchOptions sopt3 = sopt;
+                sopt3.siteRestrict = opts.site_fallback_sites;
+                const std::string q3 = (!opts.artist.empty() ? (opts.artist + " " + name) : name) +
+                                       pp_search_query_suffix(pre_profile, lang);
+                retrieval_rate_limiter().acquire();
+                const DsSearchReply s_rep3 = ds_search(cfg, q3, sopt3);
+                diag_search_ms = ms_since(t_search0);
+                if (s_rep3.ok && !s_rep3.hits.empty()) {
+                    FilterOptions rel3 = opts.filter_opts;
+                    rel3.min_authority = 0;
+                    rel3.min_rerank_score = 0.0;
+                    FilterResult f3 = filter_hits(to_hits(s_rep3.hits), rel3);
+                    for (auto& h : f3.hits) {
+                        bool dup = false;
+                        for (const auto& x : valid_hits) {
+                            if (x.url == h.url) { dup = true; break; }
+                        }
+                        if (!dup) valid_hits.push_back(h);
+                    }
+                    diag_site_fallback = (int)s_rep3.hits.size();
+                    progress.phase(SummaryPhase::Retrieving,
+                                   "album-page-fallback hits=" + std::to_string(valid_hits.size()));
+                }
+            }
+
+            // 2026-10-27（真实调用反馈 Static World）：**专辑页优先**。
+            // 实测可复现：DeepSeek 把 vgmdb.net/org/5044（组织页，22 条同团体目录）排在第一，
+            // 我们照单全收 ⟹ 模型只能看见「同团体目录」，字段全成了目录列表。
+            // 这里按页面类型重排（专辑/发行/作品页 > 通用 > 组织/艺术家页），
+            // 让 fetch 的配额（最多 4 页）优先花在真正的专辑页上。
+            std::stable_sort(valid_hits.begin(), valid_hits.end(),
+                             [](const SearchHit& a, const SearchHit& b) {
+                                 return pp_page_kind_rank(a.url, a.title) > pp_page_kind_rank(b.url, b.title);
+                             });
 
             // Step 3: ds_fetch 取前几页正文（每实体最多 4 次 fetch；官方 fetch 返回正文质量好）。
             // 2026-10-24（261024-02 #1 速度）：4 次 fetch 串行要 4×RTT，改并行（限频器内部仍有 220ms 间隔，
@@ -2012,14 +2456,29 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
                 }
                 progress.phase(SummaryPhase::Retrieving, "generate");
             }
-            SummaryResult ai_res = summary_ai_only_generate(label, kind_label, lang, cfg, on_progress, ev_text);
+            // 2026-10-27（261027-06 P1/P2）：这条兜底也先分类（材料为空 → 只能靠标题/艺术家/标签），
+            // 然后按类给专用提示词；解析走宽松路径，模型写多少就展示多少。
+            ProfileContext nodata_ctx;
+            if (opts.use_profile_prompts) {
+                const ProfileSignal s0 = summary_make_signal(name, opts.artist, {}, {}, opts.album_tags,
+                                                             opts.track_titles, opts.genre_hint);
+                nodata_ctx.decision = classify_profile(s0);
+                nodata_ctx.links.add_seed_table();
+                nodata_ctx.valid = true;
+            }
+            SummaryResult ai_res = summary_ai_only_generate(label, kind_label, lang, cfg, on_progress, ev_text,
+                                                            nodata_ctx.valid ? &nodata_ctx : nullptr);
             diag_llm_ms += (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t_ai0).count();
             if (ai_res.ok) {
                 ai_res.diag = "knowledge=" + std::to_string(diag_knowledge_ms) + "ms search=" +
                               std::to_string(diag_search_ms) + "ms fetch=" +
                               std::to_string(diag_fetch_ms) + "ms llm=" +
-                              std::to_string(diag_llm_ms) + "ms hits=0 fallback=ai_only" + ev_diag;
+                              std::to_string(diag_llm_ms) + "ms hits=0 fallback=ai_only" + ev_diag +
+                              " profile=" + (ai_res.profile.empty() ? "generic" : ai_res.profile) +
+                              " fields=" + std::to_string(ai_res.fields.size()) +
+                              " links=" + std::to_string(ai_res.links.size());
+                summary_stamp_citations(ai_res);      // 父批准 #2：调用方盖章，盖在写缓存之前
                 summary_save_cache(baseDir, eid, lang, ai_res);
                 return ai_res;
             }
@@ -2040,9 +2499,26 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     const std::string promptEntityName = (!opts.artist.empty() && kind == EntityKind::Release)
         ? (opts.artist + " - " + name)
         : name;
-    const std::vector<LlmMessage> msgs = build_synthesis_prompt(
-        promptEntityName, kr.materials, fetched_hits, lang,
-        (kind == EntityKind::Release) ? "专辑" : "艺术家");
+    const std::string kindLabel = (kind == EntityKind::Release) ? "专辑" : "艺术家";
+
+    // 2026-10-27（用户 261027-06 P1）：第一步分类 → 第二步按类定制提示词。
+    const ProfileSignal prof_signal = summary_make_signal(name, opts.artist, kr.materials, fetched_hits,
+                                                          opts.album_tags, opts.track_titles, opts.genre_hint);
+    const ProfileDecision prof_dec = classify_profile(prof_signal);
+    std::vector<std::pair<std::string, std::string>> known_tags = opts.album_tags;
+    for (const auto& kv : pp_signal_tags(prof_signal)) {
+        bool dup = false;
+        for (const auto& k2 : known_tags) {
+            if (k2.first == kv.first) { dup = true; break; }
+        }
+        if (!dup) known_tags.push_back(kv);
+    }
+    // 2026-10-27（P3）：名词 → 权威链接的索引（种子表 + 材料/命中的 URL 与页面标题）
+    const LinkIndex link_idx = summary_link_index(kr.materials, fetched_hits);
+    const bool use_profile = opts.use_profile_prompts;
+    const std::vector<LlmMessage> msgs = use_profile
+        ? build_profile_synthesis_prompt(prof_dec, promptEntityName, kindLabel, kr.materials, fetched_hits, known_tags)
+        : build_synthesis_prompt(promptEntityName, kr.materials, fetched_hits, lang, kindLabel);
     SummaryResult parsed;
     std::string last_err;
     // 2026-10-24（261024-02 #1）：400/非 JSON 的降级链。
@@ -2058,18 +2534,23 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     std::vector<KnowledgeMaterial> reduced_mats = kr.materials;
     for (auto& m : reduced_mats) m.text = m.text.substr(0, 1500);
 
+    // 2026-10-27（261027-06 P2）：token 上限从 2600 提到 4000。
+    // 「不过滤」就是要求模型写全（20+ 条标签 + 逐条曲目 + 两节解读），2600 会把它截成半截 JSON，
+    // 截断比"少写"更糟：整份资料会被判失败。max_tokens 只是上限，模型不写就不计费。
     for (int attempt = 0; attempt < 3; ++attempt) {
         std::vector<LlmMessage> attempt_msgs;
-        int attempt_tokens = 2600;
+        int attempt_tokens = use_profile ? 4000 : 2600;
         if (attempt == 0) {
             attempt_msgs = msgs;
         } else if (attempt == 1) {
-            attempt_msgs = build_synthesis_prompt(promptEntityName, reduced_mats, reduced_hits, lang,
-                                                  (kind == EntityKind::Release) ? "专辑" : "艺术家");
-            attempt_tokens = 2000;
+            attempt_msgs = use_profile
+                ? build_profile_synthesis_prompt(prof_dec, promptEntityName, kindLabel, reduced_mats, reduced_hits, known_tags)
+                : build_synthesis_prompt(promptEntityName, reduced_mats, reduced_hits, lang, kindLabel);
+            attempt_tokens = use_profile ? 3200 : 2000;
             attempt_msgs.push_back(LlmMessage{ "user",
-                "上一次请求失败（" + last_err + "）。请用更短的篇幅输出严格 JSON："
-                "最多 2 个 section、每段 1 条引用；citations 的 url 必须原样复制材料链接。" });
+                "上一次请求失败（" + last_err + "）。请重新输出严格 JSON："
+                "能确定的标签一条都不要少（fields 键名自由），解读放在 sections；"
+                "citations 的 url 必须原样复制材料链接。" });
         } else {
             break;   // 第三次交给下面的 AI 整理兜底
         }
@@ -2087,7 +2568,11 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             continue;
         }
         diag_llm_ms += llm_ms;
-        parsed = parse_synthesis_reply(chat_rep.content, allowed_urls);
+        // 2026-10-27（261027-06 P2）：宽松解析 —— 标签自由、段落自由、引用可选；
+        // 引用不在白名单只丢那一条，不再否掉整份资料（旧实现一条坏引用 = 整页空白）。
+        parsed = use_profile
+            ? summary_build_from_profile_reply(chat_rep.content, prof_dec, allowed_urls, link_idx)
+            : parse_synthesis_reply(chat_rep.content, allowed_urls);
         if (parsed.ok) break;
         last_err = "综合结果校验失败: " + parsed.error;
     }
@@ -2101,13 +2586,19 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             progress.phase(SummaryPhase::Done, "cache_fallback");
             return cached;
         }
+        // 2026-10-27（261027-06）：兜底也走同一套分类提示词（用户要的是"无论哪条路径都别过滤"）
+        ProfileContext fb_ctx;
+        fb_ctx.decision = prof_dec;
+        fb_ctx.links = link_idx;
+        fb_ctx.valid = use_profile;
         SummaryResult ai_fb = summary_ai_only_generate(promptEntityName,
-            (kind == EntityKind::Release) ? "专辑" : "艺术家", lang, cfg, on_progress);
+            kindLabel, lang, cfg, on_progress, std::string(), use_profile ? &fb_ctx : nullptr);
         if (ai_fb.ok) {
             ai_fb.error = "权威综合失败，已用 AI 自有知识整理（" + last_err + "）";
             ai_fb.diag = "fallback=ai_only; " + last_err;
             ai_fb.generated_at = now_sec;
             ai_fb.expires_at = now_sec + 3 * 86400;   // 兜底内容 TTL 短一些，方便恢复后重生成
+            summary_stamp_citations(ai_fb, now_sec);  // 父批准 #2：调用方盖章，盖在写缓存之前
             summary_save_cache(baseDir, eid, lang, ai_fb);
             return ai_fb;
         }
@@ -2125,12 +2616,20 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     parsed.from_cache = false;
     parsed.offline = false;
     parsed.validation_ok = true;
+    // 2026-10-27（父批准 #2）：这里统一盖「取回时刻」，与 generated_at 用同一个 now_sec。
+    summary_stamp_citations(parsed, now_sec);
 
     parsed.diag = "knowledge=" + std::to_string(diag_knowledge_ms) + "ms search=" +
                   std::to_string(diag_search_ms) + "ms fetch=" + std::to_string(diag_fetch_ms) +
                   "ms llm=" + std::to_string(diag_llm_ms) + "ms hits=" +
                   std::to_string(fetched_hits.size()) +
-                  (diag_site_fallback > 0 ? (" sitefb=" + std::to_string(diag_site_fallback)) : std::string());
+                  (diag_site_fallback > 0 ? (" sitefb=" + std::to_string(diag_site_fallback)) : std::string()) +
+                  // 2026-10-27（261027-06 P1）：把分类结果写进日志，便于核查"分错类"的实例
+                  " profile=" + music_profile_id(prof_dec.profile) +
+                  "(" + std::to_string(prof_dec.score) + "," + prof_dec.hint_source + ")" +
+                  " fields=" + std::to_string(parsed.fields.size()) +
+                  " links=" + std::to_string(parsed.links.size()) +
+                  (use_profile ? "" : " legacy_prompt=1");
     summary_save_cache(baseDir, eid, lang, parsed);
     progress.phase(SummaryPhase::Done, "llm ok");
 

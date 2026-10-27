@@ -42,6 +42,9 @@ var S = {
 var ADV = {
   device: '', bits: 0, taps: 0, atten: 0, transition: 0, phase: '',
   modcut: 0, moddith: -1, ir: '', irgpu: 0, ramp: 0, theme: 'dark',
+  // 房间校正自动应用（B3，2026-10-27）：1 = 播放时按当前布局自动挂 data\roomcorr\correction-<布局>.json。
+  // 默认 1（用户原话「接上就是了」）；0 = 退回"只认手动 IR"的老行为。
+  roomcorrauto: 1,
   eq: '', modorder: 5, modfamily: 'dsd', gpuvendor: 'auto', directsdm: 0, dsdKind: 'fir', dsdConv: 'narrow',
   // 输出后端与多声道
   // 261024-01 #9/#11：upnpDev = UPnP/DLNA 渲染器（设备描述 URL）；naaHost 自动发现填，
@@ -164,6 +167,39 @@ function apiRaw(u, body) {
   });
 }
 
+/* 2026-10-27（P0 真实事故，261027-06 验收时抓到）：
+   上面的 apiRaw 对所有 /api/* 一律 POST（2026-10-25 CSRF 加固：副作用端点限 POST，GET 一律 405）。
+   但有一个读端点会因此读不到东西 —— /api/settings 的 GET 返回完整 kv，POST 只回 {merged:true}。
+   loadSettings() 用 api(/api/settings) 读，拿到的是 {ok,merged} ⟹ kv 恒为 {} ⟹
+   每个设置控件都停在 HTML 默认值。
+ 
+   为什么这是 P0 而不是显示不对：
+     ① 用户看到的设置是默认值，以为没保存；
+     ② 更糟的是 saveSettings() 会把控件当前值整体 POST 回去 ——
+        控件是默认值 ⟹ 一次无关的改动就把 volume/filter/shaper/device 全部洗回默认；
+     ③ 2026-10-27 实测：settings.conf 里的 metasummary=1 被 saveSettings 写成 0 ⟹
+        用户每保存一次设置，在线整理就被关掉一次（AI 入口随之整块消失）。
+   所以这里需要一个真正发 GET 的最小封装，专门给读端点用。
+   只给 /api/settings 用（其它读端点 POST 正常，handler 不看 method）。 */
+function apiGetRaw(u) {
+  var ctrl = (typeof AbortController != 'undefined') ? new AbortController() : null;
+  var opt = {};
+  if (ctrl) opt.signal = ctrl.signal;
+  var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 8000);
+  return fetch(u, opt).then(function (r) {
+    clearTimeout(timer);
+    if (!r.ok) {
+      var err = new Error('HTTP ' + r.status);
+      err.status = r.status;
+      throw err;
+    }
+    return r.json();
+  }, function (e) {
+    clearTimeout(timer);
+    throw e;
+  });
+}
+ 
 function api(u, body) {
   return apiRaw(u, body).catch(function (err) {
     if (err && err.status && err.status >= 400 && err.status < 500) {
@@ -222,6 +258,7 @@ function params() {
          '&eq=' + encodeURIComponent(ADV.eq || '') +
          '&ir=' + encodeURIComponent(ADV.ir || '') +
          '&irgpu=' + (ADV.irgpu || 0) +
+         '&roomcorrauto=' + (ADV.roomcorrauto === 0 ? 0 : 1) +
          '&ramp=' + (ADV.ramp || 0) +
          '&backend=' + encodeURIComponent(ADV.backend || 'wasapi') +
          '&channels=' + (ADV.channels || 0) +
@@ -480,9 +517,48 @@ function rzApplyEdgeInset() {
   setTimeout(function () { rzApplyEdgeInset(); tick(); }, 700);
 })();
 
-function fmtTag(sr, bits) {
+// ============================================================================
+// P2（2026-10-27 用户 261027-05 A4：「多声道就都标记出来就好了」）
+// ----------------------------------------------------------------------------
+// 全界面**只有这两个函数**决定"声道怎么显示"，不许各处自己拼字符串：
+//   chLayout(ch) = 布局名（1=单声道 / 2=立体声 / 6=5.1 / 8=7.1 / 其他=Nch 或 N.M）
+//   chMark(ch)   = 只给 >2 声道返回标记（0/1/2 返回空串 —— 2.0 是默认，标出来只增加噪声）
+//   chText(ch)   = 带声道数的完整写法（"6 ch（5.1）"），给分析卡/信号链这种要精确的地方用
+// 逐处落点：曲目列表、专辑页曲目行、单曲页副标题、底部播放条、信号链（解码/输出两环）、分析卡。
+// ============================================================================
+function chLayout(ch) {
+  ch = parseInt(ch, 10) || 0;
+  if (ch <= 0) return '';
+  if (ch === 1) return '单声道';
+  if (ch === 2) return '立体声';
+  if (ch === 3) return '2.1';
+  if (ch === 4) return '4.0';
+  if (ch === 6) return '5.1';
+  if (ch === 8) return '7.1';
+  if (ch === 12) return '7.1.4';
+  return ch + 'ch';
+}
+function chMark(ch) {
+  ch = parseInt(ch, 10) || 0;
+  if (ch <= 2) return '';
+  return chLayout(ch);
+}
+function chText(ch) {
+  ch = parseInt(ch, 10) || 0;
+  if (ch <= 0) return '—';
+  var l = chLayout(ch);
+  return (l && l !== (ch + 'ch')) ? (ch + ' ch（' + l + '）') : (ch + ' ch');
+}
+// 行内后缀：多声道才追加（' · 5.1'），2.0 素材上界面与以前逐字相同
+function chSuffix(ch) {
+  var m = chMark(ch);
+  return m ? (' · ' + m) : '';
+}
+
+// 格式徽标：采样率/位深（+ 多声道布局）。ch 可缺省 —— 老调用点零改动。
+function fmtTag(sr, bits, ch) {
   if (!sr) return '';
-  return (sr % 1000 === 0 ? (sr / 1000) + 'k' : (Math.round(sr / 100) / 10) + 'k') + '/' + bits;
+  return (sr % 1000 === 0 ? (sr / 1000) + 'k' : (Math.round(sr / 100) / 10) + 'k') + '/' + bits + chSuffix(ch);
 }
 
 /* ---------------- 顶栏 / 工具区 ---------------- */
@@ -850,6 +926,17 @@ function fetchSummary(url, onDone, tries, isWanted, onProg) {
      * 成功/失败都缓存（失败不弹错，由调用方决定是否留一行"点击重试"）；
      * refresh=true 绕过缓存重新请求（用户明确点"重试/刷新"时才用）。 */
 var SUMC = { cache: {}, inflight: {} };
+/* 2026-10-27（261027-06 P3）：AI 整理"是否开机"的单一判据。
+   两个来源任一为真即可：
+     META.summary        —— 设置键 metasummary（前端从 /api/settings 读到的）
+     META.summaryEnabled —— 后端 /api/status 回报的**权威**开关（真正决定发不发请求）
+   为什么要「或」：本仓历史遗留 —— loadSettings() 用 api('/api/settings') 读，而 api() 对
+   /api/* 一律走 POST（2026-10-25 CSRF 加固），POST 只回 {merged:true}、不回 kv ⟹ META.summary
+   长期停在默认 0。只认它会让整块 AI 功能在界面上人间蒸发（本轮 ST3 实测就是这么发现的）。
+   summaryEnabled 直接来自后端 PlaySettings，不依赖那条读设置的路径。 */
+function aiSummaryOn() {
+  return META.summary === 1 || META.summaryEnabled === true;
+}
 function summHas(s) {
   return !!(s && ((s.fields && Object.keys(s.fields).length > 0) ||
                   (s.ok && s.sections && s.sections.length > 0)));
@@ -1015,7 +1102,8 @@ function openAlbum(k) {
            favIconHtml(t.path, isFav) +
            '<div class=tt title="' + esc(t.title) + '">' + esc(t.title) + '</div>' +
            '<div class=ar title="' + esc(t.artist || j.artist) + '">' + esc(t.artist || j.artist) + '</div>' +
-           '<div class=bd>' + fmtTag(t.sr, t.bits) + '</div>' +
+           // P2（261027-05 A4）：专辑页曲目行也标多声道 —— /api/lib/album 的 tracks 带 ch 字段
+           '<div class=bd>' + fmtTag(t.sr, t.bits, t.ch) + '</div>' +
            '<div class=du>' + fmtDurLong(t.dur) + '</div>' +
            // 2026-10-26（261025-02 #3）：曲目行加一个**看得见**的「+」——
            // 以前专辑页只能"点行=播放整张"，没有任何单曲入队入口（右键也没处理），
@@ -1027,7 +1115,7 @@ function openAlbum(k) {
     // 简介放在曲目之后（评审 #2）。
     // 261024-04 #4b：资料块左右各 22px（与 .ahead 对齐），正文内边距由 .sec-card（18px）提供。
     // 261024-04 #7：打开 AI 整理后**进入即自动加载**，不再需要点任何按钮。
-    if (META.summary == 1) {
+    if (aiSummaryOn()) {
       h += '<div class="sec-card summary-sec" id="albumSummary" data-k="' + esc(j.k) + '"' +
            ' style="margin:8px 22px 24px">' +
            '<div style="font-size:12px;color:var(--mut2)">正在整理资料…</div>' +
@@ -1037,7 +1125,7 @@ function openAlbum(k) {
     head(j.name, j.tracks.length + ' 首', '<button class=btn id=bBackAlbums title="返回专辑列表" aria-label="返回专辑列表">← 返回专辑</button>');
     if (D('bBackAlbums')) D('bBackAlbums').onclick = function () { loadAlbums(); };
 
-    if (META.summary == 1) {
+    if (aiSummaryOn()) {
       var albK = String(j.k);
       // 261024-01 #4：后端现在回结构化 fields（可能没有 sections）⟹ 判据用"能渲染出东西"
       // #3：本地曲库是时长的唯一真相源；AI 的「时长」「曲目列表」一律不采信
@@ -1184,10 +1272,18 @@ function albPrefRender() {
   box.innerHTML = '<div class="albprog"><span class=t>' + esc(txt) + '</span>' +
                   '<span class=bar><i style="width:' + pct + '%"></i></span></div>';
 }
+/* 2026-10-27（用户 261027-06 P2）：「整理资料」（专辑本身）与「整理曲目资料」（逐首）
+   原来是**共用 2 个槽位**的 —— 专辑那条一占，曲目侧就只剩 1 条在跑，用户看到的就是
+   「一个是正在整理资料、一个是正在后台整理曲目资料，好像是顺序执行」。
+   现在两件事各有独立预算：
+     * 曲目批任务：最多 ALB_PREF_MAX(=3) 条同时飞，不再看 SUMC.inflight 的总数；
+     * 专辑/艺术家/单曲那几条：本来就是每个实体 1 条（summaryOnce 单飞），不受批任务影响。
+   峰值 4 条在飞，对 DeepSeek 的 5 QPS（retrieval 侧还有 220ms 限频器）完全在额度内，
+   而总耗时从「专辑 + N×单条」变成 ≈ max(专辑, 曲目批次)。 */
+var ALB_PREF_MAX = 3;
 function albPrefPump() {
   var gen = ALBPREF.gen;
-  // 并发 ≤2，且与在飞 summary 请求共享上限，保证 summary 并发峰值 ≤ 2
-  while (ALBPREF.active < 2 && Object.keys(SUMC.inflight).length < 2 && ALBPREF.queue.length) {
+  while (ALBPREF.active < ALB_PREF_MAX && ALBPREF.queue.length) {
     if (!albPrefAlive(gen)) return;      // 已切页/换专辑：队列里剩下的一条也不再发
     var it = ALBPREF.queue.shift();
     ALBPREF.active++;
@@ -1208,7 +1304,7 @@ function albPrefPump() {
   }
 }
 function albumTrackPrefetch(alb) {
-  if (META.summary != 1) return;
+  if (!aiSummaryOn()) return;
   if (META.hasLlmKey !== true && META.summaryEnabled !== true) return;
   var key = albPrefKey(alb);
   if (ALBPREF.key === key && ALBPREF.live.v === 1) return;   // 同一张专辑只排一次
@@ -1542,7 +1638,7 @@ function artistHeroHtml(who, subText) {
 function artistBaseHtml(who) {
   var h = artistHeroHtml(who, '');
   h += '<div class=artist-body style="padding:0 22px 30px">';
-  if (META.summary == 1) {
+  if (aiSummaryOn()) {
     h += '<div class="sec-card summary-sec" id=artistSummary style="margin-bottom:20px">' +
          '<div style="font-size:12px;color:var(--mut2)">正在获取资料…</div></div>';
   }
@@ -1585,7 +1681,7 @@ function openArtistProfile(who, refresh) {
   // 261027-03 #7：hero 头像也走「占位先出、图到了再淡入」（img 的 src 由这里补上）
   artaHeroBind();
 
-  var wantSumm = (META.summary == 1);
+  var wantSumm = aiSummaryOn();
   var summState = { done: false, res: null, enabled: wantSumm, skipBio: false };
   var uSumm = '/api/entity/summary?kind=person&name=' + encodeURIComponent(who) + '&lang=zh' +
               (refresh ? '&refresh=1' : '');
@@ -1704,7 +1800,7 @@ function renderArtistProfile(who, j, summary) {
   //   词条资料缺失时不再有任何"资料暂缺 / 维基百科没有匹配条目…"的解释卡（用户：那句纯粹多余）。
   //   结构化 fields → 标签值网格；旧缓存只有 sections → 段落兜底；两者都没有就整卡不渲染。
   var summHtml = '';
-  if (META.summary == 1) {
+  if (aiSummaryOn()) {
     var sumObj = (summary && summary.enabled && summary.done) ? summary.res : null;
     var hasSummary = summHas(sumObj);
     var sumLoading = (META.hasLlmKey === true && !hasSummary);
@@ -1724,7 +1820,7 @@ function renderArtistProfile(who, j, summary) {
     // 只有"确实无内容可显示"的情况，才给一行极简空态 + 重试（绝不写一大段解释）。
     // 2026-10-25（uicheck 抓到的真空白）：在线整理**开着但没配 LLM key**时，上面那张 AI 卡永远填不满，
     // 旧条件只判 META.summary != 1 ⟹ 整页空白（三个分支一个都不命中）。补上 hasLlmKey 判断。
-    if (META.summary != 1 || META.hasLlmKey !== true) {
+    if (!aiSummaryOn() || META.hasLlmKey !== true) {
       h += '<div class="card empty-card" style="padding:22px 20px;text-align:center;background:var(--phbg);border:1px solid var(--line);border-radius:12px;margin-top:14px">' +
            '<div style="color:var(--mut);font-size:12.5px">暂无资料</div>' +
            '<button class="btn" id=bRetryKnowledge style="margin-top:12px">重试获取</button>' +
@@ -2161,7 +2257,9 @@ function renderTracksView() {
                    favIconHtml(x.path, isFav) +
                    '<div class=tt title="' + esc(x.title) + '">' + esc(x.title) + '</div>' +
                    '<div class=ar title="' + esc(x.artist + ' \u2014 ' + x.album) + '">' + esc(x.artist) + ' \u2014 ' + esc(x.album) + '</div>' +
-                   '<div class=bd>' + fmtTag(x.sr, x.bits) + '</div>' +
+                   // P2（261027-05 A4）：曲目页同样标（后端 /api/lib/search 目前不带 ch，
+                   // 所以这里只对带 ch 的响应生效；专辑页那条是确定能标出来的路）
+                   '<div class=bd>' + fmtTag(x.sr, x.bits, x.ch) + '</div>' +
                    '<div class=du>' + fmt(x.dur) + '</div>' +
                    '<button class="add-btn" title="加入播放队列" aria-label="加入播放队列">+</button></div>';
     }
@@ -2655,14 +2753,13 @@ function showTrackMenu(x, y, tk) {
   }
   item('立即播放', function () { playPath(tk.path, tk.cs, tk.ce); });
   item('加入播放队列', function () { addPathCue(tk.path, tk.cs, tk.ce); });
-  // 2026-10-27（B2/B3 接线）：音质分析（19 项客观指标）与多版本对比。
-  // 两项都只读文件（/api/health 流式解码、/api/compare 对齐后分析），不开音频设备。
-  // 2026-10-27（261027-04 #4）：设置页「分析」页签已删除（用户要求搬到单曲页）
-  //   ⟹ 第三项从「在『分析』页打开（四类）」改成「查看分析（动态/音质/假无损）」：
-  //      弹窗里就是单曲页那三块（同一个渲染器 anlCardsHtml），**版本对比仍是第二项**
-  //      「对比版本…」—— 用户明确要求这个功能不要删，入口也不变。
-  item('查看分析（动态/音质/假无损）', function () { openHealthModal(tk.path); });
-  item('分析音质（19 项）', function () { openQualityModal(tk.path); });
+  // 分析 + 多版本对比。两项都只读文件（/api/health 流式解码、/api/compare 对齐后分析），不开音频设备。
+  // 2026-10-27（261027-04 #4）：设置页「分析」页签已删除（用户要求搬到单曲页）。
+  // P3（2026-10-27 261027-05 C4，用户：「有损检测就是假无损检测，归类到一起就行」）：
+  //   这里原来是**两个**分析入口 ——「查看分析（动态/音质/假无损）」+「分析音质（19 项）」，
+  //   两处都对无损性下结论 ⟹ 合并为一条，弹窗按 L2 打开（三块卡 + 全部原始指标 + 判定依据）。
+  //   「对比版本…」不动（用户明确要求这个功能不要删，入口也不变）。
+  item('查看分析（动态/音质/无损性）', function () { openHealthModal(tk.path); });
   item('对比版本…', function () { openCompareModal(tk.path); });
   // #2（2026-10-27 用户 261026-09）：原来的「加入播放列表…」菜单项已随播放列表 UI 一起撤掉
   //（播放队列 / 播放列表重复，只留队列；要留存就用队列页的「保存为歌单」）。
@@ -2863,6 +2960,10 @@ function loadMeta(f) {
   if (!f) return;
   api('/api/meta?file=' + encodeURIComponent(f)).then(function (m) {
     S.curMeta = m;
+    // P2（261027-05 A4）：当前曲目的**源**声道数。底栏 / 单曲页副标题要标多声道，
+    // 而 /api/status 没有声道字段（不许改 rtaweb.cpp）⟹ 只能从这次 /api/meta 里取。
+    // 跟着 meta 一起更新，就是为了"换歌时不会拿上一首的声道数冒充这一首"。
+    S.curCh = Number(m.channels) || 0;
     var tName = m.title || nam(f);
     D('npt').textContent = tName;
     D('npt').title = tName;
@@ -2879,6 +2980,7 @@ function loadMeta(f) {
       renderNp();   // renderNp 内部已调 updateNpSummary(S.curMeta)，不再重复请求
     }
   }).catch(function () {
+    S.curCh = 0;                       // 取不到元数据 ⟹ 不标声道（宁可不标，也不标错的）
     var tName = nam(f);
     D('npt').textContent = tName;
     D('npt').title = tName;
@@ -2971,9 +3073,16 @@ function tick() {
     if (j.current) {
       if (S.lastCur !== j.current) { S.lastCur = j.current; loadMeta(j.current); loadLyrics(j.current); }
       syncLyrics(j.pos);
+      // P2（2026-10-27 261027-05 A4「多声道就都标记出来就好了」）：底栏这一行原来是
+      // 「播放中 · 96000 Hz / 24 bit」，6 声道文件与 2.0 完全看不出区别 ⟹ 多声道追加布局名（· 5.1）。
+      // 声道数只能从 /api/meta（loadMeta 存的 S.curCh）取：/api/status 的响应里没有声道字段，
+      // 而本轮不允许改 rtaweb.cpp（/api/meta 明确带 channels，见 rtaweb.cpp:11299）。
+      var srcCh = (typeof S.curCh === 'number' && S.curCh > 0) ? S.curCh : 0;
       D('nps').textContent = (j.playing ? (j.paused ? '已暂停' : '播放中') : '已停止') +
-        (j.outRate ? ' \u00b7 ' + j.outRate + ' Hz / ' + j.outBits + ' bit' : '');
-      D('fmt').textContent = j.outRate ? (Math.round(j.outRate / 100) / 10) + 'k/' + j.outBits : '--';
+        (j.outRate ? ' \u00b7 ' + j.outRate + ' Hz / ' + j.outBits + ' bit' : '') + chSuffix(srcCh);
+      if (D('nps')) D('nps').title = srcCh > 0 ? ('源文件 ' + chText(srcCh)) : '';
+      D('fmt').textContent = j.outRate ? ((Math.round(j.outRate / 100) / 10) + 'k/' + j.outBits + chSuffix(srcCh)) : '--';
+      if (D('fmt')) D('fmt').title = srcCh > 0 ? ('源文件 ' + chText(srcCh)) : '输出格式';
       updateNextTrackInfo();
       // 261024-04 #8：底栏 GPU 徽标只表示「GPU **真的参与**了本次播放」。
       // 后端新字段 gpuUsed（本次播放 GPU 是否实际参与）；字段还没上线时回退旧的 gpu 字段。
@@ -3028,6 +3137,7 @@ function saveSettings(immediate) {
         + '&moddith=' + (ADV.moddith === undefined ? -1 : ADV.moddith)
         + '&eq=' + encodeURIComponent(ADV.eq || '')
         + '&ir=' + encodeURIComponent(ADV.ir || '') + '&irgpu=' + (ADV.irgpu || 0)
+        + '&roomcorrauto=' + (ADV.roomcorrauto === 0 ? 0 : 1)
         + '&ramp=' + (ADV.ramp || 0)
         + '&backend=' + encodeURIComponent(ADV.backend || 'wasapi')
         + '&channels=' + (ADV.channels || 0)
@@ -3051,7 +3161,11 @@ function saveSettings(immediate) {
         // 元数据补全（P1.5）：metaon/metallm 固定两键；源开关按注册表逐源写 metasrc_<id>; metasummary 默认0
         + '&metaon=' + (META.on ? 1 : 0)
         + '&metallm=' + (META.llm ? 1 : 0)
-        + '&metasummary=' + (META.summary ? 1 : 0)
+        // 2026-10-27（261027-06 P3）：AI 整理开关的**上报值**必须与界面真实状态一致。
+        // 以前写的是 META.summary，而它因 loadSettings 读不到 kv 长期为 0 ⟹ 用户每保存一次设置
+        // 就会把 metasummary 从 1 冲回 0（后端随即关掉在线整理；实测 build-ai2 实例复现过：
+        // settings.conf 里 metasummary=1 → 任意一次保存后变 0）。改走 aiSummaryOn()。
+        + '&metasummary=' + (aiSummaryOn() ? 1 : 0)
         + (META_PROVIDERS || []).map(function (p) {
             return '&metasrc_' + p.id + '=' + (META_SRC[p.id] === 0 ? 0 : 1);
           }).join('');
@@ -3063,7 +3177,9 @@ function saveSettings(immediate) {
   }
 }
 function loadSettings() {
-  api('/api/settings').then(function (j) {
+  // 2026-10-27 P0：必须用 apiGetRaw（真 GET）。api() 会走 POST，只回 {merged:true}、不回 kv，
+  // 导致这里 kv 恒空 —— 设置控件全停在默认值，而 saveSettings() 又会把默认值写回 conf。
+  apiGetRaw('/api/settings').then(function (j) {
     var kv = j.kv || {};
     if (kv.scanThreads !== undefined || kv.scanthreads !== undefined) {
       ADV.scanThreads = parseInt(kv.scanThreads || kv.scanthreads, 10) || 0;
@@ -3098,6 +3214,9 @@ function loadSettings() {
     if (kv.eq !== undefined) ADV.eq = kv.eq;
     if (kv.ir !== undefined) ADV.ir = kv.ir;
     if (kv.irgpu !== undefined) ADV.irgpu = (kv.irgpu === '1') ? 1 : 0;
+    // B3：房间校正自动应用。缺键 = 老配置 ⟹ 默认「开」（后端 GET /api/settings 已 injectKv roomcorrauto=1）。
+    if (kv.roomcorrauto !== undefined) ADV.roomcorrauto = (kv.roomcorrauto === '0' || kv.roomcorrauto === 'false') ? 0 : 1;
+    if (D('sp_roomauto')) D('sp_roomauto').checked = (ADV.roomcorrauto !== 0);
     if (kv.ramp !== undefined) ADV.ramp = parseFloat(kv.ramp) || 0;
     if (kv.gpuvendor !== undefined) { ADV.gpuvendor = kv.gpuvendor || 'auto'; if (D('sGpu')) D('sGpu').value = ADV.gpuvendor; }
     if (kv.backend !== undefined) ADV.backend = kv.backend || 'wasapi';
@@ -4228,7 +4347,9 @@ function showChain() {
       nodes.push({ k: icon + ' ' + label, v: why || '（本次未记录）', _bp: bp, _color: color });
     }());
     nodes.push({ k: '源文件', v: nam(p.src) + (p.codec ? '  \u00b7  ' + p.codec.toUpperCase() : '') });
-    nodes.push({ k: '解码', v: (p.note || '原生无损解码') + '  \u00b7  ' + p.inRate + ' Hz / ' + p.inBits + ' bit / ' + p.inCh + ' ch' });
+    // P2（261027-05 A4）：解码环也要标多声道 —— 原来只有 "6 ch"，用户得自己知道 6 ch 就是 5.1。
+    nodes.push({ k: '解码', v: (p.note || '原生无损解码') + '  \u00b7  ' + p.inRate + ' Hz / ' + p.inBits + ' bit / ' +
+      p.inCh + ' ch' + (chMark(p.inCh) ? '（' + chLayout(p.inCh) + '）' : '') });
     // 261024-04 #8：绿色节点 = 本次**真的**由 GPU 参与计算的那一环。
     // 旧实现给「采样率转换」无条件加 gpu:true ⟹ 只要开了升频，信号链就永远有一个绿色节点，
     // 用户看到的"GPU"其实和本次播放是否用 GPU 无关。
@@ -4245,6 +4366,26 @@ function showChain() {
       if (p.eq) eqParts.push('参数 EQ' + (ADV.eq ? (' ' + nam(ADV.eq)) : ''));
       if (p.conv) eqParts.push('FIR 卷积' + (ADV.ir ? (' ' + nam(ADV.ir)) : ''));
       nodes.push({ k: 'EQ / 卷积', v: eqParts.join('  \u00b7  ') + '  \u00b7  ' + (convGpu ? 'GPU 计算' : 'CPU 计算'), gpu: convGpu });
+    }
+    // B3（2026-10-27）：房间校正自动应用 —— 单独一环。它和上面手填的 IR 是两件不同的事：
+    // 一个是"测出来、自动挂上"，一个是"用户自己挑的文件"。三种状态都必须看得见：
+    //   已应用（文件 X）/ 未应用（附 why）/ 已关闭（设置项为关）。
+    // 后端字段：/api/signal 的 p.roomCorr = { enabled, applied, mismatch, manual, file, layout, want, taps, fs, ch, why }
+    if (p.roomCorr && typeof p.roomCorr === 'object') {
+      var rc = p.roomCorr;
+      if (rc.applied) {
+        nodes.push({ k: '房间校正 已应用（' + (rc.file || '校正集') + '）',
+          v: (rc.layout || '?') + ' 布局  \u00b7  ' + (rc.ch || 0) + ' 声道  \u00b7  ' + (rc.taps || 0) +
+             ' 抽头  \u00b7  ' + (rc.fs || 0) + ' Hz' +
+             (rc.subDelaySamples || rc.subGainDb ? ('  \u00b7  超低对齐 ' + (+rc.subDelaySamples || 0).toFixed(1) +
+               ' 样 / ' + (+rc.subGainDb || 0).toFixed(1) + ' dB（未接进播放链）') : '') +
+             (rc.why ? ('  \u00b7  ' + rc.why) : '') });
+      } else if (rc.enabled) {
+        nodes.push({ k: rc.mismatch ? '房间校正 未应用（布局不匹配）' : '房间校正 未应用',
+          v: rc.why || '（后端没有给出原因）' });
+      } else {
+        nodes.push({ k: '房间校正 已关闭', v: '设置「声音校准 → 自动应用校正」为关；只认手填的 IR' });
+      }
     }
     // 2026-10-24（原生 DSD 接入）：ASIO 原生 DSD 既不调制也不装 DoP 载波 —— 单独一环。
     // 字段由 rtaweb 的 play_one_native_dsd() 写进 /api/signal：
@@ -4271,7 +4412,8 @@ function showChain() {
     if (p.loudness) nodes.push({ k: '等响度补偿', v: '开启' });
     nodes.push({ k: '音量', v: volText(p.volume), id: 'chainVol' });
     nodes.push({ k: '输出', v: p.device + '  \u00b7  ' + p.outRate + ' Hz / ' + p.outBits + ' bit / ' + p.outCh +
-      ' ch  \u00b7  ' + ((ADV.backend === 'wasapi-shared') ? '共享模式（非 bit-perfect）' : '独占模式') +
+      ' ch' + (chMark(p.outCh) ? '（' + chLayout(p.outCh) + '）' : '') +
+      '  \u00b7  ' + ((ADV.backend === 'wasapi-shared') ? '共享模式（非 bit-perfect）' : '独占模式') +
       '  \u00b7  缓冲 ' + p.buffer + ' ms' });
 
     var tDec = (typeof p.decodeMs === 'number' && p.decodeMs > 0)
@@ -5167,6 +5309,7 @@ function llmRender(j) {
     : '未配置 —— 填入 DeepSeek API Key 后点「保存 Key」';
   m.textContent = s + '；key 只存本机 rlplayer-llm.conf，不进安装包、界面从不回显明文' +
     (LLM.proxy ? '；配置里的 proxy= 行已保留' : '');
+  llmModelRender();       // 模型那一行跟着配置刷新（2026-10-27 用户 261027-06 P1）
 }
 function llmRefresh() {
   return fetch('/api/llm').then(function (r) { return r.json(); }).then(llmRender)
@@ -5202,6 +5345,93 @@ function llmTest() {
   }).catch(function () {
     if (b) { b.disabled = false; b.textContent = '测试连接'; }
     if (m) m.textContent = '连接失败：服务没响应';
+  });
+}
+
+/* 2026-10-27（用户 261027-06 P1）：模型列表 + 下拉选择。
+   对应后端 GET /api/llm/models（永远 200：拉不到就 ok:false + error）。
+   三条纪律：
+     * 拉不到 ⟹ 自动切「手填输入框」并写出原因 —— 设置页绝不能因为网关没有 /models 就崩；
+     * 列表里有当前 model ⟹ 直接选中它；没有 ⟹ 额外插一条「（当前值，不在列表中）」+ 黄字提示重选，
+       但**不改**用户配置（不擅自把用户选的模型换掉）；
+     * 选中即保存：POST /api/llm model=…（与保存 Key 同一条路径，写同一份 rlplayer-llm.conf）。 */
+var LLM_MODELS = { tried: false, ok: false, list: [], current: '', inList: false, err: '', at: 0 };
+function llmModelMsg(txt, warn) {
+  var m = D('sp_llmmodmsg');
+  if (!m) return;
+  m.innerHTML = warn ? ('<span style="color:var(--warn,#e6a23c)">' + txt + '</span>') : txt;
+}
+function llmModelRender() {
+  var sel = D('sp_llmmodel'), txt = D('sp_llmmodeltext');
+  var cur = LLM.model || '';
+  if (!sel || !txt) return;
+  if (LLM_MODELS.ok && LLM_MODELS.list.length) {
+    sel.style.display = '';
+    txt.style.display = 'none';
+    var h = '', has = false;
+    for (var i = 0; i < LLM_MODELS.list.length; ++i) {
+      var id = String(LLM_MODELS.list[i].id || '');
+      if (!id) continue;
+      if (id === cur) has = true;
+      h += '<option value="' + esc(id) + '">' + esc(id) + (id === cur ? '　（当前）' : '') + '</option>';
+    }
+    if (!has && cur) h += '<option value="' + esc(cur) + '">' + esc(cur) + '　（当前值，不在列表中）</option>';
+    sel.innerHTML = h;
+    sel.value = cur;
+    var n = LLM_MODELS.list.length;
+    if (cur && !has) {
+      llmModelMsg('已拉到 ' + n + ' 个模型，但当前用的 ' + esc(cur) +
+                  ' 不在列表里 —— 建议在上面选一个（不改也能继续用）。', true);
+    } else {
+      llmModelMsg('已拉到 ' + n + ' 个模型' + (cur ? ('，当前 ' + esc(cur)) : '') +
+                  ' · search / fetch 不受这里影响，始终用默认模型');
+    }
+    return;
+  }
+  // 降级：手填。值直接放在输入框里，用户可改可留空（留空 = 不动配置）
+  sel.style.display = 'none';
+  txt.style.display = '';
+  if (!txt.value) txt.value = cur;
+  if (LLM_MODELS.err) {
+    llmModelMsg('拉取模型列表失败：' + esc(LLM_MODELS.err) +
+                ' —— 可直接手填模型 id（回车生效），保持默认也可以。', true);
+  } else if (LLM_MODELS.tried) {
+    llmModelMsg('服务端没有返回任何模型 —— 可直接手填模型 id（回车生效）。', true);
+  } else {
+    llmModelMsg('模型列表读取中…（读不到也可以直接手填）');
+  }
+}
+function llmModelsLoad(force) {
+  var sel = D('sp_llmmodel');
+  if (!sel) return Promise.resolve(null);
+  if (!D('sp_llmmodeltext')) return Promise.resolve(null);
+  if (force) llmModelMsg('正在重新拉取模型列表…');
+  var url = '/api/llm/models' + (force ? '?refresh=1' : '');
+  return fetch(url).then(function (r) { return r.json(); }).then(function (j) {
+    LLM_MODELS.tried = true;
+    LLM_MODELS.ok = !!(j && j.ok);
+    LLM_MODELS.list = (j && j.models) || [];
+    LLM_MODELS.inList = !!(j && j.currentInList);
+    LLM_MODELS.err = (j && j.error) || '';
+    LLM_MODELS.at = Date.now();
+    if (j && j.current) { LLM.model = j.current; LLM_MODELS.current = j.current; }
+    llmModelRender();
+    return j;
+  }).catch(function () {
+    LLM_MODELS.tried = true;
+    LLM_MODELS.ok = false;
+    LLM_MODELS.list = [];
+    LLM_MODELS.err = '服务没响应';
+    llmModelRender();
+    return null;
+  });
+}
+function llmSaveModel(v) {
+  v = String(v || '').replace(/^\s+|\s+$/g, '');
+  if (!v) { toast('模型 id 不能为空'); llmModelRender(); return; }
+  if (v === LLM.model) { toast('当前已经在用 ' + v); return; }
+  llmPost('model=' + encodeURIComponent(v), '模型已切换为 ' + v).then(function (j) {
+    if (j && j.ok) { LLM.model = j.model || v; llmModelRender(); llmModelsLoad(false); }
   });
 }
 
@@ -5963,6 +6193,20 @@ function renderSettingsPage() {
        + '<button class="btn pri" id=sp_llmsave>保存 Key</button>'
        + '<button class=btn id=sp_llmtest>测试连接</button>'
        + '<button class=btn id=sp_llmclear>清除 Key</button></div>'
+       // 2026-10-27（用户 261027-06 P1）：**模型可选** —— 拉取当前列表 + 下拉选择 + 手填兜底。
+       //   用户原话：「允许用户拉取当前模型列表，并选择使用哪个模型。不再强制指定 deepseek v4.1 flash。
+       //             但是 fetch 和 search 则保持默认。」
+       //   ① 有列表：<select> 列出服务端全部 id（当前值一定在里面并标注「当前」）；选中即保存；
+       //   ② 拉不到（断网 / 401 / 网关没有 /models）：自动切成手填输入框并写明原因 —— 设置页绝不崩；
+       //   ③ 列表拉到了但当前 model 不在里面：黄字提示「建议重选」，但不擅自改动用户配置。
+       + '<div class="mh sub" style="margin-top:14px">模型' +
+           '<span class=hint style="font-weight:400">search / fetch 始终用默认模型</span></div>'
+       + '<div style="display:flex;gap:8px;margin-top:4px;align-items:center">'
+       + '<select id=sp_llmmodel style="flex:1;min-width:0"></select>'
+       + '<button class=btn id=sp_llmmodels title="重新拉取可用模型列表（GET {base}/models；拉不到也可以手填）">刷新列表</button>'
+       + '</div>'
+       + '<input id=sp_llmmodeltext type=text autocomplete=off spellcheck=false placeholder="模型 id（例如 deepseek-chat）" style="width:100%;margin-top:6px;display:none">'
+       + '<div class=hint id=sp_llmmodmsg style="margin-top:6px">模型列表读取中…</div>'
        // 用户 261024-01 #8：默认开启，不提供开关 —— 只说明能力，两个动作按钮照旧。
        + '<div class="mh sub">标签写回<span class=hint style="font-weight:400">默认开启</span></div>'
        + '<div class=hint id=sp_wbdesc style="margin:2px 0 9px">补全到的标签 / 封面写回音频文件本身；写前校验音频数据逐位不变，原文件备份到 rlplayer-meta' + SEP + 'backups</div>'
@@ -6147,6 +6391,14 @@ function renderSettingsPage() {
   if (D('sp_llmsave')) D('sp_llmsave').onclick = llmSave;
   if (D('sp_llmtest')) D('sp_llmtest').onclick = llmTest;
   if (D('sp_llmclear')) D('sp_llmclear').onclick = llmClear;
+  // 2026-10-27（用户 261027-06 P1）：模型下拉 —— 刷新按钮 / 选中即保存 / 手填回车生效。
+  if (D('sp_llmmodels')) D('sp_llmmodels').onclick = function () { llmModelsLoad(true); };
+  if (D('sp_llmmodel')) D('sp_llmmodel').onchange = function () { llmSaveModel(this.value); };
+  if (D('sp_llmmodeltext')) D('sp_llmmodeltext').addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter') llmSaveModel(this.value);
+  });
+  llmModelRender();          // 先用本地已知的 model 画一次，避免空白下拉
+  llmModelsLoad(false);      // 再异步拉服务端列表（后端 60s 缓存，重复打开设置不会重复打网络）
   if (D('sp_llmkey')) {
     D('sp_llmkey').value = '';
     D('sp_llmkey').addEventListener('keydown', function (ev) { if (ev.key === 'Enter') llmSave(); });
@@ -6164,6 +6416,15 @@ function renderSettingsPage() {
   // ReplayGain（261027-01 #2）：模式一变立刻重画"非 bit-perfect"警告，不留到保存后才提示
   if (D('sp_rgmode')) D('sp_rgmode').onchange = function () { ADV.rgmode = this.value || 'off'; rgWarn(); saveSettings(); };
   if (D('sp_rgclip')) D('sp_rgclip').onchange = function () { ADV.rgclip = this.checked ? 1 : 0; saveSettings(); };
+  // B3（2026-10-27）：房间校正自动应用开关。改完立刻落盘（下一次播放起生效），
+  // 并把当前磁盘上的校正集状态刷新到卡片上 —— 用户必须能看出"我说开/关，后端到底认哪个"。
+  if (D('sp_roomauto')) D('sp_roomauto').onchange = function () {
+    ADV.roomcorrauto = this.checked ? 1 : 0;
+    saveSettings(true);
+    rcAutoSync();
+    toast(this.checked ? '已开启：播放时自动应用房间校正' : '已关闭：不再自动应用房间校正');
+  };
+  rcAutoSync();
   // 261027-04 #4：播放时自动分析开关 —— 与单曲页那个小按钮共用 anlSetAuto（同一个值、同一份落盘）
   if (D('sp_autoanl')) D('sp_autoanl').onchange = function () {
     anlSetAuto(this.checked);
@@ -6602,6 +6863,13 @@ function calSettingsHtml() {
     + '<div class="sfld wide"><div class=rcnote>测量结果（每声道校正 FIR，32-bit float）保存到 <code>data\\roomcorr\\</code>；'
     + '应用后由播放链路的 FIR 卷积执行（与下面「校正文件 → 脉冲响应 IR」共用同一个卷积器）。<br>'
     + '测量会<strong>真的出声</strong>：每个声道一段对数扫频，默认电平 −20 dBFS，开始前会让你确认设备与时长。</div></div>'
+    // B3（2026-10-27）：自动应用开关。用户原话「既然已经基本搞定了，接上就是了」——
+    // 生成完校正集就该直接用上，不再要求用户自己转成 WAV 去「校正文件」里挑。
+    + chk('sp_roomauto', '自动应用校正（播放时按当前输出布局自动挂载校正集）', ADV.roomcorrauto !== 0,
+          '缺省开。播放时若 data\\roomcorr\\ 下存在与当前输出声道数匹配的 correction-<布局>.json，' +
+          '就把其中的每声道校正 FIR 挂进卷积链；布局不匹配（例如测的是 2.0、现在按 5.1 输出）时不应用，' +
+          '并在信号链里写明原因。手动填了「脉冲响应 IR」时以手动为准，不会被自动覆盖。', true)
+    + '<div class="sfld wide"><div class=rcnote id=rcAutoHint>自动应用：读取中…</div></div>'
     ) + '</div>';
   // 2. 校正文件（参数 EQ 文本 + 脉冲响应 IR）—— #6 核对结论：
   //    用户问「最下面的两个是不是都是 REW 的校正文件？」——**是同一类东西，但不只有 REW**：
@@ -6665,7 +6933,8 @@ var RC_STEPS = [
     b: '把每个声道的响应做<b>变分数倍频程平滑</b>（低频 1/6 oct → 高频 1/3 oct），减去目标曲线，' +
        '限制最大提升量，转成最小相位，再截断加窗成 8192 taps 的校正 FIR。' +
        '校正集保存到 <code>data\\roomcorr\\correction-<布局>.json</code>，可以直接下载。' +
-       '<span class=warnline>生成后还需要在下方「校正文件 → 脉冲响应 IR」里把它挂进播放链路才会生效 —— 这一步本轮仍是手动的。</span>' }
+       '<span class=warnline>生成后自动生效：播放时若「自动应用校正」开着（默认开），会按当前输出布局自动挂载；' +
+       '布局不匹配（例如测的是 2.0、现在按 5.1 输出）则不应用，并在信号链里写明原因。</span>' }
 ];
 function rcWizEnsure() {
   var box = D('roomWiz');
@@ -6848,6 +7117,26 @@ function rcStatusRefresh() {
     if (D('bRoomDl')) D('bRoomDl').style.display = j.hasCorrectionSet ? '' : 'none';
   }).catch(function () {});
 }
+// B3（2026-10-27）：自动应用状态一句话 —— 开了/关了、磁盘上是哪个布局、当前输出几声道。
+// 这句存在的理由：布局不匹配是**必然会发生**的正常情况（向导里测了 2.0、之后把输出改成 5.1），
+// 只靠"没生效"三个字用户无法判断该改哪边。
+function rcAutoSync() {
+  var el = D('rcAutoHint');
+  if (!el) return;
+  var on = (ADV.roomcorrauto !== 0);
+  api('/api/roomcorr/status').then(function (j) {
+    var disk = (j && j.hasCorrectionSet) ? ('磁盘上有校正集：' + (j.layout || '?') + ' · ' + j.irTaps + ' taps @ ' + j.irFs + ' Hz') : '磁盘上还没有校正集（先跑一次向导）';
+    var ch = (ADV.channels || 0);
+    var cnt = ch > 0 ? ('当前输出 ' + ch + ' 声道') : '当前输出跟随源文件声道数';
+    var localMatch = '';
+    var LAY = { '2.0': 2, '2.1': 3, '5.1': 6, '7.1': 8, '5.1.2': 8, '7.1.4': 12 };
+    if (j && j.hasCorrectionSet && ch > 0 && LAY[j.layout] && LAY[j.layout] !== ch)
+      localMatch = '<br><span style=color:#fbbf24>⚠️ 布局不匹配：校正集是 ' + j.layout + '（' + LAY[j.layout] +
+                   ' 声道），当前按 ' + ch + ' 声道输出 ⟹ 播放时不会应用。</span>';
+    el.innerHTML = (on ? '自动应用：<strong>开</strong>' : '自动应用：<strong>关</strong>（只用下面手动的 IR）') +
+      ' · ' + disk + ' · ' + cnt + localMatch;
+  }).catch(function () { el.textContent = '自动应用：' + (on ? '开' : '关'); });
+}
 function rcWizOpen() {
   var box = rcWizEnsure();
   if (!box) return;
@@ -6868,6 +7157,7 @@ function initRoomCorr() {
   };
   // 进页面先刷一次真实状态（有校正集就显示，没有就提示未测量）
   rcStatusRefresh();
+  rcAutoSync();          // B3：自动应用那一行也要看到磁盘现状与布局是否匹配
 }
 
 /* ---------------- 20 段参数均衡 PEQ（261024-02 #6） ---------------- */
@@ -7715,88 +8005,12 @@ function qualStereoText(q) {
   return s;
 }
 
+// P3（2026-10-27 用户 261027-05 C4）：旧「分析音质（19 项）」弹窗**已并入** openHealthModal。
+// 原来这里是第二套渲染器（另一张表、另一句「假无损 疑似/否」、另一个口径），两个入口各说各话。
+// 现在实现只有一份：openHealthModal 按 L2 打开（三块卡 + 全部原始指标 + 无损性判定依据）。
+// 保留这个符号是为了不让任何遗留调用点报 ReferenceError（当前仓库内已无调用者）。
 function openQualityModal(path) {
-  if (!path) { toast('没有可分析的曲目'); return; }
-  openModal('分析音质', '<div class=empty>正在分析…（流式分块解码，曲越长越久）</div>');
-  apiRaw('/api/health?file=' + encodeURIComponent(path)).then(function (j) {
-    var h = (j && j.health) || null;
-    if (!j || !j.ok || !h) {
-      D('mbody').innerHTML = '<div class=empty>' + esc((j && j.error) || (h && h.error) || '分析失败') + '</div>';
-      return;
-    }
-    var q = h.quality || {};
-    function row(label, val, hint) {
-      return '<tr><td style="color:var(--mut);padding:3px 10px 3px 0;white-space:nowrap">' + esc(label) +
-             (hint ? tip(hint) : '') + '</td><td style="padding:3px 0;font-variant-numeric:tabular-nums">' + esc(String(val)) + '</td></tr>';
-    }
-    var F = qualFacts(h, path);
-    var clip = qualClipText(q);
-    var specHide = qualSpectralHide(F);
-    var html = '<div class=hint style="margin-bottom:8px">' + esc(path) + '</div>';
-    // 2.2（报告 §5「不该展示」）：全静音 / 纯直流 / 单点冲激 ⟹ 谱类与 SNR/峰值因子整段隐藏，
-    // 明确写「素材无有效音频」，而不是给出一整套漂亮的 0 值。
-    if (F.noAudio) {
-      html += '<div class=hint style="color:var(--warn,#e6a23c);line-height:1.6;margin:0 0 8px">' +
-              '素材无有效音频（' + esc(F.noAudioWhy) + '）：谱重心 / 倾斜 / 95% 滚降 / &gt;10k 占比 / ' +
-              '信噪比 / 峰值因子 均不展示。这类素材上它们会输出一整套"看起来有效"的 0 值。</div>';
-    }
-    html += '<div style="display:flex;gap:18px;flex-wrap:wrap">';
-    // 失真
-    // 2.1 IMD：主流程恒 imd_available=false（需显式双音素材）⟹ **整格去掉**，不再显示一行恒定的"不适用"。
-    // 2.8 THD+N：真实曲库 0/655 可用（全是 multi_peak）⟹ 音乐素材不展示；只有单基频（测试音）才出数，
-    //     并写明 16 bit 的可测下限（−94 dB@0 dBFS / −37 dB@−60 dBFS）。
-    html += '<table style="font-size:12px"><tbody>'
-         +  (q.thdn_available
-              ? row('THD+N（单基频测试音）', qFmt(q.thdn_db) + ' dB',
-                    '只在单基频素材（测试音）上成立。16 bit 的可测下限：0 dBFS → −94 dB、−60 dBFS → −37 dB；' +
-                    '拿 −60 dBFS 的测试音"证明 −100 dB"是假的')
-              : row('THD+N', '不展示（音乐素材无定义）',
-                    '真实曲库 0/655 可用：音乐没有可定义的基频（全部 multi_peak）⟹ 只在测试音场景显示'))
-         +  row('非谐波残留', qFmt(q.non_tonal_db) + ' dB',
-               '16 个最强谱峰之外的能量占比 = 噪声/失真/有损残留的上界（不是失真 dB；片段间相对极差约 10 dB）')
-         +  '</tbody></table>';
-    // 噪声 + 频响
-    html += '<table style="font-size:12px"><tbody>'
-         +  row('本底噪声', qFmt(q.noise_floor_dbfs) + ' dBFS',
-               '真实噪声上界：100 ms 块 P10 = 连续音乐里"最安静段落的那段音乐"的电平，不是器材噪声底')
-         +  row('谱最小本底', qFmt(q.spectral_min_dbfs) + ' dBFS', '诊断用：平稳噪声准，密集音乐偏高')
-         +  (F.noAudio ? '' : row('信噪比', qFmt(q.snr_db) + ' dB', '相对同曲版本可比，不是器材信噪比指标'))
-         +  (specHide
-              ? row('谱类四项', '不展示 —— ' + specHide,
-                    '谱重心 / 谱倾斜 / 95% 滚降 / >10k 占比在这类素材上没有意义')
-              : (row('谱重心', qFmt(q.centroid_hz, 0) + ' Hz',
-                     '同一首不同段落可差 1.8×，跨版本比较必须同段')
-                 + row('谱倾斜', qFmt(q.tilt_db_per_oct) + ' dB/oct', '同一首不同段落会变，跨版本比较必须同段')
-                 + row('95% 滚降点', qFmt(q.rolloff95_hz, 0) + ' Hz', '同一首不同段落会变（20 s vs 60 s 差 13%）')
-                 + row('>10 kHz 占比', qFmt(q.hf_ratio_10k_db) + ' dB',
-                       '同一首不同段落可差 10 dB；低电平素材的下限被量化噪声抬高（−20 dBFS → −83 dB）')))
-         +  '</tbody></table>';
-    // 削波 + 动态 + 立体声
-    html += '<table style="font-size:12px"><tbody>'
-         +  row('峰值 / RMS', qFmt(q.peak_dbfs_q) + ' / ' + qFmt(q.rms_dbfs) + ' dBFS')
-         +  row('削波段数（判据）', clip.head, '只有 clippedRuns / longestClipRun 能当"真削波"的判据（连续 ≥3 样本）')
-         +  row('削波占比（上界）', clip.sub, '门限 0.999 = −0.0087 dBFS：合法满幅正弦也会被计入 ⟹ 只能当上界')
-         +  (F.noAudio ? '' : row('峰值因子', qFmt(q.crest_db) + ' dB', '峰值 − RMS；全静音/纯直流会是 0 dB'))
-         +  ((F.dur > 0 && F.dur < 6)
-              ? row('动态 P95−P10', '不展示（素材 < 6 s）', '3 s 块至少要 2 块，短素材恒为 0')
-              : row('动态 P95−P10', qFmt(q.dyn_p95_p10_db) + ' dB',
-                    (Number(q.silence_pct) > 5
-                      ? '含数字静音，动态值偏大（silence ' + qFmt(q.silence_pct, 1) + '% 低于 −60 dBFS）；' : '')
-                    + '段落间起伏，跨曲目不可直接比'))
-         +  row('动态重心', qFmt(q.dyn_centroid_dbfs) + ' dBFS')
-         +  row('静态段占比', qFmt(q.silence_pct) + ' %', '低于 −60 dBFS 的 100 ms 块占比')
-         +  row('声道相关 / 单声道损失', qualStereoText(q),
-               'corr=1.0000 且损失 ≈ 0 ⟹ 左右完全相同（等同单声道），不是"立体声正常"；'
-               + 'corr < −0.9 且损失 ≥ 60 dB ⟹ 可能是极性反相（老录音常见），不一定是错误')
-         +  '</tbody></table>';
-    html += '</div>';
-    html += '<div class=hint style="margin-top:10px">体检老字段：DR ' + qFmt(h.dr_db) + ' dB ｜ LUFS ' + qFmt(h.lufs) +
-            ' ｜ LRA ' + qFmt(h.lra) + ' ｜ 假无损 ' + (h.lossless_suspected ? '疑似' : '否') +
-            ' ｜ 截止 ' + qFmt(h.cutoff_hz, 0) + ' Hz' + (q.note ? ('<br>' + esc(q.note)) : '') + '</div>';
-    D('mbody').innerHTML = html;
-  }).catch(function (e) {
-    D('mbody').innerHTML = '<div class=empty>分析失败：' + esc(e && e.message ? e.message : e) + '</div>';
-  });
+  openHealthModal(path);
 }
 
 // ---- 版本对比：多选同目录下的音频文件 → 对比页 ----
@@ -7991,7 +8205,10 @@ var ANL = {
   cached: false,              // 上次是否命中后端缓存
   src: '',                    // 'front'（前端缓存）/ 'backend'（后端缓存）/ 'new'（真算）
   err: '',                    // 上次失败原因（空 = 没失败）
-  stat: { runs: 0, hits: 0 }  // 后端计数器快照（/api/health 顺带返回，判据用）
+  stat: { runs: 0, hits: 0 }, // 后端计数器快照（/api/health 顺带返回，判据用）
+  // 展开级别（2026-10-27 261027-05 A5）：0=折叠摘要（默认）/ 1=指标格 / 2=全部原始指标。
+  // 同一首歌跨重绘保持（暂停、拖动进度、重进单曲页都不重置）；换歌由 anlUpdateCur 强制归 0。
+  lvl: 0
 };
 
 // 分析可能跑几秒到几十秒（282 s 的 6 声道 FLAC 实测 2.3 s，DSD/长曲更久），
@@ -8063,7 +8280,10 @@ function anlQualLine(h) {
   if (q.stereo && Number(q.mono_loss_db) >= 60 && Number(q.channel_corr) < -0.9) {
     return { t: '左右极性相反（可能是老录音的真实极性，不一定是错误）', c: 'warn' };
   }
-  if (F.spectralOk && (q.hf_ratio_10k_db || 0) < -40) return { t: '高频偏少 · 可能被低通/有损', c: '' };
+  // P3（2026-10-27 261027-05 C4）：这一行原来说「可能被低通/有损」—— 那是**第二处**无损性判定，
+  // 口径还和 ③ 假无损卡不一样（这里只看 >10k 占比，那边看截止 + 陡沿 + 置信度）。
+  // 用户要求「有损检测就是假无损检测，归类到一起」⟹ 音质这一块只说音质，不再碰有损。
+  if (F.spectralOk && (q.hf_ratio_10k_db || 0) < -40) return { t: '高频偏少 · 能量集中在中低频', c: '' };
   if (F.spectralOk && (q.centroid_hz || 0) > 0 && q.centroid_hz < 700) return { t: '偏闷 · 能量集中在低频', c: '' };
   return { t: '干净 · 无明显削波', c: 'ok' };
 }
@@ -8132,6 +8352,85 @@ function anlCardHtml(id, title, sub, line, kv, note) {
          '</div>';
 }
 
+// ============================================================================
+// P1（2026-10-27 用户 261027-05 A5）：分析卡**三级折叠**
+// ----------------------------------------------------------------------------
+// 用户原话：「我不想他默认展示，请你做折叠，折叠状态下只显示第一行的内容，比如动态一栏只显示
+// 『中等动态 流行/摇滚常见』，音质一栏『干净，无明显削波』。用户可以展开，展开之后显示的就是现在
+// 这个内容。然后用户可以继续点击进行 2 度展开，2 度展开就是我们上个版本提供的全部完整信息。
+// 任何情况下，都可以重新折叠回去。」
+//
+//   L0（默认，折叠）= 每块**一行摘要**，三行。摘要全部由真实指标算出（下面三个 anlXxxBrief），
+//                    不是字面量文案 —— 换一首歌，摘要必然跟着变（判据就在这）。
+//   L1（展开一次）  = 上一版的内容：三块 + 2×2 指标格 + 一句结论。
+//   L2（展开两次）  = 上一版的**完整信息**：quality 段全部原始指标 + 无损性判定依据 + note/caveat。
+//
+// 状态：ANL.lvl（0/1/2）。同一首歌跨重绘保持（暂停/拖动/重进单曲页都不重置）；
+//       换歌在 anlUpdateCur() 里强制回 0（用户要求「换歌要回到 L0」）。
+// ============================================================================
+var ANL_LVLS = ['摘要', '详细', '全部指标'];
+
+// ① 动态摘要：按 DR 分档 —— <6 压缩严重 / 6~10 中等 / 10~14 良好 / >14 高动态
+function anlDynBrief(h) {
+  var dr = Number(h && h.dr_db);
+  if (!(dr > 0)) return { t: '样本太短 · 未出结论', c: 'mut' };
+  if (dr < 6) return { t: '压缩严重 · 响度战争母带', c: 'warn' };
+  if (dr < 10) return { t: '中等动态 · 流行/摇滚常见', c: '' };
+  if (dr <= 14) return { t: '良好动态 · 古典/爵士常见', c: 'ok' };
+  return { t: '高动态 · 轻响层次清楚', c: 'ok' };
+}
+
+// ② 音质摘要：0 段削波 + SNR 高 ⟹「干净」；有段 ⟹「有 N 段削波」。
+// 口径与 L1/L2 完全一致（削波只认连续 ≥3 样本的 clipped_runs，clipped_pct 只当上界），
+// 所以不会出现「摘要说干净、展开说有削波段」这种自相矛盾。
+function anlQualBrief(h) {
+  var q = (h && h.quality) || {};
+  var F = qualFacts(h);
+  if (!q.available) return { t: '样本不足 · 未出结论', c: 'mut' };
+  if (F.noAudio) return { t: '素材无有效音频', c: 'mut' };
+  var runs = Number(q.clipped_runs) || 0;
+  var snr = Number(q.snr_db);
+  if (runs > 0) return { t: '有 ' + anlNum(runs, 0) + ' 段削波 · 母带压过头', c: 'warn' };
+  if (Number(q.clipped_pct) > 0) return { t: '仅零星单样本越限 · 非连续削波', c: '' };
+  if (isFinite(snr) && snr > 0 && snr < 60) {
+    return { t: '无削波 · SNR ' + anlNum(snr, 0) + ' dB（流行母带常见）', c: '' };
+  }
+  return { t: '干净 · 无明显削波', c: 'ok' };
+}
+
+// ③ 无损性摘要：四档（未发现 / 带宽受限 / 疑似有损 / 证据不足）—— 与 L1 的「判定」格同一份数据。
+// P3（用户 261027-05 C4）：「有损检测就是假无损检测，归类到一起」⟹ 全界面只有这一处判定，
+// 音质那一行**不再出现**「可能被低通/有损」之类的第二重口径。
+function anlFakeBrief(h) {
+  var fv = (h && h.fake_verdict) || (h && h.lossless_suspected ? 'lossy' : 'none');
+  var cutHz = Number(h && h.cutoff_hz) || 0;
+  var cut = cutHz > 0 ? (cutHz / 1000).toFixed(1) + ' kHz' : '';
+  if (fv === 'lossy') return { t: '疑似有损 · 截止 ' + (cut || '?'), c: 'warn' };
+  if (fv === 'band_limited') return { t: '带宽受限 · 截止 ' + (cut || '?'), c: '' };
+  if (fv === 'unclear') return { t: '证据不足 · 不构成判据', c: 'mut' };
+  return { t: '未发现 · 带宽正常' + (cut ? '（' + cut + '）' : ''), c: 'ok' };
+}
+
+// 分析卡里那一格「声道」：>2 声道时把布局名当值、把"N ch"当单位（2 列格子很窄，写全会被省略号吃掉）
+function chCellVal(h) {
+  var n = Number(h && h.channels) || 0;
+  if (!n) return '—';
+  return chMark(n) || String(n);
+}
+function chCellUnit(h) {
+  var n = Number(h && h.channels) || 0;
+  if (!n) return '';
+  return chMark(n) ? (n + ' ch') : 'ch';
+}
+
+// L0 的单行卡：标题在左、摘要贴右，**只有一行**（折叠态的全部内容）
+function anlL0Card(id, title, sub, brief) {
+  var plain = String(title).replace(/^[\u2460-\u2462]\s*/, '');
+  return '<div class="npanal-card l0" id=' + id + ' title="' + esc(plain + '：' + brief.t) + '">' +
+         '<div class=ct>' + esc(title) + '<i>' + esc(sub) + '</i></div>' +
+         '<div class="npanal-verdict ' + (brief.c || '') + '">' + esc(brief.t) + '</div></div>';
+}
+
 // 半截文件警示条（BUG-3，2026-10-27 修复轮）。
 // 后端把「容器声明时长 ≫ 实际解码时长」的文件从 ready 降为 status="incomplete"，原因写进 h.note；
 // ok 仍然是 true（**指标照给**，这不是失败），所以这里不是错误分支而是**黄色提示 + 照常出数**。
@@ -8152,12 +8451,22 @@ function anlIncompleteHtml(h) {
          '</div>';
 }
 
-// 三类结果 → 三个卡的 HTML（单曲页分析条与右键「查看分析」弹窗**共用**这一个渲染器）
+// 三类结果 → 卡片的 HTML（单曲页分析条与右键「查看分析」弹窗**共用**这一个渲染器）
 // path：可选的曲目路径，只用于判断"DSD 源"（.dsf/.dff）；缺省时用 ANL.cur。
-function anlCardsHtml(h, path) {
+// lvl （2026-10-27 261027-05 A5）：0=折叠摘要（默认）/ 1=指标格 / 2=全部原始指标。
+// 传别的值一律按 0 处理 —— 「默认不展示」是用户明确要求，任何调用方都不该意外把它撑开。
+function anlCardsHtml(h, path, lvl) {
+  lvl = (lvl === 1 || lvl === 2) ? lvl : 0;
   var q = (h && h.quality) || {};
   var F = qualFacts(h, path);
   var clip = qualClipText(q);
+  // ===== L0：每块一行摘要（三行）。全部由真实指标算出，见 anlDynBrief/anlQualBrief/anlFakeBrief =====
+  if (lvl === 0) {
+    return anlIncompleteHtml(h) +
+      anlL0Card('npAnlDyn', '① 动态', 'TT DR / R128', anlDynBrief(h)) +
+      anlL0Card('npAnlQual', '② 音质', '客观指标', anlQualBrief(h)) +
+      anlL0Card('npAnlFake', '③ 假无损', '有损检测', anlFakeBrief(h));
+  }
   // ① 动态（2026-10-27 修复轮）：峰值一拆两格 —— 「样本峰值」永远是样本点上的值（≤0 dBFS），
   //   真的判断过载要看 4× 过采样「真峰 dBTP」。标定实测 09_reverie 样本峰 0.00、真峰 +2.5，
   //   旧界面只显示 0.00 dBFS 会把"过载 2.5 dB"说成"刚好满幅"（报告 §5）。
@@ -8219,7 +8528,7 @@ function anlCardsHtml(h, path) {
   var VERD = { lossy: '疑似有损', band_limited: '带宽受限（不判假）', unclear: '证据不足', none: '未发现' };
   var fv = h.fake_verdict || (h.lossless_suspected ? 'lossy' : 'none');
   var win = Number(h.spectral_windows) || 0;
-  var fake = anlCardHtml('npAnlFake', '③ 假无损', '有损转码检测', anlFakeLine(h), anlKV([
+  var fake = anlCardHtml('npAnlFake', '③ 假无损', '有损检测 · 唯一判定处', anlFakeLine(h), anlKV([
     ['判定', VERD[fv] || VERD.none, '', '按截止位置（相对奈奎斯特）+ 谱峭壁 + 置信度联合判断：' +
      '截止 <78% ⟹ 疑似有损；78%~95% ⟹ 有效带宽受限（母带低通/升频，不判假）；"未发现"不等于绝对无损'],
     ['截止', h.cutoff_hz > 0 ? (h.cutoff_hz / 1000).toFixed(1) : '未检出', h.cutoff_hz > 0 ? 'kHz' : '',
@@ -8229,10 +8538,107 @@ function anlCardsHtml(h, path) {
     ['置信度', anlNum((h.confidence || 0) * 100, 0), '%',
      '判定强度（陡沿深度 × 各谱窗一致率）；<50% 时不给确定结论' + (win ? ('；本次用了 ' + win + ' 个谱窗') : '')],
     ['格式', (h.bits || '—') + ' bit', h.fs ? (h.fs >= 1000 ? (h.fs / 1000).toFixed(1) + ' kHz' : h.fs + ' Hz') : '',
-     '容器里声明的位深 / 采样率（不等于母带质量）；另：fake24 标记 = 标称 24 bit 但有效位深不足']
+     '容器里声明的位深 / 采样率（不等于母带质量）；另：fake24 标记 = 标称 24 bit 但有效位深不足'],
+    // P2（用户 261027-05 A4「多声道就都标记出来就好了」）：分析卡里也标 —— 之前这一格完全没有声道，
+    // 6 声道文件在卡上看起来和 2.0 一模一样。>2 声道一律带布局名（5.1 / 7.1 / 6ch）。
+    ['声道', chCellVal(h), chCellUnit(h),
+     '容器里声明的声道数；>2 声道会在后面标出布局名（5.1 / 7.1 / 6ch）。多声道素材的 DR 取【较低声道】（保守口径）']
   ]), anlFakeNote(h));
   // 不完整警示条排在最前：用户先看到"这份结论只有一部分"，再去看数字（顺序即语义）
-  return anlIncompleteHtml(h) + dyn + qual + fake;
+  var out = anlIncompleteHtml(h) + dyn + qual + fake;
+  // L2（再展开一次）= 上一版的**完整信息**：全部原始指标 + 无损性判定依据 + note/caveat
+  if (lvl >= 2) out += anlDeepHtml(h, path);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// L2 的正文：**上一版的全部完整信息**（原来那份「分析音质（19 项）」弹窗的内容，一字不减）
+// 数据全部来自 /api/health 的 quality 段，前端一个数都不改（判据/口径都在 src/analysis/quality.h）。
+// 为什么排成组：19 项平铺成一长列没人看得下去；分组后每组 4~8 格，2 列排布 ⟹ 一屏能读完。
+// ---------------------------------------------------------------------------
+function anlDeepGroup(title, rows) {
+  return '<div class=npanal-det-g><div class=dh>' + esc(title) + '</div>' + anlKV(rows) + '</div>';
+}
+function anlDeepHtml(h, path) {
+  var q = (h && h.quality) || {};
+  var F = qualFacts(h, path);
+  var clip = qualClipText(q);
+  var specHide = qualSpectralHide(F);
+  var shortDur = (F.dur > 0 && F.dur < 6);
+  var parts = [];
+  // 1. 动态 / 响度
+  parts.push(anlDeepGroup('动态 / 响度（原始值）', [
+    ['DR', anlNum(h.dr_db, 2), 'dB', 'TT 动态范围：最响与最轻段落的电平差；同一母带内越大越活，跨曲目不可直接比。多声道取较低声道'],
+    ['LUFS', anlNum(h.lufs, 2), 'LUFS', 'EBU R128 积分响度；−14 左右是常见投放目标'],
+    ['LRA', anlNum(h.lra, 2), 'LU', 'R128 响度范围：段落间起伏'],
+    ['样本峰值', anlNum(h.peak_dbfs, 3), 'dBFS', '样本点峰值，永远 ≤ 0 dBFS（判过载要看真峰）'],
+    ['真峰', anlNum(h.true_peak_dbtp, 2), 'dBTP', '4× 过采样样本间真峰；> 0 表示母带已过载'],
+    ['动态 P95−P10', shortDur ? '不展示' : anlNum(q.dyn_p95_p10_db, 1), shortDur ? '' : 'dB',
+     shortDur ? '素材 < 6 s：3 s 块至少要 2 块，短素材恒为 0' : '段落间起伏；含数字静音时偏大'],
+    ['动态重心', anlNum(q.dyn_centroid_dbfs, 1), 'dBFS', '动态分布的加权中心（≈ 全程听感电平）'],
+    ['静态段占比', anlNum(q.silence_pct, 2), '%', '低于 −60 dBFS 的 100 ms 块占比']
+  ]));
+  // 2. 失真 / 噪声
+  parts.push(anlDeepGroup('失真 / 噪声', [
+    ['THD+N', q.thdn_available ? anlNum(q.thdn_db, 1) : '不展示', q.thdn_available ? 'dB' : '',
+     q.thdn_available ? ('单基频素材（测试音）上成立；16 bit 可测下限 −94 dB@0 dBFS / −37 dB@−60 dBFS')
+                      : '真实曲库 0/655 可用：音乐没有可定义的基频（全部 multi_peak）⟹ 只在测试音场景显示'],
+    ['非谐波残留', anlNum(q.non_tonal_db, 1), 'dB', '16 个最强谱峰之外的能量占比 = 噪声/失真/有损残留的上界'],
+    ['本底噪声', anlNum(q.noise_floor_dbfs, 1), 'dBFS', '100 ms 块 P10 = 最安静段落的那段音乐电平，不是器材噪声底'],
+    ['谱最小本底', anlNum(q.spectral_min_dbfs, 1), 'dBFS', '诊断用：平稳噪声准，密集音乐偏高'],
+    ['信噪比', F.noAudio ? '不展示' : anlNum(q.snr_db, 1), F.noAudio ? '' : 'dB',
+     '相对同曲版本可比，**不是**器材信噪比指标（本底取最安静段落）'],
+    ['峰值因子', F.noAudio ? '不展示' : anlNum(q.crest_db, 1), F.noAudio ? '' : 'dB',
+     '峰值 − RMS；全静音/纯直流会是 0 dB']
+  ]));
+  // 3. 频响
+  parts.push(specHide
+    ? anlDeepGroup('频响（不展示）', [['谱类四项', '不展示', '', specHide + '（谱重心 / 谱倾斜 / 95% 滚降 / >10k 占比）']])
+    : anlDeepGroup('频响', [
+        ['谱重心', anlNum(q.centroid_hz, 0), 'Hz', '能量重心的频率位置；同一首不同段落可差 1.8×'],
+        ['谱倾斜', anlNum(q.tilt_db_per_oct, 2), 'dB/oct', '频谱倾斜；同一首不同段落会变'],
+        ['95% 滚降点', anlNum(q.rolloff95_hz, 0), 'Hz', '累计能量到 95% 的频率；20 s vs 60 s 可差 13%'],
+        ['>10 kHz 占比', anlNum(q.hf_ratio_10k_db, 1), 'dB', '同一首不同段落可差 10 dB；低电平素材被量化噪声抬高']
+      ]));
+  // 4. 削波 / 立体声
+  parts.push(anlDeepGroup('削波 / 立体声', [
+    ['削波段数（判据）', clip.head, '', '只有 clipped_runs / longest_clip_run 能当"真削波"的判据（连续 ≥3 样本 ≥ −0.0087 dBFS）'],
+    ['削波占比（上界）', clip.sub, '', '门限 0.999 = −0.0087 dBFS：合法满幅正弦也会被计入 ⟹ 只能当上界'],
+    ['削波样本', anlNum(q.clipped_samples, 0), '个', '含单样本越限（上界口径）'],
+    ['最长连续', anlNum(q.longest_clip_run, 0), '样本', '最长的一段连续削波；< 3 样本不算一段'],
+    ['峰值 / RMS', anlNum(q.peak_dbfs_q, 2) + ' / ' + anlNum(q.rms_dbfs, 2), 'dBFS', 'quality 段的峰值/RMS（与上面 DR 段同一份解码）'],
+    ['声道相关', q.stereo ? anlNum(q.channel_corr, 4) : '非立体声', '', '1.0000 = 左右完全相同（等同单声道）；< −0.9 可能是极性反相'],
+    ['单声道损失', q.stereo ? anlNum(q.mono_loss_db, 2) : '—', q.stereo ? 'dB' : '', qualStereoText(q)],
+    ['side / mid', q.stereo ? anlNum(q.side_mid_db, 2) : '—', q.stereo ? 'dB' : '', '0 dB 也可能只是单边静音，不一定是"完全中置"']
+  ]));
+  // 5. 无损性判定依据（四档 + 判据量；P3：全界面唯一判定处）
+  var VERD2 = { lossy: '疑似有损', band_limited: '带宽受限（不判假）', unclear: '证据不足', none: '未发现' };
+  var fv2 = h.fake_verdict || (h.lossless_suspected ? 'lossy' : 'none');
+  parts.push(anlDeepGroup('无损性判定依据（四档 · 唯一判定处）', [
+    ['判定', VERD2[fv2] || VERD2.none, '', '截止 <78% 奈奎斯特 ⟹ 疑似有损；78%~95% ⟹ 带宽受限（不判假）；置信 <50% ⟹ 证据不足'],
+    ['截止', h.cutoff_hz > 0 ? (h.cutoff_hz / 1000).toFixed(2) : '未检出', h.cutoff_hz > 0 ? 'kHz' : '', '能量真正结束的位置；未检出 = 没有明显陡沿，不是"没有高频"'],
+    ['陡沿', h.edge_db > 0 ? anlNum(h.edge_db, 1) : '—', h.edge_db > 0 ? 'dB' : '', '截止处 1/6 倍频程落差（谱窗中位数）；>12 dB 才算陡'],
+    ['置信度', anlNum((h.confidence || 0) * 100, 0), '%', '陡沿深度 × 各谱窗一致率；<50% 不给确定结论'],
+    ['谱窗数', anlNum(h.spectral_windows, 0), '个', '参与判定的谱窗个数；只有 1 个时结论很弱'],
+    ['谱窗填充', anlNum((h.window_fill === undefined ? 1 : h.window_fill) * 100, 0), '%', '有实样的谱窗比例；<50% 时只作参考'],
+    ['fake24', h.fake24 ? '是' : '否', '', '标称 24 bit 但有效位深不足（把 16 bit 塞进 24 bit 容器）'],
+    ['格式', (h.bits || '—') + ' bit', h.fs ? (h.fs >= 1000 ? (h.fs / 1000).toFixed(1) + ' kHz' : h.fs + ' Hz') : '',
+     '容器里声明的位深 / 采样率（不等于母带质量）'],
+    ['声道', chText(h.channels), '', '容器里声明的声道数 + 布局（5.1 / 7.1 …）；多声道素材 DR 取较低声道']
+  ]));
+  // 6. 说明与限定（后端 reason + 前端前置限定词 + 共有的 caveat）
+  var notes = [];
+  var fakeNote = anlFakeNote(h);
+  if (fakeNote) notes.push('无损性依据：' + fakeNote);
+  if (h.note) notes.push('文件完整性：' + h.note);
+  if (q.note) notes.push('quality 备注：' + q.note);
+  notes.push('谱类四项同一首不同段落可差 1.8× / 10 dB ⟹ 跨版本比较必须同段；轻度的谐波失真本页测不出（IMD 需双音素材）。');
+  return '<div class=npanal-det id=npAnlFull>' +
+    '<div class=dh>全部原始指标 · 判定依据' +
+      '<i>quality 段全部字段 + 无损性四档依据（数据来自 /api/health，前端不改一个数）</i></div>' +
+    parts.join('') +
+    '<div class=note>' + notes.map(function (s) { return esc(s); }).join('<br>') + '</div>' +
+    '</div>';
 }
 
 // 骨架（分析中）：三块**保留各自的标题**（动态/音质/假无损），只把数字换成灰条 ——
@@ -8273,6 +8679,60 @@ function anlStatusText() {
   return '等待分析 · ' + nm;
 }
 
+// ---- 折叠控件（P1）：三级之间的按钮由这里生成/回收 ----
+// 为什么在 JS 里建而不是写在 ui_page.h 的 markup 里：分析卡的 markup 是公共骨架，
+// 本轮只被允许往 ui_page.h 追加**CSS**（另一条线同时在改别的区域）。放这里也保证
+// 「没有结果时控件不存在」—— 空面板上摆一个「展开」按钮是骗人的。
+function anlCtlBar() {
+  var hd = document.querySelector('#npAnal .npanal-hd');
+  if (!hd) return null;
+  var bar = D('npAnlCtl');
+  if (!bar) {
+    bar = document.createElement('span');
+    bar.id = 'npAnlCtl';
+    bar.className = 'npanal-ctl';
+    var sp = hd.querySelector('.sp');
+    if (sp && sp.nextSibling) hd.insertBefore(bar, sp.nextSibling);
+    else hd.appendChild(bar);
+  }
+  return bar;
+}
+// has = 当前有没有结果可展开。没有结果 ⟹ 控件整组隐藏（不是置灰：置灰仍占版面）
+function anlSyncCtl(has) {
+  var bar = anlCtlBar();
+  if (!bar) return;
+  var box = D('npAnal');
+  var lvl = (ANL.lvl === 1 || ANL.lvl === 2) ? ANL.lvl : 0;
+  if (box) box.dataset.lvl = String(lvl);   // DOM 判据读这一格
+  if (!has) { bar.innerHTML = ''; return; }
+  var h = '<span class=npanal-lvltxt title="当前展开级别：0=摘要 1=指标格 2=全部原始指标">' +
+          ANL_LVLS[lvl] + '</span>';
+  if (lvl > 0) {
+    h += '<button class=npanal-btn id=npAnlFold title="收起一级（' +
+         (lvl === 2 ? '回到指标格' : '收起回摘要') + '）">\u25B4 收起</button>';
+  }
+  if (lvl < 2) {
+    h += '<button class=npanal-btn id=npAnlMore title="' +
+         (lvl === 0 ? '展开：三块 + 2×2 指标格' : '再展开：全部原始指标（19 项 + 判定依据）') + '">' +
+         (lvl === 0 ? '\u25BE 展开' : '\u25BE 展开全部') + '</button>';
+  }
+  if (lvl === 2) {
+    h += '<button class=npanal-btn id=npAnlMin title="直接折叠回摘要（L0）">\u23F6 全部收起</button>';
+  }
+  bar.innerHTML = h;
+  var b;
+  if ((b = D('npAnlFold'))) b.onclick = function () { anlSetLvl(lvl - 1); };
+  if ((b = D('npAnlMore'))) b.onclick = function () { anlSetLvl(lvl + 1); };
+  if ((b = D('npAnlMin'))) b.onclick = function () { anlSetLvl(0); };
+}
+// 唯一的级别写入口：任何地方改级别都走它（并立即重绘）
+function anlSetLvl(n) {
+  n = (n === 1 || n === 2) ? n : 0;
+  if (((ANL.lvl === 1 || ANL.lvl === 2) ? ANL.lvl : 0) === n) return;
+  ANL.lvl = n;
+  anlPaint();
+}
+
 function anlPaint(full) {
   var grid = D('npAnlGrid');
   if (!grid) return;
@@ -8290,9 +8750,10 @@ function anlPaint(full) {
     btn.title = ANL.auto ? '关掉后播放不再自动分析（也可以在 设置-高级 改）'
                          : '打开后每次播放新的一首都会自动分析一次（也可以在 设置-高级 改）';
   }
+  anlSyncCtl(!!h);                 // 折叠控件：有结果才出现（心跳也要刷，否则收起后按钮会残留）
   if (full === false) return;      // 心跳只刷状态行
   if (busy) { grid.innerHTML = anlSkeletonHtml(); return; }
-  if (h) { grid.innerHTML = anlCardsHtml(h, p); return; }
+  if (h) { grid.innerHTML = anlCardsHtml(h, p, ANL.lvl); return; }
   if (!p) { grid.innerHTML = anlEmptyHtml('还没有在播放 · 播放一首本地曲目就会自动分析（动态 / 音质 / 假无损）'); return; }
   if (ANL.err) { grid.innerHTML = anlEmptyHtml('分析失败：' + ANL.err); return; }
   if (!ANL.auto) {
@@ -8351,6 +8812,9 @@ function anlUpdateCur(cur) {
     ANL.cached = false;
     ANL.src = '';
     ANL.elapsed = 0;
+    // P1（用户 261027-05 A5「换歌要回到 L0」）：换歌一律折叠回摘要。
+    // 只在这一处归零 ⟹ 同一首歌的暂停/拖动/重绘/重进单曲页都保持用户选过的级别。
+    ANL.lvl = 0;
     anlPaint();                       // 换歌：立刻把面板切到「这首歌」
   }
   if (!cur || !ANL.auto) return;
@@ -8377,7 +8841,11 @@ function anlSetAuto(on) {
   anlPaint();
 }
 
-// 右键「查看分析（动态/音质/假无损）」：不在播放的曲目也能看（弹窗里就是同一套三块）
+// 右键「查看分析（动态/音质/无损性）」：不在播放的曲目也能看。
+// P3（2026-10-27 用户 261027-05 C4「有损检测就是假无损检测，归类到一起就行」）：
+//   旧版有两个入口 ——「查看分析（动态/音质/假无损）」给三块卡，「分析音质（19 项）」另给一张长表，
+//   两处都对"无损/有损"下结论（口径还不完全一样）⟹ 合并成这**一个**入口。
+//   弹窗固定按 L2 打开（三块卡 + 全部原始指标 + 判定依据），信息一个都不少，只是不再分两处。
 function openHealthModal(path) {
   if (!path) { toast('没有可分析的曲目'); return; }
   openModal('音频分析', '<div class=empty>正在分析…（流式分块解码，曲越长越久）</div>');
@@ -8396,7 +8864,7 @@ function openHealthModal(path) {
         (took >= 1000 ? (took / 1000).toFixed(2) + ' s' : took + ' ms') +
         (j.cached ? '（后端缓存命中）' : '（本次新算）') +
         (h.reason ? '　·　' + esc(h.reason) : '') + '</div>' +
-      '<div style="display:grid;grid-template-columns:1fr;gap:10px">' + anlCardsHtml(h, path) + '</div>';
+      '<div style="display:grid;grid-template-columns:1fr;gap:10px">' + anlCardsHtml(h, path, 2) + '</div>';
   }).catch(function (e) {
     D('mbody').innerHTML = '<div class=empty>分析失败：' + esc(e && e.message ? e.message : e) + '</div>';
   });
@@ -9350,7 +9818,8 @@ function npDataTargets(m) {
   return out;
 }
 function npDataCan(m) {
-  return !!(META.summary && m && (m.summaryAvailable || m.summaryCached || m.summaryCacheOk || META.hasLlmKey === true));
+  // 2026-10-27（P3）：META.summary 可能是历史遗留的 0（见 aiSummaryOn 注释），改用统一判据
+  return !!(aiSummaryOn() && m && (m.summaryAvailable || m.summaryCached || m.summaryCacheOk || META.hasLlmKey === true));
 }
 function npDataTab(kind) {
   var tabs = NP_DATA.tabs || [];
@@ -9365,26 +9834,84 @@ function npDataTabsSig() {
     return t.k + ':' + t.label + ':' + st.state + ':' + (NP_DATA.active === t.k ? '1' : '0');
   }).join('|');
 }
+/* ---------------- 单曲页 AI 资料：**一个向右折叠的入口** ----------------
+   2026-10-27（用户 261027-06 P3）用户原话：
+     「单曲页面右面的 AI 整理功能，也不再需要分类歌曲、艺术家之类的。跟下面音频分析的处理方法一样，
+       默认折叠。AI 功能默认向右折叠，点击可以弹出内容框即可。」
+   旧实现：右侧四颗药丸「歌曲 / 专辑 / 艺术家 / 作品」，每颗点开才请求、才出抽屉 —— 用户说
+           这些分类没必要，而且要一个个点。
+   新实现：
+     * 只有**一个**入口「AI 资料 ›」；折叠态在下面用一行摘要（已整理 · N 段 / 整理中… / 暂无资料）；
+     * 点一下 = 从右侧滑出内容框（沿用既有 .npdrawer 抽屉，不新造浮层），内容**合并成一篇**：
+       这首歌 → 这张专辑（含本地曲目表）→ 这位艺术家 →（古典时）作品版本，段间用细线分隔；
+     * 再点一下（或点入口本身）= 收回；Esc / 右上关闭按钮同样可用；
+     * 展开时把四类实体**并行**发起（summaryOnce 单飞 + 后端每任务一条线程），不串行等待。 */
+var NP_AI_ORDER = ['track', 'release', 'person', 'work'];
+function npAiKinds() {
+  var tabs = NP_DATA.tabs || [], out = [];
+  for (var i = 0; i < NP_AI_ORDER.length; ++i) {
+    for (var j = 0; j < tabs.length; ++j) if (tabs[j].k === NP_AI_ORDER[i]) out.push(tabs[j]);
+  }
+  return out;
+}
+// 「几段」= 结构化字段条数 + 段落数（与内容框里看到的东西一一对应，不是编出来的数字）
+function npAiSegCount(s) {
+  if (!s) return 0;
+  var n = 0;
+  if (s.fields) { for (var k in s.fields) if (Object.prototype.hasOwnProperty.call(s.fields, k)) n++; }
+  if (s.sections) n += s.sections.length;
+  return n;
+}
+function npAiLoadedCount() {
+  var tabs = npAiKinds(), seg = 0, okN = 0, busy = 0, errN = 0, idle = 0;
+  for (var i = 0; i < tabs.length; ++i) {
+    var st = NP_DATA.cache[tabs[i].k] || {};
+    if (st.state === 'ok') { okN++; seg += npAiSegCount(st.data); }
+    else if (st.state === 'loading') busy++;
+    else if (st.state === 'error') errN++;
+    else idle++;
+  }
+  return { seg: seg, ok: okN, busy: busy, err: errN, idle: idle };
+}
+// 折叠态那一行摘要：用户要求「折叠态显示一行摘要（比如 AI 资料：已整理 · 7 段）」
+function npAiStateLine() {
+  if (!npAiReady() && !NP_DATA.tabs.length) return '';
+  var c = npAiLoadedCount();
+  if (c.busy > 0) return '整理中…' + (c.seg > 0 ? (' · 已 ' + c.seg + ' 段') : '');
+  if (c.ok > 0) return '已整理 · ' + c.seg + ' 段' + (c.err > 0 ? ' · 部分缺失' : '');
+  if (c.err > 0) return '暂无资料 · 点开重试';
+  if (!npAiReady()) return '未开启 AI 整理';
+  return '点开查看';
+}
+function npAiEntryHtml() {
+  var c = npAiLoadedCount();
+  var cls = c.ok > 0 ? ' ok' : (c.busy > 0 ? ' busy' : (c.err > 0 ? ' err' : ''));
+  var isOpen = (NP_DATA.active === 'all' && npDrawerIsOpen());
+  var line = npAiStateLine();
+  return '<button class="npchip npai' + cls + (isOpen ? ' on' : '') + '" id=npAiEntry' +
+         ' title="' + esc(isOpen ? '收起 AI 整理' : '展开 AI 整理（这首歌 · 专辑 · 艺术家 一起看）') + '"' +
+         ' style="justify-content:flex-start;gap:7px">' +
+         '<i class=dot></i><span style="flex:1;text-align:left">AI 资料</span>' +
+         '<span style="font-size:12px;opacity:.65">' + (isOpen ? '\u2039' : '\u203a') + '</span>' +
+         '</button>' +
+         (line ? '<div id=npAiSum style="font-size:10.5px;line-height:1.45;color:var(--mut2);padding:1px 2px 0">' +
+                 esc(line) + '</div>' : '');
+}
 function npDataRenderTabs() {
   var el = D('npTabs'); if (!el) return;
-  var sig = npDataTabsSig();
+  var sig = npDataTabsSig() + '|' + npAiStateLine() + '|' + (NP_DATA.active === 'all' && npDrawerIsOpen() ? '1' : '0');
   if (sig === NP_DATA.tabSig) return;     // renderNp 每 400ms 调一次：没变化绝不重绘（否则悬停会闪）
   NP_DATA.tabSig = sig;
-  var h = '';
-  (NP_DATA.tabs || []).forEach(function (t) {
-    var st = NP_DATA.cache[t.k] || { state: 'idle' };
-    var cls = st.state === 'ok' ? ' ok' : (st.state === 'loading' ? ' busy' : (st.state === 'error' ? ' err' : ''));
-    h += '<button class="npchip' + cls + (NP_DATA.active === t.k ? ' on' : '') + '" data-k="' + esc(t.k) + '"' +
-         ' title="' + esc(t.label + '：' + (t.name || '') + '（' +
-           (t.k === 'release' ? (npAiReady() ? '本地曲目 + AI 整理' : '本地曲目') : 'AI 整理') + '）') + '">' +
-         '<i class=dot></i>' + esc(t.label) + '</button>';
-  });
-  el.innerHTML = h;
-  Array.prototype.forEach.call(el.querySelectorAll('.npchip'), function (b) {
-    b.onclick = function () { npDataToggle(b.dataset.k); };
-  });
+  el.innerHTML = npAiEntryHtml();
+  var b = D('npAiEntry');
+  if (b) b.onclick = npDataToggleAll;
 }
-// 再点同一个标签 = 收起抽屉（浮层"看一眼就走"，不逼用户找关闭按钮）
+// 点入口：收起 ↔ 展开（"看一眼就走"，不逼用户找关闭按钮）
+function npDataToggleAll() {
+  if (NP_DATA.active === 'all' && npDrawerIsOpen()) { npDrawerClose(); npDataRenderBody(); npDataRenderTabs(); return; }
+  npDataActivateAll();
+}
+// 兼容旧调用点（预取/单飞回调里会传具体 kind）—— 现在统一按"全部"打开
 function npDataToggle(kind) {
   if (NP_DATA.active === kind && npDrawerIsOpen()) { npDrawerClose(); npDataRenderBody(); return; }
   npDataActivate(kind);
@@ -9524,7 +10051,10 @@ function npDataOnProgress(kind, prog) {
     st.streamText = clean;
   }
 
-  if (NP_DATA.active === kind) {
+  // 2026-10-27（P3）：合并内容框里没有"单个 kind 的流式块"，交给整块重绘（sig 里带了 chars）
+  if (NP_DATA.active === 'all') {
+    npDataRenderBody();
+  } else if (NP_DATA.active === kind) {
     npDataRenderProgress(st, kind);
   }
 }
@@ -9579,11 +10109,74 @@ function npDataWorkBody(d) {
 }
 // 抽屉头部：类型标签 + 实体名 + 状态（#3b ③：默认看不到这些，点标签才滑出）
 function npDataHeader(kind, st) {
+  // 2026-10-27（P3）：'all' = 合并内容框 —— 头部只写「AI 整理 · 当前曲名」+ 一行总状态。
+  if (kind === 'all') {
+    var k0 = D('npDrawerKind'), n0 = D('npDrawerName'), s0 = D('npDataStat');
+    if (k0) k0.textContent = 'AI 整理';
+    if (n0) n0.textContent = String((S.curMeta && S.curMeta.title) || (D('npt') && D('npt').textContent) || '');
+    if (s0) s0.textContent = npAiStateLine();
+    return;
+  }
   var t = kind ? (npDataTab(kind) || { label: '', name: '' }) : { label: '', name: '' };
   var k = D('npDrawerKind'), n = D('npDrawerName'), s = D('npDataStat');
   if (k) k.textContent = t.label || '资料';
   if (n) n.textContent = t.name || '';
   if (s) s.textContent = kind ? npDataStatHtml(kind, st) : '';
+}
+// 合并内容框用：某一段的「进度」一行（不抢版面，只在还没内容时出现）
+function npAiProgressHtml(st) {
+  var p = (st && st.progress) || {};
+  var raw = (st && typeof st.streamText === 'string') ? st.streamText : sanitizeStreamText(p.text);
+  var clean = sanitizeStreamText(raw);
+  if (/^\s*\{/.test(clean)) clean = '';
+  var chars = (typeof p.chars === 'number') ? p.chars : (clean ? clean.length : 0);
+  var sec = (typeof p.elapsedMs === 'number' && p.elapsedMs >= 0) ? (p.elapsedMs / 1000).toFixed(1) + 's' : '';
+  var h = '<div class=npdhint>' + esc(p.phase || '正在整理…') +
+          (chars > 0 ? (' · 已 ' + chars + ' 字') : '') + (sec ? (' · ' + sec) : '') + '</div>';
+  if (clean) h += '<div class=npdstream-text style="max-height:120px;overflow:auto;white-space:pre-wrap;font-size:11.5px;color:var(--txt2);margin-top:4px">' + esc(clean) + '</div>';
+  return h;
+}
+// 合并内容框：这首歌 → 这张专辑（含本地曲目表）→ 这位艺术家 →（古典）作品。
+// 段与段之间一条细线 + 一个极小标题（10px）。**不再有需要点开的分类** —— 一屏往下读即可。
+function npAiBodyHtml() {
+  var tabs = npAiKinds(), h = '', shown = 0;
+  for (var i = 0; i < tabs.length; ++i) {
+    var t = tabs[i];
+    var st = NP_DATA.cache[t.k] || { state: 'idle' };
+    var inner = '';
+    if (t.k === 'release') {
+      inner = npReleaseBody(st);                 // 本地曲目表 + AI 文字（状态无关）
+    } else if (t.k === 'work') {
+      if (st.state === 'ok') inner = npDataWorkBody(st.data);
+      else if (st.state === 'error') inner = '<div class=npdhint>未在 Discogs 检索到该作品。</div>';
+      else return;                               // work 是可选段：没数据就不占位
+    } else if (st.state === 'ok' && summHas(st.data)) {
+      inner = npDataSummaryBody(st.data, t.k);
+    } else if (st.state === 'loading' || st.state === 'idle') {
+      inner = npAiProgressHtml(st);
+    } else if (st.state === 'error') {
+      inner = '<div class=npdhint>未取到资料' + (st.error ? ('（' + esc(st.error) + '）') : '') + '</div>';
+    }
+    if (!inner) continue;
+    if (shown) h += '<div style="height:1px;background:var(--line);margin:14px 0"></div>';
+    // 段落小标题只写"这一段是什么"，不再重复抽屉头已显示的名字（用户：不要分类、不要重复）
+    var segTitle = (t.k === 'track') ? '这首歌'
+                 : (t.k === 'release') ? '这张专辑'
+                 : (t.k === 'person') ? '这位艺术家'
+                 : (t.k === 'work') ? '这个作品' : (t.label || '资料');
+    h += '<div style="font-size:10px;letter-spacing:1.1px;color:var(--mut2);font-weight:700;margin-bottom:6px">' +
+         segTitle + (t.k === 'release' && t.name ? (' · ' + esc(t.name)) : '') + '</div>' + inner;
+    shown++;
+  }
+  if (!shown) {
+    return '<div class=npdhint>' + (npAiReady()
+      ? '正在整理这首歌的资料…（内容框会自动刷新，不用再点）'
+      : '未开启 AI 整理 —— 在 设置 · 元数据 里打开「AI 增强」并填入 API Key') + '</div>';
+  }
+  h += '<div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">' +
+       '<button class="btn" id=npAiRefreshTrack style="font-size:11px;padding:3px 10px" ' +
+       'title="只重跑这首歌的 AI 整理（一次模型调用）">重新整理这首歌</button></div>';
+  return h;
 }
 function npDataRenderBody(force) {
   var body = D('npDataBody');
@@ -9592,6 +10185,31 @@ function npDataRenderBody(force) {
   if (!kind) {
     if (NP_DATA.bodyKey) { body.innerHTML = ''; NP_DATA.bodyKey = ''; }
     npDataHeader('', null);
+    return;
+  }
+  // 2026-10-27（P3）：合并内容框走独立渲染器（一屏读完，无分类）。
+  if (kind === 'all') {
+    var sigA = 'all';
+    var tabsA = npAiKinds();
+    for (var ia = 0; ia < tabsA.length; ++ia) {
+      var stA = NP_DATA.cache[tabsA[ia].k] || {};
+      sigA += '|' + tabsA[ia].k + ':' + stA.state + ':' +
+              (stA.local ? ((stA.local.tracks || []).length) : '-') + ':' +
+              (stA.data ? (stA.data.generated_at || (stA.data.summaryCached ? 'c' : 'f')) : '') + ':' +
+              (stA.progress ? (stA.progress.chars || 0) : 0) + ':' + ((stA.streamText || '').length);
+    }
+    npDataHeader('all', null);
+    if (sigA === NP_DATA.bodyKey && !force) return;
+    NP_DATA.bodyKey = sigA;
+    var keepA = body.scrollTop || 0;
+    body.innerHTML = npAiBodyHtml();
+    bindCopyChips(body);
+    if (keepA) body.scrollTop = keepA;
+    var rbA = D('npAiRefreshTrack');
+    if (rbA) rbA.onclick = function () { npDataEnsure('track', true); };
+    var rfA = D('npDataRefresh');               // npReleaseBody 自带的「重新整理」= 重跑专辑
+    if (rfA) rfA.onclick = function () { npDataEnsure('release', true); };
+    var woA = D('npWorkOpen'); if (woA) woA.onclick = npOpenWorks;
     return;
   }
   var st = NP_DATA.cache[kind] || { state: 'idle' };
@@ -9666,7 +10284,7 @@ function npLocalAlbum(name, artist, cb) {
 // 261024-05 A12：AI 整理是否真的可用（设置开关 + 后端权威 key/开关），决定要不要发 summary 请求。
 // 注意与 npDataCan 的区别：那个还看当前曲目的 summaryAvailable 缓存标记，这里只看"能力"。
 function npAiReady() {
-  return META.summary == 1 && (META.hasLlmKey === true || META.summaryEnabled === true);
+  return aiSummaryOn() && (META.hasLlmKey === true || META.summaryEnabled === true);
 }
 function npLocalKeyOf(t) { return String((t && t.name) || '') + '|' + String((t && t.artist) || ''); }
 function npReleaseOpts(st) {
@@ -9738,14 +10356,14 @@ function npLocalAlbumLoad(kind) {
   if (st.localKey === key && st.localState === 'loading') return;
   st.localKey = key;
   st.localState = 'loading';
-  if (NP_DATA.active === kind) npDataRenderBody(true);
+  if (npDataVisible(kind)) npDataRenderBody(true);
   npLocalAlbum(t.name, t.artist || '', function (alb) {
     var cur = NP_DATA.cache[kind];
     if (!cur || cur.localKey !== key) return;            // 切歌/换实体 → 丢弃
     if (cur.data) cur.data.__album = alb || null;
     cur.local = alb || null;
     cur.localState = alb ? 'ok' : 'none';
-    if (NP_DATA.active === kind) npDataRenderBody(true);
+    if (npDataVisible(kind)) npDataRenderBody(true);
   });
 }
 // 261024-02 追加（Lead 指定，属于 #1 的体感）：打开单曲页 / 切歌时**后台预取当前专辑的 release 资料**。
@@ -9806,7 +10424,7 @@ function npPrefetchRelease() {
      * 抽屉**不自动打开**（261024-01 #3b ③ 的「资料默认隐藏」是既有验收项），内容就绪后标签点一下即看；
      * 失败不弹错：右侧标签栏下面留一行可点击的「重试」。 */
 function npAutoSummary() {
-  if (META.summary != 1) return;
+  if (!aiSummaryOn()) return;
   if (META.hasLlmKey !== true && META.summaryEnabled !== true) return;
   if (!npDataTab('track')) return;
   var st = NP_DATA.cache['track'];
@@ -9825,7 +10443,9 @@ function npRailHint() {
                    '歌曲资料未能取到 · 点击重试</span>';
     var b = D('npSummRetry');
     if (b) b.onclick = function () { npDataEnsure('track', true); };
-  } else if (st && st.state === 'loading' && !npDrawerIsOpen()) {
+  } else if (st && st.state === 'loading' && !npDrawerIsOpen() && !npAiStateLine()) {
+    // 2026-10-27（P3）：折叠入口下面已经有一行摘要（"整理中… · 已 N 段"），
+    // 这一行只在摘要算不出来时兜底，避免右栏出现两句意思相同的话。
     el.style.display = '';
     el.innerHTML = '<span class=nprailbusy>正在后台整理歌曲资料…</span>';
   } else {
@@ -9840,7 +10460,7 @@ function npDataEnsure(kind, force) {
     if (kind === 'release') {
       var stl = NP_DATA.cache[kind] || (NP_DATA.cache[kind] = {});
       if (stl.state !== 'ok') stl.state = 'local';
-      if (NP_DATA.active === kind) npDataRenderBody();
+      if (npDataVisible(kind)) npDataRenderBody();
     }
     return;
   }
@@ -9859,7 +10479,7 @@ function npDataEnsure(kind, force) {
                           progress: force ? null : (prev.progress || null),
                           streamText: force ? '' : (prev.streamText || ''),
                           lastAttempt: force ? undefined : prev.lastAttempt };
-  if (NP_DATA.active === kind) npDataRenderBody();
+  if (npDataVisible(kind)) npDataRenderBody();
 
   function done(data, err) {
     delete NP_DATA.inflight[fp];
@@ -9874,7 +10494,7 @@ function npDataEnsure(kind, force) {
                                  error: err || '', local: alb,
                                  localState: alb ? 'ok' : cur.localState,
                                  localKey: cur.localKey || '', aiFailed: 1 };
-    if (NP_DATA.active === kind) npDataRenderBody();
+    if (npDataVisible(kind)) npDataRenderBody();
   }
   if (kind === 'work') {
     api('/api/entity/versions?kind=work&name=' + encodeURIComponent(t.name) +
@@ -9908,13 +10528,42 @@ function npDataActivate(kind) {
   NP_DATA.active = kind;
   var st = NP_DATA.cache[kind];
   if (!st) st = NP_DATA.cache[kind] = { state: 'idle' };
-  // 261024-05 A12：AI 关闭时专辑标签直接是"本地曲库"态 —— 点开就有曲目，不发任何 AI 请求
+  // 261024-05 A12：AI 关闭时专辑直接是"本地曲库"态 —— 点开就有曲目，不发任何 AI 请求
   if (kind === 'release' && !npDataCan(S.curMeta) && st.state !== 'ok') st.state = 'local';
   npDataRenderTabs();
   npDataRenderBody(true);  // 强制刷一次：占位/本地列表立刻出现（点一下就有反馈）
   npDrawerOpen();
   if (kind === 'release') npLocalAlbumLoad(kind);   // 先本地曲目，AI 文本后到再补
   npDataEnsure(kind, false);
+}
+/* 2026-10-27（用户 261027-06 P3）：点「AI 资料 ›」= 展开合并内容框。
+   一次把四类实体**全部并行**发起（每类一条 summaryOnce；后端每个任务一条线程）：
+     * 这首歌   → /api/entity/summary?kind=track
+     * 这张专辑 → kind=release（同时读本地曲库的曲目表，先本地后 AI）
+     * 这位艺术家 → kind=person
+     * 古典时还有 kind=work（走 /api/entity/versions，Discogs）
+   为什么一次全发：用户抱怨的正是"要点开好几个分类、一个个等"。展开即并发，谁先回来先显示。 */
+function npDataActivateAll() {
+  NP_DATA.active = 'all';
+  var tabs = npAiKinds();
+  for (var i = 0; i < tabs.length; ++i) {
+    if (tabs[i].k === 'release') {
+      var st = NP_DATA.cache['release'] || (NP_DATA.cache['release'] = { state: 'idle' });
+      if (!npDataCan(S.curMeta) && st.state !== 'ok') st.state = 'local';
+    }
+  }
+  npDataRenderTabs();
+  npDataRenderBody(true);
+  npDrawerOpen();
+  npLocalAlbumLoad('release');
+  for (var j = 0; j < tabs.length; ++j) npDataEnsure(tabs[j].k, false);
+  npDataRenderBody();
+}
+// 当前内容框是否在展示某一类（'all' 的时候四类都算在内 —— 数据到了要能重绘）
+function npDataVisible(kind) {
+  if (!kind) return false;
+  if (NP_DATA.active === kind) return true;
+  return NP_DATA.active === 'all' && !!npDataTab(kind);
 }
 // 打开「古典作品 · 演绎版本」整页（左导航已移除，这是唯一入口；返回按钮见 loadWorksView）
 function npOpenWorks() {
@@ -9942,7 +10591,8 @@ function updateNpData(m) {
   rail.classList.add('on');
   NP_DATA.tabs = tabs;
   // 切歌/元数据分两拍回来时，标签集合会变：抽屉开着的实体若已不存在 → 收起抽屉
-  var activeStill = false;
+  // 2026-10-27（P3）：'all' 是合成状态（合并内容框），只要还有任何一类资料就不收。
+  var activeStill = (NP_DATA.active === 'all' && tabs.length > 0);
   for (var i = 0; i < tabs.length; ++i) if (tabs[i].k === NP_DATA.active) activeStill = true;
   if (NP_DATA.active && !activeStill) npDrawerClose();
   npDataRenderTabs();
@@ -9951,7 +10601,12 @@ function updateNpData(m) {
   npPrefetchRelease();
   // 261024-04 #7：进入单曲页自动加载**这首歌**的 summary（不需要点标签）
   npAutoSummary();
-  if (NP_DATA.active) npDataEnsure(NP_DATA.active, false);
+  if (NP_DATA.active === 'all') {
+    // 合并内容框开着：每一类都保持"有就显示、没有就发起"（与展开时同一条纪律）
+    for (var k2 = 0; k2 < tabs.length; ++k2) npDataEnsure(tabs[k2].k, false);
+  } else if (NP_DATA.active) {
+    npDataEnsure(NP_DATA.active, false);
+  }
   npDataRenderBody();
 }
 
@@ -9973,6 +10628,10 @@ function renderNp() {
   D('npTitle').textContent = (D('npt') && D('npt').textContent) || '未播放';
   var sub = (D('npart') && D('npart').textContent) || '';
   var st = (D('nps') && D('nps').textContent) || '';
+  // P2（261027-05 A4）：单曲页副标题也要标多声道。底栏那行由 tick() 每 400 ms 刷，
+  // 元数据刚回来时它还带着上一拍的文字 ⟹ 这里补一次（已含标记就不重复拼）。
+  var chm = chMark(S.curCh);
+  if (chm && st.indexOf(chm) < 0) st = st + '  ·  ' + chm;
   D('npSub').textContent = sub + (st ? '  ·  ' + st : '');
   if (D('npKind')) D('npKind').textContent = npPlayingKindText(S.curMeta);
   // 元数据补全芯片 + 当前 EQ/IR 芯片（loadMeta / loadSettings 异步回来时也会走到这里刷一次）

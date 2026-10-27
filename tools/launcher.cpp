@@ -1562,9 +1562,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     {
         int dbgPort = 0;
         if (parse_debug_port_arg(dbgPort)) {
-            rta::wv2::debug_flags().remotePort = dbgPort;
-            logf(L"调试开关: --remote-debugging-port=%d 已开启（WebView2 AdditionalBrowserArguments；"
-                 L"http://127.0.0.1:%d/json 可列页面）", dbgPort, dbgPort);
+            // 2026-10-27 收尾实测（铁律 4：如实记录）：这个开关**当前不可用**。
+            // 现场：带 --remote-debugging-port=8970 启动 ⟹ 三条轨全部「创建环境失败(0x00000000)」
+            //   ⟹ 退回 Edge --app 模式（窗口还在，但不是我们的宿主，截不到 WebView2 内建界面）；
+            //   同一份二进制不带该参数则一切正常（首帧 141 ms、内建 WebView2）。
+            // 怀疑点：自实现的 ICoreWebView2EnvironmentOptions 在传了 AdditionalBrowserArguments
+            //   之后与 Loader 的交互（不传参数时同一对象根本不被创建，所以生产路径零风险）。
+            // 处置：**先禁用**，宁可没有调试端口，也不能让界面被悄悄换成 Edge 外壳。
+            //   要补真窗口截图，用 RLPLAYER_PORT 起独立实例 + Win32 点击（已验证可行）。
+            logf(L"调试开关: --remote-debugging-port=%d 已识别但**暂不启用**"
+                 L"（实测会退回 Edge 外壳；详见 docs/DEBUG会话收官-2026-10-27.md）", dbgPort);
         }
     }
     WSADATA w; WSAStartup(MAKEWORD(2, 2), &w);

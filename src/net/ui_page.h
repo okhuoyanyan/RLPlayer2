@@ -492,6 +492,41 @@ inline std::string rta_ui_page() {
     // 800p 这种常见笔记本屏必须**保留指标名 + 数值 + 单位**（用户要求的就是这三样）。
     h += "@media (max-height:680px){.npanal-kv{display:none}}";
     h += "@media (max-width:1100px){.npanal-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.npanal-card{padding:6px 8px}}";
+    // ===== 分析卡三级折叠（2026-10-27 用户 261027-05 A5）=====
+    // L0 = 单行卡（标题在左、摘要贴右，**只有一行**，副标题让位给摘要）；
+    // L1 = 上面原有的 .npanal-card（标题 + 一句结论 + 2×2 指标格）；
+    // L2 = 追加一块 .npanal-det 横跨三列（全部原始指标 + 判定依据 + caveat）。
+    h += ".npanal-ctl{display:flex;align-items:center;gap:6px;min-width:0}";
+    h += ".npanal-lvltxt{font-size:10px;color:var(--mut2);border:1px solid var(--line);border-radius:5px;padding:1px 6px;white-space:nowrap}";
+    h += ".npanal-card.l0{flex-direction:row;align-items:baseline;gap:8px;padding:5px 10px}";
+    h += ".npanal-card.l0 .ct{margin:0;flex:0 0 auto}";
+    h += ".npanal-card.l0 .ct i{display:none}";
+    h += ".npanal-card.l0 .npanal-verdict{flex:1 1 auto;min-width:0;text-align:right;font-size:11.5px;font-weight:600}";
+    h += ".npanal-card.l0 .npanal-verdict.mut{font-size:11px}";
+    // L2 的原始指标块**必须自己滚动**：35 行铺开会把播放控制区顶出视口
+    // （实测 1600×950 下 L2 高 1038 px ⟹ 控制条 bottom=1136 > innerHeight 858）。
+    // 上限 30vh：L1(210) + 30vh(≈290) + 控制区 仍留在视口内；超出部分在块内滚动。
+    // position/z-index：L2 撑高后，右栏「AI 整理」浮卡会盖住表头按钮 —— 分析条自己成一层排在它上面。
+    h += ".npanal{position:relative;z-index:20}";
+    h += ".npanal-det{grid-column:1/-1;display:flex;flex-direction:column;gap:6px;min-width:0;max-height:30vh;overflow-y:auto;overscroll-behavior:contain;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.08);border-radius:11px;padding:8px 10px}";
+    // L2 里一行两格会把"指标名…数值"拉开到 500px，读起来断裂 ⟹ 宽屏四列（窄屏由下面的媒体查询回落两列）
+    h += ".npanal-det .npanal-kv{grid-template-columns:repeat(3,minmax(0,1fr))}";
+    h += ".npanal-det .dh{font-size:10.5px;font-weight:700;letter-spacing:.6px;color:var(--mut);display:flex;align-items:baseline;gap:6px}";
+    h += ".npanal-det .dh i{font-style:normal;font-size:9.5px;font-weight:400;color:var(--mut2);letter-spacing:0}";
+    h += ".npanal-det-g{display:flex;flex-direction:column;gap:2px;padding-top:5px;border-top:1px dashed var(--line)}";
+    h += ".npanal-det-g:first-child{border-top:0;padding-top:0}";
+    h += ".npanal-det-g .dh{font-size:10px;color:var(--mut2);letter-spacing:.3px;font-weight:600}";
+    h += ".npanal-det .note{font-size:10.5px;color:var(--mut2);line-height:1.6;white-space:pre-wrap;border-top:1px dashed var(--line);padding-top:5px}";
+    // L2 在矮窗里也要给指标格（@media max-height:680px 会隐藏 .npanal-kv）——
+    // 用户点开「全部指标」就是为了看数字，再藏起来等于按钮骗人 ⟹ 这里显式恢复。
+    h += "@media (max-height:680px){.npanal-det .npanal-kv{display:grid}}";
+    h += "@media (max-width:1200px){.npanal-det .npanal-kv{grid-template-columns:repeat(2,minmax(0,1fr))}}";
+    // ⚠️ 2026-10-27 本轮实测抓到的**真 bug**（不是本轮引入，是分析卡落地时就带着的）：
+    // 指标格里的 <span class=k> 撞上了播放键的全局样式 ".k{width:32px;height:32px;display:grid}"
+    // ⟹ 每个指标名只有 32px 宽，一律被截成 2~3 个字（实测 .k 的 scrollWidth=69px、宽度只有 32px，
+    // "动态 P95−P10" 显示成 "动态 P…"）。这里把三个属性按回文字宽度。
+    h += ".npanal-kv .k{display:block;width:auto;height:auto;min-width:0;place-items:initial}";
+    h += ".npanal-kv .v{display:inline;width:auto;height:auto}";
     // 版本对比的提示块（单曲页右键「对比版本…」打开的是弹窗，这里只给样式复用）
     h += ".anl-note{margin-top:6px;font-size:11px;color:var(--mut2);line-height:1.6;white-space:pre-wrap}";
     h += ".anl-empty{color:var(--mut2);font-size:12px;padding:10px 0}";

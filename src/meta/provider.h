@@ -58,6 +58,7 @@
 #include <chrono>
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -1522,6 +1523,286 @@ inline LyricResult lyric_lrclib_entry(const LyricRequest& rq, std::string& err) 
     const LyricResult r = lyric_lrclib(rq.title, rq.artist, rq.durationSec, rq.album);
     err = r.err;
     return r;
+}
+
+// ---------------------------------------------------------------------------
+// 多源歌词链(P1,2026-10-27;用户 261027-05 E8:
+//   「歌词最少也应该有网易云和 QQ 音乐两个重要源,如果你漏了 QQ 音乐,必须补上」)
+//
+// 为什么需要它:注册表里 qq 的 canLyric=true(lyric_qq 早已端到端验证),但没有任何调用方
+// 按「多源一起比」的方式用它 —— 唯一的消费者 enrich.h 走 art_lyric_sources() 的
+// 【逆序】(lrclib → netease → qq)且【见第一个成功就停】,于是 netease 一命中,QQ 永远
+// 排不到。实测某曲 bestSource=netease 就是这个原因,不是 QQ 接口没接。
+//
+// 本链的语义(与用户钦定的优先级一致):
+//   顺序 netease → qq → lrclib(LyricChainOpts::order 可覆盖);
+//   每源自己解决句柄(搜索 songmid / 数字 id),句柄质量用 match.h 的 titleScore 门槛挡;
+//   单源失败/404/解析异常只记录不中断(某个源 404 不能把整链打断);
+//   全部源都没时间轴时,退而用第一个非空结果(纯文本也比没有强,界面会提示无时间轴);
+//   任一带时间轴的命中立刻采纳(时间轴优先 —— 只有它能让歌词跟唱高亮)。
+// ---------------------------------------------------------------------------
+
+// LRC 是否带时间轴:至少一行 ^[mm:ss(.xx|:xx)]。窗口内外的脏标签不算。
+inline bool pv_lrc_is_timed(const std::string& lrc) {
+    for (size_t i = 0; i + 6 <= lrc.size(); ++i) {
+        if (lrc[i] != '[') continue;
+        size_t k = i + 1;
+        int digits = 0;
+        while (k < lrc.size() && lrc[k] >= '0' && lrc[k] <= '9' && digits < 3) { ++k; ++digits; }
+        if (digits == 0 || k >= lrc.size() || lrc[k] != ':') continue;
+        ++k;
+        int sdig = 0;
+        while (k < lrc.size() && lrc[k] >= '0' && lrc[k] <= '9' && sdig < 2) { ++k; ++sdig; }
+        if (sdig != 2) continue;
+        if (k >= lrc.size()) continue;
+        if (lrc[k] == '.' || lrc[k] == ':') {
+            ++k;
+            int fdig = 0;
+            while (k < lrc.size() && lrc[k] >= '0' && lrc[k] <= '9' && fdig < 3) { ++k; ++fdig; }
+            if (fdig == 0) continue;
+        }
+        if (k < lrc.size() && lrc[k] == ']') return true;
+    }
+    return false;
+}
+
+// 时间轴行数(统计用;与 pv_lrc_is_timed 同口径)
+inline int pv_lrc_timed_lines(const std::string& lrc) {
+    int n = 0;
+    for (size_t p = 0; (p = lrc.find('[', p)) != std::string::npos; ) {
+        const size_t e = lrc.find(']', p);
+        if (e == std::string::npos || e <= p + 3) { ++p; continue; }
+        const std::string tag = lrc.substr(p + 1, e - p - 1);
+        if (tag.find(':') != std::string::npos &&
+            tag.find_first_not_of("0123456789:.") == std::string::npos) ++n;
+        p = e + 1;
+    }
+    return n;
+}
+
+// 该源是否必须先有源内句柄(歌曲级 mid / 数字 id)才能取词。
+// lrclib 用元数据四件套直查,不需要句柄;新增的「只需要歌名」的源按 false 处理。
+inline bool pv_lyric_needs_handle(const std::string& id) {
+    return id == "qq" || id == "netease";
+}
+
+struct LyricSrcStat {
+    std::string id;             // 源 id("netease"/"qq"/"lrclib")
+    int  searched = 0;          // 是否为本源发过搜索
+    int  calls    = 0;          // 歌词接口调用次数(同源多候选会计多次)
+    int  hit      = 0;          // 拿到非空歌词(含无时间轴)
+    int  hitTimed = 0;          // 其中带时间轴
+    int  fail     = 0;          // 网络/HTTP/解析失败
+    int  miss     = 0;          // 接口正常但无词(或无合格句柄)
+    long long ms  = 0;          // 本源总耗时
+    std::string err;            // 最后一条错误(短句,供诊断)
+};
+
+struct LyricChainOpts {
+    std::vector<std::string> order;                      // 空 = 默认 {netease, qq, lrclib}(用户钦定)
+    const std::map<std::string, bool>* srcOn = nullptr;  // 设置页逐源开关(缺省 true)
+    int    maxCandPerSource = 2;                         // 每源最多试几个候选(第一个词为空时继续)
+    double minTitleScore    = 0.85;                      // 标题匹配门槛(match.h titleScore)
+    // 带时间轴但只有 1-3 行的,通常是「此歌曲为没有填词的纯音乐,请您欣赏」这类占位词
+    // (实测 QQ 对器乐曲就返回这一行)。这种命中不短路整链 —— 记下来当兜底,继续问后面的源,
+    // 免得「前一个源给了占位词、后面源有真歌词」时永远拿占位词。
+    int    minGoodLines     = 4;
+};
+
+struct LyricChainResult {
+    bool ok = false;                 // 拿到非空歌词
+    bool timed = false;              // 该歌词带时间轴
+    int  timedLines = 0;
+    LyricResult best;                // lrc / translation / source
+    std::string err;                 // 汇总错误(空 = 各源都「合法无词」)
+    std::string trace;               // "netease:timed qq:untimed lrclib:miss"
+    std::vector<LyricSrcStat> stats; // 每源一次(顺序 = 尝试顺序)
+};
+
+// 前置声明:注册表定义在本文件更后面(它是「唯一事实源」,顺序=搜索优先级,
+// 不好为了歌词链把它挪到前面),链里按 id 查描述符只借用它的声明。
+inline const std::vector<ProviderDesc>& provider_registry();
+
+// 单源:用已排好的候选调统一歌词入口。
+inline LyricResult pv_chain_call(const ProviderDesc& pd, const LyricRequest& rq, std::string& err) {
+    err.clear();
+    LyricResult r = pd.lyric(rq, err);
+    if (r.lrc.empty()) { r.ok = false; if (r.err.empty()) r.err = err; }
+    if (r.source.empty()) r.source = pd.id;
+    return r;
+}
+
+inline LyricChainResult lyric_chain(const std::string& title, const std::string& artist,
+                                    const std::string& album, int durationSec,
+                                    const std::vector<Candidate>& candsIn,
+                                    const LyricChainOpts& opts) {
+    LyricChainResult out;
+    const std::vector<ProviderDesc>& reg = provider_registry();
+    auto findDesc = [&reg](const std::string& id) -> const ProviderDesc* {
+        for (const ProviderDesc& pd : reg) if (id == pd.id) return &pd;
+        return nullptr;
+    };
+    std::vector<std::string> order = opts.order;
+    if (order.empty()) order = { "netease", "qq", "lrclib" };
+
+    const std::string query = artist.empty() ? title : (artist + " " + title);
+    LyricResult firstUntimed;                  // 兜底:有词但无时间轴
+    bool haveUntimed = false;
+    std::string firstUntimedSrc;
+    LyricResult thinTimed;                     // 兜底:带时间轴但行数过少(占位词)
+    int thinTimedLines = 0;
+    std::string thinTimedSrc;
+
+    for (const std::string& id : order) {
+        const ProviderDesc* pd = findDesc(id);
+        if (!pd || !pd->lyric) {
+            if (!out.trace.empty()) out.trace += " ";
+            out.trace += id + ":noimpl";
+            continue;
+        }
+        const bool on = !opts.srcOn || opts.srcOn->count(id) == 0 || opts.srcOn->at(id);
+        if (!on) {
+            if (!out.trace.empty()) out.trace += " ";
+            out.trace += id + ":off";
+            continue;
+        }
+        LyricSrcStat st;
+        st.id = id;
+        const auto t0 = std::chrono::steady_clock::now();
+
+        std::vector<Candidate> usable;
+        const bool needHandle = pv_lyric_needs_handle(id);
+        std::vector<Candidate> pool;
+        if (needHandle) {
+            for (const Candidate& c : candsIn)
+                if (c.source == id && !c.songId.empty()) pool.push_back(c);
+            if (pool.empty() && pd->search) {
+                std::string serr;
+                st.searched = 1;
+                pool = pd->search(query, serr);
+                if (!serr.empty()) st.err = serr;
+            }
+            if (!pool.empty()) {
+                const std::vector<Scored> scored =
+                    match_score_all(pool, title, artist, std::string(), durationSec);
+                const int cap = opts.maxCandPerSource < 1 ? 1 : opts.maxCandPerSource;
+                for (const Scored& s : scored) {
+                    if ((int)usable.size() >= cap) break;
+                    // scored 已按分降序:第一个不达门槛,后面的只会更差
+                    if (s.titleScore < opts.minTitleScore) break;
+                    usable.push_back(pool[s.idx]);
+                }
+            }
+            if (usable.empty()) {
+                st.miss = 1;
+                if (st.err.empty())
+                    st.err = pool.empty() ? "搜索无结果" : "候选标题不匹配(低于门槛,不烧歌词接口)";
+                st.ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+                out.stats.push_back(st);
+                if (!out.trace.empty()) out.trace += " ";
+                out.trace += id + ":nohandle";
+                continue;
+            }
+        }
+
+        // 逐候选取词:第一个非空即用;无时间轴则记下来继续(后面的源可能给带时间轴的)
+        LyricResult got;
+        const int tries = needHandle ? (int)usable.size() : 1;
+        for (int i = 0; i < tries; ++i) {
+            LyricRequest rq;
+            rq.title = title; rq.artist = artist; rq.album = album; rq.durationSec = durationSec;
+            if (needHandle) rq.cands.push_back(usable[(size_t)i]);
+            std::string cerr;
+            ++st.calls;
+            const LyricResult r = pv_chain_call(*pd, rq, cerr);
+            if (!r.lrc.empty()) { got = r; break; }
+            if (!r.err.empty()) { st.err = r.err; ++st.fail; }
+            else ++st.miss;
+        }
+        st.ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+
+        const bool timed = !got.lrc.empty() && pv_lrc_is_timed(got.lrc);
+        const int gotLines = timed ? pv_lrc_timed_lines(got.lrc) : 0;
+        if (!got.lrc.empty()) {
+            st.hit = 1;
+            if (timed) st.hitTimed = 1;
+            if (!out.trace.empty()) out.trace += " ";
+            out.trace += id + (timed ? (":timed" + std::to_string(gotLines)) : std::string(":untimed"));
+            out.stats.push_back(st);
+            const int need = opts.minGoodLines < 1 ? 1 : opts.minGoodLines;
+            if (timed && gotLines >= need) {   // 带时间轴且够长 = 最优,立刻采纳
+                out.ok = true; out.timed = true;
+                out.timedLines = gotLines;
+                out.best = got;
+                return out;
+            }
+            if (timed) {                       // 占位词:记下来,继续问后面的源
+                if (gotLines > thinTimedLines) {
+                    thinTimed = got;
+                    thinTimedLines = gotLines;
+                    thinTimedSrc = id;
+                }
+                continue;
+            }
+            if (!haveUntimed) {
+                firstUntimed = got;
+                firstUntimedSrc = id;
+                haveUntimed = true;
+            }
+            continue;                          // 无时间轴:继续问后面的源
+        }
+        if (st.miss == 0 && st.fail == 0) st.miss = 1;
+        out.stats.push_back(st);
+        if (!out.trace.empty()) out.trace += " ";
+        out.trace += id + (st.fail > 0 ? ":fail" : ":miss");
+    }
+
+    if (thinTimedLines > 0) {                  // 只有占位词:用行数最多的那份兜底
+        out.ok = true;
+        out.timed = true;
+        out.best = thinTimed;
+        out.timedLines = thinTimedLines;
+        out.trace += " => placeholder(" + thinTimedSrc + " " +
+                     std::to_string(thinTimedLines) + "行)";
+    } else if (haveUntimed) {                  // 全链无时间轴:用第一个非空结果兜底
+        out.ok = true;
+        out.timed = false;
+        out.best = firstUntimed;
+        out.timedLines = 0;
+        out.trace += " => untimed(" + firstUntimedSrc + ")";
+    } else {
+        for (const LyricSrcStat& s : out.stats) {
+            if (s.err.empty()) continue;
+            if (!out.err.empty()) out.err += "; ";
+            out.err += s.id + ": " + s.err;
+        }
+        if (out.err.empty()) out.err = "各源均无歌词";
+    }
+    return out;
+}
+
+// 便捷重载:不带候选(纯元数据驱动;链内自己搜索取句柄)。
+inline LyricChainResult lyric_chain(const std::string& title, const std::string& artist,
+                                    const std::string& album, int durationSec,
+                                    const LyricChainOpts& opts) {
+    return lyric_chain(title, artist, album, durationSec, std::vector<Candidate>(), opts);
+}
+
+// 单源统计 → 一行 JSON(成功率由调用方按 calls/tried 自己算;这里给原始计数)
+inline std::string lyric_src_stat_json(const LyricSrcStat& s) {
+    std::ostringstream o;
+    o << "{\"id\":\"" << pv_jesc(s.id) << "\""
+      << ",\"searched\":" << s.searched
+      << ",\"calls\":" << s.calls
+      << ",\"hit\":" << s.hit
+      << ",\"hitTimed\":" << s.hitTimed
+      << ",\"fail\":" << s.fail
+      << ",\"miss\":" << s.miss
+      << ",\"ms\":" << s.ms
+      << ",\"err\":\"" << pv_jesc(s.err) << "\"}";
+    return o.str();
 }
 
 // 静态注册表(唯一事实源):顺序 = 搜索优先级。
