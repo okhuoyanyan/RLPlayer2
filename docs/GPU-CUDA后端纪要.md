@@ -144,3 +144,93 @@ kernel + 下载 + IFFT + 叠加。
 
 因此第 7 节「下一轮」第 3 项（make_dist 收录）已完成；第 5 项（全 arch 实机覆盖）仍是能力边界：
 只有 sm_89 真机验证过，其余 18 档只能靠 cuobjdump 证明"编进去了"。
+
+
+## 9. PR #5：streaming 会话 destroy 用 `cudaFreeHost`（2026-10-27，本机无 N 卡，仅静态取证 + HIP 门禁）
+
+PR #5（`feat/cuda-stream-fix` → `main`，作者 garaxc）两份东西：2 行源码修复 + 重建 DLL。
+以 cherry-pick 落到「片头」，合并提交 **`212c58f`**（author 保留 garaxc；main 与片头差异过大，不做整支合并）。
+`git diff pull-5 HEAD -- src/gpu/gpu_conv_cuda.cu src/gpu/gpu_resample_cuda.cu` 为空
+⟹ **DLL 的两个编译输入与本树逐字节相同**（`5AFAD54F…` / `1A87279A…`），不是"另一个分支的二进制"。
+
+### 9.1 缺陷与修法
+
+`cudaHostAlloc` 分配的 pinned 主机内存必须用 `cudaFreeHost` 释放；`cudaFree` 对它是未定义行为
+（HIP 的 `hipFree` 两种都能收，照抄过来就错）。后果链：首次 create 正常 → destroy 用错 API →
+**后续 create 失败** → `GpuStreamConvolver` 静默降级 CPU（`on_gpu=0`），**不报错**。
+
+受影响的不止一条路径（本次核对）：
+
+| 路径 | 位置 | 说明 |
+|---|---|---|
+| 播放中换 IR / EQ | `gpu_bridge.h:167` `reset()` = `close()` + `open_gpu_or_cpu()` | 就是 destroy→create，必踩 |
+| 会话建失败后的清理 | `gpu_conv_cuda.cu:299` `rta_gpu_convolve_destroy(s)` | 同一处 destroy，一并修好 |
+| 逐档新建会话（测试/探针） | `test_gpu_stream` / `gpu_stream_check` | 第 2 档起踩 |
+
+### 9.2 全部 cuda API 配对核对（`gpu_conv_cuda.cu`）
+
+| 分配 | 释放 | 结论 |
+|---|---|---|
+| `cudaMalloc` dH / dRing / dAcc / dX（:289-292） | `cudaFree` ×4（:379-383 修后） | ✅ 不混 |
+| `cudaHostAlloc` hX / hAcc（:294-295，全文件仅此两处） | `cudaFreeHost` ×2（修后） | ✅ 本次修复 |
+| `cudaStreamCreate` stream（:296） | `cudaStreamDestroy`（:384） | ✅ |
+| `rta_gpu_convolve` 整块接口 dH/dX/dY（:131-133，含 3 条失败早退路径） | 末尾 `cudaFree` ×3（:146） | ✅ 早退也逐个释放 |
+| `rta_gpu_available` 探针 d（:74） | `cudaFree`（:81） | ✅ |
+| `gpu_resample_cuda.cu` 全部 `cudaMalloc` | `cudaFree` | ✅（但见 9.4 遗留项） |
+
+流式函数本身用 pinned 内存是对的：`cudaMemcpyAsync`（:335/:343）要求 host 端是 pinned，
+否则不报错但退化成同步拷贝（正是 §2 注释里那 36→18 ms 的差距）。
+
+### 9.3 DLL 静态验证（本机无 CUDA 工具链：`cuobjdump` 不存在，改用自写 PE/fatbin 解析 + `dumpbin`）
+
+| 项 | 结果 |
+|---|---|
+| 字节 / sha256 | **1,009,664 B** / `411A9FD2F02850E35843B163C580C6CDB8C46864C68CFEE7D21C2FDAADB442B4`（与 PR 声明逐字符一致） |
+| PE | PE32+ x64，7 节，SizeOfImage 1,036,288，最大节末 = 1,009,664 = 文件长度 ⟹ **无截断**；`.nv_fatbin` 652,800 B |
+| `dumpbin /exports` | 8 个名字：7 个 `rta_*`（available / convolve / convolve_create / convolve_stream / convolve_destroy / resample / resample_invalidate）+ nvcc 自带的 `NvOptimusEnablementCuda` 数据符号 |
+| cubin（`-lelf` 等价） | **57 个 ELF，19 档 arch × 3**：50,52,53,60,61,62,70,72,75,80,86,87,89,90,100,101,103,120,121 —— 与 PR 声称的 19 档**一个不缺、无多余** |
+| PTX | `compute_121`（`.target sm_121`，PTX ISA `.version 8.8` = CUDA 12.9），`release 12.9` 字符串 |
+| 旧 DLL 对照 | 766,464 B / `BCE4093D…`：同样 19 档 57 cubin，但**导出只有 5 个、完全没有 `convolve_create/_stream/_destroy`**（`mac_stream_batch_kernel` 字符串也是 0）⟹ 仓库里那份产物是 **261026-08 之前**的，CUDA 用户此前一直拿不到流式会话 |
+| 反汇编 `rta_gpu_convolve_destroy`（RVA 0x3ff0, 176 B） | 4×`call 0x5290`（dH/dRing/dAcc/dX = `cudaFree`）、1×`call 0x6480`（stream destroy）、末 2×`call 0x53d0`（hX/hAcc）—— **后两次目标与前四次不同** ⟹ 二进制里真的是 `cudaFreeHost`，不是"只改了源码" |
+| 无 N 卡加载 | `LoadLibraryA` **成功**（本机无 `nvcuda.dll`）、7/7 `GetProcAddress` 命中、`rta_gpu_available()=0`、`create()=nullptr`、不崩 —— 与 `/api/gpu` 的 `cudaUsable` 机制一致 |
+
+### 9.4 HIP 侧门禁（本机 RX 9070 XT / gfx1201，本轮重编 `rtagpu.dll`：25 档含 `--offload-arch=gfx1201`）
+
+`ctest -R gpu` **3/3 通过**，且 `test_gpu_stream` 三档**是真 PASS 不是 SKIP**（`on_gpu()` 为真）：
+
+| IR | GPU vs CPU 流式 | max\|Δ\| |
+|---|---|---|---|
+| 1024 | −313.97 dB | 0 |
+| 8192 | −314.00 dB | 0 |
+| 65536 | −310.66 dB | 0 |
+
+`gpu_stream_check`：平凡 kernel 写 12345 读回 = 1；常量增益 `ir[0]=2`、输入全 1 ⟹ 输出 2，`max|y−2|=0`；
+四档（含 262144）全 PASS；任意切分 / `reset`（换 IR）全 PASS；整块接口回归 −145.2/−138.5/−131.1/−132.0 dB。
+`gpubench_conv`（生产路径 `GpuBridge::convolve`）：IR=262144 **2.9×**（22.63→7.92 ms）、相对 −138.4 dB；
+IR=65536 **2.0×**（8.07→3.96 ms）、−137.0 dB。
+
+⚠️ 这张表是 **HIP** 的成绩。HIP 的 `hipFree` 能收 pinned，所以**修复前后 HIP 不受影响** ——
+它证明的是"流式会话/destroy→create 这条路径在本机是通的"，不能拿来当 CUDA 修复的运行时证据。
+
+### 9.5 未验证项（铁律 4）
+
+1. **CUDA 运行时完全未验证**：本机无 N 卡、无 NVIDIA 驱动（`nvcuda.dll` 不存在），
+   `rta_gpu_available()=0`。PR 声称的 RTX 4080 上"destroy 后 create 永久失败"与修复后
+   `gpu_stream_check` 全 PASS / IR=262144 29.2 vs 158.6 ms（5.4×）**一条都没有在本机复现**。
+2. **PR 的"假绿"表格有一处对不上**：他写 `test_gpu_stream` 的 IR=65536/262144 是 SKIP，
+   但本仓库 `tests/test_gpu_stream.cpp:76` **只有 1024/8192/65536 三档，没有 262144**
+   （262144 只出现在 `tools/gpu_stream_check.cpp`）。另外"从第 2 个会话起永久失败"与
+   他表里 IR=8192 仍 PASS 也自相矛盾。**这些数字本轮无法核实，按未复现记录。**
+3. **"假绿"的判断本身成立**：`test_gpu_stream.cpp:105-108` 在 `on_gpu()==false` 时打印
+   `[SKIP]` 而不是 FAIL ⟹ 只要 create 建不起来，ctest 照样绿（铁律 3 的典型形态）。
+   建议后续把判据改成"**DLL 声明 stream_supported 且 available，却 create 失败 = FAIL**"。
+   `tests/` 不在本轮改动范围内，故只记录不改。
+4. **全 arch 实机覆盖**：19 档里本机连一档 CUDA 都跑不了，仍然只能靠静态证明"编进去了"（§7 第 5 项未变）。
+
+### 9.6 部署
+
+`cuda-artifacts/rtagpu_cuda.dll` → 两个 1.5.14 目录，逐字节核对 sha256 相同：
+`D:\RTA-hqplayer\dist\RLPlayer-1.5.14-win64\rtagpu_cuda.dll`、
+`D:\RTA-rel\dist\RLPlayer-1.5.14-win64\rtagpu_cuda.dll`（均为 1,009,664 B / `411A9FD2…`，原 766,464 B / `BCE4093D…`）。
+正在运行的 `rtaweb` 加载的是 HIP 版 `rtagpu.dll`，未持有该文件句柄；CUDA DLL 换了要**重启**才生效。
+
