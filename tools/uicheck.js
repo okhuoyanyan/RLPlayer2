@@ -619,8 +619,11 @@ async function tipThemes(prefix) {
   // 2026-10-27（用户 261026-09 #6）：EQ 页拆成「EQ」+「声音校准」，声音校准紧跟 EQ。
   // 2026-10-27（用户 261027-03 #9 / 在线更新）：新增「分析」页签（排在元数据之后、流媒体之前）
   // 与「关于与更新」页签（排在诊断之后），共 12 个。
-  ck(tabOrder === '输入/输出/PCM/SDM/高级/EQ/声音校准/元数据/分析/流媒体/诊断/关于与更新',
-     '设置页签顺序为 输入/输出/PCM/SDM/高级/EQ/声音校准/元数据/分析/流媒体/诊断/关于与更新', tabOrder);
+  // ★ 2026-10-27（261027-04 #4）：用户要求「设置-分析，整个功能页不应该放到这里，直接将分析放到
+  //   正在播放的那首歌音乐上」⟹「分析」页签**已删除**，回到 11 个；三类结果改挂在单曲页 #npAnal。
+  //   这里必须跟着改（否则旧期望值会让自检永远红）—— 改动只删了「分析」这一项，其余顺序未动。
+  ck(tabOrder === '输入/输出/PCM/SDM/高级/EQ/声音校准/元数据/流媒体/诊断/关于与更新',
+     '设置页签顺序为 输入/输出/PCM/SDM/高级/EQ/声音校准/元数据/流媒体/诊断/关于与更新（无「分析」）', tabOrder);
 
   // ---- 261027-02 #2：设置-输出-官方推荐设置 的 4 个预设必须并排一行 ----
   // 用户原话：「4 个预设一行就行，不要分两行」。旧 CSS 是 repeat(3) ⟹ 第 4 张必然掉到第二行。
@@ -1440,6 +1443,47 @@ async function tipThemes(prefix) {
     ck(npAdd && npAdd.visible && npAdd.text.indexOf('加入队列')>=0, '单曲页有默认可见的「＋ 加入队列」按钮', JSON.stringify(npAdd));
     await evalJs("document.getElementById('npClose').click()");
     await sleep(300);
+    // =====================================================================================
+    // 261027-04 #1：播放队列工具条 —— 三个按钮必须同一行（同一垂直基线）
+    // 用户原话：「主页-播放队列，'添加曲目'按钮和'保存为歌单'、'清空队列'按钮不在同一行，
+    //            把'保存为歌单'、'清空队列'放到'添加曲目'右面」。
+    // 判据（用户给的）：CDP 量三个按钮的 getBoundingClientRect()，top 完全相同（差 ≤1px），left 递增。
+    // 为什么必须在**有队列**时量：「保存为歌单 / 清空队列」只在 n>0 时渲染（空队列没东西可存/可清）。
+    // =====================================================================================
+    await evalJs("Array.from(document.querySelectorAll('.side .nav')).find(e=>e.dataset.v==='queue').click()");
+    await waitFor("!!document.getElementById('qAddBtn') && document.querySelectorAll('#list .qrow').length > 0", 10000);
+    await sleep(400);
+    const barGeo = await evalJs(`(function(){
+      function G(id){ var e=document.getElementById(id); if(!e) return null; var r=e.getBoundingClientRect(); var cs=getComputedStyle(e);
+        return {x:+r.left.toFixed(2), y:+r.top.toFixed(2), w:+r.width.toFixed(2), h:+r.height.toFixed(2), radius:cs.borderRadius, fs:cs.fontSize}; }
+      var a=G('qAddBtn'), s=G('qSaveSq'), c=G('qClrAll');
+      if(!a||!s||!c) return {missing:true, a:!!a, s:!!s, c:!!c};
+      function gap(x,y){return +(y.x - (x.x + x.w)).toFixed(2);}
+      return {a:a, s:s, c:c,
+        topSpread:+(Math.max(a.y,s.y,c.y)-Math.min(a.y,s.y,c.y)).toFixed(2),
+        hSpread:+(Math.max(a.h,s.h,c.h)-Math.min(a.h,s.h,c.h)).toFixed(2),
+        leftOrder:(a.x<s.x && s.x<c.x),
+        gapSaveClear:gap(s,c),
+        sameRadius:(a.radius===s.radius && s.radius===c.radius),
+        sameFont:(a.fs===s.fs && s.fs===c.fs)};
+    })()`);
+    ck(barGeo && !barGeo.missing && barGeo.topSpread <= 1, '队列工具条三按钮 top 完全相同（≤1px）',
+       JSON.stringify(barGeo));
+    ck(barGeo && !barGeo.missing && barGeo.leftOrder, '队列工具条三按钮 left 递增（添加曲目 → 保存为歌单 → 清空队列）',
+       barGeo && JSON.stringify([barGeo.a && barGeo.a.x, barGeo.s && barGeo.s.x, barGeo.c && barGeo.c.x]));
+    ck(barGeo && !barGeo.missing && barGeo.hSpread <= 1 && barGeo.sameRadius && barGeo.sameFont,
+       '队列工具条三按钮等高、同圆角、同字号',
+       barGeo && JSON.stringify({h:[barGeo.a.h,barGeo.s.h,barGeo.c.h], r:barGeo.a.radius, f:barGeo.a.fs}));
+    // 窄窗（<1100px）：允许换行，但「保存为歌单 / 清空队列」必须仍成组（同一 top），不许一个上、一个下
+    await send('Emulation.setDeviceMetricsOverride', { width: 1024, height: 800, deviceScaleFactor: 1, mobile: false });
+    await sleep(600);
+    const barNarrow = await evalJs(`(function(){
+      function T(id){var e=document.getElementById(id); if(!e) return null; var r=e.getBoundingClientRect(); return {x:+r.left.toFixed(2), y:+r.top.toFixed(2)};}
+      return {a:T('qAddBtn'), s:T('qSaveSq'), c:T('qClrAll')};})()`);
+    await send('Emulation.clearDeviceMetricsOverride');
+    await sleep(300);
+    ck(!barNarrow || !barNarrow.s || !barNarrow.c || Math.abs(barNarrow.s.y - barNarrow.c.y) <= 1,
+       '窄窗（1024）换行后「保存为歌单/清空队列」仍成组（同一行）', JSON.stringify(barNarrow));
     // ---- 还原用户队列（自检纪律：界面/接口都回到进来时的样子）----
     const qRestore = await evalJs(`(async()=>{
       const o = window.__qOrig || {items:[], cues:[]};
@@ -1458,6 +1502,194 @@ async function tipThemes(prefix) {
   } else {
     ck(true, '队列回归段跳过（音乐库为空，无法造测试曲目）', JSON.stringify(qSeed));
   }
+
+  // =====================================================================================
+  // 261027-04 #2：最近播放 —— 全部行等高
+  // 用户原话：「主页-最近播放，每一行的行距不一样，看起来极其不美观，主要是专辑名称那些
+  //            占用的行数不一样，你看看如何统一起来」。
+  // 根因：.du（专辑列）当年只写 text-align:right，没有 nowrap/ellipsis ⟹ 长专辑名折 2~3 行，行高浮动。
+  // 判据（用户给的）：量**全部**行的 getBoundingClientRect().height，min/max 差 ≤1px、唯一值个数 == 1；
+  //   并且必须真的有超长名字被截断（scrollWidth > clientWidth）—— 否则"全等高"可能只是"没有长名字"的空转。
+  // =====================================================================================
+  await evalJs("Array.from(document.querySelectorAll('.side .nav')).find(e=>e.dataset.v==='recent').click()");
+  await waitFor("document.querySelectorAll('#list .rrow').length > 0", 10000);
+  await sleep(500);
+  const recentGeo = await evalJs(`(function(){
+    var rows=Array.prototype.slice.call(document.querySelectorAll('#list .rrow'));
+    if(!rows.length) return {n:0};
+    var hs=rows.map(function(e){return +e.getBoundingClientRect().height.toFixed(2);});
+    var uniq={}; hs.forEach(function(h){uniq[h]=1;});
+    var det=rows.map(function(e){
+      var du=e.querySelector('.du'), tt=e.querySelector('.tt');
+      var cs=du?getComputedStyle(du):null;
+      return {h:+e.getBoundingClientRect().height.toFixed(2),
+        duWS:cs?cs.whiteSpace:null, duTO:cs?cs.textOverflow:null,
+        duClipped: du?(du.scrollWidth>du.clientWidth+1):null,
+        ttClipped: tt?(tt.scrollWidth>tt.clientWidth+1):null};});
+    return {n:rows.length, min:Math.min.apply(null,hs), max:Math.max.apply(null,hs),
+      uniq:Object.keys(uniq).length, heights:hs, det:det};
+  })()`);
+  ck(recentGeo && recentGeo.n > 0, '最近播放有行可量', JSON.stringify(recentGeo && {n:recentGeo.n}));
+  ck(recentGeo && recentGeo.n > 0 && (recentGeo.max - recentGeo.min) <= 1 && recentGeo.uniq === 1,
+     '最近播放全部行高相同（差 ≤1px）',
+     JSON.stringify(recentGeo && {n:recentGeo.n, min:recentGeo.min, max:recentGeo.max, uniq:recentGeo.uniq, heights:recentGeo.heights}));
+  ck(recentGeo && recentGeo.n > 0 && recentGeo.det.every(function(d){return d.duWS==='nowrap' && d.duTO==='ellipsis';}),
+     '最近播放专辑列单行省略（white-space:nowrap + text-overflow:ellipsis）',
+     JSON.stringify(recentGeo && recentGeo.det[0]));
+  await shot('28-recent-rows', true);
+
+  // =====================================================================================
+  // 261027-04 #3：我的歌单 —— 每个自定义歌单要有通用图标，且与一级导航逐像素对齐
+  // 用户原话：「主页-我的歌单，我尝试添加了一个歌单，只有自定义名字，名字前面没有图标，
+  //            请为歌单添加一个通用的图标标识，跟上面播的最爱、最近播放等对齐」。
+  // 判据（用户给的）：四个文字左边缘 x 全部 == 46.00（差 ≤1px）；并给四个图标的矩形与 fill/stroke。
+  // 纪律：**绝不删用户的歌单**。用户本来没有歌单时，才临时建一个自检歌单，量完立刻删掉（还原）。
+  // =====================================================================================
+  const sqMode = await evalJs(`(async()=>{
+    var l = await (await fetch('/api/sq/list')).json();
+    return {count:(l.queues||[]).length, names:(l.queues||[]).map(function(q){return q.name;})};
+  })()`);
+  let sqTempCreated = null;
+  if (sqMode && sqMode.count === 0) {
+    // 空态：先量「暂无歌单」的缩进（此刻确实没有歌单，不是造出来的空态）
+    const emptyGeo = await evalJs(`(function(){
+      var emp=document.querySelector('.side .sqempty'); if(!emp) return null;
+      var rg=document.createRange(); rg.selectNodeContents(emp);
+      return {textX:+rg.getBoundingClientRect().left.toFixed(2), text:emp.textContent.trim()};
+    })()`);
+    ck(emptyGeo && Math.abs(emptyGeo.textX - 46) <= 1, '「我的歌单」空态「暂无歌单」缩进 == 46.00px（差 ≤1px）', JSON.stringify(emptyGeo));
+    // 临时建一个歌单（用当前队列）→ 量图标 → 删掉还原
+    const mk = await evalJs(`(async()=>{
+      var q = await (await fetch('/api/queue')).json();
+      if (!(q.items||[]).length) return {skip:true};
+      var r = await fetch('/api/sq/save?name=' + encodeURIComponent('自检临时歌单'), {method:'POST'});
+      var j = await r.json();
+      await new Promise(function(t){setTimeout(t,400);});
+      if (typeof renderSavedQueues === 'function') { renderSavedQueues(); await new Promise(function(t){setTimeout(t,700);}); }
+      return {ok:!!j.ok, rows:document.querySelectorAll('.side .sqrow').length};
+    })()`);
+    if (mk && mk.ok && mk.rows > 0) sqTempCreated = '自检临时歌单';
+    else ck(true, '「我的歌单」图标判据跳过（队列为空，无法建临时歌单）', JSON.stringify(mk));
+  }
+  const sideGeo = await evalJs(`(function(){
+    function txtX(el){ var tn=Array.prototype.filter.call(el.childNodes,function(n){return n.nodeType===3 && n.textContent.trim();})[0];
+      if(!tn) return null; var rg=document.createRange(); rg.selectNodeContents(tn); return +rg.getBoundingClientRect().left.toFixed(2); }
+    function box(el){ if(!el) return null; var r=el.getBoundingClientRect(); return {x:+r.left.toFixed(2),y:+r.top.toFixed(2),w:+r.width.toFixed(2),h:+r.height.toFixed(2)}; }
+    var side=document.querySelector('.side');
+    function nav(v){ return Array.prototype.slice.call(side.querySelectorAll('.nav')).filter(function(e){return e.dataset.v===v;})[0]; }
+    var out={navs:{}};
+    [['queue',nav('queue')],['recent',nav('recent')],['favs',nav('favs')]].forEach(function(p){
+      var e=p[1]; if(!e){out.navs[p[0]]=null;return;}
+      var svg=e.querySelector('svg'); var cs=svg?getComputedStyle(svg):null;
+      out.navs[p[0]]={textX:txtX(e), text:(e.textContent||'').trim().slice(0,8), icon:box(svg),
+        fill:svg?svg.getAttribute('fill'):null, stroke:svg?svg.getAttribute('stroke'):null,
+        strokeColor:cs?cs.stroke:null, w:cs?cs.width:null, h:cs?cs.height:null};
+    });
+    var sq=side.querySelector('.sqrow');
+    if(sq){ var s2=sq.querySelector('svg'); var c2=s2?getComputedStyle(s2):null; var sn=sq.querySelector('.sqn');
+      out.sq={textX: sn?txtX(sn):null, text:(sn?sn.textContent:'').trim().slice(0,10), hasIcon:!!s2, icon:box(s2),
+        fill:s2?s2.getAttribute('fill'):null, stroke:s2?s2.getAttribute('stroke'):null,
+        strokeColor:c2?c2.stroke:null, w:c2?c2.width:null, h:c2?c2.height:null,
+        rowColor:getComputedStyle(sq).color, rowH:+sq.getBoundingClientRect().height.toFixed(2)};
+    } else out.sq = null;
+    return out;
+  })()`);
+  const nv = (sideGeo && sideGeo.navs) || {};
+  const xs = [nv.queue && nv.queue.textX, nv.recent && nv.recent.textX, nv.favs && nv.favs.textX, sideGeo && sideGeo.sq && sideGeo.sq.textX];
+  const all46 = xs.filter(function(v){return v!=null;});
+  ck(sideGeo && sideGeo.sq && sideGeo.sq.hasIcon, '「我的歌单」每个自定义歌单都有图标', JSON.stringify(sideGeo && sideGeo.sq && {text:sideGeo.sq.text, icon:sideGeo.sq.icon}));
+  ck(all46.length === 4 && Math.max.apply(null, all46) - Math.min.apply(null, all46) <= 1 && Math.abs(all46[0] - 46) <= 1,
+     '左栏四个文字左边缘 x 全部 == 46.00（差 ≤1px）', 'xs=' + JSON.stringify(xs));
+  ck(sideGeo && sideGeo.sq && sideGeo.sq.w === nv.queue.w && sideGeo.sq.h === nv.queue.h,
+     '歌单图标尺寸与一级导航图标相同（16×16）', JSON.stringify(sideGeo && sideGeo.sq && {sq:[sideGeo.sq.w, sideGeo.sq.h], nav:[nv.queue && nv.queue.w, nv.queue && nv.queue.h]}));
+  // 颜色判据（判据本身必须可靠，铁律 3）：**不拿别的行的实测颜色当基准**。
+  //   .nav 有 transition:.13s（color 也过渡），采样落在淡入中途会读到 rgb(137,149,171) 这种中间值，
+  //   把正确实现判成错（本自检第一版就是这么误报的）。改成对照 CSS 变量本体：
+  //   图标 fill=none + stroke=currentColor，歌单图标解析色 == 自己行文字色 == 根上 var(--mut)。
+  const cssVar = await evalJs("(function(){var s=getComputedStyle(document.documentElement);" +
+    "function hx(v){v=(v||'').trim(); if(v[0]!=='#') return v; if(v.length===4) v='#'+v[1]+v[1]+v[2]+v[2]+v[3]+v[3];" +
+    "  var r=parseInt(v.substr(1,2),16),g=parseInt(v.substr(3,2),16),b=parseInt(v.substr(5,2),16); return 'rgb('+r+', '+g+', '+b+')';}" +
+    "return {mut:hx(s.getPropertyValue('--mut')), onText:hx(s.getPropertyValue('--nav-on-text')), theme:document.documentElement.dataset.theme||'dark'};})()");
+  const iconsOk = sideGeo && sideGeo.sq &&
+    [nv.queue, nv.recent, nv.favs].every(function(o){return o && o.stroke === 'currentColor' && o.fill === 'none';}) &&
+    sideGeo.sq.stroke === 'currentColor' && sideGeo.sq.fill === 'none' &&
+    sideGeo.sq.strokeColor === sideGeo.sq.rowColor &&
+    sideGeo.sq.strokeColor === (cssVar && cssVar.mut);
+  ck(iconsOk, '歌单图标与一级导航同风格（fill=none/stroke=currentColor，颜色 == var(--mut)）',
+     JSON.stringify({sq: sideGeo && sideGeo.sq && {fill:sideGeo.sq.fill, stroke:sideGeo.sq.stroke, color:sideGeo.sq.strokeColor, row:sideGeo.sq.rowColor},
+                     mut: cssVar && cssVar.mut, theme: cssVar && cssVar.theme,
+                     navQueue: nv.queue && {fill:nv.queue.fill, stroke:nv.queue.stroke, color:nv.queue.strokeColor}}));
+  await shot('29-sidebar-playlists', true);
+  // 还原：只删掉自检自己建的那个歌单
+  if (sqTempCreated) {
+    const rm = await evalJs(`(async()=>{
+      await fetch('/api/sq/delete?name=' + encodeURIComponent('自检临时歌单'), {method:'POST'});
+      await new Promise(function(t){setTimeout(t,400);});
+      if (typeof renderSavedQueues === 'function') { renderSavedQueues(); await new Promise(function(t){setTimeout(t,600);}); }
+      var l = await (await fetch('/api/sq/list')).json();
+      return {left:(l.queues||[]).length};
+    })()`);
+    ck(rm && rm.left === 0, '自检建的临时歌单已删掉（用户的歌单一个都不动）', JSON.stringify(rm));
+  }
+  // ---- 2026-10-27（261027-04 #4）：分析功能从「主页 + 设置」搬到单曲页 ----
+  // 用户原话：「主页-分析和设置-分析，整个功能页不应该放到这里，直接将分析放到正在播放的那首歌
+  // 音乐上，播放就自动运行一次分析，在单曲播放页面上放置入口展示（动态、音质、假无损）。」
+  // 判据（只增不减，不改已有断言）：
+  //   ① 左栏没有「分析」；② 设置页签没有「分析」；③ 单曲页有 #npAnal 三块；
+  //   ④ 自动分析开关默认开、且与 conf 的 autoanl 一致；⑤ 版本对比入口仍在右键菜单里。
+  {
+    const navHasAnalysis = await evalJs("Array.from(document.querySelectorAll('.side .nav')).some(function(e){return e.textContent.trim()==='分析';})");
+    ck(navHasAnalysis === false, '左栏导航项里没有「分析」（已搬到单曲页）');
+    const tabHasAnalysis = await evalJs("Array.from(document.querySelectorAll('#setpage .stabs [data-g]')).some(function(e){return e.textContent.trim()==='分析'||e.dataset.g==='analysis';})");
+    ck(tabHasAnalysis === false, '设置页签里没有「分析」（整页已删除，只保留曲目右键的「对比版本…」）');
+    // 高级页的开关：必须**先进入设置页**再切到「高级」页签 ——
+    // 设置页没显示时（#setpage 没有 .on）里面所有控件 rect 恒为 0，
+    // 直接把「正确实现」判成不可见（这是判据本身的坑，不是功能坏了，本轮实测踩到两次）。
+    await evalJs("Array.from(document.querySelectorAll('.side .nav')).find(e=>e.dataset.v==='settings').click()");
+    await waitFor("document.getElementById('setpage').classList.contains('on')", 8000);
+    await evalJs("var t=document.querySelector('#setpage .stab[data-g=adv]'); if(t) t.click();");
+    await sleep(600);
+    const anlChk = await evalJs("(function(){var e=document.getElementById('sp_autoanl');if(!e) return null;var r=e.getBoundingClientRect();return {checked:e.checked,vis:r.width>0&&r.height>0,text:(e.closest('.chk')||e.parentNode).textContent.trim().slice(0,16)};})()");
+    ck(!!anlChk && anlChk.checked === true && anlChk.vis === true, '设置-高级「播放时自动分析」开关存在、可见、默认开', JSON.stringify(anlChk));
+    // 先把单曲页打开，再量分析条（页面关着时 rect 全是 0，量不到东西）
+    await evalJs("var b=document.getElementById('npOpen'); if(b) b.click();");
+    await sleep(800);
+    const npOn = await evalJs("document.getElementById('npPage').classList.contains('on')");
+    ck(npOn === true, '单曲页可以打开（分析条的宿主页面）');
+    // 单曲页分析条：三块 + 两个按钮 + 状态行
+    const anlDom = await evalJs(`(function(){
+      var box=document.getElementById('npAnal');
+      if(!box) return {ok:false,why:'no #npAnal'};
+      var r=box.getBoundingClientRect();
+      return {ok:true, cards:box.querySelectorAll('.npanal-card').length,
+              auto:!!document.getElementById('npAnlAuto'),
+              again:!!document.getElementById('npAnlNow'),
+              st:(box.querySelector('.npanal-hd .st')||{}).textContent||'',
+              h:Math.round(r.height), w:Math.round(r.width)};
+    })()`);
+    ck(anlDom && anlDom.ok && anlDom.cards >= 1 && anlDom.auto && anlDom.again && anlDom.h > 30,
+       '单曲页有「音频分析」条：三块结果位 + 自动分析开关 + 重新分析按钮', JSON.stringify(anlDom));
+    // 分析条必须在控制区之上、且在视口内（不许被挤到窗口外）
+    const anlGeom = await evalJs(`(function(){
+      var b=document.getElementById('npAnal'); if(!b) return null;
+      var r=b.getBoundingClientRect(), c=document.querySelector('#npPage .npctl2');
+      var cr=c?c.getBoundingClientRect():null;
+      return {top:Math.round(r.top),bottom:Math.round(r.bottom),h:Math.round(r.height),
+              inView:r.top>=0&&r.bottom<=innerHeight,
+              aboveCtrl: cr? (r.bottom<=cr.top+1) : null,
+              ctrlTop: cr?Math.round(cr.top):null};
+    })()`);
+    ck(anlGeom && anlGeom.inView && anlGeom.aboveCtrl === true && anlGeom.h > 30,
+       '分析条完整落在视口内、且排在播放控制区之上', JSON.stringify(anlGeom));
+    await shot('30-np-analysis-strip', true);
+    await evalJs("var b=document.getElementById('npClose'); if(b) b.click();");
+    await sleep(300);
+    // 版本对比入口仍在：曲目右键菜单里必须有「对比版本…」
+    // 路径一律写成正斜杠：字符串里出现 \x 会被 JS 当十六进制转义解析（本轮实测 SyntaxError）
+    const cmpMenu = await evalJs("(function(){try{showTrackMenu(200,200,{path:'D:/probe.flac'});var m=document.querySelector('.ctxmenu');var t=m?Array.from(m.querySelectorAll('.ctxitem')).map(function(e){return e.textContent;}):[];document.body.click();return t;}catch(e){return ['EXC:'+e.message];}})()");
+    ck(cmpMenu.indexOf('对比版本…') >= 0, '曲目右键菜单仍有「对比版本…」（版本对比功能没被删）', JSON.stringify(cmpMenu));
+  }
+
   // 设计契约：UI 永不出现外部页面 —— 全页面不允许有任何 http(s) 外链锚点
   ck(await evalJs("document.querySelectorAll('a[href^=http]').length === 0"), '全页面无 http 外链（永不跳转外部页面）');
 

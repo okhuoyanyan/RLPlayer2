@@ -431,6 +431,14 @@ target_include_directories(test_dizzylab PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_dizzylab PRIVATE winhttp)        # provider.h → http_client.h
 add_test(NAME dizzylab COMMAND test_dizzylab)
 
+# 网页取图 / URL 安全策略 / 图片闸（261026-04 #7/#9，2026-10-27）：全离线纯函数。
+# 覆盖六路抽取（og/twitter/JSON-LD/image_src/itemprop/JS 变量/<img>）、域名白名单删除后的
+# 公网判据、1×1 占位图必须被拒、简繁/去括号的名字验收，以及扩展源"只认同名"的纪律。
+add_executable(test_artpage tests/test_artpage.cpp)
+target_include_directories(test_artpage PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_artpage PRIVATE winhttp)   # artwork.h → http_client.h
+add_test(NAME artpage COMMAND test_artpage)
+
 # P2 写回 PCM 逐位门禁(writeback.h):需要环境里有 ffmpeg/ffprobe —— 工具缺失即测试
 # 失败,不跳过(门禁就是要在有 ffmpeg 的环境跑)。素材现场生成于 %TEMP%,不碰 MUSIC。
 add_executable(test_writeback tests/test_writeback.cpp)

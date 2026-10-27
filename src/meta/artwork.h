@@ -1276,4 +1276,1089 @@ inline ArtistProfileResult artwork_fetch_artist_profile(const std::string& rawNa
     return res;
 }
 
+
+// ===========================================================================
+// 9) 网页取图（2026-10-27，用户 261026-04 #7 / #9 的根因修复）
+// ===========================================================================
+// 上一轮（build-v13，15:14）实测：API 兜底"机制通、命中 0/6" —— 日志里确实抓了候选页
+// （<code>APIART/COV og page=... htmlLen=...</code>），但几乎全是 <code>ogImage=[]</code>：
+//   ① dizzylab 的 /d/ 页是 Vue SPA，**没有** og:image（htmlLen=10922 全是框架）；
+//   ② anilist.co/character 同样是 SPA（htmlLen=4907）；
+//   ③ 模型抓回来的 web_fetch 是**剥掉图片的 Markdown**（llm.h 的 ds_fetch 明说这一点），
+//      指望模型"看图给直链"结构上不可能；
+//   ④ 只有 anihk.com 这种"服务端渲染 + og:image"的页面命中（Mugai无害P，28694 B）。
+// 结论：**图不在 og:image 一个地方**。本段提供三样东西，全部是纯函数（可离线单测）：
+//   · art_page_image_candidates() 多策略抽取（og / twitter / JSON-LD / image_src / itemprop /
+//     JS 变量 / <img> 启发式），每条候选带 kind 与 score，按分排序；
+//   · art_url_public_ok() 安全策略：**不再用域名白名单**（上一轮 url_reject 过严的根因之一），
+//     改成"公网可访问性"判据 —— 非 http(s)、userinfo、非 80/443、IP 字面量、回环/内网一律拒；
+//   · art_image_dims() 尺寸校验（PNG/JPEG/GIF/WebP）：1×1 占位图、追踪像素必须被拒。
+// 再加一档**确定性源**（art_ext_artist_image）：bangumi / AniList / Apple Music。
+// 为什么放这里而不是能力矩阵（provider.h）：本轮 provider.h 归另一个代理，且这三家是
+// "网页/半结构化 API"而不是"音频平台"，走 API 兜底阶段更符合用户"satisfied by API"的意图。
+
+// ---- 9.1 URL 分解 / 拼装 / 安全策略（纯函数） ----
+struct ArtUrlParts {
+    bool valid = false;
+    bool https = false;
+    std::string scheme, host;      // host 已小写、已去端口
+    int port = 0;
+    std::string full;              // 原串（去首尾空白后）
+};
+
+inline std::string art_ascii_lower(const std::string& s) {
+    std::string o = s;
+    for (char& c : o)
+        if (static_cast<unsigned char>(c) < 0x80 && c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return o;
+}
+
+inline ArtUrlParts art_url_parts(const std::string& raw) {
+    ArtUrlParts u;
+    size_t b = 0;
+    size_t e = raw.size();
+    while (b < e && static_cast<unsigned char>(raw[b]) <= 0x20) ++b;
+    while (e > b && static_cast<unsigned char>(raw[e - 1]) <= 0x20) --e;
+    if (e <= b) return u;
+    const std::string s = raw.substr(b, e - b);
+    const size_t p = s.find("://");
+    if (p == std::string::npos) return u;
+    std::string scheme = art_ascii_lower(s.substr(0, p));
+    if (scheme != "http" && scheme != "https") return u;
+    size_t hs = p + 3;
+    size_t he = s.size();
+    for (size_t i = hs; i < s.size(); ++i)
+        if (s[i] == '/' || s[i] == '?' || s[i] == '#') { he = i; break; }
+    const std::string auth = s.substr(hs, he - hs);
+    if (auth.empty()) return u;
+    if (auth.find('@') != std::string::npos) return u;      // userinfo ⟹ 不认（SSRF 常用手法）
+    std::string host = auth;
+    int port = (scheme == "https") ? 443 : 80;
+    const size_t colon = auth.rfind(':');
+    if (colon != std::string::npos) {
+        host = auth.substr(0, colon);
+        const std::string ps = auth.substr(colon + 1);
+        if (ps.empty() || ps.size() > 5) return u;
+        for (char c : ps)
+            if (c < '0' || c > '9') return u;
+        port = std::atoi(ps.c_str());
+    }
+    host = art_ascii_lower(host);
+    if (host.empty() || host.front() == '[' || host.front() == '.' || host.back() == '.' ||
+        host.find("..") != std::string::npos) return u;
+    for (unsigned char c : host)
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.')) return u;
+    u.valid = true;
+    u.https = (scheme == "https");
+    u.scheme = scheme;
+    u.host = host;
+    u.port = port;
+    u.full = s;
+    return u;
+}
+
+// 公网可访问性：只拒"不该从外部访问的位置"，**不按域名白名单**（白名单是上一轮 0 命中的根因之一）。
+inline bool art_host_public(const std::string& host, std::string* why) {
+    if (host.empty()) { if (why) *why = "empty_host"; return false; }
+    if (host == "localhost" || host == "::1" || host.rfind("localhost.", 0) == 0) {
+        if (why) *why = "loopback"; return false;
+    }
+    bool digitDot = true;
+    for (unsigned char c : host)
+        if (!((c >= '0' && c <= '9') || c == '.')) { digitDot = false; break; }
+    if (digitDot) { if (why) *why = "ip_literal"; return false; }     // 补图不需要直连 IP
+    if (host.find(':') != std::string::npos) { if (why) *why = "ip_literal"; return false; }
+    if (host.rfind("127.", 0) == 0 || host.rfind("10.", 0) == 0 || host.rfind("192.168.", 0) == 0 ||
+        host.rfind("169.254.", 0) == 0 || host.rfind("0.", 0) == 0) {
+        if (why) *why = "private_ip"; return false;
+    }
+    if (host.rfind("172.", 0) == 0) {
+        const size_t d = host.find('.', 4);
+        if (d != std::string::npos) {
+            const int o2 = std::atoi(host.substr(4, d - 4).c_str());
+            if (o2 >= 16 && o2 <= 31) { if (why) *why = "private_ip"; return false; }
+        }
+    }
+    if (host.rfind("100.64.", 0) == 0 || host.rfind("198.18.", 0) == 0) {
+        if (why) *why = "private_ip"; return false;
+    }
+    return true;
+}
+
+// 可下载吗：http(s) + 公网主机 + 端口 80/443 + 长度合理。
+// **故意不检查扩展名**：网易云 / dizzylab / QQ 的图床大量是 "?param=300y300"、"!cover" 这种形态。
+inline bool art_url_public_ok(const std::string& raw, std::string* why) {
+    if (raw.size() > 2048) { if (why) *why = "too_long"; return false; }
+    const ArtUrlParts u = art_url_parts(raw);
+    if (!u.valid) { if (why) *why = "bad_url"; return false; }
+    if (u.port != 80 && u.port != 443) { if (why) *why = "odd_port"; return false; }
+    if (!art_host_public(u.host, why)) return false;
+    if (why) why->clear();
+    return true;
+}
+
+inline std::string art_html_unescape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        if (s[i] == '&') {
+            if (i + 4 <= s.size() && s.compare(i, 4, "&amp") == 0) { o += '&'; i += 4; continue; }
+            if (i + 5 <= s.size() && s.compare(i, 5, "&quot") == 0) { o += '"'; i += 5; continue; }
+            if (i + 5 <= s.size() && s.compare(i, 5, "&#039") == 0) { o += '\''; i += 5; continue; }
+            if (i + 4 <= s.size() && s.compare(i, 4, "&#47") == 0) { o += '/'; i += 4; continue; }
+            if (i + 6 <= s.size() && s.compare(i, 6, "&nbsp;") == 0) { o += ' '; i += 6; continue; }
+        }
+        if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '/') { o += '/'; i += 2; continue; }   // JSON 里的 "\/"
+        o += s[i++];
+    }
+    return o;
+}
+
+// 相对 → 绝对（head 里大量 "/path"、"//host/path"）。
+inline std::string art_url_abs(const std::string& base, const std::string& refRaw) {
+    std::string ref = refRaw;
+    size_t b = 0, e = ref.size();
+    while (b < e && static_cast<unsigned char>(ref[b]) <= 0x20) ++b;
+    while (e > b && static_cast<unsigned char>(ref[e - 1]) <= 0x20) --e;
+    ref = ref.substr(b, e - b);
+    if (ref.empty()) return std::string();
+    if (ref.rfind("data:", 0) == 0 || ref.rfind("blob:", 0) == 0 || ref.rfind("javascript:", 0) == 0)
+        return std::string();
+    const std::string low = art_ascii_lower(ref);
+    if (low.rfind("http://", 0) == 0 || low.rfind("https://", 0) == 0) return ref;
+    const ArtUrlParts bu = art_url_parts(base);
+    if (!bu.valid) return std::string();
+    if (ref.size() >= 2 && ref[0] == '/' && ref[1] == '/') return bu.scheme + ":" + ref;
+    const std::string root = bu.scheme + "://" + bu.host +
+                             ((bu.port != 80 && bu.port != 443) ? (":" + std::to_string(bu.port)) : std::string());
+    if (ref[0] == '/') return root + ref;
+    // 相对路径：取 base 的目录部分
+    std::string dir = bu.full;
+    const size_t q = dir.find_first_of("?#");
+    if (q != std::string::npos) dir = dir.substr(0, q);
+    const size_t sl = dir.find_last_of('/');
+    if (sl == std::string::npos || sl <= bu.scheme.size() + 2) return root + "/" + ref;
+    dir = dir.substr(0, sl + 1);
+    while (ref.rfind("../", 0) == 0) {
+        ref = ref.substr(3);
+        const size_t p2 = dir.find_last_of('/', dir.size() - 2);
+        dir = (p2 == std::string::npos) ? root + "/" : dir.substr(0, p2 + 1);
+    }
+    return dir + ref;
+}
+
+// ---- 9.2 多策略取图 ----
+struct ArtImgCand {
+    std::string url;      // 绝对 URL（已去引号/实体）
+    std::string kind;      // og:image / twitter:image / json-ld / image_src / itemprop / jsvar / img
+    int score = 0;
+};
+
+inline bool art_looks_image_url(const std::string& u) {
+    const std::string l = art_ascii_lower(u);
+    if (l.empty()) return false;
+    if (l.rfind("data:", 0) == 0 || l.rfind("blob:", 0) == 0) return false;
+    if (l.find(".svg") != std::string::npos) return false;          // 矢量图/图标，不当封面
+    static const char* kExt[] = { ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif" };
+    for (const char* x : kExt)
+        if (l.find(x) != std::string::npos) return true;
+    if (l.find("param=") != std::string::npos) return true;          // 网易云 ?param=300y300
+    if (l.find("/image") != std::string::npos || l.find("avatar") != std::string::npos ||
+        l.find("photo") != std::string::npos || l.find("img") != std::string::npos) return true;
+    return false;
+}
+
+// 从标签串里取属性值（tag 必须是**小写副本**，返回值也来自小写副本 —— 非 ASCII 字节大小写折叠不动）
+inline std::string art_tag_attr(const std::string& tag, const char* name) {
+    const std::string n = art_ascii_lower(name);
+    size_t p = 0;
+    while ((p = tag.find(n, p)) != std::string::npos) {
+        const bool leftOk = (p == 0) || tag[p - 1] == ' ' || tag[p - 1] == '\t' ||
+                            tag[p - 1] == '\n' || tag[p - 1] == '\r' || tag[p - 1] == '/' ||
+                            tag[p - 1] == '"' || tag[p - 1] == '\'';
+        size_t q = p + n.size();
+        if (!leftOk) { p = q; continue; }
+        while (q < tag.size() && (tag[q] == ' ' || tag[q] == '\t' || tag[q] == '\n' || tag[q] == '\r')) ++q;
+        if (q >= tag.size() || tag[q] != '=') { p = q; continue; }
+        ++q;
+        while (q < tag.size() && (tag[q] == ' ' || tag[q] == '\t' || tag[q] == '\n' || tag[q] == '\r')) ++q;
+        if (q >= tag.size()) return std::string();
+        std::string v;
+        if (tag[q] == '"' || tag[q] == '\'') {
+            const char qc = tag[q++];
+            while (q < tag.size() && tag[q] != qc) v += tag[q++];
+        } else {
+            while (q < tag.size() && tag[q] != ' ' && tag[q] != '>' && tag[q] != '\t' &&
+                   tag[q] != '\n' && tag[q] != '\r') v += tag[q++];
+        }
+        return v;
+    }
+    return std::string();
+}
+
+// 把一段"非结构化"文本里的第一个像图片的 URL 抠出来（JSON-LD / JS 变量共用）。
+inline std::string art_first_image_url_in(const std::string& text, size_t from, size_t limit) {
+    const size_t end = (limit == 0 || from + limit > text.size()) ? text.size() : from + limit;
+    size_t i = from;
+    while (i < end) {
+        const size_t h = text.find("http", i);
+        const size_t q1 = text.find('"', i);
+        const size_t q2 = text.find('\'', i);
+        size_t start = std::string::npos;
+        char quote = 0;
+        if (h != std::string::npos && h < end) { start = h; quote = 0; }
+        if (q1 != std::string::npos && q1 < end && (start == std::string::npos || q1 < start)) {
+            // 引号里可能是 "/path" 形式的相对路径
+            if (q1 + 1 < end) { start = q1 + 1; quote = '"'; }
+        }
+        if (q2 != std::string::npos && q2 < end && (start == std::string::npos || q2 < start)) {
+            if (q2 + 1 < end) { start = q2 + 1; quote = '\''; }
+        }
+        if (start == std::string::npos) return std::string();
+        size_t e = start;
+        if (quote) {
+            while (e < end && text[e] != quote) ++e;
+        } else {
+            while (e < end && text[e] != '"' && text[e] != '\'' && text[e] != ' ' &&
+                   text[e] != ')' && text[e] != ']' && text[e] != ',' && text[e] != '\\' &&
+                   text[e] != '>' && text[e] != '<' && text[e] != '\n' && text[e] != '\r') ++e;
+        }
+        std::string v = art_html_unescape(text.substr(start, e - start));
+        if (art_looks_image_url(v)) return v;
+        i = (e > i) ? e : i + 1;
+    }
+    return std::string();
+}
+
+// 页面 → 候选图（按 score 降序、URL 去重）。nameHint 只用于 <img> 的 alt/title 加权。
+inline std::vector<ArtImgCand> art_page_image_candidates(const std::string& html,
+                                                         const std::string& baseUrl,
+                                                         const std::string& nameHint = std::string()) {
+    std::vector<ArtImgCand> out;
+    if (html.empty()) return out;
+    const std::string low = art_ascii_lower(html);
+    const std::string hint = art_ascii_lower(nameHint);
+    auto push = [&](const std::string& raw, const char* kind, int score) {
+        if (raw.empty()) return;
+        const std::string abs = art_url_abs(baseUrl, raw);
+        if (abs.empty()) return;
+        std::string probe;
+        if (!art_url_public_ok(abs, &probe)) return;
+        for (const ArtImgCand& c : out)
+            if (c.url == abs) return;                          // 去重（先到先得 = 高分先到）
+        ArtImgCand c;
+        c.url = abs;
+        c.kind = kind;
+        c.score = score;
+        out.push_back(std::move(c));
+    };
+
+    // ① <meta ...>：og:image / og:image:secure_url / twitter:image / twitter:image:src / thumbnail
+    for (size_t i = 0; (i = low.find("<meta", i)) != std::string::npos;) {
+        size_t e = low.find('>', i);
+        if (e == std::string::npos) e = std::min(low.size(), i + 600);
+        const std::string tag = low.substr(i, e - i);
+        std::string key = art_tag_attr(tag, "property");
+        if (key.empty()) key = art_tag_attr(tag, "name");
+        if (key.empty()) key = art_tag_attr(tag, "itemprop");
+        std::string val = art_tag_attr(tag, "content");
+        if (val.empty()) val = art_tag_attr(tag, "value");
+        if (!key.empty() && !val.empty()) {
+            if (key == "og:image:secure_url")     push(val, "og:secure", 104);
+            else if (key == "og:image" || key == "og:image:url") push(val, "og:image", 103);
+            else if (key == "twitter:image")      push(val, "twitter", 100);
+            else if (key == "twitter:image:src")  push(val, "twitter", 99);
+            else if (key == "thumbnail" || key == "thumbnailurl" || key == "image") push(val, "meta", 96);
+            else if (key == "itemprop:image")     push(val, "itemprop", 92);
+        }
+        i = e + 1;
+    }
+    // ② <link rel="image_src" href="..."> / rel="apple-touch-icon" 不收（小图标）
+    for (size_t i = 0; (i = low.find("<link", i)) != std::string::npos;) {
+        size_t e = low.find('>', i);
+        if (e == std::string::npos) e = std::min(low.size(), i + 600);
+        const std::string tag = low.substr(i, e - i);
+        const std::string rel = art_tag_attr(tag, "rel");
+        if (rel.find("image_src") != std::string::npos) push(art_tag_attr(tag, "href"), "image_src", 94);
+        i = e + 1;
+    }
+    // ③ itemprop="image"（img / meta / link 都见过）
+    for (size_t i = 0; (i = low.find("itemprop=\"image\"", i)) != std::string::npos;) {
+        size_t s = (i > 300) ? i - 300 : 0;
+        size_t e = std::min(low.size(), i + 500);
+        const std::string tag = low.substr(s, e - s);
+        std::string v = art_tag_attr(tag, "content");
+        if (v.empty()) v = art_tag_attr(tag, "src");
+        if (v.empty()) v = art_tag_attr(tag, "href");
+        push(v, "itemprop", 92);
+        i += 16;
+    }
+    // ④ JSON-LD：<script type="application/ld+json">…</script> 里的 image / thumbnailUrl
+    for (size_t i = 0; (i = low.find("application/ld+json", i)) != std::string::npos;) {
+        const size_t s = low.find('>', i);
+        if (s == std::string::npos) break;
+        size_t e = low.find("</script", s);
+        if (e == std::string::npos) e = low.size();
+        const std::string block = low.substr(s + 1, e - s - 1);
+        for (const char* key : { "\"image\"", "\"thumbnailurl\"", "\"primaryimageofpage\"" }) {
+            size_t p = 0;
+            while ((p = block.find(key, p)) != std::string::npos) {
+                const size_t colon = block.find(':', p + std::strlen(key));
+                if (colon != std::string::npos)
+                    push(art_first_image_url_in(block, colon + 1, 400), "json-ld", 90);
+                p += std::strlen(key);
+            }
+        }
+        i = e + 8;
+    }
+    // ⑤ JS/内联 JSON 变量：'pic' / 'cover' / 'avatar' / 'img1v1Url' / 'singerPic' …
+    //    这条路是"宽松兜底"，所以只在**值确实像图片**时收（下载侧还有魔数/尺寸两道闸）。
+    for (const char* key : { "\"pic\"", "\"picurl\"", "\"cover\"", "\"coverurl\"", "\"avatar\"",
+                             "\"avatarurl\"", "\"headimg\"", "\"img1v1url\"", "\"singerpic\"",
+                             "\"artistpic\"", "\"albumcover\"", "\"imgurl\"", "\"imageurl\"" }) {
+        size_t p = 0;
+        while ((p = low.find(key, p)) != std::string::npos) {
+            size_t q = p + std::strlen(key);
+            while (q < low.size() && (low[q] == ' ' || low[q] == '\t' || low[q] == '\n' || low[q] == '\r')) ++q;
+            if (q >= low.size() || low[q] != ':') { p = q + 1; continue; }
+            push(art_first_image_url_in(low, q + 1, 300), "jsvar", 70);
+            p = q + 1;
+        }
+    }
+    // ⑥ <img> 启发式（最后兜底）：按 class/alt/文件名 + 尺寸属性打分；图标/logo/占位一律跳过
+    // 站点家具（2026-10-27 实测踩到的坑）：dizzylab 有个 /static/dl-n1.jpg（867x225 站招横幅），
+    // 它既过魔数也过尺寸，于是被当成"Mugai无害P 的头像"落盘了 —— 错图比空白更糟，必须在这层拦住。
+    static const char* kBad[] = { "logo", "icon", "sprite", "placeholder", "blank", "spacer", "1x1",
+                                  "pixel", "loading", "nophoto", "no-photo", "noimage", "no-image",
+                                  "default_avatar", "defaultavatar", "banner", "qrcode",
+                                  "/static/", "/assets/", "/theme/", "/skin/", "/template/",
+                                  "/common/", "/shared/", "favicon", "avatar_default",
+                                  "share-", "btn-", "-btn", "nav-", "-nav", "header", "footer",
+                                  "watermark", "qlogo" };
+    for (size_t i = 0; (i = low.find("<img", i)) != std::string::npos;) {
+        size_t e = low.find('>', i);
+        if (e == std::string::npos) e = std::min(low.size(), i + 800);
+        const std::string tag = low.substr(i, e - i);
+        std::string src = art_tag_attr(tag, "src");
+        if (src.empty()) src = art_tag_attr(tag, "data-src");
+        if (src.empty()) src = art_tag_attr(tag, "data-original");
+        if (!src.empty()) {
+            const std::string sl = art_ascii_lower(src);
+            bool bad = false;
+            for (const char* b2 : kBad)
+                if (sl.find(b2) != std::string::npos) { bad = true; break; }
+            if (!bad) {
+                int sc = 20;
+                const std::string alt = art_tag_attr(tag, "alt") + " " + art_tag_attr(tag, "title") + " " +
+                                        art_tag_attr(tag, "class");
+                if (sl.find("avatar") != std::string::npos || sl.find("head") != std::string::npos ||
+                    sl.find("singer") != std::string::npos || sl.find("artist") != std::string::npos ||
+                    sl.find("portrait") != std::string::npos || sl.find("profile") != std::string::npos) sc += 45;
+                if (sl.find("cover") != std::string::npos || sl.find("album") != std::string::npos ||
+                    sl.find("jacket") != std::string::npos || sl.find("artwork") != std::string::npos) sc += 45;
+                if (alt.find("avatar") != std::string::npos || alt.find("cover") != std::string::npos ||
+                    alt.find("album") != std::string::npos || alt.find("头像") != std::string::npos ||
+                    alt.find("封面") != std::string::npos) sc += 20;
+                if (!hint.empty() && alt.find(hint) != std::string::npos) sc += 30;
+                const int w = std::atoi(art_tag_attr(tag, "width").c_str());
+                const int h2 = std::atoi(art_tag_attr(tag, "height").c_str());
+                if (w >= 120 || h2 >= 120) sc += 15;
+                if ((w > 0 && w <= 48) || (h2 > 0 && h2 <= 48)) sc -= 40;   // 小图 = 图标/缩略
+                // 只收"有明确暗示"的图：score 基线 20 意味着它只是页面里的普通插图，
+                // 收它就是在赌 —— 实测那次赌输（落了一张站招横幅）。≥45 = 命中 avatar/cover/artist
+                // 之类的强暗示（或 alt 里有名字）。
+                if (sc >= 45) push(src, "img", sc);
+            }
+        }
+        i = e + 1;
+    }
+    std::stable_sort(out.begin(), out.end(),
+                     [](const ArtImgCand& a, const ArtImgCand& b) { return a.score > b.score; });
+    return out;
+}
+
+// ---- 9.3 图片尺寸（1×1 占位图 / 追踪像素必须被拒） ----
+// 只解析 PNG/JPEG/GIF/WebP 的头部；解析不出就返回 false（调用方按"未知尺寸"处理）。
+inline bool art_image_dims(const std::string& b, int* w, int* h) {
+    if (b.size() < 16) return false;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(b.data());
+    // PNG：IHDR 宽高在 16..24（大端）
+    if (p[0] == 0x89 && p[1] == 'P' && p[2] == 'N' && p[3] == 'G' && b.size() >= 24) {
+        const unsigned int ww = ((unsigned)p[16] << 24) | ((unsigned)p[17] << 16) | ((unsigned)p[18] << 8) | p[19];
+        const unsigned int hh = ((unsigned)p[20] << 24) | ((unsigned)p[21] << 16) | ((unsigned)p[22] << 8) | p[23];
+        if (ww == 0 || hh == 0 || ww > 20000 || hh > 20000) return false;
+        if (w) *w = (int)ww;
+        if (h) *h = (int)hh;
+        return true;
+    }
+    // GIF：6..10（小端）
+    if (b.size() >= 10 && b.compare(0, 3, "GIF") == 0) {
+        const unsigned int ww = (unsigned)p[6] | ((unsigned)p[7] << 8);
+        const unsigned int hh = (unsigned)p[8] | ((unsigned)p[9] << 8);
+        if (ww == 0 || hh == 0) return false;
+        if (w) *w = (int)ww;
+        if (h) *h = (int)hh;
+        return true;
+    }
+    // WebP：VP8X / VP8 / VP8L
+    if (b.size() >= 30 && b.compare(0, 4, "RIFF") == 0 && b.compare(8, 4, "WEBP") == 0) {
+        if (b.compare(12, 4, "VP8X") == 0) {
+            const unsigned int ww = (unsigned)p[24] | ((unsigned)p[25] << 8) | ((unsigned)p[26] << 16);
+            const unsigned int hh = (unsigned)p[27] | ((unsigned)p[28] << 8) | ((unsigned)p[29] << 16);
+            if (ww == 0 || hh == 0) return false;
+            if (w) *w = (int)(ww + 1);
+            if (h) *h = (int)(hh + 1);
+            return true;
+        }
+        if (b.compare(12, 4, "VP8 ") == 0 && b.size() >= 30) {
+            const unsigned int ww = ((unsigned)p[26] | ((unsigned)p[27] << 8)) & 0x3FFF;
+            const unsigned int hh = ((unsigned)p[28] | ((unsigned)p[29] << 8)) & 0x3FFF;
+            if (ww == 0 || hh == 0) return false;
+            if (w) *w = (int)ww;
+            if (h) *h = (int)hh;
+            return true;
+        }
+        if (b.compare(12, 4, "VP8L") == 0 && b.size() >= 25) {
+            const unsigned bits = (unsigned)p[21] | ((unsigned)p[22] << 8) | ((unsigned)p[23] << 16) | ((unsigned)p[24] << 24);
+            const unsigned ww = (bits & 0x3FFF) + 1;
+            const unsigned hh = ((bits >> 14) & 0x3FFF) + 1;
+            if (w) *w = (int)ww;
+            if (h) *h = (int)hh;
+            return true;
+        }
+    }
+    // JPEG：走 SOFn 段
+    if (p[0] == 0xFF && p[1] == 0xD8) {
+        size_t i = 2;
+        while (i + 9 < b.size()) {
+            if (p[i] != 0xFF) { ++i; continue; }
+            const unsigned char mk = p[i + 1];
+            if (mk == 0xD8 || mk == 0x01 || (mk >= 0xD0 && mk <= 0xD7)) { i += 2; continue; }
+            const size_t len = ((size_t)p[i + 2] << 8) | p[i + 3];
+            if (len < 2) return false;
+            const bool isSof = (mk >= 0xC0 && mk <= 0xC3) || (mk >= 0xC5 && mk <= 0xC7) ||
+                               (mk >= 0xC9 && mk <= 0xCB) || (mk >= 0xCD && mk <= 0xCF);
+            if (isSof) {
+                if (i + 8 >= b.size()) return false;
+                const unsigned int hh = ((unsigned)p[i + 5] << 8) | p[i + 6];
+                const unsigned int ww = ((unsigned)p[i + 7] << 8) | p[i + 8];
+                if (ww == 0 || hh == 0) return false;
+                if (w) *w = (int)ww;
+                if (h) *h = (int)hh;
+                return true;
+            }
+            i += 2 + len;
+        }
+        return false;
+    }
+    return false;
+}
+
+// 图片闸（魔数 + 字节下限 + 最小边）。为什么加尺寸：用户明确要求"1×1 占位图必须被拒"，
+// 而 1×1 PNG 只有 ~70 B（字节闸能挡），1×1 GIF 却可以做到 43 B~2 KB 之间任意大小。
+inline bool art_image_ok(const std::string& b, size_t minBytes, int minSide, std::string* why,
+                         int* wOut = nullptr, int* hOut = nullptr, double maxAspect = 2.6) {
+    if (b.size() < minBytes) {
+        if (why) *why = "too_small " + std::to_string((long long)b.size()) + "B";
+        return false;
+    }
+    if (!art_image_magic(b)) { if (why) *why = "not_image"; return false; }
+    int w = 0, h = 0;
+    const bool known = art_image_dims(b, &w, &h);
+    if (wOut) *wOut = w;
+    if (hOut) *hOut = h;
+    if (known && minSide > 0 && (w < minSide || h < minSide)) {
+        if (why) *why = "too_small_dims " + std::to_string(w) + "x" + std::to_string(h);
+        return false;
+    }
+    // 长宽比闸（2026-10-27 实测事故）：酷我页面里有张 64x316 的"唱片条"装饰图，
+    // 它恰好等于最小边 64、也能过魔数，于是被当成「秦勇/游戏科学/8082Audio 的头像」落盘。
+    // 头像与封面都是接近方形的，横幅/分隔条/跑马灯则是极端长宽比 —— 用比例一刀切掉。
+    if (known && maxAspect > 0.0) {
+        const double ar = (double)w / (double)h;
+        if (ar > maxAspect || ar < 1.0 / maxAspect) {
+            if (why) *why = "bad_aspect " + std::to_string(w) + "x" + std::to_string(h);
+            return false;
+        }
+    }
+    if (why) why->clear();
+    return true;
+}
+
+// ---- 9.4 名字归一（简繁折叠）：只用于"候选名是不是这个人" ----
+// 为什么必须有它：bangumi 的艺名是**繁体**（天門），用户库里是简体（天门）——
+// 不做折叠就只能留空；但也不能放宽到编辑距离（那会把"徐瞑蕾"匹配成"徐娇"）。
+inline unsigned long art_fold_cjk_t2s(unsigned long cp) {
+    // 只覆盖「人名里真正常见」的简繁对；同形字显式写出来（免得被当成漏项）。
+    switch (cp) {
+        case 0x9580: return 0x95E8;   // 門→门
+        case 0x6A02: return 0x4E50;   // 樂→乐
+        case 0x7121: return 0x65E0;   // 無→无
+        case 0x70BA: return 0x4E3A;   // 為→为
+        case 0x5CF6: return 0x5C9B;   // 島→岛
+        case 0x6FA4: return 0x6CFD;   // 澤→泽
+        case 0x5BAE: return 0x5BAB;   // 宮→宫
+        case 0x6BBA: return 0x6A31;   // 櫻→樱
+        case 0x6A39: return 0x6811;   // 樹→树
+        case 0x9ED1: return 0x9EC4;   // 黑→黄(异体，仅防颠倒)
+        case 0x9F8D: return 0x9F99;   // 龍→龙
+        case 0x83EF: return 0x534E;   // 華→华
+        case 0x8449: return 0x53F6;   // 葉→叶
+        case 0x6A4B: return 0x6865;   // 橋→桥
+        case 0x908A: return 0x8FB9;   // 邊→边
+        case 0x6FF1: return 0x6EE8;   // 濱→滨
+        case 0x7E6A: return 0x7ED8;   // 繪→绘
+        case 0x5B78: return 0x5B66;   // 學→学
+        case 0x6703: return 0x4F1A;   // 會→会
+        case 0x570B: return 0x56FD;   // 國→国
+        case 0x9EDE: return 0x70B9;   // 點→点
+        case 0x96FB: return 0x7535;   // 電→电
+        case 0x8ECA: return 0x8F66;   // 車→车
+        case 0x6771: return 0x4E1C;   // 東→东
+        case 0x8A9E: return 0x8BED;   // 語→语
+        case 0x8A71: return 0x8BDD;   // 話→话
+        case 0x8AAA: return 0x8BF4;   // 說→说
+        case 0x8A18: return 0x8BB0;   // 記→记
+        case 0x8A08: return 0x8BA1;   // 計→计
+        case 0x8A2D: return 0x8BBE;   // 設→设
+        case 0x8A31: return 0x8BB8;   // 許→许
+        case 0x8A8D: return 0x8BA4;   // 認→认
+        case 0x8ABF: return 0x8C03;   // 調→调
+        case 0x8ACB: return 0x8BF7;   // 請→请
+        case 0x8AD6: return 0x8BBA;   // 論→论
+        case 0x8B8A: return 0x53D8;   // 變→变
+        case 0x8B93: return 0x8BA9;   // 讓→让
+        case 0x8B77: return 0x62A4;   // 護→护
+        case 0x9322: return 0x94B1;   // 錢→钱
+        case 0x9280: return 0x94F6;   // 銀→银
+        case 0x9435: return 0x94C1;   // 鐵→铁
+        case 0x9577: return 0x957F;   // 長→长
+        case 0x95DC: return 0x5173;   // 關→关
+        case 0x967D: return 0x9633;   // 陽→阳
+        case 0x9670: return 0x9634;   // 陰→阴
+        case 0x969B: return 0x9645;   // 際→际
+        case 0x968A: return 0x961F;   // 隊→队
+        case 0x96A8: return 0x968F;   // 隨→随
+        case 0x96E3: return 0x96BE;   // 難→难
+        case 0x96F2: return 0x4E91;   // 雲→云
+        case 0x9748: return 0x7075;   // 靈→灵
+        case 0x98A8: return 0x98CE;   // 風→风
+        case 0x98DB: return 0x98DE;   // 飛→飞
+        case 0x98EF: return 0x996D;   // 飯→饭
+        case 0x99AC: return 0x9A6C;   // 馬→马
+        case 0x9A57: return 0x9A8C;   // 驗→验
+        case 0x9AD4: return 0x4F53;   // 體→体
+        case 0x9B6F: return 0x9C81;   // 魯→鲁
+        case 0x9BCA: return 0x9C8D;   // 鯊→鲨
+        case 0x9CE5: return 0x9E1F;   // 鳥→鸟
+        case 0x9E97: return 0x4E3D;   // 麗→丽
+        case 0x9EC3: return 0x9EC4;   // 黃→黄
+        case 0x9EBB: return 0x9EBB;   // 麻(同形)
+        case 0x9F13: return 0x9F13;
+        case 0x4E26: return 0x5E76;   // 並→并
+        case 0x500B: return 0x4E2A;   // 個→个
+        case 0x5099: return 0x5907;   // 備→备
+        case 0x50B7: return 0x4F24;   // 傷→伤
+        case 0x50C5: return 0x4EC5;   // 僅→仅
+        case 0x50D1: return 0x4FA8;   // 僑→侨
+        case 0x50F9: return 0x4EF7;   // 價→价
+        case 0x5104: return 0x4EBF;   // 億→亿
+        case 0x511F: return 0x507F;   // 償→偿
+        case 0x512A: return 0x4F18;   // 優→优
+        case 0x5132: return 0x50A8;   // 儲→储
+        case 0x5147: return 0x51F6;   // 兇→凶
+        case 0x514C: return 0x5151;   // 兌→兑
+        case 0x5157: return 0x515C;   // 兜→兜
+        case 0x5169: return 0x4E24;   // 兩→两
+        case 0x518A: return 0x518C;   // 冊→册
+        case 0x5225: return 0x522B;   // 別→别
+        case 0x5229: return 0x5229;   // 利
+        case 0x5247: return 0x5219;   // 則→则
+        case 0x5287: return 0x5267;   // 劇→剧
+        case 0x52D5: return 0x52A8;   // 動→动
+        case 0x52D9: return 0x52A1;   // 務→务
+        case 0x52DD: return 0x80DC;   // 勝→胜
+        case 0x52DE: return 0x52B3;   // 勞→劳
+        case 0x52F5: return 0x52B1;   // 勵→励
+        case 0x52F8: return 0x529D;   // 勸→劝
+        case 0x5331: return 0x532E;   // 匱→匮
+        case 0x5340: return 0x533A;   // 區→区
+        case 0x5354: return 0x534F;   // 協→协
+        case 0x535E: return 0x535E;   // 卞
+        case 0x5379: return 0x6064;   // 恤
+        case 0x5399: return 0x538D;   // 厙→厍
+        case 0x53AD: return 0x538C;   // 厭→厌
+        default: return cp;
+    }
+}
+
+// 「这是不是同一个名字」的宽松判据（**只用于候选验收**，不参与任何精确匹配的业务逻辑）：
+//   ① 去掉成对括号里的补充说明（"水瀬いのり (水濑祈)" → "水瀬いのり"）、空白、常见标点；
+//   ② 简繁折叠；
+//   ③ 完全相等才算命中 —— 不做编辑距离（那会把"徐瞑蕾"匹配成"徐娇"）。
+inline std::string art_name_key(const std::string& raw) {
+    std::string noParen;
+    for (size_t i = 0; i < raw.size();) {
+        const unsigned char c = (unsigned char)raw[i];
+        size_t n = 1;
+        if (c >= 0xF0) n = 4; else if (c >= 0xE0) n = 3; else if (c >= 0xC0) n = 2;
+        if (i + n > raw.size()) break;
+        // 全角/半角括号：跳过整段（只跳到配对的右括号；找不到就丢掉到串尾，与 art_trim 的语义一致）
+        const bool open = (c == '(' || c == '[') ||
+                          (c == 0xEF && i + 2 < raw.size() && (unsigned char)raw[i + 1] == 0xBC &&
+                           ((unsigned char)raw[i + 2] == 0x88 || (unsigned char)raw[i + 2] == 0x89));
+        if (open) {
+            size_t j = i + n;
+            int depth = 1;
+            while (j < raw.size() && depth > 0) {
+                const unsigned char d = (unsigned char)raw[j];
+                size_t m = 1;
+                if (d >= 0xF0) m = 4; else if (d >= 0xE0) m = 3; else if (d >= 0xC0) m = 2;
+                if (j + m > raw.size()) break;
+                if (d == '(' || d == '[') ++depth;
+                else if (d == ')' || d == ']') --depth;
+                else if (d == 0xEF && j + 2 < raw.size() && (unsigned char)raw[j + 1] == 0xBC) {
+                    if ((unsigned char)raw[j + 2] == 0x88) ++depth;
+                    else if ((unsigned char)raw[j + 2] == 0x89) --depth;
+                }
+                j += m;
+            }
+            i = j;
+            continue;
+        }
+        noParen.append(raw, i, n);
+        i += n;
+    }
+    std::string o;
+    o.reserve(noParen.size());
+    for (size_t i = 0; i < noParen.size();) {
+        const unsigned char c = (unsigned char)noParen[i];
+        if (c < 0x80) {
+            const char ch = (char)c;
+            // 只处理 ASCII 标点：多字节标点（、·（））在下方的非 ASCII 分支里折/丢，
+            // 这里若写成 '·' 这种多字节字面量会直接编译失败（char 放不下）。
+            if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '.' || ch == ',' ||
+                ch == '&' || ch == '_' || ch == '-' || ch == '\'' || ch == '"' || ch == '/') {
+                ++i;
+                continue;
+            }
+            if (ch >= 'A' && ch <= 'Z') { o += (char)(ch - 'A' + 'a'); ++i; continue; }
+            o += ch;
+            ++i;
+            continue;
+        }
+        size_t n = 1;
+        if (c >= 0xF0) n = 4; else if (c >= 0xE0) n = 3; else if (c >= 0xC0) n = 2;
+        if (i + n > noParen.size()) break;
+        unsigned long cp = (n == 2) ? (unsigned long)(c & 0x1Fu)
+                         : (n == 3) ? (unsigned long)(c & 0x0Fu)
+                                    : (unsigned long)(c & 0x07u);
+        for (size_t k = 1; k < n; ++k)
+            cp = (cp << 6) | (unsigned long)((unsigned char)noParen[i + k] & 0x3Fu);
+        if (cp == 0x3000u) { ++i; i += 0; continue; }                 // 全角空格丢掉
+        if (cp == 0x30FBu || cp == 0x00B7u || cp == 0x2027u) { i += n; continue; }  // ・ · ‧
+        if (cp >= 0xFF01u && cp <= 0xFF5Eu) cp -= 0xFEE0u;             // 全角 ASCII
+        cp = art_fold_cjk_t2s(cp);
+        if (cp < 0x80u) { o += (char)cp; i += n; continue; }
+        if (cp < 0x800u) {
+            o += (char)(0xC0u | (cp >> 6));
+            o += (char)(0x80u | (cp & 0x3Fu));
+        } else if (cp < 0x10000u) {
+            o += (char)(0xE0u | (cp >> 12));
+            o += (char)(0x80u | ((cp >> 6) & 0x3Fu));
+            o += (char)(0x80u | (cp & 0x3Fu));
+        } else {
+            o += (char)(0xF0u | (cp >> 18));
+            o += (char)(0x80u | ((cp >> 12) & 0x3Fu));
+            o += (char)(0x80u | ((cp >> 6) & 0x3Fu));
+            o += (char)(0x80u | (cp & 0x3Fu));
+        }
+        i += n;
+    }
+    return o;
+}
+
+inline bool art_name_same_loose(const std::string& a, const std::string& b) {
+    const std::string ka = art_name_key(a), kb = art_name_key(b);
+    if (ka.empty() || kb.empty()) return false;
+    return ka == kb;
+}
+
+// ---- 9.5 确定性扩展源（bangumi / AniList / Apple Music）----
+// 为什么是这三家（2026-10-27 联网实测，六个失败样本逐个过）：
+//   · bangumi(api.bgm.tv) —— 中文动画数据库，**免 key**，人名是汉字，images.large 就是官方头像；
+//     实测「水瀬いのり (水濑祈)」「手嶌 葵」「天门(←天門)」「天门 (てんもん)」四个样本的第一名都是同名命中；
+//   · AniList(graphql) —— 免 key，name.native 是**日文原名**，可以做"同名验收"而不用猜罗马字
+//     （用它查「水瀬いのり」直接返回 native=水瀬いのり）；「天门」查不到（Kanji-only 不在它的搜索索引里），
+//     这条由 bangumi 兜住了 —— 两家互补，不是重复;
+//   · Apple Music —— iTunes 的 musicArtist 搜索只给 artistId（不给图），但艺人页 music.apple.com/jp/artist/<id>
+//     带 og:image（实测 水瀬いのり 1057869661 → is1-ssl.mzstatic.com/.../1200x630cw.png）。
+// 三家都要求**名字匹配**才采纳（art_name_same_loose），绝不"第一个结果就用"。
+struct ArtWebFill {
+    bool ok = false;
+    std::string bytes, url, source;
+    std::vector<ArtSourceTry> tried;
+    std::string summary() const {
+        std::ostringstream o;
+        o << (ok ? "ok" : "miss") << " src=" << (source.empty() ? "-" : source)
+          << " bytes=" << bytes.size();
+        if (!url.empty()) o << " url=" << url;
+        for (const ArtSourceTry& t : tried)
+            o << " | " << t.source << ":" << (t.ok ? "ok" : (t.transient ? "fail" : "miss"))
+              << "(" << art_oneline(t.reason) << "," << t.ms << "ms)";
+        return o.str();
+    }
+};
+
+inline std::string art_json_escape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (char c : s) {
+        if (c == '"' || c == '\\') { o += '\\'; o += c; }
+        else if ((unsigned char)c < 0x20) { o += ' '; }
+        else o += c;
+    }
+    return o;
+}
+
+// 名字变体（去括号 / 去空格 / 主艺人）——给"哪家源用什么写法"用。
+inline std::vector<std::string> art_name_variants(const std::string& raw) {
+    std::vector<std::string> out;
+    auto add = [&](const std::string& v) {
+        const std::string t = art_trim_name(v);
+        if (t.empty()) return;
+        // 去重按**字面**比较：不能用 art_name_same_loose —— 它会把「水瀬いのり」和
+        // 「水瀬いのり (水濑祈)」判成同一个，于是"去括号的短名"永远进不了变体表。
+        for (const std::string& x : out)
+            if (x == t) return;
+        out.push_back(t);
+    };
+    add(raw);
+    // 去括号：用 art_name_key 的规则反向重建太绕，这里直接截到第一个 "(" / "（"
+    size_t cut = std::string::npos;
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (raw[i] == '(' || raw[i] == '[') { cut = i; break; }
+        if ((unsigned char)raw[i] == 0xEF && i + 2 < raw.size() &&
+            (unsigned char)raw[i + 1] == 0xBC &&
+            ((unsigned char)raw[i + 2] == 0x88 || (unsigned char)raw[i + 2] == 0x89)) { cut = i; break; }
+    }
+    if (cut != std::string::npos && cut > 0) add(raw.substr(0, cut));
+    const std::string prim = art_primary_artist(raw);
+    if (!prim.empty()) add(prim);
+    return out;
+}
+
+// 相关性闸：页面里到底有没有提到这个名字？
+// 为什么必须有（2026-10-27 实测事故）：搜索"徐瞑蕾 头像"返回的是百度百科《守候》条目，
+// 那条目有 og:image、能过全部图片闸，于是被当成"徐瞑蕾的头像"落盘 —— 人完全不对。
+// 判据很朴素但有效：页面的 UTF-8 文本里必须出现名字本身（或用它的简写变体，如去括号后的
+// "水瀬いのり"）。名字是用户数据，只做**包含**查找，不做任何解释/执行。
+inline bool art_html_has_name(const std::string& html, const std::string& rawName) {
+    if (html.empty() || rawName.empty()) return false;
+    const std::string low = art_ascii_lower(html);
+    const std::vector<std::string> vars = art_name_variants(rawName);
+    for (const std::string& v : vars) {
+        if (art_utf8_len(v) < 2) continue;                 // 单字名（"甲"）不作判据，误命中太多
+        if (low.find(art_ascii_lower(v)) != std::string::npos) return true;
+        const std::string key = art_name_key(v);           // 简繁折叠后的形态（天门 ← 天門）
+        if (key.size() >= 6 && low.find(key) != std::string::npos) return true;
+        if (key.size() >= 6 && art_name_key(html).find(key) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// 页面标题（<title> / og:title / twitter:title）——比"正文提到名字"强得多的相关性判据。
+// 实测事故（2026-10-27）：百度百科《守候》条目正文里确实提到"演唱者为徐瞑蕾"，但那张 og:image
+// 是**游戏/单曲的封面**，不是她的头像。而"页面标题里有没有这个名字"正好把两类分开：
+//   · 人物/艺人条目：标题 = 名字（或含名字）  ⟹ 收
+//   · 歌曲/游戏/专辑条目：标题 = 作品名      ⟹ 拒
+inline std::string art_html_title(const std::string& html) {
+    std::string out;
+    const std::string low = art_ascii_lower(html);
+    const size_t t0 = low.find("<title");
+    if (t0 != std::string::npos) {
+        const size_t s0 = low.find('>', t0);
+        const size_t e0 = (s0 == std::string::npos) ? std::string::npos : low.find("</title", s0);
+        if (s0 != std::string::npos && e0 != std::string::npos && e0 > s0)
+            out = art_html_unescape(html.substr(s0 + 1, e0 - s0 - 1));
+    }
+    for (const char* key : { "og:title", "twitter:title" }) {
+        size_t p = 0;
+        while ((p = low.find(key, p)) != std::string::npos) {
+            const size_t cs = low.find("content=\"", p);
+            if (cs == std::string::npos) break;
+            const size_t ce = low.find('"', cs + 9);
+            if (ce == std::string::npos) break;
+            if (!out.empty()) out += " | ";
+            out += art_html_unescape(html.substr(cs + 9, ce - cs - 9));
+            p = ce;
+        }
+    }
+    return out;
+}
+
+// 标题里有没有这个名字：汉字按"变体包含"，ASCII 按 ≥5 字符的独立词（Mugai ← "Mugai无害P"，
+// 这样 anihk 那种纯英文条目页也能过；而 "Peak" 这种 4 字母的常见词不算，避免误命中）。
+inline bool art_title_has_name(const std::string& title, const std::string& rawName) {
+    if (title.empty() || rawName.empty()) return false;
+    const std::string lowTitle = art_ascii_lower(title);
+    const std::string keyTitle = art_name_key(title);   // 去空格/标点 + 简繁折叠后的形态
+    for (const std::string& v : art_name_variants(rawName)) {
+        if (art_utf8_len(v) < 2) continue;
+        if (lowTitle.find(art_ascii_lower(v)) != std::string::npos) return true;
+        // "手嶌 葵"（用户库带空格）vs 标题里的 "手嶌葵"：折叠后比一次；
+        // 阈值 6 字节（≈2 个汉字）避免单字名在标题里碰巧出现。
+        const std::string vk = art_name_key(v);
+        if (vk.size() >= 6 && keyTitle.find(vk) != std::string::npos) return true;
+    }
+    // ASCII 词：从名字里切 [A-Za-z0-9] 连续段，长度 ≥5 才当判据
+    std::string cur;
+    auto flush = [&]() {
+        if (cur.size() >= 5 && lowTitle.find(art_ascii_lower(cur)) != std::string::npos) return true;
+        cur.clear();
+        return false;
+    };
+    for (unsigned char c : rawName) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) cur += (char)c;
+        else if (flush()) return true;
+    }
+    if (flush()) return true;
+    return false;
+}
+
+// ---- 9.5b 音频平台官方接口优先（用户 261026-04 #7/#9 的"官方接口"要求）----
+// 为什么必须补这一段（2026-10-27 实测）：搜「徐瞑蕾 头像」返回的候选页里就有
+//   https://y.music.163.com/m/artist?id=30165378
+// 但那个页面是 JS 壳（title="网易云音乐"，HTML 里没有图），按"从 HTML 抽图"永远拿不到。
+// 而**官方接口** https://music.163.com/api/artist/30165378 直接回
+//   {"artist":{"name":"徐瞑蕾","picUrl":"https://p2.music.126.net/...jpg","img1v1Url":"..."}}
+// ⟹ 正确分工是：从候选页/HTML 里抠出**平台 id**，再用官方接口换图（还自带 name 可做同名验收）。
+// 这条比"解析网页"稳得多，也比问模型便宜得多；QQ 那边 script 路径已覆盖（musicu.fcg），这里不重复。
+inline std::vector<std::string> art_page_netease_artist_ids(const std::string& html, const std::string& pageUrl) {
+    std::vector<std::string> out;
+    const std::string hay = art_ascii_lower(pageUrl + "\n" + html);
+    static const char* kPat[] = { "music.163.com/artist?id=", "music.163.com/#/artist?id=",
+                                  "y.music.163.com/m/artist?id=", "\"artistid\":", "artist?id=" };
+    for (const char* pat : kPat) {
+        size_t p = 0;
+        while ((p = hay.find(pat, p)) != std::string::npos) {
+            size_t q = p + std::strlen(pat);
+            while (q < hay.size() && (hay[q] == ' ' || hay[q] == '"')) ++q;
+            std::string id;
+            while (q < hay.size() && hay[q] >= '0' && hay[q] <= '9' && id.size() < 12) id += hay[q++];
+            if (id.size() >= 4) {
+                bool dup = false;
+                for (const std::string& x : out) if (x == id) { dup = true; break; }
+                if (!dup) out.push_back(id);
+                if (out.size() >= 3) return out;
+            }
+            p = q;
+        }
+    }
+    return out;
+}
+
+inline ArtFetchOut art_ext_netease_id(const std::string& id, const std::string& wantName,
+                                      const ArtworkOpts& opts, int budgetMs) {
+    ArtFetchOut out;
+    ArtHttpRequest q;
+    q.method = "GET";
+    q.url = "https://music.163.com/api/artist/" + id;
+    q.headers = { std::string("User-Agent: ") + pv_user_agent(), "Referer: https://music.163.com/" };
+    q.timeoutMs = std::max(500, std::min(opts.perSourceMs, budgetMs));
+    const rta::net::HttpResponse resp = art_http(q);
+    if (resp.status == 0) { out.transient = true; out.reason = "请求失败: " + resp.error; return out; }
+    if (resp.status != 200) { out.transient = (resp.status >= 500 || resp.status == 429);
+                              out.reason = "接口 HTTP " + std::to_string(resp.status); return out; }
+    const rta::net::Json j = rta::net::json_parse(std::string(resp.body.begin(), resp.body.end()));
+    const std::string nm = j["artist"]["name"].s();
+    if (nm.empty()) { out.reason = "接口无 artist.name"; return out; }
+    if (!wantName.empty() && !art_name_same_loose(nm, wantName)) {
+        out.reason = "id=" + id + " 名字不符(接口=" + art_oneline(nm) + ")";
+        return out;
+    }
+    // ★ 占位图识别（2026-10-27 实测事故）：徐瞑蕾(id=30165378) 在网易云**没有自定义头像**，
+    // 接口回 picId=0 + 默认剪影图（p1.music.126.net/.../5639395138885805.jpg，640x420 的
+    // 歌手剪影）。它有 149 KB、过魔数、过尺寸，什么闸都拦不住 —— 只有 picId==0 这条能拦。
+    // 对比：周杰伦 id=6452 的 picId=109951169164936450（正常）。
+    if (j["artist"]["picId"].n() <= 0.0) {
+        out.reason = "id=" + id + " 网易云无自定义头像(picId=0，返回的是默认剪影)";
+        return out;
+    }
+    std::string img = j["artist"]["picUrl"].s();
+    if (img.empty()) img = j["artist"]["img1v1Url"].s();
+    if (img.empty()) { out.reason = "id=" + id + " 无 picUrl"; return out; }
+    ArtFetchOut dl = art_download_image(img, { std::string("User-Agent: ") + pv_user_agent(),
+                                               "Referer: https://music.163.com/" }, opts, budgetMs);
+    if (!dl.ok) { dl.reason = "id=" + id + " " + dl.reason; return dl; }
+    return dl;
+}
+
+inline ArtFetchOut art_ext_bangumi(const std::string& query, const ArtworkOpts& opts, int budgetMs) {
+    ArtFetchOut out;
+    ArtHttpRequest q;
+    q.method = "POST";
+    q.url = "https://api.bgm.tv/v0/search/persons";
+    q.body = "{\"keyword\":\"" + art_json_escape(query) + "\",\"filter\":{\"type\":[1]}}";
+    q.contentType = "application/json";
+    q.headers = { std::string("User-Agent: ") + pv_user_agent(), "Accept: application/json" };
+    q.timeoutMs = std::max(500, std::min(opts.perSourceMs, budgetMs));
+    const rta::net::HttpResponse resp = art_http(q);
+    if (resp.status == 0) { out.transient = true; out.reason = "请求失败: " + resp.error; return out; }
+    if (resp.status != 200) { out.transient = (resp.status >= 500 || resp.status == 429);
+                              out.reason = "搜索 HTTP " + std::to_string(resp.status); return out; }
+    const rta::net::Json j = rta::net::json_parse(std::string(resp.body.begin(), resp.body.end()));
+    const rta::net::Json& arr = j["data"];
+    if (arr.size() == 0) { out.reason = "搜索 0 条"; return out; }
+    std::string first = arr.at(0)["name"].s();
+    for (size_t i = 0; i < arr.size(); ++i) {
+        const rta::net::Json& it = arr.at(i);
+        const std::string nm = it["name"].s();
+        const std::string cn = it["name_cn"].s();
+        if (!art_name_same_loose(nm, query) && !art_name_same_loose(cn, query)) continue;
+        std::string img = it["images"]["large"].s();
+        if (img.empty()) img = it["images"]["medium"].s();
+        if (img.empty()) { out.reason = "同名「" + art_oneline(nm) + "」无图"; return out; }
+        ArtFetchOut dl = art_download_image(img, { std::string("User-Agent: ") + pv_user_agent(),
+                                                   "Referer: https://bgm.tv/" }, opts, budgetMs);
+        if (!dl.ok) { dl.reason = "候选「" + art_oneline(nm) + "」" + dl.reason; return dl; }
+        return dl;
+    }
+    out.reason = "无同名(首个=" + art_oneline(first) + ")";
+    return out;
+}
+
+inline ArtFetchOut art_ext_anilist(const std::string& query, const ArtworkOpts& opts, int budgetMs) {
+    ArtFetchOut out;
+    ArtHttpRequest q;
+    q.method = "POST";
+    q.url = "https://graphql.anilist.co";
+    q.body = std::string("{\"query\":\"query($s:String){Page(perPage:5){staff(search:$s){id name{full native} "
+                         "image{large}}}}\",\"variables\":{\"s\":\"") + art_json_escape(query) + "\"}}";
+    q.contentType = "application/json";
+    q.headers = { std::string("User-Agent: ") + pv_user_agent(), "Accept: application/json" };
+    q.timeoutMs = std::max(500, std::min(opts.perSourceMs, budgetMs));
+    const rta::net::HttpResponse resp = art_http(q);
+    if (resp.status == 0) { out.transient = true; out.reason = "请求失败: " + resp.error; return out; }
+    if (resp.status != 200) { out.transient = (resp.status >= 500 || resp.status == 429);
+                              out.reason = "搜索 HTTP " + std::to_string(resp.status); return out; }
+    const rta::net::Json j = rta::net::json_parse(std::string(resp.body.begin(), resp.body.end()));
+    const rta::net::Json& arr = j["data"]["Page"]["staff"];
+    if (arr.size() == 0) { out.reason = "搜索 0 条"; return out; }
+    for (size_t i = 0; i < arr.size(); ++i) {
+        const rta::net::Json& it = arr.at(i);
+        const std::string full = it["name"]["full"].s();
+        const std::string nat  = it["name"]["native"].s();
+        if (!art_name_same_loose(nat, query) && !art_name_same_loose(full, query)) continue;
+        const std::string img = it["image"]["large"].s();
+        if (img.empty() || img.find("/default.") != std::string::npos) {
+            out.reason = "同名「" + art_oneline(nat.empty() ? full : nat) + "」无图";
+            return out;
+        }
+        ArtFetchOut dl = art_download_image(img, { std::string("User-Agent: ") + pv_user_agent(),
+                                                   "Referer: https://anilist.co/" }, opts, budgetMs);
+        if (!dl.ok) { dl.reason = "候选「" + art_oneline(nat.empty() ? full : nat) + "」" + dl.reason; return dl; }
+        return dl;
+    }
+    out.reason = "无同名(首个=" + art_oneline(arr.at(0)["name"]["native"].s().empty()
+                                                ? arr.at(0)["name"]["full"].s()
+                                                : arr.at(0)["name"]["native"].s()) + ")";
+    return out;
+}
+
+inline ArtFetchOut art_ext_apple(const std::string& query, const ArtworkOpts& opts, int budgetMs) {
+    ArtFetchOut out;
+    ArtHttpRequest q;
+    q.method = "GET";
+    q.url = "https://itunes.apple.com/search?term=" + percent_enc_utf8(query) +
+            "&entity=musicArtist&limit=5&country=jp";
+    q.headers = { std::string("User-Agent: ") + pv_user_agent() };
+    q.timeoutMs = std::max(500, std::min(opts.perSourceMs, budgetMs));
+    const rta::net::HttpResponse resp = art_http(q);
+    if (resp.status == 0) { out.transient = true; out.reason = "请求失败: " + resp.error; return out; }
+    if (resp.status != 200) { out.transient = (resp.status >= 500 || resp.status == 429);
+                              out.reason = "搜索 HTTP " + std::to_string(resp.status); return out; }
+    const rta::net::Json j = rta::net::json_parse(std::string(resp.body.begin(), resp.body.end()));
+    const rta::net::Json& arr = j["results"];
+    if (arr.size() == 0) { out.reason = "搜索 0 条"; return out; }
+    for (size_t i = 0; i < arr.size(); ++i) {
+        const rta::net::Json& it = arr.at(i);
+        const std::string nm = it["artistName"].s();
+        if (!art_name_same_loose(nm, query)) continue;          // 罗马字名与汉字名不同名 ⟹ 不采纳
+        const long long id = (long long)it["artistId"].n();
+        if (id <= 0) continue;
+        ArtHttpRequest pq;
+        pq.method = "GET";
+        pq.url = "https://music.apple.com/jp/artist/" + std::to_string(id);
+        pq.headers = { std::string("User-Agent: ") + pv_user_agent() };
+        pq.timeoutMs = std::max(800, std::min(opts.perSourceMs, budgetMs));
+        const rta::net::HttpResponse pr = art_http(pq);
+        if (pr.status != 200) { out.transient = (pr.status == 0 || pr.status >= 500);
+                                out.reason = "艺人页 HTTP " + std::to_string(pr.status); return out; }
+        const std::string html(pr.body.begin(), pr.body.end());
+        const std::vector<ArtImgCand> cands = art_page_image_candidates(html, pq.url, query);
+        for (size_t c = 0; c < cands.size() && c < 2; ++c) {
+            ArtFetchOut dl = art_download_image(cands[c].url,
+                                                { std::string("User-Agent: ") + pv_user_agent(),
+                                                  "Referer: https://music.apple.com/" }, opts, budgetMs);
+            if (dl.ok) return dl;
+            out.reason = cands[c].kind + " " + dl.reason;
+        }
+        if (!cands.empty()) return out;
+        out.reason = "艺人页无候选图";
+        return out;
+    }
+    out.reason = "无同名(首个=" + art_oneline(arr.at(0)["artistName"].s()) + ")";
+    return out;
+}
+
+// 扩展链总入口：按"对中文/日文名字覆盖最好的顺序"跑，每个源只用**同名**结果。
+// 只做网络与字节校验，不落盘（落盘仍由 rtaweb 的 apifill_write_blob 负责，保持单一写者）。
+inline ArtWebFill art_ext_artist_image(const std::string& rawName, const ArtworkOpts& opts) {
+    ArtWebFill res;
+    const std::string name = art_trim_name(rawName);
+    if (name.empty()) return res;
+    const std::vector<std::string> variants = art_name_variants(name);
+    struct Src { const char* id; ArtFetchOut (*fn)(const std::string&, const ArtworkOpts&, int); };
+    static const Src kSrc[] = {
+        { "bgm",     art_ext_bangumi },
+        { "anilist", art_ext_anilist },
+        { "apple",   art_ext_apple   },
+    };
+    int remaining = opts.totalBudgetMs > 0 ? opts.totalBudgetMs : 12000;
+    for (const Src& s : kSrc) {
+        for (const std::string& v : variants) {
+            if (remaining <= 500) {
+                ArtSourceTry t; t.source = s.id; t.reason = "总预算耗尽"; t.transient = true;
+                res.tried.push_back(t);
+                break;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            const ArtFetchOut fo = s.fn(v, opts, remaining);
+            ArtSourceTry t;
+            t.source = s.id;
+            t.ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - t0).count();
+            remaining -= t.ms;
+            t.ok = fo.ok;
+            t.transient = fo.transient;
+            t.url = fo.url;
+            t.bytes = (long long)fo.bytes.size();
+            if (fo.ok) {
+                t.reason = std::to_string(fo.bytes.size()) + "B";
+                res.tried.push_back(t);
+                res.ok = true;
+                res.bytes = fo.bytes;
+                res.url = fo.url;
+                res.source = std::string(s.id) + ":" + v;
+                return res;
+            }
+            t.reason = (v == name ? std::string() : ("[" + v + "] ")) + fo.reason;
+            res.tried.push_back(t);
+            if (fo.transient) break;                  // 瞬态(断网/429)：这一源不再换写法重试
+        }
+    }
+    return res;
+}
+
 } // namespace rta::meta

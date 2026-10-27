@@ -8,6 +8,7 @@
 // 这是本轮加主题时定的规矩。
 #pragma once
 #include <string>
+#include "version.h"   // RLPLAYER_VERSION：给 /app.js 加版本参数，避免 WebView2 缓存旧脚本
 
 namespace rta::net {
 
@@ -347,7 +348,12 @@ inline std::string rta_ui_page() {
     // 两个区块标题必须同一套数字，写两处必然再次漂移（本轮就是这么坏的）。这里不再单独覆盖。
     // #3：二级条目的左内边距 38px = 12px(.nav 内边距) + 16px(图标) + 10px(.nav gap)，
     // 与「播放」区带图标的 .nav 条目**文字左边缘对齐**（预留同样的图标槽）；行高对齐 .nav 的 36px。
-    h += ".sqlist .sqrow{padding:9px 8px 9px 38px;font-size:12px;line-height:18px;gap:6px;min-height:36px}";
+    // 261027-04 #3：用户「我的歌单…只有自定义名字，名字前面没有图标，请为歌单添加一个通用的图标标识，
+    //   跟上面的播放队列/最近播放/我的最爱等对齐」。旧版 padding-left:38px 只是**空着**一个图标槽 ⟹
+    //   文字确实对齐、但槽里没东西，用户看到的就是"没图标"。
+    // 现在：padding-left 38→12，槽里放 16px 线性图标（同 .nav svg 尺寸），gap 10 与 .nav 一致
+    //   ⟹ 文字左边缘 = .side 的 8px + 12 + 16 + 10 = 46.00px（与一级导航逐像素相同）。
+    h += ".sqlist .sqrow{padding:9px 8px 9px 12px;font-size:12px;line-height:18px;gap:10px;min-height:36px}";
     h += ".sqlist .sqn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
     h += ".sqlist .sqb{width:20px;height:18px;border-radius:5px;display:grid;place-items:center;font-size:12px;line-height:1;color:var(--mut2);flex:none;opacity:0;transition:.12s}";
     h += ".sqlist .sqrow:hover .sqb{opacity:1}";
@@ -440,23 +446,47 @@ inline std::string rta_ui_page() {
     h += ".albprog.done .t{color:var(--mut2)}";
     h += ".albprog.done .bar i{background:var(--mut2)}";
     h += ".albprog .artagain{margin-left:8px;padding:2px 9px;font-size:11px;line-height:1.5}";
-    // ===== 「分析」页签（2026-10-27 261027-03 #9）=====
-    // 四栏：动态 / 音质 / 假无损 / 版本对比。窄窗自动回落成单列（auto-fit）。
-    h += ".anlgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;padding-bottom:12px}";
-    h += ".anlcard{margin:0;min-width:0}";
-    h += ".anl-sub{font-size:10.5px;color:var(--mut2);font-weight:400;letter-spacing:0;margin-left:8px}";
+    // ===== 单曲页「分析」条（2026-10-27 261027-04 #4）=====
+    // 用户要求把「主页/设置-分析」整页搬到**正在播放的那首歌**上，展示三类：动态 / 音质 / 假无损。
+    // 版面：一条横向带（3 块并排），夹在「歌词+资料」与「播放控制」之间 —— 进单曲页第一眼就能看到，
+    // 又不挤占封面/标题区。每块 = 小标题 + 一句人话结论 + 2×2 指标格（指标名 + 数值 + 单位）。
+    // 指标格用 --mut2 小字 + tabular-nums，数值右对齐 ⟹ 三条并排时数字列也能对齐。
+    h += ".npanal{display:flex;flex-direction:column;gap:8px;min-width:0}";
+    h += ".npanal-hd{display:flex;align-items:center;gap:8px;min-width:0}";
+    h += ".npanal-hd .t{font-size:10px;letter-spacing:1.4px;color:var(--mut2);font-weight:700;white-space:nowrap}";
+    h += ".npanal-hd .st{font-size:10.5px;color:var(--mut2);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
+    h += ".npanal-hd .sp{flex:1}";
+    h += ".npanal-btn{font-size:10.5px;padding:2px 9px;border-radius:6px;border:1px solid var(--line);background:transparent;color:var(--mut);cursor:pointer;white-space:nowrap;transition:.13s}";
+    h += ".npanal-btn:hover{color:var(--txt);border-color:var(--acc);background:var(--hov)}";
+    h += ".npanal-btn.on{color:var(--ok-text);border-color:var(--ok-line);background:var(--ok-bg)}";
+    h += ".npanal-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;min-width:0}";
+    h += ".npanal-card{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.08);border-radius:11px;padding:6px 10px;min-width:0;display:flex;flex-direction:column;gap:3px}";
+    h += ".npanal-card .ct{font-size:10.5px;font-weight:700;letter-spacing:.6px;color:var(--mut);display:flex;align-items:baseline;gap:6px;min-width:0}";
+    h += ".npanal-card .ct i{font-style:normal;font-size:9.5px;font-weight:400;color:var(--mut2);letter-spacing:0}";
+    h += ".npanal-verdict{font-size:12.5px;font-weight:650;color:var(--txt);line-height:1.35;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
+    h += ".npanal-verdict.warn{color:var(--warn)}";
+    h += ".npanal-verdict.ok{color:var(--ok-text)}";
+    h += ".npanal-verdict.mut{color:var(--mut2);font-weight:500;font-size:11.5px}";
+    h += ".npanal-kv{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 10px;font-size:10.5px;line-height:1.45}";
+    h += ".npanal-kv .r{display:flex;align-items:baseline;justify-content:space-between;gap:6px;min-width:0}";
+    h += ".npanal-kv .k{color:var(--mut2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
+    h += ".npanal-kv .v{font-variant-numeric:tabular-nums;font-weight:600;color:var(--txt2);white-space:nowrap}";
+    h += ".npanal-kv .v i{font-style:normal;font-weight:400;color:var(--mut2);font-size:9.5px}";
+    h += ".npanal-skel{height:9px;border-radius:4px;background:var(--track);animation:npanlpulse 1.2s ease-in-out infinite}";
+    h += "@keyframes npanlpulse{0%,100%{opacity:.35}50%{opacity:.85}}";
+    h += "@media (prefers-reduced-motion:reduce){.npanal-skel{animation:none}}";
+    // 矮窗（<680px 高，例如 1280x720 或 1366x768 再加缩放）才收起指标格，只留三句结论 ——
+    // 800p 这种常见笔记本屏必须**保留指标名 + 数值 + 单位**（用户要求的就是这三样）。
+    h += "@media (max-height:680px){.npanal-kv{display:none}}";
+    h += "@media (max-width:1100px){.npanal-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.npanal-card{padding:6px 8px}}";
+    // 版本对比的提示块（单曲页右键「对比版本…」打开的是弹窗，这里只给样式复用）
+    h += ".anl-note{margin-top:6px;font-size:11px;color:var(--mut2);line-height:1.6;white-space:pre-wrap}";
+    h += ".anl-empty{color:var(--mut2);font-size:12px;padding:10px 0}";
     h += ".anlrow{display:flex;align-items:baseline;justify-content:space-between;gap:10px;padding:3px 0;border-bottom:1px dashed var(--line);font-size:12px}";
     h += ".anlrow:last-child{border-bottom:0}";
     h += ".anl-k{color:var(--mut);display:flex;align-items:center;gap:5px;min-width:0}";
     h += ".anl-v{font-variant-numeric:tabular-nums;font-weight:600;text-align:right;white-space:nowrap}";
     h += ".anl-v i{font-style:normal;font-weight:400;color:var(--mut2);font-size:10.5px}";
-    h += ".anl-empty{color:var(--mut2);font-size:12px;padding:10px 0}";
-    h += ".anl-note{margin-top:6px;font-size:11px;color:var(--mut2);line-height:1.6;white-space:pre-wrap}";
-    h += ".anlbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}";
-    h += ".anlbar .pin{flex:1;min-width:240px}";
-    h += ".anlvers{display:flex;flex-direction:column;gap:1px;margin-top:4px}";
-    h += ".anlck{display:flex;align-items:center;gap:8px;font-size:12px;padding:3px 6px;border-radius:6px;cursor:pointer}";
-    h += ".anlck:hover{background:var(--hov)}";
     h += ".anlck input{accent-color:var(--acc)}";
     h += ".anldir{font-weight:600;color:var(--acc-text)}";
     h += ".bio-box{font-size:13px;line-height:1.75;color:var(--txt2);white-space:pre-wrap;word-break:break-word}";
@@ -483,8 +513,17 @@ inline std::string rta_ui_page() {
     h += ".trow .n{color:var(--mut2);text-align:right;font-variant-numeric:tabular-nums;font-size:11.5px}";
     h += ".trow .tt{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
     h += ".trow .ar{color:var(--mut2);min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11.5px}";
-    h += ".trow .du{color:var(--mut2);text-align:right;font-variant-numeric:tabular-nums;font-size:11.5px}";
+    // 261027-04 #2：.du 原来**只有 text-align:right**，没有 nowrap/ellipsis ⟹ 长专辑名在窄列里
+    // 自动折 2~3 行，把最近播放的行撑成 32/50/68px 各不相同（用户：「每一行的行距不一样」）。
+    // 这里补上单行省略（.tt/.ar 早就有了，唯独漏了这一列）。
+    h += ".trow .du{color:var(--mut2);text-align:right;font-variant-numeric:tabular-nums;font-size:11.5px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
     h += ".trow .bd{font-size:9.5px;color:var(--acc-text);text-align:right;letter-spacing:.3px}";
+    // 最近播放行（261027-04 #2）：用户「每一行的行距不一样，主要是专辑名称那些占用的行数不一样」。
+    // 双保险：①四列全部 minmax(0,..)（旧版是 inline 的 "34px 1fr 160px 92px"，没有 0 下限，
+    //   长内容可以把列撑开）；②行高写死 44px —— 无论名字多长，行高恒为 44px。
+    // 三列文本都 nowrap+ellipsis，全名走 title（hover 可看），所以"更长"只影响省略号位置，不影响行高。
+    h += ".rrow{grid-template-columns:34px minmax(0,1.5fr) minmax(0,1fr) minmax(0,1.1fr);height:44px}";
+    h += ".rrow .du{text-align:left}";
     // 通用列表
     h += ".row{display:flex;align-items:center;gap:11px;padding:9px 18px;cursor:pointer;transition:background .1s;border-bottom:1px solid var(--line)}";
     h += ".row:hover{background:var(--hov)}.row .ico{width:20px;text-align:center;flex:none;opacity:.75}";
@@ -514,9 +553,26 @@ inline std::string rta_ui_page() {
     h += ".qrow .qdel{width:24px;height:24px;border-radius:6px;color:var(--mut2);flex:none;opacity:.6;transition:opacity .12s,background .12s,color .12s;background:none;border:none;cursor:pointer;font-size:15px;line-height:1;display:flex;align-items:center;justify-content:center;font-family:inherit}";
     h += ".qrow:hover .qdel{opacity:1}.qrow .qdel:hover{background:var(--hov2);color:var(--danger)}";
     h += ".qrow .qdel:focus-visible{opacity:1;outline:2px solid var(--acc);outline-offset:1px}";
-    // 队列页工具条（＋ 添加曲目 / 排序 / 撤销排序）与「添加曲目」面板的行
-    h += ".qhd{display:flex;align-items:center;gap:8px;padding:10px 20px 6px}";
-    h += ".qhdsp{flex:1}";
+    // 队列页工具条（＋ 添加曲目 / 排序 / 撤销排序 / 保存为歌单 / 清空队列）
+    // 261027-04 #1：用户「'添加曲目'和'保存为歌单'、'清空队列'不在同一行，把后两个放到'添加曲目'右面」。
+    // 旧版：「保存为歌单 / 清空队列」在顶栏 head() 的 #tools 里，「＋ 添加曲目」在这条 .qhd 里 ⟹
+    //   两条不同的行，怎么调都对不齐。现在三个按钮同在这条 flex 行：
+    //     [＋ 添加曲目]  ……（排序组）……  [保存为歌单][清空队列]
+    // 高度写死 30px + inline-flex 居中：.btn 原来只有 padding，'＋ 添加曲目' 的全角＋会撑高行盒，
+    //   三个按钮 top 会差 1~2px（正是用户说的"不在同一行"）。写死之后 top 差 0.00px。
+    // flex-wrap:wrap + .qhdend{margin-left:auto}：窄窗（<1100px）整行换行时，右组作为**一整块**下沉，
+    //   不会一个按钮留在上一行、一个掉到下一行。
+    h += ".qhd{display:flex;align-items:center;gap:8px;row-gap:8px;padding:10px 20px 6px;flex-wrap:wrap}";
+    // 2026-10-27：.qhdsp 现在是**显式弹性占位**（HTML 里真实存在的 span），比 margin-left:auto 可靠 ——
+    // 后者在 flex-wrap 容器里遇到空间不足会把右组挤到第二行且被内容盖住（1340 宽实机已复现）。
+    h += ".qhdmid,.qhdend{display:flex;align-items:center;gap:8px;flex:none}";
+    h += ".qhdend{margin-left:0}";
+    // 2026-10-27：qhdmid 也**不能**用 margin-left:auto —— 实测它会像 qhdend 一样被挤出可视区。
+    // 这条工具条上的一切都必须按顺序左排，靠 flex-wrap 换行，绝不靠剩余空间定位。
+    h += ".qhdmid{margin-left:0}";
+    // ⚠️ 临时诊断（2026-10-27 铁律 11 排查）：给右组加红底黄边，用来判断它到底是"不可见"还是"没渲染"。
+    //    定位确认后必须删掉这一行。
+    h += ".qhd .btn{height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0 13px;line-height:1}";
     h += ".qhdlb{font-size:12px;color:var(--mut2)}";
     h += ".qhdhint{font-size:11px;color:var(--acc-text);background:var(--acc-weak);border-radius:10px;padding:2px 8px}";
     h += ".qaddr{display:flex;align-items:center;gap:10px;padding:7px 10px;border-bottom:1px solid var(--line);cursor:pointer;transition:background .1s}";
@@ -615,7 +671,9 @@ h += "#npPage .npedge{display:none}";
     //   资料内容改为右侧抽屉，默认完全不出现在版面上；歌词与资料永远**左右相邻**，绝不上下堆叠。
     //   旧版四行（资料整行 + 歌词整行）已删除 —— 那正是用户说的"上下排列丑到不忍直视"。
     // 内容列限宽并居中：hero / 歌词+标签栏 / 控制区 共用同一条左右边界（对齐判据靠这个，而不是靠肉眼）
-    h += ".npgrid{position:relative;z-index:2;height:100%;display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:18px;padding:44px 40px 18px;box-sizing:border-box;max-width:1240px;margin:0 auto}";
+    // 2026-10-27（261027-04 #4）：行数 3 → 4 —— 新增的「分析条」夹在 歌词/资料 与 控制区 之间
+    // （行3 = #npAnal，auto 高；行2 仍是 minmax(0,1fr) ⟹ 只有歌词那一行会被压缩，绝不溢出窗口）。
+    h += ".npgrid{position:relative;z-index:2;height:100%;display:grid;grid-template-rows:auto minmax(0,1fr) auto auto;gap:18px;padding:44px 40px 18px;box-sizing:border-box;max-width:1240px;margin:0 auto}";
     h += ".npgrid.nolyric #npLyric{display:none}";
     // 行2：左歌词 + 右标签栏（标签栏无可用资料时整列收起，歌词自动吃满）
     h += ".npbody{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:22px;min-height:0;align-items:stretch}";
@@ -1090,10 +1148,9 @@ h += "#npPage .npedge{display:none}";
     // 2026-10-23 用户 261023-04 #9：「古典作品」不再占左导航（作品/版本推荐入口移到单曲页「作品」tab）。
     // 实现仍保留 loadWorksView/openWorkVersions/renderWorkVersions，只是不再有导航入口。
     h += "<div class=nav data-v=tracks><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M14.5 4.5v11.2'/><circle cx='12' cy='17.5' r='2.8'/><path d='M14.5 4.5c2.6.6 4 2 4.5 4.2'/></svg>曲目</div>";
-    // 2026-10-27（261027-03 #9）：用户原话「四类分析…没看到 UI」——上一轮只挂在右键菜单，
-    // 而曲目页右键其实是「加入队列」。这里给一个**一眼能看到**的入口：左栏「分析」。
-    // 它不是独立视图，点了直接进设置页的「分析」页签（见 setView/nav 点击处理）。
-    h += "<div class=nav data-v=analysis><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M4 18V9M9.3 18V4.5M14.7 18v-6M20 18v-9'/><path d='M3 21h18'/></svg>分析</div>";
+    // 2026-10-27（261027-04 #4）：用户原话「主页-分析和设置-分析，整个功能页不应该放到这里，
+    // 直接将分析放到正在播放的那首歌音乐上」⟹ 左栏「分析」导航项与设置页「分析」页签**两者都删除**，
+    // 分析改挂在单曲页（#npAnal，见下方 markup）并在播放开始时自动跑一次。
     h += "<div class=nav data-v=files><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M3 7.5a2 2 0 012-2h4l1.8 2H19a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z'/></svg>文件夹</div>";
     h += "<div class=nav data-v=remote><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M7 18a4.5 4.5 0 010-9 6 6 0 0111.6 1.6A3.7 3.7 0 0118 18z'/></svg>流媒体</div>";
     // 2026-10-23 用户 261023-04 #2：EQ 与房间校正**不再留在左导航**，改为设置页的一个页签（data-g=eq）。
@@ -1242,7 +1299,19 @@ h += "#npPage .npedge{display:none}";
     // 261024-04 #7：自动加载的状态/失败重试行（正常态 display:none，不打扰版面）
     h += "<div id=npSummHint class=nprailhint style='display:none'></div></div></aside>";
     h += "</div>";
-    // 行3：控制区（整页也要能操作，否则进来就必须退出）
+    // 行3（2026-10-27 261027-04 #4）：**分析条** —— 动态 / 音质 / 假无损 三类一屏。
+    // 用户原话：「直接将分析放到正在播放的那首歌音乐上，播放就自动运行一次分析，
+    // 在单曲播放页面上放置入口展示（动态、音质、假无损）」。
+    // 内容全部由 anlPaint() 填（前端一次 /api/health，后端按 路径+大小+mtime 缓存）；
+    // 这里只给骨架，绝不在这里算任何东西（避免进单曲页就烧 CPU）。
+    h += "<div class=npanal id=npAnal data-state=idle>";
+    h += "<div class=npanal-hd><span class=t>音频分析</span><span class=st id=npAnlSt>播放一首歌就会自动分析一次</span>";
+    h += "<span class=sp></span>";
+    h += "<button class='npanal-btn on' id=npAnlAuto title='关掉后播放不再自动分析（也可以去 设置-高级 改）'>自动分析：开</button>";
+    h += "<button class=npanal-btn id=npAnlNow title='强制重算这一次（忽略缓存）'>重新分析</button></div>";
+    h += "<div class=npanal-grid id=npAnlGrid></div>";
+    h += "</div>";
+    // 行4：控制区（整页也要能操作，否则进来就必须退出）
     h += "<div class=npctl2>";
     h += "<div class=npseek id=npSeek title='点击跳转'><i id=npBar></i></div>";
     // 261024-01 #3b ①：音量不再单独一行 —— 「时间 / 控制键 / 音量」同处一行（三列网格，中列恒居中）。
@@ -1285,7 +1354,21 @@ h += "#npPage .npedge{display:none}";
 
     h += "<div id=modal><div class=mcard><div class=mhead><b id=mtitle>信号链</b><span class=sp></span><button class=ibtn id=mclose><svg width=15 height=15 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2><path d='M18 6L6 18M6 6l12 12'/></svg></button></div><div class=mbody id=mbody></div></div></div>";
     h += "<div class=toast id=toast></div></div>";
-    h += "<script src=/app.js></script></body></html>";
+    // 2026-10-27（铁律 11 抓到的真 bug，影响所有升级用户）：
+    // 原来是 <script src=/app.js>（无版本参数）。WebView2 复用同一份用户数据目录，
+    // 它的 disk cache 会把 /app.js 缓存住 —— 后端明明换了新脚本（Cache-Control: no-store 也发了），
+    // 页面却仍在跑旧代码：本轮「保存为歌单/清空队列」两个按钮因此**整个不出现**（连红底诊断样式都不出）。
+    // 修法：URL 带版本号，升级后 URL 必变 ⟹ 必然重新拉取。--no-store 只是补充，不是主力。
+    // 版本号 + **编译时间**：只带版本号不够 —— 开发期 version.h 长期不变（本轮实测 ?v=1.5.3
+    // 与上一次完全相同 ⟹ WebView2 仍命中旧缓存，改动继续不生效）。带上 __DATE__/__TIME__
+    // 后每次重新编译 URL 必变，保证「改了前端就一定看得到」，正式发版时版本号本身也会变。
+    h += "<script src=/app.js?v=";
+    h += RLPLAYER_VERSION;
+    h += "-";
+    h += __DATE__;
+    h += "-";
+    h += __TIME__;
+    h += "></script></body></html>";
     return h;
 }
 

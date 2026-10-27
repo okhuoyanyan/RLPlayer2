@@ -208,7 +208,12 @@ static void install_wv_edge_hittest(HWND top);   // 定义在窗口过程之前�
 static void hide_main_window();                 // 261024-05 #1：WM_CLOSE -> 隐藏到托盘（定义在 show_main_window 旁）
 static void open_browser(int port) {
     wchar_t url[64];
-    swprintf_s(url, L"http://127.0.0.1:%d/", port);
+    // 2026-10-27（铁律 11 抓到的真 bug）：原来 Navigate 到固定 URL "http://127.0.0.1:<port>/"。
+        // WebView2 复用同一份用户数据目录，对同一个 URL 的导航可能直接命中它自己的缓存/页面恢复，
+        // 结果：**后端换了新 HTML 与新 app.js，界面却还是旧代码**（本轮「保存为歌单/清空队列」
+        // 两个按钮因此怎么改都不出现，连诊断用红底样式都不渲染）。
+        // 加一个每次启动都不同的查询参数，强制真正重新发起导航。
+        swprintf_s(url, L"http://127.0.0.1:%d/?t=%llu", port, (unsigned long long)GetTickCount64());
 
     const wchar_t* cand[] = {
         L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
@@ -370,7 +375,12 @@ static void darken_edge_window(DWORD pid, DWORD waitMs) {
 
 static void copy_address(int port) {
     wchar_t url[64];
-    swprintf_s(url, L"http://127.0.0.1:%d/", port);
+    // 2026-10-27（铁律 11 抓到的真 bug）：原来 Navigate 到固定 URL "http://127.0.0.1:<port>/"。
+        // WebView2 复用同一份用户数据目录，对同一个 URL 的导航可能直接命中它自己的缓存/页面恢复，
+        // 结果：**后端换了新 HTML 与新 app.js，界面却还是旧代码**（本轮「保存为歌单/清空队列」
+        // 两个按钮因此怎么改都不出现，连诊断用红底样式都不渲染）。
+        // 加一个每次启动都不同的查询参数，强制真正重新发起导航。
+        swprintf_s(url, L"http://127.0.0.1:%d/?t=%llu", port, (unsigned long long)GetTickCount64());
     if (!OpenClipboard(nullptr)) return;
     EmptyClipboard();
     const size_t bytes = (wcslen(url) + 1) * sizeof(wchar_t);
@@ -1194,7 +1204,12 @@ static bool open_webview_window(int port) {
     const DWORD tDpi = GetTickCount();   // DPI 校准结束（窗口可见耗时的分段点）
     const HRESULT ci = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     wchar_t url[64];
-    swprintf_s(url, L"http://127.0.0.1:%d/", port);
+    // 2026-10-27（铁律 11 抓到的真 bug）：原来 Navigate 到固定 URL "http://127.0.0.1:<port>/"。
+        // WebView2 复用同一份用户数据目录，对同一个 URL 的导航可能直接命中它自己的缓存/页面恢复，
+        // 结果：**后端换了新 HTML 与新 app.js，界面却还是旧代码**（本轮「保存为歌单/清空队列」
+        // 两个按钮因此怎么改都不出现，连诊断用红底样式都不渲染）。
+        // 加一个每次启动都不同的查询参数，强制真正重新发起导航。
+        swprintf_s(url, L"http://127.0.0.1:%d/?t=%llu", port, (unsigned long long)GetTickCount64());
     std::string err;
     const std::wstring userData = exe_dir() + L"\\webview2";
     auto onMessage = [hwnd](const std::wstring& m) {
