@@ -1252,75 +1252,170 @@ function enqueueAlbum(k) {
 function artistImgUrl(name, round) {
   return '/api/artist/image?name=' + encodeURIComponent(name) + (round ? ('&r=' + round) : '');
 }
-// 低饱和圆形占位里的图标：音符（24px；详情页头像更大，传 44）
-function artistNoteSvg(size) {
-  return '<svg width=' + size + ' height=' + size + ' viewBox="0 0 24 24" fill=none stroke=currentColor' +
-         ' stroke-width=1.6 stroke-linecap=round stroke-linejoin=round aria-hidden=true>' +
-         '<path d="M9 17.5V5.6l9-1.7v11.6"/><circle cx="6.6" cy="17.6" r="2.5"/><circle cx="15.6" cy="15.6" r="2.5"/></svg>';
+// 低饱和圆形占位里显示什么（2026-10-27 261027-03 #7，用户复测后的修正）：
+// 旧版这里是一个 opacity .35 的音符图标 —— 用户实测「整页看着就是空白的」。
+// 本轮用户明确要求「每张头像位置**立刻**渲染首字母占位（带艺人名首字）」，
+// 而 2026-10-26 的另一条要求是「不要大灰块 / 不许用专辑封面顶替」
+// ⟹ 取交集：**淡描边圆形 + 首字**，不做灰底块、不借任何封面。
+function artistInitialHtml(name, size) {
+  var s = String(name || '').trim();
+  var ch = '';
+  try { ch = Array.from(s)[0] || ''; } catch (e) { ch = s.charAt(0); }
+  if (!ch) ch = '音';
+  return '<span class="aini" style="font-size:' + (size || 22) + 'px">' + esc(ch) + '</span>';
 }
-var ARTAV = { timer: 0, round: 0, total: 0, done: 0, queued: 0, stopped: false };
+// 兼容旧调用（详情页曾在别处引用过音符图标）
+function artistNoteSvg(size) { return artistInitialHtml('', size); }
+var ARTAV = { total: 0, ok: 0, miss: 0, timer: 0, round: 0, gen: 0, queue: [], deadline: 0, stopped: false, lastOkAt: 0 };
+/* ---- 头像加载泵（2026-10-27 261027-03 #7）------------------------------------------
+   用户本轮原话：「头像刚刚一直没出现…已经出现了。所以问题是加载时间太长，以及加载没有任何
+   提示，也没有逐个出现，导致我判断出了问题」。旧实现（上面这段历史里那句「每轮重放 ≤48 张」）
+   实测有三个问题：
+     ① **一次性 128 个 <img> 同时塞 src**：后端 WebUi 只有 6 个 worker、listen backlog 只有 8，
+        冷缓存时并发连接把 accept 队列顶满 —— 实测 127 个并发 GET 会直接 connect refused，
+        浏览器端则表现为「一直转、迟迟不出图」；
+     ② **占位几乎看不见**（opacity .35 的音符图标）⟹ 图没到时整页就是空白；
+     ③ **进度算不出终态**：X 只数「已成功」，缺图的永远补不上 ⟹ 实测卡在
+        「头像补齐中 113 / 128 位」25 s 不下来；而且每 1.8 s 把 48 张**在途**的 src 重设一遍
+        （等于把正在下载的请求全部掐掉重来），慢网下永远收敛不了。
+   新实现：
+     · 占位（首字 + 淡描边圆）**立刻**出现，不依赖任何网络；
+     · 图片由泵按 6 并发逐个喂（与后端 worker 数对齐），每张一落地就自己替换占位
+       （CSS opacity 过渡 ⟹ 看得出是「一张一张出现」）；
+     · 失败按 0.9 s→8 s 退避重试，超过次数或总时限（150 s）才定案成「暂无图源」；
+     · 进度 = 已定案（成功 + 确定没有）/ 总数 ⟹ 数字一直在动，且有明确终态。 */
+var ARTA_CONC = 6;                 // 同时最多 6 张（后端 WebUi 是 6 个 worker，再多只是排队）
+var ARTA_RETRIES = 40;             // 单张最多重试次数
+var ARTA_MAXWAIT_MS = 150000;      // 单页总时限：到点就如实收尾，不再无限转
+// 「多久没有新图落地就收尾」：冷缓存时预热还在供货（一张 1~3 s），不能过早判死；
+// 供货停了 25 s 就定案成「暂无图源」，进度条进入完成态（用户要求：失败也要有终态）。
+var ARTA_IDLE_MS = 25000;
 function artaStop() {
   if (ARTAV.timer) { clearInterval(ARTAV.timer); ARTAV.timer = 0; }
-  ARTAV.round = 0; ARTAV.total = 0; ARTAV.done = 0; ARTAV.queued = 0; ARTAV.stopped = false;
+  ARTAV.gen++;
+  ARTAV.queue = [];
 }
 function artaRender() {
   var box = D('artProgWrap');
   if (!box) return;
   if (!ARTAV.total) { box.innerHTML = ''; return; }
-  var pct = Math.round(ARTAV.done / ARTAV.total * 100);
-  // 三种措辞：还在轮询 → 补齐中；全部到位 → 已补齐；轮询停了但仍有缺图 → 如实说"其余暂无图源"
-  //（绝不写"已补齐 X/Y"来掩盖缺的图 —— 铁律 4）
-  var txt = (ARTAV.done >= ARTAV.total)
-    ? ('头像已补齐 ' + ARTAV.done + ' / ' + ARTAV.total + ' 位')
-    : (ARTAV.stopped
-        ? ('头像已有 ' + ARTAV.done + ' / ' + ARTAV.total + ' 位（其余暂无图源）')
-        : ('头像补齐中 ' + ARTAV.done + ' / ' + ARTAV.total + ' 位'));
-  box.innerHTML = '<div class=albprog><span class=t>' + esc(txt) + '</span>' +
-                  '<span class=bar><i style="width:' + pct + '%"></i></span></div>';
+  var settled = ARTAV.ok + ARTAV.miss;
+  var done = settled >= ARTAV.total;
+  var pct = Math.round(settled / ARTAV.total * 100);
+  var txt;
+  if (done) {
+    // 有缺图就如实写「暂无图源」，绝不写成「已补齐」（铁律 4）
+    txt = ARTAV.miss
+      ? ('头像已加载 ' + ARTAV.ok + ' / ' + ARTAV.total + ' 位（' + ARTAV.miss + ' 位暂无图源，保留首字占位）')
+      : ('头像已加载 ' + ARTAV.ok + ' / ' + ARTAV.total + ' 位');
+  } else {
+    txt = '头像加载中 ' + ARTAV.ok + ' / ' + ARTAV.total + ' 位（逐张出现，缺图会自动重试）';
+  }
+  box.innerHTML = '<div class="albprog artprog' + (done ? ' done' : '') + '">' +
+                  '<span class=t>' + esc(txt) + '</span>' +
+                  '<span class=bar><i style="width:' + pct + '%"></i></span>' +
+                  (done && ARTAV.miss ? '<button class="btn artagain" id=artAgain>重试</button>' : '') +
+                  '</div>';
+  if (D('artAgain') && !D('artAgain').onclick) D('artAgain').onclick = function () { artaStart(); };
 }
-function artaBind() {
-  var imgs = document.querySelectorAll('#list .card .acv img');
-  ARTAV.total = imgs.length;
-  ARTAV.done = 0;
-  Array.prototype.forEach.call(imgs, function (im) {
-    im.onload = function () {
-      if (im.classList.contains('ok')) return;
-      im.classList.add('ok');
-      im.classList.remove('err');
-      ARTAV.done++;
-      artaRender();
-      if (ARTAV.done >= ARTAV.total && ARTAV.timer) { clearInterval(ARTAV.timer); ARTAV.timer = 0; }
-    };
-    im.onerror = function () { im.classList.add('err'); };
-    // 命中磁盘缓存时 load 事件可能早于我挂回调（图片在 innerHTML 解析时就开始了）⟹ 补一次
-    if (im.complete && im.naturalWidth > 0) im.onload();
-  });
+function artaSettle(st, ok) {
+  if (st.state === 'ok' || st.state === 'miss') return;
+  if (ok) {
+    st.state = 'ok';
+    st.im.classList.add('ok');
+    st.im.classList.remove('err');
+    ARTAV.ok++;
+    ARTAV.lastOkAt = Date.now();   // 有新图落地 ⟹ 供货还没停，别急着收尾
+    artaRender();
+    return;
+  }
+  st.tries++;
+  if (st.tries <= ARTA_RETRIES && Date.now() < ARTAV.deadline) {
+    st.state = 'pending';
+    st.due = Date.now() + Math.min(8000, 900 * st.tries);
+    return;
+  }
+  st.state = 'miss';
+  st.im.classList.add('err');
+  ARTAV.miss++;
   artaRender();
 }
-// 一轮 1.8 s；每轮只重放 ≤48 张（WebUi 单线程 accept，246 张同时重放会把它挤住）
-function artaPoll() {
-  if (ARTAV.timer) return;
-  ARTAV.timer = setInterval(function () {
-    if (S.view !== 'artists' || !D('artProgWrap')) { artaStop(); return; }
-    var pend = [];
-    Array.prototype.forEach.call(document.querySelectorAll('#list .card .acv img'), function (im) {
-      if (!im.classList.contains('ok')) pend.push(im);
-    });
-    if (!pend.length) { artaStop(); artaRender(); return; }
-    ARTAV.round++;
-    var batch = 48, off = ((ARTAV.round - 1) * batch) % pend.length;
-    for (var i = 0; i < pend.length && i < batch; i++) {
-      var im = pend[(off + i) % pend.length];
-      im.src = artistImgUrl(im.getAttribute('data-n'), ARTAV.round);
+function artaTick(gen) {
+  if (gen !== ARTAV.gen) return;
+  if (!D('artProgWrap')) { artaStop(); return; }
+  var now = Date.now(), busy = 0, allDone = true;
+  for (var i = 0; i < ARTAV.queue.length; i++) {
+    var st = ARTAV.queue[i];
+    if (st.state === 'ok' || st.state === 'miss') continue;
+    allDone = false;
+    if (st.state === 'inflight') busy++;
+  }
+  // 终态收敛（用户要求「失败也要有终态，不要一直转圈」）：只要还有成功进来，就说明预热
+  // 还在供货，继续等；一旦连续 ARTA_IDLE_MS 没有新图落地，就把还在重试的按「暂无图源」
+  // 定案，进度条进入「已加载 x / y」完成态（并给一个重试入口）。
+  if (!allDone && now - ARTAV.lastOkAt > ARTA_IDLE_MS) {
+    for (var j = 0; j < ARTAV.queue.length; j++) {
+      var s3 = ARTAV.queue[j];
+      if (s3.state === 'ok' || s3.state === 'miss') continue;
+      s3.state = 'miss';
+      s3.im.classList.add('err');
+      ARTAV.miss++;
     }
+    if (ARTAV.timer) { clearInterval(ARTAV.timer); ARTAV.timer = 0; }
+    ARTAV.stopped = true;
     artaRender();
-    if (ARTAV.round >= 20) {          // 约 36 s 后停手，但**保留真实进度**（缺的图不冒充补齐）
-      clearInterval(ARTAV.timer); ARTAV.timer = 0;
-      ARTAV.stopped = true; ARTAV.round = 0;
-      artaRender();
-    }
-  }, 1800);
+    return;
+  }
+  if (allDone) {
+    if (ARTAV.timer) { clearInterval(ARTAV.timer); ARTAV.timer = 0; }
+    ARTAV.stopped = true;
+    artaRender();
+    return;
+  }
+  for (var k = 0; k < ARTAV.queue.length && busy < ARTA_CONC; k++) {
+    var s2 = ARTAV.queue[k];
+    if (s2.state !== 'pending' || s2.due > now) continue;
+    s2.state = 'inflight';
+    busy++;
+    ARTAV.round++;
+    s2.im.src = artistImgUrl(s2.n, ARTAV.round);
+  }
 }
+// 渲染完立刻调：占位已就位，这里只负责「把图一张一张喂进来」
+function artaStart() {
+  artaStop();
+  var imgs = document.querySelectorAll('#list .card .acv img');
+  ARTAV.total = imgs.length; ARTAV.ok = 0; ARTAV.miss = 0;
+  ARTAV.queue = []; ARTAV.round = 0; ARTAV.stopped = false;
+  ARTAV.deadline = Date.now() + ARTA_MAXWAIT_MS;
+  ARTAV.lastOkAt = Date.now();
+  var gen = ARTAV.gen;
+  Array.prototype.forEach.call(imgs, function (im) {
+    var st = { im: im, n: im.getAttribute('data-n') || '', state: 'pending', tries: 0, due: 0 };
+    ARTAV.queue.push(st);
+    im.onload = function () {
+      if (gen !== ARTAV.gen) return;
+      artaSettle(st, im.naturalWidth > 0);
+    };
+    im.onerror = function () { if (gen === ARTAV.gen) artaSettle(st, false); };
+  });
+  artaRender();
+  if (!ARTAV.total) return;
+  ARTAV.timer = setInterval(function () { artaTick(gen); }, 120);
+  artaTick(gen);
+}
+// 详情页 hero（单张图）：占位在底下，图到了就淡入；失败留首字
+function artaHeroBind() {
+  Array.prototype.forEach.call(document.querySelectorAll('.ahead .acv img'), function (im) {
+    if (!im.getAttribute('src')) im.src = artistImgUrl(im.getAttribute('data-n'), 0);
+    im.onload = function () { if (im.naturalWidth > 0) { im.classList.add('ok'); im.classList.remove('err'); } };
+    im.onerror = function () { im.classList.add('err'); };
+    if (im.complete && im.naturalWidth > 0) im.classList.add('ok');
+  });
+}
+// 兼容旧调用名（别再新增调用点）：等价于「重开一轮泵」
+function artaBind() { artaStart(); }
+function artaPoll() { /* 轮询已被泵取代（见 artaStart）：保留空函数只为兼容旧调用点 */ }
 
 /* ---------------- 艺术家 ---------------- */
 // 2026-10-26（261026-05 #1）：支持按关键词过滤（搜索栏在艺术家页搜索时用）。
@@ -1333,10 +1428,9 @@ function loadArtists(q) {
   // 2026-10-26（261026-01 #1）：艺术家头像走外部源，但**抓取必须后台做** ——
   // WebUi 是单线程 accept，如果在图片请求里同步抓，246 个头像会把整站串行阻塞掉。
   // 这里只做一件事：告诉后端"开始预热这些名字"，图片端点本身只读缓存（未命中立刻 404）。
-  api('/api/artist/prefetch').then(function (j) {
-    if (j && j.ok && j.queued) ARTAV.queued = j.queued;
-    artaPoll();            // 预热一开跑就开始"补齐中 X/Y"轮询
-  }).catch(function () { artaPoll(); });
+  // 2026-10-27（261027-03 #7）：预热照旧开跑，但**页面不再等它** —— 占位立刻渲染，
+  // 图片由 artaStart() 的泵逐个喂（后端缓存命中的图几百毫秒内就到，缺图的按退避重试）。
+  api('/api/artist/prefetch').catch(function () {});
   api('/api/lib/albums').then(function (j) {
     var m = {}, order = [];
     (j.albums || []).forEach(function (a) {
@@ -1357,28 +1451,25 @@ function loadArtists(q) {
     h += '<div class=grid style="grid-template-columns:repeat(auto-fill,minmax(150px,1fr))">';
     order.forEach(function (k) {
       var v = m[k];
-      // 2026-10-26（261026-01 #1）：头像来自**外部艺术家图源**（/api/artist/image）。
-      // 用户钦定「取不到就留空、不许用专辑封面顶替」⟹ 这里三件事同时成立：
-      //   ① 不渲染 .ph 首字母灰块（旧版那排灰字母就是它）；② 不借任何专辑封面；
-      //   ③ 取不到图时露一个**低饱和圆形占位**（浅描边 + 音符图标 opacity .35），页面不至于满屏空洞。
+      // 2026-10-26（261026-01 #1）+ 2026-10-27（261027-03 #7）：
+      // 用户两条要求叠在一起 —— ①「取不到就留空，不许用专辑封面顶替」②「每张头像位置**立刻**
+      // 渲染首字母占位（带艺人名首字），不要留空白」⟹ 占位 = 淡描边圆 + 首字（不是旧版的灰块，
+      // 也不是上一版那个几乎看不见的音符图标）。
       // <img> 永远留在 DOM 里（失败只是 opacity:0，不删不摘）⟹「img 数 === 艺术家数」可被断言。
+      // ★ **不在 HTML 里写 src**：由 artaStart() 按 6 并发逐张喂（见上面的加载泵注释），
+      //   这样图是一张一张出现的，也不会一次把 128 个连接怼到后端。
       h += '<div class=card data-a="' + esc(k) + '">' +
            '<div class="cv acv">' +
-             '<div class=aph>' + artistNoteSvg(24) + '</div>' +
-             // ★ 不用 loading=lazy：惰性加载的图在视口外永远不会发请求 ⟹ 重放（换 src）也发不出去，
-             //   「补齐中 X/Y」会永远停在首屏那几张上（实测 35/127 卡死 30 s）。头像端点只读磁盘缓存、
-             //   零网络，127~246 张一起请求的代价就是几百毫秒本地读盘，值得换一个真的会收敛的进度。
-             '<img data-n="' + esc(k) + '" src="' + artistImgUrl(k) + '" alt=""' +
-             ' onerror="this.classList.add(\'err\')">' +
+             '<div class=aph>' + artistInitialHtml(k, 22) + '</div>' +
+             '<img data-n="' + esc(k) + '" class=aimg alt="">' +
            '</div>' +
            '<div class=nm title="' + esc(k) + '">' + esc(k) + '</div>' +
            '<div class=ar>' + v.n + ' 张专辑</div></div>';
     });
     h += '</div>';
     D('list').innerHTML = h;
-    // 渲染完立刻挂 load/error 统计 + 开始轮询（后端没有 progress 端点，X/Y 只能自己数）
-    artaBind();
-    artaPoll();
+    // 渲染完立刻开泵：占位已在 DOM 里，图一张一张补进来，进度条同步走
+    artaStart();
     Array.prototype.forEach.call(D('list').querySelectorAll('.card'), function (e) {
       e.onclick = function () {
         var who = e.dataset.a;
@@ -1430,9 +1521,8 @@ function artistCoverKeyUnused(who) {
 function artistHeroHtml(who, subText) {
   return '<div class="ahead artist-head">' +
        '<div class="cv acv">' +
-         '<div class=aph>' + artistNoteSvg(44) + '</div>' +
-         '<img data-n="' + esc(who) + '" src="' + artistImgUrl(who) + '" alt=""' +
-         ' onerror="this.classList.add(\'err\')">' +
+         '<div class=aph>' + artistInitialHtml(who, 40) + '</div>' +
+         '<img data-n="' + esc(who) + '" class=aimg alt="">' +
        '</div>' +
        '<div class=info>' +
        '<div class=kind>ARTIST · 艺术家资料</div>' +
@@ -1489,6 +1579,8 @@ function openArtistProfile(who, refresh) {
   // ① 立刻出基础页（绝不整页空白等接口；加载文案只进资料区块）
   D('list').innerHTML = artistBaseHtml(who);
   bindArtistButtons(who);
+  // 261027-03 #7：hero 头像也走「占位先出、图到了再淡入」（img 的 src 由这里补上）
+  artaHeroBind();
 
   var wantSumm = (META.summary == 1);
   var summState = { done: false, res: null, enabled: wantSumm, skipBio: false };
@@ -1687,6 +1779,10 @@ function renderArtistProfile(who, j, summary) {
 
   // 绑定事件（261024-04 #5：与基础骨架共用 bindArtistButtons，两处不再各写一遍）
   bindArtistButtons(who);
+  // ★ 2026-10-27（261027-03 #7 第二处真根因）：这个「资料回来后的整页重绘」也会重建 hero，
+  //   但**没有重新给 <img> 挂 src** ⟹ 打开艺术家页约 1 s 后（knowledge 返回那一刻）头像就消失，
+  //   只剩首字占位。实测：t=0.6 s 时 naturalWidth=300，t=2.5 s 变 0。必须在这里补一次绑定。
+  artaHeroBind();
 
   // 复制链接芯片：navigator.clipboard.writeText(url) + toast「已复制来源链接」
   bindCopyChips(D('list'));
@@ -1947,13 +2043,32 @@ function bindTrackRow(e, sorted) {
       toggleFav(favBtn.dataset.file, ev);
     };
   }
+  // ★ 261027-03 #3（用户：「我根本没有添加进入队列的方法」）：
+  //   曲目页/搜索页原来**没有任何可见的入队控件**（实测 300 行 0 个），只能靠猜右键，
+  //   而右键又是不弹菜单、直接加入 —— 用户既找不到入口、也不知道发生了什么。
+  //   现在每行行末有一个常显「＋」（.add-btn，与专辑页同一套），右键改成正经菜单。
+  var addBtn = e.querySelector('.add-btn');
+  if (addBtn) {
+    addBtn.onclick = function (ev) {
+      ev.stopPropagation();
+      var x = sorted[+e.dataset.i] || {};
+      addPathCue(x.path, x.cs, x.ce);
+    };
+  }
   e.onclick = function (ev) {
     if (ev.target.closest && ev.target.closest('.fav-btn')) return;
-    playPath(sorted[+e.dataset.i].path);
+    if (ev.target.closest && ev.target.closest('.add-btn')) return;
+    var x = sorted[+e.dataset.i] || {};
+    playPath(x.path, x.cs, x.ce);
   };
   e.oncontextmenu = function (ev) {
     ev.preventDefault();
-    addPath(sorted[+e.dataset.i].path);
+    // ★ 必须 stopPropagation：文件末尾那个 document 级 contextmenu 监听器（"点别处关菜单"）
+    //   只认 .qi，会把刚弹出的菜单立刻 hideContextMenu() 掉 —— 实测右键曲目行"菜单一闪就没有"。
+    ev.stopPropagation();
+    var x = sorted[+e.dataset.i] || {};
+    // 菜单（立即播放 / 加入播放队列 / 分析音质…），不再"右键即加"
+    showTrackMenu(ev.clientX, ev.clientY, x);
   };
 }
 
@@ -2037,13 +2152,15 @@ function renderTracksView() {
     for (var i = rendered; i < next; i++) {
       var x = sorted[i];
       var isFav = FAV_SET.has(x.path);
-      chunkHtml += '<div class="trow trow-track" data-i=' + i + ' style="grid-template-columns:28px 24px minmax(120px,1.6fr) minmax(0,1fr) 92px 58px;gap:8px">' +
+      // 261027-03 #3：多一列 26px 放常显「＋」（列宽与专辑页曲目行一致，窄屏媒体查询已同步）
+      chunkHtml += '<div class="trow trow-track" data-i=' + i + ' style="grid-template-columns:28px 24px minmax(120px,1.6fr) minmax(0,1fr) 92px 58px 26px;gap:8px">' +
                    '<div class=n>' + (i + 1) + '</div>' +
                    favIconHtml(x.path, isFav) +
                    '<div class=tt title="' + esc(x.title) + '">' + esc(x.title) + '</div>' +
                    '<div class=ar title="' + esc(x.artist + ' \u2014 ' + x.album) + '">' + esc(x.artist) + ' \u2014 ' + esc(x.album) + '</div>' +
                    '<div class=bd>' + fmtTag(x.sr, x.bits) + '</div>' +
-                   '<div class=du>' + fmt(x.dur) + '</div></div>';
+                   '<div class=du>' + fmt(x.dur) + '</div>' +
+                   '<button class="add-btn" title="加入播放队列" aria-label="加入播放队列">+</button></div>';
     }
     var temp = document.createElement('div');
     temp.innerHTML = chunkHtml;
@@ -2346,11 +2463,14 @@ function renderSavedQueues() {
 function paintSavedQueues() {
   {
     var box = D('sqList'); if (!box) return;
-    // #2：标题固定为「我的歌单」（原「保存的队列」）。空列表也给一行说明，
-    // 否则用户不知道左栏这一块是干什么的、也不知道去哪儿存。
+    // #2（261027-03）：标题固定为「我的歌单」。空列表只放**状态**，不放操作指引 ——
+    // 用户原话：「我的歌单下面那句话"队列页 保存为歌单 可新建"是多余的，删除」。
+    // 保留一行极短的占位是有意的：①空态仍然表达"这里能放歌单"（标题 + 空态行）；
+    // ②它是 .sqhd 的首项，删干净会让「播放 / 我的歌单」两块的
+    //   「标题→首项间距」失去可比对象（上一轮刚统一到 6.00px，见 ui_page.h 的 .sec/.sqhd 注释）。
     var h = '<div class=sqhd>我的歌单</div>';
     if (!S.sqs.length) {
-      h += '<div class=sqempty>队列页「保存为歌单」可新建</div>';
+      h += '<div class=sqempty>暂无歌单</div>';
     }
     S.sqs.forEach(function (q, i) {
       h += '<div class="nav sqrow" data-v=sq data-sq="' + esc(q.name) + '" data-i=' + i + '>' +
@@ -2518,8 +2638,11 @@ function showTrackMenu(x, y, tk) {
   item('加入播放队列', function () { addPathCue(tk.path, tk.cs, tk.ce); });
   // 2026-10-27（B2/B3 接线）：音质分析（19 项客观指标）与多版本对比。
   // 两项都只读文件（/api/health 流式解码、/api/compare 对齐后分析），不开音频设备。
+  // 2026-10-27（261027-03 #9）：菜单项的措辞改得更直白，并新增「在『分析』页打开」——
+  // 后者是**四类一起**（动态 / 音质 / 假无损 / 版本对比），前两项仍是单点快速查看。
   item('分析音质（19 项）', function () { openQualityModal(tk.path); });
   item('对比版本…', function () { openCompareModal(tk.path); });
+  item('在「分析」页打开（四类）', function () { openAnalysisFor(tk.path); });
   // #2（2026-10-27 用户 261026-09）：原来的「加入播放列表…」菜单项已随播放列表 UI 一起撤掉
   //（播放队列 / 播放列表重复，只留队列；要留存就用队列页的「保存为歌单」）。
   document.body.appendChild(m);
@@ -3519,6 +3642,9 @@ Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
   e.onclick = function () {
     var v = e.dataset.v;
     if (!v) return;
+    // 261027-03 #9：左栏「分析」不是独立视图，而是设置页「分析」页签的快捷入口
+    //（用户「没看到 UI」的根因：四类分析只挂在右键菜单里）。
+    if (v === 'analysis') { openAnalysisFor(ANL.path || ''); return; }
     setView(v);
     if (v === 'albums') loadAlbums('');
     else if (v === 'artists') loadArtists();
@@ -3757,7 +3883,15 @@ D('bHelp').onclick = function () {
   var rows = [
     ['空格', '暂停 / 继续'], ['← →', '后退 / 前进 5 秒'], ['↑ ↓', '音量增减 1 dB'],
     ['n / p', '下一首 / 上一首'], ['s', '停止'], ['l', '歌词'], ['i', '信号链'],
-    ['右键专辑', '整张加入队列'], ['右键曲目', '加入队列'], ['右键队列条目', '从队列移除'],
+    // 261027-03 #3：这四条原来和实现对不上（「右键队列条目」在队列页根本没实现，
+    // 曲目页右键是"直接加入"不弹菜单）—— 现在两边都已对齐，且补上可见的「＋」入口。
+    ['曲目/专辑行「＋」', '加入播放队列（常显，不用 hover）'],
+    ['队列页「＋ 添加曲目」', '搜曲库加入队列'],
+    ['单曲页「＋ 加入队列」', '把正在播的这首加入队列'],
+    ['右键曲目 / 专辑', '菜单：立即播放 / 加入播放队列'],
+    ['右键队列条目', '菜单：立即播放 / 从队列移除'],
+    ['队列页「排序…」', '标题 / 艺术家 / 专辑 / 时长 / 年份 / 反转 / 随机打乱'],
+    ['「↩ 撤销排序」', '回到排序前那一版顺序（有快照时才出现）'],
     ['拖动队列条目', '调整播放顺序'], ['Esc（搜索框内）', '清空搜索']
   ];
   var h = '<div style="display:grid;grid-template-columns:120px 1fr;gap:9px 14px;font-size:12.5px">';
@@ -4167,6 +4301,80 @@ function opt(v, label, cur) {
 // 开发者注释（"实测 THD+N…""顺序挑第一个能跑的后端"这类）不进入界面。
 function tip(t) {
   return t ? '<span class=tip tabindex=0 role=note data-tip="' + esc(t) + '">?</span>' : '';
+}
+
+/* (#6 / 261027-03) ? 的帮助浮层：body 下的固定定位单例 -------------------------------------
+   旧做法是 CSS 伪元素 .tip::after（绝对定位在 .tip 里）。设置页整块在 .main{overflow:auto}
+   里滚动，浮层一旦伸出主区左边界就被裁掉，而主区左边界 = 左栏右边界 ⟹ 用户看到的就是
+   「帮助文字被左侧栏挡住」。实测（69 个 ? 逐个 hover）17 个浮层压在左栏上（30~2445.7px²），
+   最狠的被吃掉 69.5px 宽），同一批 17 个被 .main 裁掉 1.71~69.5px。左栏没有层叠上下文，
+   z-index:40 本来就压得住它 —— 输的是**裁剪**。
+   ⟹ 改成固定定位的单例层，位置由 tipPlace() 算，并夹在「左栏右边界 → 视口右/下边界」之内。 */
+var _tipLayer = null, _tipOwner = null;
+function tipLayer() {
+  if (_tipLayer && document.body.contains(_tipLayer)) return _tipLayer;
+  _tipLayer = document.getElementById('tipLayer');
+  if (!_tipLayer) {
+    _tipLayer = document.createElement('div');
+    _tipLayer.id = 'tipLayer';
+    _tipLayer.setAttribute('role', 'tooltip');
+    document.body.appendChild(_tipLayer);
+  }
+  return _tipLayer;
+}
+function tipPlace(el) {
+  var L = tipLayer(); if (!L || !el) return;
+  var t = el.getAttribute('data-tip') || '';
+  if (L.textContent !== t) L.textContent = t;
+  L.classList.add('on');                       // 先上屏才能量到尺寸
+  var side = document.querySelector('.side');
+  var sr = side ? side.getBoundingClientRect() : null;
+  var vw = window.innerWidth || document.documentElement.clientWidth || 0;
+  var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+  // 左下限 = 左栏右边界 + 8：浮层绝不压到左栏（固定定位不参与 grid 布局，只能靠坐标避开）
+  var minL = sr ? (Math.ceil(sr.right) + 8) : 8;
+  if (minL > vw - 160) minL = 8;               // 极窄窗口：宁可靠左，也不能把浮层挤成 0 宽
+  L.style.maxWidth = Math.max(140, Math.min(290, vw - minL - 8)) + 'px';
+  var w = L.offsetWidth, h = L.offsetHeight;
+  var r = el.getBoundingClientRect();
+  var x = Math.round(r.left + r.width / 2 - w / 2);
+  if (x < minL) x = minL;
+  if (x + w > vw - 8) x = Math.max(minL, vw - 8 - w);
+  // 分组标题的 (?) 一律向下展开：向上会盖住吸顶的页签条（旧 CSS 也是这样单独处理的）
+  var below = !!(el.closest && el.closest('.sghead'));
+  var y = below ? Math.round(r.bottom + 8) : Math.round(r.top - h - 8);
+  if (y < 8) y = Math.round(r.bottom + 8);          // 上方放不下 → 翻到下方
+  if (y + h > vh - 8) y = Math.max(8, vh - 8 - h);  // 下方也放不下 → 夹进视口
+  L.style.left = x + 'px';
+  L.style.top = y + 'px';
+}
+function tipShow(el) { if (!el) return; _tipOwner = el; tipPlace(el); }
+function tipHide() { if (_tipLayer) _tipLayer.classList.remove('on'); _tipOwner = null; }
+function bindTips() {
+  if (window.__tipBound) return; window.__tipBound = 1;
+  function ownerOf(e) {
+    var t = e && e.target;
+    return (t && t.closest) ? t.closest('.tip') : null;
+  }
+  document.addEventListener('mouseover', function (e) {
+    var el = ownerOf(e);
+    if (el) { if (el !== _tipOwner) tipShow(el); return; }
+    if (_tipOwner) tipHide();
+  }, true);
+  document.addEventListener('mouseout', function (e) {
+    var el = ownerOf(e);
+    if (el && (el === _tipOwner)) tipHide();
+  }, true);
+  document.addEventListener('focusin', function (e) {
+    var el = ownerOf(e);
+    if (el) tipShow(el); else if (_tipOwner) tipHide();
+  }, true);
+  document.addEventListener('focusout', function () { if (_tipOwner) tipHide(); }, true);
+  // 位置是 fixed ⟹ 一旦滚动/改尺寸就作废（否则浮层会脱离它的 ?）。
+  // 设置页的滚动容器是 .main，scroll 不冒泡，必须用捕获阶段。
+  window.addEventListener('scroll', function () { if (_tipOwner) tipHide(); }, true);
+  window.addEventListener('resize', function () { if (_tipOwner) tipHide(); });
+  document.addEventListener('click', function () { if (_tipOwner) tipHide(); }, true);
 }
 function inlineHint(t) {
   return t ? '<div class=hint>' + t + '</div>' : '';
@@ -5294,6 +5502,10 @@ function renderSettingsPage() {
      + '<button class=stab data-g=eq>EQ</button>'
      + '<button class=stab data-g=cal>声音校准</button>'
      + '<button class=stab data-g=meta>元数据</button>'
+     // 2026-10-27（261027-03 #9）：四类分析（动态 / 音质 / 假无损 / 版本对比）独立成页签。
+     // 用户原话「这个功能当前如何显示？没看到 UI」—— 上一轮只挂在右键菜单里，而曲目页的右键
+     // 其实是「加入队列」，等于没有入口。这里与 EQ/声音校准 并列，一进设置就能看到。
+     + '<button class=stab data-g=analysis>分析</button>'
      // 2026-10-24（用户 261024-01 #5）：「流媒体」从「高级」拆出来的独立页签。
      + '<button class=stab data-g=stream>流媒体</button>'
      // 关于与更新（261027-02 #5）：当前版本 / 检查 / 增量下载 / 重启完成。
@@ -5550,6 +5762,8 @@ function renderSettingsPage() {
   // 声音校准 = 房间校正向导 + 校正文件（EQ/IR） —— 测量与外部文件，改的是"系统误差"
   h += '<div class=spane data-g=eq>' + eqSettingsHtml() + '</div>';
   h += '<div class=spane data-g=cal>' + calSettingsHtml() + '</div>';
+  // ---------- 分析（261027-03 #9）：动态 / 音质 / 假无损 / 版本对比 ----------
+  h += '<div class=spane data-g=analysis>' + anlPaneHtml() + '</div>';
 
   // ---------- 流媒体（用户 261024-01 #5/#6：从「高级」拆成独立页签 + 多服务器 + DLNA 归位）----------
   h += '<div class=spane data-g=stream>'
@@ -5772,7 +5986,9 @@ function renderSettingsPage() {
       // 评审 #12：诊断页是纯操作页（导出/写回），底部「保存设置/恢复默认」在这里没有意义 → 隐藏。
       // 2026-10-24 #5：流媒体页的增删改/启用都是即时落盘，同样不需要底部保存。
       var foot = document.querySelector('#setpage .setfoot');
-      if (foot) foot.style.display = (b.dataset.g === 'diag' || b.dataset.g === 'stream') ? 'none' : '';
+      // 261027-03 #9：「分析」页也只读文件、没有可保存的项 ⟹ 同样隐藏底部保存条。
+      if (foot) foot.style.display = (b.dataset.g === 'diag' || b.dataset.g === 'stream' ||
+                                      b.dataset.g === 'analysis') ? 'none' : '';
       if (b.dataset.g === 'in') {
         loadInputDevices();
         pollInputState();
@@ -5784,6 +6000,8 @@ function renderSettingsPage() {
         loadSrcConfig();
         scanCastDevices(false);   // 推送区块的设备列表
         pollCastState();          // 推送区块的实时状态（与单曲页按钮同源）
+      } else if (b.dataset.g === 'analysis') {
+        anlBind();                // 261027-03 #9：只绑事件，不自动跑分析（避免一进设置就吃满 CPU）
       }
     };
   });
@@ -7467,19 +7685,47 @@ function renderCompare(r) {
   var vs = r.versions || [], rows = r.rows || [];
   var h = '<div style="margin-top:12px;font-size:12px">';
   if (!r.sameTrack) h += '<div class=hint style="color:var(--err)">⚠ 包络相关太低，这些文件可能不是同一首曲子：结论仅供参考</div>';
-  h += '<div style="font-weight:650;margin-bottom:4px">排序（好 → 差）</div><ol style="margin:0 0 8px 18px;padding:0">';
   // 版本号（V1/V2…）是后端给的序号，单看它认不出是哪个文件 ⟹ 一律带上文件名。
   function vName(v, i) {
     var base = String((v && (v.path || v.label)) || ('#' + i)).replace(/^.*[\\\/]/, '');
     return base;
   }
+  // 第 8 维（2026-10-27）：有效带宽 / 有损转码。数值全部来自后端「长期平均谱的陡沿截止」
+  // （信号本身），不看扩展名/码率 —— 所以「改名成 .flac」「改码率标签」骗不过这一维。
+  function bwTxt(v) {
+    if (!v) return '';
+    var hz = v.cutoffDetected ? Number(v.cutoffHz) : Number(v.bandwidthHz || 0);
+    if (!isFinite(hz) || hz <= 0) return '—';
+    return (hz / 1000).toFixed(1) + ' kHz';
+  }
+  function lossyTag(v) {
+    if (!v || !v.lossySuspected) return '';
+    return ' <span style="color:var(--err);font-weight:650">［有损转码（截止 ' + bwTxt(v) + '）］</span>';
+  }
+  var topIdx = (r.ranking && r.ranking.length) ? r.ranking[0] : 0;
+  var topV = vs[topIdx] || {};
+  var anyClean = false;
+  vs.forEach(function (v) { if (v && !v.lossySuspected) anyClean = true; });
+  // 第一名仍是「疑似有损」⟹ 红字警告（正常情况不该出现：带宽维度 + 有损固定罚应把它压下去）
+  if (topV.lossySuspected && anyClean) {
+    h += '<div style="color:var(--err);font-weight:650;margin:0 0 8px;line-height:1.5">' +
+         '⚠ 排序第 1 的 ' + esc(topV.label || '') + ' 是疑似有损转码（截止 ' + esc(bwTxt(topV)) +
+         '），却排在没有该标记的版本之前：评分权重可能失效，请勿据此选版本。</div>';
+  }
+  h += '<div style="font-weight:650;margin-bottom:4px">排序（好 → 差）</div><ol style="margin:0 0 8px 18px;padding:0">';
   (r.ranking || []).forEach(function (i) {
     var v = vs[i] || {};
     h += '<li>' + esc(v.label || ('#' + i)) + ' <span style="color:var(--mut)">' + esc(vName(v, i)) + '</span>' +
          ' — <b>' + qFmt(v.score, 1) + '</b> 分' +
+         ' <span style="color:var(--mut2);font-size:11px">带宽 ' + esc(bwTxt(v)) + '</span>' +
+         lossyTag(v) +
          (v.error ? (' <span style="color:var(--err)">' + esc(v.error) + '</span>') : '') + '</li>';
   });
-  h += '</ol><div style="max-height:40vh;overflow:auto"><table style="font-size:11.5px;border-collapse:collapse;width:100%">';
+  h += '</ol>';
+  if (!anyClean && vs.length) {
+    h += '<div class=hint style="color:var(--warn,#e6a23c)">本批次所有版本都带「有损」标记 ⟹ 排序只在有损版本之间有效（带宽维度全员同罚，不影响名次）。</div>';
+  }
+  h += '<div style="max-height:40vh;overflow:auto"><table style="font-size:11.5px;border-collapse:collapse;width:100%">';
   h += '<thead><tr><th style="text-align:left;padding:3px 8px 3px 0">指标</th>';
   vs.forEach(function (v, i) {
     h += '<th style="text-align:right;padding:3px 0 3px 10px;font-weight:600">' + esc(v.label || '') +
@@ -7502,6 +7748,337 @@ function renderCompare(r) {
   h += '<div class=hint style="margin-top:8px;white-space:pre-wrap">' + esc(r.explanation || '') + '</div>';
   h += '</div>';
   return h;
+}
+
+
+// ============================================================================
+// 「分析」页签（261027-03 #9）
+// ----------------------------------------------------------------------------
+// 用户原话：「动态分析（Dynamic range (R128)、或者有其他标准可用）、音质分析、假无损分析、
+// 对比同一首音乐，不同版本之间的音质高低。这个功能当前如何显示？没看到 UI」。
+// 事实核查：四类分析后端**早就都实现了**（dynamics.h / quality.h / fake_lossless.h /
+// version_compare.h，端点 /api/health 与 /api/compare），但上一轮只接到「右键曲目 → 菜单」，
+// 而曲目页的右键其实是「加入队列」（bindTrackRow 的 oncontextmenu = addPath），
+// 所以用户根本碰不到 ⟹ 本轮把入口做成**设置页的独立「分析」页签**（左栏「分析」也直达）。
+//
+// 一屏四栏：① 动态（TT DR / R128 LUFS / LRA / 峰值 / 峰值因子）
+//          ② 音质（19 项客观指标，挑最可读的 12 项）
+//          ③ 假无损（判定 + 截止频率 + 置信度 + 理由）
+//          ④ 版本对比（同目录多选 → 后端对齐后排序 + 逐项表 + 「为什么 A 比 B 好」）
+// 结果缓存：后端 /api/health 进程内缓存（同路径 + 大小 + mtime 不重算），前端再记一层，
+//           页签来回切不再打端点；「重新分析」按钮走 fresh=1 强制重算。
+// 纪律：全部只读文件，**不开任何音频设备**（铁律 1）。
+// ============================================================================
+var ANL = { path: '', busy: false, q: {}, cmp: {}, dir: '' };
+
+// 分析可能跑几秒到几十秒（282 s 的 6 声道 FLAC 实测 2.3 s，DSD/长曲更久），
+// 所以不能用 apiRaw 的 8 s 超时 —— 这里自带一个可配超时的 fetch。
+function anlFetch(url, body, ms) {
+  var opt = { method: 'POST' };
+  if (body !== undefined) opt.body = body;
+  var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  if (ctrl) opt.signal = ctrl.signal;
+  var timer = 0;
+  if (ctrl) timer = setTimeout(function () { ctrl.abort(); }, ms || 180000);
+  return fetch(url, opt).then(function (r) {
+    if (timer) clearTimeout(timer);
+    if (!r.ok) return r.text().then(function (t) {
+      var m = '';
+      try { var j = JSON.parse(t); m = j.error || j.message || ''; } catch (e) { m = t; }
+      throw new Error(m || ('HTTP ' + r.status));
+    });
+    return r.json();
+  }, function (e) { if (timer) clearTimeout(timer); throw e; });
+}
+
+function anlNum(v, d) {
+  if (v === undefined || v === null) return '—';
+  if (typeof v !== 'number') return String(v);
+  if (!isFinite(v)) return '—';
+  if (v <= -299 && v > -1e6) return '不适用';    // −300 是「测不出」哨兵
+  return v.toFixed(d === undefined ? 2 : d);
+}
+// 一行指标：名称 + (?) 人话解释 + 数值 + 单位
+function anlRow(label, val, unit, hint) {
+  return '<div class=anlrow><span class=anl-k title="' + esc(hint || '') + '">' + esc(label) +
+         (hint ? tip(hint) : '') + '</span><span class=anl-v>' + esc(String(val)) +
+         (unit ? ' <i>' + esc(unit) + '</i>' : '') + '</span></div>';
+}
+function anlCard(id, title, sub, body) {
+  return '<div class="sgroup anlcard" id="' + id + '"><div class=sgtitle>' + esc(title) +
+         '<span class=anl-sub>' + esc(sub || '') + '</span></div><div class=sgbody>' + body + '</div></div>';
+}
+function anlPaneHtml() {
+  var h = '<div class=sgroup><div class=sgtitle>音频分析 · 四类一屏' +
+          tip('四类分析都只读文件、不开音频设备。同一文件第二次看结果会直接命中缓存（后端按 路径+大小+mtime 记）。') +
+          '</div><div class=sgbody>';
+  h += '<div class=anlbar>' +
+       '<input id=anlPath class=pin placeholder="输入音频文件绝对路径，或点右侧「选文件」" spellcheck=false value="' + esc(ANL.path || '') + '">' +
+       '<button class=btn id=anlPick>选文件</button>' +
+       '<button class=btn id=anlNow>用正在播放</button>' +
+       '<button class="btn pri" id=anlGo>开始分析</button>' +
+       '<button class=btn id=anlFresh>重新分析</button>' +
+       '</div>';
+  h += '<div class=hint id=anlMsg style="margin:2px 0 10px">选一个文件 → 点「开始分析」。动态 / 音质 / 假无损 会一起算出来。</div>';
+  h += '<div id=anlPickBox style="display:none;margin-bottom:10px"></div>';
+  h += '</div></div>';
+  h += '<div class=anlgrid id=anlGrid>' +
+       anlCard('anlDyn', '① 动态', 'TT DR / R128', '<div class=anl-empty>还没分析</div>') +
+       anlCard('anlQual', '② 音质', '19 项客观指标', '<div class=anl-empty>还没分析</div>') +
+       anlCard('anlFake', '③ 假无损', '有损转码检测', '<div class=anl-empty>还没分析</div>') +
+       anlCard('anlCmp', '④ 版本对比', '同一首的不同版本', '<div class=anl-empty>选文件分析后可对比同目录的其它版本</div>') +
+       '</div>';
+  return h;
+}
+function anlSetMsg(t, isErr) {
+  var e = D('anlMsg');
+  if (!e) return;
+  e.textContent = t || '';
+  e.style.color = isErr ? 'var(--err)' : '';
+}
+function anlFill(h) {
+  var q = (h && h.quality) || {};
+  var dyn = anlRow('TT 动态范围 DR', anlNum(h.dr_db, 1), 'dB', '最响与最轻段落的电平差；同一母带里越大越"活"，跨曲目不可直接比。')
+          + anlRow('响度 LUFS (R128)', anlNum(h.lufs, 1), 'LUFS', 'EBU R128 积分响度，流媒体以它为基准；−14 左右是常见投放目标。')
+          + anlRow('响度范围 LRA', anlNum(h.lra, 1), 'LU', 'R128 的响度范围：段落间起伏，越大动态越丰富。')
+          + anlRow('真峰值', anlNum(h.peak_dbfs, 2), 'dBFS', '采样峰值（超过 −1 dBFS 的母带在重采样后容易削波）。')
+          + anlRow('峰值因子', anlNum(q.crest_db, 1), 'dB', '峰值减 RMS；LPCM 一般 10~20 dB，压得太狠会低于 8 dB。')
+          + anlRow('动态 P95−P10', anlNum(q.dyn_p95_p10_db, 1), 'dB', '块电平的 95 分位减 10 分位，抗单点尖峰。');
+  var qual = anlRow('THD+N', q.thdn_available ? anlNum(q.thdn_db, 2) : '不适用', q.thdn_available ? 'dB' : '', '单基频总谐波失真+噪声；音乐素材通常测不出（所以给「不适用」而不是编个数）。')
+           + anlRow('非谐波残留', anlNum(q.non_tonal_db, 1), 'dB', '16 个最强谱峰之外的能量占比 = 噪声/失真/有损残留的上界。')
+           + anlRow('互调失真 IMD', q.imd_available ? anlNum(q.imd_db, 2) : '不适用', q.imd_available ? 'dB' : '', '双音互调；同样只对测试信号有意义。')
+           + anlRow('本底噪声', anlNum(q.noise_floor_dbfs, 1), 'dBFS', '最低 10% 的 100 ms 块电平；密集音乐是本底的上界。')
+           + anlRow('信噪比', anlNum(q.snr_db, 1), 'dB', '有效电平相对本底；同源不同转码之间比它最直观。')
+           + anlRow('谱重心', anlNum(q.centroid_hz, 0), 'Hz', '能量重心的频率位置：越低越"闷"，越高越"亮/刺"。')
+           + anlRow('谱倾斜', anlNum(q.tilt_db_per_oct, 2), 'dB/oct', '每倍频程的能量斜率；母带越亮斜率越平。')
+           + anlRow('95% 滚降点', anlNum(q.rolloff95_hz, 0), 'Hz', '累计能量到 95% 的频率 = 实际"用满"的带宽。')
+           + anlRow('>10 kHz 占比', anlNum(q.hf_ratio_10k_db, 1), 'dB', '高频能量占比；128 kbps 这类低码率会明显掉。')
+           + anlRow('峰值 / RMS', anlNum(q.peak_dbfs_q, 1) + ' / ' + anlNum(q.rms_dbfs, 1), 'dBFS', '绝对电平，用于判断母带响度是否被压过头。')
+           + anlRow('削波', anlNum(q.clipped_samples, 0) + ' 样本 / ' + anlNum(q.clipped_pct, 4) + '%', '', '数字满幅削波；母带常见的"糊"来源之一。')
+           + anlRow('削波段', anlNum(q.clipped_runs, 0) + ' 段（最长 ' + anlNum(q.longest_clip_run, 0) + '）', '样本', '连续削波的段数与最长一段长度。')
+           + anlRow('声道相关', q.stereo ? anlNum(q.channel_corr, 3) : '非立体声', q.stereo ? '' : '', '左右声道相关系数；接近 1 = 几乎单声道。')
+           + anlRow('单声道损失', q.stereo ? anlNum(q.mono_loss_db, 2) : '—', q.stereo ? 'dB' : '', '折成单声道时损失的能量，越大说明声场越依赖左右差异。');
+  var fake = anlRow('判定', h.lossless_suspected ? '疑似有损转码' : '未发现转码痕迹', '', '按截止频率 + 谱峭壁 + 高频能量联合判断；"未发现"不等于绝对无损。')
+           + anlRow('截止频率', anlNum(h.cutoff_hz, 0), 'Hz', '能量真正结束的位置；16/44.1 的正常无损可到 ~20 kHz，128 kbps MP3 常在 15~16 kHz 断崖。')
+           + anlRow('置信度', anlNum((h.confidence || 0) * 100, 0), '%', '判定强度；低置信度时请当参考而非结论。')
+           + anlRow('位深 / 采样率 / 声道', (h.bits || '—') + ' bit / ' + anlNum(h.fs, 0) + ' Hz / ' + (h.channels || '—') + ' ch', '', '容器里声明的格式（不等于母带质量）。')
+           + anlRow('时长', anlNum(h.duration_sec, 1), 's', '')
+           + (h.fake24 ? anlRow('★ 24bit 假高解析', '是', '', '标称 24 bit 但有效位深不足（低 8 位为 0 或噪声底偏低）。') : '')
+           + (h.reason ? '<div class=anl-note>' + esc(h.reason) + '</div>' : '')
+           + (q.note ? '<div class=anl-note>' + esc(q.note) + '</div>' : '');
+  D('anlDyn').querySelector('.sgbody').innerHTML = dyn;
+  D('anlQual').querySelector('.sgbody').innerHTML = qual;
+  D('anlFake').querySelector('.sgbody').innerHTML = fake;
+  // ④ 版本对比：分析完就把「同目录的其它版本」列出来（不自动跑，避免一进页就烧 CPU）
+  anlListVersions();
+}
+function anlFail(msg) {
+  var box = '<div class=anl-empty style="color:var(--err)">' + esc(msg) + '</div>';
+  ['anlDyn', 'anlQual', 'anlFake'].forEach(function (id) {
+    var e = D(id);
+    if (e) e.querySelector('.sgbody').innerHTML = box;
+  });
+}
+function anlRun(force) {
+  var p = (D('anlPath') ? String(D('anlPath').value || '').trim() : '');
+  if (!p) { anlSetMsg('先选一个文件（或点「用正在播放」）', true); return; }
+  ANL.path = p;
+  var key = p + '|' + (force ? 'f' : 'c');
+  if (!force && ANL.q[key]) { anlFill(ANL.q[key]); anlSetMsg('已用缓存结果：' + p); return; }
+  if (ANL.busy) return;
+  ANL.busy = true;
+  anlSetMsg('正在分析：' + p + '（流式分块解码，长曲较久）');
+  var t0 = Date.now();
+  anlFetch('/api/health?file=' + encodeURIComponent(p) + (force ? '&fresh=1' : ''), undefined, 240000)
+    .then(function (j) {
+      ANL.busy = false;
+      var h = (j && j.health) || null;
+      if (!j || !j.ok || !h) {
+        anlFail((j && j.error) || (h && h.error) || '分析失败');
+        anlSetMsg('分析失败：' + ((h && h.error) || (j && j.error) || '未知原因'), true);
+        return;
+      }
+      ANL.q[p] = h;
+      ANL.q[key] = h;
+      anlFill(h);
+      anlSetMsg('完成：' + p + ' ｜ 用时 ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s' +
+                (j.cached ? '（命中后端缓存）' : ''));
+    })
+    .catch(function (e) {
+      ANL.busy = false;
+      anlFail('分析失败：' + (e && e.message ? e.message : e));
+      anlSetMsg('分析失败：' + (e && e.message ? e.message : e), true);
+    });
+}
+// ④ 版本对比：列同目录音频文件
+function anlListVersions() {
+  var card = D('anlCmp');
+  if (!card) return;
+  var body = card.querySelector('.sgbody');
+  var p = ANL.path;
+  if (!p) { body.innerHTML = '<div class=anl-empty>先分析一个文件</div>'; return; }
+  var dir = p.replace(/[\\\/][^\\\/]*$/, '');
+  var self = p.replace(/^.*[\\\/]/, '');
+  body.innerHTML = '<div class=hint>正在列目录…</div>';
+  anlFetch('/api/files?dir=' + encodeURIComponent(dir)).then(function (j) {
+    var fs2 = ((j && j.files) || []).filter(function (n) { return /\.(flac|wav|mp3|m4a|aac|ogg|opus|aiff|aif|dsf|dff)$/i.test(n); });
+    if (!fs2.length) { body.innerHTML = '<div class=anl-empty>这个目录里没有别的音频文件</div>'; return; }
+    var h = '<div class=hint style="margin-bottom:6px">勾 2~8 个版本（同目录）。后端会先按包络对齐、再在公共区段重算指标。</div>';
+    h += '<div class=anlvers>';
+    fs2.forEach(function (n) {
+      h += '<label class=anlck><input type=checkbox class=anlckb data-n="' + esc(n) + '"' +
+           (n === self ? ' checked' : '') + '><span>' + esc(n) + '</span></label>';
+    });
+    h += '</div><div style="display:flex;gap:8px;align-items:center;margin-top:8px">' +
+         '<button class="btn pri" id=anlCmpGo>开始对比</button>' +
+         '<span class=hint id=anlCmpMsg>已选 ' + esc(self) + '</span></div>' +
+         // grid-column:1/-1 —— 卡片正文是 auto-fill 网格（每个单元 260px），不跨列的话
+         // 逐项对比表会被塞进一个 260px 的窄格（实测 1600px 窗口下只有 319px、四列表只剩一列可见）。
+         // 结果区必须跨满整行，否则新加的「有损转码（截止 x kHz）」标注全被截断。
+         '<div id=anlCmpOut style="grid-column:1/-1;min-width:0"></div>';
+    body.innerHTML = h;
+    var n = document.querySelectorAll('#anlCmp .anlckb').length;
+    D('anlCmpGo').onclick = function () {
+      var sel = [];
+      Array.prototype.forEach.call(document.querySelectorAll('#anlCmp .anlckb'), function (c) {
+        if (c.checked) sel.push(dir + '\\' + c.dataset.n);
+      });
+      if (sel.length < 2) { D('anlCmpMsg').textContent = '至少勾 2 个版本'; return; }
+      D('anlCmpMsg').textContent = '正在对齐并分析 ' + sel.length + ' 个版本…';
+      D('anlCmpGo').disabled = true;
+      var key = sel.slice().sort().join('|');
+      if (ANL.cmp[key]) {
+        D('anlCmpGo').disabled = false;
+        D('anlCmpMsg').textContent = '已用缓存结果';
+        D('anlCmpOut').innerHTML = renderCompare(ANL.cmp[key]);
+        return;
+      }
+      anlFetch('/api/compare', JSON.stringify({ files: sel }), 300000).then(function (r) {
+        D('anlCmpGo').disabled = false;
+        D('anlCmpMsg').textContent = '';
+        ANL.cmp[key] = r;
+        D('anlCmpOut').innerHTML = renderCompare(r);
+        anlDecorateCompare(sel, r);   // 补「疑似有损转码」标注 + 排序局限警告
+      }).catch(function (e) {
+        D('anlCmpGo').disabled = false;
+        D('anlCmpMsg').textContent = '对比失败：' + (e && e.message ? e.message : e);
+      });
+    };
+  }).catch(function (e) {
+    body.innerHTML = '<div class=anl-empty style="color:var(--err)">列目录失败：' + esc(e && e.message ? e.message : e) + '</div>';
+  });
+}
+// 文件选择：用 /api/files 做一个极简浏览器（点目录进、点文件选）
+function anlPick(dir) {
+  var box = D('anlPickBox');
+  if (!box) return;
+  box.style.display = '';
+  box.innerHTML = '<div class=hint>正在列目录…</div>';
+  anlFetch('/api/files?dir=' + encodeURIComponent(dir || '')).then(function (j) {
+    if (!j || !j.ok) { box.innerHTML = '<div class=anl-empty style="color:var(--err)">' + esc((j && j.error) || '列目录失败') + '</div>'; return; }
+    ANL.dir = j.dir || '';
+    var h = '<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">' +
+            '<button class=btn id=anlUp>↑ 上一级</button>' +
+            '<span class=hint style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(ANL.dir) + '</span>' +
+            '<button class=btn id=anlPickClose>关闭</button></div><div class=anlvers style="max-height:240px;overflow:auto">';
+    (j.dirs || []).forEach(function (n) {
+      h += '<div class="anlck anldir" data-d="' + esc(n) + '">📁 ' + esc(n) + '</div>';
+    });
+    (j.files || []).forEach(function (n) {
+      h += '<div class="anlck anlfile" data-f="' + esc(n) + '">♪ ' + esc(n) + '</div>';
+    });
+    h += '</div>';
+    box.innerHTML = h;
+    Array.prototype.forEach.call(box.querySelectorAll('.anldir'), function (e) {
+      e.onclick = function () { anlPick((ANL.dir.replace(/[\\\/]+$/, '')) + '\\' + e.dataset.d); };
+    });
+    Array.prototype.forEach.call(box.querySelectorAll('.anlfile'), function (e) {
+      e.onclick = function () {
+        var p = (ANL.dir.replace(/[\\\/]+$/, '')) + '\\' + e.dataset.f;
+        if (D('anlPath')) D('anlPath').value = p;
+        box.style.display = 'none';
+        anlRun(false);
+      };
+    });
+    if (D('anlPickClose')) D('anlPickClose').onclick = function () { box.style.display = 'none'; };
+    if (D('anlUp')) D('anlUp').onclick = function () {
+      var parts = ANL.dir.replace(/[\\\/]+$/, '').split('\\');
+      parts.pop();
+      anlPick(parts.join('\\'));
+    };
+  }).catch(function (e) {
+    box.innerHTML = '<div class=anl-empty style="color:var(--err)">' + esc(e && e.message ? e.message : e) + '</div>';
+  });
+}
+function anlBind() {
+  if (D('anlGo')) D('anlGo').onclick = function () { anlRun(false); };
+  if (D('anlFresh')) D('anlFresh').onclick = function () { anlRun(true); };
+  if (D('anlPick')) D('anlPick').onclick = function () { anlPick(ANL.dir || ''); };
+  if (D('anlNow')) D('anlNow').onclick = function () {
+    api('/api/status').then(function (j) {
+      if (j && j.current) {
+        if (D('anlPath')) D('anlPath').value = j.current;
+        anlRun(false);
+      } else toast('当前没有在播放的曲目');
+    });
+  };
+  if (D('anlPath')) D('anlPath').onkeydown = function (e) { if (e.key === 'Enter') anlRun(false); };
+  // 页签回来时把上次的结果/选定文件恢复出来（只是回填 DOM，不重跑）
+  if (ANL.path && !ANL.q[ANL.path] && !ANL.q[ANL.path + '|c']) anlSetMsg('上次分析过：' + ANL.path + '（点「开始分析」重新跑）');
+}
+// 版本对比结果的补充标注（261027-03 #9；2026-10-27 随第 8 维落地重写）——**必须读**：
+// 上一轮实测（同一首 60 s：FLAC 无损 / 320k MP3 / 128k MP3 / 低通 14k 的假高解析）：
+//   排序给出 V3(128k) 第一、V1(FLAC) 最后 —— 因为 score_versions 当时只有七个维度，
+//   **没有带宽/有损这一维**；有损编码把峰值压低、削波样本变少（V1 276 段 → V3 51 段），
+//   反而在这套指标上占便宜。上一轮的兜底是前端逐版打 /api/health 另取「假无损」判定做标注。
+// 本轮（2026-10-27）：version_compare.h 已把「有效带宽 / 有损转码」做成**第 8 个评分维度**
+//   （截止频率来自长期平均谱的陡沿，权重 0.20，再对确证有损的版本固定扣 12 分），
+//   /api/compare 的 versions[] 直接带 cutoffHz / bandwidthHz / lossySuspected / cutoffReason。
+// 于是这里不再需要 N 次 /api/health —— 排序已把有损版本压下去，本函数只做两件事：
+//   ① 把「有损转码（截止 x kHz）」的清单集中列一次（排序列表里也逐个标了）；
+//   ② 若第一名仍是有损版本，红字警告（自检：正常不该出现）。
+function anlDecorateCompare(sel, r) {
+  var out = D('anlCmpOut');
+  if (!out) return;
+  Array.prototype.forEach.call(out.querySelectorAll('.anl-note'), function (b) {
+    if (b.dataset.cmpnote) b.parentNode.removeChild(b);
+  });
+  var vs = (r && r.versions) || [];
+  if (!vs.length) return;
+  var lines = [];
+  vs.forEach(function (v) {
+    if (!v || !v.lossySuspected) return;
+    var hz = v.cutoffDetected ? Number(v.cutoffHz) : Number(v.bandwidthHz || 0);
+    lines.push('· ' + (v.label || '') + ' ' + String(v.path || '').replace(/^.*[\\\/]/, '') +
+               ' 有损转码（截止 ' + (isFinite(hz) && hz > 0 ? (hz / 1000).toFixed(1) + ' kHz' : '未知') +
+               (v.cutoffReason ? '；' + v.cutoffReason : '') + '）');
+  });
+  var top = vs[(r.ranking && r.ranking.length) ? r.ranking[0] : 0];
+  var anyClean = false;
+  vs.forEach(function (v) { if (v && !v.lossySuspected) anyClean = true; });
+  var warn = '';
+  if (top && top.lossySuspected && anyClean) {
+    warn = '⚠ 排序第 1 的 ' + (top.label || '') + ' 被判定为疑似有损转码，却排在没有该标记的版本之前。' +
+           '带宽维度 + 有损固定罚本该把它压下去 ⟹ 请把这份结果当作权重失效的信号上报，不要照着排序选版本。';
+  }
+  if (!lines.length && !warn) return;
+  var h = '<div class=anl-note data-cmpnote=1 style="margin-top:10px">' +
+          (lines.length
+            ? '<div style="font-weight:600;margin-bottom:3px">有损转码判定（信号自身的谱截止，不看扩展名/码率）</div>' +
+              lines.map(function (x) { return '<div>' + esc(x) + '</div>'; }).join('')
+            : '') +
+          (warn ? '<div style="margin-top:6px;color:var(--err);font-weight:650">' + esc(warn) + '</div>' : '') +
+          '</div>';
+  // 放在最上面（在「排序」之前）：警告必须第一眼看到，不能被长表格压到折叠线以下。
+  out.insertAdjacentHTML('afterbegin', h);
+}
+
+// 从别处跳进来：切到设置页的「分析」页签 + 预填文件 + 立刻分析
+function openAnalysisFor(path) {
+  ANL.path = path || '';
+  openSettingsTab('analysis');
+  if (D('anlPath') && path) D('anlPath').value = path;
+  if (path) anlRun(false);
 }
 
 // ============================================================================
@@ -7982,40 +8559,49 @@ document.addEventListener('keydown', function (e) {
   else if (e.key === 'i') showChain();
 });
 
-/* ---------------- 队列排序（261027-02 #4） ----------------
-   用户原话：「播放队列本来有的那些排序功能呢？」—— 曲目页有排序下拉，队列页只有拖拽。
-   现在队列页右上角也有同一个下拉（复用曲目页的 .track-sort 视觉，不新造控件）。
+/* ---------------- 播放队列：排序 / 右键 / 添加面板（261027-03 #3 重构） ----------------
+   用户原话：「播放队列页有严重BUG，出现了一个默认顺序，已经添加的歌曲不能删除。
+                添加的逻辑也跟之前版本严重不同。请你认真分析、重构合理的播放队列功能。」
 
-   三条必须守住的规矩（判据就是这三条）：
-   ① **只换顺序，不换曲**：排序在前端算完，把目标顺序整列交给 POST /api/qorder，
-      由后端把 index **重新定位到"当前播的那一首"**（QItem::same，含 CUE 区间）。
-      前端绝不自己改 index —— 那正是"排序一次跳一首歌"的根源。
-   ② **可撤销**：「默认顺序」不是前端猜一个"原始顺序"，而是让后端把**第一次排序前的快照**
-      整列还原（POST /api/qsort?by=default）。队列可能是用户精心排的，必须有后悔药；
-      快照存在后端 ⟹ 刷新页面/重开窗口之后也还能撤销。
-   ③ 排序结果**落回后端 items**（与拖拽排序一致），否则会出现"看到的是 A 顺序、播的是 B 顺序"。
+   重构后模型只有一句话：**队列 = 一张有序表 + 一个"正在播"指针；加/删/排只改表，播只改指针。**
+     · 加（5 个入口，全部是**看得见的**按钮/菜单项）：
+         ① 队列页「＋ 添加曲目」→ 搜索面板，点行即加入（本文件的 openQueueAddPanel）
+         ② 曲目页 / 搜索页 每行「＋」（与专辑页同一套 .add-btn）
+         ③ 专辑页「加入队列」=整张；专辑曲目行「＋」=单首
+         ④ 曲目/专辑行右键菜单「加入播放队列」/「整张加入队列」
+         ⑤ 把文件/文件夹拖进窗口
+       —— 1.5.x 的入口其实一个都没少（已用 dist\RLPlayer-1.5.1…1.5.10 的内嵌脚本逐版比对），
+          真正的病是**曲目页 300 行里 0 个可见控件、队列页 0 个**，用户只能靠猜右键。
+     · 删（3 条路径）：行内「×」（**静止就可见**，不再 opacity:0）/ 行右键「从队列移除」/「清空队列」。
+     · 排（一次动作 + 一键后悔）：下拉里只有**动作**（标题/艺术家/专辑/时长/年份/反转/随机打乱），
+       排序后出现「↩ 撤销排序」（后端快照；队列结构一变快照即作废，按钮自己消失）。
+       **不再有「默认顺序」这个伪选项** —— 它既不是动作、又是一直亮着的"状态"，选中还会弹
+       "没有可恢复的排序"，用户读到的正是"凭空冒出来一个默认顺序"。
 
-   为什么排序在前端算：标题/艺术家必须走 localeCompare('zh') 才是音序（拼音），
-   后端没有 ICU，用字节序会把中文按码点排开，用户一眼就看出"乱序"。 */
+   三条硬约束（判据就是这三条）：
+   ① **只换顺序，不换曲**：排序在前端算完，把目标顺序整列交给 POST /api/qorder，由后端把 index
+      重新定位到"当前播的那一首"（QItem::same，含 CUE 区间）。前端绝不自己改 index。
+   ② **可撤销**：第一次排序前后端把原顺序快照进 g_q.sortBase，POST /api/qsort?by=default 整列还原；
+      /api/queue 回 canUndo，前端据此决定是否显示「↩ 撤销排序」（没有后悔药时按钮根本不出现）。
+   ③ **顺序只有一份**：排序结果落回后端 items（与拖拽同一条通路），否则"看到的"和"播的"不一致。
+   为什么排序在前端算：标题/艺术家必须走 localeCompare('zh') 才是音序（拼音）；后端无 ICU，
+   用字节序会把中文按码点排开，用户一眼看出"乱序"。
+   为什么随机模式与排序/拖拽/删除互不覆盖：随机模式另存一份"打乱前的原顺序"（g_q.base），退出
+   随机时还原；用户一旦手动重排，后端会把那份快照作废 —— 否则"开随机→按标题排序→关随机"
+   会把顺序一把推回添加顺序（旧实现实测 15/15 项跳回，用户感受就是"又冒出个默认顺序"）。 */
 function queueItemLine(items, cues, i) {
   var f = items[i] || '';
   var c = cues[i] || [-1, -1];
   return (c && c[0] >= 0) ? (f + '\t' + c[0] + '\t' + c[1]) : f;
 }
+// 排序动作的显示名（toast 与下拉文案共用一份，避免两处说法不一致）
+var QSORT_LABEL = { title: '标题 A→Z', artist: '艺术家 A→Z', album: '专辑 A→Z',
+                    dur: '时长 短→长', year: '年份 新→旧', reverse: '反转顺序', shuffle: '随机打乱' };
 function applyQueueSort(by) {
   if (!by) return;
-  if (by === 'default') {
-    api('/api/qsort?by=default', '').then(function (j) {
-      if (j && j.ok === false) { toast(j.error || '没有可恢复的排序'); S.queueSort = ''; renderQueuePage(); return; }
-      S.queueSort = '';
-      toast('已恢复默认顺序');
-      renderQueuePage(); loadQ();
-    }).catch(function () { renderQueuePage(); });
-    return;
-  }
   // ★ 排序前**现取**一份带元数据的队列，绝不依赖 S.q.metas：
   //   3 秒轮询的 loadQ() 会用不带 metas 的那份覆盖 S.q，此时所有排序键都是空串/0，
-  //   排序会**静默变成 no-op**（本轮实测踩到：连续点标题/艺术家/时长，顺序纹丝不动）。
+  //   排序会**静默变成 no-op**（261027-02 实测踩到：连续点标题/艺术家/时长，顺序纹丝不动）。
   api('/api/queue?meta=1').then(function (q) {
     var items = q.items || [], cues = q.cues || [], metas = q.metas || [];
     var n = items.length;
@@ -8046,10 +8632,113 @@ function applyQueueSort(by) {
     var lines = idx.map(function (i) { return queueItemLine(items, cues, i); });
     return api('/api/qorder', 'files=' + encodeURIComponent(lines.join('\n'))).then(function (j) {
       if (j && j.ok === false) { toast(j.error || '排序失败'); renderQueuePage(); return; }
-      S.queueSort = by;
+      toast('已按「' + (QSORT_LABEL[by] || by) + '」重排 ' + n + ' 首（可点「↩ 撤销排序」还原）');
       renderQueuePage(); loadQ();
     });
   }).catch(function () { renderQueuePage(); });
+}
+// 撤销排序：后端把第一次排序前的快照整列还原（没有快照 → 如实报错，绝不假装排过）
+function undoQueueSort() {
+  api('/api/qsort?by=default', '').then(function (j) {
+    if (j && j.ok === false) { toast(j.error || '没有可撤销的排序'); renderQueuePage(); return; }
+    toast('已撤销排序，还原为排序前那 ' + ((j && j.n) || 0) + ' 首的顺序');
+    renderQueuePage(); loadQ();
+  }).catch(function () { renderQueuePage(); });
+}
+// 从队列移除一项：× 按钮与行右键菜单走**同一条通路**（两处各写一份必然走偏）
+function removeQueueItem(i) {
+  api('/api/qdel?i=' + i, '').then(function (j) {
+    if (j && j.ok === false) { toast(j.error || '移除失败'); return; }
+    toast('已从队列移除');
+    loadQ();
+    if (S.view === 'queue') renderQueuePage();
+  }).catch(function () { toast('移除失败'); });
+}
+// 队列条目右键菜单（帮助浮层一直写着「右键队列条目 → 从队列移除」，1.5.x 其实没实现）
+function showQueueRowMenu(x, y, i) {
+  hideContextMenu();
+  var m = document.createElement('div');
+  m.className = 'ctxmenu';
+  m.style.left = Math.max(4, x) + 'px';
+  m.style.top = Math.max(4, y) + 'px';
+  function item(label, fn, cls) {
+    var d = document.createElement('div');
+    d.className = 'ctxitem' + (cls ? (' ' + cls) : '');
+    d.textContent = label;
+    d.onclick = function (ev) { ev.stopPropagation(); hideContextMenu(); fn(); };
+    m.appendChild(d);
+  }
+  var f = (S.q && S.q.items) ? S.q.items[i] : '';
+  item('\u25b6 立即播放', function () { var c = (S.q.cues || [])[i] || [-1, -1]; playPath(f, c[0], c[1]); });
+  item('\u00d7 从队列移除', function () { removeQueueItem(i); }, 'danger');
+  document.body.appendChild(m);
+  _activeCtxMenu = m;
+  var rr = m.getBoundingClientRect();
+  if (x + rr.width > window.innerWidth - 6) m.style.left = Math.max(4, window.innerWidth - rr.width - 6) + 'px';
+  if (y + rr.height > window.innerHeight - 6) m.style.top = Math.max(4, window.innerHeight - rr.height - 6) + 'px';
+}
+
+/* 「＋ 添加曲目」面板（261027-03 #3）：队列页上一个**不用右键、不用换页**就能加的入口。
+   为什么要有它：用户原话「我根本没有添加进入队列的方法」—— 实测队列页上确实一个添加入口都没有。
+   面板 = 搜索框 + 结果表（每行末「＋」，整行也可点）；加入的曲目一律**追加到队列末尾**，
+   不动已在队列里的歌（与 /api/add 同一语义）。 */
+function openQueueAddPanel() {
+  if (!D('modal') || !D('mtitle') || !D('mbody')) return;
+  D('mtitle').textContent = '添加到播放队列';
+  D('mbody').innerHTML =
+    '<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">' +
+    '<input id=qAddQ spellcheck=false placeholder="搜索标题 / 艺术家 / 专辑（留空 = 前 40 首）"' +
+    ' style="flex:1;height:32px;border-radius:7px;border:1px solid var(--line);background:var(--field);color:var(--txt);padding:0 10px;font-size:12.5px;outline:none">' +
+    '</div>' +
+    '<div id=qAddList style="max-height:min(52vh,420px);overflow:auto;border-top:1px solid var(--line)"></div>' +
+    '<div style="margin-top:10px;font-size:11px;color:var(--mut2);line-height:1.8">' +
+    '点行末「＋」或整行即可加入；加入的曲目**追加在队列末尾**，不会动已在队列里的歌。<br>' +
+    '其他入口：曲目页/专辑页行内「＋」、右键曲目或专辑「加入播放队列」、把文件拖进窗口。</div>';
+  D('modal').classList.add('on');
+  var inp = D('qAddQ'), list = D('qAddList'), tmr = 0;
+  function render(q) {
+    if (!D('qAddList')) return;
+    list.innerHTML = '<div style="padding:14px;color:var(--mut2);font-size:12px">搜索中…</div>';
+    api('/api/lib/search?q=' + encodeURIComponent(q || '')).then(function (j) {
+      if (!D('qAddList')) return;             // 面板已关掉 → 丢弃迟到响应
+      var t = (j.tracks || []).slice(0, 40);
+      if (!t.length) { list.innerHTML = '<div style="padding:14px;color:var(--mut2);font-size:12px">没有找到曲目</div>'; return; }
+      var h = '';
+      t.forEach(function (x, i) {
+        h += '<div class=qaddr data-i=' + i + '>' +
+             '<span class=qt1 title="' + esc(x.path) + '">' + esc(x.title || nam(x.path)) + '</span>' +
+             '<span class=qa2>' + esc(x.artist || '') + (x.album ? (' \u00b7 ' + esc(x.album)) : '') + '</span>' +
+             '<span class=qd>' + fmt(x.dur || 0) + '</span>' +
+             '<button class="add-btn qaddbtn" data-i=' + i + ' title="加入播放队列" aria-label="加入播放队列">+</button></div>';
+      });
+      list.innerHTML = h;
+      Array.prototype.forEach.call(list.querySelectorAll('.qaddr'), function (e) {
+        var x = t[+e.dataset.i];
+        function add() {
+          api('/api/add', 'file=' + encodeURIComponent(x.path) + cueQuery(x.cs, x.ce)).then(function (rr) {
+            if (rr && rr.ok === false) { toast(rr.error || '加入失败'); return; }
+            toast('已加入队列：' + (x.title || nam(x.path)) + '（队列共 ' + ((rr && rr.count) || '?') + ' 首）');
+            loadQ();
+            if (S.view === 'queue') renderQueuePage();
+            var b = e.querySelector('.qaddbtn');
+            if (b) { b.textContent = '\u2713'; b.disabled = true; b.style.opacity = '1'; }
+            e.classList.add('added');
+          }).catch(function () { toast('加入失败'); });
+        }
+        e.onclick = add;
+        var b = e.querySelector('.qaddbtn');
+        if (b) b.onclick = function (ev) { ev.stopPropagation(); add(); };
+      });
+    }).catch(function () {
+      if (D('qAddList')) list.innerHTML = '<div style="padding:14px;color:var(--mut2);font-size:12px">搜索失败</div>';
+    });
+  }
+  inp.oninput = function () {
+    var v = this.value;
+    clearTimeout(tmr);
+    tmr = setTimeout(function () { render(v); }, 250);
+  };
+  render('');
 }
 
 /* ---------------- 播放队列（主视图） ---------------- */
@@ -8058,65 +8747,82 @@ function renderQueuePage() {
   // 2026-10-23（自检暴露）：标题原来只在 /api/queue 回来后才写 → 本地接口虽快，但慢的时候
   // 会出现"已经在队列页、标题还是上一页"的空窗。先同步写标题，再等数据补数量/按钮。
   head('播放队列', '', '');
-  // meta=1（261027-02 #4）：多要一份与 items 逐项对齐的 metas（标题/艺术家/专辑/时长/年份），
-  // 排序下拉才有东西可排。普通 3 秒轮询仍走不带 meta 的 /api/queue（零额外开销）。
+  // meta=1：多要一份与 items 逐项对齐的 metas（标题/艺术家/专辑/时长/年份），排序要用；
+  // canUndo：后端是否还留着"排序前快照" ⟹ 决定「↩ 撤销排序」按钮出不出来。
+  // 普通 3 秒轮询仍走不带 meta 的 /api/queue（零额外开销）。
   api('/api/queue?meta=1').then(function (j) {
     if (S.view !== 'queue') return;   // 已切走 → 丢弃，别覆写当前页面
-    S.q = { items: j.items || [], cues: j.cues || [], metas: j.metas || [], index: j.index || 0 };
+    S.q = { items: j.items || [], cues: j.cues || [], metas: j.metas || [],
+            index: j.index || 0, canUndo: !!j.canUndo, shuffle: !!j.shuffle };
     var n = S.q.items.length;
     // #2（261026-09）：用户「从播放队列那里直接保存为歌单即可」⟹ 队列页顶部提供
     // 「保存为歌单」（写入 rlplayer-savedqueues.conf，含顺序与 CUE 区间，重启后仍在）。
     head('播放队列', n ? (n + ' 首') : '',
       (n ? '<button class="btn pri" id=qSaveSq title="把当前队列原样存成一个歌单（含顺序与 CUE 区间，重启后仍在）">保存为歌单</button>' : '') +
       (n ? '<button class=btn id=qClrAll>清空队列</button>' : ''));
-    if (!n) {
-      D('list').innerHTML = '<div class=empty>队列是空的<br><span style="font-size:11.5px">把文件拖进窗口，或右键专辑/曲目「加入队列」</span></div>';
-      return;
+    // 工具条：左边是**静止可见**的「＋ 添加曲目」；右边是排序动作 + 撤销（只在有后悔药时出现）。
+    var h = '<div class=qhd>' +
+            '<button class="btn pri" id=qAddBtn title="搜索曲库并加入队列（追加在末尾，不动已在队列里的歌）">\uff0b 添加曲目</button>' +
+            '<span class=qhdsp></span>';
+    if (n) {
+      h += '<span class=qhdlb>排序</span>' +
+           '<select id=qSort class="track-sort sort-select" title="一次性重排队列顺序：只改顺序、不换曲，也不会改变正在播放的那一首">' +
+           '<option value="">排序…</option>' +
+           '<option value=title>标题 A→Z</option>' +
+           '<option value=artist>艺术家 A→Z</option>' +
+           '<option value=album>专辑 A→Z</option>' +
+           '<option value=dur>时长 短→长</option>' +
+           '<option value=year>年份 新→旧</option>' +
+           '<option value=reverse>反转顺序</option>' +
+           '<option value=shuffle>随机打乱</option>' +
+           '</select>';
+      if (S.q.canUndo)
+        h += '<button class=btn id=qSortUndo title="把队列还原成排序前的那一版顺序">\u21a9 撤销排序</button>';
+      if (S.q.shuffle)
+        h += '<span class=qhdhint title="随机播放模式会物理打乱队列；关闭随机时不再改动你手动排好的顺序">随机播放中</span>';
     }
-    // 261027-02 #4：排序下拉放在列表右上角（与曲目页同一套 .track-sort 视觉/同一批选项）。
-    // 注意「默认顺序」= 撤销排序（后端快照），不是"重新猜一个顺序"；没有快照时后端回 ok:false，
-    // 这里弹 toast 说明原因，绝不假装排过。
-    var qs = S.queueSort || 'default';
-    var h = '<div class="qsortbar" style="display:flex;justify-content:flex-end;align-items:center;padding:10px 20px 4px;gap:8px">' +
-            '<span style="font-size:12px;color:var(--mut2)">排序：</span>' +
-            '<select id=qSort class="track-sort sort-select" title="只改变队列顺序，不改变正在播放的那一首">' +
-            '<option value=default' + (qs === 'default' ? ' selected' : '') + '>默认顺序</option>' +
-            '<option value=title' + (qs === 'title' ? ' selected' : '') + '>标题</option>' +
-            '<option value=artist' + (qs === 'artist' ? ' selected' : '') + '>艺术家</option>' +
-            '<option value=album' + (qs === 'album' ? ' selected' : '') + '>专辑</option>' +
-            '<option value=dur' + (qs === 'dur' ? ' selected' : '') + '>时长</option>' +
-            '<option value=year' + (qs === 'year' ? ' selected' : '') + '>年份</option>' +
-            '<option value=shuffle' + (qs === 'shuffle' ? ' selected' : '') + '>随机打乱</option>' +
-            '<option value=reverse' + (qs === 'reverse' ? ' selected' : '') + '>反转顺序</option>' +
-            '</select></div>';
-    h += '<div class=qlist2>';
-    S.q.items.forEach(function (f, i) {
-      h += '<div class="qrow' + (i === S.q.index ? ' on' : '') + '" data-i=' + i + ' draggable=true>' +
-           '<span class=qn>' + (i + 1) + '</span>' +
-           '<span class=qt title="' + esc(f) + '">' + esc(nam(f)) + '</span>' +
-           // 评审 #8：以前这里打完整物理路径，又长又不可读；只显示所在文件夹名，全路径放 tooltip
-           '<span class=qp title="' + esc(f) + '">' + esc(parentFolder(f)) + '</span>' +
-           '<button class=qdel data-i=' + i + ' title="从队列移除">\u00d7</button></div>';
-    });
-    D('list').innerHTML = h + '</div>';
-    Array.prototype.forEach.call(D('list').querySelectorAll('.qrow'), function (e) {
-      var i = +e.dataset.i;
-      e.onclick = function (ev) { if (ev.target.classList.contains('qdel')) return; playPath(S.q.items[i]); };
-      e.ondragstart = function (ev) { ev.dataTransfer.setData('text/plain', String(i)); ev.dataTransfer.effectAllowed = 'move'; };
-      e.ondragover = function (ev) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'move'; };
-      e.ondrop = function (ev) {
-        ev.preventDefault(); ev.stopPropagation();
-        var from = parseInt(ev.dataTransfer.getData('text/plain'), 10);
-        if (isNaN(from) || from === i) return;
-        api('/api/qmove?from=' + from + '&to=' + i, '').then(function () { renderQueuePage(); loadQ(); });
-      };
-      var d = e.querySelector('.qdel');
-      if (d) d.onclick = function (ev) {
-        ev.stopPropagation();
-        api('/api/qdel?i=' + i, '').then(function () { toast('已移除'); renderQueuePage(); loadQ(); });
-      };
-    });
-    if (D('qSort')) D('qSort').onchange = function () { applyQueueSort(this.value); };
+    h += '</div>';
+    if (!n) {
+      D('list').innerHTML = h + '<div class=empty>队列是空的<br>' +
+        '<span style="font-size:11.5px">点上面的「＋ 添加曲目」，或在曲目/专辑页点行内「＋」、' +
+        '右键曲目「加入播放队列」、把文件拖进窗口</span></div>';
+    } else {
+      h += '<div class=qlist2>';
+      S.q.items.forEach(function (f, i) {
+        h += '<div class="qrow' + (i === S.q.index ? ' on' : '') + '" data-i=' + i + ' draggable=true>' +
+             '<span class=qn>' + (i + 1) + '</span>' +
+             '<span class=qt title="' + esc(f) + '">' + esc(nam(f)) + '</span>' +
+             // 评审 #8：以前这里打完整物理路径，又长又不可读；只显示所在文件夹名，全路径放 tooltip
+             '<span class=qp title="' + esc(f) + '">' + esc(parentFolder(f)) + '</span>' +
+             // ★ 261027-03 #3：× 必须**静止可见**（CSS 里 base opacity .45）。旧版 opacity:0，
+             //   只在鼠标精确悬停到那一行才浮现 ⟹ 用户看不到任何删除控件，报「不能删除」。
+             '<button class=qdel data-i=' + i + ' title="从队列移除这首" aria-label="从队列移除">\u00d7</button></div>';
+      });
+      D('list').innerHTML = h + '</div>';
+      Array.prototype.forEach.call(D('list').querySelectorAll('.qrow'), function (e) {
+        var i = +e.dataset.i;
+        e.onclick = function (ev) {
+          if (ev.target.closest && ev.target.closest('.qdel')) return;
+          var c = (S.q.cues || [])[i] || [-1, -1];
+          playPath(S.q.items[i], c[0], c[1]);
+        };
+        // 右键菜单（此前队列页没有 → 帮助浮层里那句「右键队列条目 → 从队列移除」是空头支票）
+        e.oncontextmenu = function (ev) { ev.preventDefault(); ev.stopPropagation(); showQueueRowMenu(ev.clientX, ev.clientY, i); };
+        e.ondragstart = function (ev) { ev.dataTransfer.setData('text/plain', String(i)); ev.dataTransfer.effectAllowed = 'move'; };
+        e.ondragover = function (ev) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'move'; };
+        e.ondrop = function (ev) {
+          ev.preventDefault(); ev.stopPropagation();
+          var from = parseInt(ev.dataTransfer.getData('text/plain'), 10);
+          if (isNaN(from) || from === i) return;
+          api('/api/qmove?from=' + from + '&to=' + i, '').then(function () { renderQueuePage(); loadQ(); });
+        };
+        var d = e.querySelector('.qdel');
+        if (d) d.onclick = function (ev) { ev.stopPropagation(); removeQueueItem(i); };
+      });
+    }
+    if (D('qAddBtn')) D('qAddBtn').onclick = function () { openQueueAddPanel(); };
+    if (D('qSort')) D('qSort').onchange = function () { var v = this.value; this.value = ''; if (v) applyQueueSort(v); };
+    if (D('qSortUndo')) D('qSortUndo').onclick = function () { undoQueueSort(); };
     if (D('qSaveSq')) D('qSaveSq').onclick = function () { saveQueueDialog(); };
     if (D('qClrAll')) D('qClrAll').onclick = function () {
       api('/api/clear', '').then(function () { toast('队列已清空'); renderQueuePage(); loadQ(); });
@@ -9099,10 +9805,23 @@ D('bRep').onclick = cycleRep;
 if (D('sRep')) D('sRep').addEventListener('change', function () { applyRep(this.value); });
 
 /* ---------------- 启动 ---------------- */
+bindTips();           // #6（261027-03）：? 帮助浮层改由固定层统一出，启动时挂一次事件委托
 initFavs();
 // #6（261026-08）：左栏「保存的队列」列表（我的最爱下面）启动就渲染，重启后能立刻看到
 renderSavedQueues();
 if (D('npFavBtn')) D('npFavBtn').onclick = function (ev) { if (S.lastCur) toggleFav(S.lastCur, ev); };
+// ★ 261027-03 #3：单曲页「＋ 加入队列」—— 把"正在播的这一首"追加到队列末尾。
+// 语义刻意选"追加"：用户点这个按钮的意图是"留住这首"，绝不该顺手改掉正在播的那一首。
+if (D('npAddQ')) D('npAddQ').onclick = function () {
+  if (!S.lastCur) { toast('还没有在播放'); return; }
+  api('/api/add', 'file=' + encodeURIComponent(S.lastCur)).then(function (j) {
+    if (j && j.ok === false) { toast(j.error || '加入失败'); return; }
+    var n = (j && j.count) || 0;
+    toast('已加入队列：' + nam(S.lastCur) + (n ? ('（共 ' + n + ' 首）') : ''));
+    if (D('npAddQTip')) D('npAddQTip').textContent = n ? ('队列 ' + n + ' 首') : '';
+    loadQ();
+  }).catch(function () { toast('加入失败'); });
+};
 loadLibStats();
 loadSettings();
 loadFilterPhases();   // 功能2：相位预设真相源（/api/filters）

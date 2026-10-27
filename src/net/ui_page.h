@@ -247,8 +247,10 @@ inline std::string rta_ui_page() {
     h += "@media (max-width:1240px){#app{grid-template-columns:200px minmax(0,1fr) 0}#app #right{display:none}}";
     // 窄窗口下曲目行按「歌名 > 艺术家 > 规格」优先级收列，绝不把歌名压成 0 宽（评审 #3/#18 的根因兜底）
     h += ".trow-track .ar,.trow-track .bd{overflow:hidden}";
-    h += "@media (max-width:1400px){.trow-track{grid-template-columns:28px 24px minmax(120px,1.8fr) minmax(0,1fr) 0px 58px!important}}";
-    h += "@media (max-width:1120px){.trow-track{grid-template-columns:28px 24px minmax(0,1fr) minmax(0,.9fr) 0px 58px!important}}";
+    // 261027-03 #3：末尾补 26px —— 曲目行/专辑行都多了一列「＋」，
+    // 窄屏媒体查询若还只给 6 列，那个「＋」会被挤到第二行（专辑页在 ≤1400px 一直有这个毛病）。
+    h += "@media (max-width:1400px){.trow-track{grid-template-columns:28px 24px minmax(120px,1.8fr) minmax(0,1fr) 0px 58px 26px!important}}";
+    h += "@media (max-width:1120px){.trow-track{grid-template-columns:28px 24px minmax(0,1fr) minmax(0,.9fr) 0px 58px 26px!important}}";
     
     // 顶栏
     // 顶栏与内容同底色、无分隔线：整块界面连成一片（QQ 音乐式一体化）。
@@ -421,10 +423,42 @@ inline std::string rta_ui_page() {
     // 留下就是一块**灰底**；② 列表里还渲染了 .ph 首字母块。现在 .acv 一律去掉灰底，
     // 图取不到时露出低饱和圆形占位（浅描边 + 音符图标，opacity .35），<img> 保留但 opacity:0。
     h += ".card .cv.acv,.ahead .cv.acv{background:transparent;border-radius:50%}";
-    h += ".card .cv.acv .aph,.ahead .cv.acv .aph{position:absolute;inset:0;display:grid;place-items:center;color:var(--mut2);opacity:.35;pointer-events:none}";
+    h += ".card .cv.acv .aph,.ahead .cv.acv .aph{position:absolute;inset:0;display:grid;place-items:center;color:var(--mut2);opacity:.9;pointer-events:none}";
+    // 2026-10-27（261027-03 #7）：占位从「opacity .35 的音符图标」改成**首字**（用户原话：
+    // 「每张头像位置立刻渲染首字母占位（带艺人名首字）」），但仍不许出现 2026-10-26 被否掉的
+    // 「大灰块」⟹ 只给字上色（--mut2，75% 不透明），不加底色块。
+    h += ".acv .aini{font-weight:650;line-height:1;letter-spacing:0;color:var(--mut2);opacity:.75}";
     h += ".card .cv.acv img.err,.ahead .cv.acv img.err{opacity:0}";
     h += ".ahead .cv.acv img,.ahead .cv.acv svg{display:block}";
+    // 图落地才淡入（.ok 由加载泵在 onload 里加）—— 这样「一张一张出现」看得出来，
+    // 也不会出现「解码到一半先画半张」的闪烁。
+    h += ".card .cv.acv img,.ahead .cv.acv img{opacity:0;transition:opacity .22s ease}";
+    h += ".card .cv.acv img.ok,.ahead .cv.acv img.ok{opacity:1}";
     h += ".ahead .cv.acv img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}";
+    // 头像进度条（复用 .albprog 的骨架）：加载中显示 x/y 且数字会动，收尾后变暗
+    h += ".albprog.artprog{padding-top:6px}";
+    h += ".albprog.done .t{color:var(--mut2)}";
+    h += ".albprog.done .bar i{background:var(--mut2)}";
+    h += ".albprog .artagain{margin-left:8px;padding:2px 9px;font-size:11px;line-height:1.5}";
+    // ===== 「分析」页签（2026-10-27 261027-03 #9）=====
+    // 四栏：动态 / 音质 / 假无损 / 版本对比。窄窗自动回落成单列（auto-fit）。
+    h += ".anlgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;padding-bottom:12px}";
+    h += ".anlcard{margin:0;min-width:0}";
+    h += ".anl-sub{font-size:10.5px;color:var(--mut2);font-weight:400;letter-spacing:0;margin-left:8px}";
+    h += ".anlrow{display:flex;align-items:baseline;justify-content:space-between;gap:10px;padding:3px 0;border-bottom:1px dashed var(--line);font-size:12px}";
+    h += ".anlrow:last-child{border-bottom:0}";
+    h += ".anl-k{color:var(--mut);display:flex;align-items:center;gap:5px;min-width:0}";
+    h += ".anl-v{font-variant-numeric:tabular-nums;font-weight:600;text-align:right;white-space:nowrap}";
+    h += ".anl-v i{font-style:normal;font-weight:400;color:var(--mut2);font-size:10.5px}";
+    h += ".anl-empty{color:var(--mut2);font-size:12px;padding:10px 0}";
+    h += ".anl-note{margin-top:6px;font-size:11px;color:var(--mut2);line-height:1.6;white-space:pre-wrap}";
+    h += ".anlbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}";
+    h += ".anlbar .pin{flex:1;min-width:240px}";
+    h += ".anlvers{display:flex;flex-direction:column;gap:1px;margin-top:4px}";
+    h += ".anlck{display:flex;align-items:center;gap:8px;font-size:12px;padding:3px 6px;border-radius:6px;cursor:pointer}";
+    h += ".anlck:hover{background:var(--hov)}";
+    h += ".anlck input{accent-color:var(--acc)}";
+    h += ".anldir{font-weight:600;color:var(--acc-text)}";
     h += ".bio-box{font-size:13px;line-height:1.75;color:var(--txt2);white-space:pre-wrap;word-break:break-word}";
     h += ".bio-box.collapsed{max-height:140px;overflow:hidden;-webkit-mask-image:linear-gradient(180deg,#000 65%,transparent)}";
     // 261024-04 #4b：资料块（AI 整理 / 简介 / 风格 / 来源）原来**没有任何 CSS**（.sec-card 只在标记里出现），
@@ -474,8 +508,23 @@ inline std::string rta_ui_page() {
     h += ".qrow .qn{width:26px;text-align:right;font-size:11px;color:var(--mut2);flex:none;font-variant-numeric:tabular-nums}";
     h += ".qrow .qt{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12.5px}";
     h += ".qrow .qp{font-size:11px;color:var(--mut2);flex:none;max-width:38%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
-    h += ".qrow .qdel{width:24px;height:24px;border-radius:6px;color:var(--mut2);flex:none;opacity:0;transition:.12s}";
+    // ★ 261027-03 #3：× 从 opacity:0 改成常显 .45（hover 1）——
+    //   用户「已经添加的歌曲不能删除」的真因不是删不掉（实测点得到），而是**根本看不见**这个按钮。
+    //   同时补上 button 的复位样式（旧版这行少了 background/border/cursor，× 长成系统灰键）。
+    h += ".qrow .qdel{width:24px;height:24px;border-radius:6px;color:var(--mut2);flex:none;opacity:.6;transition:opacity .12s,background .12s,color .12s;background:none;border:none;cursor:pointer;font-size:15px;line-height:1;display:flex;align-items:center;justify-content:center;font-family:inherit}";
     h += ".qrow:hover .qdel{opacity:1}.qrow .qdel:hover{background:var(--hov2);color:var(--danger)}";
+    h += ".qrow .qdel:focus-visible{opacity:1;outline:2px solid var(--acc);outline-offset:1px}";
+    // 队列页工具条（＋ 添加曲目 / 排序 / 撤销排序）与「添加曲目」面板的行
+    h += ".qhd{display:flex;align-items:center;gap:8px;padding:10px 20px 6px}";
+    h += ".qhdsp{flex:1}";
+    h += ".qhdlb{font-size:12px;color:var(--mut2)}";
+    h += ".qhdhint{font-size:11px;color:var(--acc-text);background:var(--acc-weak);border-radius:10px;padding:2px 8px}";
+    h += ".qaddr{display:flex;align-items:center;gap:10px;padding:7px 10px;border-bottom:1px solid var(--line);cursor:pointer;transition:background .1s}";
+    h += ".qaddr:hover{background:var(--hov)}";
+    h += ".qaddr.added{opacity:.55}";
+    h += ".qaddr .qt1{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12.5px}";
+    h += ".qaddr .qa2{flex:none;max-width:38%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px;color:var(--mut2)}";
+    h += ".qaddr .qd{flex:none;width:52px;text-align:right;font-size:11px;color:var(--mut2);font-variant-numeric:tabular-nums}";
     // 拖拽提示
     h += "#dropmask{position:fixed;inset:0;z-index:90;display:none;align-items:center;justify-content:center;background:rgba(8,9,12,.72);backdrop-filter:blur(2px)}";
     h += "#dropmask.on{display:flex}";
@@ -528,7 +577,7 @@ inline std::string rta_ui_page() {
 // 与 bit-perfect 的绿、非 bit-perfect 的橙区分开 —— 一眼能看出「这次到底有没有动数据」。
 h += "#bpBadge.bp-up{display:inline-flex;color:var(--acc);border-color:currentColor;background:var(--hov)}";
 // 2026-10-26（261025-02 #3）：曲目行「+」入队按钮 —— 默认淡显，hover 行才亮，键盘也够得着
-h += ".add-btn{display:flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:6px;border:1px solid var(--line);background:transparent;color:var(--mut2);font-size:14px;line-height:1;cursor:pointer;padding:0;opacity:.45;transition:opacity .12s,color .12s,border-color .12s}";
+h += ".add-btn{display:flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:6px;border:1px solid var(--line);background:transparent;color:var(--mut2);font-size:14px;line-height:1;cursor:pointer;padding:0;opacity:.6;transition:opacity .12s,color .12s,border-color .12s}";
 h += ".trow:hover .add-btn{opacity:1}";
 h += ".add-btn:hover{color:var(--acc);border-color:var(--acc);background:var(--hov)}";
 h += ".add-btn:focus-visible{opacity:1;outline:2px solid var(--acc);outline-offset:1px}";
@@ -887,11 +936,19 @@ h += "#npPage .npedge{display:none}";
     // 2026-10-24（用户 261024-01 #7）：长说明不再铺在页面上 —— 收进 (?) 图标，hover/focus 才显示。
     h += ".tip{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;margin-left:5px;border-radius:50%;border:1px solid var(--line2,var(--line));color:var(--mut2);font-size:9.5px;font-weight:700;line-height:1;cursor:help;vertical-align:1px;position:relative;user-select:none;flex:none}";
     h += ".tip:hover,.tip:focus{border-color:var(--acc);color:var(--acc);outline:0}";
-    h += ".tip::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 8px);transform:translateX(-50%);width:max-content;max-width:290px;background:var(--bg3);color:var(--txt2);border:1px solid var(--line);border-radius:9px;padding:8px 10px;font-size:11px;line-height:1.6;font-weight:400;white-space:normal;text-align:left;box-shadow:0 10px 28px var(--shadow);opacity:0;visibility:hidden;transition:opacity .12s,transform .12s;z-index:40;pointer-events:none}";
-    h += ".tip:hover::after,.tip:focus::after{opacity:1;visibility:visible}";
-    // 分组标题的 (?) 改成向下展开：向上会被吸顶的页签条盖住（实测第一个分组就是这样）。
-    h += ".sghead .tip::after{bottom:auto;top:calc(100% + 8px)}";
-    h += "@media (max-width:1200px){.tip::after{max-width:min(240px,42vw)}}";
+    // 2026-10-27（用户 261027-03 #6「所有 ? 的帮助文档都被左侧栏挡住文字」）：
+    // 旧实现是**伪元素** .tip::after（content:attr(data-tip) + position:absolute + left:50%/bottom:100%），
+    // 它长在 .tip 里面，而设置页整块在 .main{overflow:auto} 里滚动 ⟹ 浮层一旦伸出主区左边界
+    // 就被 overflow **裁掉**（主区左边界 x=212 正是左栏右边界）⟹ 用户看到的就是"被左侧栏挡住"。
+    // 实测（build-tip，uicheck.js 的 tips 模式，69 个 ? 逐个 hover）：**17 个**浮层压在左栏上，
+    // 重叠 30~2445.7px²（最狠的「输出 · 模式」「输出 · 后端」各被吃掉 69.5px 宽），
+    // 同一批 17 个还被 .main 裁掉 1.71~69.5px —— 两者是同一件事的两面（裁剪线就在 x=212）。
+    // z-index 不是原因（40 本来就能压住左栏，左栏没有层叠上下文）——
+    // overflow 容器的子树再怎么抬 z-index 也出不了裁剪框。
+    // 新实现：body 下的固定定位单例 #tipLayer，位置由 ui_script 的 tipPlace() 算，
+    // 横向夹在「左栏右边界 → 视口右边界」、纵向夹在视口内，与任何滚动容器/层叠上下文无关。
+    h += "#tipLayer{position:fixed;left:0;top:0;z-index:9100;max-width:290px;background:var(--bg3);color:var(--txt2);border:1px solid var(--line);border-radius:9px;padding:8px 10px;font-size:11px;line-height:1.6;font-weight:400;white-space:normal;text-align:left;box-shadow:0 10px 28px var(--shadow);opacity:0;visibility:hidden;transition:opacity .12s;pointer-events:none}";
+    h += "#tipLayer.on{opacity:1;visibility:visible}";
     h += ".sfld.wide{grid-column:1/-1}";
     h += ".sfld .chk{margin:0}";
     // 元数据「高级选项」：左右两列卡片（左=数据源，右=DeepSeek 接入 + 标签写回）。
@@ -1033,6 +1090,10 @@ h += "#npPage .npedge{display:none}";
     // 2026-10-23 用户 261023-04 #9：「古典作品」不再占左导航（作品/版本推荐入口移到单曲页「作品」tab）。
     // 实现仍保留 loadWorksView/openWorkVersions/renderWorkVersions，只是不再有导航入口。
     h += "<div class=nav data-v=tracks><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M14.5 4.5v11.2'/><circle cx='12' cy='17.5' r='2.8'/><path d='M14.5 4.5c2.6.6 4 2 4.5 4.2'/></svg>曲目</div>";
+    // 2026-10-27（261027-03 #9）：用户原话「四类分析…没看到 UI」——上一轮只挂在右键菜单，
+    // 而曲目页右键其实是「加入队列」。这里给一个**一眼能看到**的入口：左栏「分析」。
+    // 它不是独立视图，点了直接进设置页的「分析」页签（见 setView/nav 点击处理）。
+    h += "<div class=nav data-v=analysis><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M4 18V9M9.3 18V4.5M14.7 18v-6M20 18v-9'/><path d='M3 21h18'/></svg>分析</div>";
     h += "<div class=nav data-v=files><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M3 7.5a2 2 0 012-2h4l1.8 2H19a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z'/></svg>文件夹</div>";
     h += "<div class=nav data-v=remote><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M7 18a4.5 4.5 0 010-9 6 6 0 0111.6 1.6A3.7 3.7 0 0118 18z'/></svg>流媒体</div>";
     // 2026-10-23 用户 261023-04 #2：EQ 与房间校正**不再留在左导航**，改为设置页的一个页签（data-g=eq）。
@@ -1161,6 +1222,11 @@ h += "#npPage .npedge{display:none}";
     h += "<div class=npkind id=npKind>正在播放</div>";
     h += "<div class=nptitleline><div class=nptit id=npTitle>未播放</div>";
     h += "<button class=fav-btn id=npFavBtn title='收藏' style='padding:4px;display:none'><svg width=20 height=20 viewBox='0 0 24 24' fill=none stroke='currentColor' stroke-width=2><path d='M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z'/></svg></button></div>";
+    // ★ 261027-03 #3（用户：「我根本没有添加进入队列的方法」）：单曲页给一个**常显**的入队按钮。
+    //   这里进的是"正在播的这一首"，语义 = 追加到队列末尾（不改当前播放、不动已在队列里的歌）。
+    h += "<div style=\"display:flex;gap:8px;align-items:center;margin:6px 0 2px\">"
+         "<button class=btn id=npAddQ title=\"把这一首加入播放队列（追加在末尾；不改正在播的那首）\" style=\"padding:3px 10px;font-size:11.5px\">\uff0b 加入队列</button>"
+         "<span id=npAddQTip style=\"font-size:11px;color:var(--mut2)\"></span></div>";
     h += "<div class=npsub id=npSub></div>";
     h += "<div class=npnext id=npNextTrackHero style='display:none;font-size:12px;color:var(--mut2);margin-top:4px'></div>";
     // npMeta：元数据补全芯片（year/genre/albumArtist/已补全）+ 当前 EQ/IR 芯片，由 renderNp 填充

@@ -22,14 +22,42 @@
 //  （评分权重在这些行上重新归一化，见 score_versions）。
 //
 // ================== 综合排序的权重与理由 ==================
-//   动态范围 DR        0.25  母带压得狠就不可逆损失微动态，是最核心的判据
-//   削波 clipping      0.20  波形被削掉是不可逆破坏，比"听起来差一点"严重
-//   信噪比 SNR         0.20  本底噪声抬升（有损转制/不良转录）同样不可逆
-//   峰值因子 crest     0.10  与 DR 同向但口径不同（全局 vs 3 s 块），交叉验证
-//   LRA                0.10  短时动态分布，同上
-//   非谐波残留         0.10  16 峰之外的能量（编码噪声/失真上界），覆盖面比 SNR 宽
-//   单声道兼容 mono    0.05  只有相位反转这种病态素材会爆表，平时差异极小，故最低
-//  合计 1.00。
+//   有效带宽 cutoff    0.20  见下节「第 8 维：有效带宽 / 有损转码」（新，最大权重之一）
+//   动态范围 DR        0.18  母带压得狠就不可逆损失微动态，是最核心的判据
+//   削波 clipping      0.14  波形被削掉是不可逆破坏，比"听起来差一点"严重
+//   信噪比 SNR         0.14  本底噪声抬升（有损转制/不良转录）同样不可逆
+//   非谐波残留         0.08  16 峰之外的能量（编码噪声/失真上界），覆盖面比 SNR 宽
+//   峰值因子 crest     0.07  与 DR 同向但口径不同（全局 vs 3 s 块），交叉验证
+//   LRA                0.07  短时动态分布，同上
+//   单声道兼容 mono    0.04  只有相位反转这种病态素材会爆表，平时差异极小，故最低
+//  合计 0.92（评分按【可比维度权重和】归一化，见 score_versions）。
+//  ★ 为什么把原 7 维的权重整体调小：第 8 维拿走了 0.20，若其余不动，相对份额会被悄悄稀释
+//    （0.20/1.20 只有 16.7 分），达不到"带宽不足要显著扣分"的要求。现在 0.20 是明确标定的：
+//    带宽维净扣 21.7 分（= 100×0.20/0.92 满罚），> 削波维最大摆幅 14 分、> DR 维 19.6 分，
+//    任何"靠削波少/动态高"攒出来的 6~8 分优势都翻不过它。
+//  ★ 第 8 维（2026-10-27 新增，修下面的排序缺陷）
+//  缺陷（上一轮自己上报的未解决项）：只用前 7 维时，有损编码（MP3/AAC）把峰值压低、
+//    削波样本变少 ⟹ 「削波段数少」反而让它占便宜。实测同一首 60 s 四版：
+//    V3(128k MP3) 100.0 > V4(低通14k假高解析) 94.3 > V2(320k MP3) 93.8 > V1(FLAC) 93.4，
+//    削波段数 V1 276 段 → V3 51 段：无损因「削波多」被扣分，结论完全反了。
+//  修法：用【信号本身】测有效带宽（不看容器/码率等可伪造的元数据）——
+//    复用 fake_lossless.h 的长期平均谱算法（≤12 个 65536 点 Hann 窗、参考段 1–5 kHz、
+//    −40 dB 门限、8 bin 连跑、1/6 倍频程陡沿判据），得到 spectralCutoffHz 与 lossySuspected。
+//  依据（编码器实测上限，见 tests/test_version_compare.cpp 的实测段）：
+//    FLAC 无损 @44.1k 满带宽（实测检出 21.3 kHz，源母带 21 kHz 以上本就滚降）；
+//    320k MP3 实测 19.9 kHz；128k MP3 实测 16.6 kHz；低通 14k 的假高解析实测 12.6 kHz。
+//    因此判据取「截止 < 0.78×奈奎斯特」（44.1k ⟹ 17.2 kHz、48k ⟹ 18.7 kHz）+ 陡沿 + 置信度，
+//    正好落在 128k(0.75×) 与 192k/320k(0.86~0.90×) 之间。
+//  为什么扣分要分两段：
+//    (a) 连续项「有效带宽」权重 0.20（满罚门限 6 kHz ≈ 22.05−16 kHz，即 128k 边界），
+//        对 128k 是 0.20/0.92 ≈ 21.7 分的差距 —— 单这一项就 > 削波维度最大摆幅 14 分，
+//        实测把 128k 从「旧口径第一（99.9）」直接压到「67.4、倒数第二」（见报告）；
+//    (b) 离散项：被确证为有损转码（陡沿+低截止+置信度 ≥0.5）的版本，总分再固定 −12 分。
+//        理由：编解码的损伤（预回声/频域量化/高频涂抹/立体声联合编码）不止体现为截止频率，
+//        这些成分没有任何单一连续指标能捕捉，故给一道固定罚，而不是把带宽维度的权重再加大
+//        （加大权重会连带惩罚「带宽本就窄但无损」的合法素材）。
+//  防误伤：带宽维度按【本批次最高截止】做相对比较，整批都是同一窄带源（老录音/黑胶）时
+//    所有人同分，不会把「母带本来就窄」算成某一版的错；固定罚对全员生效 ⟹ 不影响排序。
 //  ★ 打分方式：不用"绝对锚点"，用【相对最好版本的扣分】——
 //     score = 100 · (1 − Σ wᵢ·penaltyᵢ / Σ wᵢ)，penaltyᵢ = min(1, |valᵢ − bestᵢ| / 满罚门限ᵢ)
 //     满罚门限（"差到这个程度就算全错"）：DR 6 dB、SNR 20 dB、峰值因子 4 dB、LRA 6 LU、
@@ -42,6 +70,7 @@
 #include "quality.h"
 #include "dynamics.h"
 #include "health_stream.h"
+#include "fake_lossless.h"     // 复用其长期平均谱 + 陡沿截止判据（第 8 维：有效带宽/有损转码）
 #include "../audio/audio_loader.h"
 #include <string>
 #include <vector>
@@ -144,6 +173,12 @@ struct VersionData {
     QualityResult quality;
     DynamicsResult dynamicsTimes;
     bool analyzed = false;
+    // ---- 第 8 维：有效带宽 / 有损转码（判据只用信号本身，见文件头）----
+    double spectralCutoffHz = 0.0;   // 长期平均谱检出的截止；0 = 未检出陡沿（视为满带宽）
+    double cutoffConfidence = 0.0;   // 0..1（陡沿深度 × 窗间一致率）
+    bool   cutoffDetected = false;
+    bool   lossySuspected = false;   // 陡沿 + 截止 < 0.78×奈奎斯特 + 置信度 ≥0.5
+    std::string cutoffReason;        // 中文人话（UI/解释直接显示）
 };
 
 struct VersionCompare {
@@ -156,6 +191,15 @@ struct VersionCompare {
     std::vector<VersionData> versions;
     std::vector<MetricRow> rows;
     std::vector<double> scores;
+    // 各评分维度的扣分与折算分（0..100），供 UI/报告逐步交代「分数是怎么来的」。
+    // penalty ∈ [0,1]（1 = 满罚），score = 100·(1−penalty)。
+    struct DimRow {
+        std::string key, label;
+        double weight = 0.0;
+        std::vector<double> penalty;
+        std::vector<double> score;
+    };
+    std::vector<DimRow> dims;
     std::vector<size_t> ranking;      // 好→差
     std::string explanation;          // 确定性人话（不依赖 AI）
     double enrollMs = 0.0, alignMs = 0.0, analyzeMs = 0.0;
@@ -262,16 +306,22 @@ inline double map_range(double v, double lo, double hi) {
 
 } // namespace vcdetail
 
-// 公共区段分析：把 src 的 [start, start+len) 帧喂给两个增量分析器
+// 公共区段分析：把 src 的 [start, start+len) 帧喂给三个增量分析器（音质 / 动态 / 带宽）
+// lc 非空时顺带算「有效带宽 + 有损转码」：用的是 fake_lossless.h 的同一套长期平均谱算法，
+// 这样 UI 上的截止频率（/api/health 的假无损判定）与本页的带宽维度口径完全一致。
 template <class Src>
 inline bool analyze_window(Src& src, size_t start, size_t len, size_t blockFrames,
-                           QualityResult& q, DynamicsResult& d, std::string* why = nullptr) {
+                           QualityResult& q, DynamicsResult& d, std::string* why = nullptr,
+                           LosslessCheck* lc = nullptr) {
     const int chn = src.channels();
     if (chn <= 0 || len == 0) { if (why) *why = "公共区段为空"; return false; }
     QualityAccumulator qacc;
     DynamicsAccumulator dacc;
-    qacc.begin(len, chn, (double)src.rate());
-    dacc.begin(chn, (double)src.rate());
+    LosslessAccumulator lacc;
+    const double fs = (double)src.rate();
+    qacc.begin(len, chn, fs);
+    dacc.begin(chn, fs);
+    if (lc) lacc.begin(len, chn, fs, src.bits());
     rta::audio::AudioBuffer chunk;
     std::vector<double> tmp;
     size_t pos = 0;
@@ -284,11 +334,13 @@ inline bool analyze_window(Src& src, size_t start, size_t len, size_t blockFrame
             for (int c = 0; c < chn; ++c) tmp[i * (size_t)chn + (size_t)c] = chunk.sample(i, c);
         qacc.add_interleaved(tmp.data(), got);
         dacc.add_interleaved(tmp.data(), got);
+        if (lc) lacc.add_interleaved(tmp.data(), got);
         pos += got;
         if (got < n) break;
     }
     q = qacc.finalize();
     d = dacc.finalize();
+    if (lc) *lc = lacc.finalize();
     if (pos != len) {
         if (why) *why = "公共区段读取不完整（" + std::to_string(pos) + "/" + std::to_string(len) + " 帧）";
         return false;
@@ -411,11 +463,24 @@ inline VersionCompare compare_versions(const std::vector<std::string>& paths, co
         VersionData& v = out.versions[i];
         const size_t len = (size_t)std::llround(minWinSec * (double)v.fs);
         std::string why;
+        LosslessCheck lc;
         if (!analyze_window(*srcs[i], (size_t)v.windowStartFrames, len, opt.blockFrames,
-                            v.quality, v.dynamicsTimes, &why)) {
+                            v.quality, v.dynamicsTimes, &why, &lc)) {
             v.error = why;
         } else {
             v.analyzed = true;
+            // 第 8 维：带宽/有损（长度与采样率都来自本文件，与容器位深/码率无关）
+            v.spectralCutoffHz = lc.cutoffHz;
+            v.cutoffConfidence = lc.confidence;
+            v.cutoffDetected = (lc.cutoffHz > 0.0);
+            v.lossySuspected = lc.suspected;
+            v.cutoffReason = lc.reason;
+            if (opt.verbose)
+                std::fprintf(stderr, "  %s 有效带宽: 截止 %s, 置信度 %.2f, 有损=%d (%s)\n",
+                             v.label.c_str(),
+                             v.cutoffDetected ? (std::to_string((int)std::lround(v.spectralCutoffHz)) + " Hz").c_str()
+                                              : "未检出",
+                             v.cutoffConfidence, (int)v.lossySuspected, v.cutoffReason.c_str());
         }
     }
     out.analyzeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count();
@@ -458,6 +523,16 @@ inline double mono_score(const VersionData& v) {
     if (!v.quality.stereo) return 100.0;          // 单声道素材没有兼容性问题
     return std::clamp(100.0 - v.quality.monoLossDb * 20.0, 0.0, 100.0);
 }
+// 有效带宽（第 8 维）：未检出陡沿 ⟹ 视为满带宽，取 min(奈奎斯特, 22.05 kHz)。
+// 为什么封顶 22.05 kHz：一个 96 kHz 的无损版本若「未检出截止」，不该因为奈奎斯特更高就在
+// 这一维白拿 26 kHz；44.1k 的 22.05 kHz 才是本维度的「满带宽」参照。
+inline double effective_bandwidth(const VersionData& v) {
+    if (v.spectralCutoffHz > 0.0) return v.spectralCutoffHz;
+    const double nyq = (v.fs > 0) ? 0.5 * (double)v.fs : 22050.0;
+    return std::min(nyq, 22050.0);
+}
+// 被确证为有损转码的固定扣分（见文件头「为什么扣分要分两段」）
+inline constexpr double kLossyPenaltyPoints = 12.0;
 // 削波：占比与连续段都罚，但【连续段罚得更重】—— 单个越限样本多为限幅器/抖动残留，
 // 几乎不可闻；连续 ≥3 样本的平台才是真削波（听感是"糊/破"）。
 //   占比项 20·log10(1+pct/0.01)：0.02% → 0.2 dB，1% → 6 dB，10% → 21 dB
@@ -516,6 +591,9 @@ inline void score_versions(VersionCompare& r) {
                        [](VD v) { return v.quality.clippedPct; });
     vcdetail::push_row(r, "clipped_runs", "连续削波段数（≥3 样本）", "段", false, false,
                        [](VD v) { return (double)v.quality.clippedRuns; });
+    // 第 8 维：有效带宽（信号判据，与容器位深/码率无关）。未检出陡沿 ⟹ 满带宽。
+    vcdetail::push_row(r, "cutoff_hz", "有效带宽截止（长期平均谱）", "Hz", true, false,
+                       [](VD v) { return vcdetail::effective_bandwidth(v); });
     vcdetail::push_row(r, "centroid_hz", "谱重心（brightness）", "Hz", true, true,
                        [](VD v) { return v.quality.centroidHz; }, whyFs);
     vcdetail::push_row(r, "tilt_db_oct", "频谱倾斜", "dB/oct", true, true,
@@ -538,15 +616,20 @@ inline void score_versions(VersionCompare& r) {
                        [](VD v) { return v.dynamicsTimes.lufsIntegrated; });
 
     // ---- 评分（相对最好版本的扣分，见文件头）----
+    // 权重表（第 8 维 cutoff 于 2026-10-27 加入；合计 0.92，按可比维度权重和归一化）：
+    //   cutoff 0.20（满罚 6 kHz ≈ 22.05−16 kHz = 128k 边界）
+    //   dr 0.18 / clip 0.14 / snr 0.14 / crest 0.07 / lra 0.07 / non_tonal 0.08 / mono 0.04
+    // 带宽 0.20 > 削波 0.14：即使有损版在削波维度上占尽便宜（最多 14 分），也翻不过带宽这一维。
     struct Dim { const char* key; double w; double fullDelta; bool higherBetter; };
     static const Dim dims[] = {
-        { "dr_db",        0.25,  6.0, true  },
-        { "snr_db",       0.20, 20.0, true  },
-        { "clipped_pct",  0.20,  0.0, false },   // 特殊：penalty 由 clip_penalty 给
-        { "crest_db",     0.10,  4.0, true  },
-        { "lra",          0.10,  6.0, true  },
-        { "non_tonal_db", 0.10, 10.0, false },
-        { "mono_loss_db", 0.05,  3.0, false },
+        { "cutoff_hz",    0.20, 6000.0, true  },  // 第 8 维：有效带宽（满罚 = 差 6 kHz）
+        { "dr_db",        0.18,  6.0, true  },
+        { "snr_db",       0.14, 20.0, true  },
+        { "clipped_pct",  0.14,  0.0, false },   // 特殊：penalty 由 clip_penalty 给
+        { "crest_db",     0.07,  4.0, true  },
+        { "lra",          0.07,  6.0, true  },
+        { "non_tonal_db", 0.08, 10.0, false },
+        { "mono_loss_db", 0.04,  3.0, false },
     };
     auto row_by_key = [&](const std::string& k) -> const MetricRow* {
         for (const MetricRow& row : r.rows) if (row.key == k) return &row;
@@ -561,9 +644,22 @@ inline void score_versions(VersionCompare& r) {
         return std::max(pctP, runP);
     };
     r.scores.assign(n, 0.0);
+    r.dims.clear();
+    r.dims.reserve(sizeof(dims) / sizeof(dims[0]));
+    for (const Dim& d : dims) {
+        VersionCompare::DimRow dr;
+        dr.key = d.key;
+        const MetricRow* row = row_by_key(d.key);
+        dr.label = row ? row->label : d.key;
+        dr.weight = d.w;
+        dr.penalty.assign(n, 0.0);
+        dr.score.assign(n, 100.0);
+        r.dims.push_back(std::move(dr));
+    }
     for (size_t i = 0; i < n; ++i) {
         double pen = 0.0, wsum = 0.0;
-        for (const Dim& d : dims) {
+        for (size_t di = 0; di < r.dims.size(); ++di) {
+            const Dim& d = dims[di];
             if (std::string(d.key) == "clipped_pct") {
                 const MetricRow* row = row_by_key(d.key);
                 if (!row || !row->comparable) continue;
@@ -572,7 +668,10 @@ inline void score_versions(VersionCompare& r) {
                     for (size_t k = 0; k < n; ++k) b = std::min(b, clip_penalty(k));
                     return b;
                 }();
-                pen += d.w * std::min(1.0, clip_penalty(i) - bestP);
+                const double p = std::min(1.0, clip_penalty(i) - bestP);
+                r.dims[di].penalty[i] = p;
+                r.dims[di].score[i] = 100.0 * (1.0 - p);
+                pen += d.w * p;
                 wsum += d.w;
                 continue;
             }
@@ -581,10 +680,14 @@ inline void score_versions(VersionCompare& r) {
             const double best = row->values[row->bestIndex];
             const double diff = d.higherBetter ? (best - row->values[i]) : (row->values[i] - best);
             const double penalty = (d.fullDelta > 0.0) ? std::min(1.0, std::max(0.0, diff) / d.fullDelta) : 0.0;
+            r.dims[di].penalty[i] = penalty;
+            r.dims[di].score[i] = 100.0 * (1.0 - penalty);
             pen += d.w * penalty;
             wsum += d.w;
         }
         r.scores[i] = (wsum > 0.0) ? 100.0 * (1.0 - pen / wsum) : 0.0;
+        // 离散项：确证的「有损转码」额外固定扣分（理由见文件头）
+        if (r.versions[i].lossySuspected) r.scores[i] -= vcdetail::kLossyPenaltyPoints;
         if (r.scores[i] < 0.0) r.scores[i] = 0.0;
     }
 
@@ -611,6 +714,30 @@ inline void score_versions(VersionCompare& r) {
         o << r.versions[r.ranking[k]].label << "(" << std::setprecision(1) << r.scores[r.ranking[k]] << ")";
     }
     o << "\n";
+    // 每版的有效带宽与有损判定：这是排序里最容易被误读的一维，必须逐版写出来。
+    // 有损版单独占一行，并在括号里给陡沿证据（reason 来自同一套 fake_lossless 算法）。
+    {
+        bool anyLossy = false;
+        for (const VersionData& v : r.versions) anyLossy = anyLossy || v.lossySuspected;
+        if (anyLossy) {
+            o << "有效带宽 / 有损判定（长期平均谱，截止 = 谱密度连续低于 1–5 kHz 参考段 −40 dB 的最高频点）：\n";
+            for (const VersionData& v : r.versions) {
+                o << "  " << v.label << "：";
+                if (v.spectralCutoffHz > 0.0)
+                    o << std::setprecision(1) << (v.spectralCutoffHz / 1000.0) << " kHz";
+                else
+                    o << "未检出陡沿（满带宽）";
+                if (v.lossySuspected) {
+                    o << " ⟹ 疑似有损转码（" << v.cutoffReason << "，置信度 "
+                      << std::setprecision(2) << v.cutoffConfidence << "），总分已扣 "
+                      << std::setprecision(0) << vcdetail::kLossyPenaltyPoints << " 分";
+                } else if (v.spectralCutoffHz > 0.0) {
+                    o << "（" << v.cutoffReason << "）";
+                }
+                o << "\n";
+            }
+        }
+    }
     const size_t best = r.ranking.front();
     for (size_t k = 1; k < n; ++k) {
         const size_t other = r.ranking[k];
@@ -627,16 +754,33 @@ inline void score_versions(VersionCompare& r) {
             else if (row.key == "clipped_pct") thr = 1e-9;
             else if (row.key == "clipped_runs") thr = 0.5;
             else if (row.key == "mono_loss_db") thr = 0.2;
+            else if (row.key == "cutoff_hz") thr = 500.0;
             else continue;                 // 信息性/无方向的维度不进解释
             if (std::fabs(d) < thr) continue;
             const bool better = row.higherBetter ? (d > 0) : (d < 0);
             if (!better) continue;         // 只列"赢"的维度，输的维度另有汇总
             any = true;
+            if (row.key == "cutoff_hz") {
+                o << " 有效带宽 " << std::setprecision(1) << (a / 1000.0) << " kHz vs "
+                  << (b2 / 1000.0) << " kHz（" << (d > 0 ? "+" : "") << (d / 1000.0) << " kHz";
+                if (r.versions[other].lossySuspected) o << "；后者为有损转码级截止";
+                o << "）;";
+                continue;
+            }
             o << " " << row.label << " " << std::setprecision(2) << a << row.unit
               << " vs " << b2 << row.unit << "（" << (d > 0 ? "+" : "") << d << "）;";
         }
         if (!any) o << " 各评分维度差异都在噪声级以内（差别主要来自信息性指标，见对比表）。";
         o << "\n";
+    }
+    // 自检：若排序第 1 仍是有损版、而批次里存在无损版，说明权重再次失效，必须显式警告
+    {
+        const VersionData& top = r.versions[r.ranking.front()];
+        bool anyClean = false;
+        for (const VersionData& v : r.versions) if (!v.lossySuspected) anyClean = true;
+        if (top.lossySuspected && anyClean)
+            o << "⚠ 排序第 1 的 " << top.label
+              << " 被判为疑似有损转码，却排在没有该标记的版本之前 —— 这是评分权重失效的信号，请勿据此选版本。\n";
     }
     // 不可比项
     std::vector<std::string> notComp;

@@ -788,6 +788,34 @@ int main() {
         }
         std::printf("  -- 6 首拒采曲命中结果: %d/6 命中 --\n", hitCount);
         ck(hitCount >= 4, "E-17: 6 首拒采曲真网命中至少 4/6(与 §1.5 核对结论一致)", std::to_string(hitCount) + "/6");
+
+        // ---- 261026-05 #3 用户点名案例：专辑「深空余音」(https://www.dizzylab.net/d/skyy-ast/) ----
+        // 用户原话「比如深空余音…一下子就能搜到，也有封面…你是为什么搜不到的？」
+        // 这里用【专辑名】直接搜（不是曲名/艺术家整串），并断言封面 URL 可取 —— 就是用户
+        // 「也有封面」这一半要求；端到端封面落盘另由 rtaweb 的 COVSRC 日志佐证。
+        {
+            std::string e3;
+            const std::vector<Candidate> sk = search_dizzylab("深空余音", e3);
+            ck(e3.empty(), "真网:深空余音搜索 err 空", e3);
+            ck(!sk.empty(), "真网:深空余音(专辑名直接搜)命中 ≥1", std::to_string(sk.size()));
+            if (!sk.empty()) {
+                std::printf("      └ 深空余音首条: %s | %s | %s | %s\n", sk[0].title.c_str(),
+                            sk[0].artist.c_str(), sk[0].album.c_str(), sk[0].coverUrl.c_str());
+                ck(!sk[0].coverUrl.empty(), "真网:深空余音首条 coverUrl 非空",
+                   sk[0].coverUrl);
+            }
+            // 带结构回来的查询（专辑 + 社团），这是 enrich 实际使用的形态
+            ProviderQuery pq2;
+            pq2.query = "深空余音";
+            pq2.title = "深空余音";
+            pq2.album = "深空余音";
+            pq2.circle = "星夜梦ASTRAL";
+            pq2.dirName = "深空余音 @ 星夜梦ASTRAL";
+            std::string e4;
+            const std::vector<Candidate> sk2 = search_dizzylab(pq2, e4);
+            ck(e4.empty() && !sk2.empty(), "真网:深空余音 ProviderQuery(带社团)命中 ≥1",
+               e4 + "/" + std::to_string(sk2.size()));
+        }
     }
 
     std::printf("\n%s\n", g_fail == 0 ? "全部通过" : (std::to_string(g_fail) + " 项失败").c_str());

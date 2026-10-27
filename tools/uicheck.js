@@ -90,6 +90,236 @@ async function gotoFiles() {
   return false;
 }
 
+// ---- 全站 ? 浮层核查（261027-03 #6）--------------------------------------------------
+// 为什么需要它：用户报「设置-诊断，所有 ? 的帮助文档都被左侧栏挡住文字」。
+// 这里把设置页每个页签里**每一个** ? 都 hover 一遍，量出浮层矩形，再算：
+//   ① 与左栏 .side 的重叠面积（判据：必须为 0）；
+//   ② 是否完整落在视口内；
+//   ③ 被主区 .main（overflow:auto）裁掉的宽度 —— 老实现 .tip::after 就是死在这一条上。
+// 老实现（CSS ::after）量不到真实节点，用计算样式反推它自己的盒模型；
+// 新实现（body 下的 #tipLayer 固定层）直接量那个节点，两者字段一致，可以前后对比。
+async function tipAudit(prefix) {
+  const rows = [], badSide = [], badView = [], badClip = [];
+  // 可选：窄窗口复核（TIP_W/TIP_H 环境变量）—— 左栏在 ≤1240px 时变 200px，
+  // 浮层的 minL/maxW 要跟着变，所以窄窗必须单独量一遍。
+  const EMU_W = +(process.env.TIP_W || 0), EMU_H = +(process.env.TIP_H || 0);
+  if (EMU_W && EMU_H) await send('Emulation.setDeviceMetricsOverride', { width: EMU_W, height: EMU_H, deviceScaleFactor: 1, mobile: false });
+  const MEAS = (idx) => '(function(){' +
+    'var e=document.querySelector(\'#setpage .tip[data-tipidx="' + idx + '"]\');' +
+    'if(!e) return {err:\'tip gone\'};' +
+    'var L=document.getElementById(\'tipLayer\');' +
+    'if(!L||!L.classList.contains(\'on\')) e.dispatchEvent(new MouseEvent(\'mouseover\',{bubbles:true}));' +
+    'L=document.getElementById(\'tipLayer\');' +
+    'var vr=e.getBoundingClientRect(), out={impl:\'none\',rect:null};' +
+    'if(L&&L.classList.contains(\'on\')){' +
+    '  var lr=L.getBoundingClientRect();' +
+    '  out={impl:\'layer\',rect:{l:+lr.left.toFixed(2),t:+lr.top.toFixed(2),r:+lr.right.toFixed(2),b:+lr.bottom.toFixed(2),w:+lr.width.toFixed(2),h:+lr.height.toFixed(2)}};' +
+    '}else{' +
+    '  var cs=getComputedStyle(e,\'::after\');' +
+    '  var w=parseFloat(cs.width)||0,h=parseFloat(cs.height)||0;' +
+    '  if(cs.content&&cs.content!==\'none\'&&cs.content!==\'normal\'&&w>0&&h>0){' +
+    '    var below=!!e.closest(\'.sghead\');' +   // 分组标题的 (?) 旧 CSS 是向下展开
+    '    var l=vr.left+vr.width/2-w/2, t=below?(vr.bottom+7):(vr.top-7-h);' +
+    '    out={impl:\'pseudo\',rect:{l:+l.toFixed(2),t:+t.toFixed(2),r:+(l+w).toFixed(2),b:+(t+h).toFixed(2),w:+w.toFixed(2),h:+h.toFixed(2)}};' +
+    '  }' +
+    '}' +
+    'var side=document.querySelector(\'.side\'), main=document.querySelector(\'.main\');' +
+    'if(!side||!main||!out.rect) return {err:\'no rect\',impl:out.impl};' +
+    'var sr=side.getBoundingClientRect(), mr=main.getBoundingClientRect();' +
+    'function isect(a,b,c,d,A,B,C,Dd){var w=Math.min(c,C)-Math.max(a,A),h=Math.min(d,Dd)-Math.max(b,B);return (w>0&&h>0)?{w:+w.toFixed(2),h:+h.toFixed(2),area:+(w*h).toFixed(1)}:{w:0,h:0,area:0};}' +
+    'var R=out.rect;' +
+    'return {impl:out.impl,rect:R,side:isect(R.l,R.t,R.r,R.b,sr.left,sr.top,sr.right,sr.bottom),' +
+    '  clip:{l:+Math.max(0,mr.left-R.l).toFixed(2),r:+Math.max(0,R.r-mr.right).toFixed(2),t:+Math.max(0,mr.top-R.t).toFixed(2),b:+Math.max(0,R.b-mr.bottom).toFixed(2)},' +
+    '  vw:window.innerWidth,vh:window.innerHeight,' +
+    '  sideR:+sr.right.toFixed(2), mainL:+mr.left.toFixed(2)};' +
+    '})()';
+  const pad = (s, n) => { s = String(s == null ? '' : s); let w = 0; for (const ch of s) w += (ch.charCodeAt(0) > 255 ? 2 : 1); return s + ' '.repeat(Math.max(0, n - w)); };
+  await send('Page.navigate', { url: URL_ });
+  await sleep(700);
+  await waitFor("window.S && S.view", 15000);
+  await sleep(400);
+  console.log('=== 全站 ? 浮层核查（前缀 ' + prefix + '）===');
+  console.log('左栏文本: ' + JSON.stringify(await evalJs("(document.querySelector('.side')||{}).innerText || ''")));
+  await evalJs("Array.from(document.querySelectorAll('.side .nav')).filter(function(e){return e.dataset.v==='settings';})[0].click()");
+  if (!await waitFor("!!document.querySelector('#setpage .stabs')", 8000)) { console.log('设置页没打开'); return { total: 0, fail: true, badSide, badView, badClip }; }
+  await sleep(500);
+  const tabs = await evalJs("Array.from(document.querySelectorAll('#setpage .stabs [data-g]')).map(function(e){return {g:e.dataset.g,t:e.textContent.trim()};})") || [];
+  console.log('页签: ' + tabs.map(t => t.t + '(' + t.g + ')').join(' / '));
+  console.log('');
+  console.log(pad('页签', 5) + ' ' + pad('控件', 18) + ' ' + pad('浮层矩形 x/y (w×h)', 34) + ' ' + pad('左栏重叠', 12) + ' ' + pad('视口', 5) + ' 主区裁剪');
+  for (const tb of tabs) {
+    await evalJs('(function(g){var b=Array.from(document.querySelectorAll(\'#setpage .stabs [data-g]\')).filter(function(e){return e.dataset.g===g;})[0]; if(b)b.click();})(' + JSON.stringify(tb.g) + ')');
+    await sleep(340);
+    const tips = await evalJs('(function(){' +
+      'var all=Array.prototype.slice.call(document.querySelectorAll(\'#setpage .tip\'));' +
+      'all.forEach(function(e){e.removeAttribute(\'data-tipidx\');});' +
+      'var vis=all.filter(function(e){var r=e.getBoundingClientRect();return r.width>1&&r.height>1;});' +
+      'vis.forEach(function(e,i){e.setAttribute(\'data-tipidx\',String(i));});' +
+      'return vis.map(function(e,i){var r=e.getBoundingClientRect();' +
+      '  var p=e.parentElement, lb=p?(p.textContent||\'\'):\'\';' +
+      '  return {i:i,cx:+(r.left+r.width/2).toFixed(2),cy:+(r.top+r.height/2).toFixed(2),' +
+      '    label:lb.replace(/[?？]/g,\'\').trim().slice(0,18)};});' +
+      '})()') || [];
+    for (const t of tips) {
+      // 先把 ? 滚到视口中央：用户是"滚到那里再 hover"，不滚会量到视口外的假数据
+      await evalJs('(function(idx){var e=document.querySelector(\'#setpage .tip[data-tipidx="' + t.i + '"]\');' +
+        'if(!e) return 0; e.scrollIntoView({block:"center",inline:"nearest"}); return 1;})()');
+      await sleep(140);
+      await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: Math.round(t.cx), y: Math.round(t.cy), button: 'none', buttons: 0 });
+      await sleep(90);
+      const pos = await evalJs('(function(idx){var e=document.querySelector(\'#setpage .tip[data-tipidx="' + t.i + '"]\');' +
+        'if(!e) return null; var r=e.getBoundingClientRect(); return {cx:r.left+r.width/2, cy:r.top+r.height/2};})()');
+      if (pos && (Math.round(pos.cx) !== Math.round(t.cx) || Math.round(pos.cy) !== Math.round(t.cy))) {
+        await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: Math.round(pos.cx), y: Math.round(pos.cy), button: 'none', buttons: 0 });
+        await sleep(90);
+      }
+      const m = await evalJs(MEAS(t.i));
+      // 截图必须在鼠标还停在 ? 上时抓：浮层只在 hover/focus 时显示，移开就没了
+      if (m && m.rect) {
+        if (tb.g === 'diag' && t.i === 0) await shot(prefix + '-diag-tip');
+        if (tb.g === 'out' && t.i === 0) await shot(prefix + '-out-tip');
+      }
+      await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 4, y: 4, button: 'none', buttons: 0 });  // 移开，收起浮层
+      if (!m || m.err || !m.rect) { console.log(pad(tb.t, 5) + ' ' + pad(t.label, 18) + ' 量不到浮层: ' + (m && m.err)); continue; }
+      const R = m.rect, area = m.side.area;
+      const clipW = Math.max(m.clip.l, m.clip.r), clipH = Math.max(m.clip.t, m.clip.b);
+      const clipped = clipW > 0.5 || clipH > 0.5;
+      const inView = R.l >= -0.5 && R.t >= -0.5 && R.r <= m.vw + 0.5 && R.b <= m.vh + 0.5;
+      const key = tb.t + '/' + t.label;
+      rows.push({ tab: tb.t, g: tb.g, label: t.label, impl: m.impl, rect: R, area: area, inView: inView, clipW: clipW, clipH: clipH });
+      if (area > 0) badSide.push(key + '(' + area + 'px²)');
+      if (!inView) badView.push(key + '(l=' + R.l + ',r=' + R.r + '/vw=' + m.vw + ',b=' + R.b + '/vh=' + m.vh + ')');
+      if (clipped) badClip.push(key + '(裁 ' + (clipW || clipH) + 'px)');
+      console.log(pad(tb.t, 5) + ' ' + pad(t.label, 18) + ' ' +
+        pad('x ' + R.l + '..' + R.r + ' y ' + R.t + '..' + R.b + ' (' + R.w + '×' + R.h + ')', 34) + ' ' +
+        pad(area > 0 ? ('✗ ' + m.side.w + '×' + m.side.h + '=' + area) : '0', 12) + ' ' +
+        pad(inView ? 'ok' : '✗越界', 5) + ' ' + (clipped ? ('✗ ' + clipW + '/' + clipH + 'px') : '0') + ' [' + m.impl + ']');
+    }
+  }
+  // ---- 边界用例：把 ? 顶到视口最下沿/最上沿，验证"夹进视口"真的生效 ----
+  // （上面的循环用 scrollIntoView(block:'center')，测不到 y 方向夹取；这两条专门打边）
+  await evalJs('(function(){var b=Array.prototype.slice.call(document.querySelectorAll(\'#setpage .stabs [data-g]\')).filter(function(e){return e.dataset.g===\'diag\';})[0]; if(b)b.click();})()');
+  await sleep(340);
+  for (const edge of ['end', 'start']) {
+    const info = await evalJs('(function(){var all=Array.prototype.slice.call(document.querySelectorAll(\'#setpage .tip\'));' +
+      'all.forEach(function(e){e.removeAttribute(\'data-tipidx\');});' +
+      'var vis=all.filter(function(e){var r=e.getBoundingClientRect();return r.width>1&&r.height>1;});' +
+      'if(!vis.length) return null; var pick=' + (edge === 'end' ? 'vis[vis.length-1]' : 'vis[0]') + ';' +
+      'vis.forEach(function(e,i){if(e===pick) e.setAttribute(\'data-tipidx\',\'0\');});' +
+      'pick.scrollIntoView({block:"' + edge + '"});' +
+      'var r=pick.getBoundingClientRect(); return {cx:r.left+r.width/2,cy:r.top+r.height/2};})()');
+    if (!info) continue;
+    await sleep(160);
+    const pos = await evalJs('(function(){var e=document.querySelector(\'#setpage .tip[data-tipidx="0"]\'); if(!e) return null;' +
+      'var r=e.getBoundingClientRect(); return {cx:r.left+r.width/2,cy:r.top+r.height/2};})()') || info;
+    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: Math.round(pos.cx), y: Math.round(pos.cy), button: 'none', buttons: 0 });
+    await sleep(120);
+    const m = await evalJs(MEAS(0));
+    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 4, y: 4, button: 'none', buttons: 0 });
+    if (!m || !m.rect) { console.log('边界(' + edge + ') 量不到'); continue; }
+    const R = m.rect;
+    const inView = R.l >= -0.5 && R.t >= -0.5 && R.r <= m.vw + 0.5 && R.b <= m.vh + 0.5;
+    const key = '边界/diag-' + edge;
+    rows.push({ tab: '边界', g: 'diag', label: edge, impl: m.impl, rect: R, area: m.side.area, inView: inView, clipW: 0, clipH: 0 });
+    if (m.side.area > 0) badSide.push(key + '(' + m.side.area + 'px²)');
+    if (!inView) badView.push(key + '(t=' + R.t + ',b=' + R.b + '/vh=' + m.vh + ')');
+    console.log(pad('边界', 5) + ' ' + pad('diag ? ' + edge, 18) + ' ' +
+      pad('x ' + R.l + '..' + R.r + ' y ' + R.t + '..' + R.b + ' (' + R.w + '×' + R.h + ')', 34) + ' ' +
+      pad(m.side.area > 0 ? ('✗ ' + m.side.area) : '0', 12) + ' ' + pad(inView ? 'ok' : '✗越界', 5) + ' 视口高 ' + m.vh);
+  }
+  await evalJs("Array.from(document.querySelectorAll('.side .nav')).filter(function(e){return e.dataset.v==='albums';})[0].click()");
+  await sleep(600);
+  await shot(prefix + '-sidebar');
+  const align = await evalJs('(function(){' +
+    'function R(e){var r=e.getBoundingClientRect();return {x:+r.left.toFixed(2),y:+r.top.toFixed(2),h:+r.height.toFixed(2),b:+r.bottom.toFixed(2)};}' +
+    'var side=document.querySelector(\'.side\');' +
+    'var play=Array.prototype.slice.call(side.querySelectorAll(\'.sec\')).filter(function(e){return e.textContent.trim()===\'播放\';})[0];' +
+    'var sqhd=side.querySelector(\'.sqhd\');' +
+    'if(!play||!sqhd) return {ok:false};' +
+    'var nav=play.nextElementSibling, sq=sqhd.nextElementSibling;' +
+    'var cp=R(play), cs=R(sqhd), cn=nav?R(nav):null, cq=sq?R(sq):null;' +
+    'return {ok:true,leftDiff:+(cs.x-cp.x).toFixed(2),gapPlay:cn?+(cn.y-cp.b).toFixed(2):null,gapSq:cq?+(cq.y-cs.b).toFixed(2):null,' +
+    '  gapDiff:(cn&&cq)?+(Math.abs((cq.y-cs.b)-(cn.y-cp.b))).toFixed(2):null, firstSq:sq?sq.className:null, sqText:sq?sq.textContent.trim():null,' +
+    '  titleH:[cp.h,cs.h]};' +
+    '})()');
+  console.log('');
+  console.log('左栏对齐: ' + JSON.stringify(align));
+  return { total: rows.length, rows: rows, badSide: badSide, badView: badView, badClip: badClip, align: align,
+           fail: badSide.length > 0 || badView.length > 0 || badClip.length > 0 || errors.length > 0 };
+}
+
+// ---- 三主题复核（261027-03 #6）-------------------------------------------------------
+// 浮层改成固定层之后，配色改由 CSS 变量驱动（--bg3/--txt2/--line/--shadow）。
+// 这里在 dark / light / blue 三套主题下各抽 3 个 ?，重新量「与左栏重叠 / 是否在视口内」，
+// 并把浮层的前景/背景色取回来算对比度（证明三套主题下都还读得清）。
+async function tipThemes(prefix) {
+  const rows = [];
+  const con = (fg, bg) => {
+    const p = (s) => { const m = String(s).match(/[\d.]+/g) || []; return m.slice(0, 3).map(Number); };
+    const lin = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+    const L = (rgb) => 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2]);
+    const a = L(p(fg)), b = L(p(bg));
+    return +(((Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05))).toFixed(2);
+  };
+  const MEAS = '(function(){' +
+    'var e=document.querySelector(\'#setpage .tip[data-tipidx="0"]\');' +
+    'if(!e) return {err:"no tip"};' +
+    'e.dispatchEvent(new MouseEvent(\'mouseover\',{bubbles:true}));' +   // 无条件重放：绝不用上一个 ? 的残留'
+    'var L=document.getElementById(\'tipLayer\');' +
+    'if(!L||!L.classList.contains(\'on\')) return {err:"layer not shown"};' +
+    'var lr=L.getBoundingClientRect(), side=document.querySelector(\'.side\').getBoundingClientRect(), cs=getComputedStyle(L);' +
+    'var w=Math.min(lr.right,side.right)-Math.max(lr.left,side.left), h=Math.min(lr.bottom,side.bottom)-Math.max(lr.top,side.top);' +
+    'return {l:+lr.left.toFixed(2),t:+lr.top.toFixed(2),r:+lr.right.toFixed(2),b:+lr.bottom.toFixed(2),' +
+    '  w:+lr.width.toFixed(2),h:+lr.height.toFixed(2),area:(w>0&&h>0)?+(w*h).toFixed(1):0,' +
+    '  inView:(lr.left>=-0.5&&lr.top>=-0.5&&lr.right<=innerWidth+0.5&&lr.bottom<=innerHeight+0.5),' +
+    '  vw:innerWidth,vh:innerHeight,color:cs.color,bg:cs.backgroundColor,text:L.textContent.slice(0,24)};' +
+    '})()';
+  await send('Page.navigate', { url: URL_ });
+  await sleep(700);
+  await waitFor("window.S && S.view", 15000);
+  await sleep(300);
+  await evalJs("Array.from(document.querySelectorAll('.side .nav')).filter(function(e){return e.dataset.v==='settings';})[0].click()");
+  if (!await waitFor("!!document.querySelector('#setpage .stabs')", 8000)) { console.log('设置页没打开'); return { fail: true, rows }; }
+  await sleep(400);
+  console.log('=== 三主题 ? 浮层复核（' + prefix + '）===');
+  let bad = 0;
+  for (const th of ['dark', 'light', 'blue']) {
+    await evalJs('(function(t){var b=document.querySelector(\'.themes .sw[data-theme="' + th + '"]\'); if(b)b.click();})()');
+    await sleep(350);
+    for (const g of ['in', 'out', 'diag']) {
+      // 注意：这里必须把 g 传进 IIFE —— 少了实参就等于没点页签，9 次测量会全落在同一个 ? 上（本轮真踩到）
+      await evalJs('(function(g){var b=Array.prototype.slice.call(document.querySelectorAll(\'#setpage .stabs [data-g]\')).filter(function(e){return e.dataset.g===g;})[0]; if(b)b.click();})(' + JSON.stringify(g) + ')');
+      await sleep(320);
+      const info = await evalJs('(function(){var all=Array.prototype.slice.call(document.querySelectorAll(\'#setpage .tip\'));' +
+        'all.forEach(function(e){e.removeAttribute(\'data-tipidx\');});' +
+        'var vis=all.filter(function(e){var r=e.getBoundingClientRect();return r.width>1&&r.height>1;});' +
+        'if(!vis.length) return null; vis.forEach(function(e,i){e.setAttribute(\'data-tipidx\',String(i));});' +
+        'vis[0].scrollIntoView({block:"center"});' +
+        'var r=vis[0].getBoundingClientRect(); return {cx:r.left+r.width/2,cy:r.top+r.height/2,n:vis.length};})()');
+      if (!info) continue;
+      await sleep(140);
+      const pos = await evalJs('(function(){var e=document.querySelector(\'#setpage .tip[data-tipidx="0"]\'); if(!e) return null; ' +
+        'var r=e.getBoundingClientRect(); return {cx:r.left+r.width/2,cy:r.top+r.height/2};})()') || info;
+      await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 4, y: 4, button: 'none', buttons: 0 });  // 先离开，保证下一个 ? 一定能触发 mouseover
+      await sleep(70);
+      await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: Math.round(pos.cx), y: Math.round(pos.cy), button: 'none', buttons: 0 });
+      await sleep(120);
+      const m = await evalJs(MEAS);
+      if (th === 'dark' && g === 'diag') await shot(prefix + '-theme-dark');
+      if (th === 'light' && g === 'diag') await shot(prefix + '-theme-light');
+      if (th === 'blue' && g === 'diag') await shot(prefix + '-theme-blue');
+      await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 4, y: 4, button: 'none', buttons: 0 });
+      if (!m || m.err) { console.log(th + ' ' + g + ' 量不到: ' + (m && m.err)); bad++; continue; }
+      const cr = con(m.color, m.bg);
+      rows.push({ th, g, m, cr });
+      if (m.area > 0 || !m.inView) bad++;
+      console.log(th + '  ' + g.padEnd(5) + ' x ' + m.l + '..' + m.r + ' y ' + m.t + '..' + m.b + ' (' + m.w + '×' + m.h + ')' +
+        ' 左栏重叠 ' + m.area + ' 视口 ' + (m.inView ? 'ok' : '✗') + ' 对比度 ' + cr + ':1  ' + JSON.stringify(m.text));
+    }
+  }
+  return { rows, fail: bad > 0 };
+}
+
 (async () => {
   const pages = await targets();
   ws = new WebSocket(pages[0].webSocketDebuggerUrl);
@@ -108,6 +338,31 @@ async function gotoFiles() {
   await send('Runtime.enable');
   await send('Page.enable');
   await send('Log.enable');
+
+  // ---- 模式 `tips`：全站 ? 浮层核查（261027-03 #6「帮助文档被左侧栏挡住」）----
+  // 用法：node tools/uicheck.js <url> <截图目录> tips [截图前缀]
+  // 判据（用户给的）：每个 ? 浮层的矩形与左栏 .side 的重叠面积必须为 0，且浮层完整落在视口内。
+  // 另外多记一项"被主区裁剪"：主区 .main 是 overflow:auto，浮层若伸出它的左边界就会被裁掉
+  // —— 那正是"被左侧栏挡住文字"的真实形态（不是 z-index）。
+  const MODE = (process.argv[4] || '').trim().toLowerCase();
+  if (MODE === 'themes') {
+    const r = await tipThemes((process.argv[5] || 'tip').trim());
+    if (errors.length) console.log('  JS 异常: ' + errors.slice(0, 3).join(' | '));
+    console.log(r.fail ? '结果: FAIL' : '结果: PASS');
+    try { child.kill(); } catch (e) { }
+    process.exit(r.fail ? 1 : 0);
+  }
+  if (MODE === 'tips') {
+    const r = await tipAudit((process.argv[5] || 'tip').trim());
+    console.log('\n汇总: ' + r.total + ' 个 ?；与左栏重叠 ' + r.badSide.length +
+      ' 个；超出视口 ' + r.badView.length + ' 个；被主区裁剪 ' + r.badClip.length + ' 个');
+    if (r.badSide.length) console.log('  重叠清单: ' + r.badSide.slice(0, 8).join(' / '));
+    if (r.badView.length) console.log('  越界清单: ' + r.badView.slice(0, 8).join(' / '));
+    if (errors.length) console.log('  JS 异常: ' + errors.slice(0, 3).join(' | '));
+    console.log(r.fail ? '结果: FAIL' : '结果: PASS');
+    try { child.kill(); } catch (e) { }
+    process.exit(r.fail ? 1 : 0);
+  }
 
   const results = [];
   const ck = (ok, what, detail) => {
@@ -362,8 +617,10 @@ async function gotoFiles() {
   // 2026-10-23 用户 261023-04 #2：EQ 与房间校正从主导航移进设置页，「EQ」页签排在「高级」之后。
   // 2026-10-24 用户 261024-01 #5：「流媒体」从「高级」拆成独立页签，排在元数据之后、诊断之前。
   // 2026-10-27（用户 261026-09 #6）：EQ 页拆成「EQ」+「声音校准」，声音校准紧跟 EQ。
-  ck(tabOrder === '输入/输出/PCM/SDM/高级/EQ/声音校准/元数据/流媒体/诊断',
-     '设置页签顺序为 输入/输出/PCM/SDM/高级/EQ/声音校准/元数据/流媒体/诊断', tabOrder);
+  // 2026-10-27（用户 261027-03 #9 / 在线更新）：新增「分析」页签（排在元数据之后、流媒体之前）
+  // 与「关于与更新」页签（排在诊断之后），共 12 个。
+  ck(tabOrder === '输入/输出/PCM/SDM/高级/EQ/声音校准/元数据/分析/流媒体/诊断/关于与更新',
+     '设置页签顺序为 输入/输出/PCM/SDM/高级/EQ/声音校准/元数据/分析/流媒体/诊断/关于与更新', tabOrder);
 
   // ---- 261027-02 #2：设置-输出-官方推荐设置 的 4 个预设必须并排一行 ----
   // 用户原话：「4 个预设一行就行，不要分两行」。旧 CSS 是 repeat(3) ⟹ 第 4 张必然掉到第二行。
@@ -1070,6 +1327,137 @@ async function gotoFiles() {
      '1024 宽底栏控制组仍水平居中，五键 + 播放链（歌词/信号链/音量）仍可见', JSON.stringify(bg2));
 
 
+  // =====================================================================================
+  // 261027-03 #3：播放队列重构的回归断言（只测队列；自检前后都不改用户队列）
+  // 判据逐条对应用户三条抱怨，全部读真实 DOM / 接口数字（不看文案）：
+  //   ① × 默认可见（computed opacity > 0.1，不需要 hover）；右键队列条目有「从队列移除」
+  //   ② 添加入口默认可见：队列页「＋ 添加曲目」/ 曲目页每行「＋」/ 单曲页「＋ 加入队列」
+  //   ③ 排序下拉里没有「默认顺序」这种伪状态；排序后出现「↩ 撤销排序」，撤销后它自己消失
+  // 纪律：先把原队列（items + cues）整列存下来，结尾用 /api/queue/set 还原；原队列为空则 /api/clear。
+  // =====================================================================================
+  await evalJs("window.__qOrig = null; fetch('/api/queue').then(r=>r.json()).then(j=>{window.__qOrig = {items:j.items||[], cues:j.cues||[]};});");
+  await sleep(400);
+  // 造 3 首测试曲（从库里取；库为空时跳过本段，不让自检假失败）
+  const qSeed = await evalJs(`(async()=>{
+    const j = await (await fetch('/api/lib/search?q=')).json();
+    const t = (j.tracks||[]).slice(0,3).map(x=>x.path);
+    if (!t.length) return {seeded:0};
+    for (const p of t) await fetch('/api/add', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'file='+encodeURIComponent(p)});
+    const q = await (await fetch('/api/queue')).json();
+    return {seeded:t.length, n:q.items.length};
+  })()`);
+  if (qSeed && qSeed.seeded) {
+    await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='queue').click()");
+    await waitFor("!!document.querySelector('#list .qrow')", 8000);
+    await sleep(300);
+    const qAddBtn = await evalJs(`(function(){
+      var b=document.getElementById('qAddBtn'); if(!b) return null;
+      var r=b.getBoundingClientRect(), cs=getComputedStyle(b);
+      return {visible: r.width>0 && r.height>0 && cs.display!=='none' && cs.visibility!=='hidden' && parseFloat(cs.opacity)>0.1, text:b.textContent.trim()};
+    })()`);
+    ck(qAddBtn && qAddBtn.visible, '队列页「＋ 添加曲目」按钮默认可见（不用 hover/右键）', JSON.stringify(qAddBtn));
+    const qDelVis = await evalJs(`(function(){
+      var b=document.querySelector('#list .qrow .qdel'); if(!b) return null;
+      var r=b.getBoundingClientRect(), cs=getComputedStyle(b);
+      var hit=document.elementFromPoint(r.left+r.width/2, r.top+r.height/2);
+      return {opacity:cs.opacity, visible: parseFloat(cs.opacity)>0.1, w:Math.round(r.width),
+              hitIsSelf: hit===b || (hit&&b.contains(hit))};
+    })()`);
+    ck(qDelVis && qDelVis.visible && qDelVis.w > 0 && qDelVis.hitIsSelf,
+       '队列行「×」默认可见且点得到（不再是 hover 才显形）', JSON.stringify(qDelVis));
+    const qSortOpts = await evalJs(`(function(){var s=document.getElementById('qSort');return s?Array.prototype.map.call(s.options,function(o){return o.text;}) : null;})()`);
+    ck(Array.isArray(qSortOpts) && qSortOpts.some(t=>t.indexOf('标题')>=0) && !qSortOpts.some(t=>t.indexOf('默认顺序')>=0),
+       '队列排序下拉只有动作项，没有「默认顺序」伪状态', JSON.stringify(qSortOpts));
+    // 排序 → 出现「↩ 撤销排序」；撤销 → 顺序还原 + 按钮消失
+    const sortRes = await evalJs(`(async()=>{
+      const before = (await (await fetch('/api/queue')).json()).items.slice();
+      window.__qSortedBefore = before;
+      const s = document.getElementById('qSort');
+      s.value='title'; s.dispatchEvent(new Event('change'));
+      await new Promise(r=>setTimeout(r,1200));
+      const q = await (await fetch('/api/queue')).json();
+      const undo1 = !!document.getElementById('qSortUndo');
+      return {changed: q.items.join('|')!==before.join('|'), n:q.items.length, undoBtn:undo1, canUndo:!!q.canUndo, before:before};
+    })()`);
+    ck(sortRes && sortRes.n === (qSeed.n||0) && sortRes.undoBtn && sortRes.canUndo,
+       '按标题排序后条数不变且出现「↩ 撤销排序」（canUndo 与按钮一致）', JSON.stringify({n:sortRes&&sortRes.n, undo:sortRes&&sortRes.undoBtn}));
+    const undoRes = await evalJs(`(async()=>{
+      const b = document.getElementById('qSortUndo'); if (!b) return {noBtn:true};
+      b.click();
+      await new Promise(r=>setTimeout(r,1100));
+      const q = await (await fetch('/api/queue')).json();
+      return {restored: q.items.join('|')===window.__qSortedBefore.join('|'), n:q.items.length, undoBtn:!!document.getElementById('qSortUndo'), canUndo:!!q.canUndo};
+    })()`);
+    ck(undoRes && undoRes.restored === true && undoRes.undoBtn === false,
+       '「↩ 撤销排序」能整列还原，且还原后按钮自己消失', JSON.stringify(undoRes));
+    // 右键队列条目 → 菜单里有「从队列移除」，点了真的少一首
+    const rcRes = await evalJs(`(async()=>{
+      const row = document.querySelector('#list .qrow');
+      const n0 = (await (await fetch('/api/queue')).json()).items.length;
+      const r = row.getBoundingClientRect();
+      row.dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, cancelable:true, clientX:r.left+40, clientY:r.top+8}));
+      await new Promise(x=>setTimeout(x,300));
+      const m = document.querySelector('.ctxmenu');
+      const hasDel = !!m && m.textContent.indexOf('从队列移除')>=0;
+      let n1 = n0;
+      if (m) {
+        const it = Array.prototype.slice.call(m.children).filter(function(d){return d.textContent.indexOf('从队列移除')>=0;})[0];
+        if (it) { it.click(); await new Promise(x=>setTimeout(x,700)); n1 = (await (await fetch('/api/queue')).json()).items.length; }
+        else document.body.click();
+      }
+      return {menu:!!m, hasDel:hasDel, n0:n0, n1:n1};
+    })()`);
+    ck(rcRes && rcRes.menu && rcRes.hasDel && rcRes.n1 === rcRes.n0 - 1,
+       '右键队列条目有「从队列移除」菜单且真的删掉一首', JSON.stringify(rcRes));
+    // 曲目页：每行都有常显「＋」
+    await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='tracks').click()");
+    await waitFor("!!document.querySelector('#list .trow')", 8000);
+    await sleep(400);
+    const trPlus = await evalJs(`(function(){
+      var rows=document.querySelectorAll('#list .trow'), btns=document.querySelectorAll('#list .trow .add-btn');
+      if(!rows.length) return {rows:0};
+      var cs=getComputedStyle(btns[0]);
+      return {rows:rows.length, addBtns:btns.length, opacity:parseFloat(cs.opacity), disp:cs.display};
+    })()`);
+    ck(trPlus && trPlus.rows > 0 && trPlus.addBtns === trPlus.rows && trPlus.opacity > 0.1 && trPlus.disp !== 'none',
+       '曲目页每行都有默认可见的「＋」入队按钮', JSON.stringify(trPlus));
+    if (trPlus && trPlus.addBtns) {
+      const trAdd = await evalJs(`(async()=>{
+        const n0=(await (await fetch('/api/queue')).json()).items.length;
+        document.querySelector('#list .trow .add-btn').click();
+        await new Promise(r=>setTimeout(r,800));
+        const n1=(await (await fetch('/api/queue')).json()).items.length;
+        return {n0:n0,n1:n1};
+      })()`);
+      ck(trAdd && trAdd.n1 === trAdd.n0 + 1, '点曲目行「＋」队列 +1', JSON.stringify(trAdd));
+    }
+    // 单曲页「＋ 加入队列」按钮存在且可见
+    await evalJs("document.getElementById('npOpen').click()");
+    await sleep(500);
+    const npAdd = await evalJs(`(function(){var b=document.getElementById('npAddQ');if(!b)return null;
+      var r=b.getBoundingClientRect(),cs=getComputedStyle(b);
+      return {visible:r.width>0&&r.height>0&&cs.display!=='none'&&cs.visibility!=='hidden', text:b.textContent.trim()};})()`);
+    ck(npAdd && npAdd.visible && npAdd.text.indexOf('加入队列')>=0, '单曲页有默认可见的「＋ 加入队列」按钮', JSON.stringify(npAdd));
+    await evalJs("document.getElementById('npClose').click()");
+    await sleep(300);
+    // ---- 还原用户队列（自检纪律：界面/接口都回到进来时的样子）----
+    const qRestore = await evalJs(`(async()=>{
+      const o = window.__qOrig || {items:[], cues:[]};
+      let okr = true;
+      if (!o.items.length) { await fetch('/api/clear', {method:'POST'}); }
+      else {
+        const lines = o.items.map((f,i)=>{ const c=(o.cues||[])[i]||[-1,-1];
+          return (c && c[0]>=0) ? (f+'\\t'+c[0]+'\\t'+c[1]) : f; }).join('\\n');
+        const r = await fetch('/api/queue/set', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'files='+encodeURIComponent(lines)});
+        const j = await r.json(); okr = !!j.ok;
+      }
+      const q = await (await fetch('/api/queue')).json();
+      return {ok:okr, n:q.items.length, want:o.items.length};
+    })()`);
+    ck(qRestore && qRestore.ok && qRestore.n === qRestore.want, '自检结束后用户队列已还原', JSON.stringify(qRestore));
+  } else {
+    ck(true, '队列回归段跳过（音乐库为空，无法造测试曲目）', JSON.stringify(qSeed));
+  }
   // 设计契约：UI 永不出现外部页面 —— 全页面不允许有任何 http(s) 外链锚点
   ck(await evalJs("document.querySelectorAll('a[href^=http]').length === 0"), '全页面无 http 外链（永不跳转外部页面）');
 

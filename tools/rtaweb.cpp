@@ -4308,7 +4308,13 @@ static constexpr int    kArtistImgSearchMs   = 3000;              // 搜索单�
 static constexpr int    kArtistImgDownloadMs = 3000;              // 下载单跳上限
 static constexpr size_t kArtistImgMinBytes   = 1024;              // 小于它当「没有头像」
 static constexpr long long kArtistImgNegSec  = 7LL * 24 * 3600;   // 负缓存有效期：7 天
-static constexpr int    kArtistImgBgConcurrency = 2;              // 后台同时抓几个（再大也过不了单线程 accept，只是压网络）
+// 2026-10-27（261027-03 #7）：2 → 6。原来的理由「再大也过不了单线程 accept」已过期 ——
+// WebUi 现在是 6 个 worker 并发（webui.h: kMaxWorkers=6）。实测（用户库 127 位艺术家、
+// 冷缓存）：并发 2 时 113 张头像耗时 **313 s**（12:25:39→12:30:52，平均 2.2 s/张），
+// 期间前端只能干等 —— 用户看到的就是「一个头像都没有」。单艺人预算 12 s 不变，
+// 并发 6 后同样的量理论上 ~1/3 墙钟时间；四家源各自的礼节限频（dizzylab 1 req/s、
+// Discogs 25/min）仍在 meta::artwork 内部生效，超限只会记瞬态失败（不写 .none，下次重试）。
+static constexpr int    kArtistImgBgConcurrency = 6;              // 后台同时抓几个（对齐 WebUi 的 6 worker）
 
 static uint64_t artistimg_fnv1a(const std::string& s) {
     uint64_t h = 1469598103934665603ull;      // FNV-1a 64 位
@@ -8832,8 +8838,21 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // 绝不回退到专辑封面（用户 2026-10-25 钦定：「不许再用专辑封面顶替，取不到就留空」）。
     // 位置要求：必须挂在 /api 顶层分支（不能塞进 /api/lib 块里 —— 前缀恰好不冲突也会在重构时静默丢失）。
     if (rq.path.rfind("/api/artist/image", 0) == 0) {
+        // 2026-10-27（261027-03 #7 真根因）：**先按 '&' 切参数，再 urlDecode**。
+        // 旧写法是把 ?name= 之后到行尾整段 urlDecode 进 name ⟹ 前端只要带缓存击穿参数
+        // （artistImgUrl(name, round) 的 "&r=<round>"，用于绕过 Chromium 对 404 的负缓存），
+        // name 就变成 "蔡琴&r=1" → FNV 对不上 → **必然 404**。
+        // 后果（实测）：列表渲染后每 1.8 s 重放一次没命中的图，重放 URL 一定 404，
+        // 于是「预热补进来的新图」永远顶不上来 —— 用户看到的就是「艺术家页一个头像都没有」。
+        // 单条 ?name=蔡琴（不带 r）是 200，所以只看一条 curl 永远复现不出来。
         const size_t q = rq.path.find("?name=");
-        std::string name = (q != std::string::npos) ? urlDecode(rq.path.substr(q + 6)) : std::string();
+        std::string name;
+        if (q != std::string::npos) {
+            std::string raw = rq.path.substr(q + 6);
+            const size_t amp = raw.find('&');        // 先切参数
+            if (amp != std::string::npos) raw = raw.substr(0, amp);
+            name = urlDecode(raw);                   // 再解码（名字里的 %26 仍能进来）
+        }
         auto trim = [](std::string s) {
             size_t b = 0, e = s.size();
             while (b < e && (unsigned char)s[b] <= 0x20) ++b;
@@ -10184,18 +10203,21 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
         {
             std::lock_guard<std::mutex> lk(g_q.mtx);
-            // 如果点的文件已在队列里，就从它开始播；否则把队列换成它。
+            // 如果点的文件已在队列里，就把指针移到它；否则**追加到末尾再播**。
             // CUE 分轨（2026-10-25）：匹配必须带区间 —— 同一路径在一张 cue 专辑里出现 N 次，
             // 只按路径找会永远命中第 1 首（点第 3 轨听到第 1 轨）。
+            // ★ 261027-03 #3 重构（用户：「已经添加的歌曲不能删除」「添加的逻辑跟之前版本严重不同」）：
+            //   旧实现在"这一首不在队列里"时执行 items.clear() —— 于是用户辛苦加进队列的 15 首，
+            //   只要在曲目页点了另外一首就**整列消失**（实测 15 → 1，见 build-q11/shots/baseline-08）。
+            //   队列是用户的劳动成果，"播一首"绝不该销毁它 ⟹ 改成追加到末尾（与「加入队列」同义）。
             const QItem want(p.file, p.cueStart, p.cueEnd);
             bool found = false;
             for (size_t i = 0; i < g_q.items.size(); ++i)
                 if (g_q.items[i].same(want)) { g_q.index = i; found = true; break; }
             if (!found) {
-                g_q.items.clear();
                 g_q.items.push_back(want);
-                g_q.index = 0;
-                g_q.sortBase.clear();     // 队列被换成单曲 ⟹ 排序撤销点作废
+                g_q.index = g_q.items.size() - 1;
+                g_q.sortBase.clear();     // 队列结构变了 ⟹ 排序撤销点作废（与 /api/add 一致）
             }
         }
         // 261027-02 #4：index 变了就落盘 —— 旧实现 /api/play 只改内存 index 不写文件，
@@ -10243,6 +10265,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                         if (g_q.sortBase[i].same(gone)) { g_q.sortBase.erase(g_q.sortBase.begin() + (long long)i); break; }
                     }
                 }
+                // ★ 261027-03 #3：删过歌之后，随机模式的"打乱前原顺序"快照也不再可信
+                //   （它里面还有刚删掉的那一项）⟹ 作废，免得关闭随机时把删掉的歌变回来。
+                if (g_q.shuffle) g_q.base.clear();
                 if (g_q.index > idx && g_q.index > 0) --g_q.index;
                 if (g_q.index >= g_q.items.size()) g_q.index = g_q.items.empty() ? 0 : g_q.items.size() - 1;
             }
@@ -10263,6 +10288,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 QItem v = g_q.items[from];
                 g_q.items.erase(g_q.items.begin() + (long long)from);
                 g_q.items.insert(g_q.items.begin() + (long long)to, v);
+                // ★ 261027-03 #3：用户手动拖动排序 = 对顺序的显式意愿 ⟹ 随机模式的旧快照作废
+                //（否则"开着随机拖了两下，关随机"会把顺序推回打乱前那一版）。
+                if (g_q.shuffle) g_q.base.clear();
             }
             cnt = g_q.items.size();
         }
@@ -10303,7 +10331,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             }
             if (!had) newIndex = g_q.index;
         }
-        if (!had) return "{\"ok\":false,\"error\":\"没有可恢复的排序（队列本来就是默认顺序）\"}";
+        // 261027-03 #3：文案不再用「默认顺序」这个既不是动作、又像一种状态的词 —— 前端按钮叫「↩ 撤销排序」。
+        if (!had) return "{\"ok\":false,\"error\":\"没有可撤销的排序（队列当前就是最后一次手动排的顺序）\"}";
         queue_save();
         return "{\"ok\":true,\"by\":\"default\",\"n\":" + std::to_string(n) +
                ",\"index\":" + std::to_string(newIndex) + "}";
@@ -10359,6 +10388,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 const QItem cur = (g_q.index < g_q.items.size()) ? g_q.items[g_q.index] : QItem();
                 if (g_q.sortBase.empty()) g_q.sortBase = g_q.items;   // 撤销点 = 排序前的顺序
                 g_q.items = std::move(want);
+                // ★ 261027-03 #3：随机播放模式另存一份"打乱前的原顺序"（g_q.base），
+                //   退出随机时会用它整列还原。用户手动重排（排序/拖拽/删除）之后那份快照就**过期**了
+                //   —— 旧实现不清理，于是"随机开→按标题排序→关随机"会把用户刚排好的顺序
+                //   一把推回「添加顺序」（实测 15/15 项全部跳回，用户感受正是"又出现了一个默认顺序"）。
+                //   规则：显式的手动操作永远优先于隐式快照 ⟹ 作废它（关闭随机时保持当前顺序）。
+                if (g_q.shuffle) g_q.base.clear();
                 newIndex = queue_reindex_locked(cur);
                 n = g_q.items.size();
             }
@@ -11340,12 +11375,14 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         size_t index = 0;
         int repeat = 0;
         bool shuffle = false;
+        bool canUndo = false;      // 261027-03 #3：有没有"撤销排序"的后悔药（前端据此决定是否显示按钮）
         {
             std::lock_guard<std::mutex> lk(g_q.mtx);
             items = g_q.items;
             index = g_q.index;
             repeat = g_q.repeat;
             shuffle = g_q.shuffle;
+            canUndo = !g_q.sortBase.empty();
         }
         std::map<std::string, rta::net::LibTrack> meta;
         if (wantMeta && !items.empty()) {
@@ -11367,7 +11404,11 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
           << ",\"repeat\":" << repeat
           // #2：repeat 就是四态播放模式（0关/1列表/2单曲/3随机），别名 mode 让前端只读一个字段
           << ",\"mode\":" << repeat
-          << ",\"shuffle\":" << (shuffle ? "true" : "false") << ",\"items\":[";
+          << ",\"shuffle\":" << (shuffle ? "true" : "false")
+          // canUndo（261027-03 #3）：队列页的「↩ 撤销排序」只在真有快照时才出现 ——
+          // 旧版把一个永远都在的「默认顺序」选项摆在最上面，选了却回
+          // "没有可恢复的排序"，用户读到的就是"冒出来一个默认顺序"。
+          << ",\"canUndo\":" << (canUndo ? "true" : "false") << ",\"items\":[";
         for (size_t i = 0; i < items.size(); ++i) {
             if (i) j << ",";
             j << "\"" << jesc(items[i].path) << "\"";
@@ -12969,22 +13010,74 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // 只读文件、不开任何音频设备。
     if (rq.path.rfind("/api/health", 0) == 0) {
         ct = "application/json; charset=utf-8";
+        // 2026-10-27（261027-03 #9，两个真根因都在这几行）：
+        //  ① 参数切分顺序错了：旧版是「整段 urlDecode → 再按 & 截断」，可是路径里的 & 属于
+        //     文件名本身（本机实测 584 个音频文件里 581 个的路径含 &，例如
+        //     MUSIC\专辑-原创&同人\…）。解码后再截断 ⟹ 路径被砍成半截 ⟹ 一律返回
+        //     "无法打开文件: D:\...\专辑-原创"。也就是说「分析音质」对 99.5% 的库内文件
+        //     直接失败，不只是入口难找。现在改成：先按 & 切出键值对，只对值做 urlDecode。
+        //  ② 结果没有缓存：同一首每次点都要重跑（实测 282 s 的 6 声道 FLAC 单次 2.3 s）。
+        //     这里加一层进程内缓存，key = 路径 + 大小 + mtime（+ whole 标志）；
+        //     fresh=1 可强制重算；命中直接返回并带 "cached":true。
         std::string file;
-        bool whole = false;
-        const size_t q = rq.path.find("?file=");
-        if (q != std::string::npos) {
-            file = urlDecode(rq.path.substr(q + 6));
-            const size_t amp = file.find('&');       // 后面可能还有 &whole=1
-            if (amp != std::string::npos) file = file.substr(0, amp);
+        bool whole = false, fresh = false;
+        {
+            const size_t q = rq.path.find('?');
+            if (q != std::string::npos) {
+                const std::string qs = rq.path.substr(q + 1);
+                size_t p = 0;
+                while (p <= qs.size()) {
+                    size_t e = qs.find('&', p);
+                    if (e == std::string::npos) e = qs.size();
+                    const std::string kv = qs.substr(p, e - p);
+                    const size_t eq = kv.find('=');
+                    if (eq != std::string::npos) {
+                        const std::string k = kv.substr(0, eq);
+                        const std::string v = urlDecode(kv.substr(eq + 1));
+                        if (k == "file") file = v;
+                        else if (k == "whole") whole = (v == "1" || v == "true");
+                        else if (k == "fresh") fresh = (v == "1" || v == "true");
+                    }
+                    if (e >= qs.size()) break;
+                    p = e + 1;
+                }
+            }
         }
-        if (rq.path.find("whole=1") != std::string::npos) whole = true;
         if (file.empty()) return std::string("{\"ok\":false,\"error\":\"缺少 file 参数\"}");
         if (!valid_utf8(file)) return utf8_path_reject(file);
+        // —— 结果缓存（同一文件不重复跑）——
+        // 只存 health 段的 JSON，命中时再拼外壳，避免字符串替换把 JSON 弄坏。
+        struct HealthCacheItem { std::string key; std::string health; };
+        static std::mutex                  hcMx;
+        static std::deque<HealthCacheItem> hcQ;
+        static const size_t                kHcMax = 64;
+        std::string key = file;
+        {
+            std::error_code ec, ec2;
+            const auto sz = fs::file_size(fs::u8path(file), ec);
+            const auto mt = fs::last_write_time(fs::u8path(file), ec2);
+            if (!ec) key += "|" + std::to_string((unsigned long long)sz);
+            if (!ec2) key += "|" + std::to_string((long long)mt.time_since_epoch().count());
+            key += whole ? "|w" : "|s";
+        }
+        if (!fresh) {
+            std::lock_guard<std::mutex> lk(hcMx);
+            for (const auto& it : hcQ) {
+                if (it.key != key) continue;
+                return std::string("{\"ok\":true,\"cached\":true,\"health\":") + it.health + "}";
+            }
+        }
         rta::analysis::TrackHealth h = whole
             ? rta::analysis::analyze_file_whole(file)
             : rta::analysis::analyze_file(file, rta::analysis::HealthStreamOptions{});
+        const std::string healthJson = rta::analysis::track_health_json(h);
+        if (h.status == "ready") {          // 只缓存成功结果（失败可能只是当前打不开）
+            std::lock_guard<std::mutex> lk(hcMx);
+            hcQ.push_back(HealthCacheItem{ key, healthJson });
+            if (hcQ.size() > kHcMax) hcQ.pop_front();
+        }
         return std::string("{\"ok\":") + (h.status == "ready" ? "true" : "false") +
-               ",\"health\":" + rta::analysis::track_health_json(h) + "}";
+               ",\"cached\":false,\"health\":" + healthJson + "}";
     }
 
     // ---------------- 版本对比（B3 version_compare.h）----------------
@@ -13057,6 +13150,14 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
               << ",\"lagSec\":" << v.lagSec
               << ",\"envCorr\":" << v.envCorr
               << ",\"analyzed\":" << (v.analyzed ? "true" : "false")
+              // 第 8 维（2026-10-27）：有效带宽 / 有损转码。数值全部来自信号本身
+              // （长期平均谱的陡沿截止），与容器位深/码率无关；UI 用它标「有损转码（截止 x kHz）」
+              << ",\"cutoffHz\":" << v.spectralCutoffHz
+              << ",\"bandwidthHz\":" << rta::analysis::vcdetail::effective_bandwidth(v)
+              << ",\"cutoffConfidence\":" << v.cutoffConfidence
+              << ",\"cutoffDetected\":" << (v.cutoffDetected ? "true" : "false")
+              << ",\"lossySuspected\":" << (v.lossySuspected ? "true" : "false")
+              << ",\"cutoffReason\":\"" << jesc(v.cutoffReason) << "\""
               << ",\"score\":" << (i < vc.scores.size() ? vc.scores[i] : 0.0)
               << ",\"rank\":" << [&] {
                      for (size_t r = 0; r < vc.ranking.size(); ++r) if (vc.ranking[r] == i) return (int)r + 1;
@@ -13077,6 +13178,21 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
               << ",\"bestIndex\":" << (unsigned long long)row.bestIndex
               << ",\"values\":[";
             for (size_t k = 0; k < row.values.size(); ++k) { if (k) j << ","; j << row.values[k]; }
+            j << "]}";
+        }
+        // 各评分维度的扣分与折算分（0..100）：让「分数怎么来的」在界面上可核对，
+        // 而不是给一个黑箱数字。penalty=1 表示该维度满罚。
+        j << "],\"dims\":[";
+        for (size_t di = 0; di < vc.dims.size(); ++di) {
+            const auto& d = vc.dims[di];
+            if (di) j << ",";
+            j << "{\"key\":\"" << jesc(d.key) << "\""
+              << ",\"label\":\"" << jesc(d.label) << "\""
+              << ",\"weight\":" << d.weight
+              << ",\"penalty\":[";
+            for (size_t i = 0; i < d.penalty.size(); ++i) { if (i) j << ","; j << d.penalty[i]; }
+            j << "],\"dimScore\":[";
+            for (size_t i = 0; i < d.score.size(); ++i) { if (i) j << ","; j << d.score[i]; }
             j << "]}";
         }
         j << "],\"scores\":[";
