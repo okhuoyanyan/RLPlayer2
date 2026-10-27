@@ -382,7 +382,14 @@ RTA_EXPORT void rta_gpu_convolve_destroy(void* h) {
     if (s->dAcc) cudaFree(s->dAcc);
     if (s->dX) cudaFree(s->dX);
     if (s->stream) cudaStreamDestroy(s->stream);
-    if (s->hX) cudaFree(s->hX);        // pinned 主机内存也用 cudaFree 释放
-    if (s->hAcc) cudaFree(s->hAcc);
+    // ★ 2026-10-27 修复：pinned 主机内存必须用 cudaFreeHost 释放。
+    //   这里原来照抄 HIP 的 hipFree（HIP 能同时处理 host/device），而 CUDA 的
+    //   cudaFree 对 cudaHostAlloc 分配的内存是未定义行为——实测后果是：
+    //   第一次 create 正常，destroy 之后**后续 create 永久失败**
+    //   （GpuStreamConvolver 静默降级 CPU，on_gpu=0），表现为
+    //   tools/gpu_stream_check 从第 2 个会话起全部 FAIL、而 ctest 的
+    //   test_gpu_stream 每档只建一次所以恰好绕开。
+    if (s->hX) cudaFreeHost(s->hX);
+    if (s->hAcc) cudaFreeHost(s->hAcc);
     delete s;
 }
