@@ -104,12 +104,23 @@ add_executable(feedback_probe tools/feedback_probe.cpp)
 target_include_directories(feedback_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(feedback_probe PRIVATE winhttp psapi user32 shell32)
 
+# ---------------- 在线更新自检 / 演练（用户 261027-02 #5）----------------
+# 与 rtaweb 共用 src/net/update.h（检查/下载/校验/解压）与 src/net/update_apply.h（保护清单/
+# 脚本生成/回滚台账）—— 单测必须跑同一份代码，不许另写一份"测试专用"实现。
+# winhttp：GitHub release API 与资产下载；ws2_32：演练用的假启动器（只回 /api/ping）。
+add_executable(update_probe tools/update_probe.cpp)
+target_include_directories(update_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(update_probe PRIVATE winhttp ws2_32)
+add_test(NAME update_selftest COMMAND update_probe --selftest)
+
 # ---------------- 桌面启动器（Win32 GUI，双击即用）----------------
 # 产品名：RLPlayer
 add_executable(rta_launcher WIN32 tools/launcher.cpp)
 set_target_properties(rta_launcher PROPERTIES OUTPUT_NAME "RLPlayer")
 # ole32/uuid/mmdevapi:启动横幅只读枚举输出端点(wasapi_out.h);dbghelp:崩溃转储(crash_dump.h)
-target_link_libraries(rta_launcher PRIVATE ws2_32 shell32 user32 ole32 uuid mmdevapi dbghelp)
+# winhttp：261027-02 #5 起启动器要 include src/net/update_apply.h（→ net/update.h → platform/http.h），
+# 在线更新的"落地"就发生在启动器 main() 开头（此刻 rtaweb 还没起来，文件都不被占用）。
+target_link_libraries(rta_launcher PRIVATE ws2_32 shell32 user32 ole32 uuid mmdevapi dbghelp winhttp)
 target_include_directories(rta_launcher PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(rta_launcher PRIVATE UNICODE _UNICODE)
 # 内置 WebView2：官方 SDK 头文件（third_party/webview2/include），运行时用同目录的 WebView2Loader.dll

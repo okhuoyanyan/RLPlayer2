@@ -322,22 +322,37 @@ inline std::string rta_ui_page() {
     // 侧栏
     h += ".side{background:var(--bg2);border-right:1px solid var(--line);padding:10px 8px;overflow:auto;display:flex;flex-direction:column}";
     h += ".side .sp{flex:1;min-height:12px}";
+    // 2026-10-27（261027-02 #3）：左栏是 column flex 容器，条目默认 flex-shrink:1；而 .nav 带
+    // overflow:hidden ⟹ 自动最小尺寸为 0 ⟹ 窗口高度不够时条目会被压扁，且各条压扁程度不同
+    // （实测 876×608 视口：一级行 29.11px、二级行 36px，差 6.89px = 用户说的「各个元素没有统一间隔」）。
+    // 判据：高度不够就让 .side 滚动（它本来就有 overflow:auto），绝不压扁条目。
+    h += ".side>*{flex:none}.sqlist>*{flex:none}";
     h += ".side .nav svg{width:16px;height:16px;flex:none}";
-    h += ".nav{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:9px;color:var(--mut);cursor:pointer;font-weight:500;transition:.13s;white-space:nowrap;overflow:hidden;font-size:12.5px}";
+    // 2026-10-27（261027-02 #3）：行高必须显式写死 —— 旧代码靠行盒默认值（12.5px 字 ⟹ 18.75px），
+    // 与「我的歌单」的二级行（内含 20px 小按钮 ⟹ 行高 20px）天然差 1.25px，用户看到的就是「各元素间隔不统一」。
+    // 现在 .nav 行 = 9+9+18 = 36px，二级行也用 18px 行高 + 18px 小按钮 ⟹ 两者逐像素相等。
+    h += ".nav{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:9px;color:var(--mut);cursor:pointer;font-weight:500;transition:.13s;white-space:nowrap;overflow:hidden;font-size:12.5px;line-height:18px}";
     h += ".nav:hover{background:var(--hov);color:var(--txt)}";
     h += ".nav.on{background:var(--nav-on);color:var(--nav-on-text)}";
-    h += ".nav svg{flex:none}.sec{margin:16px 12px 6px;font-size:10px;letter-spacing:1.2px;color:var(--mut2);font-weight:600}";
+    // 2026-10-27（261027-02 #3，用户「播放、我的歌单两个对齐，这一列各个元素没有统一间隔」）：
+    // 「播放」区标题（.sec）与「我的歌单」标题（.sqhd）**共用同一套盒模型**，标题左边缘/行高/
+    // 到第一项的间距因此逐像素一致。旧账：.sec 是 margin 12px + 无 padding，.sqhd 是 padding-left 22px、
+    // 下边距 2px、字距 .6px ⟹ 标题左边缘差 10px、标题到首项间距差 4px、行高也不同。
+    h += ".nav svg{flex:none}.sec,.sqlist .sqhd{margin:16px 12px 6px;padding:0;font-size:10px;letter-spacing:1.2px;color:var(--mut2);font-weight:600;line-height:1.2}";
     // 保存的队列（261026-08 #6）：缩进的二级条目，悬停露出「改名 / 删除」两个小按钮
     h += ".sqlist{display:flex;flex-direction:column}";
-    h += ".sqlist .sqhd{padding:6px 12px 2px 22px;font-size:10px;letter-spacing:.6px;color:var(--mut2)}";
-    h += ".sqlist .sqrow{padding:6px 8px 6px 22px;font-size:12px;gap:6px}";
+    // 2026-10-27（261027-02 #3）：.sqhd 的样式已并入上面的 ".sec,.sqlist .sqhd" 组合选择器 ——
+    // 两个区块标题必须同一套数字，写两处必然再次漂移（本轮就是这么坏的）。这里不再单独覆盖。
+    // #3：二级条目的左内边距 38px = 12px(.nav 内边距) + 16px(图标) + 10px(.nav gap)，
+    // 与「播放」区带图标的 .nav 条目**文字左边缘对齐**（预留同样的图标槽）；行高对齐 .nav 的 36px。
+    h += ".sqlist .sqrow{padding:9px 8px 9px 38px;font-size:12px;line-height:18px;gap:6px;min-height:36px}";
     h += ".sqlist .sqn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
-    h += ".sqlist .sqb{width:20px;height:20px;border-radius:5px;display:grid;place-items:center;font-size:12px;line-height:1;color:var(--mut2);flex:none;opacity:0;transition:.12s}";
+    h += ".sqlist .sqb{width:20px;height:18px;border-radius:5px;display:grid;place-items:center;font-size:12px;line-height:1;color:var(--mut2);flex:none;opacity:0;transition:.12s}";
     h += ".sqlist .sqrow:hover .sqb{opacity:1}";
     h += ".sqlist .sqb:hover{background:var(--hov2);color:var(--txt)}";
     h += ".sqlist .sqb.del:hover{color:var(--danger)}";
     // #2（261026-09）：「我的歌单」空态提示（左栏二级条目区里的一行灰字）
-    h += ".sqlist .sqempty{padding:4px 12px 2px 22px;font-size:10.5px;color:var(--mut2);line-height:1.5}";
+    h += ".sqlist .sqempty{padding:6px 8px 2px 38px;font-size:10.5px;color:var(--mut2);line-height:1.5}";
     // #1（261026-09）我的最爱：顶部一行行为提示 + 单击选中态（双击才是播放整列）
     h += ".favhint{padding:8px 20px 2px;font-size:11.5px;color:var(--mut2);line-height:1.6}";
     h += ".favhint b{color:var(--txt2);font-weight:600}";
@@ -897,8 +912,16 @@ h += "#npPage .npedge{display:none}";
     h += ".preset-card-head{display:flex;align-items:center;justify-content:space-between;padding:11px 16px;border-bottom:1px solid var(--line);background:var(--bg3)}";
     h += ".preset-card-title{font-size:13px;font-weight:650;color:var(--txt);display:flex;align-items:center;gap:8px}";
     h += ".preset-caps-line{font-size:12px;color:var(--txt2);padding:9px 16px;border-bottom:1px solid var(--line);background:var(--field);display:flex;align-items:center;gap:6px}";
-    h += ".preset-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:14px 16px}";
-    h += "@media (max-width:920px){.preset-grid{grid-template-columns:1fr}}";
+    // 2026-10-27（261027-02 #2，用户「4 个预设一行就行，不要分两行」）：
+    // 旧规则是 repeat(3) ⟹ 第 4 张卡必然掉到第二行。改成 4 列，只有窗口真的窄了才换行。
+    // 断点反推（实测）：设置页内容宽 ≈ 视口 - 212(左栏) - 48(#setpage 内边距) - 32(卡片内边距)，
+    // 单卡宽 = (内容宽 - 3×12) / 4。要让单卡 ≥ 200px（标题「原音直通（bit-perfect）」约 150px +
+    // 左右内边距 28px 不挤），需要内容宽 ≥ 836 ⟹ 视口 ≥ 1096；实测视口 1076 时单卡只有 176px
+    // （副标题换到 4 行、明显挤），所以断点定在 1140px：视口 ≥1141 一行 4 个（单卡 ≥206px），
+    // 更窄才降成 2×2 / 单列。
+    h += ".preset-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;padding:14px 16px}";
+    h += "@media (max-width:1140px){.preset-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}";
+    h += "@media (max-width:720px){.preset-grid{grid-template-columns:1fr}}";
     h += ".preset-btn{display:flex;flex-direction:column;align-items:flex-start;text-align:left;padding:12px 14px;border-radius:10px;border:1px solid var(--line);background:var(--field);color:var(--txt);cursor:pointer;transition:all .15s ease;min-height:76px;width:100%}";
     h += ".preset-btn:hover{border-color:var(--acc);background:var(--hov);transform:translateY(-1px);box-shadow:0 3px 12px var(--shadow)}";
     h += ".preset-btn:active{transform:translateY(0)}";

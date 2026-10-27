@@ -5296,9 +5296,11 @@ function renderSettingsPage() {
      + '<button class=stab data-g=meta>元数据</button>'
      // 2026-10-24（用户 261024-01 #5）：「流媒体」从「高级」拆出来的独立页签。
      + '<button class=stab data-g=stream>流媒体</button>'
+     // 关于与更新（261027-02 #5）：当前版本 / 检查 / 增量下载 / 重启完成。
      // 「诊断」独立成页：用户 2026-10-22 功能3 明确要求不要塞在元数据里。
      // 开发期它是必需品（报错时要拿现场），所以与输入/输出/PCM/SDM/高级 平级。
      + '<button class=stab data-g=diag>诊断</button>'
+     + '<button class=stab data-g=upd>关于与更新</button>'
      + '</div>';
 
   // ---------- 输出 ----------
@@ -5606,15 +5608,11 @@ function renderSettingsPage() {
   // 三份文件；另外这个选项放在元数据这里明显不合适，单独出来做选项卡吧，
   // 我们还在开发，报错是必不可少的。」
   // 2026-10-24（用户 261024-01 #7）：包内清单从页面正文挪进 (?) 提示，页面只留一句话 + 两个按钮。
+  // 2026-10-27（261027-02 #1）：用户要求**删除「导出诊断包」这一栏**，功能合并进下面的一键反馈。
+  // 原话：「设置-诊断，导致诊断包，这一栏删除，功能合并到下面一键反馈，点击"提交反馈"自动发送诊断包到我的GITHUB上」
+  // ⟹ 诊断包内容（版本/系统/CPU/GPU/设备/设置/日志尾）本来就由 feedback.h 自动采集并脱敏后随反馈一起上传，
+  //   所以这里不再单独给「导出 zip / 只要 JSON」两个按钮；后端 /api/diagzip 与 /api/diag 端点保留（CLI 与排障仍可用）。
   h += '<div class=spane data-g=diag>'
-     + sgroup('导出诊断包', '一个文件，不用再到处找日志',
-         '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
-       + '<button class="btn pri" id=sp_diagzip>导出诊断包（.zip）</button>'
-       + '<button class=btn id=sp_diagjson>只要 JSON</button>'
-       + tip('包内：rlplayer-diag.json（版本 / 系统 / CPU / GPU / 端口）、rlplayer-playback.log（含 .1/.2 轮转）、launcher.log、dumps-manifest.txt、settings-summary.txt；' +
-             'api_key / token / password 一律脱敏为 ***，rlplayer-llm.conf 本体不会被打进包。')
-       + '<span style="font-size:11.5px;color:var(--mut2);margin-left:2px" id=sp_diagmsg></span></div>'
-       + '<div class=hint>一个 zip 打包全部日志 / 系统信息 / 设置摘要（已脱敏），不用再到处找日志文件</div>')
      // 2026-10-27（261027-01 #1）：诊断页从「导出诊断包」升级成「一键反馈」。
      // 用户原话：报错要能直接发给我们 —— 不用再让他自己找日志、贴日志。
      // 表单只收「人才能提供」的四项（类型 / 标题 / 正文 / 复现步骤），其余（版本 / 系统 / CPU /
@@ -5636,6 +5634,39 @@ function renderSettingsPage() {
        + '<div class=hint id=sp_fbresult style="white-space:pre-wrap;word-break:break-all"></div>')
      + '</div>';
 
+  // ---------- 关于与更新（261027-02 #5）----------
+  // 用户原话：「主要是有个在线更新功能，未来我们WIN版本更新，也需要这个」+「尽量做成增量更新」。
+  // 本页只做四件事：说清当前版本 / 检查 / 增量下载 / 重启完成。
+  // ★ 必须明确写「更新不会动你的数据」——这是用户最可能的顾虑，且清单与后端受保护清单同源。
+  h += '<div class=spane data-g=upd>'
+     + sgroup('版本', '增量更新：只下 sha256 与本机不一致的文件',
+         '<div class="sfld wide" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
+       + '<div style="font-size:19px;font-weight:600;letter-spacing:.4px">v<span id=sp_updcur>—</span></div>'
+       + '<button class="btn pri" id=sp_updcheck>检查更新</button>'
+       + '<span style="font-size:12px;color:var(--mut2)" id=sp_updstate>点「检查更新」看看有没有新版本</span>'
+       + '</div>'
+       + '<div class="sfld wide hint" style="margin-top:8px;line-height:1.6">'
+       + '更新只替换<b>程序文件</b>（RLPlayer.exe / rtaweb.exe / rtagpu*.dll / tools / 其余代码资产），'
+       + '每个文件都校验 sha256。下面这些<b>一个字节都不会改</b>：'
+       + 'rlplayer-settings.conf · rlplayer-library.conf · rlplayer-llm.conf · rlplayer-feedback.conf · '
+       + 'rlplayer-queue.txt · rlplayer-savedqueues.conf · rlplayer-favs.json · data\\（库索引/封面缓存/房间校正集） · '
+       + 'covercache\\ · WebView2Runtime\\ · playlists\\。'
+       + '</div>'
+       + '<div class="sfld wide" id=sp_updcard style="display:none;margin-top:14px">'
+       + '<div class=meta-card>'
+       + '<div class=mh>新版本 <b id=sp_updver>—</b><span style="font-weight:400;color:var(--mut2);font-size:11.5px" id=sp_updsize></span></div>'
+       + '<div class=hint id=sp_updplan style="margin-top:4px"></div>'
+       + '<div class=hint id=sp_updnotes style="white-space:pre-wrap;max-height:170px;overflow:auto;margin-top:6px"></div>'
+       + '<div class=hint id=sp_updfiles style="margin-top:6px;font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre-wrap;max-height:120px;overflow:auto"></div>'
+       + '<div style="margin-top:10px;height:6px;border-radius:4px;background:var(--line);overflow:hidden;display:none" id=sp_updbarwrap>'
+       + '<div id=sp_updbar style="height:100%;width:0%;background:var(--acc);transition:width .25s"></div></div>'
+       + '<div class=hint id=sp_updmsg style="margin-top:8px"></div>'
+       + '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">'
+       + '<button class="btn pri" id=sp_upddl>下载更新</button>'
+       + '<button class=btn id=sp_updapply style="display:none">立即更新并重启</button>'
+       + '<button class=btn id=sp_updskip style="font-size:12px">跳过此版本</button>'
+       + '</div></div></div>')
+     + '</div>';
   // ---------- 元数据补全（排在「高级」之后）----------
   // P1.5：源开关不再硬编码 —— #sp_metasrc 占位容器由 fillMetaProviders 按
   // /api/providers 动态填充（注册表驱动，后端新增数据源前端零改动）。
@@ -5865,11 +5896,12 @@ function renderSettingsPage() {
     D('sp_llmkey').addEventListener('keydown', function (ev) { if (ev.key === 'Enter') llmSave(); });
   }
   llmRefresh();
-  // 诊断页签的两个按钮（2026-10-22 功能3：从元数据迁出 + 改为一个 ZIP）
-  if (D('sp_diagzip')) D('sp_diagzip').onclick = exportDiagZip;
-  if (D('sp_diagjson')) D('sp_diagjson').onclick = exportDiag;
+  // 2026-10-27（261027-02 #1）：「导出诊断包」那一栏已按用户要求删除，按钮随之不存在。
+  // exportDiagZip / exportDiag 两个函数仍保留（未来若要在别处挂入口可直接复用），这里不再绑定。
   // 一键反馈（261027-01 #1）：提交按钮 + 回车即交（在标题框里按 Enter 不提交空表单）
   if (D('sp_fbsubmit')) D('sp_fbsubmit').onclick = fbSubmit;
+  // 关于与更新（261027-02 #5）：按钮 + 初始状态（进入设置页就把当前版本刷出来）
+  updBind();
   if (D('sp_fbtitle')) D('sp_fbtitle').addEventListener('keydown', function (ev) {
     if (ev.key === 'Enter') { ev.preventDefault(); fbSubmit(); }
   });
@@ -7473,6 +7505,195 @@ function renderCompare(r) {
 }
 
 // ============================================================================
+// 关于与更新（261027-02 #5；后端 = src/net/update.h + src/net/update_apply.h）
+// ----------------------------------------------------------------------------
+// 端点契约：
+//   GET  /api/update/check?force=1   **异步**：立刻回 {checking:true}，本页每 700 ms 轮询同一 URL
+//   GET  /api/update/progress        下载进度（phase/downloaded/total/pct/speed/error）
+//   GET  /api/update/state           当前版本 / 跳过版本 / 暂存 / 台账（上次更新结果）
+//   POST /api/update/download        增量下载：只下 sha256 与本机不一致的文件
+//   POST /api/update/apply           写台账 + 让程序退出；**重新打开 RLPlayer 才换文件**
+//   POST /api/update/skip            {"version":"1.6.0"}；空串 = 取消跳过
+// 为什么检查必须异步：后端 WebUi 是单线程 accept，一次清单往返最长 8 s，
+//   同步做会把整个界面（含 /api/status、/api/ping）一起排住。
+// 为什么 apply 之后要重启：rtaweb.exe 与 dll 正被本进程映射，运行中无法覆盖自己；
+//   真正的替换发生在下次启动器启动、rtaweb 还没起来的那一刻（见 update_apply.h 头注）。
+// ============================================================================
+var UPD = { phase: 'idle', applyArm: false };
+
+function updNum(n) {
+  if (!n || n <= 0) return '—';
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+function updSet(id, text) { var e = D(id); if (e) e.textContent = text; }
+
+function updShowCheck(j) {
+  if (!j) j = {};
+  if (j.current) updSet('sp_updcur', j.current);
+  var card = D('sp_updcard');
+  if (!j.ok) {
+    if (card) card.style.display = 'none';
+    updSet('sp_updstate', '检查失败：' + (j.error || j.checkError || '未知原因'));
+    return;
+  }
+  if (!j.hasUpdate) {
+    if (card) card.style.display = 'none';
+    updSet('sp_updstate', j.upToDate ? ('已是最新版本 v' + (j.latest || j.current)) : ('当前 v' + j.current));
+    return;
+  }
+  if (card) card.style.display = '';
+  updSet('sp_updver', 'v' + j.latest);
+  var plan = '增量：需下载 ' + (j.filesToDownload | 0) + ' 个文件 / ' + (j.downloadText || '—') +
+             '，跳过 ' + (j.filesUnchanged | 0) + ' 个 / ' + (j.skippedText || '—');
+  if (j.fullBytes > 0) plan += '；全量包 ' + updNum(j.fullBytes);
+  updSet('sp_updplan', plan);
+  updSet('sp_updsize', j.publishedAt ? ('　发布 ' + j.publishedAt) : '');
+  updSet('sp_updnotes', j.notes || '（这次没有写更新说明）');
+  var list = j.files || [], fl = '', i;
+  for (i = 0; i < list.length && i < 12; i++) fl += '+ ' + list[i].path + '  ' + updNum(list[i].size) + '\n';
+  if (list.length > 12) fl += '… 还有 ' + (list.length - 12) + ' 个\n';
+  updSet('sp_updfiles', fl);
+  var dl = D('sp_upddl');
+  if (dl) { dl.style.display = ''; dl.disabled = (j.filesToDownload | 0) === 0; dl.textContent = '下载更新'; }
+  var sk = D('sp_updskip'); if (sk) sk.style.display = '';
+  updSet('sp_updstate', '发现新版本 v' + j.latest);
+}
+
+function updPollCheck() {
+  api('/api/update/check').then(function (j) {
+    var btn = D('sp_updcheck');
+    if (j && j.checking) { setTimeout(updPollCheck, 700); return; }
+    if (btn) btn.disabled = false;
+    updShowCheck(j || {});
+  }).catch(function () { var b = D('sp_updcheck'); if (b) b.disabled = false; });
+}
+
+function updCheck() {
+  updSet('sp_updstate', '正在检查…（最长 8 秒）');
+  var btn = D('sp_updcheck'); if (btn) btn.disabled = true;
+  api('/api/update/check?force=1').then(function (j) {
+    if (j && j.checking) { setTimeout(updPollCheck, 700); return; }
+    if (btn) btn.disabled = false;
+    updShowCheck(j || {});
+  }).catch(function (e) {
+    if (btn) btn.disabled = false;
+    updSet('sp_updstate', '检查失败：' + (e && e.message ? e.message : e));
+  });
+}
+
+function updPollProgress() {
+  api('/api/update/progress').then(function (p) {
+    if (!p) { setTimeout(updPollProgress, 900); return; }
+    var bar = D('sp_updbar');
+    if (bar) bar.style.width = (p.pct || 0) + '%';
+    if (p.phase === 'error') {
+      updSet('sp_updmsg', '下载失败：' + (p.error || '未知原因'));
+      var b = D('sp_upddl'); if (b) { b.disabled = false; b.style.display = ''; }
+      return;
+    }
+    if (p.phase === 'ready' || p.canApply) {
+      if (bar) bar.style.width = '100%';
+      updSet('sp_updmsg', '已就绪：' + (p.files | 0) + ' 个文件已逐个校验 sha256 并解压到暂存区。点「立即更新并重启」生效。');
+      var ap = D('sp_updapply'); if (ap) ap.style.display = '';
+      var dl = D('sp_upddl'); if (dl) { dl.disabled = false; dl.style.display = 'none'; }
+      return;
+    }
+    var label = { downloading: '下载中', verifying: '校验 sha256…', extracting: '解压中…',
+                  'downloading-one-by-one': '逐文件补下…', 'downloading-full': '回落到全量包…',
+                  checking: '检查中…' }[p.phase] || p.phase;
+    updSet('sp_updmsg', label + '  ' + (p.pct || 0) + '%   ' + updNum(p.downloaded) + ' / ' +
+                        updNum(p.total) + '   ' + (p.speedText || ''));
+    setTimeout(updPollProgress, 500);
+  }).catch(function () { setTimeout(updPollProgress, 900); });
+}
+
+function updDownload() {
+  var btn = D('sp_upddl'); if (btn) btn.disabled = true;
+  var barwrap = D('sp_updbarwrap'); if (barwrap) barwrap.style.display = '';
+  updSet('sp_updmsg', '正在下载…');
+  api('/api/update/download', '').then(function (j) {
+    if (!j || !j.ok) {
+      updSet('sp_updmsg', '下载没能开始：' + ((j && j.error) || '未知原因'));
+      if (btn) btn.disabled = false;
+      return;
+    }
+    updPollProgress();
+  }).catch(function (e) {
+    updSet('sp_updmsg', '下载没能开始：' + (e && e.message ? e.message : e));
+    if (btn) btn.disabled = false;
+  });
+}
+
+function updApply() {
+  var btn = D('sp_updapply');
+  if (!UPD.applyArm) {
+    UPD.applyArm = true;
+    if (btn) btn.textContent = '再点一次：更新并退出';
+    updSet('sp_updmsg', '点击后程序会退出；重新打开 RLPlayer 就会用上新版本。设置 / 库 / 歌单 / 收藏 / 封面缓存都不会动。');
+    setTimeout(function () { UPD.applyArm = false; if (btn && !btn.disabled) btn.textContent = '立即更新并重启'; }, 6000);
+    return;
+  }
+  UPD.applyArm = false;
+  if (btn) { btn.disabled = true; btn.textContent = '正在退出…'; }
+  api('/api/update/apply', '').then(function (j) {
+    if (!j || !j.ok) {
+      updSet('sp_updmsg', '没能开始更新：' + ((j && j.error) || '未知原因'));
+      if (btn) { btn.disabled = false; btn.textContent = '立即更新并重启'; }
+      return;
+    }
+    updSet('sp_updmsg', '程序正在退出…重新打开 RLPlayer 即完成更新（v' + j.version + '）。');
+    toast('程序即将退出，重新打开即完成更新');
+  }).catch(function (e) {
+    updSet('sp_updmsg', '没能开始更新：' + (e && e.message ? e.message : e));
+    if (btn) { btn.disabled = false; btn.textContent = '立即更新并重启'; }
+  });
+}
+
+function updSkip() {
+  var v = ((D('sp_updver') || {}).textContent || '').replace(/^v/, '');
+  if (!v || v === '—') { toast('先检查更新'); return; }
+  api('/api/update/skip', JSON.stringify({ version: v })).then(function () {
+    var card = D('sp_updcard'); if (card) card.style.display = 'none';
+    updSet('sp_updstate', '已跳过 v' + v + '（删掉 rlplayer-update.conf 里的 skip= 可恢复提示）');
+    toast('已跳过 v' + v);
+  }).catch(function () { toast('跳过失败'); });
+}
+
+function updBind() {
+  if (D('sp_updcheck')) D('sp_updcheck').onclick = updCheck;
+  if (D('sp_upddl')) D('sp_upddl').onclick = updDownload;
+  if (D('sp_updapply')) D('sp_updapply').onclick = updApply;
+  if (D('sp_updskip')) D('sp_updskip').onclick = updSkip;
+  // 进页面先把当前版本与上次更新结果刷出来（不发网络）
+  api('/api/update/state').then(function (s) {
+    if (!s) return;
+    if (s.current) updSet('sp_updcur', s.current);
+    if (s.pendingPhase === 'rolled_back') {
+      updSet('sp_updstate', '上次更新失败已自动回滚：' + (s.pendingDetail || ''));
+    } else if (s.pendingPhase === 'apply_failed') {
+      updSet('sp_updstate', '上次替换失败已回滚：' + (s.pendingDetail || ''));
+    } else if (s.pendingPhase === 'ready') {
+      updSet('sp_updstate', '有已下载但还没生效的更新（v' + (s.pendingVersion || '') + '），重启后生效');
+    }
+    if (s.staged) {
+      var card = D('sp_updcard'); if (card) card.style.display = '';
+      var ap = D('sp_updapply'); if (ap) ap.style.display = '';
+      var dl = D('sp_upddl'); if (dl) dl.style.display = 'none';
+      updSet('sp_updver', 'v' + s.stagedVersion);
+      updSet('sp_updstate', '已下好 v' + s.stagedVersion + ' 的更新包，点「立即更新并重启」生效');
+    }
+  }).catch(function () {});
+  // 缓存里的检查结果（5 分钟）—— 没有就顺手起一次后台检查
+  api('/api/update/check').then(function (j) {
+    if (j && j.checked && !j.checking) updShowCheck(j);
+    else if (j && j.checking) setTimeout(updPollCheck, 700);
+  }).catch(function () {});
+}
+
+
+// ============================================================================
 // 一键反馈（261027-01 #1；后端 = src/net/feedback.h，端点 = POST /api/feedback）
 // ----------------------------------------------------------------------------
 // 为什么不用 api()/apiRaw()：那两个帮手把超时写死 8 s，而后端的反馈总预算是 14 s
@@ -7761,15 +7982,87 @@ document.addEventListener('keydown', function (e) {
   else if (e.key === 'i') showChain();
 });
 
+/* ---------------- 队列排序（261027-02 #4） ----------------
+   用户原话：「播放队列本来有的那些排序功能呢？」—— 曲目页有排序下拉，队列页只有拖拽。
+   现在队列页右上角也有同一个下拉（复用曲目页的 .track-sort 视觉，不新造控件）。
+
+   三条必须守住的规矩（判据就是这三条）：
+   ① **只换顺序，不换曲**：排序在前端算完，把目标顺序整列交给 POST /api/qorder，
+      由后端把 index **重新定位到"当前播的那一首"**（QItem::same，含 CUE 区间）。
+      前端绝不自己改 index —— 那正是"排序一次跳一首歌"的根源。
+   ② **可撤销**：「默认顺序」不是前端猜一个"原始顺序"，而是让后端把**第一次排序前的快照**
+      整列还原（POST /api/qsort?by=default）。队列可能是用户精心排的，必须有后悔药；
+      快照存在后端 ⟹ 刷新页面/重开窗口之后也还能撤销。
+   ③ 排序结果**落回后端 items**（与拖拽排序一致），否则会出现"看到的是 A 顺序、播的是 B 顺序"。
+
+   为什么排序在前端算：标题/艺术家必须走 localeCompare('zh') 才是音序（拼音），
+   后端没有 ICU，用字节序会把中文按码点排开，用户一眼就看出"乱序"。 */
+function queueItemLine(items, cues, i) {
+  var f = items[i] || '';
+  var c = cues[i] || [-1, -1];
+  return (c && c[0] >= 0) ? (f + '\t' + c[0] + '\t' + c[1]) : f;
+}
+function applyQueueSort(by) {
+  if (!by) return;
+  if (by === 'default') {
+    api('/api/qsort?by=default', '').then(function (j) {
+      if (j && j.ok === false) { toast(j.error || '没有可恢复的排序'); S.queueSort = ''; renderQueuePage(); return; }
+      S.queueSort = '';
+      toast('已恢复默认顺序');
+      renderQueuePage(); loadQ();
+    }).catch(function () { renderQueuePage(); });
+    return;
+  }
+  // ★ 排序前**现取**一份带元数据的队列，绝不依赖 S.q.metas：
+  //   3 秒轮询的 loadQ() 会用不带 metas 的那份覆盖 S.q，此时所有排序键都是空串/0，
+  //   排序会**静默变成 no-op**（本轮实测踩到：连续点标题/艺术家/时长，顺序纹丝不动）。
+  api('/api/queue?meta=1').then(function (q) {
+    var items = q.items || [], cues = q.cues || [], metas = q.metas || [];
+    var n = items.length;
+    if (!n) { toast('队列是空的'); return; }
+    var idx = [];
+    for (var i = 0; i < n; i++) idx.push(i);
+    function meta(i) { return metas[i] || {}; }
+    function txt(i, k) { return String(meta(i)[k] || ''); }
+    if (by === 'title') {
+      idx.sort(function (a, b) { return txt(a, 't').localeCompare(txt(b, 't'), 'zh'); });
+    } else if (by === 'artist') {
+      idx.sort(function (a, b) { return txt(a, 'a').localeCompare(txt(b, 'a'), 'zh'); });
+    } else if (by === 'album') {
+      idx.sort(function (a, b) { return txt(a, 'al').localeCompare(txt(b, 'al'), 'zh'); });
+    } else if (by === 'dur') {
+      idx.sort(function (a, b) { return (+meta(a).d || 0) - (+meta(b).d || 0); });
+    } else if (by === 'year') {
+      idx.sort(function (a, b) { return (+meta(b).y || 0) - (+meta(a).y || 0); });
+    } else if (by === 'shuffle') {
+      // 一次性洗牌：**只重排队列**，不改「播放模式=随机」那个持续状态（两者语义不同，绝不联动）
+      for (var k = n - 1; k > 0; k--) {
+        var r = Math.floor(Math.random() * (k + 1));
+        var t = idx[k]; idx[k] = idx[r]; idx[r] = t;
+      }
+    } else if (by === 'reverse') {
+      idx.reverse();
+    }
+    var lines = idx.map(function (i) { return queueItemLine(items, cues, i); });
+    return api('/api/qorder', 'files=' + encodeURIComponent(lines.join('\n'))).then(function (j) {
+      if (j && j.ok === false) { toast(j.error || '排序失败'); renderQueuePage(); return; }
+      S.queueSort = by;
+      renderQueuePage(); loadQ();
+    });
+  }).catch(function () { renderQueuePage(); });
+}
+
 /* ---------------- 播放队列（主视图） ---------------- */
 function renderQueuePage() {
   S.view = 'queue';
   // 2026-10-23（自检暴露）：标题原来只在 /api/queue 回来后才写 → 本地接口虽快，但慢的时候
   // 会出现"已经在队列页、标题还是上一页"的空窗。先同步写标题，再等数据补数量/按钮。
   head('播放队列', '', '');
-  api('/api/queue').then(function (j) {
+  // meta=1（261027-02 #4）：多要一份与 items 逐项对齐的 metas（标题/艺术家/专辑/时长/年份），
+  // 排序下拉才有东西可排。普通 3 秒轮询仍走不带 meta 的 /api/queue（零额外开销）。
+  api('/api/queue?meta=1').then(function (j) {
     if (S.view !== 'queue') return;   // 已切走 → 丢弃，别覆写当前页面
-    S.q = { items: j.items || [], index: j.index || 0 };
+    S.q = { items: j.items || [], cues: j.cues || [], metas: j.metas || [], index: j.index || 0 };
     var n = S.q.items.length;
     // #2（261026-09）：用户「从播放队列那里直接保存为歌单即可」⟹ 队列页顶部提供
     // 「保存为歌单」（写入 rlplayer-savedqueues.conf，含顺序与 CUE 区间，重启后仍在）。
@@ -7780,7 +8073,23 @@ function renderQueuePage() {
       D('list').innerHTML = '<div class=empty>队列是空的<br><span style="font-size:11.5px">把文件拖进窗口，或右键专辑/曲目「加入队列」</span></div>';
       return;
     }
-    var h = '<div class=qlist2>';
+    // 261027-02 #4：排序下拉放在列表右上角（与曲目页同一套 .track-sort 视觉/同一批选项）。
+    // 注意「默认顺序」= 撤销排序（后端快照），不是"重新猜一个顺序"；没有快照时后端回 ok:false，
+    // 这里弹 toast 说明原因，绝不假装排过。
+    var qs = S.queueSort || 'default';
+    var h = '<div class="qsortbar" style="display:flex;justify-content:flex-end;align-items:center;padding:10px 20px 4px;gap:8px">' +
+            '<span style="font-size:12px;color:var(--mut2)">排序：</span>' +
+            '<select id=qSort class="track-sort sort-select" title="只改变队列顺序，不改变正在播放的那一首">' +
+            '<option value=default' + (qs === 'default' ? ' selected' : '') + '>默认顺序</option>' +
+            '<option value=title' + (qs === 'title' ? ' selected' : '') + '>标题</option>' +
+            '<option value=artist' + (qs === 'artist' ? ' selected' : '') + '>艺术家</option>' +
+            '<option value=album' + (qs === 'album' ? ' selected' : '') + '>专辑</option>' +
+            '<option value=dur' + (qs === 'dur' ? ' selected' : '') + '>时长</option>' +
+            '<option value=year' + (qs === 'year' ? ' selected' : '') + '>年份</option>' +
+            '<option value=shuffle' + (qs === 'shuffle' ? ' selected' : '') + '>随机打乱</option>' +
+            '<option value=reverse' + (qs === 'reverse' ? ' selected' : '') + '>反转顺序</option>' +
+            '</select></div>';
+    h += '<div class=qlist2>';
     S.q.items.forEach(function (f, i) {
       h += '<div class="qrow' + (i === S.q.index ? ' on' : '') + '" data-i=' + i + ' draggable=true>' +
            '<span class=qn>' + (i + 1) + '</span>' +
@@ -7807,6 +8116,7 @@ function renderQueuePage() {
         api('/api/qdel?i=' + i, '').then(function () { toast('已移除'); renderQueuePage(); loadQ(); });
       };
     });
+    if (D('qSort')) D('qSort').onchange = function () { applyQueueSort(this.value); };
     if (D('qSaveSq')) D('qSaveSq').onclick = function () { saveQueueDialog(); };
     if (D('qClrAll')) D('qClrAll').onclick = function () {
       api('/api/clear', '').then(function () { toast('队列已清空'); renderQueuePage(); loadQ(); });

@@ -149,7 +149,8 @@ inline HttpResult http_request(const HttpRequest& req) {
         if (req.onChunk) {
             try { req.onChunk(reinterpret_cast<const char*>(buf.data()), (size_t)got); } catch (...) {}
         }
-        r.body.insert(r.body.end(), buf.begin(), buf.begin() + got);
+        // discardBody：调用方只要流（见 platform/http.h 的注释），别再把 372 MB 攒一份到内存
+        if (!req.discardBody) r.body.insert(r.body.end(), buf.begin(), buf.begin() + got);
     }
 
     ::WinHttpCloseHandle(hreq);

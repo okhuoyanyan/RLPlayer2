@@ -128,6 +128,37 @@ async function gotoFiles() {
   ck(await evalJs("!document.querySelector('#list .empty')"), '主内容区没有落到空状态');
   const p1 = await shot('01-albums');
 
+  // ---- 261027-02 #3：左栏「播放」区与「我的歌单」区必须是同一套间距 ----
+  // 用户原话：「主界面，播放、我的歌单两个对齐，现在这一行各个元素没有完全统一间隔」。
+  // 旧账：.sec 是 margin-left 12px + 无 padding、下边距 6px；.sqhd 是 padding-left 22px、下边距 2px、
+  // 行高也不同 ⟹ 标题左边缘差 10px、标题到首项间距差 4px、二级行比一级行高 2.75px。
+  // 判据（用户给的）：标题文字左边缘 x 差 ≤1px、标题到各自第一项间距差 ≤1px、行高一致。
+  await waitFor("!!document.querySelector('.side .sqhd')", 6000);
+  const sideAlign = await evalJs(`(function(){
+    function R(e){var r=e.getBoundingClientRect();return {x:+r.left.toFixed(2),y:+r.top.toFixed(2),h:+r.height.toFixed(2),b:+r.bottom.toFixed(2)};}
+    var side=document.querySelector('.side');
+    var play=Array.prototype.slice.call(side.querySelectorAll('.sec')).filter(function(e){return e.textContent.trim()==='播放';})[0];
+    var sqhd=side.querySelector('.sqhd');
+    if(!play||!sqhd) return {ok:false,why:'缺少「播放」标题或「我的歌单」标题'};
+    var nav=play.nextElementSibling, sq=sqhd.nextElementSibling;
+    if(!nav||!sq) return {ok:false,why:'缺少首项'};
+    var cp=R(play), cs=R(sqhd), cn=R(nav), cq=R(sq);
+    var sp=getComputedStyle(play), ss=getComputedStyle(sqhd);
+    var isRow=sq.classList.contains('sqrow');
+    return {ok:true, isRow:isRow,
+      leftDiff:+(cs.x-cp.x).toFixed(2),
+      gapPlay:+(cn.y-cp.b).toFixed(2), gapSq:+(cq.y-cs.b).toFixed(2),
+      gapDiff:+((cq.y-cs.b)-(cn.y-cp.b)).toFixed(2),
+      titleH:[cp.h,cs.h], titleHdiff:+Math.abs(cp.h-cs.h).toFixed(2),
+      lineHeight:[sp.lineHeight,ss.lineHeight], fontSize:[sp.fontSize,ss.fontSize],
+      rowH:[cn.h,cq.h], rowHdiff:isRow?+Math.abs(cn.h-cq.h).toFixed(2):null};
+  })()`);
+  ck(sideAlign && sideAlign.ok && Math.abs(sideAlign.leftDiff)<=1 && Math.abs(sideAlign.gapDiff)<=1 &&
+     sideAlign.titleHdiff<=1 && sideAlign.lineHeight[0]===sideAlign.lineHeight[1] &&
+     sideAlign.fontSize[0]===sideAlign.fontSize[1] && (sideAlign.isRow ? sideAlign.rowHdiff<=1 : true),
+     '左栏「播放」与「我的歌单」标题左边缘/行高/标题→首项间距一致（差 ≤1px）', JSON.stringify(sideAlign));
+  await shot('27-sidebar-align', true);
+
   // ---- 验收 1：左导航两项都已移走 ----
   // 2026-10-23 用户 261023-04 #2/#9：EQ 与房间校正 → 设置页「EQ」页签；古典作品 → 单曲页「作品」tab。
   const navOk = await evalJs(`(function(){
@@ -333,6 +364,28 @@ async function gotoFiles() {
   // 2026-10-27（用户 261026-09 #6）：EQ 页拆成「EQ」+「声音校准」，声音校准紧跟 EQ。
   ck(tabOrder === '输入/输出/PCM/SDM/高级/EQ/声音校准/元数据/流媒体/诊断',
      '设置页签顺序为 输入/输出/PCM/SDM/高级/EQ/声音校准/元数据/流媒体/诊断', tabOrder);
+
+  // ---- 261027-02 #2：设置-输出-官方推荐设置 的 4 个预设必须并排一行 ----
+  // 用户原话：「4 个预设一行就行，不要分两行」。旧 CSS 是 repeat(3) ⟹ 第 4 张必然掉到第二行。
+  // 判据：4 个 .preset-btn 的 top 只有一个值（=同一行）、left 严格递增；并记录每张卡的 x/y/w/h。
+  await evalJs("document.querySelector('.stab[data-g=out]').click()");
+  ck(await waitFor("!!document.getElementById('presetCard')", 8000), '设置-输出 页能打开「官方推荐预设」卡片');
+  await sleep(200);
+  const preGeom = await evalJs(`(function(){
+    var grid=document.querySelector('#presetCard .preset-grid'); if(!grid) return {ok:false,why:'没有 .preset-grid'};
+    var bs=Array.prototype.slice.call(grid.querySelectorAll('.preset-btn'));
+    var rs=bs.map(function(b){var r=b.getBoundingClientRect();
+      return {id:b.id,x:+r.left.toFixed(2),y:+r.top.toFixed(2),w:+r.width.toFixed(2),h:+r.height.toFixed(2)};});
+    var tops={}, lefts=[];
+    rs.forEach(function(r){ tops[Math.round(r.y)]=1; lefts.push(r.x); });
+    var inc=lefts.every(function(v,i){ return i===0||v>lefts[i-1]; });
+    return {ok:true,n:rs.length,rows:Object.keys(tops).length,inc:inc,
+            cols:getComputedStyle(grid).gridTemplateColumns, items:rs};
+  })()`);
+  ck(preGeom && preGeom.ok && preGeom.n===4 && preGeom.rows===1 && preGeom.inc,
+     '官方推荐设置的 4 个预设在同一行（top 相同、left 递增）',
+     JSON.stringify(preGeom && {rows:preGeom.rows, inc:preGeom.inc, cols:preGeom.cols, items:preGeom.items}));
+  await shot('26-presets-row', true);
 
   // ---- 2026-10-24 用户 261024-01 #5/#6/#8/#12 的界面契约（全部只读，不改任何设置）----
   // #5 密码框样式：旧 CSS 选择器只列了 text/number，password 落到浏览器默认样式（方角/无内边距/
@@ -599,16 +652,20 @@ async function gotoFiles() {
      '设置页有独立的「诊断」页签');
   ck(await evalJs("(function(){var p=document.querySelector('#setpage .spane[data-g=diag]');return !!p && p.dataset.g==='diag';})()"),
      '「诊断」是独立分页（.spane[data-g=diag]），不是塞在别的页里');
-  ck(await evalJs("(function(){var m=document.querySelector('#setpage .spane[data-g=meta]');return m ? !m.contains(document.getElementById('sp_diagzip')) : false;})()"),
-     '诊断导出按钮不在元数据分组里（已移出）');
+  // 2026-10-27（261027-02 #1）：该按钮已整体删除，原断言（它不在元数据分组）失去意义 → 改为断言它不存在。
+  ck(await evalJs("!document.getElementById('sp_diagzip')"),
+     '诊断导出按钮已不存在（元数据页与诊断页都没有，已并入一键反馈）');
   ck(await evalJs("!document.getElementById('sp_diag')"), '旧的单一 JSON「导出诊断信息」按钮已移除（sp_diag 不存在）');
   await evalJs("document.querySelector('.stab[data-g=diag]').click()");
   ck(await waitFor("document.querySelector('#setpage .spane[data-g=diag]') && document.querySelector('#setpage .spane[data-g=diag]').classList.contains('on')", 5000),
      '诊断页签能切过去');
-  ck(await evalJs("!!document.getElementById('sp_diagzip') && !!document.getElementById('sp_diagzip').onclick && document.getElementById('sp_diagzip').textContent.indexOf('zip') >= 0"),
-     '「导出诊断包（.zip）」按钮存在且已绑定');
-  ck(await evalJs("!!document.getElementById('sp_diagjson') && document.getElementById('sp_diagjson').onclick"),
-     '「只要 JSON」按钮保留（有人只想贴文本）');
+  // 2026-10-27（261027-02 #1）：用户要求删除「导出诊断包」这一栏，功能合并进「一键反馈」。
+  // 原话：「设置-诊断，导致诊断包，这一栏删除，功能合并到下面一键反馈，点击"提交反馈"自动发送诊断包到我的GITHUB上」
+  // ⟹ 旧断言要求 sp_diagzip / sp_diagjson 存在，现在应当**反过来断言它们不存在**，且一键反馈表单齐全。
+  ck(await evalJs("!document.getElementById('sp_diagzip') && !document.getElementById('sp_diagjson')"),
+     '「导出诊断包 / 只要 JSON」两个按钮已按用户要求移除（功能并入一键反馈）');
+  ck(await evalJs("!!document.getElementById('sp_fbsubmit') && !!document.getElementById('sp_fbsubmit').onclick && !!document.getElementById('sp_fbtitle') && !!document.getElementById('sp_fbbody')"),
+     '一键反馈表单（类型/标题/正文/复现步骤/提交按钮）齐全且已绑定');
   ck(await evalJs("document.querySelectorAll('#setpage .spane[data-g=diag] a[href^=http]').length === 0"),
      '诊断页无外链');
   // 端点必须真的返回 ZIP（PK\3\4）。只看文案会被"接口挂了但按钮还在"骗过。
@@ -870,7 +927,7 @@ async function gotoFiles() {
       //  P1.5：元数据源开关是动态的（/api/providers 注册表）—— 在静态清单之外逐源补查
       //  P2：标签写回的预览/执行按钮也是要点了有反应的
       // 2026-10-24 #5：旧的单服务器表单 srcSave 已删除，改为流媒体页的多服务器控件。
-      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_diagzip','sp_diagjson','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_instart','sp_instop','sp_inmon','sp_cast_scan','sp_cast_push','sp_cast_stop','sp_cast_dev','sp_src_add','sp_src_save','sp_src_cancel','sp_src_testform'];
+      var needBind=['bStop','bNext','bPrev','bPause','qclr','tq','sRep','sShuf','vol','sLoud','seek','bScan','bAddRoot','bRescan','bUpnp','bNet','bHelp','bLyric','bChain','sp_directsdm','sp_dsdkind','sp_dsdconv','sp_metaon','sp_metallm','sp_wbdry','sp_wbapply','sp_llmsave','sp_llmtest','sp_llmclear','npRep','npVol','sp_instart','sp_instop','sp_inmon','sp_cast_scan','sp_cast_push','sp_cast_stop','sp_cast_dev','sp_src_add','sp_src_save','sp_src_cancel','sp_src_testform'];
       (META_PROVIDERS || []).forEach(function (p) { needBind.push('sp_meta_' + p.id); });
       var valueOnly=['sRate','sFilt','sFiltNx','sShap','sBuf','sDSD','sIsp','s2s'];
       var miss=[];

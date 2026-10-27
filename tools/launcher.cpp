@@ -1504,6 +1504,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// 261027-02 #5：在线更新的「落地」这一半在启动器里做。
+// 为什么是启动器：更新必须替换 rtaweb.exe / dll / 它自己，而**正在运行的文件不能覆盖**；
+// 启动器启动的那一刻，rtaweb 还没起来，全部文件都不被占用 —— 这是唯一的干净时机，
+// 也正是用户说的「重启一下就能完成」。实现见 src/net/update_apply.h。
+#include "net/update_apply.h"
+
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     // ★ 必须在任何窗口/WebView2 创建之前：决定进程的 DPI 感知级别。
     // 漏了它，Windows 会把整个窗口按 96 DPI 位图拉伸（界面发糊，见 enable_high_dpi 的注）。
@@ -1540,6 +1546,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         started = true;
         break;
     }
+    // ★ 261027-02 #5：把上一次暂存的更新落地 —— **必须在 rtaweb 起来之前**。
+    // 只有"没有别的实例在跑"时才做：否则我们会去改一个正在被别的进程映射的 rtaweb.exe
+    // （改名虽然允许，但那个实例会继续跑旧代码，界面与文件对不上）。
+    if (!started) {
+        const std::string upd = rta::update::apply_pending_on_startup();
+        if (!upd.empty()) logf(L"%s", utf8_to_wide(upd).c_str());
+    }
+
     if (!started) logf(L"未发现已有实例，开始启动服务");
 
     // 选一个空闲端口并启动服务
@@ -1557,6 +1571,26 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         }
         logf(L"  port %d started=%d", p, (int)started);
         if (!started && g_child) { TerminateProcess(g_child, 0); CloseHandle(g_child); g_child = nullptr; }
+    }
+
+    // ★ 261027-02 #5：新版本起不来 ⟹ 立刻按台账回滚，再试一次。
+    // 回滚判据不靠"感觉"：5 秒窗口内 rtaweb 没监听端口（或子进程提前退出）就算失败。
+    if (!started) {
+        const std::string rb = rta::update::rollback_pending("新版本启动失败（rtaweb 未在 5 秒内监听端口）");
+        if (!rb.empty()) {
+            logf(L"%s", utf8_to_wide(rb).c_str());
+            for (int p = kDefaultPort; p < kDefaultPort + 12 && !started; ++p) {
+                if (port_open(p)) continue;
+                if (!spawn_server(p)) break;
+                for (int i = 0; i < 100; ++i) {
+                    Sleep(50);
+                    if (port_open(p)) { g_port = p; started = true; break; }
+                    if (g_child && WaitForSingleObject(g_child, 0) == WAIT_OBJECT_0) break;
+                }
+                if (!started && g_child) { TerminateProcess(g_child, 0); CloseHandle(g_child); g_child = nullptr; }
+            }
+            if (started) logf(L"回滚完成：旧版本已起在端口 %d", g_port);
+        }
     }
 
     if (!started) {

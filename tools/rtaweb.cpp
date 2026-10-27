@@ -24,6 +24,8 @@
 #include "net/http_client.h"       // /api/artist/image 打网易云音乐搜索 + 下载头像(2026-10-25)
 #include "net/json.h"              // /api/lib/cover/prefetch 解析网易 type=10 专辑搜索响应(2026-10-26)
 #include "net/feedback.h"          // 一键反馈（261027-01 #1）：诊断快照 + 用户手打文字 → 一个 JSON → 上传仓库
+#include "net/update.h"             // 在线更新（261027-02 #5）：清单检查 / 增量计划 / 下载 / 校验
+#include "net/update_apply.h"       // 替换与回滚台账（真正换文件在启动器启动那一刻做）
 #include "analysis/track_health.h"  // 曲目体检（含 quality 19 项）：/api/health 的数据源
 #include "analysis/version_compare.h"  // 版本对比（B3）：/api/compare 的数据源
 using rta::net::Library;
@@ -4212,22 +4214,17 @@ struct QueueState {
     int    repeat = 0;
     bool   shuffle = false; // 派生量：== (repeat==3)。落盘仍写 shuffle= 行以兼容旧队列文件
     std::vector<QItem> base;   // 随机前的原始顺序（关掉随机时还原）
+    // 261027-02 #4「队列排序」：**排序**前的原始顺序（"恢复默认顺序"用它）。
+    // 为什么不复用上面的 base：base 是"播放模式=随机"那份真相的一部分，两者一旦共用，
+    // 关随机会顺手把用户的排序撤销掉（反之亦然）。两件事各留一个快照，互不干扰。
+    std::vector<QItem> sortBase;
 };
 static QueueState g_q;
 // ---- 队列持久化：重启后仍保留播放列表 ----
-static std::string queue_file() {
-    wchar_t buf[MAX_PATH];
-    GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    std::wstring d(buf);
-    const size_t s = d.find_last_of(L"\\/");
-    if (s != std::wstring::npos) d = d.substr(0, s);
-    d += L"\\rlplayer-playlist.txt";
-    const int n = WideCharToMultiByte(CP_UTF8, 0, d.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string o((size_t)n, 0);
-    WideCharToMultiByte(CP_UTF8, 0, d.c_str(), -1, o.data(), n, nullptr, nullptr);
-    if (!o.empty() && o.back() == 0) o.pop_back();
-    return o;
-}
+// 位置 = exe 同目录 rlplayer-playlist.txt（项目里所有配置都这个规矩）。
+// path_in_exe_dir 定义在下面几百行的「最近播放」区块里，这里先声明，免得把那一整块挪上来。
+static std::string path_in_exe_dir(const char* name);
+static std::string queue_file() { return path_in_exe_dir("rlplayer-playlist.txt"); }
 
 // ---- 最近播放（落盘，最多 200 条，写的时候就把标题/艺术家记下来，
 //      这样列表视图不用为了显示去翻音乐库）----
@@ -7153,58 +7150,171 @@ static void recent_add(const std::string& file, const std::string& title,
     for (auto& l : out) f << l << "\n";
 }
 
-static void queue_save() {
-    std::lock_guard<std::mutex> lk(g_q.mtx);
-    std::ofstream f(queue_file(), std::ios::trunc);
-    if (!f) return;
-    f << "# RLPlayer playlist v1\n";
-    f << "index=" << g_q.index << "\n";
-    f << "repeat=" << g_q.repeat << "\n";
-    f << "shuffle=" << (g_q.shuffle ? 1 : 0) << "\n";
-    // 队列项落盘格式：item=<路径>，CUE 分轨项再跟两个 TAB 分隔的秒数（cs/ce）。
-    // 普通曲目**逐字节与旧格式相同** ⟹ 老队列文件照旧可读（读侧只在有 TAB 时才当 cue 解析）。
-    for (const auto& it : g_q.items) {
-        f << "item=" << it.path;
-        if (it.isCue()) {
-            char cb[80];
-            std::snprintf(cb, sizeof(cb), "\t%.6f\t%.6f", it.cs, it.ce);
-            f << cb;
+// ---- 队列持久化（261027-02 #4 重做）----
+// 落盘位置：exe 同目录 rlplayer-playlist.txt。
+// 旧实现三个坑，合起来就是用户看到的「队列怎么是空的」：
+//   1) ofstream(trunc) 直接写正式文件：写到一半进程被杀/崩溃 ⟹ 文件半截甚至 0 字节，重启即空队列；
+//   2) 队列文件跟着**安装目录**走：1.5.7 与 1.5.9 各自一个文件夹，升级后新目录没有这个文件，
+//      老队列留在老目录里没人读（实测：dist\RLPlayer-1.5.7-win64 有 1534 字节，1.5.9 目录一个都没有）；
+//   3) 读失败静默 return，日志里一个字都没有 ⟹ 事后分不清"从没写"还是"读不到"。
+// 现在的行为：tmp+rename 原子写；本目录没有队列时从兄弟安装目录（RLPlayer-*）取最新的那份导入；
+//             路径 / 条数 / 来源一律记 QUEUE 日志。
+static QItem item_from_line(const std::string& rest);   // 定义在后面（与具名保存队列共用同一套解析）
+
+// 原子写：先写 <文件>.tmp，再 rename 覆盖正式文件。
+// rename 失败（目标被占用 / 跨卷）才退回整份重写 —— 宁可这一次非原子，也不让队列丢掉。
+static bool queue_write_file(const std::string& dst, const std::vector<QItem>& items,
+                             size_t index, int repeat, bool shuffle) {
+    const std::string tmp = dst + ".tmp";
+    {
+        std::ofstream f(fs::u8path(tmp), std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        f << "# RLPlayer playlist v1\n";
+        f << "index=" << index << "\n";
+        f << "repeat=" << repeat << "\n";
+        f << "shuffle=" << (shuffle ? 1 : 0) << "\n";
+        // 队列项落盘格式：item=<路径>，CUE 分轨项再跟两个 TAB 分隔的秒数（cs/ce）。
+        // 普通曲目**逐字节与旧格式相同** ⟹ 老队列文件照旧可读（读侧只在有 TAB 时才当 cue 解析）。
+        for (const auto& it : items) {
+            f << "item=" << it.path;
+            if (it.isCue()) {
+                char cb[80];
+                std::snprintf(cb, sizeof(cb), "\t%.6f\t%.6f", it.cs, it.ce);
+                f << cb;
+            }
+            f << "\n";
         }
-        f << "\n";
+        f.flush();
+        if (!f) return false;
+    }
+    std::error_code ec;
+    fs::rename(fs::u8path(tmp), fs::u8path(dst), ec);
+    if (!ec) return true;
+    fs::remove(fs::u8path(tmp), ec);
+    std::ofstream f(fs::u8path(dst), std::ios::binary | std::ios::trunc);
+    return (bool)f;
+}
+
+// 读一个队列文件；解析规则与旧格式**逐字节兼容**（item=<路径>[TAB cs TAB ce]）。
+static bool queue_read_file(const std::string& path, std::vector<QItem>& items,
+                            size_t& index, int& repeat, bool& shuffle) {
+    std::ifstream f(fs::u8path(path), std::ios::binary);
+    if (!f) return false;
+    items.clear();
+    index = 0;
+    repeat = 0;
+    shuffle = false;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("index=", 0) == 0) index = (size_t)atoi(line.c_str() + 6);
+        else if (line.rfind("repeat=", 0) == 0) repeat = atoi(line.c_str() + 7);
+        else if (line.rfind("shuffle=", 0) == 0) shuffle = (atoi(line.c_str() + 8) != 0);
+        else if (line.rfind("item=", 0) == 0) items.push_back(item_from_line(line.substr(5)));
+    }
+    if (index >= items.size()) index = 0;
+    // 兼容旧落盘（2026-10-26）：老版本写的是 repeat(0..2) + 独立 shuffle。
+    //   shuffle=1 的老队列一律读成四态里的"随机"（3），否则会出现"随机开着但图标说关闭"。
+    if (repeat == 3) shuffle = true;
+    else if (shuffle) repeat = 3;
+    return true;
+}
+
+// 兄弟安装目录里的队列 —— 「升级后队列空了」的唯一来源。
+// 只认名字以 "RLPlayer-" 开头的兄弟目录：build-*/ 与其它测试目录里的队列绝不能被当成用户的播放列表。
+static std::string queue_find_sibling(const std::string& selfPath) {
+    std::error_code ec;
+    const fs::path self = fs::u8path(selfPath);
+    const fs::path dir = self.parent_path();
+    const fs::path parent = dir.parent_path();
+    if (dir.empty() || parent.empty()) return {};
+    fs::file_time_type bestT{};
+    std::string best;
+    for (fs::directory_iterator it(parent, fs::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        std::error_code e0;
+        if (!it->is_directory(e0) || e0) continue;
+        if (it->path() == dir) continue;
+        const std::string name = pathToUtf8(it->path().filename());
+        if (name.rfind("RLPlayer-", 0) != 0) continue;
+        const fs::path cand = it->path() / fs::u8path("rlplayer-playlist.txt");
+        std::error_code e1;
+        if (!fs::is_regular_file(cand, e1) || e1) continue;
+        std::error_code e2;
+        const auto t = fs::last_write_time(cand, e2);
+        if (e2) continue;
+        if (best.empty() || t > bestT) { bestT = t; best = pathToUtf8(cand); }
+    }
+    return best;
+}
+
+// 串行化落盘：tmp 文件名是固定的（rlplayer-playlist.txt.tmp），
+// 请求线程与播放线程同时保存会互相踩成半截文件 —— 队列宁可晚写一次，也不能写坏。
+static std::mutex g_qsaveMu;
+static void queue_save() {
+    const std::string path = queue_file();
+    std::vector<QItem> items;
+    size_t index = 0;
+    int repeat = 0;
+    bool shuffle = false;
+    {
+        std::lock_guard<std::mutex> lk(g_q.mtx);
+        items = g_q.items;
+        index = g_q.index;
+        repeat = g_q.repeat;
+        shuffle = g_q.shuffle;
+    }   // 出锁再落盘：写文件是几十毫秒级 IO，不能让持锁的播放线程陪着等
+    std::lock_guard<std::mutex> sl(g_qsaveMu);
+    const bool ok = queue_write_file(path, items, index, repeat, shuffle);
+    static bool loggedFirst = false;     // 第一次成功保存记一行路径，事后能直接看出"写去哪了"
+    if (!ok) play_log("QUEUE save FAIL path=" + path + " n=" + std::to_string(items.size()));
+    else if (!loggedFirst) {
+        loggedFirst = true;
+        play_log("QUEUE save path=" + path + " n=" + std::to_string(items.size()));
     }
 }
 
 static void queue_load() {
-    std::ifstream f(queue_file());
-    if (!f) return;
-    std::lock_guard<std::mutex> lk(g_q.mtx);
-    std::string line;
-    g_q.items.clear();
-    while (std::getline(f, line)) {
-        if (line.rfind("index=", 0) == 0) g_q.index = (size_t)atoi(line.c_str() + 6);
-        else if (line.rfind("repeat=", 0) == 0) g_q.repeat = atoi(line.c_str() + 7);
-        else if (line.rfind("shuffle=", 0) == 0) g_q.shuffle = (atoi(line.c_str() + 8) != 0);
-        else if (line.rfind("item=", 0) == 0) {
-            // item=<路径>[	<cs>	<ce>]：没有 TAB = 普通曲目（旧格式）
-            const std::string rest = line.substr(5);
-            const size_t t1 = rest.find('\t');
-            if (t1 == std::string::npos) {
-                g_q.items.emplace_back(rest);
-            } else {
-                QItem it;
-                it.path = rest.substr(0, t1);
-                const size_t t2 = rest.find('\t', t1 + 1);
-                it.cs = std::atof(rest.c_str() + t1 + 1);
-                if (t2 != std::string::npos) it.ce = std::atof(rest.c_str() + t2 + 1);
-                g_q.items.push_back(std::move(it));
+    const std::string path = queue_file();
+    std::vector<QItem> items;
+    size_t index = 0;
+    int repeat = 0;
+    bool shuffle = false;
+    bool got = queue_read_file(path, items, index, repeat, shuffle) && !items.empty();
+    std::string from = path;
+    if (!got) {
+        const std::string sib = queue_find_sibling(path);
+        if (!sib.empty()) {
+            std::vector<QItem> si;
+            size_t sidx = 0;
+            int srep = 0;
+            bool ssh = false;
+            if (queue_read_file(sib, si, sidx, srep, ssh) && !si.empty()) {
+                items = std::move(si);
+                index = sidx;
+                repeat = srep;
+                shuffle = ssh;
+                from = sib;
+                got = true;
+                play_log("QUEUE migrate from=" + sib + " n=" + std::to_string(items.size()));
             }
         }
     }
-    if (g_q.index >= g_q.items.size()) g_q.index = 0;
-    // 兼容旧落盘（2026-10-26）：老版本写的是 repeat(0..2) + 独立 shuffle。
-    //   shuffle=1 的老队列一律读成四态里的"随机"（3），否则会出现"随机开着但图标说关闭"。
-    if (g_q.repeat == 3) g_q.shuffle = true;
-    else if (g_q.shuffle) g_q.repeat = 3;
+    const size_t n = items.size();
+    {
+        std::lock_guard<std::mutex> lk(g_q.mtx);
+        g_q.items = std::move(items);
+        g_q.index = index;
+        g_q.repeat = repeat;
+        g_q.shuffle = shuffle;
+        g_q.base.clear();
+        g_q.sortBase.clear();
+        if (g_q.index >= g_q.items.size()) g_q.index = 0;
+    }
+    play_log(std::string("QUEUE load ") + (got ? "ok" : "miss") + " path=" + from +
+             " n=" + std::to_string(n) + " index=" + std::to_string(index));
+    // 从兄弟目录导入的，立刻在本目录落一份：下次启动就读自己的，不再依赖老目录还在不在。
+    if (got && from != path) queue_save();
 }
 
 // ---- 队列项的一行文本 → QItem（queue_load 与具名保存队列共用同一套解析规则）----
@@ -7252,6 +7362,19 @@ static void apply_play_mode_locked(int mode) {
             if (g_q.items[i].same(cur)) { g_q.index = i; break; }
     }
     if (g_q.index >= g_q.items.size()) g_q.index = g_q.items.empty() ? 0 : g_q.items.size() - 1;
+}
+
+// 把 index 重新定位到"重排前正在播的那一项"。**调用方必须持有 g_q.mtx**。
+// 为什么不能记下标：重排后下标全变，记下标就等于"排序一次换一首歌"。
+// 为什么不能只记路径：一张 CUE 里同一路径有 N 项（只有区间能区分），只按路径会永远落到第 1 轨。
+static size_t queue_reindex_locked(const QItem& cur) {
+    if (!cur.path.empty()) {
+        for (size_t i = 0; i < g_q.items.size(); ++i) {
+            if (g_q.items[i].same(cur)) { g_q.index = i; break; }
+        }
+    }
+    if (g_q.index >= g_q.items.size()) g_q.index = g_q.items.empty() ? 0 : g_q.items.size() - 1;
+    return g_q.index;
 }
 
 // ---------------- 具名保存队列（用户 261026-08 #6「保存队列 + 重命名」）----------------
@@ -8364,6 +8487,8 @@ static bool is_side_effect_path(const std::string& p) {
         "/api/buffer/reset", "/api/upload",
         // 261026-08 #2/#5/#6：播放模式（写队列 conf）、整列替换队列、具名保存队列（写 conf）
         "/api/playmode", "/api/queue/set", "/api/sq",
+        // 261027-02 #4：队列排序会重写 items 顺序并落盘（恢复默认顺序同理）⟹ 纯副作用，只接受 POST
+        "/api/qorder", "/api/qsort",
         // 三档预设的 apply 会写 rlplayer-settings.conf（副作用）；caps 是只读查询，不进这张表
         "/api/preset/apply",
         // 艺术家头像预热：会落盘缓存 + 打网络（副作用端点，只接受 POST；GET 端点是 /api/artist/image）
@@ -8385,6 +8510,9 @@ static bool is_side_effect_path(const std::string& p) {
         // 一键反馈（261027-01 #1）：会打网络 + 往仓库写文件 ⟹ 纯副作用，只接受 POST
         //（否则一个 <img src=".../api/feedback?title=..."> 就能替用户提交反馈）
         "/api/feedback",
+        // 在线更新（261027-02 #5）：下载会打网络+落盘；apply 会让程序重启；skip 会写 conf。
+        // 只读端点是 /api/update/check、/api/update/progress、/api/update/state（不进这张表）。
+        "/api/update/download", "/api/update/apply", "/api/update/skip",
     };
     for (const char* k : kNeedPost) {
         const size_t n = std::strlen(k);
@@ -9693,6 +9821,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 g_q.items = std::move(items);
                 g_q.index = idx;
                 g_q.base.clear();
+                g_q.sortBase.clear();   // 整列换掉 ⟹ 上一次排序的撤销点作废（否则"恢复默认"会拉回旧队列）
                 cnt = g_q.items.size();
             }
             queue_save();
@@ -9914,6 +10043,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 g_q.items = items;
                 g_q.index = 0;
                 g_q.base.clear();
+                g_q.sortBase.clear();   // 整列换掉 ⟹ 排序撤销点作废
             }
             queue_save();
             return "{\"ok\":true,\"name\":\"" + jesc(name) + "\",\"count\":" +
@@ -10061,8 +10191,16 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             bool found = false;
             for (size_t i = 0; i < g_q.items.size(); ++i)
                 if (g_q.items[i].same(want)) { g_q.index = i; found = true; break; }
-            if (!found) { g_q.items.clear(); g_q.items.push_back(want); g_q.index = 0; }
+            if (!found) {
+                g_q.items.clear();
+                g_q.items.push_back(want);
+                g_q.index = 0;
+                g_q.sortBase.clear();     // 队列被换成单曲 ⟹ 排序撤销点作废
+            }
         }
+        // 261027-02 #4：index 变了就落盘 —— 旧实现 /api/play 只改内存 index 不写文件，
+        // 重启后 index 会退回上一次"队列结构变化"时的位置（用户感受是"重启后指针乱跳"）。
+        queue_save();
         ps.played.store(0);
         ps.total.store(0);
         // 后端 = UPnP / DLNA：曲目交给投放会话（cast_service），不启动本地播放线程。
@@ -10097,7 +10235,14 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         {
             std::lock_guard<std::mutex> lk(g_q.mtx);
             if (idx < g_q.items.size()) {
+                // 撤销快照同步删掉同一项：否则"恢复默认顺序"会把刚删掉的歌又变回来。
+                const QItem gone = g_q.items[idx];
                 g_q.items.erase(g_q.items.begin() + (long long)idx);
+                if (!g_q.sortBase.empty()) {
+                    for (size_t i = 0; i < g_q.sortBase.size(); ++i) {
+                        if (g_q.sortBase[i].same(gone)) { g_q.sortBase.erase(g_q.sortBase.begin() + (long long)i); break; }
+                    }
+                }
                 if (g_q.index > idx && g_q.index > 0) --g_q.index;
                 if (g_q.index >= g_q.items.size()) g_q.index = g_q.items.empty() ? 0 : g_q.items.size() - 1;
             }
@@ -10123,6 +10268,104 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
         queue_save();
         return "{\"ok\":true,\"count\":" + std::to_string(cnt) + "}";
+    }
+
+    // ---------------- 队列排序（261027-02 #4）----------------
+    // 两个入口，分工明确：
+    //   POST /api/qorder  body: files=<urlencoded>，值为**按目标顺序**排列的多行队列项
+    //                     （每行 <路径>[TAB cs TAB ce]，与 /api/queue/set 同格式）。
+    //                     排序在**前端**算 —— 标题/艺术家必须走 localeCompare('zh') 才是音序，
+    //                     后端没有 ICU，拿字节序排中文等于"按码点乱排"（用户一眼就看出不对）。
+    //   POST /api/qsort?by=default  —— 「恢复默认顺序」：把第一次排序前的快照整列还原。
+    // 三条硬约束（用户 261027-02 #4 明确要求）：
+    //   ① **只换顺序，不换曲**：以"当前播的那一项"为锚（QItem::same，含 CUE 区间），
+    //      排序后重新扫出它的新位置写回 index —— 否则一排序就跳到别一首（随机模式早年踩过这个坑）。
+    //   ② **可撤销**：第一次排序前把原顺序快照进 g_q.sortBase，by=default 整列还原。
+    //      队列可能是用户精心排的 ⟹ 必须有后悔药。
+    //   ③ **落回后端 items**：排序不只是前端显示顺序（拖拽排序本来就改后端），
+    //      两套顺序并存必然出现"看到的和播放的不一致"。
+    if (rq.path.rfind("/api/qsort", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        std::string by = "default";
+        { const size_t q = rq.path.find("?by="); if (q != std::string::npos) by = urlDecode(rq.path.substr(q + 4)); }
+        if (by != "default") return "{\"ok\":false,\"error\":\"未知排序方式（只支持 by=default）\"}";
+        size_t n = 0, newIndex = 0;
+        bool had = false;
+        {
+            std::lock_guard<std::mutex> lk(g_q.mtx);
+            if (!g_q.sortBase.empty()) {
+                const QItem cur = (g_q.index < g_q.items.size()) ? g_q.items[g_q.index] : QItem();
+                g_q.items = g_q.sortBase;
+                g_q.sortBase.clear();
+                newIndex = queue_reindex_locked(cur);   // 还原顺序同样要重新定位"正在播的那首"
+                n = g_q.items.size();
+                had = true;
+            }
+            if (!had) newIndex = g_q.index;
+        }
+        if (!had) return "{\"ok\":false,\"error\":\"没有可恢复的排序（队列本来就是默认顺序）\"}";
+        queue_save();
+        return "{\"ok\":true,\"by\":\"default\",\"n\":" + std::to_string(n) +
+               ",\"index\":" + std::to_string(newIndex) + "}";
+    }
+    if (rq.path.rfind("/api/qorder", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        std::string files;
+        {
+            std::istringstream is(rq.body);
+            std::string tok;
+            while (std::getline(is, tok, '&')) {
+                const size_t e = tok.find('=');
+                if (e == std::string::npos) continue;
+                if (urlDecode(tok.substr(0, e)) == "files") files = urlDecode(tok.substr(e + 1));
+            }
+        }
+        std::vector<QItem> want;
+        {
+            std::istringstream ls(files);
+            std::string line;
+            while (std::getline(ls, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty()) continue;
+                want.push_back(item_from_line(line));
+            }
+        }
+        for (const auto& it : want)
+            if (!valid_utf8(it.path)) return utf8_path_reject(it.path);   // F1
+        std::string err;
+        size_t n = 0, newIndex = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_q.mtx);
+            // 严格校验：条数一致，且每一项都**恰好**能在当前队列里找到一次（多重集相等）。
+            // 为什么必须校验：前端算错/页面过期时若盲目接受，就会**悄悄丢曲目或复制曲目** ——
+            // 队列是用户的劳动成果，宁可这次排序失败（回 ok:false），也不能改坏它。
+            if (want.size() != g_q.items.size()) {
+                err = "顺序与队列条数不一致（" + std::to_string(want.size()) + " vs " +
+                      std::to_string(g_q.items.size()) + "）";
+            } else {
+                std::vector<bool> used(g_q.items.size(), false);
+                for (const auto& w : want) {
+                    bool hit = false;
+                    for (size_t i = 0; i < g_q.items.size(); ++i) {
+                        if (used[i] || !g_q.items[i].same(w)) continue;
+                        used[i] = true;
+                        hit = true;
+                        break;
+                    }
+                    if (!hit) { err = "顺序里出现了队列中没有的曲目"; break; }
+                }
+            }
+            if (err.empty()) {
+                const QItem cur = (g_q.index < g_q.items.size()) ? g_q.items[g_q.index] : QItem();
+                if (g_q.sortBase.empty()) g_q.sortBase = g_q.items;   // 撤销点 = 排序前的顺序
+                g_q.items = std::move(want);
+                newIndex = queue_reindex_locked(cur);
+                n = g_q.items.size();
+            }
+        }
+        if (!err.empty()) return std::string("{\"ok\":false,\"error\":\"") + jesc(err) + "\"}";
+        queue_save();
+        return "{\"ok\":true,\"n\":" + std::to_string(n) + ",\"index\":" + std::to_string(newIndex) + "}";
     }
 
     if (rq.path.rfind("/api/add", 0) == 0) {
@@ -10164,6 +10407,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             // 若在持锁状态下调用就会死锁（本轮踩到：服务端直接挂住，连接被关闭）。
             std::lock_guard<std::mutex> lk(g_q.mtx);
             for (const auto& f : addList) g_q.items.emplace_back(f);
+            // 新加进来的曲目不在旧排序快照里 ⟹ 快照作废（否则"恢复默认顺序"会把它抹掉）。
+            if (!addList.empty()) g_q.sortBase.clear();
             cnt = g_q.items.size();
         }
         queue_save();
@@ -11076,6 +11321,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             g_q.items = std::move(items);
             g_q.index = 0;
             g_q.base.clear();
+            g_q.sortBase.clear();   // 整列换掉 ⟹ 排序撤销点作废
             cnt = g_q.items.size();
         }
         queue_save();
@@ -11083,26 +11329,82 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
     if (rq.path.rfind("/api/queue", 0) == 0) {
         ct = "application/json; charset=utf-8";
-        std::lock_guard<std::mutex> lk(g_q.mtx);
+        // meta=1（261027-02 #4）：额外回一个与 items **逐项对齐**的 metas 数组
+        //   {t:标题, a:艺术家, al:专辑, d:时长秒, y:年份} —— 队列页排序要用它。
+        // 为什么不做成"items 变对象"：这个端点的 items 一直是路径字符串数组，界面/脚本大量按
+        // 字符串消费；加一个平行数组既不改旧契约，又只在队列页需要时才算（3 秒轮询不带 meta=1，
+        // 零额外开销）。元数据只从**库索引**取，绝不逐首 ffprobe（WebUi 单线程阻塞 accept，
+        // 几十首逐个探活会把整站卡住 —— 与 /api/fav/list 同一条教训）。
+        const bool wantMeta = rq.path.find("meta=1") != std::string::npos;
+        std::vector<QItem> items;
+        size_t index = 0;
+        int repeat = 0;
+        bool shuffle = false;
+        {
+            std::lock_guard<std::mutex> lk(g_q.mtx);
+            items = g_q.items;
+            index = g_q.index;
+            repeat = g_q.repeat;
+            shuffle = g_q.shuffle;
+        }
+        std::map<std::string, rta::net::LibTrack> meta;
+        if (wantMeta && !items.empty()) {
+            std::set<std::string> want;
+            for (const auto& it : items) want.insert(rta::net::lib_path_key(it.path));
+            auto& lib = rta::net::Library::instance();
+            const size_t nt = lib.trackCount();
+            for (size_t i = 0; i < nt; ++i) {
+                rta::net::LibTrack t;
+                if (!lib.trackAt(i, t)) continue;
+                const std::string k = rta::net::lib_path_key(t.path);
+                if (!want.count(k)) continue;
+                meta.emplace(k, std::move(t));
+                if (meta.size() >= want.size()) break;   // 全命中就不必再扫全库
+            }
+        }
         std::ostringstream j;
-        j << "{\"ok\":true,\"index\":" << g_q.index
-          << ",\"repeat\":" << g_q.repeat
+        j << "{\"ok\":true,\"index\":" << index
+          << ",\"repeat\":" << repeat
           // #2：repeat 就是四态播放模式（0关/1列表/2单曲/3随机），别名 mode 让前端只读一个字段
-          << ",\"mode\":" << g_q.repeat
-          << ",\"shuffle\":" << (g_q.shuffle ? "true" : "false") << ",\"items\":[";
-        for (size_t i = 0; i < g_q.items.size(); ++i) {
+          << ",\"mode\":" << repeat
+          << ",\"shuffle\":" << (shuffle ? "true" : "false") << ",\"items\":[";
+        for (size_t i = 0; i < items.size(); ++i) {
             if (i) j << ",";
-            j << "\"" << jesc(g_q.items[i].path) << "\"";
+            j << "\"" << jesc(items[i].path) << "\"";
         }
         // cues：与 items **逐项对齐**的 [起, 止] 秒数组（-1,-1 = 整首）。
         // 为什么不做成 items 里的对象：这个端点的 items 一直是"路径字符串数组"，界面/脚本
         // 大量按字符串消费；加一个平行数组既不改旧契约，又让前端能把区间带进 /api/play。
         j << "],\"cues\":[";
-        for (size_t i = 0; i < g_q.items.size(); ++i) {
+        for (size_t i = 0; i < items.size(); ++i) {
             if (i) j << ",";
-            j << "[" << g_q.items[i].cs << "," << g_q.items[i].ce << "]";
+            j << "[" << items[i].cs << "," << items[i].ce << "]";
         }
-        j << "]}";
+        j << "]";
+        if (wantMeta) {
+            j << ",\"metas\":[";
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (i) j << ",";
+                std::string t, a, al;
+                int y = 0;
+                double d = 0.0;
+                // CUE 分轨的"时长"是区间长度，不是整轨文件时长（整轨 70 分钟会把 cue 分轨排到最后）
+                const bool isCue = items[i].isCue() && items[i].ce > items[i].cs;
+                if (isCue) d = items[i].ce - items[i].cs;
+                auto f = meta.find(rta::net::lib_path_key(items[i].path));
+                if (f != meta.end()) {
+                    t = f->second.title;
+                    a = f->second.artist;
+                    al = f->second.album;
+                    y = f->second.year;
+                    if (!isCue) d = f->second.duration;
+                }
+                j << "{\"t\":\"" << jesc(t) << "\",\"a\":\"" << jesc(a) << "\",\"al\":\""
+                  << jesc(al) << "\",\"d\":" << d << ",\"y\":" << y << "}";
+            }
+            j << "]";
+        }
+        j << "}";
         return j.str();
     }
 
@@ -11120,7 +11422,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             std::lock_guard<std::mutex> lk(g_lastEndMx);
             g_lastEnd.isPosZeroNoErr = false;
         }
-        { std::lock_guard<std::mutex> lk(g_q.mtx); g_q.items.clear(); g_q.index = 0; }
+        {
+            std::lock_guard<std::mutex> lk(g_q.mtx);
+            g_q.items.clear();
+            g_q.index = 0;
+            g_q.sortBase.clear();   // 队列空了，排序撤销点也作废
+        }
         queue_save();
         return "{\"ok\":true}";
     }
@@ -11171,6 +11478,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             }
         }
         if (!ok) return "{\"ok\":false,\"error\":\"已到队列边界\"}";
+        // 261027-02 #4：切歌同样要落盘 index（旧实现只改内存 ⟹ 重启后指针退回旧位置）
+        {
+            std::lock_guard<std::mutex> lk(g_q.mtx);
+            g_q.index = target;
+        }
+        queue_save();
         ps.played.store(0);
         ps.total.store(0);
         // 后端 = UPnP / DLNA：切歌同样转交投放会话（停旧会话 → 起新会话），
@@ -12870,6 +13183,80 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return "{\"ok\":true}";
     }
 
+    // ---------------- 在线更新（261027-02 #5；实现见 src/net/update.h / src/net/update_apply.h）----------------
+    //   GET  /api/update/check[?force=1][&wait=1]  只读。默认**异步**（立刻返回 checking:true，UI 轮询）；
+    //        wait=1 才同步（CLI/演练）。为什么异步：WebUi 是单线程 accept，一次清单往返最长 8 s，
+    //        同步做会把整站（含 /api/ping）一起排住。
+    //   GET  /api/update/progress                  只读：phase/downloaded/total/pct/speed/...
+    //   GET  /api/update/state                     只读：当前版本 / 跳过版本 / 暂存 / 台账
+    //   POST /api/update/download                  增量下载（只下 sha256 不一致的文件）→ 校验 → 解压
+    //   POST /api/update/apply                     写台账并让程序退出重启（真正换文件在启动器启动时）
+    //   POST /api/update/skip                      body {"version":"1.6.0"}；空串 = 取消跳过
+    if (rq.path.rfind("/api/update/check", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        const bool force = rq.path.find("force=1") != std::string::npos;
+        const bool wait  = rq.path.find("wait=1") != std::string::npos;
+        if (wait) rta::update::check_now(8000);
+        else      rta::update::start_check(force);
+        return rta::update::check_json();
+    }
+    if (rq.path.rfind("/api/update/progress", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        return rta::update::progress_json();
+    }
+    if (rq.path.rfind("/api/update/state", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        return rta::update::state_json();
+    }
+    if (rq.path.rfind("/api/update/download", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        std::string err;
+        if (!rta::update::start_download(err))
+            return std::string("{\"ok\":false,\"error\":\"") + jesc(err) + "\"}";
+        return std::string("{\"ok\":true,\"started\":true,\"progress\":") +
+               rta::update::progress_json() + "}";
+    }
+    if (rq.path.rfind("/api/update/skip", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        std::string ver;
+        {
+            const auto j = rta::net::json_parse(rq.body);
+            ver = j["version"].s();
+        }
+        rta::update::set_skip_version(ver);
+        return std::string("{\"ok\":true,\"skipVersion\":\"") + jesc(rta::update::skip_version()) + "\"}";
+    }
+    if (rq.path.rfind("/api/update/apply", 0) == 0) {
+        // 只做三件事：校验暂存 → 写台账 → 让程序退出重启。
+        // **绝不在这里换文件**：此刻 rtaweb.exe / dll 都被本进程映射着，覆盖必失败；
+        // 真正的替换发生在下次 RLPlayer.exe 启动、rtaweb 还没起来的那一刻（update_apply.h）。
+        ct = "application/json; charset=utf-8";
+        auto& ust = rta::update::state();
+        std::string ver, staging;
+        bool staged = false;
+        {
+            std::lock_guard<std::mutex> lk(ust.mtx);
+            staged = ust.staged;
+            ver = ust.dlVersion;
+            staging = ust.stagingDir;
+        }
+        if (!staged) return "{\"ok\":false,\"error\":\"还没有下载好更新包，请先点「下载」\"}";
+        std::string err;
+        if (!rta::update::write_ready_plan(ver, rta::update::current_version(), staging, err))
+            return std::string("{\"ok\":false,\"error\":\"") + jesc(err) + "\"}";
+        // 先把响应发出去，再退出：1300 ms 足够 webui 把 JSON 写完。
+        // 退出走启动器自己的托盘「退出」路径（WM_COMMAND 1003，见 update_apply.h），
+        // 不是 taskkill（铁律 2）；没有启动器（开发时直接跑 rtaweb）就只退自己。
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1300));
+            rta::update::request_launcher_exit();
+            g_exitReq.store(true);
+        }).detach();
+        std::ostringstream o;
+        o << "{\"ok\":true,\"version\":\"" << jesc(ver) << "\",\"restart\":true,"
+          << "\"note\":\"程序即将退出；重新打开 RLPlayer 即完成更新\"}";
+        return o.str();
+    }
     if (rq.path.rfind("/api/quit", 0) == 0 || rq.path.rfind("/api/shutdown", 0) == 0) {
         g_exitReq.store(true);
         return "{\"ok\":true}";
@@ -13240,6 +13627,14 @@ int main(int argc, char** argv) {
                  (Library::instance().trackCount() == 0 ? "empty" : "index_v<5"));
         Library::instance().startScan();
     }
+    // 261027-02 #5：在线更新收尾 —— 确认「上一轮换文件成功」（台账 applied 且版本对上 ⟹ done，清 staging），
+    // 并把「上一轮下完但还没装」的暂存恢复出来（用户重启后 UI 仍能显示「立即更新并重启」）。
+    {
+        const std::string updMsg = rta::update::confirm_on_startup();
+        if (!updMsg.empty()) { std::printf("%s%s", updMsg.c_str(), "\n"); play_log(updMsg); }
+        rta::update::restore_staging_state();
+    }
+
     rta::net::WebUi ui;
     if (!ui.start(port, handle, !lan)) {
         printf("!! 端口 %u 启动失败（被占用？）\n", (unsigned)port);

@@ -35,6 +35,10 @@ struct HttpRequest {
     // 复制第二份迟早与第一份行为不一致（超时、代理、重定向都要重写一遍）。
     // 契约：onChunk 只会在 http_request() 返回前被调用；回调里别把裸指针留到返回之后用。
     std::function<void(const char* data, size_t n)> onChunk;
+    // 261027-02 #5（在线更新）：设为 true 时【不】把响应体累积进 HttpResult.body —— 只走 onChunk。
+    // 为什么需要它：更新包 372 MB，边下边写盘已经拿到了全部字节；再往 vector 里攒一份
+    // 会额外占用 372 MB 峰值（重新分配时接近 1 GB），对正在播歌的进程是没必要的风险。
+    bool discardBody = false;
 };
 
 struct HttpResult {
