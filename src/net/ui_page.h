@@ -179,6 +179,12 @@ inline std::string rta_ui_page() {
     h += "<link rel=icon type='image/png' href='/favicon.png'>";
     h += "<style>";
     // ---------- 主题变量 ----------
+    // 2026-10-27（真窗口 UI 扫描 BUG-1）：--mut2 是「9–11px 次要文字」的专用色，
+    // 原来三主题取值只到 3.36/2.84/2.66 :1（WCAG AA 要求 4.5:1），浅色/蓝连大字的 3:1 都不到。
+    // 现在按**实测反解**提到 AA：dark #78849a / light #5f6f86 / blue #4f6b8d
+    //   （对 --bg / --bg2 / --bg3 分别 5.28~4.88 / 5.12~4.52 / 5.29~4.54，见 build-ufix 报告）
+    // 纯装饰用途（进度条填充、PEQ 关闭节点、封面首字占位）不该跟着提亮 ⟹ 拆出 --deco，
+    // 取值就是旧的 --mut2，那些地方的像素与改动前完全一致。
     h += ":root{color-scheme:dark;"
          "--bg:#08090c;--bg2:#0c0e13;--bg3:#11141b;"
          "--topbg:linear-gradient(180deg,#12151c,#0b0d11);"
@@ -186,7 +192,7 @@ inline std::string rta_ui_page() {
          "--line:rgba(255,255,255,.075);"
          "--hov:rgba(255,255,255,.055);--hov2:rgba(255,255,255,.11);"
          "--field:rgba(6,8,11,.9);--crumb:rgba(8,9,12,.94);"
-         "--txt:#e9edf5;--txt2:#c3ccdb;--mut:#828ea3;--mut2:#5b6478;"
+         "--txt:#e9edf5;--txt2:#c3ccdb;--mut:#828ea3;--mut2:#78849a;--deco:#5b6478;"
          "--acc:#3b82f6;--acc2:#8b5cf6;--acc-weak:rgba(59,130,246,.16);--acc-text:#9dc0ff;"
          "--nav-on:linear-gradient(90deg,rgba(59,130,246,.24),rgba(59,130,246,.04));--nav-on-text:#cfe0ff;"
          "--cvbg:#151a24;--phbg:linear-gradient(135deg,#1a2233,#12161f);--ph-txt:rgba(255,255,255,.14);"
@@ -202,7 +208,7 @@ inline std::string rta_ui_page() {
          "--line:rgba(15,23,42,.10);"
          "--hov:rgba(15,23,42,.05);--hov2:rgba(15,23,42,.09);"
          "--field:#ffffff;--crumb:rgba(244,246,249,.94);"
-         "--txt:#0f172a;--txt2:#334155;--mut:#5a6b82;--mut2:#8794a8;"
+         "--txt:#0f172a;--txt2:#334155;--mut:#5a6b82;--mut2:#5f6f86;--deco:#8794a8;"
          "--acc:#2563eb;--acc2:#7c3aed;--acc-weak:rgba(37,99,235,.12);--acc-text:#1d4ed8;"
          "--nav-on:linear-gradient(90deg,rgba(37,99,235,.13),rgba(37,99,235,.02));--nav-on-text:#1e40af;"
          "--cvbg:#e6ecf5;--phbg:linear-gradient(135deg,#e6ecf6,#dae2ee);--ph-txt:rgba(15,23,42,.20);"
@@ -218,7 +224,7 @@ inline std::string rta_ui_page() {
          "--line:rgba(12,60,120,.13);"
          "--hov:rgba(12,60,120,.06);--hov2:rgba(12,60,120,.11);"
          "--field:#ffffff;--crumb:rgba(233,242,255,.94);"
-         "--txt:#0b2545;--txt2:#1e3a5f;--mut:#4a6b93;--mut2:#7d97b8;"
+         "--txt:#0b2545;--txt2:#1e3a5f;--mut:#4a6b93;--mut2:#4f6b8d;--deco:#7d97b8;"
          "--acc:#0d6efd;--acc2:#3b9bff;--acc-weak:rgba(13,110,253,.13);--acc-text:#0b5ed7;"
          "--nav-on:linear-gradient(90deg,rgba(13,110,253,.16),rgba(13,110,253,.02));--nav-on-text:#0a58ca;"
          "--cvbg:#d9e9ff;--phbg:linear-gradient(135deg,#dbeafe,#cde2ff);--ph-txt:rgba(11,37,69,.20);"
@@ -304,6 +310,13 @@ inline std::string rta_ui_page() {
     h += ".search input{width:100%;padding:8px 32px 8px 32px;border-radius:9px;border:1px solid var(--line);background:var(--field);transition:.15s;font-size:12.5px}";
     h += ".search input:focus{outline:0;border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-weak)}";
     h += ".search svg{position:absolute;left:10px;top:9px;opacity:.4}";
+    // 2026-10-27（真窗口扫描 BUG-2）：960 宽时顶栏搜索框只剩 ~125px，占位符「搜索专辑 / 艺术家 / 曲目…」
+    // 被**字符中间硬裁**（input 的 placeholder 默认 clip，且没有省略号）。
+    // 两条一起做：① 装不下就换短文案（JS：ui_script.h 的 syncSearchPh，按实测宽度判定，不用魔法断点）；
+    //             ② 这里补 ellipsis 兜底 —— Chromium 对 ::placeholder 的 text-overflow 支持不稳，
+    //                所以只当补充，不能当主修。
+    // 颜色显式写 --mut2：不写就吃浏览器默认占位灰（≈ --txt 的 54% 不透明），AA 无从谈起。
+    h += ".search input::placeholder{color:var(--mut2);opacity:1;text-overflow:ellipsis;white-space:nowrap;overflow:hidden}";
     h += ".search .q-clear{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--mut2);font-size:16px;line-height:1;cursor:pointer;padding:2px 6px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;transition:.15s}";
     h += ".search .q-clear:hover{color:var(--txt);background:var(--hov)}";
     h += ".nav-badge{position:absolute;top:2px;right:2px;background:var(--acc);color:#fff;border-radius:10px;font-size:9.5px;padding:0 5px;line-height:14px;font-weight:600;pointer-events:none}";
@@ -429,11 +442,11 @@ inline std::string rta_ui_page() {
     // 留下就是一块**灰底**；② 列表里还渲染了 .ph 首字母块。现在 .acv 一律去掉灰底，
     // 图取不到时露出低饱和圆形占位（浅描边 + 音符图标，opacity .35），<img> 保留但 opacity:0。
     h += ".card .cv.acv,.ahead .cv.acv{background:transparent;border-radius:50%}";
-    h += ".card .cv.acv .aph,.ahead .cv.acv .aph{position:absolute;inset:0;display:grid;place-items:center;color:var(--mut2);opacity:.9;pointer-events:none}";
+    h += ".card .cv.acv .aph,.ahead .cv.acv .aph{position:absolute;inset:0;display:grid;place-items:center;color:var(--deco);opacity:.9;pointer-events:none}";
     // 2026-10-27（261027-03 #7）：占位从「opacity .35 的音符图标」改成**首字**（用户原话：
     // 「每张头像位置立刻渲染首字母占位（带艺人名首字）」），但仍不许出现 2026-10-26 被否掉的
-    // 「大灰块」⟹ 只给字上色（--mut2，75% 不透明），不加底色块。
-    h += ".acv .aini{font-weight:650;line-height:1;letter-spacing:0;color:var(--mut2);opacity:.75}";
+    // 「大灰块」⟹ 只给字上色（--deco：装饰色，不随 AA 提亮，75% 不透明），不加底色块。
+    h += ".acv .aini{font-weight:650;line-height:1;letter-spacing:0;color:var(--deco);opacity:.75}";
     h += ".card .cv.acv img.err,.ahead .cv.acv img.err{opacity:0}";
     h += ".ahead .cv.acv img,.ahead .cv.acv svg{display:block}";
     // 图落地才淡入（.ok 由加载泵在 onload 里加）—— 这样「一张一张出现」看得出来，
@@ -444,7 +457,7 @@ inline std::string rta_ui_page() {
     // 头像进度条（复用 .albprog 的骨架）：加载中显示 x/y 且数字会动，收尾后变暗
     h += ".albprog.artprog{padding-top:6px}";
     h += ".albprog.done .t{color:var(--mut2)}";
-    h += ".albprog.done .bar i{background:var(--mut2)}";
+    h += ".albprog.done .bar i{background:var(--deco)}";
     h += ".albprog .artagain{margin-left:8px;padding:2px 9px;font-size:11px;line-height:1.5}";
     // ===== 单曲页「分析」条（2026-10-27 261027-04 #4）=====
     // 用户要求把「主页/设置-分析」整页搬到**正在播放的那首歌**上，展示三类：动态 / 音质 / 假无损。
@@ -942,7 +955,7 @@ h += "#npPage .npedge{display:none}";
     h += ".peqcv svg.peqsvg{display:block;width:100%;height:auto;touch-action:none}";
     h += ".peqnode{fill:var(--acc);stroke:var(--bg);stroke-width:1.4;cursor:ns-resize}";
     h += ".peqnode:hover,.peqnode.on{fill:var(--acc2);stroke-width:2}";
-    h += ".peqnode.off{fill:var(--mut2);opacity:.5}";
+    h += ".peqnode.off{fill:var(--deco);opacity:.5}";
     h += ".peqhit{fill:transparent;cursor:ns-resize}";
     h += ".peqtip{position:absolute;z-index:6;pointer-events:none;background:var(--toast);border:1px solid var(--line);border-radius:7px;padding:4px 8px;font-size:11px;color:var(--txt);box-shadow:0 6px 18px var(--shadow);white-space:nowrap;opacity:0;transition:opacity .1s}";
     h += ".peqtip.on{opacity:1}";

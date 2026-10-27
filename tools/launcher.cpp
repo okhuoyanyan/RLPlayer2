@@ -1525,20 +1525,79 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // 也正是用户说的「重启一下就能完成」。实现见 src/net/update_apply.h。
 #include "net/update_apply.h"
 
+// ---------------- 调试开关：--remote-debugging-port=<N>（默认关闭） ----------------
+// 只为一件事：铁律 11 要求在**真 WebView2 窗口**里做 UI 取证（真窗口里跑 JS / 抓 DOM）。
+// 默认不传这个参数 ⟹ rta::wv2::debug_flags().remotePort 保持 0 ⟹ 建环境时 options 传 nullptr，
+// 与改动前完全一致，**生产包不会开任何调试端口**。
+// 两种写法都认：--remote-debugging-port=9222 / --remote-debugging-port 9222
+// 端口范围 1024~65535（避开特权端口）；写错了就当没写，并在日志里说一声。
+static bool parse_debug_port_arg(int& out) {
+    std::wstring cl = GetCommandLineW() ? GetCommandLineW() : L"";
+    const std::wstring key = L"--remote-debugging-port";
+    size_t i = cl.find(key);
+    while (i != std::wstring::npos) {
+        size_t k = i + key.size();
+        if (k < cl.size() && (cl[k] == L'=' || cl[k] == L':')) ++k;
+        while (k < cl.size() && cl[k] == L' ') ++k;
+        int n = 0; size_t digits = 0;
+        while (k < cl.size() && cl[k] >= L'0' && cl[k] <= L'9' && digits < 6) {
+            n = n * 10 + (int)(cl[k] - L'0'); ++k; ++digits;
+        }
+        if (digits) {
+            if (n >= 1024 && n <= 65535) { out = n; return true; }
+            logf(L"调试开关: --remote-debugging-port 端口 %d 越界（只接受 1024~65535），忽略", n);
+        }
+        i = cl.find(key, i + 1);
+    }
+    return false;
+}
+
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     // ★ 必须在任何窗口/WebView2 创建之前：决定进程的 DPI 感知级别。
     // 漏了它，Windows 会把整个窗口按 96 DPI 位图拉伸（界面发糊，见 enable_high_dpi 的注）。
     enable_high_dpi();
     rta::crash::install();    // 崩溃转储（1.0.5）：dump 落 exe 目录 dumps\，filter 先写日志
     logf(L"=== wWinMain 进入 ===");
+    // 调试开关（默认关闭）：必须在建 WebView2 之前设好，见 parse_debug_port_arg 注
+    {
+        int dbgPort = 0;
+        if (parse_debug_port_arg(dbgPort)) {
+            rta::wv2::debug_flags().remotePort = dbgPort;
+            logf(L"调试开关: --remote-debugging-port=%d 已开启（WebView2 AdditionalBrowserArguments；"
+                 L"http://127.0.0.1:%d/json 可列页面）", dbgPort, dbgPort);
+        }
+    }
     WSADATA w; WSAStartup(MAKEWORD(2, 2), &w);
     logf(L"WSAStartup 完成");
+
+    // ---------------- 端口覆盖：RLPLAYER_PORT=<port>（261027 追加） ----------------
+    // 为什么需要：rtaweb.exe 自己不建窗，窗口只能由 launcher 建；而 launcher 一旦发现
+    // 8899 上已有实例就"接管"它 ⟹ 任何自动化代理截到的永远是用户正在跑的那份界面，
+    // 拿不到"本次新构建的 UI 真窗口截图"（铁律 11）。
+    // 语义：设了合法端口 ⟹ 只用这个端口、且**跳过接管**，一定起自己的实例；
+    //       没设 / 非法 ⟹ 行为与改动前完全一致（默认 8899、接管已有实例）。
+    int forcedPort = 0;
+    {
+        wchar_t eb[16] = {0};
+        if (GetEnvironmentVariableW(L"RLPLAYER_PORT", eb, 16) > 0) {
+            wchar_t* end = nullptr;
+            const long v = wcstol(eb, &end, 10);
+            const bool clean = (end && *end == L'\0');
+            if (clean && v >= 1024 && v < 65536) {
+                forcedPort = (int)v;
+                logf(L"RLPLAYER_PORT=%d：强制使用该端口起独立实例（跳过接管已有实例）", forcedPort);
+            } else {
+                logf(L"RLPLAYER_PORT=\"%ls\" 非法（只接受 1024~65535），忽略，按默认行为", eb);
+            }
+        }
+    }
 
     // 已有实例则直接开浏览器。
     // !! 只认"确实是 RLPlayer 服务"的端口：早先只要端口有人监听就当成本程序，
     //    本机别的程序占着 8902 时会把浏览器指到别人的界面上（本轮踩到）。
     bool started = false;
-    for (int p = kDefaultPort; p < kDefaultPort + 12; ++p) {
+    // forcedPort 置位时整个接管循环一次都不进（见 RLPLAYER_PORT 注）
+    for (int p = kDefaultPort; p < kDefaultPort + 12 && !forcedPort; ++p) {
         if (!port_open(p)) continue;
         if (!probe_app(p)) { logf(L"端口 %d 被别的程序占用，跳过", p); continue; }
         // 2026-10-26（261026-04 真机根因）：版本不一致就不接管。
@@ -1571,8 +1630,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 
     if (!started) logf(L"未发现已有实例，开始启动服务");
 
-    // 选一个空闲端口并启动服务
-    for (int p = kDefaultPort; p < kDefaultPort + 12 && !started; ++p) {
+    // 选一个空闲端口并启动服务（forcedPort ⟹ 只试这一个，试不到就报错，不偷偷换端口）
+    for (int p = (forcedPort ? forcedPort : kDefaultPort);
+         p < (forcedPort ? forcedPort + 1 : kDefaultPort + 12) && !started; ++p) {
         if (port_open(p)) continue;          // 被别的程序占了
         if (!spawn_server(p)) break;
         for (int i = 0; i < 100; ++i) {      // 最多等 5 秒
@@ -1594,7 +1654,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         const std::string rb = rta::update::rollback_pending("新版本启动失败（rtaweb 未在 5 秒内监听端口）");
         if (!rb.empty()) {
             logf(L"%s", utf8_to_wide(rb).c_str());
-            for (int p = kDefaultPort; p < kDefaultPort + 12 && !started; ++p) {
+            for (int p = (forcedPort ? forcedPort : kDefaultPort);
+                 p < (forcedPort ? forcedPort + 1 : kDefaultPort + 12) && !started; ++p) {
                 if (port_open(p)) continue;
                 if (!spawn_server(p)) break;
                 for (int i = 0; i < 100; ++i) {

@@ -220,7 +220,7 @@ static int report_mode(const std::vector<std::string>& files) {
             printf("%s%s(%.1f)", k ? " > " : "", r.versions[ord[k]].label.c_str(), old[ord[k]]);
         printf("\n");
     }
-    // 反事实（去掉第 8 维与有损固定罚；其余权重沿用今天这份表）——看"这一维单独贡献了什么"。
+    // 反事实（去掉第 8 维与编解码损伤；其余权重沿用今天这份表）——看"这一维单独贡献了什么"。
     {
         double wsum = 0.0;
         for (const auto& d : r.dims) if (d.key != "cutoff_hz") wsum += d.weight;
@@ -237,7 +237,7 @@ static int report_mode(const std::vector<std::string>& files) {
         for (size_t i = 0; i < order.size(); ++i) order[i] = i;
         std::stable_sort(order.begin(), order.end(),
                          [&](size_t a, size_t b) { return legacy[a] > legacy[b]; });
-        printf("旧口径（无带宽维/无有损固定罚）排序：");
+        printf("旧口径（无带宽维/无编解码损伤）排序：");
         for (size_t k = 0; k < order.size(); ++k)
             printf("%s%s(%.1f)", k ? " > " : "", r.versions[order[k]].label.c_str(), legacy[order[k]]);
         printf("\n\n");
@@ -512,23 +512,46 @@ int main(int argc, char** argv) {
             check(rw.ranking[0] == 0, "无损版排第一", f2(rw.scores[0]));
             check(rw.ranking[3] == 2 || rw.ranking[3] == 3, "128k / 低通 14k 占最后一名");
             check(rw.ranking[2] == 2 || rw.ranking[2] == 3, "最后两名都是被有损处理过的版本");
-            // 标定：带宽维 + 有损固定罚，单独让 128k 相对无损掉多少分 —— 必须 ≥20
+            // ③b 三档间距（P1/P3 判据）：
+            //   无损 > 320k > 128k 必须成立；320k 与无损的间距既不能被一笔固定罚撑到 ≥12 分
+            //   （那是"同一证据罚两次"的旧缺陷），也不能小到分不清（<1 分 = 测量噪声级）。
+            {
+                const double g01 = rw.scores[0] - rw.scores[1];
+                const double g12 = rw.scores[1] - rw.scores[2];
+                printf("  三档间距：无损−320k = %.2f 分，320k−128k = %.2f 分\n", g01, g12);
+                check(rw.scores[0] > rw.scores[1] && rw.scores[1] > rw.scores[2],
+                      "三档排序 无损 > 320k > 128k", f2(rw.scores[1], rw.scores[2]));
+                check(g01 >= 1.0 && g01 <= 12.0,
+                      "320k 与无损的间距落在 1~12 分（不再被 12 分固定罚撑大）", f2(g01));
+                check(g12 >= 8.0, "128k 比 320k 再低 ≥8 分（低码率仍显著更差）", f2(g12));
+            }
+            // 标定：带宽损失 + 编解码损伤，单独让 128k 相对无损掉多少分 —— 必须 ≥20
             // （用户的硬要求：要显著扣分，并且压过"削波少"带来的加分；削波维最大摆幅只有 14 分）
             {
                 double wsum = 0.0;
                 for (const auto& d : rw.dims) wsum += d.weight;
                 double pCut = 0.0;
                 for (const auto& d : rw.dims) if (d.key == "cutoff_hz") pCut = d.penalty[2] - d.penalty[0];
-                const double pts = 100.0 * (0.20 / wsum) * pCut
-                                 + (rw.versions[2].lossySuspected ? vcdetail::kLossyPenaltyPoints : 0.0);
-                printf("  第 8 维净扣分（V3 相对 V1）：带宽 %.1f 分 + 有损固定 %.1f 分 = %.1f 分\n",
-                       100.0 * (0.20 / wsum) * pCut, vcdetail::kLossyPenaltyPoints, pts);
-                check(pts >= 20.0, "带宽维 + 有损固定罚让 128k 净掉 ≥20 分（标定达标）", f2(pts));
+                const double codec = rw.versions[2].codecPenaltyPoints;
+                const double pts = 100.0 * (0.20 / wsum) * pCut + codec;
+                printf("  第 8 维净扣分（V3 相对 V1）：带宽 %.1f 分 + 编解码损伤 %.1f 分 = %.1f 分\n",
+                       100.0 * (0.20 / wsum) * pCut, codec, pts);
+                check(pts >= 20.0, "带宽损失 + 编解码损伤让 128k 净掉 ≥20 分（标定达标）", f2(pts));
                 check(rw.scores[0] - rw.scores[2] >= 12.0,
                       "版面上无损仍领先 128k ≥12 分（扣掉无损自身的削波损失后）",
                       f2(rw.scores[0] - rw.scores[2]));
+                // P1 判据（2026-10-27 修复）：320k 的编解码损伤必须【明显小于满额】——
+                // 原实现是「判假 ⟹ 固定 −12」，与截止位置无关，于是 320k（0.83×Nyq）与 128k（0.67×Nyq）
+                // 吃一样的固定罚。现在按「离奈奎斯特多远」平滑折算，320k 应明显低于 12。
+                check(rw.versions[1].codecPenaltyPoints > 0.0 &&
+                      rw.versions[1].codecPenaltyPoints < vcdetail::kCodecDamagePoints * 0.9,
+                      "320k 的编解码损伤 < 满额的 90%（不再与 128k 吃同一笔固定罚）",
+                      f2(rw.versions[1].codecPenaltyPoints, rw.versions[2].codecPenaltyPoints));
+                check(rw.versions[2].codecPenaltyPoints >= vcdetail::kCodecDamagePoints * 0.99,
+                      "128k（0.67×Nyq）仍吃满额编解码损伤",
+                      f2(rw.versions[2].codecPenaltyPoints));
             }
-            // ④ 反事实：把第 8 维与有损固定罚去掉（= 旧口径），排序会退回"128k 第一"
+            // ④ 反事实：把第 8 维与编解码损伤去掉（= 旧口径），排序会退回"有损版第一"
             {
                 double wsum = 0.0;
                 for (const auto& d : rw.dims) if (d.key != "cutoff_hz") wsum += d.weight;
@@ -543,7 +566,7 @@ int main(int argc, char** argv) {
                 }
                 size_t bestL = 0;
                 for (size_t i = 1; i < legacy.size(); ++i) if (legacy[i] > legacy[bestL]) bestL = i;
-                printf("  反事实（去掉第 8 维与有损固定罚）：V1=%.1f V2=%.1f V3=%.1f V4=%.1f ⟹ %s 第一\n",
+                printf("  反事实（去掉第 8 维与编解码损伤）：V1=%.1f V2=%.1f V3=%.1f V4=%.1f ⟹ %s 第一\n",
                        legacy[0], legacy[1], legacy[2], legacy[3], rw.versions[bestL].label.c_str());
                 check(bestL != 0, "去掉第 8 维后【有损版】反而第一（证明这一维就是翻转的原因）");
                 check(rw.explanation.find("疑似有损转码") != std::string::npos,
@@ -552,6 +575,57 @@ int main(int argc, char** argv) {
                       "解释里不出现「权重失效」自检警告（说明有损版没被判成第一）");
             }
         }
+    }
+
+    printf("\n=== 8c. 编解码损伤是连续量：20 Hz 截止漂移不许翻转判决（P2 回归）===\n");
+    {
+        // 上一轮的 BUG-6：同一个 320k 文件、两种分析窗口下 cutoff 20244.6→20240.0 Hz，
+        // 「判假」这个布尔量翻转 ⟹ 总分 78.94→90.98（12 分跳变）。
+        // 本轮修法：分数只看连续量（ratio / 陡沿 dB / 置信度），布尔量只用于措辞。
+        // 判据（不是"跑通了"）：把 cutoff 从 0.70×Nyq 扫到 0.99×Nyq（步长 1 Hz），
+        // 相邻两点的扣分差必须 < 0.05 分 —— 任何阶跃都会立刻超过它（阶跃 = 12 分）。
+        VersionData v;
+        v.fs = 44100;
+        v.nyquistHz = 22050.0;
+        v.cutoffEdgeDb = 63.0;        // 实测 320k MP3 的陡沿
+        v.cutoffConfidence = 0.92;
+        double maxJump = 0.0, prev = 0.0;
+        bool first = true;
+        for (double hz = 0.70 * v.nyquistHz; hz <= 0.99 * v.nyquistHz; hz += 1.0) {
+            v.spectralCutoffHz = hz;
+            const double p = vcdetail::codec_damage_points(v);
+            if (!first) maxJump = std::max(maxJump, std::fabs(p - prev));
+            prev = p; first = false;
+        }
+        printf("  连续扫描 0.70~0.99×Nyq（1 Hz 步长）：相邻点最大跳变 %.4f 分\n", maxJump);
+        check(maxJump < 0.05, "扣分曲线连续（相邻 1 Hz 的最大跳变 < 0.05 分）", f2(maxJump));
+
+        // 同一 320k 文件两种窗口的实测值（build-vc3 报告 §6-BUG-6 / 本轮 build-vcfix 实测）
+        VersionData a; a.fs = 44100; a.nyquistHz = 22050.0; a.cutoffEdgeDb = 63.0;
+        a.cutoffConfidence = 0.917; a.spectralCutoffHz = 20244.6;
+        VersionData b = a; b.spectralCutoffHz = 20240.0;
+        VersionData c = a; c.spectralCutoffHz = 20224.6;   // −20 Hz
+        const double pa = vcdetail::codec_damage_points(a);
+        const double pb = vcdetail::codec_damage_points(b);
+        const double pc = vcdetail::codec_damage_points(c);
+        printf("  cutoff 20244.6 / 20240.0 / 20224.6 Hz ⟹ 编解码损伤 %.4f / %.4f / %.4f 分\n",
+               pa, pb, pc);
+        check(std::fabs(pa - pb) < 0.05 && std::fabs(pa - pc) < 0.10,
+              "cutoff 抖动 4.6 Hz / 20 Hz 时扣分变化 < 0.1 分（修前是 12 分）",
+              f2(pa, pc));
+
+        // 边界处必须归零：>0.95×Nyq 不该再罚（否则满带宽版本与 0.951×Nyq 版本差 12 分）
+        VersionData hi = a; hi.spectralCutoffHz = 0.96 * hi.nyquistHz;
+        check(vcdetail::codec_damage_points(hi) <= 0.0,
+              "截止 >0.95×Nyq 时编解码损伤为 0（与满带宽版本连续衔接）",
+              f2(vcdetail::codec_damage_points(hi)));
+        // 缓坡（模拟母带滚降 15 dB）不该被当成编码器
+        VersionData soft = a; soft.cutoffEdgeDb = 15.0; soft.spectralCutoffHz = 16000.0;
+        check(vcdetail::codec_damage_points(soft) <= 0.0,
+              "陡沿只有 15 dB（磁带/母带级）时编解码损伤为 0（不误伤合法母带低通）",
+              f2(vcdetail::codec_damage_points(soft)));
+        // 纯函数：连续两次调用逐位相同（无随机性）
+        check(vcdetail::codec_damage_points(a) == pa, "同一输入两次调用逐位相同（确定性）");
     }
 
     printf("\n=== 8b. 兜底：有损版合理胜出时，解释里必须出现红字自检警告 ===\n");

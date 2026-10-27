@@ -13503,8 +13503,34 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 }
             }
         }
-        if (file.empty()) return std::string("{\"ok\":false,\"error\":\"缺少 file 参数\"}");
-        if (!valid_utf8(file)) return utf8_path_reject(file);
+        // 2026-10-27（261027-04 #4）：把「跑了几次 / 命中几次 / 本次耗时」一起交出去 ——
+        // 单曲页的自动分析要能自证「一首歌只跑一次」「第二次是缓存」，光靠前端计时不可信。
+        auto anl_counts = [&]() {
+            return std::string(",\"runs\":") + std::to_string(g_anlRuns.load(std::memory_order_relaxed)) +
+                   ",\"hits\":" + std::to_string(g_anlHits.load(std::memory_order_relaxed));
+        };
+        // ---- 统一错误外壳（BUG-2，2026-10-27 修复）----
+        // 契约：本端点**任何**输入下都返回 {ok, cached, runs, hits, ms, health{…}}，
+        // 其中 health 段一律是 track_health_json() 的完整结构。
+        // 为什么必须这么改：旧版「缺 file 参数」「非法 UTF-8」这两条路只回 {ok:false,error:"…"}，
+        // **没有 health 对象** —— 同一个端点两种 schema，前端读 data.health.status 拿到 undefined，
+        // 只能靠 ok 字段猜「到底是没参数、编码坏了、还是文件坏了」。现在四种错误
+        // （缺参 / 非法 UTF-8 / 文件不存在 / 文件打不开）与正常路径**逐字段同构**，
+        // 差异只在值：status="error"、error=人话原因、数值字段全 0（quality.available=false）。
+        // 注意：不再输出顶层 error 键 —— 错误原因只有一个来源（health.error），两处写会分叉。
+        auto health_err = [&](const std::string& why) {
+            rta::analysis::TrackHealth eh;
+            eh.status = "error";
+            eh.error  = why;
+            eh.analyzedAtMs = rta::analysis::detail::now_ms();
+            return std::string("{\"ok\":false,\"cached\":false") + anl_counts() +
+                   ",\"ms\":0,\"health\":" + rta::analysis::track_health_json(eh) + "}";
+        };
+        if (file.empty()) return health_err("缺少 file 参数");
+        if (!valid_utf8(file)) {
+            (void)utf8_path_reject(file);   // 复用它的 WARN 日志（原始字节十六进制前 64 字节）
+            return health_err("路径编码非 UTF-8(请用浏览器或 UTF-8 客户端)");
+        }
         // —— 结果缓存（同一文件不重复跑）——
         // 只存 health 段的 JSON，命中时再拼外壳，避免字符串替换把 JSON 弄坏。
         struct HealthCacheItem { std::string key; std::string health; };
@@ -13519,13 +13545,40 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             if (!ec) key += "|" + std::to_string((unsigned long long)sz);
             if (!ec2) key += "|" + std::to_string((long long)mt.time_since_epoch().count());
             key += whole ? "|w" : "|s";
+            // ★ 2026-10-27（本轮 DEBUG 定位的真 bug）：key 只看「路径+大小+mtime」会**错误命中**。
+            //   mtime 是可以被原样保留的：robocopy /COPY:T、从备份还原、就地写标签后回填时间戳、
+            //   某些网络盘/归档工具的时间戳粒度。实测（build-hf 独立实例，8931）：
+            //     A B.flac 32.046 s：lufs=-8.516 dr=10.454 rms=-11.224
+            //     把中段 40% 字节清零、大小不变、mtime 写回原值
+            //       → 不带 fresh：cached=true，返回**旧值** -8.516 / 10.454（7 ms）
+            //       → 带 fresh  ：真实值 -8.676 / 10.574（251 ms）
+            //   修法：把**整文件** FNV-1a 指纹并进 key。
+            //   为什么是整文件而不是「首尾各 64 KB」：第一版就是首尾抽样，结果中段被清零时指纹不变
+            //   ⟹ 缓存照样命中（复测时被抓出来）。抽样指纹只能挡「整文件被替换」，挡不住就地改写。
+            //   代价实测：顺序读一遍 + 每字节 1 次异或乘，NVMe 上 ~0.3~0.8 GB/s；相比随后的解码 +
+            //   三套分析器（33 MB/s 量级）便宜 20~50 倍，所以命中与未命中都值得付这笔钱 ——
+            //   命中省掉解码，未命中只多一次顺序读。文件读不到（不存在/无权限/读一半消失）时
+            //   不加指纹，等于退化成旧 key：不会错误命中，也不会改变错误路径。
+            if (!ec && sz > 0) {
+                std::ifstream cf(rta::audio::widen(file).c_str(), std::ios::binary);
+                if (cf) {
+                    unsigned long long fp = 1469598103934665603ULL;
+                    std::vector<char> buf(1u << 20);
+                    unsigned long long left = (unsigned long long)sz;
+                    bool readAll = true;
+                    while (left > 0) {
+                        const size_t want = (size_t)std::min<unsigned long long>(left, (unsigned long long)buf.size());
+                        cf.read(buf.data(), (std::streamsize)want);
+                        const std::streamsize got = cf.gcount();
+                        if (got <= 0) { readAll = false; break; }
+                        const char* p = buf.data();
+                        for (std::streamsize i = 0; i < got; ++i) { fp ^= (unsigned char)p[i]; fp *= 1099511628211ULL; }
+                        left -= (unsigned long long)got;
+                    }
+                    if (readAll && left == 0) key += "|h" + std::to_string(fp);
+                }
+            }
         }
-        // 2026-10-27（261027-04 #4）：把「跑了几次 / 命中几次 / 本次耗时」一起交出去 ——
-        // 单曲页的自动分析要能自证「一首歌只跑一次」「第二次是缓存」，光靠前端计时不可信。
-        auto anl_counts = [&]() {
-            return std::string(",\"runs\":") + std::to_string(g_anlRuns.load(std::memory_order_relaxed)) +
-                   ",\"hits\":" + std::to_string(g_anlHits.load(std::memory_order_relaxed));
-        };
         if (!fresh) {
             std::lock_guard<std::mutex> lk(hcMx);
             for (const auto& it : hcQ) {
@@ -13546,12 +13599,22 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         g_anlRuns.fetch_add(1, std::memory_order_relaxed);
         play_log("ANL run file=" + file + " ms=" + std::to_string(anlMs) +
                  " status=" + h.status + anl_counts());
-        if (h.status == "ready") {          // 只缓存成功结果（失败可能只是当前打不开）
+        // 只缓存**完整文件的成功结果**：
+        //   * error      —— 失败可能只是当前打不开，下次再试；
+        //   * incomplete —— 半截文件的指标虽然"能看"，但它是**半份结论**（BUG-3）。缓存它等于把
+        //                   "16 s 的动态/LUFS" 固化成"这首曲子的体检结果"；虽然有整文件指纹兜底
+        //                   （拷完内容变了 ⟹ key 变了 ⟹ 不会命中旧值），但"边写边分析"期间反复
+        //                   重算本来就是对的语义（每次字节数不同 ⟹ 结论不同）。所以不进缓存。
+        if (h.status == "ready") {
             std::lock_guard<std::mutex> lk(hcMx);
             hcQ.push_back(HealthCacheItem{ key, healthJson });
             if (hcQ.size() > kHcMax) hcQ.pop_front();
         }
-        return std::string("{\"ok\":") + (h.status == "ready" ? "true" : "false") +
+        // ok 的语义 = "这次请求**给出了可用的指标**"，不是"文件完美"：
+        //   incomplete 必须 ok:true，否则前端（ui_script.h 的 anlRun/openHealthModal）会把
+        //   "半截文件"整块当成"分析失败"，用户就看不见那三条指标 + 黄色提示了（BUG-3 要求照给数）。
+        const bool gaveMetrics = (h.status == "ready" || h.status == "incomplete");
+        return std::string("{\"ok\":") + (gaveMetrics ? "true" : "false") +
                ",\"cached\":false" + anl_counts() +
                ",\"ms\":" + std::to_string(anlMs) +
                ",\"health\":" + healthJson + "}";

@@ -7634,6 +7634,87 @@ function qFmt(v, d) {
   if (v <= -299 && v > -1e6) return '不适用';   // −300 是"测不出"的哨兵值，不能显示成 −300 dB
   return v.toFixed(d === undefined ? 2 : d);
 }
+// ============================================================================
+// 音质 19 项：素材分类 + 显隐判据（2026-10-27 置信度审查，见 build-qc/quality_confidence_report.md §3/§5）
+// ----------------------------------------------------------------------------
+// 一条原则：**没有有效音频的素材不该给出一整套"看起来有效"的 0 值**；跨段落/跨采样率不可比的
+// 指标不该裸着数值出现。这里只做"分类 + 显隐 + 限定词"，算法与字段全部来自后端（quality.h 的
+// 19 项），前端一个数都不改，也不重算 —— 判据、口径、实测数据都在 quality.h 的文件头里。
+// ============================================================================
+function qualFacts(h, path) {
+  var q = (h && h.quality) || {};
+  var fs = Number(h && h.fs) || 0;
+  var p = String(path || (typeof ANL !== 'undefined' && ANL.cur) || '');
+  var available = !!q.available;
+  var peak = Number(q.peak_dbfs_q), rms = Number(q.rms_dbfs), crest = Number(q.crest_db);
+  var cen = Number(q.centroid_hz), roll = Number(q.rolloff95_hz), sil = Number(q.silence_pct);
+  // DSD 源（.dsf/.dff）或 DSD 化 PCM（352.8k / 705.6k 倍率）：噪声整形把重心推到 50–100 kHz、
+  // >10k 占比 ≈ 0 dB ⟹ 频响四项失去意义（实测 DSD 化素材 centroid 99.9 kHz、hf10k −0.02 dB）。
+  var dsd = /\.(dsf|dff)$/i.test(p) || fs >= 300000;
+  // ① 数字静音：峰值 ≤ −120 dBFS（−300 是"测不出"哨兵）；② 整轨都在 −60 dBFS 以下
+  //    （silence_pct ≈ 100 且 RMS ≤ −70）：库里那首 5.25 s「100% 静音」音轨 peak 只有 −59.7 dBFS、
+  //    RMS −91 dB —— 它是全库 >10k 占比最高的"文件"（−5.2 dB），正是这一条要挡的样本。
+  var silent = available && ((isFinite(peak) && peak <= -120) ||
+                             (sil >= 99.5 && isFinite(rms) && rms <= -70));
+  // ③ 纯直流：峰值因子 ≈ 0（peak == rms）且重心 < 100 Hz（实测 0.5 直流：crest 0.00、centroid 2 Hz）
+  var dc = available && !silent && isFinite(crest) && crest < 0.5 && isFinite(cen) && cen < 100 &&
+           isFinite(rms) && rms > -60;
+  // ④ 单点冲激：峰值因子 ≥ 40 dB（音乐到不了）且 95% 滚降 ≥ 0.4×采样率（能量摊到全带）
+  var impulse = available && !silent && !dc && isFinite(crest) && crest >= 40 && fs > 0 &&
+                isFinite(roll) && roll >= 0.4 * fs;
+  var noAudio = silent || dc || impulse;
+  var why = silent ? (isFinite(peak) && peak <= -120 ? '全静音（峰值 ≤ −120 dBFS）'
+                                                    : '整轨都低于 −60 dBFS（silence ' + sil.toFixed(1) + '%）')
+          : dc ? '纯直流（峰值因子 ≈ 0、谱重心 < 100 Hz）'
+          : impulse ? '单点冲激（峰值因子 ≥ 40 dB、95% 滚降 ≥ 0.4×采样率）' : '';
+  return {
+    q: q, fs: fs, available: available, dur: Number(h && h.duration_sec),
+    dsd: dsd, noAudio: noAudio, noAudioWhy: why,
+    spectralOk: available && !noAudio && fs >= 44100 && !dsd
+  };
+}
+
+// 谱四项（重心/倾斜/95% 滚降/>10k 占比）不展示的原因；空串 = 可以展示。
+function qualSpectralHide(F) {
+  if (!F.available) return '样本不足，未出结论';
+  if (F.noAudio) return '素材无有效音频：' + F.noAudioWhy;
+  if (F.dsd) return 'DSD / DSD 化素材：噪声整形把能量推到 50–100 kHz，四项无意义';
+  if (F.fs > 0 && F.fs < 44100) return '采样率 ' + (F.fs / 1000).toFixed(1) + ' kHz < 44.1 kHz：10 kHz 以上频段不存在';
+  return '';
+}
+
+// 削波口径（报告 §5）：**headline 只认 clippedRuns / longestClipRun**；clippedPct 是上界。
+// 「pct>0 但 runs=0」= 稀疏单点满幅（全库 110/655 首如此），必须说清不是连续削波。
+function qualClipText(q) {
+  var runs = Number(q.clipped_runs), pct = Number(q.clipped_pct), longest = Number(q.longest_clip_run);
+  if (isFinite(runs) && runs > 0) {
+    return { head: anlNum(runs, 0) + ' 段 · 最长 ' + anlNum(longest, 0) + ' 样本',
+             sub: anlNum(q.clipped_samples, 0) + ' 样本 / ' + anlNum(pct, 4) + ' %（上界，含单样本越限）',
+             sparse: false };
+  }
+  if (isFinite(pct) && pct > 0) {
+    return { head: '0 段 · 仅零星单样本越限，非连续削波',
+             sub: anlNum(q.clipped_samples, 0) + ' 样本 / ' + anlNum(pct, 4) + ' %（上界，含单样本越限）',
+             sparse: true };
+  }
+  return { head: '0 段', sub: '0 样本 / 0 %（上界，含单样本越限）', sparse: false };
+}
+
+// 立体声三项（报告 §3）：mono-in-stereo 与极性反相都必须有说明，不能只说"立体声正常"。
+function qualStereoText(q) {
+  if (!q || !q.stereo) return '非立体声（单声道或 >2 声道）';
+  var corr = Number(q.channel_corr), loss = Number(q.mono_loss_db), sm = Number(q.side_mid_db);
+  if (isFinite(corr) && corr > 0.99995 && isFinite(loss) && loss < 0.05) {
+    return '双声道但左右完全相同（等同单声道）';
+  }
+  var s = '相关 ' + anlNum(corr, 4) + ' / 单声道损失 ' + anlNum(loss, 2) + ' dB';
+  if (isFinite(loss) && loss >= 60 && isFinite(corr) && corr < -0.9) {
+    s += ' —— 可能是极性反相（老录音常见），不一定是错误';
+  }
+  if (isFinite(sm) && sm > -0.01 && sm < 0.01) s += ' —— side/mid = 0 dB：单边静音也会这样，不是"完全中置"';
+  return s;
+}
+
 function openQualityModal(path) {
   if (!path) { toast('没有可分析的曲目'); return; }
   openModal('分析音质', '<div class=empty>正在分析…（流式分块解码，曲越长越久）</div>');
@@ -7648,34 +7729,65 @@ function openQualityModal(path) {
       return '<tr><td style="color:var(--mut);padding:3px 10px 3px 0;white-space:nowrap">' + esc(label) +
              (hint ? tip(hint) : '') + '</td><td style="padding:3px 0;font-variant-numeric:tabular-nums">' + esc(String(val)) + '</td></tr>';
     }
+    var F = qualFacts(h, path);
+    var clip = qualClipText(q);
+    var specHide = qualSpectralHide(F);
     var html = '<div class=hint style="margin-bottom:8px">' + esc(path) + '</div>';
+    // 2.2（报告 §5「不该展示」）：全静音 / 纯直流 / 单点冲激 ⟹ 谱类与 SNR/峰值因子整段隐藏，
+    // 明确写「素材无有效音频」，而不是给出一整套漂亮的 0 值。
+    if (F.noAudio) {
+      html += '<div class=hint style="color:var(--warn,#e6a23c);line-height:1.6;margin:0 0 8px">' +
+              '素材无有效音频（' + esc(F.noAudioWhy) + '）：谱重心 / 倾斜 / 95% 滚降 / &gt;10k 占比 / ' +
+              '信噪比 / 峰值因子 均不展示。这类素材上它们会输出一整套"看起来有效"的 0 值。</div>';
+    }
     html += '<div style="display:flex;gap:18px;flex-wrap:wrap">';
     // 失真
+    // 2.1 IMD：主流程恒 imd_available=false（需显式双音素材）⟹ **整格去掉**，不再显示一行恒定的"不适用"。
+    // 2.8 THD+N：真实曲库 0/655 可用（全是 multi_peak）⟹ 音乐素材不展示；只有单基频（测试音）才出数，
+    //     并写明 16 bit 的可测下限（−94 dB@0 dBFS / −37 dB@−60 dBFS）。
     html += '<table style="font-size:12px"><tbody>'
-         +  row('THD+N（单基频）', q.thdn_available ? (qFmt(q.thdn_db) + ' dB') : ('不适用（' + (q.thdn_method || '') + '）'))
-         +  row('非谐波残留', qFmt(q.non_tonal_db) + ' dB', '16 个最强谱峰之外的能量占比 = 噪声/失真/有损残留的上界')
-         +  row('互调失真 IMD', q.imd_available ? (qFmt(q.imd_db) + ' dB') : (q.imd_note || '不适用'))
+         +  (q.thdn_available
+              ? row('THD+N（单基频测试音）', qFmt(q.thdn_db) + ' dB',
+                    '只在单基频素材（测试音）上成立。16 bit 的可测下限：0 dBFS → −94 dB、−60 dBFS → −37 dB；' +
+                    '拿 −60 dBFS 的测试音"证明 −100 dB"是假的')
+              : row('THD+N', '不展示（音乐素材无定义）',
+                    '真实曲库 0/655 可用：音乐没有可定义的基频（全部 multi_peak）⟹ 只在测试音场景显示'))
+         +  row('非谐波残留', qFmt(q.non_tonal_db) + ' dB',
+               '16 个最强谱峰之外的能量占比 = 噪声/失真/有损残留的上界（不是失真 dB；片段间相对极差约 10 dB）')
          +  '</tbody></table>';
     // 噪声 + 频响
     html += '<table style="font-size:12px"><tbody>'
-         +  row('本底噪声', qFmt(q.noise_floor_dbfs) + ' dBFS', '最低 10% 的 100 ms 块电平；密集音乐是本底的上界')
-         +  row('谱最小本底', qFmt(q.spectral_min_dbfs) + ' dBFS')
-         +  row('信噪比', qFmt(q.snr_db) + ' dB')
-         +  row('谱重心', qFmt(q.centroid_hz, 0) + ' Hz')
-         +  row('谱倾斜', qFmt(q.tilt_db_per_oct) + ' dB/oct')
-         +  row('95% 滚降点', qFmt(q.rolloff95_hz, 0) + ' Hz')
-         +  row('>10 kHz 占比', qFmt(q.hf_ratio_10k_db) + ' dB')
+         +  row('本底噪声', qFmt(q.noise_floor_dbfs) + ' dBFS',
+               '真实噪声上界：100 ms 块 P10 = 连续音乐里"最安静段落的那段音乐"的电平，不是器材噪声底')
+         +  row('谱最小本底', qFmt(q.spectral_min_dbfs) + ' dBFS', '诊断用：平稳噪声准，密集音乐偏高')
+         +  (F.noAudio ? '' : row('信噪比', qFmt(q.snr_db) + ' dB', '相对同曲版本可比，不是器材信噪比指标'))
+         +  (specHide
+              ? row('谱类四项', '不展示 —— ' + specHide,
+                    '谱重心 / 谱倾斜 / 95% 滚降 / >10k 占比在这类素材上没有意义')
+              : (row('谱重心', qFmt(q.centroid_hz, 0) + ' Hz',
+                     '同一首不同段落可差 1.8×，跨版本比较必须同段')
+                 + row('谱倾斜', qFmt(q.tilt_db_per_oct) + ' dB/oct', '同一首不同段落会变，跨版本比较必须同段')
+                 + row('95% 滚降点', qFmt(q.rolloff95_hz, 0) + ' Hz', '同一首不同段落会变（20 s vs 60 s 差 13%）')
+                 + row('>10 kHz 占比', qFmt(q.hf_ratio_10k_db) + ' dB',
+                       '同一首不同段落可差 10 dB；低电平素材的下限被量化噪声抬高（−20 dBFS → −83 dB）')))
          +  '</tbody></table>';
     // 削波 + 动态 + 立体声
     html += '<table style="font-size:12px"><tbody>'
          +  row('峰值 / RMS', qFmt(q.peak_dbfs_q) + ' / ' + qFmt(q.rms_dbfs) + ' dBFS')
-         +  row('削波样本', qFmt(q.clipped_samples, 0) + '（' + qFmt(q.clipped_pct, 4) + '%）')
-         +  row('削波段数', qFmt(q.clipped_runs, 0) + ' 段，最长 ' + qFmt(q.longest_clip_run, 0) + ' 样本')
-         +  row('峰值因子', qFmt(q.crest_db) + ' dB')
-         +  row('动态 P95−P10', qFmt(q.dyn_p95_p10_db) + ' dB')
+         +  row('削波段数（判据）', clip.head, '只有 clippedRuns / longestClipRun 能当"真削波"的判据（连续 ≥3 样本）')
+         +  row('削波占比（上界）', clip.sub, '门限 0.999 = −0.0087 dBFS：合法满幅正弦也会被计入 ⟹ 只能当上界')
+         +  (F.noAudio ? '' : row('峰值因子', qFmt(q.crest_db) + ' dB', '峰值 − RMS；全静音/纯直流会是 0 dB'))
+         +  ((F.dur > 0 && F.dur < 6)
+              ? row('动态 P95−P10', '不展示（素材 < 6 s）', '3 s 块至少要 2 块，短素材恒为 0')
+              : row('动态 P95−P10', qFmt(q.dyn_p95_p10_db) + ' dB',
+                    (Number(q.silence_pct) > 5
+                      ? '含数字静音，动态值偏大（silence ' + qFmt(q.silence_pct, 1) + '% 低于 −60 dBFS）；' : '')
+                    + '段落间起伏，跨曲目不可直接比'))
          +  row('动态重心', qFmt(q.dyn_centroid_dbfs) + ' dBFS')
-         +  row('静态段占比', qFmt(q.silence_pct) + ' %')
-         +  row('声道相关 / 单声道损失', q.stereo ? (qFmt(q.channel_corr, 3) + ' / ' + qFmt(q.mono_loss_db) + ' dB') : '非立体声')
+         +  row('静态段占比', qFmt(q.silence_pct) + ' %', '低于 −60 dBFS 的 100 ms 块占比')
+         +  row('声道相关 / 单声道损失', qualStereoText(q),
+               'corr=1.0000 且损失 ≈ 0 ⟹ 左右完全相同（等同单声道），不是"立体声正常"；'
+               + 'corr < −0.9 且损失 ≥ 60 dB ⟹ 可能是极性反相（老录音常见），不一定是错误')
          +  '</tbody></table>';
     html += '</div>';
     html += '<div class=hint style="margin-top:10px">体检老字段：DR ' + qFmt(h.dr_db) + ' dB ｜ LUFS ' + qFmt(h.lufs) +
@@ -7745,6 +7857,9 @@ function renderCompare(r) {
     if (!isFinite(hz) || hz <= 0) return '—';
     return (hz / 1000).toFixed(1) + ' kHz';
   }
+  // 2026-10-27：这一条只说明「经过编码器」，**不再是「扣 12 分」的同义词** ——
+  // 后端的扣分拆成两笔（带宽损失按 Hz、编解码损伤按陡沿×置信度×截止离奈奎斯特的距离），
+  // 320k（截止约 0.92×奈奎斯特）那档的编解码损伤会小到 2~3 分，128k 才是满额 12 分。
   function lossyTag(v) {
     if (!v || !v.lossySuspected) return '';
     return ' <span style="color:var(--err);font-weight:650">［有损转码（截止 ' + bwTxt(v) + '）］</span>';
@@ -7753,24 +7868,68 @@ function renderCompare(r) {
   var topV = vs[topIdx] || {};
   var anyClean = false;
   vs.forEach(function (v) { if (v && !v.lossySuspected) anyClean = true; });
-  // 第一名仍是「疑似有损」⟹ 红字警告（正常情况不该出现：带宽维度 + 有损固定罚应把它压下去）
+  // 第一名仍是「疑似有损」⟹ 红字警告（正常情况不该出现：带宽损失 + 编解码损伤应把它压下去）
   if (topV.lossySuspected && anyClean) {
     h += '<div style="color:var(--err);font-weight:650;margin:0 0 8px;line-height:1.5">' +
          '⚠ 排序第 1 的 ' + esc(topV.label || '') + ' 是疑似有损转码（截止 ' + esc(bwTxt(topV)) +
          '），却排在没有该标记的版本之前：评分权重可能失效，请勿据此选版本。</div>';
   }
+  // 对齐可信度（2026-10-27 DEBUG 增补，只加限定词）：相关值必须露在名次旁边 ——
+  // 0.45~0.70 只是「像同一首」（母带/剪辑不同也会落在这里），只有后端 explanation 里写一句
+  // 用户基本看不到；而名次是拿来当结论的，可信度必须和名次同时出现。
+  var corr = Number(r.sameTrackCorr);
+  if (isFinite(corr)) {
+    h += '<div class="hint" style="margin:0 0 6px">对齐相关 ' + esc(corr.toFixed(3)) +
+         '（≥0.45 才判同曲）' + ((corr < 0.70) ? ' —— 偏低：母带/剪辑可能不同，结论仅供参考' : '') + '</div>';
+  }
   h += '<div style="font-weight:650;margin-bottom:4px">排序（好 → 差）</div><ol style="margin:0 0 8px 18px;padding:0">';
+  var prevScore = null;
   (r.ranking || []).forEach(function (i) {
     var v = vs[i] || {};
+    // 分差 <1 分：这套指标的测量噪声就有这个量级（实测同一内容只差前导静音 0.20 分、
+    // 48k 往返一次 0.67 分），所以名次在这里没有意义 —— 必须在界面上说出来，否则
+    // 「V3 100.0 > V1 99.4」会被读成音质高低。
+    var gapNote = '';
+    if (prevScore !== null && isFinite(v.score)) {
+      var g = prevScore - Number(v.score);
+      if (g >= 0 && g < 1.0)
+        gapNote = ' <span style="color:var(--warn,#e6a23c);font-size:11px">与上一名仅差 ' +
+                  g.toFixed(2) + ' 分 · 差异可忽略</span>';
+    }
+    if (isFinite(v.score)) prevScore = Number(v.score);
+    // 前导静音/整体偏移：对齐结论是"公共区段"的前提，露出来便于核对
+    var lagNote = '';
+    var lg = Number(v.lagSec);
+    if (isFinite(lg) && Math.abs(lg) >= 0.005)
+      lagNote = ' <span style="color:var(--mut2);font-size:11px">前导' + (lg > 0 ? '+' : '') +
+                lg.toFixed(2) + ' s 已对齐</span>';
     h += '<li>' + esc(v.label || ('#' + i)) + ' <span style="color:var(--mut)">' + esc(vName(v, i)) + '</span>' +
          ' — <b>' + qFmt(v.score, 1) + '</b> 分' +
          ' <span style="color:var(--mut2);font-size:11px">带宽 ' + esc(bwTxt(v)) + '</span>' +
-         lossyTag(v) +
+         lagNote + lossyTag(v) + gapNote +
          (v.error ? (' <span style="color:var(--err)">' + esc(v.error) + '</span>') : '') + '</li>';
   });
   h += '</ol>';
+  // 不可比项：表格里已灰显 + 行首 tip，这里给一个总数，避免用户以为"所有指标都参与了打分"
+  var nNotComp = 0;
+  rows.forEach(function (row) { if (row && !row.comparable) ++nNotComp; });
+  if (nNotComp > 0) {
+    h += '<div class="hint" style="margin:0 0 6px">' + nNotComp +
+         ' 项指标不可比（表内灰显，鼠标移到指标名上看原因），它们不参与评分</div>';
+  }
   if (!anyClean && vs.length) {
     h += '<div class=hint style="color:var(--warn,#e6a23c)">本批次所有版本都带「有损」标记 ⟹ 排序只在有损版本之间有效（带宽维度全员同罚，不影响名次）。</div>';
+  }
+  // 扣分口径说明（2026-10-27 P1 修复）：用户最容易误读的就是「有损 ⟹ 一律 −12」。
+  // 现在两笔罚的是不同性质的损失，且后一笔在截止接近奈奎斯特时自动变小 —— 必须在界面上讲清，
+  // 否则「320k 只比无损低几分」会被读成"工具漏判了"。
+  if (vs.some(function (v) { return v && v.cutoffDetected; })) {
+    h += '<div class=hint style="margin:0 0 6px">有损版本的扣分拆两笔（不重复罚同一个截止值）：' +
+         '<b>带宽损失</b> 按「缺了多少频谱」连续折算；<b>编解码损伤</b> 最多 12 分，' +
+         '按编码器级陡沿 × 置信度 × 截止离奈奎斯特的距离平滑折算 —— ' +
+         '128k（截止约 0.76×奈奎斯特）吃满额，320k（约 0.92×）只剩 2~3 分，' +
+         '接近奈奎斯特时归零。' +
+         '（这两笔都只看信号本身，不看扩展名/码率。轻度的谐波失真本页测不出，见已知缺陷说明。）</div>';
   }
   h += '<div style="max-height:40vh;overflow:auto"><table style="font-size:11.5px;border-collapse:collapse;width:100%">';
   h += '<thead><tr><th style="text-align:left;padding:3px 8px 3px 0">指标</th>';
@@ -7805,9 +7964,11 @@ function renderCompare(r) {
 // 音乐上，播放就自动运行一次分析，在单曲播放页面上放置入口展示（动态、音质、假无损）。」
 //
 // 落点：单曲页 #npAnal（markup 与 CSS 见 ui_page.h），三类各一块：
-//   ① 动态   —— TT DR / R128 LUFS / LRA / 峰值
+//   ① 动态   —— TT DR / R128 LUFS / LRA / 样本峰值 / 真峰(dBTP，2026-10-27 加)
 //   ② 音质   —— 削波 / 谱重心 / 信噪比 / THD+N（THD+N 对音乐素材通常「不适用」，如实显示）
-//   ③ 假无损 —— 判定（疑似/未发现）+ 截止频率 + 置信度 + 后端给的中文理由
+//   ③ 假无损 —— 判定【四档：疑似有损 / 带宽受限（不判假）/ 证据不足 / 未发现】
+//               + 截止 + 陡沿(dB) + 置信度 + 谱窗数，并把后端 reason 与三条前置限定词显示在卡上
+//               （2026-10-27 修复轮：旧版只有「未发现转码痕迹」绿字，会被读成"文件是好的"）
 // 数据源只有一个：GET /api/health?file=…（后端 track_health_json：一次解码出三份结论）。
 //
 // 自动触发（anlUpdateCur，由 400 ms 的 tick() 驱动）：
@@ -7884,20 +8045,73 @@ function anlDynLine(h) {
 function anlQualLine(h) {
   var q = h.quality || {};
   if (!q.available) return { t: '样本不足，未出结论', c: 'mut' };
+  var F = qualFacts(h);
+  // 2.2：素材无有效音频 ⟹ 一句话说清，不再给"干净 · 无明显削波"这种正面结论。
+  if (F.noAudio) return { t: '素材无有效音频 · 谱类与 SNR 不展示', c: 'mut' };
   // ⚠️ 这里**不能**拿 snr_db 判"底噪大"：quality.h 的定义是「全轨 RMS − 本底（最低 10% 块电平）」，
   // 对压缩过的流行乐天然只有 15~20 dB —— 那是动态小，不是噪声大。第一版写成"本底偏高·噪声大"
   // 对着一首干净的 FLAC 报噪声（实测踩到），已删除该分支。
-  if ((q.clipped_pct || 0) >= 0.01) return { t: '有数字削波 · 母带压过头', c: 'warn' };
-  if ((q.hf_ratio_10k_db || 0) < -40) return { t: '高频偏少 · 可能被低通/有损', c: '' };
-  if ((q.centroid_hz || 0) > 0 && q.centroid_hz < 700) return { t: '偏闷 · 能量集中在低频', c: '' };
+  // 2.4：headline **只认 clippedRuns**（连续 ≥3 样本）。clippedPct 是上界（含单样本越限），
+  //      以前「pct ≥ 0.01 就报削波」会把 110/655 首稀疏单点满幅曲目误判成削波。
+  var clip = qualClipText(q);
+  if (Number(q.clipped_runs) > 0) return { t: '有数字削波 ' + clip.head + ' · 母带压过头', c: 'warn' };
+  if (clip.sparse) return { t: '仅零星单样本越限，非连续削波', c: '' };
+  // 2.3：mono-in-stereo 必须说出来（库内 4 首 corr=1.0000），不能说成"立体声正常"。
+  if (q.stereo && Number(q.channel_corr) > 0.99995 && Number(q.mono_loss_db) < 0.05) {
+    return { t: '双声道但左右完全相同（等同单声道）· 无真立体声内容', c: '' };
+  }
+  if (q.stereo && Number(q.mono_loss_db) >= 60 && Number(q.channel_corr) < -0.9) {
+    return { t: '左右极性相反（可能是老录音的真实极性，不一定是错误）', c: 'warn' };
+  }
+  if (F.spectralOk && (q.hf_ratio_10k_db || 0) < -40) return { t: '高频偏少 · 可能被低通/有损', c: '' };
+  if (F.spectralOk && (q.centroid_hz || 0) > 0 && q.centroid_hz < 700) return { t: '偏闷 · 能量集中在低频', c: '' };
   return { t: '干净 · 无明显削波', c: 'ok' };
 }
+// ③ 假无损的一句话（2026-10-27 修复轮）：**不再只给绿/红两个字**
+// 后端 fake_verdict 四档，且每档都把判据量写在脸上（报告 §3「会误导用户的具体说法」）：
+//   lossy        「疑似有损转码 · 截止 16.6 kHz、下降 40 dB」
+//   band_limited 「有效带宽受限 19.9 kHz · 母带低通/升频，不判假」
+//   unclear      「证据不足 · 素材过短（0.60 s）」/「… 置信度 43% < 50%」
+//   none         「未发现 · 检出 21.0 kHz、下降 18 dB、置信 45% ⟹ 不构成判据」
+// 旧版只有「未发现转码痕迹」+ 绿字，用户会读成"这文件是好的"。
 function anlFakeLine(h) {
-  if (h.lossless_suspected) {
-    return { t: '疑似有损转码 · 截止 ' + (h.cutoff_hz > 0 ? (h.cutoff_hz / 1000).toFixed(1) + ' kHz' : '未知'),
-             c: 'warn' };
+  var v = h.fake_verdict || (h.lossless_suspected ? 'lossy' : 'none');
+  var cutHz = Number(h.cutoff_hz) || 0;
+  var cut = cutHz > 0 ? (cutHz / 1000).toFixed(1) : '';
+  var conf = Math.round((Number(h.confidence) || 0) * 100);
+  var edge = Math.round(Number(h.edge_db) || 0);
+  var fill = (typeof h.window_fill === 'number') ? Number(h.window_fill) : 1;
+  var dur = Number(h.duration_sec) || 0;
+  var durTxt = dur > 0 ? ((dur < 10 ? dur.toFixed(2) : dur.toFixed(1)) + ' s') : '很短';
+  if (v === 'lossy') {
+    return { t: '疑似有损转码 · 截止 ' + (cut || '?') + ' kHz、下降 ' + edge + ' dB', c: 'warn' };
   }
-  return { t: '未发现转码痕迹', c: 'ok' };
+  if (v === 'band_limited') {
+    return { t: '有效带宽受限 ' + cut + ' kHz · 母带低通/升频，不判假', c: '' };
+  }
+  if (v === 'unclear') {
+    if (fill < 0.5) return { t: '证据不足 · 素材过短（' + durTxt + '），不构成判据', c: 'mut' };
+    return { t: '证据不足 · 置信度 ' + conf + '% < 50%，检出 ' + (cut || '?') + ' kHz', c: 'mut' };
+  }
+  if (!(cutHz > 0)) return { t: '未发现转码痕迹 · 未检出频谱截止（满带宽）', c: 'ok' };
+  return { t: '未发现转码痕迹 · 检出 ' + cut + ' kHz、下降 ' + edge + ' dB、置信 ' + conf + '% ⟹ 不构成判据',
+           c: (conf >= 40 ? 'mut' : 'ok') };
+}
+
+// ③ 假无损卡底部的限定词行（把后端 reason + 三条前置限定词摊开，原来是看不到的）
+function anlFakeNote(h) {
+  var parts = [];
+  var fill = (typeof h.window_fill === 'number') ? Number(h.window_fill) : 1;
+  var win = Number(h.spectral_windows) || 0;
+  var dur = Number(h.duration_sec) || 0;
+  var conf = Math.round((Number(h.confidence) || 0) * 100);
+  var durTxt = dur > 0 ? ((dur < 10 ? dur.toFixed(2) : dur.toFixed(1)) + ' s') : '很短';
+  if (fill > 0 && fill < 0.5) parts.push('素材过短（' + durTxt + '，谱窗仅 ' + Math.round(fill * 100) + '% 有实样）只作参考');
+  else if (fill > 0 && fill < 0.999) parts.push('素材偏短（' + durTxt + '），置信度已打折');
+  if (win === 1) parts.push('仅 1 个谱窗');
+  if (conf >= 40 && conf < 50) parts.push('置信度擦线（' + conf + '% ≈ 50% 阈值）');
+  var head = parts.length ? ('【' + parts.join(' · ') + '】 ') : '';
+  return head + String(h.reason || '');
 }
 
 // 指标格：2 列 × N 行，每格 = 指标名 + 数值 + 单位（人话解释进 title，与旧「分析」页口径一致）
@@ -7910,38 +8124,115 @@ function anlKV(rows) {
   });
   return h + '</div>';
 }
-function anlCardHtml(id, title, sub, line, kv) {
+function anlCardHtml(id, title, sub, line, kv, note) {
   return '<div class=npanal-card id=' + id + '>' +
          '<div class=ct>' + esc(title) + '<i>' + esc(sub) + '</i></div>' +
-         '<div class="npanal-verdict ' + (line.c || '') + '">' + esc(line.t) + '</div>' + kv + '</div>';
+         '<div class="npanal-verdict ' + (line.c || '') + '">' + esc(line.t) + '</div>' + kv +
+         (note ? '<div class=hint style="margin-top:6px;line-height:1.55">' + esc(note) + '</div>' : '') +
+         '</div>';
+}
+
+// 半截文件警示条（BUG-3，2026-10-27 修复轮）。
+// 后端把「容器声明时长 ≫ 实际解码时长」的文件从 ready 降为 status="incomplete"，原因写进 h.note；
+// ok 仍然是 true（**指标照给**，这不是失败），所以这里不是错误分支而是**黄色提示 + 照常出数**。
+// 为什么必须显示：实测把 FLAC 截到 50% 后，dur=14.942 s（真值 32.046 s），DR/LUFS/LRA 三项
+// 全都"看起来正常"；用户若在拷贝/下载过程中分析，会拿到一份只有一半的结论而毫不知情。
+function anlIncompleteHtml(h) {
+  if (!h || !(h.incomplete === true || h.status === 'incomplete')) return '';
+  var d = Number(h.declared_sec) || 0, a = Number(h.duration_sec) || 0;
+  var txt = h.note || ('文件可能不完整：容器声明 ' + d.toFixed(3) + ' s，实际解码 ' + a.toFixed(3) + ' s');
+  return '<div class=npanal-card id=npAnlWarn style="grid-column:1/-1;' +
+         'border-color:var(--warn,#e6a23c);background:rgba(230,162,60,.10)">' +
+         '<div class=ct style="color:var(--warn,#e6a23c)">⚠ 文件可能不完整' +
+         '<i>只分析了已存在的部分</i></div>' +
+         '<div class="npanal-verdict warn" style="color:var(--warn,#e6a23c)">' + esc(txt) + '</div>' +
+         (d > 0 ? ('<div class=hint style="line-height:1.55">容器声明 ' + d.toFixed(3) +
+                   ' s ／ 实际可解码 ' + a.toFixed(3) + ' s（' + (100 * a / d).toFixed(1) + '%）' +
+                   '　·　等拷贝/下载完成后再点一次「重新分析」就会恢复正常</div>') : '') +
+         '</div>';
 }
 
 // 三类结果 → 三个卡的 HTML（单曲页分析条与右键「查看分析」弹窗**共用**这一个渲染器）
-function anlCardsHtml(h) {
+// path：可选的曲目路径，只用于判断"DSD 源"（.dsf/.dff）；缺省时用 ANL.cur。
+function anlCardsHtml(h, path) {
   var q = (h && h.quality) || {};
+  var F = qualFacts(h, path);
+  var clip = qualClipText(q);
+  // ① 动态（2026-10-27 修复轮）：峰值一拆两格 —— 「样本峰值」永远是样本点上的值（≤0 dBFS），
+  //   真的判断过载要看 4× 过采样「真峰 dBTP」。标定实测 09_reverie 样本峰 0.00、真峰 +2.5，
+  //   旧界面只显示 0.00 dBFS 会把"过载 2.5 dB"说成"刚好满幅"（报告 §5）。
+  var tp = Number(h.true_peak_dbtp);
+  var tpCell = ['真峰', anlNum(h.true_peak_dbtp, 2), 'dBTP',
+                '4× 过采样算出的样本间真峰（dBTP）。样本峰永远 ≤ 0 dBFS，真峰可以 > 0 —— 判"母带是否过载"只能看这一格'];
+  var dynNote = '';
+  if (isFinite(tp) && Number(h.peak_dbfs) > -299 && tp > -0.05) {
+    dynNote = '真峰 ' + (tp > 0 ? '+' : '') + tp.toFixed(2) + ' dBTP ⟹ 母带已过载'
+            + (tp > 0.3 ? '（样本之间超出满幅 ' + tp.toFixed(1) + ' dB，重采样/加 EQ 后会削波）' : '')
+            + '；样本峰值 ' + anlNum(h.peak_dbfs, 2) + ' dBFS 只反映样本点';
+  }
   var dyn = anlCardHtml('npAnlDyn', '① 动态', 'TT DR / R128', anlDynLine(h), anlKV([
-    ['DR', anlNum(h.dr_db, 1), 'dB', 'TT 动态范围：最响与最轻段落的电平差（同一母带内越大越活，跨曲目不可直接比）'],
+    ['DR', anlNum(h.dr_db, 1), 'dB', 'TT 动态范围：最响与最轻段落的电平差（同一母带内越大越活，跨曲目不可直接比）。' +
+                                  '多声道素材取【较低声道】（保守口径）'],
     ['LUFS', anlNum(h.lufs, 1), 'LUFS', 'EBU R128 积分响度；−14 左右是常见投放目标'],
     ['LRA', anlNum(h.lra, 1), 'LU', 'R128 响度范围：段落间起伏，越大动态越丰富'],
-    ['峰值', anlNum(h.peak_dbfs, 2), 'dBFS', '采样峰值；超过 −1 dBFS 的母带在重采样后容易削波']
-  ]));
-  var qual = anlCardHtml('npAnlQual', '② 音质', '客观指标', anlQualLine(h), anlKV([
-    ['削波', q.available ? (anlNum(q.clipped_samples, 0) + ' / ' + anlNum(q.clipped_pct, 3) + '%') : '—', '样本',
-     '数字满幅削波的样本数与占比（母带"糊"的常见来源）'],
-    ['谱重心', q.available ? anlNum(q.centroid_hz, 0) : '—', 'Hz', '能量重心的频率位置：越低越闷，越高越亮/刺'],
-    ['信噪比', q.available ? anlNum(q.snr_db, 1) : '—', 'dB', '全轨 RMS 减本底（最低 10% 的 100 ms 块电平）；压缩过的流行乐天然只有 15~25 dB，别当设备信噪比看'],
-    ['THD+N', (q.available && q.thdn_available) ? anlNum(q.thdn_db, 1) : '不适用', (q.available && q.thdn_available) ? 'dB' : '',
-     '单基频总谐波失真+噪声；音乐素材通常测不出，所以给「不适用」而不是编一个数']
-  ]));
+    ['样本峰值', anlNum(h.peak_dbfs, 2), 'dBFS', '只看样本点的峰值，永远 ≤ 0 dBFS；不能用来判是否过载（看下一格）'],
+    tpCell
+  ]), dynNote);
+  // ② 音质（2026-10-27 置信度审查后的口径）：
+  //   * 2.1 IMD 不在卡里（主流程恒不可用）；
+  //   * 2.4 削波 headline 只认段数；占比一律标「上界，含单样本越限」，稀疏单点越限要说清；
+  //   * 2.2 无有效音频 ⟹ 谱类/SNR/峰值因子不出现，改为一句「素材无有效音频」；
+  //   * 2.8 THD+N 音乐素材不展示（0/655 可用），只有单基频素材才多一格；
+  //   * 2.6 谱四项在 fs < 44.1k / DSD 化素材上直接隐藏，并给"跨段落可差 1.8×/10 dB"的范围提示。
+  var qualCells = [];
+  if (!q.available) {
+    qualCells.push(['状态', '样本不足', '', '素材太短，未出结论']);
+  } else {
+    if (F.noAudio) qualCells.push(['素材', '无有效音频', '', F.noAudioWhy + ' —— 这种素材上谱类指标会输出一整套"看起来有效"的 0 值']);
+    qualCells.push(['削波', clip.head, '',
+                    '判据（段数）：连续 ≥3 样本 ≥ −0.0087 dBFS 才算一段；' + clip.sub]);
+    if (!F.noAudio) qualCells.push(['峰值因子', anlNum(q.crest_db, 1), 'dB', '峰值 − RMS；派生量，全静音/纯直流会是 0 dB']);
+    var specWhy = qualSpectralHide(F);
+    if (specWhy) {
+      qualCells.push(['谱类四项', '不展示', '', specWhy + '（谱重心 / 倾斜 / 95% 滚降 / >10k 占比）']);
+    } else {
+      qualCells.push(['谱重心', anlNum(q.centroid_hz, 0), 'Hz',
+                      '能量重心的频率位置。同一首不同段落可差 1.8×，跨版本比较必须同段']);
+      qualCells.push(['>10k', anlNum(q.hf_ratio_10k_db, 1), 'dB',
+                      '同一首不同段落可差 10 dB；低电平素材的下限被量化噪声抬高 ⟹ 跨版本比较必须同段']);
+    }
+    if (!F.noAudio) {
+      qualCells.push(['信噪比', anlNum(q.snr_db, 1), 'dB',
+                      '相对同曲版本可比，不是器材信噪比指标（本底 = 100 ms 块 P10 = 最安静段落的音乐电平）']);
+    }
+    if (q.thdn_available) {
+      qualCells.push(['THD+N', anlNum(q.thdn_db, 1), 'dB',
+                      '只在单基频（测试音）上成立；16 bit 可测下限 −94 dB@0 dBFS / −37 dB@−60 dBFS']);
+    }
+    if (q.stereo && Number(q.channel_corr) > 0.99995 && Number(q.mono_loss_db) < 0.05) {
+      qualCells.push(['立体声', '左右完全相同', '', '双声道但左右样本完全相同 = 等同单声道（库内 4 首如此），不是"立体声正常"']);
+    }
+  }
+  var qual = anlCardHtml('npAnlQual', '② 音质', '客观指标', anlQualLine(h), anlKV(qualCells));
+  // ③ 假无损的「判定」格改成四档文字（不再只有 疑似有损 / 未发现 两种），并把 reason 显示到卡上，
+  //   另加「陡沿」一格 —— 它才是判有损的核心量，报告 §3 里"检出但边沿不陡"的场合全靠它说清。
+  var VERD = { lossy: '疑似有损', band_limited: '带宽受限（不判假）', unclear: '证据不足', none: '未发现' };
+  var fv = h.fake_verdict || (h.lossless_suspected ? 'lossy' : 'none');
+  var win = Number(h.spectral_windows) || 0;
   var fake = anlCardHtml('npAnlFake', '③ 假无损', '有损转码检测', anlFakeLine(h), anlKV([
-    ['判定', h.lossless_suspected ? '疑似有损' : '未发现', '', '按截止频率 + 谱峭壁 + 高频能量联合判断；"未发现"不等于绝对无损'],
+    ['判定', VERD[fv] || VERD.none, '', '按截止位置（相对奈奎斯特）+ 谱峭壁 + 置信度联合判断：' +
+     '截止 <78% ⟹ 疑似有损；78%~95% ⟹ 有效带宽受限（母带低通/升频，不判假）；"未发现"不等于绝对无损'],
     ['截止', h.cutoff_hz > 0 ? (h.cutoff_hz / 1000).toFixed(1) : '未检出', h.cutoff_hz > 0 ? 'kHz' : '',
      '能量真正结束的位置；CD 无损可到 ~20 kHz，128 kbps MP3 常在 15~16 kHz 断崖。未检出 = 没有明显陡沿，不是"没有高频"'],
-    ['置信度', anlNum((h.confidence || 0) * 100, 0), '%', '判定强度；低置信度时只当参考'],
+    ['陡沿', h.edge_db > 0 ? Math.round(h.edge_db) : '—', h.edge_db > 0 ? 'dB' : '',
+     '截止处 1/6 倍频程的能量落差（各谱窗取中位数）。>12 dB 才算陡；编码器实测 26~60 dB，老录音自然滚降只有 10~20 dB'],
+    ['置信度', anlNum((h.confidence || 0) * 100, 0), '%',
+     '判定强度（陡沿深度 × 各谱窗一致率）；<50% 时不给确定结论' + (win ? ('；本次用了 ' + win + ' 个谱窗') : '')],
     ['格式', (h.bits || '—') + ' bit', h.fs ? (h.fs >= 1000 ? (h.fs / 1000).toFixed(1) + ' kHz' : h.fs + ' Hz') : '',
      '容器里声明的位深 / 采样率（不等于母带质量）；另：fake24 标记 = 标称 24 bit 但有效位深不足']
-  ]));
-  return dyn + qual + fake;
+  ]), anlFakeNote(h));
+  // 不完整警示条排在最前：用户先看到"这份结论只有一部分"，再去看数字（顺序即语义）
+  return anlIncompleteHtml(h) + dyn + qual + fake;
 }
 
 // 骨架（分析中）：三块**保留各自的标题**（动态/音质/假无损），只把数字换成灰条 ——
@@ -8001,7 +8292,7 @@ function anlPaint(full) {
   }
   if (full === false) return;      // 心跳只刷状态行
   if (busy) { grid.innerHTML = anlSkeletonHtml(); return; }
-  if (h) { grid.innerHTML = anlCardsHtml(h); return; }
+  if (h) { grid.innerHTML = anlCardsHtml(h, p); return; }
   if (!p) { grid.innerHTML = anlEmptyHtml('还没有在播放 · 播放一首本地曲目就会自动分析（动态 / 音质 / 假无损）'); return; }
   if (ANL.err) { grid.innerHTML = anlEmptyHtml('分析失败：' + ANL.err); return; }
   if (!ANL.auto) {
@@ -8105,7 +8396,7 @@ function openHealthModal(path) {
         (took >= 1000 ? (took / 1000).toFixed(2) + ' s' : took + ' ms') +
         (j.cached ? '（后端缓存命中）' : '（本次新算）') +
         (h.reason ? '　·　' + esc(h.reason) : '') + '</div>' +
-      '<div style="display:grid;grid-template-columns:1fr;gap:10px">' + anlCardsHtml(h) + '</div>';
+      '<div style="display:grid;grid-template-columns:1fr;gap:10px">' + anlCardsHtml(h, path) + '</div>';
   }).catch(function (e) {
     D('mbody').innerHTML = '<div class=empty>分析失败：' + esc(e && e.message ? e.message : e) + '</div>';
   });
@@ -9872,6 +10163,43 @@ function dropFiles(e) {
 D('bRep').onclick = cycleRep;
 // 快捷面板 #sRep 被别处改动（如设置页保存）时，图标状态也要跟上
 if (D('sRep')) D('sRep').addEventListener('change', function () { applyRep(this.value); });
+
+/* ---------------- 搜索框占位符（BUG-2：窄窗不许硬裁） ----------------
+   2026-10-27 真窗口扫描：960 宽时顶栏搜索框只剩 ~125px，长占位「搜索专辑 / 艺术家 / 曲目…」
+   被裁在字符中间（截图上是「搜索专辑 / 艺」），且 input 的 placeholder 天然没有省略号。
+   判据不用魔法断点：量一下"这行字实际多宽"，装不下才换短文案（换字号/DPI/主题都不会误判）。 */
+function phTextWidth(q, txt) {
+  var m = D('phMeasure');
+  if (!m) {
+    m = document.createElement('span');
+    m.id = 'phMeasure';
+    m.style.cssText = 'position:absolute;left:-9999px;top:-9999px;visibility:hidden;' +
+                      'white-space:nowrap;pointer-events:none';
+    document.body.appendChild(m);
+  }
+  var cs = getComputedStyle(q);
+  m.style.font = cs.font || '';
+  m.style.fontSize = cs.fontSize;
+  m.style.fontFamily = cs.fontFamily;
+  m.style.letterSpacing = cs.letterSpacing;
+  m.textContent = txt;
+  return m.offsetWidth || 0;
+}
+function syncSearchPh() {
+  var q = D('q');
+  if (!q) return;
+  var FULL = '搜索专辑 / 艺术家 / 曲目…', SHORT = '搜索…';
+  var cs = getComputedStyle(q);
+  var avail = (q.clientWidth || 0) - (parseFloat(cs.paddingLeft) || 0) -
+              (parseFloat(cs.paddingRight) || 0) - 2;   // -2：左右边框
+  var need = phTextWidth(q, FULL);
+  var ph;
+  if (need > 0 && avail > 0) ph = (avail >= need) ? FULL : SHORT;
+  else ph = ((window.innerWidth || 0) < 1100) ? SHORT : FULL;   // 量不出来时的兜底
+  if (q.placeholder !== ph) q.placeholder = ph;
+}
+syncSearchPh();
+window.addEventListener('resize', syncSearchPh);
 
 /* ---------------- 启动 ---------------- */
 bindTips();           // #6（261027-03）：? 帮助浮层改由固定层统一出，启动时挂一次事件委托

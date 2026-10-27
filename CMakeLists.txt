@@ -680,6 +680,17 @@ add_executable(test_quality tests/test_quality.cpp)
 target_include_directories(test_quality PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME quality COMMAND test_quality)
 
+# B2 置信度专项（DEBUG）：19 项的重复性 / 有效动态范围 / 误报边界 / 说谎场景
+# 与 test_quality 的分工：那边证明"给定已知答案测得对"，这边量化"什么时候它会错"。
+add_executable(test_quality_confidence tests/test_quality_confidence.cpp)
+target_include_directories(test_quality_confidence PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME quality_confidence COMMAND test_quality_confidence)
+
+# B2 真实文件探针（不注册 add_test：依赖本机曲库；只读分析，不开音频设备）
+add_executable(quality_probe tools/quality_probe.cpp)
+target_link_libraries(quality_probe PRIVATE rtadsp)
+target_include_directories(quality_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # B3：同一首多版本对比（包络互相关对齐 / 可比性标注 / 加权排序 / 确定性解释）
 add_executable(test_version_compare tests/test_version_compare.cpp)
 target_link_libraries(test_version_compare PRIVATE rtadsp)
@@ -747,3 +758,41 @@ target_compile_definitions(test_replaygain PRIVATE RTA_RG_PROBE="$<TARGET_FILE:r
 add_dependencies(test_replaygain rg_probe)
 add_test(NAME replaygain COMMAND test_replaygain)
 
+# ==================== 2026-10-27 DEBUG 新增测试（主控统一登记） ====================
+# 来源：5 条 DEBUG 线（19 项置信度 / 假无损标定 / 版本对比稳定性 / 端到端 fuzz / 真窗口 UI）。
+# 每个测试都要能"失败"（铁律 3），不是只断言不崩。
+
+# 【health 契约】BUG-2：四种错误响应逐字段同构（65 条键路径）；
+# BUG-3：半截文件必须报 incomplete（容器声明时长 vs 实际解码时长）。
+# 缺省 SKIP（不读本机曲库）；带一个真 FLAC 路径参数可跑端到端。
+add_executable(test_health_completeness tests/test_health_completeness.cpp)
+target_include_directories(test_health_completeness PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME health_completeness COMMAND test_health_completeness)
+
+# 【health 健壮性】48 条断言：非法 UTF-8 / 缺失参数 / 目录 / 0 字节 / 假扩展名 / 超长路径。
+# 需要 psapi（内存与句柄统计）。
+add_executable(test_health_robust tests/test_health_robust.cpp)
+target_include_directories(test_health_robust PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_health_robust PRIVATE psapi)
+add_test(NAME health_robust COMMAND test_health_robust)
+
+# 【版本对比稳定性】§1 确定性 / §2 容器互换 Δ=0 / §3 对齐 / §4 不同录音拒绝 / §5 可比性 /
+# §6 分差<1 提示 / §7 第 8 维带宽。
+add_executable(test_version_compare_stability tests/test_version_compare_stability.cpp)
+target_include_directories(test_version_compare_stability PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_version_compare_stability PRIVATE rtadsp)
+add_test(NAME version_compare_stability COMMAND test_version_compare_stability)
+
+# ---- 探针：故意不注册 add_test（要读本机曲库或标定素材，进 ctest 必然红） ----
+add_executable(fl_probe tools/fl_probe.cpp)
+target_include_directories(fl_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(vc_probe tools/vc_probe.cpp)
+target_include_directories(vc_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(health_fuzz tools/health_fuzz.cpp)
+target_include_directories(health_fuzz PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(health_fuzz PRIVATE psapi winhttp)
+
+# tools/wv2_shot.cpp 故意不登记：它是一次性取证用的最小 WebView2 宿主，
+# 与产品无关，进构建只会拖慢全量。

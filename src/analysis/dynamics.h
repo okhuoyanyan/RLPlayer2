@@ -9,7 +9,10 @@
 //
 // 设计要点（三条指标全部按公开规范实现，不自造口径）：
 //  1) TT DR：每声道切 3 秒块（尾部不足一块丢弃），块 RMS 降序取前 20% 的块，把这些块的
-//     【样本合并】求二阶 RMS₂，DR_ch = 20·log10(全轨峰值 / RMS₂)，结果取各声道较低者。
+//     【样本合并】求二阶 RMS₂，DR_ch = 20·log10(全轨峰值 / RMS₂)，结果取各声道较低者
+//     （= min，**保守口径**）。⚠️ 口径说明（2026-10-27 标定报告 P6）：TT DR 官方 min/max
+//     未取得离线对照，故不改口径、只在 UI 与字段注释里写明「取较低声道（保守）」：
+//     与 max 口径相比立体声偏低 0.1~0.6 dB、6 声道偏低 6.6 dB（实测 03_蔡琴 min 9.97 / max 16.56）。
 //     ★ 合并样本的 RMS ≠ 块 RMS 的平均：块 RMS 平均的平方是均值的平方，合并样本 RMS 的平方
 //       是均方本身，正弦信号（各块等幅）下两者差 10·log10(π/2·...) ≈ 3 dB 级别 ——
 //       这是该口径最常见的实现错误，会把稳态正弦测成 ~0 dB。
@@ -60,10 +63,14 @@
 namespace rta::analysis {
 
 struct DynamicsResult {
-    double drDb = 0.0;           // TT DR（各声道取较低者）
+    double drDb = 0.0;           // TT DR（各声道取较低者（保守）—— 见文件头「DR 口径」）
     double lufsIntegrated = 0.0; // BS.1770-4 K 加权积分响度
     double lra = 0.0;            // EBU R128 短期响度 10~95 百分位差
-    double peakDbfs = 0.0;       // 样本峰值
+    double peakDbfs = 0.0;       // 样本峰值（只看样本点，永远 ≤ 0 dBFS）
+    // 真峰（True Peak，4× 过采样，dBTP）。**过载判据只能看这个**：限幅过载母带的样本峰
+    // 恰好 0.00 dBFS，样本之间却能到 +2.5 dBTP（标定实测 09_reverie）。缺这个字段时
+    // 把 +2.5 dB 的过载显示成"刚好满幅"，会误导用户（2026-10-27 标定报告 §5）。
+    double truePeakDbtp = 0.0;
     bool   valid = false;
 };
 
@@ -125,6 +132,65 @@ inline double percentile_sorted(const std::vector<double>& asc, double q) {
     return asc[i] * (1.0 - t) + asc[j] * t;
 }
 
+// ==================== 真峰（True Peak）：4× 过采样插值器 ====================
+// 为什么必须做：采样峰只反映"样本点上的值"。限幅过载母带（标定实测 09_reverie / 10_晚安舞会）
+// 的样本峰恰 0.00 dBFS，而样本之间的真实波形到 +2.5 / +0.8 dBTP —— 把过载 2.5 dB 显示成
+// "刚好满幅"是硬错误（报告 §5）。
+//
+// 做法（离线、无外部依赖、可复现）：4 相多相 FIR 插值，每相 16 抽头（等价 64 抽头原型），
+// 系数由【加窗 sinc】现算：sinc(j + p/4) × Blackman 窗，每相归一化到直流增益 1。
+// p=0 相严格等于原样本（sinc(j)=δ），所以样本峰天然被包含在内，插值不会"改小"任何值。
+// 精度与 ITU-R BS.1770-4 Annex 2（4× 过采样测真峰）同一量级；实测见 tests/test_dynamics.cpp
+// 第 10 节（解析解对照 ≤0.1 dB）与 build-fix2 的 ffmpeg ebur128 对照（≤0.3 dB）。
+//
+// ★ 性能护栏（必须精确）：插值只在「局部 16 点幅度上界 > 当前最好值」时才算 ——
+//   |y| ≤ Σ|c|·localMax，Σ|c| 是常数 l1（实测约 1.35）。跳过时该窗内任何插值点都
+//   严格小于当前最好值，且"当前最好值"随时间单调不减 ⟹ 最终结果与"逐点全算"逐位相同，
+//   不是近似。安静素材几乎不花时间，只有接近满幅的段落才算（实测开销见报告）。
+struct TruePeakInterp {
+    static constexpr int kL = 8;       // 过采样倍数
+    static constexpr int kTaps = 32;   // 每相抽头数（等价 256 抽头原型）
+    static constexpr int kSpan = 32;   // 覆盖的输入样本数（= kTaps）
+    static constexpr int kDelay = 15;  // 评估样本 m 需要看到 x[m+15]
+    double c[kL][kTaps] = {};
+    double l1 = 1.0;                   // max_p Σ_t |c[p][t]|（跳过判据用的上界常数）
+
+    TruePeakInterp() {
+        const double half = 0.5 * (double)kTaps;
+        for (int p = 0; p < kL; ++p) {
+            double sum = 0.0;
+            for (int t = 0; t < kTaps; ++t) {
+                const double j = (double)(t - kTaps / 2);          // -8 … +7
+                const double u = j + (double)p / (double)kL;
+                double v = 0.0;
+                if (p == 0) {
+                    v = (t == kTaps / 2) ? 1.0 : 0.0;              // p=0 严格取原样本
+                } else {
+                    const double z = rta::dsp::kPi * u;
+                    const double sinc = (std::fabs(u) < 1e-12) ? 1.0 : std::sin(z) / z;
+                    const double w = u / half;
+                    v = sinc * (0.42 + 0.5 * std::cos(rta::dsp::kPi * w)
+                                     + 0.08 * std::cos(2.0 * rta::dsp::kPi * w));
+                }
+                c[p][t] = v;
+                sum += v;
+            }
+            if (std::fabs(sum) > 1e-12)
+                for (int t = 0; t < kTaps; ++t) c[p][t] /= sum;     // 直流增益 = 1
+        }
+        for (int p = 0; p < kL; ++p) {
+            double s = 0.0;
+            for (int t = 0; t < kTaps; ++t) s += std::fabs(c[p][t]);
+            if (s > l1) l1 = s;
+        }
+    }
+};
+
+inline const TruePeakInterp& true_peak_interp() {
+    static const TruePeakInterp g;
+    return g;
+}
+
 // ==================== 增量（流式）动态分析器 ====================
 //
 // 用法：
@@ -148,6 +214,10 @@ public:
 
         pos_ = 0;
         peakCh_.assign((size_t)channels_, 0.0);
+
+        // 真峰：每声道 kSpan 个样本的环形缓冲（4× 插值要看到前后各 8 个样本）
+        tpRing_.assign((size_t)channels_, std::vector<double>(TruePeakInterp::kSpan, 0.0));
+        tpPeak_.assign((size_t)channels_, 0.0);
 
         drLen_ = (fs > 0.0) ? (size_t)std::llround(3.0 * fs) : 0;
         drAcc_.assign((size_t)channels_, 0.0);
@@ -223,6 +293,13 @@ public:
         for (int c = 0; c < channels_; ++c)
             if (active_[(size_t)c] && peakCh_[(size_t)c] > peak) peak = peakCh_[(size_t)c];
         r.peakDbfs = (peak > 0.0) ? 20.0 * std::log10(peak) : -300.0;
+
+        // 真峰：max(样本峰, 各声道插值峰)。样本峰也参与取大 —— 短素材（<16 帧）没有插值点，
+        // 那时真峰就退化成样本峰（如实反映"没算到"，而不是给一个更小的数）。
+        double tp = peak;
+        for (int c = 0; c < channels_; ++c)
+            if (active_[(size_t)c] && tpPeak_[(size_t)c] > tp) tp = tpPeak_[(size_t)c];
+        r.truePeakDbtp = (tp > 0.0) ? 20.0 * std::log10(tp) : -300.0;
 
         // ---- TT DR：3 s 块，前 20% 块合并样本求 RMS₂ ----
         if (drLen_ > 0) {
@@ -320,10 +397,44 @@ private:
             }
             if (++ringPos_ == ringLen_) ringPos_ = 0;
         }
+        true_peak_push(getVal);
         ++pos_;
         if (lufsEnabled_) {
             if (pos_ == nextBlkEnd_) { blkPow_.push_back(window_power(blk_)); nextBlkEnd_ += stp_; }
             if (lraEnabled_ && pos_ == nextStEnd_) { stPow_.push_back(window_power(w3_)); nextStEnd_ += stp_; }
+        }
+    }
+
+    // 真峰：把本帧写进各声道 16 点环，并对"已经能看到完整 16 点窗"的样本 m = i-7
+    // 算 4 相插值。★ 环的写入与评估都严格按帧序进行 ⟹ 与块大小无关（逐位一致的硬约定）。
+    template <class GetVal>
+    inline void true_peak_push(GetVal&& getVal) {
+        const TruePeakInterp& tp = true_peak_interp();
+        const size_t i = pos_;                          // 本帧的绝对下标
+        for (int c = 0; c < channels_; ++c) {
+            if (!active_[(size_t)c]) continue;
+            std::vector<double>& ring = tpRing_[(size_t)c];
+            ring[i & (size_t)(TruePeakInterp::kSpan - 1)] = getVal(c);
+            if (i + 1 < (size_t)TruePeakInterp::kSpan) continue;   // 还没攒够 16 点
+            // 上界护栏：本窗任何插值点都 ≤ l1·localMax（见结构体注释）
+            double lm = 0.0;
+            for (int t = 0; t < TruePeakInterp::kSpan; ++t) {
+                const double a = std::fabs(ring[(size_t)t]);
+                if (a > lm) lm = a;
+            }
+            const double best = std::max(peakCh_[(size_t)c], tpPeak_[(size_t)c]);
+            if (lm * tp.l1 <= best) continue;
+            size_t q = (i + 1) & (size_t)(TruePeakInterp::kSpan - 1);  // x[i-15] 所在的槽
+            for (int p = 1; p < TruePeakInterp::kL; ++p) {
+                double y = 0.0;
+                size_t k = q;
+                for (int t = 0; t < TruePeakInterp::kTaps; ++t) {
+                    y += tp.c[p][t] * ring[k];
+                    k = (k + 1) & (size_t)(TruePeakInterp::kSpan - 1);
+                }
+                const double a = std::fabs(y);
+                if (a > tpPeak_[(size_t)c]) tpPeak_[(size_t)c] = a;
+            }
         }
     }
 
@@ -353,6 +464,8 @@ private:
     size_t pos_ = 0;
 
     std::vector<double> peakCh_;
+    std::vector<std::vector<double>> tpRing_;   // 真峰插值的每声道 16 点环
+    std::vector<double> tpPeak_;                // 每声道插值峰（线性）
     size_t drLen_ = 0;
     std::vector<double> drAcc_;
     std::vector<size_t> drCnt_;

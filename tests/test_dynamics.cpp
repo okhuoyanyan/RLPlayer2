@@ -61,12 +61,14 @@ static double max_abs_diff(const DynamicsResult& a, const DynamicsResult& b) {
     d = std::max(d, std::fabs(a.lufsIntegrated - b.lufsIntegrated));
     d = std::max(d, std::fabs(a.lra - b.lra));
     d = std::max(d, std::fabs(a.peakDbfs - b.peakDbfs));
+    d = std::max(d, std::fabs(a.truePeakDbtp - b.truePeakDbtp));
     return d;
 }
 
 static bool same_all(const DynamicsResult& a, const DynamicsResult& b) {
     return same_bits(a.drDb, b.drDb) && same_bits(a.lufsIntegrated, b.lufsIntegrated)
-        && same_bits(a.lra, b.lra) && same_bits(a.peakDbfs, b.peakDbfs) && a.valid == b.valid;
+        && same_bits(a.lra, b.lra) && same_bits(a.peakDbfs, b.peakDbfs)
+        && same_bits(a.truePeakDbtp, b.truePeakDbtp) && a.valid == b.valid;
 }
 
 
@@ -319,6 +321,91 @@ int main() {
         check(std::fabs(r.lufsIntegrated - ref.lufsIntegrated) < 0.01
               && std::fabs(r.peakDbfs - ref.peakDbfs) < 0.01,
               "float 重载与 double 结果的偏差 < 0.01 dB（不是逐位，符合文件头说明）", b);
+    }
+
+    printf("\n=== 10. 真峰（4× 过采样，dBTP）：样本峰 ≤0 dBFS，真峰必须能 >0 ===\n");
+    {
+        // 10a：fs/4 正弦、相位 45° ⟹ 样本正好落在 ±45°（样本峰 −9.03 dBFS），真峰应为 −6.02 dBTP。
+        // 这是"样本峰 vs 真峰"最干净的解耦用例：知道解析答案，不用外部工具。
+        {
+            const size_t n = (size_t)(2.0 * fs);
+            std::vector<std::vector<double>> ch(1, std::vector<double>(n));
+            // 相位 +45° ⟹ 样本值恒为 ±0.3536（样本峰 −9.03 dBFS），而波形真峰是 0.5（−6.02 dBTP）
+            for (size_t i = 0; i < n; ++i)
+                ch[0][i] = 0.5 * std::sin(2.0 * kPi * (fs / 4.0) * (double)i / fs + kPi / 4.0);
+            auto p = ptrs(ch);
+            const DynamicsResult r = measure_dynamics(p.data(), 1, n, fs);
+            char b[192];
+            std::snprintf(b, sizeof(b), "(样本峰 %.3f dBFS, 真峰 %.3f dBTP, 期望 −6.021)", r.peakDbfs, r.truePeakDbtp);
+            check(std::fabs(r.truePeakDbtp - (-6.0206)) <= 0.05, "fs/4 正弦：真峰 = −6.02 ±0.05 dBTP", b);
+            check(r.truePeakDbtp > r.peakDbfs + 2.5, "真峰比样本峰高 ≈3 dB（说明真的插值到了样本之间）", b);
+        }
+        // 10b：双音（0.45/0.469 ×fs）—— 真峰解析解在 1/512 采样网格上求，比对自己的值。
+        // 这条直接压"高频段插值是否准确"（4× 网格 + 64 抽头原型），单个正弦测不出来。
+        {
+            const size_t n = (size_t)(2.0 * fs);
+            const double f1 = 0.45 * fs, f2 = 0.46875 * fs, ph2 = 1.1;
+            std::vector<std::vector<double>> ch(1, std::vector<double>(n));
+            for (size_t i = 0; i < n; ++i) {
+                const double t = (double)i / fs;
+                ch[0][i] = 0.5 * std::sin(2.0 * kPi * f1 * t) + 0.5 * std::sin(2.0 * kPi * f2 * t + ph2);
+            }
+            double analytic = 0.0;
+            const long long steps = (long long)(n * 512);
+            for (long long k = 0; k < steps; ++k) {
+                const double t = (double)k / (fs * 512.0);
+                const double v = std::fabs(0.5 * std::sin(2.0 * kPi * f1 * t) + 0.5 * std::sin(2.0 * kPi * f2 * t + ph2));
+                if (v > analytic) analytic = v;
+            }
+            auto p = ptrs(ch);
+            const DynamicsResult r = measure_dynamics(p.data(), 1, n, fs);
+            const double want = 20.0 * std::log10(analytic);
+            char b[224];
+            std::snprintf(b, sizeof(b), "(真峰 %.3f dBTP vs 解析 %.3f dBTP，差 %+.3f dB)", r.truePeakDbtp, want,
+                          r.truePeakDbtp - want);
+            check(std::fabs(r.truePeakDbtp - want) <= 0.1, "双音高频（0.45/0.469 fs）：真峰与解析解 ≤0.1 dB", b);
+        }
+        // 10c：过载母带（硬限幅 + 高频）⟹ 真峰必须 >0 dBTP（样本峰只能是 0.00）
+        {
+            const size_t n = (size_t)(2.0 * fs);
+            std::vector<std::vector<double>> ch(1, std::vector<double>(n));
+            // 两个近奈奎斯特分量相加后硬限幅（限幅过载母带的典型形态）
+            for (size_t i = 0; i < n; ++i) {
+                const double t = (double)i / fs;
+                const double v = 0.9 * std::sin(2.0 * kPi * 11000.0 * t)
+                               + 0.9 * std::sin(2.0 * kPi * 15500.0 * t + 0.7);
+                ch[0][i] = std::max(-1.0, std::min(1.0, v));
+            }
+            auto p = ptrs(ch);
+            const DynamicsResult r = measure_dynamics(p.data(), 1, n, fs);
+            char b[192];
+            std::snprintf(b, sizeof(b), "(样本峰 %.3f dBFS, 真峰 %.3f dBTP)", r.peakDbfs, r.truePeakDbtp);
+            check(std::fabs(r.peakDbfs) < 1e-9 && r.truePeakDbtp > 0.5,
+                  "硬限幅过载：样本峰 0.00 但真峰 > +0.5 dBTP（旧实现只报样本峰）", b);
+        }
+        // 10d：真峰也必须满足分块逐位一致（已并入 same_all，这里单独给一条可读的判据）
+        {
+            const size_t n = (size_t)(3.3 * fs);
+            auto ch = make_composite(n, fs, 2);
+            std::vector<const double*> p{ch[0].data(), ch[1].data()};
+            const DynamicsResult ref = measure_dynamics(p.data(), 2, n, fs);
+            bool allSame = true; double maxDiff = 0.0;
+            for (size_t B : {size_t(1), size_t(997), size_t(4096), size_t(65536)}) {
+                DynamicsAccumulator acc;
+                acc.begin(2, fs);
+                for (size_t pos = 0; pos < n; pos += B) {
+                    const size_t m = std::min(B, n - pos);
+                    const double* sub[2] = { p[0] + pos, p[1] + pos };
+                    acc.add_planar(sub, m);
+                }
+                const DynamicsResult r = acc.finalize();
+                allSame = allSame && same_bits(r.truePeakDbtp, ref.truePeakDbtp);
+                maxDiff = std::max(maxDiff, std::fabs(r.truePeakDbtp - ref.truePeakDbtp));
+            }
+            char b[192];
+            std::snprintf(b, sizeof(b), "(真峰 %.6f dBTP, 4 种块大小 max|Δ| = %g)", ref.truePeakDbtp, maxDiff);
+            check(allSame && maxDiff == 0.0, "真峰分块与整段逐位相同", b);
+        }
     }
 
     printf("\n%s (失败项 %d)\n", fails == 0 ? "全部通过" : "存在失败", fails);

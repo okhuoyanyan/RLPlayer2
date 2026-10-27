@@ -12,6 +12,11 @@
 //
 // 位深处理：先探测源的真实位深，再用 pcm_s16le / pcm_s24le / pcm_s32le 请求，
 //   避免把 24-bit 素材降成 16-bit，也避免把 16-bit 素材无谓地抬成 24-bit。
+//   ★ 2026-10-27（修 D7）：解码器输出是【浮点】的格式（mp3/aac/vorbis/opus/wma/dsd…）
+//   改用 pcm_f32le 中转 —— 任何整数格式（s16/s24/s32 一样）都会把 >0 dBFS 的过冲钳到满幅，
+//   实测 320k MP3 的 +0.66 dBFS 过冲被压成精确 1.0（峰值低 0.66 dB + 假平顶削波）。
+//   整数源（flac/alac/wavpack/pcm_*…）仍走整数中转 ⟹ 无损格式解码结果与以前逐位相同。
+//   详见 probe_ffmpeg_pcm() 的注释。
 #pragma once
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -25,6 +30,7 @@
 #include "dsp/dsd_integrator.h"
 #include <string>
 #include <vector>
+#include <sstream>
 #include <cstdio>
 #include <algorithm>
 #include <stdexcept>
@@ -293,6 +299,89 @@ inline int probe_bit_depth(const std::string& ffprobe, const std::string& file) 
     if (v <= 16) return 16;
     if (v <= 24) return 24;
     return 32;
+}
+
+// ===========================================================================
+// ffmpeg 中转的取样格式选择（2026-10-27 修 D7：整数中转把 >0 dBFS 的过冲钳成满幅）
+//
+// 现象（实测，见 build-qc/quality_confidence_report.md §2 / §4-D7）：
+//   320k MP3《赤伶(交响乐版)》解码器输出峰值 = 1.0792（+0.662 dBFS），但旧代码请求
+//   pcm_s32le，而 ffmpeg 的 flt→int 转换按【满幅】钳位（1.0792 × 2^31 溢出 int32），于是
+//     ① 峰值偏低 0.662 dB（我们报 0.0000 dBFS，真值 +0.662 dBFS）；
+//     ② 所有越限样本变成精确 1.0 ⟹ 波形出现"平顶"，看起来就是削波（制造假削波）。
+//   s16/s24 同样会钳 —— 位深只决定量化误差，钳位点永远在 1.0。
+//
+// 修法：解码器输出是【浮点】（sample_fmt = flt/fltp/dbl/dblp）的格式一律用 pcm_f32le 中转，
+//   全程不经过整数。为什么这不破坏逐位/bit-perfect 语义：
+//   * 整数解码器（flac / alac / wavpack / tta / pcm_* …）**仍然请求整数格式**（16/24/32 原样），
+//     WAV 与 DSD 的原生解析路径完全没动 ⟹ 无损格式的解码结果与以前逐位相同
+//     （实测 11 首里 9 首峰值/RMS 指纹不变，只有 MP3 一项按预期变化）。
+//   * 浮点中转对 ≤24 bit 整数是**精确**的（float32 有 24 位尾数，|v| ≤ 2^23 的整数一一对应），
+//     所以即使某个整数源位深探测不到而落到 f32，16/24 bit 内容也不会掉一位；真正的 32 bit
+//     整数源仍走 pcm_s32le（f32 存不下 32 bit 整数），绝不浮点化。
+//   * 浮点缓冲 isFloat=true ⟹ pipeline::willBeBitPerfect() 本来就直接返回 false。有损源本来
+//     就不该被标成"逐位直通"（s32 中转时代它反而可能被误标成 bit-perfect），这是修正。
+// ===========================================================================
+struct FfmpegPcmChoice {
+    const char* codec = "pcm_f32le";
+    bool        floatDecoder = false;  // 解码器输出浮点 ⟹ 峰值可能 > 0 dBFS（过冲）
+    int         bits = 0;              // 整数解码器的位深（浮点源为 0）
+    std::string why;                   // 人话原因（进 LoadNote / 日志，便于现场核对走了哪条）
+};
+
+// 用 ffprobe 探测 a:0 流的 sample_fmt + 位深，决定该向 ffmpeg 请求哪个 pcm_* 编码。
+// 只读、无副作用、不开任何设备。探测失败或结果不可解析时**退回 pcm_f32le**：
+//   f32 不会钳位，且对 ≤24 bit 整数精确 —— 比"猜一个整数位深"安全。
+// 为什么看 sample_fmt 而不是只看位深：位深是 N/A 的正是有损格式（flt/fltp），而 pcm_s16le
+//   这类整数编码的 bits_per_raw_sample 也是 N/A（要用 bits_per_sample），光看位深会误判。
+inline FfmpegPcmChoice probe_ffmpeg_pcm(const std::string& ffprobe, const std::string& file) {
+    FfmpegPcmChoice c;
+    if (ffprobe.empty()) {
+        c.why = "没有 ffprobe，无法判断解码器取样格式 ⟹ pcm_f32le（不会钳位）";
+        return c;
+    }
+    std::string out;
+    const std::wstring cmd = L"\"" + widen(ffprobe) + L"\" -v error -select_streams a:0 "
+                             L"-show_entries stream=sample_fmt,bits_per_raw_sample,bits_per_sample "
+                             L"-of default=nw=1 \"" + widen(file) + L"\"";
+    if (run_hidden(cmd, &out) != 0) {
+        c.why = "ffprobe 探测失败 ⟹ pcm_f32le（不会钳位）";
+        return c;
+    }
+    std::string sfmt;
+    int bprs = 0, bps = 0;
+    {
+        std::istringstream is(out);
+        std::string line;
+        while (std::getline(is, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            const size_t e = line.find('=');
+            if (e == std::string::npos) continue;
+            const std::string k = line.substr(0, e);
+            const std::string v = line.substr(e + 1);
+            if (k == "sample_fmt") sfmt = v;
+            else if (k == "bits_per_raw_sample") bprs = (v == "N/A" || v.empty()) ? 0 : atoi(v.c_str());
+            else if (k == "bits_per_sample")     bps  = (v == "N/A" || v.empty()) ? 0 : atoi(v.c_str());
+        }
+    }
+    const bool flt = (sfmt.rfind("flt", 0) == 0) || (sfmt.rfind("dbl", 0) == 0);
+    if (flt) {
+        c.floatDecoder = true;
+        c.codec = "pcm_f32le";
+        c.why = "解码器输出浮点（sample_fmt=" + sfmt + "）⟹ pcm_f32le 中转，>0 dBFS 过冲不被钳位";
+        return c;
+    }
+    // 整数解码器：flac/alac 用 bits_per_raw_sample，pcm_* 用 bits_per_sample
+    const int d = bprs > 0 ? bprs : bps;
+    if (d <= 0) {
+        c.codec = "pcm_f32le";
+        c.why = "整数解码器但位深未知（sample_fmt=" + sfmt + "）⟹ pcm_f32le（≤24 bit 精确）";
+        return c;
+    }
+    c.bits = d;
+    c.codec = (d <= 16) ? "pcm_s16le" : (d <= 24 ? "pcm_s24le" : "pcm_s32le");
+    c.why = "整数解码器 " + sfmt + " @ " + std::to_string(d) + " bit ⟹ " + c.codec + "（与以前逐位相同）";
+    return c;
 }
 
 struct LoadNote {
@@ -891,8 +980,9 @@ inline AudioBuffer read_via_ffmpeg_file(const std::string& path, LoadNote* note 
             "同目录，或加进 PATH。WAV / DSF / DFF 不需要 ffmpeg。");
     }
 
-    const int bits = probe_bit_depth(ffprobe, path);
-    const char* codec = (bits <= 16) ? "pcm_s16le" : (bits <= 24 ? "pcm_s24le" : "pcm_s32le");
+    // 2026-10-27（D7）：浮点解码器走 pcm_f32le，整数解码器仍走对应整数位深（见 probe_ffmpeg_pcm）
+    const FfmpegPcmChoice pcm = probe_ffmpeg_pcm(ffprobe, path);
+    const char* codec = pcm.codec;
 
     wchar_t tmpDir[MAX_PATH] = {0};
     if (GetTempPathW(MAX_PATH, tmpDir) == 0)
@@ -1034,8 +1124,9 @@ inline AudioBuffer read_via_ffmpeg_stream(const std::string& path, LoadNote* not
             "同目录，或加进 PATH。WAV / DSF / DFF 不需要 ffmpeg。");
     }
 
-    const int bits = probe_bit_depth(ffprobe, path);
-    const char* codec = (bits <= 16) ? "pcm_s16le" : (bits <= 24 ? "pcm_s24le" : "pcm_s32le");
+    // 2026-10-27（D7）：浮点解码器走 pcm_f32le，整数解码器仍走对应整数位深（见 probe_ffmpeg_pcm）
+    const FfmpegPcmChoice pcm = probe_ffmpeg_pcm(ffprobe, path);
+    const char* codec = pcm.codec;
     const std::wstring cmd = L"\"" + widen(ffmpeg) + L"\" -v error -i \"" + widen(path) +
                              L"\" -vn -c:a " + widen(codec) + L" -f wav pipe:1";
     const auto t_total_0 = std::chrono::steady_clock::now();

@@ -14,8 +14,10 @@
 #include <winver.h>   // GetFileVersionInfoW / VerQueryValueW（读 msedgewebview2.exe 的版本）
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 #include "WebView2.h"
 
@@ -201,6 +203,86 @@ private:
 
 typedef HRESULT(__stdcall* FnCreateEnv)(LPCWSTR browserExecutableFolder, LPCWSTR userDataFolder,
                                         ICoreWebView2EnvironmentOptions* options, EnvHandler* handler);
+
+// ---------------- 调试端口：--remote-debugging-port=<N>（默认关闭） ----------------
+// 为什么需要：铁律 11 要求 UI 改动必须在**真 WebView2 窗口**里取证，而真窗口此前没有任何
+//   调试入口（1.5.12 二进制里根本没有 remote-debugging 字符串）。上一轮为了在真窗口跑 JS，
+//   只能把副本 launcher 的导航指到本地代理、由代理注入脚本 —— 又脆弱又要改副本二进制。
+// 现在：显式传 --remote-debugging-port=N 时，把这条 flag 作为
+//   ICoreWebView2EnvironmentOptions::AdditionalBrowserArguments 交给 WebView2，
+//   http://127.0.0.1:N/json 就能列出页面，CDP 直接 eval / 截图。
+// 安全：**只有显式带参数才开**。不带参数时 options 传 nullptr，与改动前逐字节等价
+//   ⟹ 生产包（双击、无参数）绝不监听任何调试端口。
+struct DebugFlags {
+    int remotePort = 0;   // 0 = 关闭（默认）
+};
+inline DebugFlags& debug_flags() {
+    static DebugFlags f;
+    return f;
+}
+
+// 极简 ICoreWebView2EnvironmentOptions：只填 AdditionalBrowserArguments，其余返回空/默认。
+// 不用 SDK 的 CoreWebView2EnvironmentOptions 类：它建在 WRL RuntimeClass 上，会拖进
+// Microsoft::WRL 的模块单例；本工程（clang + lld-link、静态 CRT）没必要为此引 WRL。
+class BrowserOptions : public ICoreWebView2EnvironmentOptions {
+public:
+    // targetVer **必须**给一个真实版本号：实测传空（get_TargetCompatibleBrowserVersion 返回
+    // nullptr）时 CreateCoreWebView2EnvironmentWithOptions 直接返回 0x80070057 (E_INVALIDARG)。
+    // SDK 的 CoreWebView2EnvironmentOptions 构造里也是先把 TargetCompatibleBrowserVersion 设成
+    // CORE_WEBVIEW_TARGET_PRODUCT_VERSION，这里照同样的契约办事（用实测到的运行库版本）。
+    BrowserOptions(std::wstring args, std::wstring targetVer)
+        : args_(std::move(args)), targetVer_(std::move(targetVer)) {
+        if (targetVer_.empty()) targetVer_ = L"100.0.0.0";
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_ICoreWebView2EnvironmentOptions) {
+            *ppv = static_cast<ICoreWebView2EnvironmentOptions*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&ref_); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG r = InterlockedDecrement(&ref_);
+        if (r == 0) delete this;
+        return (ULONG)r;
+    }
+    HRESULT STDMETHODCALLTYPE get_AdditionalBrowserArguments(LPWSTR* v) override { return copy_out(args_, v); }
+    HRESULT STDMETHODCALLTYPE put_AdditionalBrowserArguments(LPCWSTR v) override { args_ = v ? v : L""; return S_OK; }
+    // 语言保持"未设置"（返回 nullptr）：交给 WebView2 用自己的默认值（UI 语言跟系统走）。
+    // 注意 TargetCompatibleBrowserVersion 不能为空（见构造函数注），下面返回真实版本号。
+    HRESULT STDMETHODCALLTYPE get_Language(LPWSTR* v) override { return copy_out(std::wstring(), v); }
+    HRESULT STDMETHODCALLTYPE put_Language(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_TargetCompatibleBrowserVersion(LPWSTR* v) override { return copy_out(targetVer_, v); }
+    HRESULT STDMETHODCALLTYPE put_TargetCompatibleBrowserVersion(LPCWSTR v) override { targetVer_ = v ? v : L""; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_AllowSingleSignOnUsingOSPrimaryAccount(BOOL* allow) override {
+        if (!allow) return E_POINTER;
+        *allow = FALSE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE put_AllowSingleSignOnUsingOSPrimaryAccount(BOOL) override { return S_OK; }
+
+private:
+    // SDK 约定：返回的字符串由 CoTaskMemAlloc 分配，调用方（WebView2）负责释放。
+    // 空串一律返回 nullptr（等价于"该项未设置"），与 SDK 头文件的行为一致。
+    static HRESULT copy_out(const std::wstring& s, LPWSTR* out) {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (s.empty()) return S_OK;
+        const size_t bytes = (s.size() + 1) * sizeof(wchar_t);
+        auto* p = static_cast<LPWSTR>(CoTaskMemAlloc(bytes));
+        if (!p) return E_OUTOFMEMORY;
+        memcpy(p, s.c_str(), bytes);
+        *out = p;
+        return S_OK;
+    }
+    std::wstring args_;
+    std::wstring targetVer_;
+    LONG ref_ = 1;
+};
 
 inline bool pump_until(HANDLE h, DWORD timeoutMs) {
     const DWORD t0 = GetTickCount();
@@ -478,11 +560,13 @@ struct AttemptResult {
 };
 
 // 用指定的一轨创建环境。browserFolder 为 nullptr = 让 Loader 自己找系统 Evergreen。
+// options = nullptr 时行为与改动前完全一致（生产路径）。
 inline ICoreWebView2Environment* create_env(FnCreateEnv fn, const wchar_t* browserFolder,
-                                            const std::wstring& userDataDir, AttemptResult& ar) {
+                                            const std::wstring& userDataDir, AttemptResult& ar,
+                                            ICoreWebView2EnvironmentOptions* options = nullptr) {
     auto* eh = new EnvHandler();
     eh->done_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    const HRESULT hr = fn(browserFolder, userDataDir.c_str(), nullptr, eh);
+    const HRESULT hr = fn(browserFolder, userDataDir.c_str(), options, eh);
     ar.hr = hr;
     if (FAILED(hr)) {
         ar.wide_reason = L"CreateCoreWebView2EnvironmentWithOptions 返回 " + hr_text(hr);
@@ -600,6 +684,16 @@ inline bool create(HWND parent, const std::wstring& userDataDir, const std::wstr
         return false;
     }
 
+    // 调试端口（只有 --remote-debugging-port=N 时才非空；生产路径这里是 nullptr）
+    std::wstring dbgArgs;
+    if (debug_flags().remotePort > 0) {
+        wchar_t arg[64] = {0};
+        swprintf_s(arg, L"--remote-debugging-port=%d", debug_flags().remotePort);
+        dbgArgs = arg;
+        log_line(exeDir, L"WebView2: 调试端口已开启（AdditionalBrowserArguments=\"" + dbgArgs +
+                         L"\"），仅供 UI 取证；生产包不带此参数时不会开");
+    }
+
     // 每条路各留一份失败原因，最后一起写进日志与 err —— 不许只说一句"创建环境失败"
     struct TrackFail { std::wstring wide; std::string ascii; };
     std::vector<TrackFail> fails;
@@ -614,7 +708,13 @@ inline bool create(HWND parent, const std::wstring& userDataDir, const std::wstr
             continue;
         }
         AttemptResult ar;
-        env = create_env(fn, (t == Track::System) ? nullptr : rt.dir.c_str(), userDataDir, ar);
+        // 选项对象按"这一轨"的运行库版本构造（targetCompatibleBrowserVersion 必须真实，
+        // 否则 Loader 直接 E_INVALIDARG），用完立刻放。
+        BrowserOptions* dbgOptions = nullptr;
+        if (!dbgArgs.empty()) dbgOptions = new BrowserOptions(dbgArgs, rt.version);
+        env = create_env(fn, (t == Track::System) ? nullptr : rt.dir.c_str(), userDataDir, ar,
+                         dbgOptions);
+        if (dbgOptions) { dbgOptions->Release(); dbgOptions = nullptr; }
         if (env) {
             log_line(exeDir, L"WebView2: 已选用 " + track_label(t) + L" " + ver_text(rt) +
                              L" | 来源=" + (rt.source.empty() ? std::wstring(L"未知") : rt.source) +

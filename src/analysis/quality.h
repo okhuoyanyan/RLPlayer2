@@ -29,6 +29,32 @@
 //    落在门限内；正常节目的峰值极少越过 −0.009 dBFS，误报风险由「连续 ≥3 样本成段」再收一道。
 //  * 立体声指标只取前两个声道（多声道素材按 L/R 看前两声道，其余声道不参与）。
 //
+// ================== 置信度与已知边界（2026-10-27 DEBUG 实测） ==================
+// 本节是「什么时候会错」的索引，不是「测得对」的证明（后者在 tests/test_quality.cpp，
+// 量化数据在 tests/test_quality_confidence.cpp；真实文件交叉验证用 tools/quality_probe.cpp）。
+//  * 重复性：同一素材重复 5 次、任意分块（4096/65536/262144 vs 整段）都【逐位一致】⟹ σ_repeat ≡ 0。
+//    真正的抖动只来自「看哪一段」：平稳素材谱重心片段间极差 10%、95% 滚降 13%；
+//    非平稳音乐同一首不同段落谱重心可差 1.8 倍、>10k 占比极差 10 dB ⟹ 跨版本比较必须同段比。
+//  * THD+N：只在【满幅附近】读。16 bit 量化地板 ≈ 20·log10(LSB/√12 ÷ A/√2)：
+//      0 dBFS → −94 dB；−20 → −80；−40 → −59；−60 → −37；−80 → −19（实测与理论差 ±3 dB）。
+//    ⟹「用 −60 dBFS 的测试音证明 −100 dB」是假的（铁律 3）。同电平 24 bit 多 51 dB。
+//  * 本底噪声/SNR：−40…−90 dBFS 白噪 ±0.3 dB；低于 16 bit LSB（−96 dBFS）被量化地板钳住。
+//    连续音乐上 noiseFloor 是「最安静的 10% 音乐」，是真实噪声的【上界】（实测常见 −20…−30 dBFS），
+//    于是 SNR 只有 ~10 dB —— 不能当「器材信噪比」读。
+//  * 削波：门限 0.999 = −0.0087 dBFS，低于任何「峰值归一到 0 dBFS」母带的驻留区 ⟹
+//    合法满幅正弦会被记 4.17%（1 kHz）/2.83%（40 Hz）/8.33%（10 kHz）削波；孤立单样本也计入
+//    clippedPct（clippedRuns 却要 ≥3 样本）⟹ 会出现「有占比、0 段」。判「真削波」要用
+//    clippedRuns/longestClipRun；clippedPct 只能当【上界】。
+//  * 频响四项：只在 [100 Hz, min(10 kHz, fs/2)] 有定义；fs ≤ 20 kHz 时 >10k 判为 0（−120 dB）；
+//    DSD 源（噪声整形）重心被推到 50–100 kHz、>10k 占比 ≈ 0 dB ⟹ 这四项对 DSD 化 PCM 无意义。
+//    低电平纯音的 >10k 占比下限被量化噪声抬高（−20 dBFS → −83 dB；−60 → −38；−80 → −20）。
+//  * 立体声三项：单声道内容塞进双声道 → corr=1 / sideMid=−120，与「完美中置立体声」不可区分（无告警）；
+//    单边静音 → corr=0 但 sideMid=0 dB（看着像中置）；反相 → corr=−1 / monoLoss=120（需限定词：
+//    老唱片真实存在反相）。>2 声道显式不适用。
+//  * 动态细化：3 s 块要 ≥2 块（<6 s 时 P95−P10 恒为 0）；20 s 素材只有 6 块，P95−P10 抖动 21.6%。
+//  * 静音/直流/单点冲激：会给出一整套「看起来有效」的 0 值（重心 0 Hz、倾斜 0 dB/oct、SNR 0 dB）
+//    ⟹ 调用方必须先用 peakDbfs ≤ −200 或 silencePct ≈ 100 把这类输入挡掉，别拿去展示。
+
 // ================== 增量（流式）接口 ==================
 // 曲长与内存解耦：整轨只保留
 //   * 每 100 ms 一条的块能量（8 B/100 ms ≈ 0.29 MB/小时）、每 3 s 一条（8 B/3 s）；
@@ -296,13 +322,25 @@ inline void spectrum_metrics(const QualityWindowPlan& plan,
 
 
     // ---- THD+N（单基频）/ 非谐波残留（多峰），均取窗间 dB 中位数 ----
+    // ★ 2026-10-27 DEBUG 修的坑：静音窗（或比最响窗低 60 dB 以上的窗）也参与"窗间中位数"，
+    //   而静音窗的 rf/tot ≈ 1 ⟹ 单窗 THD+N ≈ 0 dB。实测「前 5 s 满幅正弦 + 后 15 s 抖动静音」
+    //   时中位数被拉到 0 dB（100% 失真），把 −96 dB 的真实值彻底盖掉。修法：与下面噪声门的
+    //   同一口径，比最响窗低 60 dB 的窗不参与 THD+N/非谐波残留的中位数（数字全零窗本来就被
+    //   tot>0 挡掉，真正的坑是 −90 dBFS 量级的抖动噪声）。
+    double maxTot = 0.0;
+    for (const auto& P : wins) {
+        double t = 0.0;
+        for (size_t k = 0; k <= half; ++k) t += P[k];
+        if (t > maxTot) maxTot = t;
+    }
+    const double thdnGate = maxTot * 1e-6;      // −60 dB
     std::vector<double> thdnList, nonTonalList;
     for (const auto& P : wins) {
         // ★ 分子分母必须同口径：这里都用「单边 bin 直和」（不折半）。用 full_power_sum（中间
         //   bin ×2）当分母、残差用直和，会恰好差 3.01 dB —— 实测踩过（−40 → −43.01）。
         double tot = 0.0;
         for (size_t k = 0; k <= half; ++k) tot += P[k];
-        if (!(tot > 0.0)) continue;
+        if (!(tot > thdnGate)) continue;
         double rf = 0.0, rm = 0.0;
         for (size_t k = 0; k <= half; ++k) {
             if (!notchFund[k]) rf += P[k];      // 只扣基频 ⟹ 谐波+噪声全留在残差里
@@ -403,7 +441,11 @@ inline void spectrum_metrics(const QualityWindowPlan& plan,
     {
         double hf = 0.0;
         const size_t k10 = (size_t)std::ceil(10000.0 / binHz);
-        for (size_t k = std::min(k10, half); k <= half; ++k) hf += avgPower[k];
+        // ★ 2026-10-27 DEBUG 修的坑：fs ≤ 20 kHz（8/16 kHz 素材）时"10 kHz 以上"这个频段
+        //   根本不存在，但旧代码从 min(k10, half) 起算 ⟹ 只把【奈奎斯特那一个 bin】当成
+        //   "10 kHz 以上"，8 kHz 白噪实测报出 −48.49 dB 的假高频占比。这里直接判为 0。
+        if ((double)half * binHz > 10000.0)
+            for (size_t k = std::min(k10, half); k <= half; ++k) hf += avgPower[k];
         out.hfRatio10kDb = 10.0 * std::log10(std::max(hf, 1e-300) / den);
         if (out.hfRatio10kDb < -120.0) out.hfRatio10kDb = -120.0;
     }
@@ -502,14 +544,16 @@ public:
         r.rmsDbfs = (rms > 0.0) ? 20.0 * std::log10(rms) : -300.0;
 
         // ---- 削波 ----
-        size_t cnt = 0, runs = 0, longest = 0;
+        size_t cnt = 0, runs = runCount_, longest = 0;
         for (int c = 0; c < channels_; ++c) {
             cnt += clipCnt_[(size_t)c];
-            // 文件结束时仍挂着的连续段也要结算
+            // ★ 2026-10-27 DEBUG 修的坑：文件结束时【仍挂着】的连续段原先只计入 longest、
+            //   不计入 runs，于是"整曲削波"会报出 clippedRuns=0 但 longestClipRun=全部样本
+            //   （实测 5 s 全幅方波：runs=0, longest=240000，两个字段自相矛盾）。
             const size_t openRun = run_[(size_t)c];
+            if (openRun >= kClipRunMin) ++runs;
             longest = std::max(longest, openRun);
         }
-        runs = runCount_;
         longest = std::max(longest, longestRun_);
         const double denom = (double)pos_ * (double)std::max(1, nActive_);
         r.clippedSamples = cnt;
@@ -583,10 +627,19 @@ public:
             r.snrDb = std::clamp(r.rmsDbfs - r.noiseFloorDbfs, 0.0, 140.0);
         }
         r.valid = (r.frames > 0);
-        if (r.frames < plan_.kW) r.note = "素材短于一个谱窗，谱类指标按单窗估计";
-        // 口径提醒（不是错误）：谱最小统计对动态音乐是【下界】，绝对值偏低；同一首的相对比较不受影响
+        // ★ 2026-10-27 DEBUG 修的坑：这里原来是 r.note = ...（赋值），会整条覆盖前面
+        //   "多声道（N ch）素材：立体声指标不适用" 的提示 ⟹ 短素材的多声道文件丢失唯一的原因说明。
+        if (r.frames < plan_.kW) {
+            if (!r.note.empty()) r.note += "；";
+            r.note += "素材短于一个谱窗，谱类指标按单窗估计";
+        }
+        // 口径提醒（不是错误）：noiseFloorDbfs 取 100 ms 块 P10 —— 有静音段就测到静音段的噪声，
+        // 连续音乐则测到"最安静的 10% 的音乐"，是真实本底噪声的【上界】。
+        // ★ 2026-10-27 DEBUG 修的坑：旧文案写"本底噪声为谱最小统计（动态音乐为下界）"，
+        //   与实现正好相反（谱最小统计在密集音乐上偏高，而且是【上界】）——这句是用户可见文本，
+        //   会直接引导错误结论。现在按实现写。
         if (!r.note.empty()) r.note += "；";
-        r.note += "本底噪声为谱最小统计（动态音乐为下界，同一首相对比较不受影响）";
+        r.note += "本底噪声取 100 ms 块 P10（真实噪声的上界）；谱最小统计仅供诊断";
         if (tm) tm->spectralMs =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tSpec).count();
         return r;

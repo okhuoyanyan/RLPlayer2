@@ -78,7 +78,11 @@ static bool same_bits(double a, double b) {
 static bool same_check(const LosslessCheck& a, const LosslessCheck& b) {
     return a.suspected == b.suspected && a.fake24bit == b.fake24bit
         && same_bits(a.cutoffHz, b.cutoffHz) && same_bits(a.confidence, b.confidence)
-        && a.reason == b.reason;
+        && a.reason == b.reason
+        // 2026-10-27：判定档与判据量也纳入"逐位一致"契约（UI 直接显示它们）
+        && a.fakeVerdict == b.fakeVerdict && same_bits(a.edgeDb, b.edgeDb)
+        && a.windows == b.windows && same_bits(a.windowFill, b.windowFill)
+        && same_bits(a.cutoffRatio, b.cutoffRatio) && a.guardBins == b.guardBins;
 }
 // 按 B 帧一块喂满整段；planOk 返回 planMatched()
 static LosslessCheck fed_chunked(const std::vector<std::vector<double>>& ch, size_t n, double fs,
@@ -302,6 +306,148 @@ int main() {
         std::snprintf(b, sizeof(b), "(n=%zu: cutoff %.17g, conf %.17g, %s)", nSmall, ref.cutoffHz,
                       ref.confidence, ref.reason.c_str());
         check(allSame, "单窗（n<65536）分块与整段逐位一致", b);
+    }
+
+    printf("\n=== 9. 同一素材 4 种长度 → 同一结论（P1：陡沿逐窗各算一次、取中位数）===\n");
+    {
+        // 8 阶（4 个双二阶级联）16 kHz 低通白噪 —— 与标定素材 lpb_16000 同一条通路。
+        // 这类"截止不算太低、陡沿也不算太陡"的素材正是旧实现翻车的场景：
+        // 先把 12 个窗的幅度谱平均、再量一次陡沿 ⟹ 窗越多陡沿越低，30 s 反而漏报。
+        const size_t n30 = (size_t)(30.0 * kFs);
+        std::vector<std::vector<double>> sig(2, std::vector<double>(n30));
+        for (int c = 0; c < 2; ++c) {
+            Rng rng(0xC0FFEEull + (uint64_t)c * 7919ull);
+            for (size_t i = 0; i < n30; ++i) sig[(size_t)c][i] = 0.4 * rng.gauss();
+        }
+        for (int c = 0; c < 2; ++c) {
+            const double Q[2] = { 0.541196, 1.306563 };
+            Biquad bq[4];
+            biquad_design::lowpass(bq[0], kFs, 16000.0, Q[0]);
+            biquad_design::lowpass(bq[1], kFs, 16000.0, Q[1]);
+            biquad_design::lowpass(bq[2], kFs, 16000.0, Q[0]);
+            biquad_design::lowpass(bq[3], kFs, 16000.0, Q[1]);
+            for (size_t i = 0; i < n30; ++i) {
+                double v = sig[(size_t)c][i];
+                for (int k = 0; k < 4; ++k) v = bq[k].process(v);
+                sig[(size_t)c][i] = v;
+            }
+        }
+        std::vector<std::pair<double, LosslessCheck>> got;
+        for (double L : {30.0, 10.0, 3.0}) {
+            const size_t n = (size_t)(L * kFs);
+            std::vector<const double*> p{ sig[0].data(), sig[1].data() };
+            got.push_back({ L, check_lossless(p.data(), 2, n, kFs, 16) });
+        }
+        bool sameVerdict = true, detected = true;
+        std::string detail;
+        for (const auto& g : got) {
+            const LosslessCheck& c = g.second;
+            sameVerdict = sameVerdict && (c.fakeVerdict == got[0].second.fakeVerdict);
+            detected = detected && c.fakeVerdict != kFakeVerdictNone && c.fakeVerdict != kFakeVerdictInconclusive;
+            char b[192];
+            std::snprintf(b, sizeof(b), "%.0fs: cut %.0f conf %.3f edge %.1f win %d v %d | ", g.first,
+                          c.cutoffHz, c.confidence, c.edgeDb, c.windows, c.fakeVerdict);
+            detail += b;
+        }
+        check(sameVerdict && detected, "30/10/3 s 三个长度给出同一结论（且都算「检出」）", detail);
+        // 陡沿必须与窗数基本无关（旧实现 2 窗 21.9 → 12 窗 18.1）
+        {
+            const double eShort = got[2].second.edgeDb, eLong = got[0].second.edgeDb;
+            char b[160];
+            std::snprintf(b, sizeof(b), "(3 s %.1f dB vs 30 s %.1f dB, 差 %+.1f dB)", eShort, eLong, eLong - eShort);
+            check(std::fabs(eLong - eShort) <= 3.0, "陡沿与片段长度无关（|Δ| ≤ 3 dB）", b);
+        }
+        // 0.6 s：谱窗填充 <50% ⟹ 必须给「证据不足」，既不许判假、也不许说"未发现"
+        {
+            const size_t n = (size_t)(0.6 * kFs);
+            std::vector<const double*> p{ sig[0].data(), sig[1].data() };
+            const LosslessCheck c = check_lossless(p.data(), 2, n, kFs, 16);
+            char b[256];
+            std::snprintf(b, sizeof(b), "(fill %.2f, cut %.0f, edge %.1f, conf %.3f, v %d) %s",
+                          c.windowFill, c.cutoffHz, c.edgeDb, c.confidence, c.fakeVerdict, c.reason.c_str());
+            check(!c.suspected && c.fakeVerdict == kFakeVerdictInconclusive,
+                  "0.6 s（fill<0.5）→ 证据不足，不判假", b);
+            check(c.reason.find("不构成判据") != std::string::npos, "0.6 s 的 reason 写明「不构成判据」", c.reason);
+        }
+        // 1.0 s：fill 在 0.5~0.9 之间 ⟹ 置信度打七折，reason 必须写明（P4 第二档）
+        {
+            const size_t n = (size_t)(1.0 * kFs);
+            std::vector<const double*> p{ sig[0].data(), sig[1].data() };
+            const LosslessCheck c = check_lossless(p.data(), 2, n, kFs, 16);
+            char b[256];
+            std::snprintf(b, sizeof(b), "(fill %.2f, conf %.3f) %s", c.windowFill, c.confidence, c.reason.c_str());
+            check(c.windowFill >= 0.5 && c.windowFill < 0.9 && c.reason.find("折算") != std::string::npos,
+                  "1.0 s（fill 0.5~0.9）→ reason 写明置信度已折算", b);
+        }
+    }
+
+    printf("\n=== 10. 两档相对奈奎斯特（P2）：20 kHz 8 阶 ⟹ 带宽受限；12 kHz 8 阶 ⟹ 判有损 ===\n");
+    {
+        // 用 8 阶（4 个双二阶级联）而不是 511 抽头 Kaiser 砖墙：真实的母带低通/老录音
+        // 就是这个陡度（20 kHz 处实测陡沿 20~25 dB），而理想砖墙（60~70 dB）在现实里不存在。
+        auto cascade8 = [&](std::vector<std::vector<double>>& v, double fc) {
+            for (size_t c = 0; c < v.size(); ++c) {
+                const double Q[2] = { 0.541196, 1.306563 };
+                Biquad bq[4];
+                biquad_design::lowpass(bq[0], kFs, fc, Q[0]);
+                biquad_design::lowpass(bq[1], kFs, fc, Q[1]);
+                biquad_design::lowpass(bq[2], kFs, fc, Q[0]);
+                biquad_design::lowpass(bq[3], kFs, fc, Q[1]);
+                for (size_t i = 0; i < v[c].size(); ++i) {
+                    double x = v[c][i];
+                    for (int k = 0; k < 4; ++k) x = bq[k].process(x);
+                    v[c][i] = x;
+                }
+            }
+        };
+        // 8 阶 Butterworth 的 −40 dB 点在 fc 的 1.19 倍处（白噪实测），所以 fc=15.6k 的
+        // 截止落在 ≈18.6 kHz = 0.84×Nyq —— 正是"母带低通/升频"那一档，也是旧实现被
+        // 20500 绝对门一刀切成"未发现"的区间。
+        auto v20 = make_noise(2, 0xBEEF0001ull, 0.5);
+        cascade8(v20, 15600.0);
+        auto p20 = ptrs(v20);
+        const LosslessCheck c20 = check_lossless(p20.data(), 2, kN, kFs, 16);
+        printf("  band-limited %s\n", brief(c20).c_str());
+        char b[224];
+        std::snprintf(b, sizeof(b), "(cutoff %.0f Hz = %.3f×Nyq, edge %.1f dB, conf %.3f)",
+                      c20.cutoffHz, c20.cutoffRatio, c20.edgeDb, c20.confidence);
+        check(!c20.suspected && c20.fakeVerdict == kFakeVerdictBandLimited,
+              "0.84×Nyq 的陡沿 → 带宽受限，不判假（旧实现被 20500 绝对门漏成「未发现」）", b);
+        check(c20.reason.find("带宽受限") != std::string::npos, "reason 写明「有效带宽受限」", c20.reason);
+
+        auto v12 = make_noise(2, 0xBEEF0002ull, 0.5);
+        cascade8(v12, 12000.0);
+        auto p12 = ptrs(v12);
+        const LosslessCheck c12 = check_lossless(p12.data(), 2, kN, kFs, 16);
+        printf("  lossy-band %s\n", brief(c12).c_str());
+        std::snprintf(b, sizeof(b), "(cutoff %.0f Hz = %.3f×Nyq, edge %.1f dB, conf %.3f)",
+                      c12.cutoffHz, c12.cutoffRatio, c12.edgeDb, c12.confidence);
+        check(c12.suspected && c12.fakeVerdict == kFakeVerdictLossy,
+              "12 kHz 8 阶（<0.78×Nyq）→ 判有损（旧实现漏报）", b);
+    }
+
+    printf("\n=== 11. 纯音/窄带护栏（P3）：997 Hz 主导的窄带素材 → 不判假 ===\n");
+    {
+        // 997 Hz −6 dBFS + −70 dBFS 底噪，再 1.15 kHz 砖墙低通：
+        // 这就是标定报告里"检出 1172 Hz、置信 1.00 ⟹ 有损"那类误报的成因（截止远低于 6 kHz）。
+        const size_t n = (size_t)(5.0 * kFs);
+        std::vector<std::vector<double>> ch(2, std::vector<double>(n));
+        Rng rng(0x997997ull);
+        for (size_t i = 0; i < n; ++i) {
+            const double tone = 0.5011872336 * std::sin(2.0 * kPi * 997.0 * (double)i / kFs);
+            ch[0][i] = tone + 3.16e-4 * rng.gauss();
+            ch[1][i] = 0.0;
+        }
+        fir_apply(ch[0], brickwall(1150.0));
+        std::vector<const double*> p{ ch[0].data(), nullptr };
+        const LosslessCheck c = check_lossless(p.data(), 2, n, kFs, 16);
+        printf("  %s\n", brief(c).c_str());
+        char b[224];
+        std::snprintf(b, sizeof(b), "(cutoff %.0f Hz, edge %.1f dB, guard %d bin, conf %.3f)",
+                      c.cutoffHz, c.edgeDb, c.guardBins, c.confidence);
+        check(!c.suspected && c.fakeVerdict == kFakeVerdictNone,
+              "997 Hz 主导 + 1.15 kHz 陡沿 → 未发现（不判假）", b);
+        check(c.reason.find("6 kHz") != std::string::npos, "reason 说明「低于 6 kHz 不构成判据」", c.reason);
     }
 
     printf("\n%s (失败项 %d)\n", fails == 0 ? "全部通过" : "存在失败", fails);
