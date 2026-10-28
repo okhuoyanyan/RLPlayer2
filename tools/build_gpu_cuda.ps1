@@ -143,7 +143,13 @@ $nvArgs += @('-o', $Out)
 
 $log = Join-Path $buildDir 'gpu_cuda_build.log'
 $ver = (& $nvcc --version 2>&1 | Out-String)
-$drv = (& nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>&1 | Out-String)
+# 2026-10-28：本机没有 N 卡时 nvidia-smi 不存在，而上面 $ErrorActionPreference='Stop'
+# 会把它当终止错误 —— 于是「在无 N 卡的机器上交叉编译」完全走不通（实测 exit=1）。
+# 这一行只是往日志里记一条环境信息，不能因此中断构建。改成先探测再调用。
+$drv = '(nvidia-smi not available on this machine)'
+if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+  $drv = (& nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>&1 | Out-String)
+}
 Write-Host ("building rtagpu_cuda.dll for " + ($archs -join ',') + " (arch count " + $archs.Count + ") ...")
 "=== nvcc ===`n$ver`n=== gpu ===`n$drv`n=== ccbin ===`n$ccbin`n=== args ===`n$($nvArgs -join ' ')" | Set-Content -Path $log -Encoding UTF8
 

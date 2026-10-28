@@ -4426,6 +4426,11 @@ static constexpr long long kArtistImgNegSec  = 7LL * 24 * 3600;   // 负缓存�
 // 并发 6 后同样的量理论上 ~1/3 墙钟时间；四家源各自的礼节限频（dizzylab 1 req/s、
 // Discogs 25/min）仍在 meta::artwork 内部生效，超限只会记瞬态失败（不写 .none，下次重试）。
 static constexpr int    kArtistImgBgConcurrency = 6;              // 后台同时抓几个（对齐 WebUi 的 6 worker）
+// 每轮允许走 dizzylab 的艺人数量（2026-10-28 用户反馈「艺术家头像抓取仍然非常慢」）。
+// dizzylab 是 1 req/s 的全局串行闸门，还排在头像链第一位；不设预算时它独占整轮的时间。
+// 预算用「轮转窗口」而不是「永远前 N 个」：每轮起点往后挪，几轮之后所有艺人都轮到过 dizzylab。
+static constexpr size_t kArtistImgDzBudget     = 24;
+static std::atomic<size_t> g_artistimg_dz_rot{0};   // 轮转起点（每轮前进一个预算窗口）
 
 static uint64_t artistimg_fnv1a(const std::string& s) {
     uint64_t h = 1469598103934665603ull;      // FNV-1a 64 位
@@ -4559,7 +4564,12 @@ enum class ArtistImgOutcome { Ok, Miss, Fail };
 // 这里只做三件事：把 rtaweb 的缓存目录/预算/阈值传下去；把结果映射回 Ok/Miss/Fail；
 // 把**逐源失败原因**塞进 detail（后台日志 ARTISTIMG bg ... 会原样落盘，便于排查）。
 // 缓存文件布局不变（<exe>\artistimg\<fnv>.jpg / .src / .none），旧缓存继续有效。
-static ArtistImgOutcome artist_avatar_fetch(const std::string& name, std::string* detail, long long* bytesOut) {
+// allowDz=false：本轮 dizzylab 预算已用完 ⟹ 只走快源（QQ/网易/iTunes…）。
+// 为什么需要这个参数：dizzylab 的限频是**全局串行**的（provider.h 的 dl_gate_acquire 持锁 sleep
+// 1 s），而它排头像链第一位 ⟹ 6 个后台 worker 全被这一把锁串成 1 个/秒。
+// 实测口径：246 位艺人仅 dizzylab 一步就要约 246 s（4 分钟），这就是用户说的「头像抓取非常慢」。
+static ArtistImgOutcome artist_avatar_fetch(const std::string& name, std::string* detail,
+                                            long long* bytesOut, bool allowDz) {
     const auto t0 = std::chrono::steady_clock::now();
     auto elapsed_ms = [&]() {
         return (int)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -4574,6 +4584,8 @@ static ArtistImgOutcome artist_avatar_fetch(const std::string& name, std::string
     o.perSourceMs   = kArtistImgSearchMs;
     o.downloadMs    = kArtistImgDownloadMs;
     o.minBytes      = kArtistImgMinBytes;
+    // 每轮 dizzylab 预算（见函数头注释）。关掉它只是本轮不试这一源，不写任何负缓存。
+    if (!allowDz) o.srcOn["dizzylab"] = false;
     // 环境变量 RLPLAYER_ARTISTIMG_HOST（网易云）与 _QQ/_DZ/_DC 由 artwork.h 自己读，
     // 语义与旧版一致：把请求指到别处（自动化测试用不可达域名验证「不崩、不阻塞」）。
 
@@ -4621,6 +4633,7 @@ static constexpr size_t kApiAutoMax = 40;
 
 struct ArtistImgBg {
     std::atomic<size_t> next{0};        // 原子游标（不用锁也能领号；名字只读，不抢锁）
+    size_t dzRot = 0;                   // 本轮 dizzylab 轮转起点（建 bg 时定死，worker 只读）
     std::atomic<int> ok{0}, miss{0}, fail{0};
     std::atomic<long long> bytes{0};    // 本轮落盘总字节
     std::vector<std::string> names;     // 深拷贝的名单（线程独占）
@@ -4636,7 +4649,14 @@ static void artistimg_bg_worker(std::shared_ptr<ArtistImgBg> bg) {
         const std::string nm = bg->names[i];      // 拷贝：下面只碰局部 + 文件系统
         std::string detail;
         long long got = 0;
-        const ArtistImgOutcome oc = artist_avatar_fetch(nm, &detail, &got);
+        // dizzylab 预算：只有落在本轮轮转窗口内的艺人才走它（其余直接用快源）。
+        const bool allowDz = [&]() {
+            const size_t total = bg->names.size();
+            if (total <= kArtistImgDzBudget) return true;          // 名单本身就小，不必限制
+            const size_t rel = (i + bg->dzRot) % total;
+            return rel < kArtistImgDzBudget;
+        }();
+        const ArtistImgOutcome oc = artist_avatar_fetch(nm, &detail, &got, allowDz);
         switch (oc) {
         case ArtistImgOutcome::Ok:
             bg->ok.fetch_add(1);
@@ -4672,6 +4692,8 @@ static bool artistimg_bg_start(std::vector<std::string> names) {
     if (!g_artistimg_active.compare_exchange_strong(expect, 1)) return false;
     auto bg = std::make_shared<ArtistImgBg>();
     bg->names = std::move(names);
+    // 轮转窗口：每轮把 dizzylab 预算换一批人，几轮后覆盖全部艺人（见 kArtistImgDzBudget 注释）
+    bg->dzRot = g_artistimg_dz_rot.fetch_add(kArtistImgDzBudget);
     std::thread([bg]() {
         std::vector<std::thread> ws;
         ws.reserve((size_t)kArtistImgBgConcurrency);
@@ -5952,10 +5974,16 @@ static std::vector<CoverJob> cover_build_queue(const std::vector<std::string>& o
     return out;
 }
 
-// 列表端点用：一张专辑的封面来源。只信扫描时算好的 hasCover 标志 + 一次 stat，绝不触发 ffmpeg。
-static const char* cover_src_of(const std::string& key, bool hasCover) {
-    if (hasCover) return "embed";
-    if (cover_has_disk(key)) return "net";
+// 列表端点用：一张专辑的封面来源。只信专辑表里算好的来源 + 一次 stat，绝不触发 ffmpeg。
+// 2026-10-27（用户 2.0 发包前 BUG「专辑名对、封面严重错误」）：来源从 2 态扩成 3 态 ——
+//   embed = 曲目**内嵌**封面（APIC/PICTURE/covr，永远首选，天然按「文件 → 专辑」绑定）
+//   dir   = 同目录 cover/folder/front，**仅当该目录只对应这一张专辑**（多碟装的 CD1/CD2 仍算一目录）
+//   net   = 磁盘上的在线抓取缓存；none = 都没有（前端露首字母占位，而不是显示别人的图）
+// cv 的语义不变（"有图可显示" = embed/dir/net 任一），只是 dir 不再冒充 embed。
+static const char* cover_src_of(const rta::net::LibAlbum& a) {
+    if (a.coverSrc == rta::net::kCoverEmbedded) return "embed";
+    if (a.coverSrc == rta::net::kCoverDirFile)  return "dir";
+    if (cover_has_disk(a.key)) return "net";
     return "none";
 }
 
@@ -10200,11 +10228,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 rta::net::LibTrack t0;
                 int sr = 0, bits = 0;
                 if (!a.idx.empty() && lib.trackAt(a.idx[0], t0)) { sr = t0.sampleRate; bits = t0.bits; }
-                // cvSrc（2026-10-26）：embed = 库里已有图（内嵌流/同目录封面文件）；
-                // net = 磁盘 covercache 有网图；none = 都没有（前端显示首字母占位）。
+                // cvSrc（2026-10-26，2026-10-27 扩成三态）：embed = 曲目内嵌封面；dir = 同目录封面
+                // 文件（**仅一目录一专辑**才有这个值）；net = 磁盘 covercache 有网图；
+                // none = 都没有（前端显示首字母占位）。
                 // cvUrl 只在有网图时给 —— 与 GET /api/lib/cover?k= 完全同一条路径，
-                // 前端拿它做 <img src> 即可（embed 的那条不必给：老前端本来就写死算出来的 k）。
-                const std::string csrc = cover_src_of(a.key, a.hasCover);
+                // 前端拿它做 <img src> 即可（embed/dir 的那条不必给：老前端本来就写死算出来的 k）。
+                const std::string csrc = cover_src_of(a);
                 j << "{\"k\":\"" << a.key << "\",\"name\":\"" << jesc(a.name)
                   << "\",\"artist\":\"" << jesc(a.artist) << "\",\"year\":" << a.year
                   << ",\"n\":" << a.nTracks << ",\"dur\":" << a.duration
@@ -10227,7 +10256,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             if (!lib.album(key, a)) return "{\"ok\":false,\"error\":\"专辑不存在\"}";
             std::ostringstream j;
             // cvSrc/cvUrl 与 /api/lib/albums 同一口径（见那里注释）
-            const std::string csrc = cover_src_of(a.key, a.hasCover);
+            const std::string csrc = cover_src_of(a);
             j << "{\"ok\":true,\"k\":\"" << a.key << "\",\"name\":\"" << jesc(a.name)
               << "\",\"artist\":\"" << jesc(a.artist) << "\",\"year\":" << a.year
               << ",\"dur\":" << a.duration
@@ -10513,16 +10542,18 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             std::vector<unsigned char> bytes;
             std::string mime = "image/jpeg";
             const char* src = "none";
-            // ① 内嵌/同目录图（现有逻辑）。
-            //    ★ 只有 hasCover=1 才去问 —— hasCover 是扫描时算好的（内嵌流 or 同目录封面文件），
-            //      实测 0 误报 0 漏报（docs/261025-02 §2.2）。对 hasCover=0 的专辑调 albumCover()
-            //      会为每张专辑起 3 次 ffmpeg（~200 ms/张），187 张就把单线程 accept 堵死 30+ 秒 ——
-            //      这正是"封面页卡死"的老病根。现在这条路是 0 次 ffmpeg。
-            bool hasEmbedded = false;
+            // ① 库里自己的图（内嵌 or 一目录一专辑的目录封面，来源见 LibAlbum::coverSrc）。
+            //    ★ 只有 hasCover=1 才去问 —— hasCover / coverSrc 是整理专辑表时算好的，
+            //      且语义已收紧（2026-10-27）：**没有属于本专辑的图时 hasCover=false**，
+            //      所以"一目录多专辑"里那 9 张会走到 ②/③ 去要网图，而**不会**再拿同目录那张。
+            //      对 hasCover=0 的专辑调 albumCover() 会为每张专辑起 3 次 ffmpeg（~200 ms/张），
+            //      187 张就把单线程 accept 堵死 30+ 秒 —— 这正是"封面页卡死"的老病根。
+            bool hasCv = false;
+            int cvSrc = rta::net::kCoverNone;
             rta::net::LibAlbum a;
-            if (!key.empty() && lib.album(key, a)) hasEmbedded = a.hasCover;
-            if (hasEmbedded && lib.albumCover(key, bytes, mime) && !bytes.empty()) {
-                src = "embed";
+            if (!key.empty() && lib.album(key, a)) { hasCv = a.hasCover; cvSrc = a.coverSrc; }
+            if (hasCv && lib.albumCover(key, bytes, mime) && !bytes.empty()) {
+                src = (cvSrc == rta::net::kCoverDirFile) ? "dir" : "embed";
             } else {
                 // ② 磁盘正缓存（网图）
                 bytes.clear();
@@ -11923,14 +11954,40 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         if (file.empty()) return "{\"ok\":false,\"error\":\"未指定文件\"}";
         if (!valid_utf8(file)) return utf8_path_reject(file);   // F1：probe_media/get_cover 内部有 u8path
         const MediaInfo mi = probe_media(file);
-        std::string mime;
-        // 只探测有没有封面（不把图片塞进 JSON）
-        auto c = get_cover(file, mime);
-        const bool hasCover = c.size() > 128;
+        // 只探测有没有封面（不把图片塞进 JSON）。
+        // ★ 2026-10-27（第三轮）：hasCover 也必须按**专辑封面来源**判 —— 这是同一个 BUG 的第四条路径
+        //   （用户 2.0 发包前：「专辑名对、封面严重错误」）。老口径 get_cover(file) 第 1 步就是
+        //   "同目录 cover.jpg 优先" ⟹ 一目录多专辑时会把**别人那张图**算成这一首有图（hasCover=true），
+        //   底栏于是去请求 /api/cover（按新逻辑返回空）→ 空白格子：图不再是别人的，但
+        //   "有没有图"这个语义仍然是错的。
+        //   库内文件问 Library::trackCover（与专辑页、单曲页**同一份**来源判断）；库外保持旧行为。
+        bool hasCover = false;
+        {
+            std::vector<unsigned char> cb;
+            std::string cm;
+            if (!rta::net::Library::instance().trackCover(file, cb, cm)) {
+                cb = get_cover(file, cm);      // 库外（拖进来的临时文件 / 还没扫进库）：旧行为
+            }
+            hasCover = cb.size() > 128;
+        }
         // MetaStore 补全结果覆盖输出(P1):记录里值非空才覆盖;albumArtist/year/lyrics 是新增键
         rta::meta::TrackMeta tm;
         const bool haveMeta = rta::meta::MetaStore::instance().load(file, tm);
         std::string fTitle = mi.title, fArtist = mi.artist, fAlbum = mi.album, fGenre = mi.genre;
+        // 2026-10-28（用户真机：「单曲的 AI 搜索仍然没加入专辑名」——查下来**不是搜索词代码没改**，
+        //   而是这里没兜底）：
+        //   本库大量同人碟是**无标签 WAV**。实测 02. 19：30.wav 连 RIFF 的 LIST/INFO 块都没有，
+        //   probe_media 返回空 ⟹ fAlbum 为空 ⟹ 前端 npDataTargets 的 m.album 为空 ⟹
+        //   npSummUrl 拼不出 &album= ⟹ 后端 opts.album 为空 ⟹ 搜索词退化成
+        //     "19：30 歌曲 作词 作曲 编曲 发行"
+        //   实测这种查询的 rerank 最高只有 0.26，拿回来的是吉他谱/K歌app/DJ粤语版 —— 全是垃圾。
+        //   而**库里本来就能从目录名算出专辑名**（albumVecLocked → lib_dir_album_for，
+        //   已经拆过「专辑 @ 社团」）。这里把同一条兜底接到 /api/meta 上，
+        //   保证「专辑页显示的专辑名」「单曲页副标题」「AI 搜索用的专辑名」是**同一个值**。
+        if (fAlbum.empty()) {
+            const rta::net::LibDirAlbum da = rta::net::lib_dir_album_for(file);
+            if (da.fromDir && !da.album.empty()) fAlbum = da.album;
+        }
         std::string fAlbumArtist, fYear, fLyrics;
         std::map<std::string, std::string> metaSrc;     // 字段 → MetaValue.source(溯源表)
         auto metaOverride = [&](const char* key, std::string& dst) {
@@ -12199,6 +12256,11 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         std::string kindStr = "person";
         std::string name;
         std::string artist;
+        // 2026-10-28（用户真机：AI 把《19:30》挂到不相干的《火花》上）：
+        //   曲目所属的**专辑名**。kind=track 时由前端带上（专辑页已经把名字确定下来了，
+        //   不需要也不应该再用文件夹名去猜）。裸曲名的搜索结果必然是垃圾 ——
+        //   "19:30" 这种时间型曲名全网同名无数。
+        std::string album;
         std::string lang = "zh";
         bool refresh = false;
 
@@ -12214,6 +12276,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 if (k == "kind") kindStr = v;
                 else if (k == "name") name = v;
                 else if (k == "artist") artist = v;
+                else if (k == "album") album = v;
                 else if (k == "refresh") refresh = (v == "1" || v == "true");
                 else if (k == "lang") lang = v;
             }
@@ -12244,6 +12307,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             rta::meta::RetrievalOptions ropts;
             ropts.metabase = metabaseT;
             ropts.refresh = refresh;
+            // 2026-10-28：把专辑名交给检索层，单曲搜索词因此变成「专辑 + 曲名」而不是裸曲名。
+            ropts.album = album;
             ropts.llm_cfg = rta::meta::llm_config_load(llm_conf_path());
             const std::string jobKey = eidTrack + "|" + lang;
             {
@@ -12265,7 +12330,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                     job.running = true;
                     job.started_at = now;
                     g_summ_jobs[jobKey] = job;
-                    play_log("SUMMARY generate(async) kind=track name=" + name);
+                    // 2026-10-28：把**实际用于检索的专辑名**也打进日志。
+                    //   用户实机反馈「单曲 AI 搜索仍不含专辑名」，光看代码分不清是哪一环没接上；
+                    //   有了这一行，album= 为空就说明 /api/meta 没兜底（本次修的就是它），
+                    //   非空就说明搜索词里确实带上了（见 retrieval.h 的 qBase 拼接）。
+                    play_log("SUMMARY generate(async) kind=track name=" + name +
+                             " album=" + (ropts.album.empty() ? std::string("<empty>") : ropts.album));
                     summary_job_start_fn(jobKey, "track", name, [name, artist, lang, ropts]() {
                         return rta::meta::retrieval_fetch_track(name, artist, lang, ropts);
                     });
@@ -12404,8 +12474,32 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
         std::string mime = "image/png";
         std::vector<unsigned char> bytes;
-        if (!file.empty()) bytes = rta::audio::get_cover(file, mime);
-        // 内嵌/本地图片读取失败(≤128B = get_cover 的占位 PNG)→ MetaStore 缓存封面兜底
+        // 2026-10-27（用户 2.0 发包前 BUG「专辑名对、封面严重错误」的**第三条**路径）：
+        //   老实现直接 get_cover(file)，而它第 1 步是"同目录 cover.jpg 优先" ⟹ 一目录多专辑时
+        //   底栏/单曲页会把别人那张图发给这一首（与 /api/lib/cover 同源，只是入口不同）。
+        //   现在：**库内文件**先问 Library（按它所属专辑的 coverSrc 取图，与专辑页完全同一份判据）；
+        //         **库外文件**（拖进来的临时文件/还没扫进库）保持旧行为，由 get_cover 决定。
+        if (!file.empty()) {
+            if (!rta::net::Library::instance().trackCover(file, bytes, mime))
+                bytes = rta::audio::get_cover(file, mime);
+            // 2026-10-28（用户「所有曲目都没封面」的第二个真因）：
+            //   trackCover 返回空 = 本专辑没有**属于自己**的图（一目录多专辑且该曲无内嵌）。
+            //   此时专辑页（/api/lib/cover?k=）会去查 covercache 的网图，而这里**原来不查**
+            //   ⟹ 在线补图之后，专辑页有图、单曲页与底栏仍空白，同一张专辑两个入口两套结果。
+            //   现在按「该文件所属专辑的键」查一次网图正缓存，与专辑页走同一份数据。
+            if (bytes.size() <= 128) {
+                std::string akey;
+                if (rta::net::Library::instance().trackAlbumKey(file, akey) && !akey.empty()) {
+                    std::vector<unsigned char> nb;
+                    if (cover_read_cached(akey, nb) && nb.size() > 128) {
+                        bytes.swap(nb);
+                        mime = cover_mime_of(bytes);
+                    }
+                }
+            }
+        }
+        // 内嵌/本地图片读取失败(≤128B = get_cover 的占位 PNG，或本专辑没有属于自己的图)
+        // → MetaStore 缓存封面兜底
         if (file.empty() || bytes.size() <= 128) {
             std::vector<unsigned char> mb;
             std::string mm;
@@ -13190,6 +13284,11 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                                            // 261027-04 #4：播放时自动分析（单曲页那三块）。默认 1 = 开；
                                            // 0 = 只有手动点「重新分析」才跑（不想每次播放吃 CPU 的用户）
                                            "autoanl",
+                                           // 2026-10-28（用户 2.0 前要求）：音频分析**模块总开关**。默认 1 = 开；
+                                           // 0 = 整个模块关掉（单曲页不显示分析卡、不发 /api/health、右键无入口）。
+                                           // 与 autoanl 的区别：autoanl 只管"要不要自动跑"，卡还在；
+                                           // anlmaster 管"这个模块还要不要"。
+                                           "anlmaster",
                                            // B3（2026-10-27）：房间校正自动应用。默认 1 = 开；
                                            // 0 = 不自动挂 data\roomcorr\correction-<布局>.json（只用「校正文件 → 脉冲响应 IR」）
                                            "roomcorrauto" })
@@ -13256,6 +13355,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         injectKv("streamdecode", "1");
         // 261027-04 #4：老配置里没有 autoanl 键 ⟹ 缺省「开」（用户要求默认开）。
         injectKv("autoanl", "1");
+        // 2026-10-28：模块总开关缺省「开」（老配置里没有这个键，不能让升级用户突然丢功能）
+        injectKv("anlmaster", "1");
         // B3：房间校正自动应用缺省「开」（用户原话「接上就是了」）。老配置没有这个键 ⟹ 也该自动生效，
         // 否则升级上来的用户永远看不到自己测过的校正集被用上。
         injectKv("roomcorrauto", "1");

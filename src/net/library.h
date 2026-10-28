@@ -24,8 +24,10 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <mutex>
+#include <iterator>
 #include <atomic>
 #include <thread>
 #include <filesystem>
@@ -98,13 +100,25 @@ struct LibTrack {
     bool needsConvert() const { return lib_is_iso_path(path); }
 };
 
+// 专辑封面的**来源**（2026-10-27，用户 2.0 发包前 BUG：「专辑名对、封面严重错误」）。
+// 顺序有意义：数值越大越优先（见 albumVecLocked 里的 src > a.coverSrc）。
+//   kCoverNone     没有图 ⟹ /api/lib/cover 直接 404，前端露首字母占位（不许拿别人的图凑）
+//   kCoverDirFile  同目录 cover/folder/front —— **仅当该目录（CD1/Disc 2 归一后）只对应一张专辑**
+//   kCoverEmbedded 曲目内嵌（APIC/PICTURE/covr）—— 永远首选（天然按"文件 → 专辑"绑定）
+enum LibCoverSrc { kCoverNone = 0, kCoverDirFile = 1, kCoverEmbedded = 2 };
+
 struct LibAlbum {
     std::string key;          // 十六进制哈希（URL 用）
     std::string name, artist;
     int    year = 0;
     int    nTracks = 0;
     double duration = 0;
-    bool   hasCover = false;
+    bool   hasCover = false;  // = (coverSrc != kCoverNone)，保留给老调用方/JSON 的 cv
+    // 封面来源与「同目录里还有几张专辑」：两个字段一起才能说清"这张图凭什么算这张专辑的"。
+    // dirAlbums > 1 ⟹ 这个目录里塞了多张不同专辑，目录里的那张封面文件**不属于本专辑**
+    // （见 lib_has_cover_file 上方的现场记录），本专辑只认内嵌。
+    int    coverSrc  = kCoverNone;
+    int    dirAlbums = 1;
     // 2026-10-26 (261026-05): legacy album key (pre key-formula change).
     // Old formula: (albumArtist|artist) + 0x1f + album. Kept so covercache entries
     // written by older versions are still found after upgrading.
@@ -264,9 +278,30 @@ public:
     // 某专辑的封面（字节 + mime），失败返回空
     bool albumCover(const std::string& key, std::vector<unsigned char>& bytes, std::string& mime);
 
+    // 单文件封面（GET /api/cover?file= 用）——**库内文件**按"它所属专辑的封面来源"取图。
+    //   返回 true  ⟹ bytes/mime 已定（bytes 可能为空 = 本专辑确实没有属于自己的图，调用方显示占位）；
+    //   返回 false ⟹ 这个文件**不在索引里**（拖进来的临时文件 / 刚加还没扫 / 网络流），
+    //                调用方必须保持旧行为（rta::audio::get_cover：同目录 cover.jpg 优先 → 内嵌）。
+    // 为什么必须有这一层：get_cover() 第 1 步就是"同目录 cover.jpg 优先"，而 /api/cover 是**单文件**接口，
+    // 一目录多专辑时它会把别人的图发给这一首 —— 与 /api/lib/cover 完全同源的那个 BUG
+    // （2026-10-27「专辑名对、封面严重错误」，见 lib_has_cover_file 上方的现场记录）。
+    bool trackCover(const std::string& path, std::vector<unsigned char>& bytes, std::string& mime) const;
+
+    // 2026-10-28（用户「所有曲目都没封面」的**第二个**真因）：
+    // 曲目 → 它所属专辑的键（就是 /api/lib/cover?k= 用的那个 key）。
+    // 存在的理由：trackCover 在「本专辑没有属于自己的图」时返回空，而 /api/cover?file=
+    // 拿到空之后**只查了 MetaStore（单曲级缓存），没查 covercache（专辑级网图缓存）**。
+    // 于是专辑页（走 /api/lib/cover?k=）能看到在线补的图，单曲页与底栏却一片空白 ——
+    // 同一个专辑两个入口、两套结果，用户看到的就是"封面全没了"。
+    // 有了这个函数，/api/cover 就能在同一条链路上补齐：trackCover → covercache[key] → MetaStore。
+    // 不在库里（临时文件/未扫描）返回 false，调用方继续走旧行为。
+    bool trackAlbumKey(const std::string& path, std::string& key) const;
+
     // ---- 封面在线抓取用的「按 album+artist 反查」（2026-10-26）----
-    // ① 全库快照：所有「内嵌流与同目录封面文件都没有」的专辑（hasCover 在扫描时已算好：
-    //    内嵌 video 流 **或** 同目录 cover/folder/front 任一存在 ⟹ hasCover=1，见 lib_probe 尾部）。
+    // ① 全库快照：所有「**没有一张属于自己**的图」的专辑。
+    //    判据是 LibAlbum::coverSrc（见 albumVecLocked）：内嵌封面，或「一目录一专辑」时的
+    //    同目录 cover/folder/front；一目录多专辑时那张目录文件**不算**（2026-10-27 修 BUG：
+    //    否则 10 张专辑会共用同一张图，预抓取也因此永远认为它们"已经有图"）。
     //    文件系统 IO 由调用方做（磁盘正/负缓存留在 rtaweb），本模块只回答「库里有没有图」。
     std::vector<LibCoverTerm> albumsWithoutCover() const;
     // ② 单张反查：按 key 取回专辑名/艺术家/搜索词。key 不在库里返回 false。
@@ -336,6 +371,11 @@ private:
     LibCleanResult pruneMissingLocked();          // 扫描线程内部用：调用方已持锁 */
     void applyCleanLocked(std::vector<LibTrack>&& kept, int removed);
     const std::vector<LibAlbum>& albumVecLocked() const;
+    // 「这首歌自己有内嵌封面吗」——带 memo（同一次库生命周期内每文件只探一次）。
+    // 只在「一目录多专辑 + 目录里有封面文件」时才会被调用，所以这层缓存只是防止
+    // 反复重建专辑表时重复起 ffprobe；结果在每次扫描/载入索引时清空（见 albumsDirty_ 的两处 swap）。
+    // 调用方必须已持 mtx_（与 albumVecLocked 同一约定）。
+    bool embeddedCoverLocked(const std::string& path) const;
     static std::string readFile(const std::string& p);
     static void writeFile(const std::string& p, const std::string& s);
     static std::string exeDirOrEmpty();   // 2026-10-23：库配置/索引固定落 exe 目录（见 confPath 注释）
@@ -350,6 +390,8 @@ private:
     mutable std::vector<LibAlbum> albums_;
     mutable bool albumsDirty_ = true;
     mutable std::map<std::string, std::pair<std::vector<unsigned char>, std::string>> coverCache_;
+    // 路径 → 1/0：这首歌自己有没有内嵌封面（见 embeddedCoverLocked）。不落盘、不占索引列。
+    mutable std::map<std::string, signed char> embedMemo_;
 
     std::thread th_;
     std::atomic<bool> scanning_{false};
@@ -467,6 +509,74 @@ inline bool lib_has_cover_file(const std::string& trackPath) {
         for (const char* e : kExts)
             if (fsx::exists(dir / rta::audio::widen(std::string(n) + e), ec)) return true;
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// 封面来源（2026-10-27，用户 2.0 发包前 BUG：「艺术家 凋叶棕 (without leaf) → 专辑，
+// 专辑名字是对的，但专辑封面严重错误」）
+//
+// 现场（只读取证，D:\RTA-hqplayer\MUSIC\专辑-感动我的&RainLain\2023）：
+//   一个目录里放了 **10 张不同专辑**（10 个不同的 ALBUM 标签），但目录里只有**一张** cover.jpg。
+//   实测那张 cover.jpg（800×800, 229855 B, md5 63d90cda799f260f47b120ecd7a45f4b）与
+//   「瓦依那 - 大梦.flac」（ALBUM=乐队的夏天3 第7期）的内嵌封面**逐字节相同**。
+//   ⟹ 不是"搜错了图"，而是**粒度不一致**：
+//       专辑名来自**标签**（每首自己的 ALBUM ⟹ 目录被正确切成 10 张专辑）；
+//       封面却来自**目录文件**（lib_has_cover_file 只看父目录 ⟹ 10 张专辑共用一张图）。
+//
+// 修法（判据只有一条）：**目录里的封面文件只属于"这个目录里唯一的那张专辑"**。
+//   ① 内嵌（APIC/PICTURE/covr）永远是首选 —— 它天然按「文件 → 专辑」绑定，不可能串台；
+//   ② 同目录 cover/folder/front **只在**「该目录（按 lib_dir_album_key 把 CD1/Disc 2 归一后）
+//      只对应一张专辑」时才算数；
+//   ③ 多碟装（CD1/CD2 子目录归一成同一个目录键）仍是**一张**专辑 ⟹ 仍允许用各碟自己目录里的
+//      封面，这条不能被误伤（判据：tests/test_library.cpp 的「多碟共享封面」用例）；
+//   ④ 一目录一专辑的大多数目录**不做任何额外探测**（不 probe：目录图就是这张碟的），
+//      只有"一目录多专辑且确有目录封面文件"这一种情形才需要分清内嵌/目录 —— 覆盖率不受影响。
+// ---------------------------------------------------------------------------
+
+// 只取**内嵌**封面字节（绝不看同目录文件）。
+// 为什么不复用 rta::audio::get_cover：它第 1 步就是"同目录 cover.jpg 优先"，
+// 而本 BUG 要的恰恰是"不回落到同目录文件"（那张图可能属于同目录里的另一张专辑）。
+// 抽法逐字照抄 media_info.h 的 -c:v copy（**不转码**），原因见那里 2026-10-23 的实测注释：
+// 发布包的 ffmpeg 裁掉了 PNG 编码器，转码会静默失败、只剩 1×1 占位图。
+inline std::vector<unsigned char> lib_cover_embedded_bytes(const std::string& file, std::string& outMime) {
+    std::vector<unsigned char> bytes;
+    outMime = "image/jpeg";
+    const std::string ffmpeg = rta::audio::find_tool("ffmpeg");
+    if (ffmpeg.empty()) return bytes;
+    const std::string tmp = rta::audio::temp_path(L".img");
+    const std::wstring cmd = L"\"" + rta::audio::widen(ffmpeg) + L"\" -v error -y -i \"" +
+        rta::audio::widen(file) + L"\" -map 0:v:0 -c:v copy -f image2 \"" + rta::audio::widen(tmp) + L"\"";
+    rta::audio::run_hidden(cmd, nullptr);
+    {
+        std::ifstream f(fsx::u8path(tmp), std::ios::binary);
+        if (f) bytes.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    DeleteFileW(rta::audio::widen(tmp).c_str());
+    if (bytes.size() <= 64) { bytes.clear(); return bytes; }      // 空/占位：当作没有
+    // -c:v copy 下扩展名不可信，按文件头判真实 mime（与 media_info.h 同一口径）
+    if (bytes.size() > 8 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47) outMime = "image/png";
+    else if (bytes.size() > 12 && bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x46) outMime = "image/webp";
+    return bytes;
+}
+
+// 「这首歌自己有没有内嵌封面」（只看文件内部，**不看同目录文件**）。
+//   ① 原生解析（进程内、FLAC/WAV/MP3/OGG）：tags_native 的 hasCover 判据就是"ffprobe 会真的
+//      建封面流"（见 tags_native.h 的注释），与 ffprobe 分支同口径；
+//   ② 原生不支持的容器（.m4a/.dsf/.ape/.wma…）退回 ffprobe，只问"有没有 codec_type=video 的流"。
+// 只在「一目录多专辑 + 目录里确有封面文件」时调用（见 albumVecLocked）⟹ 常态零开销。
+inline bool lib_has_embedded_cover(const std::string& file) {
+    if (rta::meta::native::enabled()) {
+        rta::meta::native::TagInfo ni;
+        std::string why;
+        if (rta::meta::native::probe_file(file, &ni, &why)) return ni.hasCover;
+    }
+    const std::string fp = rta::audio::find_tool("ffprobe");
+    if (fp.empty()) return false;
+    std::string out;
+    const std::wstring cmd = L"\"" + rta::audio::widen(fp) + L"\" -v error -select_streams v"
+        L" -show_entries stream=codec_type -of csv=p=0 \"" + rta::audio::widen(file) + L"\"";
+    if (rta::audio::run_hidden(cmd, &out) != 0) return false;
+    return out.find("video") != std::string::npos;
 }
 
 // 「能被曲库收进来」的扩展名。注意 .iso **不是**可播放音轨（见 lib_is_iso_path /
@@ -1159,6 +1269,7 @@ inline void Library::load() {
         std::lock_guard<std::mutex> lk(mtx_);
         tracks_.swap(loaded);
         albumsDirty_ = true;
+        embedMemo_.clear();            // 换了整份索引 ⟹ 内嵌封面判定必须重问
         trackCount_.store(tracks_.size());
         albumCount_.store(0);          // 下次 albums() 会重建并回填（见 albumVecLocked）
     }
@@ -1259,19 +1370,121 @@ inline std::string lib_dir_album_key(const std::string& dir) {
     return d;
 }
 
+// 专辑名归一（2026-10-28，用户紧急反馈「矫枉过正：所有曲目都没封面」）。
+// 用途**只有一个**：判断「同一个目录里到底有几张不同的专辑」，即 LibAlbum::dirAlbums。
+// 不用于显示、不用于专辑键 —— 显示必须保持用户看到的原文。
+//
+// 为什么必须有它：dirAlbums > 1 会让整张碟的「目录封面文件」被判定为归属不确定，
+// 于是一目录多专辑时所有没内嵌封面的曲目全部变空白（这就是用户说的矫枉过正）。
+// 而现实中"同一张专辑"经常只差一点点：
+//   "Album" vs "album"（大小写） · "Album " 尾部空格 · 全角空格 U+3000
+//   "Album（初回盘）" 全角括号 vs "Album(初回盘)" 半角括号 · 中文全角标点
+// 这些必须算**同一张**，否则假阳性会把正常磁盘判成"多专辑"。
+// 前置声明：lib_album_dir_matches 要用它，定义在下面（保持原有定义位置不动）。
+inline std::string lib_album_norm_key(const std::string& name);
+
+// 取路径的最后一段（目录名）。用于「文件夹名才是权威」这条判据。
+inline std::string lib_base_name(const std::string& dir) {
+    size_t e = dir.size();
+    while (e > 0 && (dir[e - 1] == '\\' || dir[e - 1] == '/')) --e;
+    size_t b = e;
+    while (b > 0 && dir[b - 1] != '\\' && dir[b - 1] != '/') --b;
+    return dir.substr(b, e - b);
+}
+
+// 2026-10-28（用户钦定的判据，取代我上一版"按 album 标签分组计数"的做法）：
+//
+//   **本地播放器认定专辑，首先看文件夹名。** 用户就是按文件夹整理唱片的，
+//   标签可能错、可能空，但文件夹名是人手取的。
+//
+// 所以「同目录那张 cover.jpg 属不属于这张专辑」的判定是：
+//   ① 一目录一专辑（dirAlbums<=1）⟹ 肯定属于（不需要比名字）
+//   ② 多专辑目录 ⟹ 比 **文件夹名** 与 **专辑名**（都归一化）：
+//        · 相等            ⟹ 属于
+//        · 一方包含另一方  ⟹ 属于（"Abbey Road" vs "Abbey Road (Remaster)"）
+//        · 专辑名为空      ⟹ 属于（空标签是常态，不能因此判成混装）
+//        · 其它            ⟹ **不属于** ⟹ 交给逐首在线抓
+//
+// 实例：文件夹 "2023" + 标签 "宴"/"Declan"/"Rainbow" ⟹ 不匹配 ⟹ 逐首抓（正确）
+//       文件夹 "Abbey Road" + 标签 "Abbey Road"        ⟹ 匹配   ⟹ 继承（正确）
+//       文件夹 "CD1"/"CD2" + 标签 "Live"               ⟹ 不匹配，但 dirAlbums 归一后为 1 ⟹ 走 ① 继承（正确）
+inline bool lib_album_dir_matches(const std::string& albumName, const std::string& dir) {
+    if (albumName.empty()) return true;                       // 空标签：信任文件夹
+    std::string na = lib_album_norm_key(albumName);
+    std::string nb = lib_album_norm_key(lib_base_name(dir));
+    if (na.empty() || nb.empty()) return true;
+    if (na == nb) return true;
+    if (na.size() >= 2 && nb.find(na) != std::string::npos) return true;
+    if (nb.size() >= 2 && na.find(nb) != std::string::npos) return true;
+    return false;
+}
+
+inline std::string lib_album_norm_key(const std::string& name) {
+    std::string out;
+    out.reserve(name.size());
+    for (size_t i = 0; i < name.size();) {
+        const unsigned char c = (unsigned char)name[i];
+        // 1) 全角 → 半角：ASCII 可见区（U+FF01..U+FF5E）整体减 0xFEE0；U+3000 当空格
+        if (c == 0xEF && i + 2 < name.size()) {
+            const unsigned char c1 = (unsigned char)name[i + 1];
+            const unsigned char c2 = (unsigned char)name[i + 2];
+            if (c1 == 0xBC && (c2 == 0x88 || c2 == 0x89)) {     // （ ） 全角圆括号
+                out.push_back(c2 == 0x88 ? '(' : ')');
+                i += 3; continue;
+            }
+            if (c1 == 0xBC && (c2 == 0xBB || c2 == 0xBD)) {     // ［ ］ / 【 】
+                out.push_back(c2 == 0xBB ? '[' : ']');
+                i += 3; continue;
+            }
+            if (c1 == 0x80 && c2 == 0x80) { out.push_back(' '); i += 3; continue; }   // U+3000 全角空格
+        }
+        // 2) ASCII：小写化；空白统一成一个空格
+        if (c < 0x80) {
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { out.push_back(' '); }
+            else out.push_back((char)std::tolower(c));
+            ++i; continue;
+        }
+        out.push_back(name[i]); ++i;
+    }
+    // 3) 折叠连续空格 + 去首尾空格
+    std::string r;
+    r.reserve(out.size());
+    bool prevSp = true;
+    for (char ch : out) {
+        if (ch == ' ') { if (!prevSp) r.push_back(' '); prevSp = true; }
+        else { r.push_back(ch); prevSp = false; }
+    }
+    while (!r.empty() && r.back() == ' ') r.pop_back();
+    return r;
+}
+
+// 内嵌封面判定（带 memo；调用方须持 mtx_，见声明处注释）
+inline bool Library::embeddedCoverLocked(const std::string& path) const {
+    auto it = embedMemo_.find(path);
+    if (it != embedMemo_.end()) return it->second != 0;
+    const bool v = lib_has_embedded_cover(path);
+    embedMemo_[path] = v ? 1 : 0;
+    return v;
+}
+
 inline const std::vector<LibAlbum>& Library::albumVecLocked() const {
     if (!albumsDirty_) return albums_;
     albums_.clear();
     const size_t n = tracks_.size();
     LibDirAlbumMemo memo;               // 局部 memo：同目录只扫一次
     std::vector<int> discOf(n, 0);      // 预先算好排序用碟号（comparator 里必须零 IO）
-    std::map<std::string, size_t> byKey;
+
+    // ---- 第一遍：每首的「最终专辑名」「父目录」「目录键」 ----
+    // 为什么要先单独走一遍：目录里的那张封面文件到底属于谁，取决于**这个目录里有几张专辑**
+    // （见 lib_has_cover_file 上方的 2026-10-27 现场记录）。而这个计数必须等**所有**曲目的
+    // 专辑名都算完才知道 ⟹ 不能在同一次循环里边算边判。
+    std::vector<std::string> nameOf(n), dirOf(n), dirKeyOf(n);
+    std::map<std::string, std::set<std::string>> albumsByDir;   // 目录键 → 该目录出现过的专辑名
     for (size_t i = 0; i < n; ++i) {
         const auto& t = tracks_[i];
         std::string aName = t.album;
-        std::string aArtist = t.albumArtist.empty() ? t.artist : t.albumArtist;
         int discForSort = t.discNo;
-        std::string pdir = u8s(p8(t.path).parent_path().u8string());
+        const std::string pdir = u8s(p8(t.path).parent_path().u8string());
         if (aName.empty() || discForSort == 0) {
             const LibDirAlbum da = memo.get(pdir, t.path);
             if (da.fromDir) {
@@ -1282,12 +1495,33 @@ inline const std::vector<LibAlbum>& Library::albumVecLocked() const {
             }
         }
         discOf[i] = discForSort;
+        nameOf[i] = aName;
+        dirOf[i] = pdir;
+        dirKeyOf[i] = lib_dir_album_key(pdir);
+        // 2026-10-28（用户紧急反馈「矫枉过正：所有曲目都没封面」）：
+        // 计数用的名字**必须先归一**，否则"同一张专辑"会被鸡毛蒜皮的差异算成多张：
+        //   "Album" / "album" / "Album " / 全角空格 / 全角括号 —— 任何一条命中，dirAlbums 就 >1，
+        //   于是整张碟被判成「封面归属不确定」、所有曲目一起变空白。
+        // 归一只用于**计数**，不改显示用的 nameOf。
+        auto& names = albumsByDir[dirKeyOf[i]];
+        if (names.size() < 4096) names.insert(lib_album_norm_key(aName));   // 上限只为防病态输入撑爆内存
+    }
+    std::map<std::string, int> dirAlbumCount;                   // 目录键 → 不同专辑数（≥1）
+    for (const auto& kv : albumsByDir) dirAlbumCount[kv.first] = (int)kv.second.size();
+
+    // ---- 第二遍：分组 + 逐曲封面来源 ----
+    std::map<std::string, bool> dirCoverMemo;   // 父目录 → 是否有独立封面文件（每个目录只 stat 一次）
+    std::map<std::string, size_t> byKey;
+    for (size_t i = 0; i < n; ++i) {
+        const auto& t = tracks_[i];
+        const std::string& aName = nameOf[i];
+        const std::string& dirKey = dirKeyOf[i];
+        std::string aArtist = t.albumArtist.empty() ? t.artist : t.albumArtist;
         // ★ 2026-10-26（261026-02 #3 的根因之一）：专辑键**不能带 artist**。
         // 旧键 = (albumArtist?:artist) + "\x1f" + album ⟹ 同一张碟里每首 artist 不同就被切成多个"专辑"：
         // 实测本库 654 首被切成 **301 张卡**，而物理目录只有 87 个（RESOLVERS 一张碟裂成 19 张）。
         // 后果：专辑页看着零碎、封面按裂开的卡逐张去搜（同一张碟搜 19 次）、覆盖率分母被人为放大。
         // 新键 = 专辑名 + "\x1f" + 目录（目录做 CD1/Disc 2 归一，保证多碟装仍合成一张）。
-        const std::string dirKey = lib_dir_album_key(pdir);
         const std::string legacyRawKey = aArtist + "\x1f" + aName;
         const std::string legacyHash = fnv_hex(legacyRawKey);
         const std::string rawKey = aName + "\x1f" + dirKey;
@@ -1295,18 +1529,48 @@ inline const std::vector<LibAlbum>& Library::albumVecLocked() const {
         if (it == byKey.end()) {
             LibAlbum a; a.key = fnv_hex(rawKey); a.name = aName; a.artist = aArtist; a.year = t.year;
             a.legacyKey = legacyHash;
+            // 同一目录（CD1/Disc 2 归一后）里还有几张别的专辑 —— 封面可信度的唯一依据
+            auto dc = dirAlbumCount.find(dirKey);
+            a.dirAlbums = (dc == dirAlbumCount.end()) ? 1 : dc->second;
             byKey[rawKey] = albums_.size();
             albums_.push_back(a);
             it = byKey.find(rawKey);
         }
         LibAlbum& a = albums_[it->second];
+        // ---- 封面来源（2026-10-27，见 lib_has_cover_file 上方的现场记录）----
+        // 规则一句话：**内嵌永远首选；目录文件只在"一目录一专辑"时才算数**。
+        //   * 同目录没有封面文件        ⟹ 索引里的 cv=1 只能来自内嵌，不必探测（零开销）
+        //   * 一目录一专辑（含多碟装）  ⟹ 那张封面文件就是这张碟的，照旧用它（零探测 ⟹ 覆盖率不回归）
+        //   * 一目录多专辑              ⟹ 必须分清"这首自己有没有内嵌"，否则就是 10 张专辑共用一张图
+        const bool dirCov = [&] {
+            auto m = dirCoverMemo.find(dirOf[i]);
+            if (m != dirCoverMemo.end()) return m->second;
+            const bool v = lib_has_cover_file(t.path);
+            dirCoverMemo.emplace(dirOf[i], v);
+            return v;
+        }();
+        int src = kCoverNone;
+        if (t.hasCover) {
+            if (!dirCov)             src = kCoverEmbedded;
+            else if (a.dirAlbums <= 1) src = kCoverDirFile;
+            // 2026-10-28（用户钦定的判据）：多专辑目录**不等于**封面不属于本专辑。
+            // 只要文件夹名与这张专辑的名字对得上（归一化后相等或互相包含），那张 cover.jpg
+            // 就是这张碟的 —— 继承它。对不上的（文件夹叫 2023、标签是 宴）才判为混装，
+            // 交给逐首在线抓。上一版只写 dirAlbums<=1 一条，于是所有一目录多专辑的碟
+            // 一起变空白，就是用户说的矫枉过正。
+            else if (lib_album_dir_matches(aName, dirOf[i])) src = kCoverDirFile;
+            else src = embeddedCoverLocked(t.path) ? kCoverEmbedded : kCoverNone;
+        }
+        if (src > a.coverSrc) a.coverSrc = src;
         a.idx.push_back(i);
         a.nTracks = (int)a.idx.size();
         a.duration += t.duration;
-        if (t.hasCover) a.hasCover = true;
         if (a.year == 0) a.year = t.year;
     }
     for (auto& a : albums_) {
+        // hasCover 的语义收紧了：**必须真的有一张属于本专辑的图**。
+        // 老实现是"任一曲目 cv=1"（而 cv 又含目录文件）⟹ 本 BUG 里 10 张专辑全部 hasCover=true。
+        a.hasCover = (a.coverSrc != kCoverNone);
         std::sort(a.idx.begin(), a.idx.end(), [&](size_t x, size_t y) {
             const int pDisc = discOf[x], qDisc = discOf[y];
             if (pDisc != qDisc) return pDisc < qDisc;
@@ -1349,8 +1613,9 @@ inline std::vector<size_t> Library::search(const std::string& q, size_t limit) c
 //     3) 空结果写进"负缓存"（first 为空，永久），小图**不**写缓存（下次还能重试）。
 //   判据：tests/test_library.cpp 的画布用例 + 真库抽样（docs/261025-02-封面与字体核查.md）。
 inline bool Library::albumCover(const std::string& key, std::vector<unsigned char>& bytes, std::string& mime) {
-    // 抽出顺序：先本专辑 cv=1 的曲目，再其余曲目（最多各 3 首，避免对 200 首的合辑起 200 次 ffmpeg）
+    // 抽出顺序：先本专辑有图的曲目，再其余曲目（最多各 3 首，避免对 200 首的合辑起 200 次 ffmpeg）
     std::vector<std::string> order;
+    int src = kCoverNone;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = coverCache_.find(key);
@@ -1362,17 +1627,40 @@ inline bool Library::albumCover(const std::string& key, std::vector<unsigned cha
         std::vector<std::string> withCv, without;
         for (auto& a : v) {
             if (a.key != key) continue;
+            src = a.coverSrc;
+            size_t probes = 0;                  // 内嵌判定最多问 6 首（防 200 首的合辑把 accept 线程拖住）
             for (size_t ix : a.idx) {
                 if (ix >= tracks_.size()) continue;
-                if (tracks_[ix].hasCover) { if (withCv.size() < 3) withCv.push_back(tracks_[ix].path); }
-                else                      { if (without.size() < 3) without.push_back(tracks_[ix].path); }
+                if (a.coverSrc == kCoverEmbedded) {
+                    if (withCv.size() >= 3 || probes >= 6) break;
+                    ++probes;
+                }
+                // ★ 2026-10-27：**来源决定"哪几首算有图"**。
+                //   内嵌来源只认"这首自己有内嵌封面"的曲目 —— 否则会把一首"只有同目录封面文件"的
+                //   曲目排到前面，抽出来的又是那张不属于本专辑的图（本 BUG 的原形）。
+                //   目录来源照旧看索引里的 cv（那份 1 本来指的就是目录文件）。
+                const bool has = (a.coverSrc == kCoverEmbedded)
+                                     ? embeddedCoverLocked(tracks_[ix].path)
+                                     : (tracks_[ix].hasCover != 0);
+                if (has) { if (withCv.size() < 3) withCv.push_back(tracks_[ix].path); }
+                else if (a.coverSrc != kCoverEmbedded) {
+                    if (without.size() < 3) without.push_back(tracks_[ix].path);
+                }
             }
             break;
         }
         order = withCv;
-        order.insert(order.end(), without.begin(), without.end());
+        if (src != kCoverEmbedded) order.insert(order.end(), without.begin(), without.end());
     }
-    if (order.empty()) return false;
+    // 没有属于本专辑的图 ⟹ 直接判"无"（让 /api/lib/cover 回 404、前端露首字母）。
+    // 这里**绝不**回落到同目录封面文件：那正是"10 张专辑共用一张图"的来源。
+    if (src == kCoverNone || order.empty()) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (coverCache_.size() > 256) coverCache_.clear();
+        coverCache_[key] = { std::vector<unsigned char>(), "image/png" };   // 负缓存（无图可给）
+        bytes.clear();
+        return false;
+    }
     // < 1 KB 的图基本只可能是占位/损坏：真实封面（含 APIC 缩略图）极少这么小。
     // 这里不直接判死，而是"继续试下一首"——全试完仍只有小图才用它（总比空白好）。
     std::vector<unsigned char> b;
@@ -1380,7 +1668,12 @@ inline bool Library::albumCover(const std::string& key, std::vector<unsigned cha
     std::vector<unsigned char> small;
     for (const auto& p : order) {
         std::string m;
-        std::vector<unsigned char> cand = rta::audio::get_cover(p, m);
+        // 来源决定抽法（2026-10-27）：
+        //   DirFile  → 照旧走 get_cover（它第 1 步就是同目录封面文件，正是这种来源要的图）；
+        //   Embedded → 只抽内嵌（lib_cover_embedded_bytes），**绝不**碰同目录文件。
+        std::vector<unsigned char> cand = (src == kCoverDirFile)
+            ? rta::audio::get_cover(p, m)
+            : lib_cover_embedded_bytes(p, m);
         if (cand.size() >= 1024) { b.swap(cand); mime = m; break; }
         if (small.empty() && !cand.empty()) { small.swap(cand); smallMime = m; }
     }
@@ -1403,6 +1696,71 @@ inline bool Library::albumCover(const std::string& key, std::vector<unsigned cha
     return !bytes.empty();
 }
 
+// 单文件封面（GET /api/cover?file= 的库内分支）——见声明处的注释。
+// 取图规则与 albumCover 同源（**同一份来源判断**，不重复实现一套）：
+//   embed → 只抽内嵌，先问这一首自己，再退到**同一张专辑**里其它有内嵌的曲目（仍是同一张碟的图）；
+//   dir   → get_cover（它第 1 步就是同目录封面文件，正是这种来源要的）；
+//   none  → 空（绝不外借同目录那张，那可能属于同目录里的另一张专辑）。
+inline bool Library::trackCover(const std::string& path, std::vector<unsigned char>& bytes, std::string& mime) const {
+    int src = kCoverNone;
+    std::vector<std::string> order;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        const std::string want = lib_path_key(path);
+        size_t ix = tracks_.size();
+        for (size_t i = 0; i < tracks_.size(); ++i)
+            if (lib_path_key(tracks_[i].path) == want) { ix = i; break; }
+        if (ix == tracks_.size()) return false;          // 不在库里 ⟹ 调用方按旧行为走
+        const auto& v = albumVecLocked();
+        for (const auto& a : v) {
+            if (std::find(a.idx.begin(), a.idx.end(), ix) == a.idx.end()) continue;
+            src = a.coverSrc;
+            if (src == kCoverEmbedded) {
+                order.push_back(tracks_[ix].path);
+                size_t probes = 0;
+                for (size_t jx : a.idx) {                // 同一张专辑的其它曲目（最多再找 2 首）
+                    if (jx == ix || jx >= tracks_.size()) continue;
+                    if (order.size() >= 3 || probes >= 6) break;
+                    ++probes;
+                    if (embeddedCoverLocked(tracks_[jx].path)) order.push_back(tracks_[jx].path);
+                }
+            }
+            break;
+        }
+    }
+    bytes.clear();
+    mime = "image/png";
+    if (src == kCoverDirFile) { bytes = rta::audio::get_cover(path, mime); return true; }
+    if (src != kCoverEmbedded) return true;              // 本专辑没有属于自己的图：不借别人的
+    std::vector<unsigned char> small;
+    std::string smallMime;
+    for (const auto& p : order) {
+        std::string m;
+        std::vector<unsigned char> cand = lib_cover_embedded_bytes(p, m);
+        if (cand.size() >= 1024) { bytes.swap(cand); mime = m; return true; }
+        if (small.empty() && !cand.empty()) { small.swap(cand); smallMime = m; }
+    }
+    bytes.swap(small);                                   // 只有小图（缩略/占位）：照给，让上层判 ≤128
+    if (!bytes.empty()) mime = smallMime;
+    return true;
+}
+
+inline bool Library::trackAlbumKey(const std::string& path, std::string& key) const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    const std::string want = lib_path_key(path);
+    size_t ix = tracks_.size();
+    for (size_t i = 0; i < tracks_.size(); ++i)
+        if (lib_path_key(tracks_[i].path) == want) { ix = i; break; }
+    if (ix == tracks_.size()) return false;
+    const auto& v = albumVecLocked();
+    for (const auto& a : v) {
+        if (std::find(a.idx.begin(), a.idx.end(), ix) == a.idx.end()) continue;
+        key = a.key;
+        return true;
+    }
+    return false;
+}
+
 // ---------------- 封面在线抓取：按 album+artist 反查（2026-10-26）----------------
 // 为什么由 Library 出这份数据，而不是让 rtaweb 自己拼：
 //   /api/lib/albums 里的 name/artist 是 albumVecLocked() 的**成品**（真实标签，缺了才用目录名回填，
@@ -1421,7 +1779,7 @@ inline std::vector<LibCoverTerm> Library::albumsWithoutCover() const {
     const auto& v = albumVecLocked();
     out.reserve(v.size());
     for (const auto& a : v) {
-        if (a.hasCover) continue;                 // 库里已有图（内嵌流或同目录封面文件）
+        if (a.hasCover) continue;                 // 库里已有**属于本专辑**的图（见 coverSrc）
         LibCoverTerm t;
         t.key = a.key; t.name = a.name; t.artist = a.artist;
         t.term = lib_cover_term(a.name, a.artist);
@@ -1921,6 +2279,7 @@ inline void Library::startScan(bool forceFull) {
             std::lock_guard<std::mutex> lk(mtx_);
             tracks_.swap(fresh);
             albumsDirty_ = true;
+            embedMemo_.clear();        // 扫描换了整份索引 ⟹ 内嵌封面判定必须重问
             lastScanMs_.store(durMs);
             lastScanProbed_.store(probedCount.load());
             lastScanCached_.store(cachedCount.load());

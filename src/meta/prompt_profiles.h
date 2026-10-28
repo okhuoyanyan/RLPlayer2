@@ -686,6 +686,44 @@ inline ProfilePrompt build_profile_prompt(
     sys += "      · 只有「完全不知道」的字段才省略。\n";
     sys += "8. 【材料页类型】材料里同时有「专辑/作品页」与「组织/艺术家页」时，以专辑页为准；"
            "组织页只能用来确认团体名、目录编号前缀这类外围信息。\n\n";
+    // 2026-10-28（用户真机实测抓到的**真事故**）：
+    //   资源为「Static World 会场限定CD / 02. 19：30.wav」（WAV 无任何标签，只有目录名与文件名），
+    //   模型拿曲名 "19:30" 去搜网易云，搜到一个完全不相干的专辑《火花》（id=148064894，
+    //   歌手「啵啵啵啵菜」，只收录 1 首 02:06），却断言
+    //     「所属专辑：网易云音乐专辑页 id=148064894 收录本曲（专辑名与艺术家未能确证）」
+    //   —— **它自己都写了"未能确证"，却仍然下了"收录本曲"的结论**。
+    //   用户点开那个链接看到的是《火花》，与《19:30》毫无关系。
+    // 这类错误比"没查到"更有害：它给出了一个可点击、可被信任的错误归属。
+    sys += "9. 【引用外部页面必须先核对归属】这是本提示词里最容易出错的一条，务必逐字执行：\n";
+    sys += "   a) 你可以引用材料里给出的音乐平台页面（网易云/QQ音乐/dizzylab 等），"
+           "但**只有当该页面的内容能与本实体对上时**，才能说它「收录了」本实体。\n";
+    sys += "   b) 「对得上」的判据（**至少满足两项**，缺一不可）：\n";
+    sys += "      · 专辑名一致或明显是同一张（含译名、缩写、全半角差异）；\n";
+    sys += "      · 曲目列表里能找到本曲（曲名一致，或曲目数与序号能对应）；\n";
+    sys += "      · 时长一致（允许 ±3 秒）。\n";
+    sys += "   c) **只对上曲名不算对得上** —— 曲名常常重名（「19:30」「Intro」「Theme」这类尤其如此）。\n";
+    sys += "   d) 对不上时，**绝对不要写「收录本曲」「收录于」「所属专辑：XX 平台 id=...」这类断言**。"
+           "要么整条不输出（按规则 7c），要么只写你确证的部分，**不带那个页面**。\n";
+    sys += "   e) **禁止**出现「XX 专辑页收录本曲（专辑名与艺术家未能确证）」这种自相矛盾的表述："
+           "既然未能确证专辑名，就没有依据断言收录关系。\n";
+    sys += "   f) 你自己知道的发行信息（「这张碟是同人社团在某某展会上发的无料盘」）可以照写并标"
+           "「（AI 知识）」，但**不要把不确定的搜索结果伪装成已核实的事实**。\n\n";
+    // 2026-10-28（真机实测抓到的观感问题）：
+    //   模型把 URL **直接写进字段值**，于是专辑名被劈成两半：
+    //     "专辑名称": "Static World（https://vgmdb.net/org/5044） 会場限定CD"
+    //     "译名":     "Static World（https://vgmdb.net/org/5044） 限定作"
+    //   每一个出现社团名的地方都被插了一遍，读起来支离破碎。
+    //   而**程序本身有 linkify_text()**：它会把核对过的名词（维基/萌娘/VGMdb/THBWiki 等）
+    //   自动变成超链接。模型手写 URL 不但多余，还会把短语切断。
+    sys += "10. 【字段值里不要写 URL】\n";
+    sys += "   a) 所有字段值一律写**纯文本**：不要出现 http://、https://、www.，也不要用「名词（链接）」这种形式。\n";
+    sys += "   b) 需要给出来源时，把链接放进 citations[]（并从材料里原样复制），"
+           "**不要塞进 fields 的值里面**。\n";
+    sys += "   c) **名词超链接由程序自动完成**（人名、团体、会场、专辑、作品、音乐厅等，"
+           "程序会匹配维基百科 / 萌娘百科 / VGMdb / THBWiki 等权威站点）。"
+           "你只要把名词写对，链接会自己挂上去。\n";
+    sys += "   d) 反例（不要这样写）：\"专辑名称\": \"Static World（https://vgmdb.net/org/5044） 会場限定CD\"\n";
+    sys += "      正例：\"专辑名称\": \"Static World 会場限定CD\"\n\n";
     sys += std::string("【本类必查信息】") + spec.fields + "\n";
     sys += std::string("【本类解读角度】") + spec.angles + "\n";
     if (spec.rules && *spec.rules) sys += std::string("【本类特有规矩】") + spec.rules + "\n";
@@ -1263,6 +1301,39 @@ inline std::string pp_strip_source_suffix(const std::string& title) {
 
 // 按 profile 定制检索词尾（2026-10-27 真实调用反馈：同人盘只搜到 VGMdb 组织页）。
 // 目的不是"多搜"，而是把搜索引到**专辑页**（曲目/售价/颁布日期都在专辑页上）。
+// 2026-10-28（用户真机对比：DeepSeek 网页能搜到准确资料，软件里是垃圾）：
+//   除了「artist 与 name 重复」之外，还有第二层重复 —— suffix 里的判别词与 base 里的词撞车：
+//     base   = "Static World 会场限定CD"
+//     suffix = " 同人 東方 会场限定 颁布 曲目 社团 售价"
+//                                ↑ 又一遍「会场限定」
+//   重复词会拉低搜索引擎的相关性排序。这里按**空格分词 + 子串判定**去掉已经出现过的词
+//   （中文没有分词器，所以用"这个词是不是 base 的子串"来判断，对「会场限定 ⊂ 会场限定CD」这种
+//    情形恰好成立，也不会丢信息 —— base 里本来就有）。
+//   同时给后缀长度设了软上限：超过 6 个词就把尾部（通常是次要判别词）丢掉，避免稀释。
+inline std::string pp_query_merge_suffix(const std::string& base, const std::string& suffix) {
+    // 拆 base（用于子串判定）与 suffix（用于逐词过滤）
+    std::vector<std::string> sw;
+    {
+        std::string cur;
+        for (char ch : suffix) {
+            if (ch == ' ' || ch == '\t') { if (!cur.empty()) { sw.push_back(cur); cur.clear(); } }
+            else cur.push_back(ch);
+        }
+        if (!cur.empty()) sw.push_back(cur);
+    }
+    std::string out = base;
+    int kept = 0;
+    for (const auto& w : sw) {
+        if (w.empty()) continue;
+        if (base.find(w) != std::string::npos) continue;   // base 里已有 ⟹ 跳过
+        if (kept >= 6) break;                              // 软上限：避免 query 被稀释
+        out += ' ';
+        out += w;
+        ++kept;
+    }
+    return out;
+}
+
 inline std::string pp_search_query_suffix(MusicProfile p, const std::string& lang) {
     const bool ja = (lang == "ja");
     const bool en = (lang == "en");

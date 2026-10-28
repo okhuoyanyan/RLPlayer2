@@ -59,7 +59,11 @@ var ADV = {
   rgmode: 'off', rgclip: 1,
   // 261027-04 #4：播放时自动分析（单曲页那三块）。默认 **1 = 开**（用户要求「播放就自动运行一次」），
   // 关掉后只有手动点「重新分析」才跑。conf 键 = autoanl（/api/settings 白名单里）。
-  autoAnl: 1
+  autoAnl: 1,
+  // 2026-10-28：音频分析**模块总开关**（conf 键 anlmaster，默认 1）。
+  // 与 autoAnl 的区别：autoAnl=0 只是不自动跑（卡还在，可手动跑）；
+  // anlMaster=0 是整块关掉（单曲页不渲染、不发请求、右键无入口）。
+  anlMaster: 1
 };
 // 元数据补全开关（P1.5 注册表化）：总开关 metaon 与 DeepSeek metallm 固定两键；
 // 数据源开关按 /api/providers（后端注册表）动态渲染，写 metasrc_<id> ——
@@ -767,23 +771,104 @@ function efValueText(v) {
 }
 // 261024-02 #3：本地曲库真实数据优先 —— opts.local = {标签: 值}（本地有就用本地的），
 // opts.drop = {标签:1}（本地数据在页面上已经有专门的展示位置时，AI 那一项直接不渲染）。
-// 值里的 http/https 自动变成可点链接（261024-02 #2：「关联」字段里的网址以前完全点不动）
-function linkifyEscaped(v) {
-  v = String(v == null ? '' : v);
-  var re = /https?:\/\/[^\s<>"'）)】]+/g, out = '', last = 0, m;
-  while ((m = re.exec(v))) {
-    out += esc(v.slice(last, m.index));
-    out += '<span class=eflink data-url="' + esc(m[0]) + '" role=link tabindex=0>' + esc(m[0]) + '</span>';
-    last = m.index + m[0].length;
+// 2.0 UI-3：字段值里的 URL 自动转成超链接（丢弃括号内裸 URL，可读文本优先）
+var DOMAIN_NAMES = {
+  'discogs.com': 'Discogs',
+  'www.discogs.com': 'Discogs',
+  'musicbrainz.org': 'MusicBrainz',
+  'moegirl.org.cn': '萌娘百科',
+  'zh.moegirl.org.cn': '萌娘百科',
+  'wikipedia.org': '维基百科',
+  'zh.wikipedia.org': '维基百科',
+  'ja.wikipedia.org': '维基百科 (日文)',
+  'en.wikipedia.org': 'Wikipedia',
+  'vgmdb.net': 'VGMdb',
+  'baike.baidu.com': '百度百科',
+  'bilibili.com': '哔哩哔哩',
+  'www.bilibili.com': '哔哩哔哩',
+  'youtube.com': 'YouTube',
+  'www.youtube.com': 'YouTube',
+  'spotify.com': 'Spotify',
+  'open.spotify.com': 'Spotify',
+  'apple.com': 'Apple Music',
+  'music.apple.com': 'Apple Music'
+};
+function friendlyUrlTitle(u, links) {
+  u = String(u || '').trim();
+  if (Array.isArray(links)) {
+    var found = links.find(function (l) { return l && l.url === u; });
+    if (found && found.name) return found.name;
+    var uNoSlash = u.replace(/\/+$/, '');
+    var found2 = links.find(function (l) { return l && l.url && l.url.replace(/\/+$/, '') === uNoSlash; });
+    if (found2 && found2.name) return found2.name;
   }
-  out += esc(v.slice(last));
+  try {
+    var parsed = new URL(u);
+    var host = parsed.hostname.toLowerCase();
+    var siteName = DOMAIN_NAMES[host] || DOMAIN_NAMES[host.replace(/^www\./, '')] || host;
+    var pathname = parsed.pathname;
+    if (pathname && pathname !== '/') {
+      var parts = pathname.split('/').filter(Boolean);
+      if (parts.length > 0) {
+        var lastPart = parts[parts.length - 1];
+        try {
+          var decoded = decodeURIComponent(lastPart).replace(/_/g, ' ');
+          if (decoded && decoded !== lastPart && !/^[\d\-_]+$/.test(decoded)) {
+            return (siteName ? (siteName + ' · ') : '') + decoded;
+          }
+          if (decoded && !/^[\d\-_]+$/.test(decoded) && decoded.length < 30) {
+            return (siteName ? (siteName + ' · ') : '') + decoded;
+          }
+        } catch (e) {}
+      }
+    }
+    return siteName;
+  } catch (e) {
+    return u;
+  }
+}
+function makeLinkTag(href, text) {
+  if (!/^https?:\/\//i.test(href)) return esc(text || href);
+  return '<a href="' + esc(href) + '" target="_blank" rel="noopener noreferrer" class="eflink" data-url="' + esc(href) + '">' +
+         esc(text) + '</a>';
+}
+function linkifyEscaped(v, links) {
+  v = String(v == null ? '' : v);
+  if (!v) return '';
+  var masterRegex = /([《【][^》】\n\r<>]+[》】]|[^\s,，、；;（(\n\r<>]+)\s*[（(]\s*(https?:\/\/[^\s<>"'）)]+)\s*[）)]|([^\s,，、；;\n\r<>]+[（(][^）)\n\r<>]+[）)])\s*(https?:\/\/[^\s<>"'）)\]】]+)|(https?:\/\/[^\s<>"'）)\]】]+)/gi;
+  var out = '', lastIndex = 0, match;
+  while ((match = masterRegex.exec(v)) !== null) {
+    out += esc(v.slice(lastIndex, match.index));
+    lastIndex = masterRegex.lastIndex;
+    if (match[1] && match[2]) {
+      var textA = match[1];
+      var bm = /^(.*?)([《【][^》】]+[》】])$/.exec(textA);
+      if (bm) {
+        out += esc(bm[1]) + makeLinkTag(match[2].replace(/[.,;。，；]+$/, ''), bm[2]);
+      } else {
+        out += makeLinkTag(match[2].replace(/[.,;。，；]+$/, ''), textA);
+      }
+    } else if (match[3] && match[4]) {
+      out += makeLinkTag(match[4].replace(/[.,;。，；]+$/, ''), match[3]);
+    } else if (match[5]) {
+      var clean = match[5].replace(/[.,;。，；]+$/, '');
+      var trailing = match[5].slice(clean.length);
+      out += makeLinkTag(clean, friendlyUrlTitle(clean, links)) + esc(trailing);
+    }
+  }
+  out += esc(v.slice(lastIndex));
   return out;
 }
 // 外链点击（事件委托，重绘后不需要重新绑定）
 document.addEventListener('click', function (ev) {
   var t = ev.target;
   while (t && t !== document) {
-    if (t.classList && t.classList.contains('eflink')) { ev.preventDefault(); openExternal(t.dataset.url); return; }
+    if (t.tagName === 'A' && t.classList && t.classList.contains('eflink')) {
+      ev.preventDefault();
+      openExternal(t.getAttribute('data-url') || t.getAttribute('href'));
+      return;
+    }
+    if (t.classList && t.classList.contains('eflink')) { ev.preventDefault(); openExternal(t.dataset.url || t.getAttribute('href')); return; }
     t = t.parentNode;
   }
 });
@@ -816,7 +901,7 @@ function renderFieldGrid(fields, kind, opts) {
     if (!v) return;                              // 空值 = 后端不知道 ⟹ 不占位
     var wide = !!EF_WIDE[lb] || v.length > 46 || v.indexOf('\n') >= 0;
     rows += '<div class="efrow' + (wide ? ' wide' : '') + '">' +
-            '<div class=lb>' + esc(lb) + '</div><div class=vl>' + linkifyEscaped(v) + '</div></div>';
+            '<div class=lb>' + esc(lb) + '</div><div class=vl>' + linkifyEscaped(v, opts && opts.links) + '</div></div>';
   });
   // 261024-02 #3：曲目列表用本地曲库逐行渲染（序号 / 曲名 / 时长三列对齐），不再用 AI 的一行文本。
   // 只有调用方真的传了本地曲目（opts.tracklist）才渲染；否则保留 AI 的文本版（并在末尾标注 AI 推测）。
@@ -842,6 +927,8 @@ function efTracklistHtml(tl) {
 // title 非空时作为小标题（内容全是 AI 整理的板块一律传「AI 整理」，全站同一措辞 —— 261024-01 #2）。
 function renderSummaryContent(summary, title, kind, opts) {
   if (!summary) return '';
+  opts = opts || {};
+  if (!opts.links && summary && summary.links) opts.links = summary.links;
   var sections = (summary.sections || []);
   var body = renderFieldGrid(summary.fields, (summary.kind || kind || ''), opts);
   if (!body) {
@@ -860,7 +947,7 @@ function renderSummaryContent(summary, title, kind, opts) {
           var found = citMap0[cid];
           if (found) sups += '<sup style="color:var(--mut);font-size:10px;margin-left:2px">[' + found + ']</sup>';
         });
-        b0 += '<div style="font-size:12.5px;line-height:1.7;color:var(--txt);margin-bottom:6px">' + esc(p.text) + sups + '</div>';
+        b0 += '<div style="font-size:12.5px;line-height:1.7;color:var(--txt);margin-bottom:6px">' + linkifyEscaped(p.text, opts && opts.links) + sups + '</div>';
       });
       b0 += '</div>';
     });
@@ -1239,8 +1326,14 @@ function albPrefKey(a) { return String((a && a.k) || '') + '|' + String((a && a.
 // 曲目级 URL 的拼法与单曲页抽屉（npDataEnsure）保持一致，才能命中同一份缓存
 function albumTrackUrl(t, alb) {
   var ar = (t && t.artist) || (alb && alb.artist) || '';
+  // 2026-10-28（用户真机：AI 把《19:30》挂到不相干的《火花》上）：
+  //   **必须带上所属专辑名**。这张碟的 WAV 没有任何标签，旧 URL 只有曲名 ⟹ 后端拿
+  //   "19:30" 去搜，全网同名无数，命中了什么全看运气。
+  //   专辑名从专辑对象来（专辑页已把它确定下来了），**不用文件夹名去猜**。
+  var albName = (alb && alb.name) || (t && t.album) || '';
   return '/api/entity/summary?kind=track&name=' + encodeURIComponent((t && t.title) || '') +
-         (ar ? ('&artist=' + encodeURIComponent(ar)) : '') + '&lang=zh';
+         (ar ? ('&artist=' + encodeURIComponent(ar)) : '') +
+         (albName ? ('&album=' + encodeURIComponent(albName)) : '') + '&lang=zh';
 }
 // 261024-05 #T2：离开专辑页 / 打开另一张专辑 → 立刻停掉剩余队列（含还在 2s 轮询的旧 key）。
 // 用户原话：「只在单曲播放页面才预取本曲所属的专辑，不是全部专辑」——专辑页的"整张"只能指
@@ -2759,7 +2852,8 @@ function showTrackMenu(x, y, tk) {
   //   这里原来是**两个**分析入口 ——「查看分析（动态/音质/假无损）」+「分析音质（19 项）」，
   //   两处都对无损性下结论 ⟹ 合并为一条，弹窗按 L2 打开（三块卡 + 全部原始指标 + 判定依据）。
   //   「对比版本…」不动（用户明确要求这个功能不要删，入口也不变）。
-  item('查看分析（动态/音质/无损性）', function () { openHealthModal(tk.path); });
+  // 2026-10-28：模块总开关关掉 ⟹ 这个入口也不给（否则"模块已关"却还能点开分析，语义不成立）
+  if (ANL.master) item('查看分析（动态/音质/无损性）', function () { openHealthModal(tk.path); });
   item('对比版本…', function () { openCompareModal(tk.path); });
   // #2（2026-10-27 用户 261026-09）：原来的「加入播放列表…」菜单项已随播放列表 UI 一起撤掉
   //（播放队列 / 播放列表重复，只留队列；要留存就用队列页的「保存为歌单」）。
@@ -3129,6 +3223,8 @@ function saveSettings(immediate) {
   body += '&rgmode=' + (ADV.rgmode || 'off') + '&rgclip=' + (ADV.rgclip ? 1 : 0);
   // 261027-04 #4：播放时自动分析开关（conf 键 autoanl；默认 1）
   body += '&autoanl=' + (ANL.auto ? 1 : 0);
+  // 2026-10-28：模块总开关也要落盘，否则重启后又冒出来。
+  body += '&anlmaster=' + (ANL.master ? 1 : 0);
   body += '&theme=' + encodeURIComponent(S.theme || 'dark');
   body += '&device=' + encodeURIComponent(ADV.device || '') + '&bits=' + (ADV.bits || 0)
         + '&taps=' + (ADV.taps || 0) + '&atten=' + (ADV.atten || 0)
@@ -3181,6 +3277,22 @@ function loadSettings() {
   // 导致这里 kv 恒空 —— 设置控件全停在默认值，而 saveSettings() 又会把默认值写回 conf。
   apiGetRaw('/api/settings').then(function (j) {
     var kv = j.kv || {};
+    // 2026-10-28（P0，真机定位）：**先落这两个开关，再碰任何 DOM**。
+    //   事故链：本函数中间有一批「裸 D(...)」调用，例如
+    //     3298: if (kv.loudness !== undefined) { D('sLoud').checked = ... }
+    //   而 D('sLoud') 只在「输出」页签渲染后才存在；用户停在专辑页时它是 null
+    //   ⟹ 抛 TypeError ⟹ **整个 .then 从那一行中断** ⟹ 后面所有字段（包括 anlmaster）
+    //   一律读不到，于是总开关永远停在 HTML 默认的「勾选」上。
+    //   autoanl 之所以看起来"生效"，是因为它同时在 SET_KEYS 里，走了另一条路径。
+    //   修法：把这两个与「功能是否可用」直接相关的开关**提到最前**，让它们不受后续任何
+    //   行的影响；剩下的字段即使中途出错，也不会把模块开关带偏。
+    if (kv.autoanl !== undefined) ADV.autoAnl = (kv.autoanl === '0' || kv.autoanl === 'false') ? 0 : 1;
+    ANL.auto = ADV.autoAnl ? 1 : 0;
+    if (kv.anlmaster !== undefined) ADV.anlMaster = (kv.anlmaster === '0' || kv.anlmaster === 'false') ? 0 : 1;
+    ANL.master = ADV.anlMaster ? 1 : 0;
+    if (D('sp_autoanl'))    D('sp_autoanl').checked = !!ANL.auto;
+    if (D('sp_anlmaster'))  D('sp_anlmaster').checked = !!ANL.master;
+    if (D('npAnal')) { if (ANL.master) anlPaint(); else anlHideCard(); }
     if (kv.scanThreads !== undefined || kv.scanthreads !== undefined) {
       ADV.scanThreads = parseInt(kv.scanThreads || kv.scanthreads, 10) || 0;
     }
@@ -3198,8 +3310,17 @@ function loadSettings() {
     if (kv.rate === undefined) {
       if (D('sRate')) D('sRate').value = 'follow';
     }
-    if (kv.volume !== undefined) { S.vol = parseFloat(kv.volume) || 0; D('vol').value = S.vol; syncVolUi(); }
-    if (kv.loudness !== undefined) { D('sLoud').checked = (kv.loudness === '1'); S.loud = D('sLoud').checked; }
+    // 2026-10-28：这两行原本是「裸 D(...)」，元素不存在时抛 TypeError 会把整个 .then 打断
+    //   （上面注释里那条事故链就是它们触发的）。加判空，缺元素时只跳过 UI 同步，不影响状态。
+    if (kv.volume !== undefined) {
+      S.vol = parseFloat(kv.volume) || 0;
+      if (D('vol')) { D('vol').value = S.vol; syncVolUi(); }
+    }
+    if (kv.loudness !== undefined) {
+      var sl = D('sLoud');
+      if (sl) { sl.checked = (kv.loudness === '1'); S.loud = sl.checked; }
+      else { S.loud = (kv.loudness === '1'); }
+    }
     // 高级参数
     if (kv.device !== undefined) ADV.device = kv.device;
     if (kv.bits !== undefined) ADV.bits = parseInt(kv.bits, 10) || 0;
@@ -3245,7 +3366,11 @@ function loadSettings() {
     if (kv.autoanl !== undefined) ADV.autoAnl = (kv.autoanl === '0' || kv.autoanl === 'false') ? 0 : 1;
     ANL.auto = ADV.autoAnl ? 1 : 0;
     if (D('sp_autoanl')) D('sp_autoanl').checked = !!ANL.auto;
-    if (D('npAnal')) anlPaint();
+    // 2026-10-28：**模块总开关**。缺键 = 老配置 ⟹ 默认「开」（升级用户不能突然丢功能）。
+    if (kv.anlmaster !== undefined) ADV.anlMaster = (kv.anlmaster === '0' || kv.anlmaster === 'false') ? 0 : 1;
+    ANL.master = ADV.anlMaster ? 1 : 0;
+    if (D('sp_anlmaster')) D('sp_anlmaster').checked = !!ANL.master;
+    if (D('npAnal')) { if (ANL.master) anlPaint(); else anlHideCard(); }
     if (kv.dsdkind !== undefined) ADV.dsdKind = kv.dsdkind || 'fir';
     if (kv.dsdconv !== undefined) ADV.dsdConv = kv.dsdconv || 'narrow';
     if (kv.opraproduct !== undefined) ADV.opraproduct = kv.opraproduct;
@@ -3262,6 +3387,44 @@ function loadSettings() {
     // 用户 261023-04 #4：EQ/IR 芯片读的是上面刚填好的 ADV.eq / ADV.ir ——
     // 设置页保存后立刻重绘单曲页（清空 EQ 后芯片要马上消失，不用重开页面）。
     if (D('npPage') && D('npPage').classList.contains('on')) renderNp();
+    // 2026-10-28（用户真机：「启用音频分析模块」取消勾选、保存、刷新后又勾上）：
+    //   根因不在那个复选框，而在更上面一层 —— loadSettings() 定义了却从来没有调用点。
+    //   ⟹ kv 恒为空 ⟹ 控件显示 HTML 默认值 ⟹ saveSettings() 把默认值写回 conf，
+    //   用户的设置每保存一次就被覆盖一次。anlmaster 只是第一个被发现的受害者
+    //   （autoanl 同样读不到，所以它也是勾着的）。
+    //   修法两半：① 启动块补 loadSettings()；② 这里在加载完成时，若用户正停在
+    //   设置页，就按刚读到的 kv 重画一次 —— 否则他会一直看着默认值。
+    // 2026-10-28：只在用户**确实停在设置页**时重绘。
+    //   早先我写成 sp.innerHTML.length > 200 —— 但 #setpage 是所有页面共用的容器，
+    //   专辑页的内容同样超过 200 字符，于是启动时会把专辑页误画成设置页
+    //   （真机表现：切到设置再切高级，页面整体跳到「加载失败」）。
+    //   正确判据是 #setpage 上的 'on' 类 —— 路由函数 nav() 用它标记设置页可见。
+    // 2026-10-28（真机第三稿，最终）：**不能重建整页**。
+    //   试过 renderSettingsPage()：它会把 #setpage 整个 innerHTML 换掉 ⟹
+    //   页签弹回第一个（输入）、滚动位置丢失、连当前视图都可能被路由判错（实测跳回专辑页）。
+    //   正确做法是**就地刷新控件的值**：conf 到达时，页面结构早已就位，
+    //   只需要把「用户看到的值」改成「conf 里的值」。不重建 ⟹ 零副作用。
+    try {
+      var sp0 = D('setpage');
+      if (sp0 && sp0.classList.contains('on')) {
+        SET_KEYS.forEach(function (p) {
+          var e = D(p[0]); if (!e) return;
+          var v = kv[p[1]];
+          if (v === undefined) return;
+          if (e.type === 'checkbox') e.checked = (v === '1');
+          else e.value = v;
+        });
+        // 这两个不在 SET_KEYS 里（它们由 ANL 状态机单独维护）
+        var cm = D('sp_anlmaster'); if (cm) cm.checked = !!ANL.master;
+        var ca = D('sp_autoanl');   if (ca) ca.checked = !!ANL.auto;
+        var msg = D('sp_anlmsg');
+        if (msg) msg.textContent = ANL.master
+          ? ('当前：' + (ANL.auto ? '开' : '关') + '　·　已在单曲页展示，不需要额外操作')
+          : '模块已关闭：单曲页不显示分析卡，也不会再请求分析数据';
+        // 主题也要跟上（否则用户改了主题、重启后又看到旧色）
+        try { setTheme(kv.theme || 'dark', false); } catch (e4) { }
+      }
+    } catch (e) { }
   }).catch(function () { });
 }
 
@@ -5063,8 +5226,8 @@ function castDevNameOf(loc) {
   return m ? m[1] : (loc || '设备');
 }
 function castIconSvg() {
-  return '<svg width=12 height=12 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width="2" ' +
-         'style="vertical-align:-1px;margin-right:4px"><path d="M2 16.1A5 5 0 0 1 5.9 20"/><path d="M2 12.05A9 9 0 0 1 9.95 20"/>' +
+  return '<svg width=16 height=16 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=1.8 stroke-linecap=round stroke-linejoin=round>' +
+         '<path d="M2 16.1A5 5 0 0 1 5.9 20"/><path d="M2 12.05A9 9 0 0 1 9.95 20"/>' +
          '<path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><path d="M2 20h.01"/></svg>';
 }
 // 三处 UI 的唯一刷新入口
@@ -5075,10 +5238,10 @@ function applyCastUi(st) {
   var nm = castDevNameOf(st.device);
   var nb = D('npCastBtn');
   if (nb) {
-    nb.innerHTML = castIconSvg() + (running ? ('已推送到 ' + esc(nm)) : '推送到设备');
+    nb.innerHTML = castIconSvg();
     nb.classList.toggle('on', running);
-    nb.title = running ? ('点击停止投放并恢复本机输出（阶段：' + (st.phase || '-') + '）')
-                       : '把当前曲目推送到 UPnP / DLNA 设备，之后所有播放都走它';
+    nb.title = running ? ('点击停止投放并恢复本机输出（已投放到 ' + nm + (st.phase ? (' · 阶段：' + st.phase) : '') + '）')
+                       : '把当前曲目推送到 UPnP / DLNA 设备';
   }
   var badge = D('castBadge');
   if (badge) {
@@ -5086,7 +5249,6 @@ function applyCastUi(st) {
     badge.title = running ? ('正在投放到 ' + nm) : '';
   }
   var push = D('sp_cast_push'), stop = D('sp_cast_stop');
-  if (push) { push.textContent = running ? '重新推送当前曲' : '推送当前曲'; }
   if (stop) stop.disabled = !running;
   updateCastStateUi(st);
 }
@@ -5174,11 +5336,7 @@ function castToggle() {
   else castPush(S.lastCur);
 }
 function npCastBtnHtml() {
-  var running = castRunning();
-  return '<button class="chip npcast' + (running ? ' on' : '') + '" id=npCastBtn title="' +
-         (running ? '点击停止投放并恢复本机输出' : '把当前曲目推送到 UPnP / DLNA 设备') + '">' +
-         castIconSvg() + (running ? ('已推送到 ' + esc(castDevNameOf((CAST.state || {}).device))) : '推送到设备') +
-         '</button>';
+  return '';
 }
 
 /* ---------------- 输出模式 / DSD 比特率 / 封装 ---------------- */
@@ -6020,6 +6178,13 @@ function renderSettingsPage() {
       // 2026-10-27（261027-04 #4）：新增「音频分析」组 —— 用户要求「自动分析要能被关掉」。
       // 默认开；关掉后播放不再自动跑（单曲页仍可手动点「重新分析」）。
       + sgroup('音频分析', '正在播放那首歌的动态 / 音质 / 假无损，展示在单曲页；播放时自动分析一次',
+          // 2026-10-28（用户要求）：**模块总开关**。
+          // 关掉后：单曲页那块框整个消失（包括"自动分析已关闭"的提示框）、右键菜单没有分析入口、
+          // 不再发任何 /api/health 请求。与下面「播放时自动分析」的区别是"要不要这个模块"vs"要不要自动跑"。
+          chk('sp_anlmaster', '启用音频分析模块', ANL.master !== 0,
+              '总开关。关掉后单曲页不再显示分析卡（包括那个"自动分析已关闭"的提示框）、' +
+              '右键菜单不再有「查看分析」入口、也不会再向后台请求任何分析数据。' +
+              '如果你只是不想每次播放都自动跑、但仍想手动看结果，用下面的「播放时自动分析」。') +
           chk('sp_autoanl', '播放时自动分析', ANL.auto !== 0,
               '默认开。每首本地曲目开始播放时自动跑一次（只读文件、不开音频设备）；' +
               '结果按 路径+大小+mtime 缓存，同一首再播是秒出。' +
@@ -6152,6 +6317,24 @@ function renderSettingsPage() {
        + '<button class=btn id=sp_updapply style="display:none">立即更新并重启</button>'
        + '<button class=btn id=sp_updskip style="font-size:12px">跳过此版本</button>'
        + '</div></div></div>')
+       // 2026-10-28（2.0 正式版）：关于本项目。用户要求「开发者信息一定要整合进去」，
+       // 放这里而不是只在 README —— 用户遇到问题第一眼会来「关于」页找联系方式。
+       + sgroup('关于本项目', 'RLPlayer 2.0 · GPL-3.0 开源',
+           '<div class="sfld wide" style="line-height:1.75;font-size:12.5px">'
+         + '<div><b>项目开发者</b>　RainLain、猫与小行星</div>'
+         + '<div><b>协助开发者</b>　聆听风暴</div>'
+         + '<div><b>媒体与美术</b>　Gosed</div>'
+         + '<div><b>测试鸣谢</b>　Miyu、正在下载99%</div>'
+         + '<div style="margin-top:8px"><b>官方主页</b>　'
+         + '<a href="#" class="eflink" data-url="https://rlplayer.rainlain.com">rlplayer.rainlain.com</a>'
+         + '<span style="color:var(--mut2);font-size:11.5px">（即将上线）</span></div>'
+         + '<div><b>粉丝和反馈 Q 群</b>　'
+         + '<a href="#" class="eflink" data-url="https://qm.qq.com/q/895816505">895816505</a></div>'
+         + '<div style="margin-top:8px;color:var(--mut2);font-size:11.5px">'
+         + '本程序以 GNU 通用公共许可证第 3 版（GPL-3.0-or-later）发布；'
+         + '内置第三方组件（ffmpeg / AMD HIP / NVIDIA CUDA / WebView2 / OPRA）各自遵循原始许可，'
+         + '详见程序目录下的 THIRD-PARTY-NOTICES.txt。</div>'
+         + '</div>')
      + '</div>';
   // ---------- 元数据补全（排在「高级」之后）----------
   // P1.5：源开关不再硬编码 —— #sp_metasrc 占位容器由 fillMetaProviders 按
@@ -6430,6 +6613,14 @@ function renderSettingsPage() {
     anlSetAuto(this.checked);
     var m = D('sp_anlmsg');
     if (m) m.textContent = '当前：' + (ANL.auto ? '开' : '关') + '　·　已在单曲页展示，不需要额外操作';
+  };
+  // 2026-10-28（用户紧急反馈）：「设置-高级-音频分析 → 启用音频分析模块」取消勾选、保存、刷新后又自动勾上。
+  // 真因：sp_anlmaster 这个复选框**从来没有绑定 onchange**（anlSetMaster 定义了却零调用点）⟹
+  //   取消勾选只改了 DOM 的 checked，ANL.master 仍是 1；saveSettings() 于是照旧把 anlmaster=1 写回 conf，
+  //   刷新读回 1、又勾上。用户因此根本无法验证这个开关有没有用。
+  // 修法：与 sp_autoanl 完全同构 —— 变化即写内存状态并落盘（anlSetMaster 内部已经 saveSettings()）。
+  if (D('sp_anlmaster')) D('sp_anlmaster').onchange = function () {
+    anlSetMaster(this.checked);
   };
   rgWarn();
   // 功能2：相位说明跟随 1x 滤波器与相位覆盖的选择联动
@@ -7978,7 +8169,7 @@ function qualSpectralHide(F) {
 function qualClipText(q) {
   var runs = Number(q.clipped_runs), pct = Number(q.clipped_pct), longest = Number(q.longest_clip_run);
   if (isFinite(runs) && runs > 0) {
-    return { head: anlNum(runs, 0) + ' 段 · 最长 ' + anlNum(longest, 0) + ' 样本',
+    return { head: '有数字削波 ' + anlNum(runs, 0) + ' 段 · 最长 ' + anlNum(longest, 0) + ' 样本',
              sub: anlNum(q.clipped_samples, 0) + ' 样本 / ' + anlNum(pct, 4) + ' %（上界，含单样本越限）',
              sparse: false };
   }
@@ -7987,9 +8178,8 @@ function qualClipText(q) {
              sub: anlNum(q.clipped_samples, 0) + ' 样本 / ' + anlNum(pct, 4) + ' %（上界，含单样本越限）',
              sparse: true };
   }
-  return { head: '0 段', sub: '0 样本 / 0 %（上界，含单样本越限）', sparse: false };
+  return { head: '无削波', sub: '0 样本 / 0 %（上界，含单样本越限）', sparse: false };
 }
-
 // 立体声三项（报告 §3）：mono-in-stereo 与极性反相都必须有说明，不能只说"立体声正常"。
 function qualStereoText(q) {
   if (!q || !q.stereo) return '非立体声（单声道或 >2 声道）';
@@ -8208,7 +8398,12 @@ var ANL = {
   stat: { runs: 0, hits: 0 }, // 后端计数器快照（/api/health 顺带返回，判据用）
   // 展开级别（2026-10-27 261027-05 A5）：0=折叠摘要（默认）/ 1=指标格 / 2=全部原始指标。
   // 同一首歌跨重绘保持（暂停、拖动进度、重进单曲页都不重置）；换歌由 anlUpdateCur 强制归 0。
-  lvl: 0
+  lvl: 0,
+  // 2026-10-28（2.0 前，用户要求）：**模块总开关**。
+  //   auto=0 只是"不自动跑"，单曲页那块卡还在（可手动点重新分析）；
+  //   master=0 则是**整个模块关掉** —— 单曲页不渲染分析卡、右键菜单没有分析入口、
+  //   所有 /api/health 请求都不发。conf 键 anlmaster（默认 1）。
+  master: 1
 };
 
 // 分析可能跑几秒到几十秒（282 s 的 6 声道 FLAC 实测 2.3 s，DSD/长曲更久），
@@ -8271,12 +8466,9 @@ function anlQualLine(h) {
   // 2.4：headline **只认 clippedRuns**（连续 ≥3 样本）。clippedPct 是上界（含单样本越限），
   //      以前「pct ≥ 0.01 就报削波」会把 110/655 首稀疏单点满幅曲目误判成削波。
   var clip = qualClipText(q);
-  if (Number(q.clipped_runs) > 0) return { t: '有数字削波 ' + clip.head + ' · 母带压过头', c: 'warn' };
+  var clip = qualClipText(q);
+  if (Number(q.clipped_runs) > 0) return { t: clip.head + ' · 母带压过头', c: 'warn' };
   if (clip.sparse) return { t: '仅零星单样本越限，非连续削波', c: '' };
-  // 2.3：mono-in-stereo 必须说出来（库内 4 首 corr=1.0000），不能说成"立体声正常"。
-  if (q.stereo && Number(q.channel_corr) > 0.99995 && Number(q.mono_loss_db) < 0.05) {
-    return { t: '双声道但左右完全相同（等同单声道）· 无真立体声内容', c: '' };
-  }
   if (q.stereo && Number(q.mono_loss_db) >= 60 && Number(q.channel_corr) < -0.9) {
     return { t: '左右极性相反（可能是老录音的真实极性，不一定是错误）', c: 'warn' };
   }
@@ -8733,9 +8925,24 @@ function anlSetLvl(n) {
   anlPaint();
 }
 
+// 2026-10-28：模块总开关关掉时把整块藏起来（连"自动分析已关闭"的提示框都不留）。
+// 隐藏而不是删 DOM：用户重新打开时 anlPaint 会把它显示回来，不用重建节点。
+function anlHideCard() {
+  var box = D('npAnal');
+  if (box) { box.style.display = 'none'; box.dataset.master = '0'; }
+  var grid = D('npAnlGrid');
+  if (grid) grid.innerHTML = '';
+  var st = D('npAnlSt');
+  if (st) st.textContent = '';
+}
+
 function anlPaint(full) {
   var grid = D('npAnlGrid');
   if (!grid) return;
+  // 总开关关掉 ⟹ 整块不渲染（也不刷新状态行），避免"关了还杵着一个框"。
+  var boxM = D('npAnal');
+  if (!ANL.master) { anlHideCard(); return; }
+  if (boxM && boxM.dataset.master === '0') { boxM.style.display = ''; boxM.dataset.master = '1'; }
   var p = ANL.cur;
   var h = p ? ANL.cache[p] : null;
   var busy = !!(p && ANL.busy[p]);
@@ -8767,6 +8974,9 @@ function anlPaint(full) {
 function anlRun(path, force) {
   path = String(path || '');
   if (!path) return;
+  // 2026-10-28：总开关关掉时一律不发起（自动和手动都算）——
+  // 用户关掉模块的语义是"别动我的 CPU、别读我的文件"，不是"少读几次"。
+  if (!ANL.master) return;
   if (ANL.busy[path]) return;
   if (!force && ANL.cache[path]) { ANL.src = 'front'; anlPaint(); return; }
   ANL.busy[path] = true;
@@ -8825,6 +9035,29 @@ function anlUpdateCur(cur) {
     ANL.src = 'front'; ANL.elapsed = 0; anlPaint(); return;
   }
   anlRun(cur, false);
+}
+
+// 2026-10-28（用户 2.0 前要求）：模块**总开关**。
+// 关掉 = 单曲页整块消失 + 不发任何 /api/health + 右键菜单没有分析入口。
+function anlSetMaster(on) {
+  ANL.master = on ? 1 : 0;
+  ADV.anlMaster = ANL.master;
+  var c = D('sp_anlmaster');
+  if (c) c.checked = !!ANL.master;
+  saveSettings();
+  if (!ANL.master) {
+    anlHideCard();
+  } else {
+    var box = D('npAnal');
+    if (box) { box.style.display = ''; box.dataset.master = '1'; }
+    anlPaint();
+    // 重新打开且当前有本地曲目、又没分析过 ⟹ 补一次（只在 auto 也开着时才跑，不改 auto 语义）
+    if (ANL.auto && ANL.cur && !ANL.cache[ANL.cur] && anlIsLocal(ANL.cur)) anlRun(ANL.cur, false);
+  }
+  var m2 = D('sp_anlmsg');
+  if (m2) m2.textContent = ANL.master
+    ? ('当前：' + (ANL.auto ? '开' : '关') + '　·　已在单曲页展示，不需要额外操作')
+    : '模块已关闭：单曲页不显示分析卡，也不会再请求分析数据';
 }
 
 // 开关（单曲页按钮 / 设置-高级 / 都走这里，写同一个 adv 键并落盘）
@@ -9804,7 +10037,10 @@ function npDataTargets(m) {
   var album = String((m && m.album) || '');
   var albumArtist = String((m && m.albumArtist) || '');
   var artist = String((m && m.artist) || '');
-  if (title) out.push({ k: 'track', label: '歌曲', name: title, artist: artist });
+  // 2026-10-28（用户真机：AI 把《19:30》挂到不相干的《火花》上）：
+  //   track 这一项**必须带上所属专辑名**，否则后端只能拿裸曲名去搜。
+  //   本库的 WAV/自抓文件普遍零标签，裸曲名的搜索结果必然是垃圾。
+  if (title) out.push({ k: 'track', label: '歌曲', name: title, artist: artist, album: album });
   if (album && album !== title) {
     var relArtist = (m && m.summaryArtist) || albumArtist || artist;
     out.push({ k: 'release', label: '专辑', name: album, artist: relArtist });
@@ -9892,7 +10128,7 @@ function npAiEntryHtml() {
          ' title="' + esc(isOpen ? '收起 AI 整理' : '展开 AI 整理（这首歌 · 专辑 · 艺术家 一起看）') + '"' +
          ' style="justify-content:flex-start;gap:7px">' +
          '<i class=dot></i><span style="flex:1;text-align:left">AI 资料</span>' +
-         '<span style="font-size:12px;opacity:.65">' + (isOpen ? '\u2039' : '\u203a') + '</span>' +
+         '<span class=npai-arr><svg width=13 height=13 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2.4 stroke-linecap=round stroke-linejoin=round><path d="M6 9l6 6 6-6"/></svg></span>' +
          '</button>' +
          (line ? '<div id=npAiSum style="font-size:10.5px;line-height:1.45;color:var(--mut2);padding:1px 2px 0">' +
                  esc(line) + '</div>' : '');
@@ -10381,8 +10617,21 @@ function npPrefReset() {
 }
 // 单曲页各类资料的 URL 只在这里拼（抽屉 / 预取 / 自动加载共用，才能命中同一份 summaryOnce 缓存）
 function npSummUrl(kind, t, force) {
+  // 2026-10-28（用户真机：《19:30》被挂到不相干的《火花》上）：
+  //   单曲检索带上**所属专辑名**。专辑名来自 npDataTargets(m) 里的 m.album
+  //   （也就是专辑页已经确定下来的那个名字），**不用文件夹名去猜**。
+  //   kind=release 时 name 本身就是专辑名，不需要再带 album。
+  var albQ = '';
+  if (kind === 'track') {
+    var an = (t && t.album) || '';
+    if (!an) {                               // 兜底：从同一份 tabs 里的 release 项取
+      var tabs = NP_DATA.tabs || [];
+      for (var i = 0; i < tabs.length; ++i) if (tabs[i].k === 'release') { an = tabs[i].name || ''; break; }
+    }
+    if (an) albQ = '&album=' + encodeURIComponent(an);
+  }
   return '/api/entity/summary?kind=' + kind + '&name=' + encodeURIComponent((t && t.name) || '') +
-         ((t && t.artist) ? ('&artist=' + encodeURIComponent(t.artist)) : '') + '&lang=zh' +
+         ((t && t.artist) ? ('&artist=' + encodeURIComponent(t.artist)) : '') + albQ + '&lang=zh' +
          (force ? '&refresh=1' : '');
 }
 function npPrefetchRelease() {
@@ -10866,22 +11115,45 @@ initFavs();
 // #6（261026-08）：左栏「保存的队列」列表（我的最爱下面）启动就渲染，重启后能立刻看到
 renderSavedQueues();
 if (D('npFavBtn')) D('npFavBtn').onclick = function (ev) { if (S.lastCur) toggleFav(S.lastCur, ev); };
-// ★ 261027-03 #3：单曲页「＋ 加入队列」—— 把"正在播的这一首"追加到队列末尾。
-// 语义刻意选"追加"：用户点这个按钮的意图是"留住这首"，绝不该顺手改掉正在播的那一首。
+// 2.0 UI-1：单曲页「加入队列」与「推送到设备」移到底部控制排（与音量同一行，图标展示）
+function initNpBottomControls() {
+  var oldAdd = document.querySelector('.npinfo #npAddQ');
+  if (oldAdd && oldAdd.parentElement) oldAdd.parentElement.remove();
+  var vol = document.querySelector('.npvol');
+  if (vol && !D('npAddQ')) {
+    var addBtn = document.createElement('button');
+    addBtn.className = 'k npctl-ibtn';
+    addBtn.id = 'npAddQ';
+    addBtn.title = '把当前曲目加入播放队列（追加在末尾；不改正在播的那首）';
+    addBtn.innerHTML = '<svg width=16 height=16 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=1.8 stroke-linecap=round stroke-linejoin=round><path d="M4 6h10M4 12h10M4 18h6"/><path d="M19 8v6M16 11h6"/></svg>';
+    var castBtn = document.createElement('button');
+    castBtn.className = 'k npctl-ibtn npcast';
+    castBtn.id = 'npCastBtn';
+    castBtn.title = '把当前曲目推送到 UPnP / DLNA 设备';
+    castBtn.innerHTML = '<svg width=16 height=16 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=1.8 stroke-linecap=round stroke-linejoin=round><path d="M2 16.1A5 5 0 0 1 5.9 20"/><path d="M2 12.05A9 9 0 0 1 9.95 20"/><path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><path d="M2 20h.01"/></svg>';
+    vol.insertBefore(castBtn, vol.firstChild);
+    vol.insertBefore(addBtn, castBtn);
+  }
+}
+initNpBottomControls();
 if (D('npAddQ')) D('npAddQ').onclick = function () {
   if (!S.lastCur) { toast('还没有在播放'); return; }
   api('/api/add', 'file=' + encodeURIComponent(S.lastCur)).then(function (j) {
     if (j && j.ok === false) { toast(j.error || '加入失败'); return; }
     var n = (j && j.count) || 0;
     toast('已加入队列：' + nam(S.lastCur) + (n ? ('（共 ' + n + ' 首）') : ''));
-    if (D('npAddQTip')) D('npAddQTip').textContent = n ? ('队列 ' + n + ' 首') : '';
     loadQ();
   }).catch(function () { toast('加入失败'); });
 };
-loadLibStats();
-loadSettings();
+if (D('npCastBtn')) D('npCastBtn').onclick = castToggle;
 loadFilterPhases();   // 功能2：相位预设真相源（/api/filters）
 fillMetaProviders();   // P1.5：数据源注册表（/api/providers）驱动元数据分组源开关
+// 2026-10-28（P0）：**必须在启动时加载 conf**。
+//   此前这里没有调用 loadSettings()，于是全站设置控件都停在 HTML 默认值上：
+//   用户看到的「深色 / 自动 / 5 阶 / DSD256…」其实是硬编码默认，不是他的 conf；
+//   而他每点一次「保存设置」，就把这些默认值写回 conf，**覆盖掉自己的配置**。
+//   anlmaster / autoanl 之所以「改了不生效」，根子都在这一行缺失。
+loadSettings();
 loadRates();
 loadAlbums('');
 loadQ();

@@ -1,272 +1,166 @@
-# RLPlayer
+# RLPlayer 2.0
 
-**Windows 上的高保真播放引擎 + 播放器**（HQPlayer 同类）。核心目标只有一个：**不计代价提升本地播放音质**，并且把每一步都变成可测量的数字。
+> **免费、开源（GPL-3.0）、面向 Windows 的本地高保真播放器。**
+> 升频、滤波、DSD、房间校正、耳机 EQ —— 全链路可调、可测、可自证。
 
-- 输出链路完全自研：升频 → 抖动/噪声整形 → SDM/DSD 调制 → 卷积 → 20 段 PEQ → WASAPI 独占 / ASIO / UPnP / 网络端点
-- **不追求"听起来更好"，追求"能测出来好"**：升频阻带 −189 dB、DSD 源抽取 THD+N 99.2 dB、网络传输端到端逐位相同
-- 内置 WebView2 界面（**真正无边框**、托盘常驻），也可全部用 CLI 驱动
-- 单包自包含：内置 ffmpeg/ffprobe、GPU 内核、WebView2 运行时，用户机上**不需要装任何运行库**
-
-> 当前版本 **1.3.15**（2026-10-24）。最新事实、逐轮实测数字与已知限制以 [STATUS.md](STATUS.md) 为准。
-
-![主界面](docs/screens/20-dark-albums.png)
+![平台](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
+![协议](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
+![版本](https://img.shields.io/badge/version-2.0.0-green)
 
 ---
 
-## 最近更新（1.3.15）
+## 这是什么
 
-| 项 | 内容 |
+一个装在 Windows 上的本地音乐播放器。
+
+它不联网听歌，也不做社交。它只干一件事：**把你已经收藏在硬盘里的音乐，用尽可能高的保真度放出来**，
+并把「为什么这样放」摊开给你看 —— 每一个滤波器都能画出频响曲线，每一项测量都能追溯到实测数据。
+
+如果你只用手机听流媒体，它可能不适合你。
+如果你有一堆 FLAC / DSD / APE，在意升频算法、抖动整形、房间驻波、耳机频响 —— 它是为你做的。
+
+---
+
+## 能做什么
+
+### 曲库与资料：它会自己整理，还会告诉你凭什么
+
+- 首次全量扫描 **15000 首约 2.81 秒**（比旧版快 117 倍）
+- 封面自动补全 **177/178（99.44%）**，艺术家头像 **116/127**
+- 同一专辑的多个版本自动归并（**301 张碎卡 → 181 张**）
+- 标签、封面、歌词从 **6 个公开源**补全：QQ 音乐 / 网易云 / iTunes / dizzylab / lrclib / Discogs
+- 歌词三源合并（网易云 → QQ → lrclib），实测命中率 **76.7%**
+- AI 整理资料时**标来源**：哪些是材料里查到的，哪些是模型知识补的，分得清
+
+### 升频与滤波：不是玄学，是一条能画出频响曲线的链
+
+- **79 个**命名滤波器预设（sinc / poly-sinc / closed-form / 切趾 / minringFIR）
+- 20 kHz 通带塌陷修复：**−3.29 dB → 0.00 dB**
+- 阻带（镜像/混叠压制）：**−6.6 dB → −144.6 dB**
+- 44.1k → 384k 时的抽头塌陷修复（**4 → 512 抽头/相**）
+- 完整的抖动（dither）与噪声整形（noise shaping）链，含 LNS15 / 7 阶 SDM
+
+### EQ 与校准：房间、耳机、参数 EQ，一套界面修平
+
+- **20 段**参数 EQ
+- 耳机 EQ 库 **6230 款 / 712 品牌**（来自 OPRA 开源数据库），一键套用
+- 房间校正：**6 种布局**（2.0 ~ 7.1.4）+ 支持导入 REW 测量与脉冲响应 IR
+- 校正集自动挂载（开关、布局匹配、文件可读，三项都满足才应用，否则明确告诉你为什么没应用）
+
+### 格式与效率
+
+- **FLAC / APE / ALAC / OGG / WMA / AAC / WAV / DSF / DFF**
+- DSD 流式解码：大 DSD 首帧 **8.2 s → 651 ms**，峰值内存 **2071 MB → 59 MB**
+- 首屏 300 行渲染 **4.20 ms**
+- ASIO 原生 DSD 直通（真机实测 0 欠载）
+
+### 免费与开源
+
+- **无订阅、无广告、无功能锁**
+- **GPL-3.0 开源**，源码在 GitHub
+- 不可能被厂商下架，也不可能突然改成付费
+
+### GPU 加速（可选，不装也能用）
+
+- AMD：**25 种架构**的 fat binary，内置 HIP 运行时，不需要你装 ROCm
+- NVIDIA：**CUDA 12.9**，覆盖 compute_50 … compute_121 共 **19 档**
+- 没有符合条件的显卡时**自动回退 CPU**，功能不变，只是慢一点
+
+---
+
+## 下载与安装
+
+### 系统要求
+
+| 项 | 要求 |
 |---|---|
-| 窗口 | **四边可拖拽拉伸**（页面发起 resize；WebView2 子窗口跨进程，原生 hit-test 拿不到鼠标） |
-| GPU | `/api/status` 拆成 `gpu`（可用）/ `gpuUsed`（本次真的参与）/ `gpuResample` / `gpuConv`；修掉"一首走过 GPU 后所有曲目都亮"的复位 bug |
-| AI 资料 | 进单曲页/专辑页**自动整理**（不用再点）；专辑页并发 ≤2 后台预取全部曲目；检索 knowledge 与 search+fetch 并行（受控 A/B −46%） |
-| 页面 | 艺术家页不再整页空白（先渲染基础页）；专辑资料不再贴边；「切到 bit-perfect 直通」挪到输出后端右侧 |
-| PEQ | 旁路语义写清 + 常驻状态行（已旁路 / 生效·全 0 dB / 生效·有非 0 dB 段） |
-| 音频 | 独占缓冲尊重设置（1.3.14）：删除 20 ms 封顶 + L1/L2 自适应回退 + 学习缓存；STAT 增 `dry/per/bf` |
+| 系统 | Windows 10 1809 (x64) 或更新 / Windows 11 |
+| 内存 | 4 GB（大 DSD 库建议 8 GB+） |
+| 硬盘 | 约 400 MB（含内置运行时） |
+| 显卡 | 集显即可；有 AMD/NVIDIA 独显可开启 GPU 加速 |
 
-1.3.14：**四边白框真因**（WebView2 创建时内缩 5px）、歌词跟随重写、PEQ 20 段对齐与 HIFI 化、N300 欠载修复。
+### 安装
 
----
+**解压即用，不需要安装任何运行库。**
 
-## 特性
+1. 下载 `RLPlayer-2.0-win64.zip`
+2. 解压到任意目录（**不要放进 Program Files**，那里写入需要管理员权限）
+3. 双击 `RLPlayer.exe`
+4. 首次启动会让你选择音乐文件夹，选好后等它扫完即可
 
-### DSP 链路
+包里已内置：解码器（ffmpeg）、GPU 运行时（HIP / CUDA）、界面运行时（WebView2 固定版）、
+以及全部命令行工具。**不需要另外装 .NET、VC++ 运行库或 WebView2。**
 
-| 能力 | 说明 |
-|---|---|
-| **多相 sinc 升频** | 任意有理比率；阻带 **−189 dB**，通带纹波 **0.0000 dB** |
-| **滤波器家族** | 16 个预设 + 倒谱法最小相位、混合相位；可指定抽头数 |
-| **抖动 / 噪声整形** | 10 项：NS1/NS4/NS5/NS9/LNS15 + RPDF/TPDF/Gauss1/shaped |
-| **SDM 调制器** | DSD5 / DSD7、多电平 AHM 风格；1-bit 带内 SNR 86.2 dB，8-bit 118.8 dB |
-| **DSD 原生读取** | DSF/DFF 直接读；抽取器 FIR/IIR/CIC；**DirectSDM 逐位直通** |
-| **卷积引擎** | 零延迟均匀分块 FFT，**支持 GPU**（IR 262144 抽头 / 1 秒音频 = 2.0 ms） |
-| **20 段参数均衡 PEQ** | RBJ 双二阶（PK/LS/HS）、1/3 倍频程、曲线可拖拽节点、自动前级（防削波）、预设 |
-| **Matrix / EQ** | 声道路由 + 双二阶 IIR EQ + 延迟插件 + REW/AutoEq 文本解析 + OPRA 耳机预设 |
-| **多声道** | 5.1 / 7.1（WAVEFORMATEXTENSIBLE 声道掩码）+ 每声道增益微调 |
-| **保护** | 过采样峰值检测（ISP）自动预衰减、音量渐变、响度补偿；满幅/瞬态/恢复都有回归测试 |
+### 卸载
 
-### 输出后端
+直接删掉整个目录。
 
-| 后端 | 用途 |
-|---|---|
-| **WASAPI 独占** | bit-perfect 直通；自动协商采样率/位深，设备不支持时**如实报错不静默替换**；缓冲尊重用户设置（20–500 ms，失败自适应回退） |
-| **WASAPI 共享** | 独占不可用时的兜底（非 bit-perfect，会明确告知） |
-| **ASIO** | 低延迟专业声卡（驱动崩溃用子进程预检隔离） |
-| **UPnP / DLNA** | 一键推送到局域网渲染器（单曲页 / 流媒体页 / 底栏三处同源） |
-| **RTANet（命令行）** | 两机网络音频：端到端逐位相同 + 时钟漂移检测（`rtaplay --net` + `rtanet_rx.exe`）。**NAA 已删除**：数播只认 HQPlayer 私有握手 |
-| **Null** | 离线/自动化测试，不开任何设备 |
-
-### 界面
-
-WebView2 内嵌、**完全无边框**（无系统标题栏/白框，四边可拉伸，6px 边缘热区）、托盘常驻：
-专辑网格 / 艺术家 / 曲目 / 文件夹 / 流媒体 / 单曲整页（歌词跟随 + 资料抽屉 + 推送）/ 播放队列 / 设置页（输出·PCM·SDM·高级·EQ·元数据·流媒体·诊断）。
-三套主题（深 / 浅 / 浅蓝），标题栏与窗口边随主题即时切换。
-
-### 元数据与 AI
-
-- 播放时自动补全标签/封面/歌词：QQ 音乐 / 网易云 / iTunes / lrclib / Discogs；
-- DeepSeek 负责疑难文件名解析、歧义裁决与"资料整理"（**防幻觉**：无来源时标注"AI 整理"，有来源时强制引用）；
-- 实体级缓存（person/release/track），命中即秒回；单曲页与艺术家页**共用同一份 person 缓存**；
-- 可选写回文件标签（`rtatag`），失败不动原文件。
+所有数据（设置、曲库索引、封面缓存、房间校正集）都在程序目录内，不写注册表、
+不往 `AppData` 里塞东西 —— 这也是为什么建议不要放 Program Files。
 
 ---
 
-## 界面
+## 关于数据与隐私
 
-| | |
-|---|---|
-| ![专辑](docs/screens/20-dark-albums.png) | ![专辑详情](docs/screens/11-album.png) |
-| ![歌词](docs/screens/12-lyrics.png) | ![信号链](docs/screens/14-chain.png) |
-| ![设置-深](docs/screens/20-dark-settings.png) | ![设置-浅](docs/screens/21-light-settings.png) |
+**RLPlayer 不收集任何遥测。**
 
----
-
-## 快速开始
-
-### 直接用发布包
-
-1. 解压 `RLPlayer-<版本>-win64.zip`（约 371 MB，解压后约 885 MB）
-2. 双击 `RLPlayer.exe`
-3. 托盘图标右键：打开界面 / 复制地址 / 允许局域网访问 / 退出
-
-无需安装 VC++ 运行库，无需安装 ROCm，无需单独装 ffmpeg。
-
-### 用 CLI
-
-```powershell
-# 列出音频端点 + 独占模式支持的采样率/位深矩阵
-tools\wasapi_probe.exe
-
-# 生成测试音（默认 −60 dBFS，不可闻；铁律：绝不擅自放可听声音）
-tools\rtaplay.exe --gen tone.wav 5 44100 24
-
-# bit-perfect 直通
-tools\rtaplay.exe music.flac
-
-# 升频 + 噪声整形
-tools\rtaplay.exe music.flac --rate 705600 --taps 262144 --shaper NS9 --bits 24
-
-# 房间校正（卷积）+ 耳机 EQ + 音量
-tools\rtaplay.exe music.flac --ir room.wav --eq autoeq.txt --volume -6 --gpu
-
-# 只跑管线不开设备（验证链路首选）
-tools\rtaplay.exe music.flac --rate 705600 --analyze
-```
+- 曲库扫描、播放、分析全部在本地完成
+- 联网只发生在你**主动**触发的场景：补全标签/封面/歌词、AI 整理资料、检查更新、提交反馈
+- 所有联网请求都可以在设置里逐个关掉
+- 提交反馈时，诊断包会先做**脱敏**（token / 密码 / 路径中的用户名 → `***`），且**不会**上传你的音乐文件
+- 没有账号系统，不需要注册
 
 ---
 
-## 从源码构建
+## 已知限制（2.0.0）
 
-### 前置
+我们把这些写在最显眼的地方，而不是藏进 FAQ：
 
-| 依赖 | 说明 |
-|---|---|
-| CMake ≥ 3.20 + Ninja | 构建系统 |
-| clang++ / lld-link / llvm-rc | **ROCm 自带的那套**即可（无需 Visual Studio，但需要 Windows SDK 的 rc/库） |
-| Windows SDK | 系统 API / WASAPI / ASIO 头 |
-| WebView2 SDK | 已在 `third_party/webview2` 内置头文件 |
-
-### 构建
-
-```powershell
-cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release `
-      -DCMAKE_CXX_COMPILER="C:/Program Files/AMD/ROCm/7.2/bin/clang++.exe" `
-      -DCMAKE_AR="C:/Program Files/AMD/ROCm/7.2/bin/llvm-ar.exe" `
-      -DCMAKE_LINKER="C:/Program Files/AMD/ROCm/7.2/bin/lld-link.exe" `
-      -DCMAKE_RC_COMPILER="C:/Program Files/AMD/ROCm/7.2/bin/llvm-rc.exe"
-cmake --build build
-ctest --test-dir build -E wasapi_shared     # 65/65
-```
-
-`RTA_ARCH` 默认 `x86-64-v2`（分发基线，**不含 AVX-512**，兼容 2009 年后的 CPU）；只在自用机器上可 `-DRTA_ARCH=znver5`。
-
-### GPU 后端（可选）
-
-没有 GPU 也能正常工作（纯 CPU 卷积）。有 AMD 卡时：
-
-```powershell
-hipcc --offload-arch=gfx1201 -O3 -shared -Isrc `
-      src/gpu/gpu_conv_hip.cpp src/gpu/gpu_resample_hip.cpp -o build/rtagpu.dll
-```
-
-> ⚠️ `--offload-arch` **必须**写对（本机 RX 9070 XT = Navi 48 = `gfx1201`）。
-> 写错时 kernel 会**静默失败**而 `hipDeviceSynchronize()` 仍返回成功 —— 详见 [AGENTS.md](AGENTS.md) 铁律 5。
-
-NVIDIA 卡用 `tools/build_gpu_cuda.ps1`（CUDA 12.x；脚本会校验 cubin 与导出符号，避免静默退回 CPU）。
-
-### 出发布包
-
-```powershell
-powershell -File tools\make_dist.ps1 -Version 1.3.15
-```
-
-会先跑兼容门禁（静态 CRT / subsystem ≤ 6.1 / 无 AVX-512），再在"PATH 只剩 System32"的临时目录里
-对内置 GPU 运行时做一次卷积 smoke，任一失败即**拒绝出包**。
-
----
-
-## 客观指标
-
-全部由 `ctest` / `verify.ps1` 自动验证，不是估算：
-
-| 项 | 实测 |
-|---|---|
-| 升频阻带衰减 | **−189 dB** |
-| 升频通带纹波 | **0.0000 dB** |
-| NS9 带内噪声 vs TPDF | 低 **45.4 dB** |
-| DSD5 1-bit 带内 SNR | **86.2 dB** |
-| 8-bit SDM 带内 SNR | **118.8 dB** |
-| DSD 源抽取 THD+N（DSD64→176.4k） | **99.2 dB** |
-| DSD 源抽取混叠抑制 | 144.4 / 156.1 / 108.1 dB（FIR/IIR/CIC） |
-| 双二阶 10 种设计（解析 vs 实测） | 偏差 **0.0000 dB** |
-| 20 段 PEQ 单段 +6 dB | **6.0000 dB**（44.1/48/96/192k） |
-| 网络传输（回环 690 包） | **逐位相同** |
-| GPU 卷积（IR 262144 抽头 / 1 秒） | **2.0 ms** |
-| 离线升频转换速度 | **9.9× 实时** |
-
----
-
-## 项目结构
-
-```
-src/
-  dsp/         DSP 核心：升频/滤波器/量化器/调制器/卷积/EQ/PEQ（头文件库）
-  audio/      WAV 读写、WASAPI 独占/共享输出、DSD 原生读取、渲染循环、缓冲策略
-  net/        RTANet 协议、UPnP 投放、Web 界面（ui_page.h / ui_script.h）
-  engine/     播放管线（信号链整合）
-  gpu/        HIP / CUDA 内核（卷积 / 重采样）
-  meta/       元数据补全（实体模型 / 数据源 / 缓存 / LLM 综合 / 状态标志）
-tools/        播放器 CLI、端点程序、探针、逐位比对、打包脚本、界面自检
-tests/        ctest 门禁（65 套）
-docs/         各模块实测纪要与调研（含"三次假失败"等踩坑记录）
-verify.ps1    一键自检（全程不打开音频设备）
-AGENTS.md     开发铁律（动手前必读）
-STATUS.md     逐轮状态与实测数字（最新事实在这里）
-HANDOVER.md   架构 / 构建 / 已知坑清单
-```
-
----
-
-## 测试与验证
-
-```powershell
-ctest --test-dir build -E wasapi_shared    # 65 套客观验证
-powershell -File verify.ps1               # 一键自检（构建/测试/GPU/网络/界面/DSD/兼容门禁）
-node tools\uicheck.js http://127.0.0.1:8911/ build\uicheck_out   # 界面自检
-powershell -File tools\bordercheck.ps1 -Exe dist\RLPlayer-1.3.15-win64\RLPlayer.exe   # 无边框逐像素/结构判据
-```
-
-**验证不打开音频设备**：所有链路验证优先离线（`--analyze`）或 Null 后端。
-需要出声的测试默认电平 ≤ −60 dBFS（见 AGENTS.md 铁律 1）。
-
----
-
-## 发布包
-
-| 项 | 要求 / 说明 |
-|---|---|
-| 系统 | Windows 7 SP1 / 8 / 10 / 11，x64 |
-| CPU | SSE4.2 + POPCNT（2009 年后）；产物**不含 AVX-512** |
-| 运行库 | **不需要** VC++ 运行库（CRT 静态链接） |
-| 体积 | zip 约 371 MB，解压约 885 MB（主要是 ffmpeg 与 WebView2 运行时） |
-| 内置 | ffmpeg / ffprobe、`rtagpu.dll`（AMD 多架构）、`rtagpu_cuda.dll`（NVIDIA）、`amdhip64_7.dll`、WebView2 固定运行时、17 个 CLI 工具 |
-
----
-
-## 已知限制
-
-- **输入采集**：设备枚举与设置页已有，采集→DSP→输出通路未实现
-- **NAA 已删除**（数播只认 HQPlayer 私有握手，EULA 禁止逆向）；两机方案用 RTANet（命令行）
-- **DSD 域重采样**：同速率 DirectSDM 逐位直通可用；**速率不同时的 DSD→DSD 重采样未做**
-- **Native DSD（ASIO）**：需驱动支持 ASIODSD* 通道类型；DSD 输出走 DoP
-- **7 阶 1-bit 调制器**：只在 DSD128 以上稳定
-- **AI 资料**：首次生成耗时主要来自 LLM（中位 ~12 s）；缓存命中 6~7 ms。检索阶段已并行，LLM 本身未做流式
-- **元数据源**：同人/小众曲目在四大源命中率低属正常（会如实标注"AI 整理"）
-
-完整清单（含每项的判据与阻塞原因）见 [STATUS.md](STATUS.md) 与 [ROADMAP.md](ROADMAP.md)。
-
----
-
-## 文档
-
-| 文件 | 内容 |
-|---|---|
-| [STATUS.md](STATUS.md) | **逐轮状态与实测数字 —— 最新事实以这里为准** |
-| [HANDOVER.md](HANDOVER.md) | 架构、构建、已知坑 |
-| [ROADMAP.md](ROADMAP.md) | 待开发项与验收判据 |
-| [AGENTS.md](AGENTS.md) | 开发铁律（8 条 + 反馈目录规范） |
-| [tools/README.md](tools/README.md) | 17 个命令行工具逐个说明 |
-| [docs/](docs/) | 各模块实测纪要、调研、踩坑记录 |
+1. **CUDA 后端仅做过静态验证**（校验符号、fatbin 架构、PE 结构、以及修复是否真的编进二进制）。
+   我方开发机没有 NVIDIA 显卡，运行时行为由协作者在 RTX 4080 上验证，**我们没有独立复现**。
+2. **版本对比对「音乐素材上的谐波失真」不敏感** —— 一份被加了少量三次谐波染色的文件，
+   可能被判得比原版更好。合成测试信号上正常，音乐素材上有这个盲区。已立项修复。
+3. **ISO / SACD-ISO / DST 尚不支持**。SACD ISO 请先用 `sacd_extract` 转成 DSF/DFF 再放入曲库。
+4. **跨采样率的评分差距仍偏大** —— 96k/24 vs 44.1k/16 的分差已从 18.58 收到 9.28，
+   剩下的部分是 DR 与峰值因子的真实读数差，不是测量伪影。
 
 ---
 
 ## 反馈
 
-用户反馈与开发需求统一投递到 `反馈和开发\`（`debug\` = BUG，`develop\` = 需求），
-处理记录见 [AGENTS.md](AGENTS.md) §8.4。
+| 渠道 | 地址 |
+|---|---|
+| **粉丝和反馈 Q 群** | **895816505** |
+| 问题跟踪 | https://github.com/okhuoyanyan/RLPlayer-feedback/issues |
+| 官方主页 | https://rlplayer.rainlain.com （即将上线） |
 
-## 版权
+程序内也有一键反馈：**设置 → 关于与更新 → 意见反馈**，会自动附带脱敏后的诊断信息。
 
-私有项目，保留所有权利（All rights reserved）。未经作者书面许可，不得复制、分发或用于商业用途。
+---
 
-第三方组件（ffmpeg、WebView2 SDK、AMD HIP runtime 等）遵循其各自许可证。
+## 开发与致谢
+
+| 角色 | 成员 |
+|---|---|
+| **项目开发者** | **RainLain**、**猫与小行星** |
+| 协助开发者 | 聆听风暴 |
+| 媒体与美术 | Gosed |
+| 测试鸣谢 | Miyu、正在下载99% |
+
+以及所有提交过 issue、帮忙试听、报告过问题的朋友。
+
+---
+
+## 协议
+
+**GNU General Public License v3.0 or later**（GPL-3.0-or-later），见 [LICENSE](LICENSE)。
+
+随包分发的第三方组件（FFmpeg / AMD HIP / NVIDIA CUDA / WebView2 / OPRA）
+各自遵循其原始许可，见 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt)。
+
+其中 AMD HIP 与 NVIDIA CUDA 为**厂商专有二进制**，按「可分离第三方组件」处理，
+不在本项目的 GPL 授权范围内。
+
+---
+
+*RLPlayer 是一个独立的开源项目，与任何商业播放器厂商无关。*

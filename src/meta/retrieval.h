@@ -154,6 +154,19 @@ inline const std::vector<std::string>& default_domain_whitelist() {
         "dizzylab.net", "booth.pm", "ototoy.jp", "mora.jp", "qobuz.com", "hdtracks.com",
         // VGMdb：同人/游戏/动画音乐最全的数据库（实测 authority=2~3），查同人专辑必用
         "vgmdb.net", "vgmdb.info",
+        // 2026-10-28（真机实测发现的**第二处致命遗漏**）：
+        //   把单曲搜索词改成「专辑+曲名」之后，命中最高的三条全被白名单丢掉：
+        //     1. [1.30] touhou.arrangement-chronicle.com/.../Static World 会場限定CD
+        //     2. [1.11] raw.githubusercontent.com/.../THBWiki-Markdown/.../Static_World_会場限定CD.md
+        //     4. [0.58] thbwiki.cc/Static_World
+        //   这三个是**东方同人圈最权威的资料来源**（THBWiki 是中文东方维基，
+        //   arrangement-chronicle 是全量同人编曲数据库，VGMdb 只覆盖有商业登记的部分）。
+        //   白名单不收 ⟹ 搜索结果被当成垃圾扔掉 ⟹ AI 又退回去靠记忆瞎编。
+        //   这就是"搜索词对了但还是搜不到"的第二道坎。
+        "thbwiki.cc", "thwiki.cc", "touhou.arrangement-chronicle.com",
+        // THBWiki 的 Markdown 镜像托管在 GitHub raw 上（Delsin-Yu/THBWiki-Markdown）。
+        // 只放行 raw 路径，不放行 github.com 主站（太泛，会把无关仓库放进来）。
+        "raw.githubusercontent.com",
         // 明日方舟 / 塞壬唱片官方
         "monster-siren.hypergryph.com", "hypergryph.com", "arknights.jp",
         // 通用（中文媒体常见）
@@ -1062,7 +1075,14 @@ inline std::string summary_to_json(const SummaryResult& sr) {
       // 在读取时直接判过期，让下次请求重新生成 —— 否则升级后老用户永远看不到标签网格。
       // 2026-10-27（261027-06）：v4 起带 profile（分类）与 links（名词外链）。v3 缓存仍可读，
       // 只是没有这两项 —— 不强制重生成，避免升级后把用户已付过钱的资料全部作废。
-      << "  \"v\": 4,\n"
+      //
+      // 2026-10-28（用户真机抓到的真事故，v5 的唯一理由）：
+      //   提示词新增规则 9「引用外部页面必须先核对归属」。v4 及以前生成的缓存里可能含这类错误断言：
+      //     「所属专辑：网易云音乐专辑页 id=148064894 收录本曲（专辑名与艺术家未能确证）」
+      //   而那个页面实际是完全不相干的《火花》。这类错误带可点击链接、看起来像已核实的事实，
+      //   比"没查到"更有害 ⟹ v4 缓存一律不复用，下次打开重新生成一次。
+      //   （代价：已整理过的资料会重算一次，消耗一次额度。用户已确认接受。）
+      << "  \"v\": 6,\n"
       << "  \"ok\": " << (sr.ok ? "true" : "false") << ",\n"
       << "  \"ai\": " << (sr.ai ? "true" : "false") << ",\n"
       << "  \"model\": \"" << meta_jesc(sr.model) << "\",\n"
@@ -1457,6 +1477,14 @@ struct RetrievalOptions {
     LlmConfig llm_cfg;
     FilterOptions filter_opts;
     std::string artist;           // 针对 Release 的艺术家辅助（用于 Wikipedia 与 Discogs 检索消歧）
+    // 2026-10-28（用户真机：AI 把《19:30》归到了完全不相干的网易云专辑《火花》上）：
+    //   **曲目所属的专辑名**。单曲检索必须带上它，否则裸曲名的搜索结果必然是垃圾 ——
+    //   "19:30" 这种时间型曲名全网同名无数；而本库的 WAV/自抓文件普遍**没有任何标签**
+    //   （artist/album/title 全空），旧代码于是只拿曲名 + 「歌曲 作词 作曲 编曲 发行」去搜，
+    //   命中什么全看运气。有了 album 就能组成
+    //     "Static World 会场限定CD 19:30 Static World" ⟹ 唯一指向这张同人碟。
+    //   传空表示调用方不知道专辑（保持旧行为）。
+    std::string album;
     std::string entity_id;        // 显式指定实体 ID（为空则自动计算）
     // ---- 2026-10-27（用户 261027-06 P1：「把所有专辑标签都交给模型」）----
     // 这些都是**可选**输入：rtaweb 现在只传 artist/entity_id，因此生产上标签多为空，
@@ -1927,12 +1955,27 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
     std::vector<SearchHit> hits;
     if (opts.enable_search) {
         std::string query;
+        // 2026-10-28（用户真机）：单曲检索的前缀里**必须带上所属专辑名**。
+        //   实测反例：《Static World 会场限定CD》的 02「19：30」是**无任何标签的 WAV**，
+        //   artist 为空 ⟹ 旧代码只搜「19:30 歌曲 作词 作曲 编曲 发行」，
+        //   结果模型把这首挂到了完全不相干的网易云专辑《火花》（id=148064894）上。
+        //   组成「专辑 + 曲名 + 艺术家」之后，指向性从"全网红同名"变成"这一张碟的这一首"。
+        //   顺序上把专辑放最前：搜索引擎对前置词权重更高。
+        std::string qBase;
+        if (!opts.album.empty()) qBase += opts.album;
+        if (!title.empty()) { if (!qBase.empty()) qBase += ' '; qBase += title; }
+        // 艺术家只有在「专辑与曲名里都没有它」时才追加，避免又一个重复词（见 Release 分支的同款处理）
+        if (!artist.empty() && (opts.album + ' ' + title).find(artist) == std::string::npos) {
+            if (!qBase.empty()) qBase += ' ';
+            qBase += artist;
+        }
+        if (qBase.empty()) qBase = title;
         if (lang == "zh" || lang.empty()) {
-            query = (artist.empty() ? title : (artist + " " + title)) + " 歌曲 作词 作曲 编曲 发行";
+            query = qBase + " 歌曲 作词 作曲 编曲 发行";
         } else if (lang == "ja") {
-            query = (artist.empty() ? title : (artist + " " + title)) + " 楽曲 作詞 作曲 編曲";
+            query = qBase + " 楽曲 作詞 作曲 編曲";
         } else {
-            query = (artist.empty() ? title : (artist + " " + title)) + " song credits release lyrics";
+            query = qBase + " song credits release lyrics";
         }
         retrieval_rate_limiter().acquire();
         const DsSearchReply s_rep = ds_search(cfg, query, opts.max_search_hits > 0 ? opts.max_search_hits : 8);
@@ -2233,10 +2276,38 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
         // 2026-10-24（261024-01 #1）：官方 /v1/tools/search 的召回质量与 query 强相关。
         // 实测「专辑名 + 艺术家 + EP 发行 曲目 制作」比「背景 评价」命中多得多（评价类词会把结果带偏到乐评站）。
         if (kind == EntityKind::Release) {
-            std::string qTarget = !opts.artist.empty() ? (opts.artist + " " + name) : name;
-            // 艺术家串里的分隔符（"塞壬唱片-MSR / Ivoris"）会稀释 query，换成空格
-            for (char& ch : qTarget) if (ch == '/' || ch == '&' || ch == '|' || ch == '+') ch = ' ';
-            query = qTarget + pp_search_query_suffix(pre_profile, lang);
+            // 2026-10-28（用户真机对比：他直接用 DeepSeek 搜索能拿到极准确的资料，软件里却是垃圾）：
+            //   根因是**搜索词里同一个词出现了两次**。
+            //   本库的目录命名是「专辑名 @ 社团」，entity_parse_album_circle 已把 @ 拆掉，
+            //   于是 name = "Static World 会场限定CD"、artist = "Static World"
+            //   ⟹ 旧代码 artist + " " + name 拼出
+            //        "Static World Static World 会场限定CD 专辑 EP 发行 曲目 制作"
+            //   同一个词重复两次会显著拉低搜索引擎的相关性排序 —— 实测拿回来的正是
+            //   完全不相干的《火花》（网易云 id=148064894）。
+            //   修法：**name 里已经含 artist 时就不再重复拼**（同人碟的专辑名普遍带社团名）。
+            std::string qTarget;
+            const bool nameHasArtist = !opts.artist.empty() &&
+                                       name.find(opts.artist) != std::string::npos;
+            if (!opts.artist.empty() && !nameHasArtist) qTarget = opts.artist + " " + name;
+            else                                       qTarget = name;
+            // 分隔符会稀释 query，换成空格。@ / ＠ 一并清掉（防御：万一上游没拆干净，
+            // 出现在 query 里的 @ 只是噪音）。
+            for (char& ch : qTarget) {
+                if (ch == '/' || ch == '&' || ch == '|' || ch == '+' || ch == '@') ch = ' ';
+            }
+            // 折叠连续空格（"A  B" → "A B"），并去掉首尾空格
+            std::string collapsed;
+            collapsed.reserve(qTarget.size());
+            bool prevSpace = true;
+            for (char ch : qTarget) {
+                if (ch == ' ') { if (!prevSpace) { collapsed.push_back(' '); prevSpace = true; } }
+                else { collapsed.push_back(ch); prevSpace = false; }
+            }
+            while (!collapsed.empty() && collapsed.back() == ' ') collapsed.pop_back();
+            // 2026-10-28：suffix 与 base 也要去重（「会场限定」在两边各出现一次会稀释 query）。
+            // 见 prompt_profiles.h 的 pp_query_merge_suffix 注释。
+            query = pp_query_merge_suffix(collapsed.empty() ? name : collapsed,
+                                          pp_search_query_suffix(pre_profile, lang));
         } else {
             std::string qn = name;
             for (char& ch : qn) if (ch == '/' || ch == '&' || ch == '|' || ch == '+') ch = ' ';
@@ -2425,7 +2496,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     //   结果写缓存 7 天，第二次打开不再调用。有材料时仍走严格引用路径，不受影响。
     if (kr.materials.empty() && fetched_hits.empty()) {
         // 2026-10-24（261024-02 #1）：同样只回退 v3+ 缓存（旧缓存可能是消歧义垃圾，见下方说明）
-        if (have_cache && cached.ok && cached.cache_ver >= 3) {
+        if (have_cache && cached.ok && cached.cache_ver >= 6) {
             cached.from_cache = true;
             cached.offline = true;
             cached.error = "未检索到任何权威材料，已回退至本地缓存";
@@ -2579,7 +2650,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     if (!parsed.ok) {
         // 2026-10-24（261024-02 #1）：只回退 **v3+** 的缓存。旧格式缓存内容可能是消歧义垃圾
         //（实测 Irotas：v2 缓存里是"页面仅显示多个候选标题…"），拿它当兜底等于把坏内容永久固化。
-        if (have_cache && cached.ok && cached.cache_ver >= 3) {
+        if (have_cache && cached.ok && cached.cache_ver >= 6) {
             cached.from_cache = true;
             cached.offline = true;
             cached.error = "综合校验失败 (" + last_err + ")，已回退至本地缓存";

@@ -54,7 +54,8 @@ namespace rta::update {
 // ---------------------------------------------------------------------------
 // 0. 常量（唯一真相源）
 // ---------------------------------------------------------------------------
-// 2026-10-26（用户决定）：**通道从 Gitea 整体迁到 GitHub**，仓库 BH2VOQ/RLPlayer-Mac（公开）。
+// 2026-10-26（用户决定）：**通道从 Gitea 整体迁到 GitHub**。
+// 2026-10-27：仓库从 Mac 分支（BH2VOQ/RLPlayer-Mac）改到 Windows 主线 okhuoyanyan/RLPlayer2。
 //   迁移原因：Gitea 私有仓库的 release 附件对 token 全线 403（见下方历史注释），
 //   且匿名建 issue 不可用；GitHub 公开仓库的三条通道都能走通。
 //
@@ -67,8 +68,13 @@ namespace rta::update {
 //   ⚠️ 用 raw.githubusercontent.com 而不是 api.github.com：
 //      · 走 raw 不需要 token，也不吃 API 速率限制（匿名 API 只有 60 次/小时/IP）；
 //      · 实测 200 + 正确 JSON。
+// 2026-10-27：**从 Mac 分支的清单地址改到 Windows 主线自己的仓库**。
+//   旧值指向 BH2VOQ/RLPlayer-Mac —— 那是 macOS 移植分支，Windows 用户去那里取清单
+//   会拿到 mac 那边的发布物（或 404），属于真事故级错误，不是"以后再说"。
+//   新仓库 okhuoyanyan/RLPlayer2 由 2.0 正式版发布时建立；仓库建好前这里会 404，
+//   那是**预期行为**（比拿到别的平台的包安全得多）。
 inline constexpr const char kDefaultManifestUrl[] =
-    "https://raw.githubusercontent.com/BH2VOQ/RLPlayer-Mac/main/latest-win.json";
+    "https://raw.githubusercontent.com/okhuoyanyan/RLPlayer2/main/latest-win.json";
 
 // 下载与取清单**唯一允许**的主机（精确匹配，不含端口）。
 // 更新这条时**必须同步** update_download_url_allowed() 里的注释与测试用例：
@@ -83,13 +89,13 @@ inline constexpr const char kAllowedHost[] = "raw.githubusercontent.com";
 inline constexpr const char kAllowedDownloadHost[] = "github.com";
 
 // 仓库标识（拼 API 路径用）
-inline constexpr const char kRepoOwner[] = "BH2VOQ";
-inline constexpr const char kRepoName[] = "RLPlayer-Mac";
+inline constexpr const char kRepoOwner[] = "okhuoyanyan";
+inline constexpr const char kRepoName[] = "RLPlayer2";
 inline constexpr const char kRepoBranch[] = "main";
 
 // releases API（诊断/反馈上传走 issue，不走这里；保留给"从 release 读清单"的备选路径）
 inline constexpr const char kReleasesApiUrl[] =
-    "https://api.github.com/repos/BH2VOQ/RLPlayer-Mac/releases";
+    "https://api.github.com/repos/okhuoyanyan/RLPlayer2/releases";
 
 // 说明：旧版有一个 kPrivateRawPrefix = "https://api.github.com/repos/.../contents/"，
 // 用于拼相对路径下载地址。**已删除** —— api.github.com 不在白名单里（白名单只放行

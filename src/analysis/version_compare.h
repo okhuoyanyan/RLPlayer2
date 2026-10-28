@@ -17,6 +17,9 @@
 // ================== 不可比项（必须显式标注，不许硬比） ==================
 //  * 位深不同（如 16-bit vs 24-bit）⟹ 本底噪声 / SNR 不可比（受容器量化下限影响）；
 //  * 采样率不同（|Δ| > 20%）⟹ 谱重心 / 95% 滚降点 / >10 kHz 占比不可比（奈奎斯特不同）；
+//    ★ 2026-10-27 BUG-3 修：采样率不同时【非谐波残留（权重 0.08）】也标不可比 —— 该指标的 FFT 窗长
+//      随 fs 变（44.1k 1.49 s / 96k 0.68 s），同一母带 96/24 vs 44.1/16 实测漂 13.9 dB（吃满该维 10 dB
+//      满罚门限），曾让两版差 18.6 分。同采样率对比时它照常参与（不是一刀切关掉）。
 //  * 声道数不同（单声道 vs 立体声）⟹ 声道相关 / 单声道损失 / side-mid 不可比。
 //  不可比的行照常列出数值，但 comparable=false + 中文原因，且不参与综合评分
 //  （评分权重在这些行上重新归一化，见 score_versions）。
@@ -734,6 +737,11 @@ inline void score_versions(VersionCompare& r) {
         : "版本间位深不同（" + std::to_string(r.versions[0].bits) + "-bit vs 其它）：本底噪声/SNR 受容器量化下限影响，不可直接比";
     const std::string whyFs = fsSame ? std::string()
         : "版本间采样率不同：奈奎斯特不同，频响类指标不在同一带宽内，不可直接比";
+    // BUG-3（2026-10-27）：非谐波残留的 FFT 窗长随采样率变化（44.1k 1.49 s / 96k 0.68 s），
+    // 同一录音 96/24 vs 44.1/16 实测漂 13.9 dB（> 本维度满罚 10 dB）⟹ 跨 fs 时与谱重心那几行同样处理。
+    // 同采样率时这里为空 ⟹ 该维度照常可比、照常参与评分（不是一刀切关掉）。
+    const std::string whyFsNonTonal = fsSame ? std::string()
+        : "版本间采样率不同：非谐波残留的分析窗长随采样率变化（44.1k 1.49 s vs 96k 0.68 s），同一内容实测漂 13.9 dB，不可直接比";
     std::string whyCh = chSame ? std::string()
         : "版本间声道数不同（单声道 vs 立体声）：重合度/单声道兼容性不可比";
     if (whyCh.empty()) {
@@ -754,7 +762,7 @@ inline void score_versions(VersionCompare& r) {
     vcdetail::push_row(r, "noise_floor_dbfs", "本底噪声（最低 10% 块电平）", "dBFS", false, false,
                        [](VD v) { return v.quality.noiseFloorDbfs; }, whyBits);
     vcdetail::push_row(r, "non_tonal_db", "非谐波残留（噪声+失真上界）", "dB", false, false,
-                       [](VD v) { return v.quality.nonTonalDb; });
+                       [](VD v) { return v.quality.nonTonalDb; }, whyFsNonTonal);
     vcdetail::push_row(r, "thdn_db", "THD+N（单基频素材才有）", "dB", false, false,
                        [](VD v) { return v.quality.thdnAvailable ? v.quality.thdnDb : -300.0; });
     vcdetail::push_row(r, "clipped_pct", "削波样本占比", "%", false, false,
@@ -994,17 +1002,17 @@ inline void score_versions(VersionCompare& r) {
         }
     }
     {
-        // 采样率不同：非谐波残留(权重 0.08)/DR/峰值都随采样率变，但这几行仍按「可比」参与评分。
+        // 采样率不同：非谐波残留（权重 0.08）已标不可比、不参与评分（BUG-3 修）；DR/峰值仍可比但会随 fs 微变。
         double fsMin = 1e18, fsMax = 0.0;
         for (const VersionData& v : r.versions)
             if (v.fs) { fsMin = std::min(fsMin, (double)v.fs); fsMax = std::max(fsMax, (double)v.fs); }
         if (fsMax > fsMin * 1.0001) {
             char buf[1024];   // 中文按 UTF-8 3 字节/字，460 会把这条 caveat 截断（编译器已报 -Wformat-truncation）
             std::snprintf(buf, sizeof(buf),
-                "⚠ 版本间采样率不同（%.1f vs %.1f kHz）：非谐波残留 / 动态范围 / 峰值都会随采样率变化 —— "
-                "实测同一段 44.1k 素材原样上采样到 96 kHz，非谐波残留从 −18.7 dB 变成 −32.6 dB（差 13.9 dB，"
-                "已超过该维度「满罚 10 dB」的门限），而这几行仍按「可比」参与评分；"
-                "96 kHz 的升频/假高解析素材截止/容器奈奎斯特只有约 0.46 ⟹ 编解码损伤吃满额 −12 分"
+                "⚠ 版本间采样率不同（%.1f vs %.1f kHz）：非谐波残留的分析窗长随 fs 变"
+                "（44.1k 1.49 s vs 96k 0.68 s，同一内容实测漂 13.9 dB）⟹ 本轮起它在跨采样率对比中"
+                "【标为不可比、不参与评分】（权重按可比维度重新归一化）；DR / 峰值 / 峰值因子仍会随采样率轻微变化；"
+                "96 kHz 的升频/假高解析素材截止/容器奈奎斯特只有约 0.46 ⟹ 编解码损伤仍可能吃满额 −12 分"
                 "（这是「拿容器奈奎斯特当参照」的副作用，不是它真有编码器损伤）。"
                 "跨采样率的对比只建议看带宽/有损判定，不要看总分。",
                 fsMin / 1000.0, fsMax / 1000.0);

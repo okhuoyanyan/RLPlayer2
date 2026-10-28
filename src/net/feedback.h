@@ -103,8 +103,24 @@ namespace rta::feedback {
 // 表单结构和语义变了就 +1。老 JSON 仍然可读（字段只增不删）。
 constexpr int kSchema = 1;
 
-// 缺省目标仓库（用户 261027-01：反馈存进"我们当前 github 仓库"的 feedback/ 目录）
-constexpr const char* kRepoDefault   = "okhuoyanyan/RLPlayer";
+// 2026-10-27：**默认 Worker 地址**（用户 2.0 前钦定，Cloudflare Workers）。
+//   配了这个就完全不需要 token：客户端 POST 到这里，Worker 用它自己的 Secrets token 建 issue。
+//   实测（2026-10-27）：POST → 200 {"ok":true,"id":"FB-20261027-KQZ1G","issue":1}，
+//   issue 落在 github.com/okhuoyanyan/RLPlayer-feedback。
+//   想换地址：在 <exe>\rlplayer-feedback.conf 里写 worker=https://... 覆盖（只接受 https）。
+//   想彻底关掉改用旧 token 路径：写 worker=none。
+inline constexpr const char* kWorkerUrlDefault =
+    "https://rlplayer-feedback.okhuoyanyan.workers.dev";
+
+// 缺省目标仓库。
+// 2026-10-27：**改到专门的公开反馈仓 okhuoyanyan/RLPlayer-feedback**（用户钦定）。
+//   旧值 okhuoyanyan/RLPlayer 是**私有开发仓** —— 反馈必然 404/403，而且不该把用户诊断包
+//   塞进开发仓历史。
+//   ⚠️ 已知设计缺陷（待 2.0 前改）：当前实现是 PUT /repos/{repo}/contents/，即把诊断包
+//   **写进 Git**，这需要 contents:write 权限，普通用户没有。正确做法是 POST 到 Cloudflare
+//   Worker（token 只在 Worker Secrets），诊断包进 R2 而不是 Git。
+//   详见 docs/项目相关仓库与在线服务.md 第三、四节。
+constexpr const char* kRepoDefault   = "okhuoyanyan/RLPlayer-feedback";
 constexpr const char* kBranchDefault = "main";
 constexpr const char* kDirDefault    = "feedback";
 
@@ -150,7 +166,13 @@ struct Options {
     int totalBudgetMs = 14000;                 // 总预算（含取 token），硬上限 15 s
     int ghTimeoutMs   = 2500;                  // gh auth token 的预算
     std::string proxy;                         // "" = 自动（系统代理）；"none" = 强制直连
-    bool skipTokenLookup = false;              // 测试用：模拟"三个来源都没有"（走降级路径）
+    // 2026-10-27：Worker 模式。非空 ⟹ POST 到这个 Cloudflare Worker，**完全不需要 token**
+  // （token 只在 Worker 的 Secrets 里）。空 ⟹ 走旧的 GitHub contents API（需 token）。
+  // 为什么加这条路：GitHub contents API 要求 contents:write，普通用户不可能有；
+  // Worker 是唯一能同时做到「零凭据 / 零配置 / 抗刷」的形态。
+  // 默认就用 Worker（kWorkerUrlDefault）；conf 里 worker=none 可关掉退回 token 路径。
+  std::string workerUrl = kWorkerUrlDefault;
+  bool skipTokenLookup = false;              // 测试用：模拟"三个来源都没有"（走降级路径）
     bool keepLocalCopy = false;                // 上传成功也留一份本地副本
 };
 
@@ -728,6 +750,28 @@ inline std::string token_from_conf(std::string& where) {
     return "";
 }
 
+// 2026-10-27：rlplayer-feedback.conf 里读 worker=<url>（也认 worker_url= / feedback_worker=）。
+// 给了就 POST 到 Worker（不需要 token）；没给就走旧的 contents API。
+// 只接受 https:// —— Worker 必须是 TLS，且明文 http 会把反馈内容暴露在链路上。
+inline std::string worker_url_from_conf(std::string& where) {
+  where = rta::platform::join(exe_dir(), "rlplayer-feedback.conf");
+  std::ifstream f(rta::platform::from_utf8(where), std::ios::binary);
+  if (!f) return "";
+  std::string line;
+  while (std::getline(f, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty() || line[0] == '#') continue;
+    const size_t e = line.find('=');
+    if (e == std::string::npos) continue;
+    const std::string k = strip_trim(line.substr(0, e));
+    if (k != "worker" && k != "worker_url" && k != "feedback_worker") continue;
+    const std::string v = strip_trim(line.substr(e + 1));
+    if (v.rfind("https://", 0) == 0 && v.size() > 9) return v;
+    return "";   // 写了但不是 https ⟹ 当没配，绝不降级到明文
+  }
+  return "";
+}
+
 // gh auth token：run_hidden 会 INFINITE 等待，所以放到一次性线程里、只等 ghTimeoutMs。
 // 超时就把线程 detach 掉（绝不 kill 用户进程），本次当"没有凭据"处理。
 inline std::string token_from_gh(int timeoutMs) {
@@ -904,6 +948,68 @@ inline PutResult http_put_once(const std::string& url, const std::vector<std::st
     r.ok = (r.status >= 200 && r.status < 300);
     if (!r.ok && r.error.empty()) r.error = "HTTP " + std::to_string(r.status);
     return r;
+}
+
+// 2026-10-27（2.0 前，用户钦定）：POST 版。
+//   Worker 只接受 POST，而上面那个函数写死了 L"PUT"。复制一份而不是加参数：
+//   http_put_once 被多处与测试引用，改签名会牵连；这里只多 60 行，风险更低。
+inline PutResult http_post_once(const std::string& url, const std::vector<std::string>& headers,
+                                const std::string& body, int timeoutMs, int proxyMode,
+                                const std::string& proxy) {
+  PutResult r;
+  const UrlParts u = parse_url(url);
+  if (!u.valid) { r.error = "URL 解析失败"; return r; }
+
+  const std::wstring wproxy = (proxyMode == 2) ? utf8_to_wide(proxy) : std::wstring();
+  const DWORD access = (proxyMode == 1) ? WINHTTP_ACCESS_TYPE_NO_PROXY
+                      : (proxyMode == 2) ? WINHTTP_ACCESS_TYPE_NAMED_PROXY
+                                         : WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY;
+  HINTERNET ses = ::WinHttpOpen(L"RLPlayer-feedback/1.0", access,
+                                (proxyMode == 2) ? wproxy.c_str() : WINHTTP_NO_PROXY_NAME,
+                                WINHTTP_NO_PROXY_BYPASS, 0);
+  if (!ses) { r.error = winhttp_reason(::GetLastError()); return r; }
+  ::WinHttpSetTimeouts(ses, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
+
+  HINTERNET con = ::WinHttpConnect(ses, u.host.c_str(), (INTERNET_PORT)u.port, 0);
+  if (!con) { r.error = winhttp_reason(::GetLastError()); ::WinHttpCloseHandle(ses); return r; }
+
+  HINTERNET hreq = ::WinHttpOpenRequest(con, L"POST", u.path.c_str(), nullptr, WINHTTP_NO_REFERER,
+                                        WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                        u.https ? WINHTTP_FLAG_SECURE : 0);
+  if (!hreq) {
+    r.error = winhttp_reason(::GetLastError());
+    ::WinHttpCloseHandle(con); ::WinHttpCloseHandle(ses);
+    return r;
+  }
+  for (const auto& h : headers) {
+    const std::wstring w = utf8_to_wide(h);
+    if (!w.empty()) ::WinHttpAddRequestHeaders(hreq, w.c_str(), (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
+  }
+  const bool sent = ::WinHttpSendRequest(hreq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                         (LPVOID)body.data(), (DWORD)body.size(),
+                                         (DWORD)body.size(), 0) != 0 &&
+                    ::WinHttpReceiveResponse(hreq, nullptr) != 0;
+  if (!sent) {
+    r.error = winhttp_reason(::GetLastError());
+    ::WinHttpCloseHandle(hreq); ::WinHttpCloseHandle(con); ::WinHttpCloseHandle(ses);
+    return r;
+  }
+  DWORD code = 0, len = sizeof(code);
+  ::WinHttpQueryHeaders(hreq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &code, &len, WINHTTP_NO_HEADER_INDEX);
+  r.status = (int)code;
+  for (;;) {
+    DWORD avail = 0;
+    if (!::WinHttpQueryDataAvailable(hreq, &avail) || avail == 0) break;
+    std::vector<char> buf((size_t)avail);
+    DWORD got = 0;
+    if (!::WinHttpReadData(hreq, buf.data(), avail, &got) || got == 0) break;
+    r.body.append(buf.data(), (size_t)got);
+  }
+  ::WinHttpCloseHandle(hreq); ::WinHttpCloseHandle(con); ::WinHttpCloseHandle(ses);
+  r.ok = (r.status >= 200 && r.status < 300);
+  if (!r.ok && r.error.empty()) r.error = "HTTP " + std::to_string(r.status);
+  return r;
 }
 
 inline std::string http_status_hint(int st) {
@@ -1117,6 +1223,50 @@ inline Result submit(const UserReport& u, const LiveState& live, const Options& 
     if (u.title.empty() && u.body.empty()) {
         r.error = "标题和正文不能都为空";
         r.message = r.error;
+        r.elapsedMs = (long long)(GetTickCount64() - t0);
+        return r;
+    }
+
+    // ①' 2026-10-27：Worker 模式（配了 worker= 就走这里，**不需要任何 token**）。
+    //     请求体按 Worker 协议：{text, version, os, diag(base64)}；diag 放整份诊断 JSON
+    //     （Worker 已同时接受 ZIP 与 JSON，见 worker/feedback-worker.js 的注释）。
+    if (!opt.workerUrl.empty()) {
+        std::string wt = u.title.empty() ? u.body : (u.title + "\n\n" + u.body);
+        if (wt.size() > 16000) wt = wt.substr(0, 16000) + "\n…（已截断）";
+        std::string wb = "{";
+        wb += "\"text\":" + jq(wt);
+        wb += ",\"version\":" + jq(std::string(RLPLAYER_VERSION));
+        // LiveState 没有 os 字段（那是 macOS 分支的形态）；Windows 这边用 source + backend 代替，
+        // 真正的系统信息本来就在 diag JSON 的 app/system 段里，这里只做 issue 标题的简短标注。
+        wb += ",\"os\":" + jq(std::string("Windows · ") + live.source);
+        wb += ",\"diag\":" + jq(base64_encode(pl.json));
+        wb += "}";
+        std::vector<std::string> wh;
+        wh.push_back("Content-Type: application/json");
+        wh.push_back("User-Agent: RLPlayer-feedback/1.0");
+        const int wmode = opt.proxy.empty() ? 0 : (opt.proxy == "none" ? 1 : 2);
+        const PutResult wp = http_post_once(opt.workerUrl, wh, wb, opt.timeoutMs, wmode, opt.proxy);
+        r.status = wp.status;
+        if (!wp.ok) {
+            r.error = (wp.status != 0) ? http_status_hint(wp.status) : ("网络请求失败：" + wp.error);
+            r.localPath = outbox_write(pl.id, pl.json, opt.outboxDir);
+            r.message = r.localPath.empty()
+                ? (r.error + "；本地兜底也没写成，请检查 exe 目录是否可写")
+                : ("没上传成功（" + r.error + "）。反馈已保存到本地：" + r.localPath);
+            r.elapsedMs = (long long)(GetTickCount64() - t0);
+            return r;
+        }
+        // Worker 回 {"ok":true,"id":"FB-20261027-XXXXX","issue":12}
+        const rta::net::Json wj = rta::net::json_parse(wp.body);
+        const std::string wid = wj["id"].s();
+        const int wissue = (int)wj["issue"].n();
+        if (!wid.empty()) r.id = wid;
+        r.uploaded = true;
+        r.remotePath = wissue > 0 ? ("issue #" + std::to_string(wissue)) : std::string();
+        r.message = wissue > 0
+            ? ("已提交，感谢反馈！工单 " + r.id + "（issue #" + std::to_string(wissue) + "）")
+            : ("已提交，感谢反馈！工单 " + r.id);
+        if (opt.keepLocalCopy) r.localPath = outbox_write(pl.id, pl.json, opt.outboxDir);
         r.elapsedMs = (long long)(GetTickCount64() - t0);
         return r;
     }

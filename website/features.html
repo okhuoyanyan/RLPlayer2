@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>技术细节 —— RLPlayer 2.0</title>
+<meta name="description" content="RLPlayer 技术细节：信号链、79 个滤波器的实测数据、DSD 调制三道闸、GPU 逐样本一致判据、AI 资料整理的检索与核对流程。">
+<script>document.documentElement.className += " js";</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="nav">
+  <div class="nav-inner">
+    <a class="brand" href="index.html"><span class="dot"></span>RLPlayer<small>2.0</small></a>
+    <nav class="nav-links">
+      <a href="index.html">主页</a>
+      <a href="features.html" class="on">技术细节</a>
+      <a href="download.html">下载</a>
+      <a href="download.html" class="btn">获取 2.0</a>
+    </nav>
+  </div>
+</header>
+<section style="padding-top:80px;padding-bottom:36px">
+  <div class="wrap">
+    <span class="reveal" style="display:inline-flex;align-items:center;gap:9px;font-size:12.5px;letter-spacing:2px;text-transform:uppercase;color:var(--text-mute);margin-bottom:20px"><i style="width:26px;height:1px;background:linear-gradient(90deg,var(--accent),transparent);display:inline-block"></i>Engineering</span>
+    <h1 class="reveal" data-d="1" style="font-size:52px;letter-spacing:-1.8px;margin:0 0 18px;font-weight:800">技术细节</h1>
+    <p class="lede reveal" data-d="2" style="font-size:18px;color:var(--text-dim);max-width:660px;margin:0">
+      写给想弄清楚每一档到底差在哪的人。下面每个数字都标了测法，可以在随包的技术白皮书里复现。
+    </p>
+  </div>
+</section>
+
+<section id="chain" style="padding-top:20px">
+  <div class="wrap wide">
+    <div class="sec-head reveal">
+      <span class="kicker">Signal Path</span>
+      <h2 class="sec">一、信号链：每一步都能换</h2>
+      <p class="sub">一首歌从文件到耳朵，走的是这条路。每一环都可以在设置里换成别的做法。</p>
+    </div>
+    <div class="chain reveal">
+      <svg viewBox="0 0 840 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="信号链：解码、矩阵、均衡、校准、升频、音量、抖动、输出">
+<defs>
+<linearGradient id="gf2" x1="0" y1="0" x2="1" y2="0">
+<stop offset="0" stop-color="#6b8afd" stop-opacity="0"/><stop offset=".5" stop-color="#a87bff" stop-opacity=".95"/><stop offset="1" stop-color="#6b8afd" stop-opacity="0"/>
+</linearGradient>
+<linearGradient id="gv" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#6b8afd" stop-opacity="0"/><stop offset=".5" stop-color="#a87bff" stop-opacity=".95"/><stop offset="1" stop-color="#6b8afd" stop-opacity="0"/>
+</linearGradient>
+</defs>
+
+
+<line x1="218" y1="113" x2="234" y2="113" stroke="#2b3244" stroke-width="2" stroke-linecap="round"/>
+<line class="flow" x1="218" y1="113" x2="234" y2="113" stroke="url(#gf2)" stroke-width="2.8" stroke-linecap="round" stroke-dasharray="10 15" style="animation-delay:0.00s"/>
+<path d="M227,108 L234,113 L227,118" fill="none" stroke="#3b4459" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<line x1="412" y1="113" x2="428" y2="113" stroke="#2b3244" stroke-width="2" stroke-linecap="round"/>
+<line class="flow" x1="412" y1="113" x2="428" y2="113" stroke="url(#gf2)" stroke-width="2.8" stroke-linecap="round" stroke-dasharray="10 15" style="animation-delay:0.20s"/>
+<path d="M421,108 L428,113 L421,118" fill="none" stroke="#3b4459" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<line x1="606" y1="113" x2="622" y2="113" stroke="#2b3244" stroke-width="2" stroke-linecap="round"/>
+<line class="flow" x1="606" y1="113" x2="622" y2="113" stroke="url(#gf2)" stroke-width="2.8" stroke-linecap="round" stroke-dasharray="10 15" style="animation-delay:0.40s"/>
+<path d="M615,108 L622,113 L615,118" fill="none" stroke="#3b4459" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<g class="node">
+<rect x="40" y="74" width="178" height="78" rx="14" fill="#12151d" stroke="#2b3244" stroke-width="1.5"/>
+<text x="129" y="106" text-anchor="middle" font-size="20" font-weight="600" fill="#eef1f7" font-family="Segoe UI, Microsoft YaHei, sans-serif">解码</text>
+<text x="129" y="130" text-anchor="middle" font-size="13.5" fill="#6b8afd" font-family="Segoe UI, Microsoft YaHei, sans-serif">流式分块</text>
+</g>
+<text x="129" y="178" text-anchor="middle" font-size="13" fill="#68718a" font-family="Segoe UI, Microsoft YaHei, sans-serif">FLAC / DSF / WAV</text>
+<g class="node">
+<rect x="234" y="74" width="178" height="78" rx="14" fill="#12151d" stroke="#2b3244" stroke-width="1.5"/>
+<text x="323" y="106" text-anchor="middle" font-size="20" font-weight="600" fill="#eef1f7" font-family="Segoe UI, Microsoft YaHei, sans-serif">矩阵</text>
+<text x="323" y="130" text-anchor="middle" font-size="13.5" fill="#6b8afd" font-family="Segoe UI, Microsoft YaHei, sans-serif">多声道下混</text>
+</g>
+<text x="323" y="178" text-anchor="middle" font-size="13" fill="#68718a" font-family="Segoe UI, Microsoft YaHei, sans-serif">2.0 – 7.1.4</text>
+<g class="node">
+<rect x="428" y="74" width="178" height="78" rx="14" fill="#12151d" stroke="#2b3244" stroke-width="1.5"/>
+<text x="517" y="106" text-anchor="middle" font-size="20" font-weight="600" fill="#eef1f7" font-family="Segoe UI, Microsoft YaHei, sans-serif">均衡</text>
+<text x="517" y="130" text-anchor="middle" font-size="13.5" fill="#6b8afd" font-family="Segoe UI, Microsoft YaHei, sans-serif">20 段 PEQ</text>
+</g>
+<text x="517" y="178" text-anchor="middle" font-size="13" fill="#68718a" font-family="Segoe UI, Microsoft YaHei, sans-serif">旁路可直通</text>
+<g class="node">
+<rect x="622" y="74" width="178" height="78" rx="14" fill="#12151d" stroke="#2b3244" stroke-width="1.5"/>
+<text x="711" y="106" text-anchor="middle" font-size="20" font-weight="600" fill="#eef1f7" font-family="Segoe UI, Microsoft YaHei, sans-serif">校准</text>
+<text x="711" y="130" text-anchor="middle" font-size="13.5" fill="#6b8afd" font-family="Segoe UI, Microsoft YaHei, sans-serif">卷积 IR</text>
+</g>
+<text x="711" y="178" text-anchor="middle" font-size="13" fill="#68718a" font-family="Segoe UI, Microsoft YaHei, sans-serif">房间校正</text>
+<line x1="234" y1="255" x2="218" y2="255" stroke="#2b3244" stroke-width="2" stroke-linecap="round"/>
+<line class="flow" x1="234" y1="255" x2="218" y2="255" stroke="url(#gf2)" stroke-width="2.8" stroke-linecap="round" stroke-dasharray="10 15" style="animation-delay:0.00s"/>
+<path d="M225,250 L218,255 L225,260" fill="none" stroke="#3b4459" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<line x1="428" y1="255" x2="412" y2="255" stroke="#2b3244" stroke-width="2" stroke-linecap="round"/>
+<line class="flow" x1="428" y1="255" x2="412" y2="255" stroke="url(#gf2)" stroke-width="2.8" stroke-linecap="round" stroke-dasharray="10 15" style="animation-delay:0.20s"/>
+<path d="M419,250 L412,255 L419,260" fill="none" stroke="#3b4459" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<line x1="622" y1="255" x2="606" y2="255" stroke="#2b3244" stroke-width="2" stroke-linecap="round"/>
+<line class="flow" x1="622" y1="255" x2="606" y2="255" stroke="url(#gf2)" stroke-width="2.8" stroke-linecap="round" stroke-dasharray="10 15" style="animation-delay:0.40s"/>
+<path d="M613,250 L606,255 L613,260" fill="none" stroke="#3b4459" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<g class="node">
+<rect x="40" y="216" width="178" height="78" rx="14" fill="#12151d" stroke="#2b3244" stroke-width="1.5"/>
+<text x="129" y="248" text-anchor="middle" font-size="20" font-weight="600" fill="#eef1f7" font-family="Segoe UI, Microsoft YaHei, sans-serif">升频</text>
+<text x="129" y="272" text-anchor="middle" font-size="13.5" fill="#6b8afd" font-family="Segoe UI, Microsoft YaHei, sans-serif">最高 768 kHz</text>
+</g>
+<text x="129" y="320" text-anchor="middle" font-size="13" fill="#68718a" font-family="Segoe UI, Microsoft YaHei, sans-serif">79 个滤波器</text>
+<g class="node">
+<rect x="234" y="216" width="178" height="78" rx="14" fill="#12151d" stroke="#2b3244" stroke-width="1.5"/>
+<text x="323" y="248" text-anchor="middle" font-size="20" font-weight="600" fill="#eef1f7" font-family="Segoe UI, Microsoft YaHei, sans-serif">音量</text>
+<text x="323" y="272" text-anchor="middle" font-size="13.5" fill="#6b8afd" font-family="Segoe UI, Microsoft YaHei, sans-serif">ReplayGain</text>
+</g>
+<text x="323" y="320" text-anchor="middle" font-size="13" fill="#68718a" font-family="Segoe UI, Microsoft YaHei, sans-serif">0 dB 直通</text>
+<g class="node">
+<rect x="428" y="216" width="178" height="78" rx="14" fill="#12151d" stroke="#2b3244" stroke-width="1.5"/>
+<text x="517" y="248" text-anchor="middle" font-size="20" font-weight="600" fill="#eef1f7" font-family="Segoe UI, Microsoft YaHei, sans-serif">抖动</text>
+<text x="517" y="272" text-anchor="middle" font-size="13.5" fill="#6b8afd" font-family="Segoe UI, Microsoft YaHei, sans-serif">TPDF / NS9</text>
+</g>
+<text x="517" y="320" text-anchor="middle" font-size="13" fill="#68718a" font-family="Segoe UI, Microsoft YaHei, sans-serif">LNS15</text>
+<g class="node">
+<rect x="622" y="216" width="178" height="78" rx="14" fill="#12151d" stroke="#2b3244" stroke-width="1.5"/>
+<text x="711" y="248" text-anchor="middle" font-size="20" font-weight="600" fill="#eef1f7" font-family="Segoe UI, Microsoft YaHei, sans-serif">输出</text>
+<text x="711" y="272" text-anchor="middle" font-size="13.5" fill="#6b8afd" font-family="Segoe UI, Microsoft YaHei, sans-serif">WASAPI 独占</text>
+</g>
+<text x="711" y="320" text-anchor="middle" font-size="13" fill="#68718a" font-family="Segoe UI, Microsoft YaHei, sans-serif">ASIO / UPnP</text>
+<path d="M711,186 L711,204" stroke="#2b3244" stroke-width="2" fill="none" stroke-linecap="round"/>
+<path class="flow" d="M711,186 L711,204" stroke="url(#gv)" stroke-width="2.8" fill="none" stroke-dasharray="9 14" style="animation-delay:.6s"/>
+<path d="M706,197 L711,205 L716,197" fill="none" stroke="#3b4459" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+    </div>
+    <div class="note reveal" data-d="2">
+      举例：44.1k 的 FLAC 可以被升到 768k（<strong>升频</strong>），
+      用 79 个预设里的某一个做内插（<strong>滤波</strong>），
+      降到 24 bit 时加 TPDF（<strong>抖动</strong>），音量保持 0 dB（<strong>直通</strong>），
+      最后走 WASAPI 独占送到 DAC（<strong>输出</strong>）。这条链上任何一环换了，声音都会变。
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="filters">
+  <div class="wrap wide">
+    <div class="sec-head reveal">
+      <span class="kicker">Filters</span>
+      <h2 class="sec">二、79 个滤波器预设</h2>
+      <p class="sub">
+        每个预设都跑真实冲激响应，测出六种采样率组合下的 −3 dB 带宽、20 kHz 衰减、阻带深度与群延迟。
+        随包技术白皮书里附了 87 张双面板频响图，全部来自本机实测。
+      </p>
+    </div>
+
+    <div class="row" style="padding-top:0">
+      <div class="txt reveal">
+        <h3>抽头是按内插后的域预算的</h3>
+        <p>每相抽头数 = 总抽头 ÷ 内插倍数。倍率越高，每相抽头越少。</p>
+        <table class="data" style="margin-top:14px">
+          <thead><tr><th>预设</th><th>44.1k→96k</th><th>44.1k→384k</th></tr></thead>
+          <tbody>
+            <tr><td><code>poly-sinc-short-lp</code></td><td class="num">12 抽头/相</td><td class="num"><strong>4 抽头/相</strong></td></tr>
+            <tr><td><code>poly-sinc-tight-lp</code></td><td class="num">512 抽头/输入</td><td class="num">512 抽头/输入</td></tr>
+          </tbody>
+        </table>
+        <p style="margin-top:14px">同一个短抽头滤波器，44.1k→384k 时的可听带镜像抑制会从 −16.5 dB 掉到 −7.8 dB。</p>
+      </div>
+      <div class="shot reveal" data-d="1"><img src="assets/img/filter.png" alt="PCM 升频与滤波"></div>
+    </div>
+
+    <div class="row">
+      <div class="txt reveal">
+        <h3>相位：线性 / 最小 / 混合</h3>
+        <table class="data" style="margin-top:6px">
+          <thead><tr><th>类型</th><th>@100 Hz</th><th>@1 kHz</th><th>@10 kHz</th></tr></thead>
+          <tbody>
+            <tr><td>线性相位</td><td class="num">9.286 ms</td><td class="num">9.286 ms</td><td class="num">9.286 ms</td></tr>
+            <tr><td>最小相位</td><td class="num">0.126 ms</td><td class="num">0.158 ms</td><td class="num">4.769 ms</td></tr>
+          </tbody>
+        </table>
+        <p style="margin-top:14px">多声道系统建议线性相位，各声道相位才能对齐。</p>
+      </div>
+      <div class="shot reveal" data-d="1"><img src="assets/img/eq.png" alt="20 段参数均衡器"></div>
+    </div>
+  </div>
+</section>
+
+<section id="dsd">
+  <div class="wrap wide">
+    <div class="sec-head reveal">
+      <span class="kicker">DSD</span>
+      <h2 class="sec">三、DSD 调制：三道闸</h2>
+      <p class="sub">调制器再激进，也不该把高音单元推爆。所以有这三道保护串在一起。</p>
+    </div>
+
+    <div class="figures" style="border-top:1px solid var(--line);margin-bottom:30px">
+      <div class="figure reveal" data-d="1"><div class="v">1024</div><div class="k">最高 DSD 比特率（45.1584 MHz）</div></div>
+      <div class="figure reveal" data-d="2"><div class="v">−108.32<small> dBFS</small></div><div class="k">DSD64→DSD128 带内噪声（与 DSD64 原样差 0.002 dB）</div></div>
+      <div class="figure reveal" data-d="3"><div class="v">0.000010<small> dB</small></div><div class="k">0–20 kHz 通带平坦度最差偏差</div></div>
+      <div class="figure reveal" data-d="4"><div class="v">3.11<small>× 实时</small></div><div class="k">真实 .dsf 流式转换（258.6 MB / DSD64 / 384 s）</div></div>
+    </div>
+    <div class="feat three">
+      <div class="card reveal" data-d="1">
+        <span class="idx">闸 1</span>
+        <h3>量化器输入限幅</h3>
+        <p>|u| ≤ 1.5，超限计入 overload 计数。界面上能看到这个数在动。</p>
+      </div>
+      <div class="card reveal" data-d="2">
+        <span class="idx">闸 2</span>
+        <h3>误差钳位</h3>
+        <p>积分器误差不发散——这是「过载之后还能回来」的前提。</p>
+      </div>
+      <div class="card reveal" data-d="3">
+        <span class="idx">闸 3</span>
+        <h3>恢复判据</h3>
+        <p>瞬态结束后测 RMS 回落、同号率、限幅计数不再增长，三项都过才算恢复。</p>
+      </div>
+    </div>
+    <table class="data" style="margin-top:26px">
+      <thead><tr><th>配置</th><th>实测</th><th>结论</th></tr></thead>
+      <tbody>
+        <tr><td>7 阶 · DSD64</td><td class="num">MSSA 0.704</td><td>稳定</td></tr>
+        <tr><td>Chebyshev · DSD64</td><td class="num">5640 次/秒钳位 · 带内 −47.5 dBFS</td><td>持续过载，不建议</td></tr>
+        <tr><td>降阶的原因</td><td class="num">带内噪声差 6.5 dB</td><td>音质取舍，不是稳定性问题</td></tr>
+      </tbody>
+    </table>
+    <div class="shot reveal" data-d="1" style="margin-top:26px"><img src="assets/img/sdm.png" alt="SDM（DSD）设置"></div>
+
+    <div class="row" style="padding-top:44px">
+      <div class="txt reveal">
+        <h3>DSD 升频：44.1k 族与 48k 族分开算</h3>
+        <p>
+          DSD 的比特率和 PCM 一样有两条族谱：44.1k 族（DSD64 = 2.8224 MHz，逐级翻倍）
+          与 48k 族（DSD64 = 3.0720 MHz）。两族比值是 147:160，不能混着搬。
+        </p>
+        <ul>
+          <li>输出比特率：DSD64 / 128 / 256 / 512 / 1024</li>
+          <li>封装：DoP（WASAPI 与 ASIO 都行）或 Native（ASIO 原生 1-bit 直送）</li>
+          <li>源是 DSD 时可以原样输出，也可以升到更高 DSD 率（DSD→DSD，不经 PCM 中转）</li>
+          <li>降速也可用（如 DSD128→DSD64），但带内水平受源自身位率限制</li>
+        </ul>
+      </div>
+      <div class="txt reveal" data-d="1">
+        <h3 style="font-size:22px">实测数据</h3>
+        <table class="data" style="margin-top:6px">
+          <thead><tr><th>项目</th><th>结果</th></tr></thead>
+          <tbody>
+            <tr><td>DSD64→DSD128 带内噪声</td><td class="num">−108.32 dBFS</td></tr>
+            <tr><td>与「DSD64 原样」对照</td><td class="num">差 0.002 dB</td></tr>
+            <tr><td>通带平坦度（0–20 kHz）</td><td class="num">0.000010 dB</td></tr>
+            <tr><td>级联 64→128→256 vs 直接 64→256</td><td class="num">ΔTHD+N −0.004 dB</td></tr>
+            <tr><td>降速 128→64 的 THD+N</td><td class="num">101.87 dB（源 106.81 dB）</td></tr>
+            <tr><td>流式转换吞吐</td><td class="num">3.11× 实时</td></tr>
+          </tbody>
+        </table>
+        <p style="margin-top:12px;font-size:14px;color:var(--text-mute)">
+          降速那条不是缺陷：1-bit 量化步长与位率决定了上限，DSD64 装不下 DSD128 的信息量。
+          有意思的是，降速结果的 THD+N 比原生 DSD64 基线（99.55 dB）还高 2.3 dB，因为送进来的中间信号更干净。
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="tone">
+  <div class="wrap wide">
+    <div class="sec-head reveal">
+      <span class="kicker">Tone &amp; Room</span>
+      <h2 class="sec">四、音色与房间：EQ 与校准</h2>
+      <p class="sub">
+        这两块在处理链的中段：先 EQ 调音色，再卷积补房间。顺序是固定的，因为房间的坑不该被 EQ 掩盖。
+      </p>
+    </div>
+
+    <div class="row" style="padding-top:0">
+      <div class="txt reveal">
+        <h3>20 段参数均衡（PEQ）</h3>
+        <p>
+          每段可以设频率、增益、Q 值和类型（峰值 PK / 低架 LS / 高架 HS / 高通 HP / 低通 LP）。
+          曲线上直接拖节点改增益与频率，<code>Shift + 拖</code> 改 Q，双击归零。
+        </p>
+        <ul>
+          <li>旁路时是<strong>真旁路</strong>：20 段全部不参与计算，不是把增益置零</li>
+          <li>默认 20 段全 0 dB，即使生效也等同直通</li>
+          <li>自动前级：按当前曲线算一个负增益，防止 EQ 后削波</li>
+          <li>预设可保存 / 加载 / 删除</li>
+        </ul>
+      </div>
+      <div class="shot reveal" data-d="1"><img src="assets/img/eq.png" alt="20 段参数均衡器"></div>
+    </div>
+
+    <div class="row">
+      <div class="txt reveal">
+        <h3>房间声学校正</h3>
+        <p>用麦克风测房间的真实响应，反卷积得到校正卷积核，挂到每个声道的处理链上。</p>
+        <ul>
+          <li>方法：Farina 扫频 + 正则化反卷积 + 心理声学平滑 + Hilbert 最小相位变换</li>
+          <li>实测：反卷积恢复误差 0.0095 dB，校正闭环 1.28 dB</li>
+          <li>支持 2.0 / 5.1 / 7.1 / 7.1.4 等布局，逐声道独立测量</li>
+          <li>卷积走 CPU 或 GPU（长 IR 自动切 GPU 流式卷积）</li>
+        </ul>
+      </div>
+      <div class="shot reveal" data-d="1"><img src="assets/img/calib.png" alt="声音校准"></div>
+    </div>
+
+    <div class="note reveal" data-d="2">
+      处理链顺序（<code>src/engine/pipeline.h</code>）：解码 → 矩阵 → <strong>PEQ</strong> →
+      每声道 EQ / 延迟 / <strong>卷积</strong> → 重采样 → 音量 → 抖动 / 量化 → 输出。
+      这条链上任何一环开启处理，都会反映到「是否 bit-perfect」的判定里。
+    </div>
+  </div>
+</section>
+
+<section id="gpu">
+  <div class="wrap wide">
+    <div class="sec-head reveal">
+      <span class="kicker">GPU</span>
+      <h2 class="sec">五、GPU 升频：与 CPU 逐样本一致</h2>
+      <p class="sub">AMD HIP 与 NVIDIA CUDA 两条后端。判据不是「快了多少」，而是结果和 CPU 参考完全一样。</p>
+    </div>
+    <div class="figures" style="border-top:1px solid var(--line)">
+      <div class="figure reveal" data-d="1"><div class="v">−310<small> dB</small></div><div class="k">流式卷积 relRMS（相对 CPU 参考）</div></div>
+      <div class="figure reveal" data-d="2"><div class="v"><span data-to="0">0</span></div><div class="k">max|Δ|（逐样本差）</div></div>
+      <div class="figure reveal" data-d="3"><div class="v">−316<small> dB</small></div><div class="k">FP64 升频偏差（≤2 ULP）</div></div>
+      <div class="figure reveal" data-d="4"><div class="v"><span data-to="19">0</span></div><div class="k">CUDA 覆盖的 cubin 架构档数</div></div>
+    </div>
+    <div class="note reveal" data-d="3" style="margin-top:30px">
+      <strong>CUDA 后端</strong>：DLL 内含 19 档 cubin（sm_50…sm_121）与 PTX 前向兼容，导出 7 个符号、
+      静态链接 CUDA Runtime——用 <code>cuobjdump -lelf</code> / <code>dumpbin /exports</code> 逐项核对过。
+    </div>
+  </div>
+</section>
+
+<section id="ai">
+  <div class="wrap wide">
+    <div class="sec-head reveal">
+      <span class="kicker">AI Intelligence</span>
+      <h2 class="sec">六、AI 资料整理：检索、核对、落盘</h2>
+      <p class="sub">
+        这是 RLPlayer 认真做的一块。播放器不该只是播放器——一个本地曲库也该有在线资料库的深度。
+      </p>
+    </div>
+
+    <div class="row" style="padding-top:0">
+      <div class="txt reveal">
+        <h3>两步走：先检索，再综合</h3>
+        <p>
+          模型不靠记忆写百科。它先通过 function calling 调用检索与抓取工具，
+          拿到真实页面，再根据页面内容整理成结构化字段。
+        </p>
+        <ul>
+          <li>检索走 DeepSeek 的 search / fetch 工具，结果带出处</li>
+          <li>引用外部页面时核对归属：专辑名、曲目列表、时长，至少两项对得上</li>
+          <li>对不上的页面不采信，也不拿它写断言</li>
+          <li>模型自己的知识单独标注来源，与检索到的内容分开</li>
+        </ul>
+      </div>
+      <div class="shot reveal" data-d="1"><img src="assets/img/ai.png" alt="专辑详情页的 AI 整理结果"></div>
+    </div>
+
+    <div class="row">
+      <div class="txt reveal">
+        <h3>三类档案，字段各不相同</h3>
+        <p>
+          专辑、单曲、艺术家各有自己的字段表。专辑关心首发日期、会场、售价、曲目列表；
+          单曲关心原曲、编曲、时长、曲目档案；艺术家关心社团归属与作品年表。
+        </p>
+        <ul>
+          <li>结果按文件路径缓存，同一个文件不重复消耗额度</li>
+          <li>缓存带版本号，提示词升级时整体失效重算</li>
+          <li>字段值只写纯文本，名词由程序自动挂权威链接（维基 / 萌娘 / VGMdb / THBWiki）</li>
+          <li>AI 结果异步到达，不阻塞播放</li>
+        </ul>
+      </div>
+      <div class="shot reveal" data-d="1"><img src="assets/img/single.png" alt="单曲页：AI 档案与音频分析"></div>
+    </div>
+
+    <div class="feat three" style="margin-top:20px">
+      <div class="card reveal" data-d="1">
+        <h3>元数据补全</h3>
+        <p>六个数据源并行：MusicBrainz、VGMdb、Discogs 等。不用 AI 也能补全基础字段。</p>
+      </div>
+      <div class="card reveal" data-d="2">
+        <h3>封面与头像</h3>
+        <p>脚本源抓不到时，自动回落到 AI 检索——同一套工具链，不用两套逻辑。</p>
+      </div>
+      <div class="card reveal" data-d="3">
+        <h3>额度可见</h3>
+        <p>设置页能看用量统计。不想花额度随时可以关掉，本地功能不受影响。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap wide">
+    <div class="sec-head reveal">
+      <span class="kicker">Analysis</span>
+      <h2 class="sec">七、音频分析：假无损一测便知</h2>
+      <p class="sub">播放时自动跑一次，结果挂在单曲页。轻量、离线、不打扰。</p>
+    </div>
+    <table class="data">
+      <thead><tr><th>指标</th><th>口径</th><th>实测精度</th></tr></thead>
+      <tbody>
+        <tr><td>动态范围</td><td>ITU BS.1770-4（含 K 加权）</td><td class="num">997 Hz / −23 dBFS → −23.000 LUFS</td></tr>
+        <tr><td>跨采样率一致性</td><td>44.1 / 96 / 192 kHz</td><td class="num">±0.003 LU</td></tr>
+        <tr><td>假无损（砖墙）</td><td>16k / 19k 截止检出</td><td class="num">±200 Hz</td></tr>
+        <tr><td>缓坡误报</td><td>自然衰减的母带</td><td class="num">不误报</td></tr>
+        <tr><td>16 bit 装 24 bit</td><td>容器位深 ≠ 有效位深</td><td class="num">可检出</td></tr>
+      </tbody>
+    </table>
+    <p class="sub" style="margin-top:16px;font-size:14.5px">置信度 &lt; 0.5 的结果不显示，避免误报。</p>
+  </div>
+</section>
+
+<section id="notes">
+  <div class="wrap wide">
+    <div class="sec-head reveal">
+      <span class="kicker">Notes</span>
+      <h2 class="sec">八、暂不支持与使用注意</h2>
+    </div>
+    <div class="feat asym">
+      <div class="card big reveal" data-d="1">
+        <h3>暂不支持 ISO / SACD-ISO / DST</h3>
+        <p>
+          遇到这类文件会识别并提示。需要播放的话，先用 <code>sacd_extract</code> 转成 DSF / DFF，
+          再放进音乐库即可——转换后的 DSD 可以正常走原生输出。
+        </p>
+      </div>
+      <div class="card reveal" data-d="2">
+        <h3>AI 需要外部服务</h3>
+        <p>要填自己的 API Key 与额度。不填的话全部本地功能照常，只是没有资料整理。</p>
+      </div>
+      <div class="card reveal" data-d="3">
+        <h3>版本对比的维度</h3>
+        <p>对比两个版本时看的是频响与动态差异，这是最能反映编码差别的两个维度。</p>
+      </div>
+    </div>
+  </div>
+</section>
+<footer>
+  <div class="wrap">
+    <div class="cols">
+      <div>
+        <a class="brand" href="index.html" style="margin-bottom:16px"><span class="dot"></span>RLPlayer<small>2.0</small></a>
+        <p style="margin:14px 0 0;max-width:400px;line-height:1.8">
+          本地高保真播放器。Windows 与 macOS 双平台，GPL-3.0-or-later 开源。
+        </p>
+      </div>
+      <div>
+        <h4>本页</h4>
+        <ul>
+          <li><a href="#chain">信号链</a></li>
+          <li><a href="#filters">滤波器</a></li>
+          <li><a href="#dsd">DSD</a></li>
+          <li><a href="#ai">AI 资料整理</a></li>
+          <li><a href="#notes">暂不支持</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>社区</h4>
+        <ul>
+          <li><a href="https://github.com/okhuoyanyan/RLPlayer2">GitHub</a></li>
+          <li><span>Q 群 895816505</span></li>
+          <li><a href="index.html#credits">开发团队</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="fin">
+      <span>© 2026 RainLain、猫与小行星　·　GPL-3.0-or-later</span>
+      <span>rlplayer.rainlain.com</span>
+    </div>
+  </div>
+</footer>
+<script src="assets/site.js"></script>
+</body>
+</html>

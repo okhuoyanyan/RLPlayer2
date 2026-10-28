@@ -26,9 +26,153 @@ static void ck(bool cond, const char* what, const std::string& detail = "") {
     else { std::printf("  [FAIL] %s  %s\n", what, detail.c_str()); ++g_fail; }
 }
 
+
+// ---------------------------------------------------------------------------
+// 真库封面审计（2026-10-27）：P1/P3 判据的取证工具，**严格只读**（只读索引/stat/抽内嵌图，
+// 不写 MUSIC、不写索引、不开设备）。为什么不另建 tools/ 下的小程序：本轮 CMakeLists 禁改，
+// 不能新增 target ⟹ 放在已有 test_library 里，用环境变量开启（不设 = 完全不运行，ctest 不受影响）。
+//
+// 环境变量：
+//   RLPLAYER_COVER_AUDIT_LIB  = 含 rlplayer-index.tsv 的库目录（**复制**用户库目录，别指向用户正在用的那份）
+//   RLPLAYER_COVER_AUDIT_NET  = covercache 目录（可选；把"在线抓到的网图"计入覆盖率）
+//   RLPLAYER_COVER_AUDIT_DIR  = 只详列这个目录前缀下的专辑（可选）
+//   RLPLAYER_COVER_AUDIT_DEEP = 1 → 对每张专辑都真取一次字节（慢；用来验"src=embed 就真能取到"）
+// 输出一律以 AUDIT 开头，便于抓取。
+// ---------------------------------------------------------------------------
+static void coverAudit(const std::string& libDir) {
+    using rta::net::LibAlbum;
+    const std::string netDir = rta::net::lib_env_utf8(L"RLPLAYER_COVER_AUDIT_NET", "RLPLAYER_COVER_AUDIT_NET");
+    const std::string onlyDir = rta::net::lib_env_utf8(L"RLPLAYER_COVER_AUDIT_DIR", "RLPLAYER_COVER_AUDIT_DIR");
+    const bool deep = !rta::net::lib_env_utf8(L"RLPLAYER_COVER_AUDIT_DEEP", "RLPLAYER_COVER_AUDIT_DEEP").empty();
+
+    _putenv_s("RLPLAYER_LIBRARY_DIR", libDir.c_str());
+    _putenv_s("RLPLAYER_PORT", "");
+    Library& lib = Library::instance();
+    lib.load();
+    const auto albums = lib.albums();
+    std::printf("AUDIT lib=%s tracks=%zu albums=%zu deep=%d\n", libDir.c_str(), lib.trackCount(), albums.size(), deep ? 1 : 0);
+
+    auto dirOfAlbum = [&](const LibAlbum& a) -> std::string {
+        if (a.idx.empty()) return std::string();
+        rta::net::LibTrack t;
+        if (!lib.trackAt(a.idx[0], t)) return std::string();
+        return rta::net::lib_dir_album_key(rta::net::u8s(rta::net::p8(t.path).parent_path().u8string()));
+    };
+    auto netHas = [&](const std::string& key) {
+        if (netDir.empty()) return false;
+        std::error_code e;
+        const auto p = std::filesystem::u8path(netDir + "\\" + key + ".jpg");
+        return std::filesystem::exists(p, e) && std::filesystem::file_size(p, e) > 1024;
+    };
+    auto oldBytes = [&](const LibAlbum& a) {          // 模拟修复前的取图路径（get_cover：同目录文件优先）
+        std::vector<std::string> withCv, without;
+        for (size_t ix : a.idx) {
+            rta::net::LibTrack t;
+            if (!lib.trackAt(ix, t)) continue;
+            if (t.hasCover) { if (withCv.size() < 3) withCv.push_back(t.path); }
+            else if (without.size() < 3) without.push_back(t.path);
+        }
+        withCv.insert(withCv.end(), without.begin(), without.end());
+        for (const auto& p : withCv) {
+            std::string m;
+            std::vector<unsigned char> b = rta::audio::get_cover(p, m);
+            if (b.size() >= 1024) return b;
+        }
+        return std::vector<unsigned char>();
+    };
+
+    std::map<std::string, std::vector<std::string>> byDir;      // 目录键 → 专辑名
+    for (const auto& a : albums) byDir[dirOfAlbum(a)].push_back(a.name);
+
+    int nEmbed = 0, nDirFile = 0, nNone = 0, nNet = 0, nNewCov = 0, nOldCov = 0;
+    int nMultiDirs = 0, nMultiAlbums = 0, nMultiTracks = 0, nMultiNoCover = 0;
+    int nEmbedFail = 0, nDirFail = 0;
+    std::map<std::string, std::vector<std::string>> dupAfter, dupBefore;   // 目录+字节哈希 → 专辑名
+    std::ostringstream detail;
+    for (const auto& a : albums) {
+        const std::string dir = dirOfAlbum(a);
+        const bool multi = a.dirAlbums > 1;
+        if (a.coverSrc == rta::net::kCoverEmbedded) ++nEmbed;
+        else if (a.coverSrc == rta::net::kCoverDirFile) ++nDirFile;
+        else ++nNone;
+        const bool net = netHas(a.key);
+        if (net) ++nNet;
+        if (a.coverSrc != rta::net::kCoverNone || net) ++nNewCov;
+        if (a.hasCover) ++nOldCov;                  // 老口径 = 任一曲目 cv=1（= LibAlbum::hasCover 旧语义）
+        if (multi) { ++nMultiAlbums; nMultiTracks += a.nTracks; if (a.coverSrc == rta::net::kCoverNone && !net) ++nMultiNoCover; }
+
+        std::vector<unsigned char> nb; std::string nm;
+        if (multi || deep) {
+            if (lib.albumCover(a.key, nb, nm)) {
+                if (multi) dupAfter[dir + "\x1f" + rta::net::fnv_hex(std::string(nb.begin(), nb.end()))].push_back(a.name);
+            } else if (a.coverSrc == rta::net::kCoverEmbedded) ++nEmbedFail;
+            else if (a.coverSrc == rta::net::kCoverDirFile)   ++nDirFail;
+        }
+        if (multi) {
+            const auto ob = oldBytes(a);
+            if (ob.size() >= 1024)
+                dupBefore[dir + "\x1f" + rta::net::fnv_hex(std::string(ob.begin(), ob.end()))].push_back(a.name);
+        }
+        const bool show = onlyDir.empty() ? multi : (dir.compare(0, onlyDir.size(), onlyDir) == 0);
+        if (show) {
+            detail << "AUDIT ALBUM dir=" << dir << " name=" << a.name << " n=" << a.nTracks
+                   << " dirAlbums=" << a.dirAlbums
+                   << " src=" << (a.coverSrc == rta::net::kCoverEmbedded ? "embed"
+                                  : a.coverSrc == rta::net::kCoverDirFile ? "dir" : "none")
+                   << " bytes=" << nb.size();
+            if (!nb.empty()) detail << " hash=" << rta::net::fnv_hex(std::string(nb.begin(), nb.end())).substr(0, 12);
+            if (multi) {
+                const auto ob = oldBytes(a);
+                detail << " oldBytes=" << ob.size();
+                if (ob.size() >= 1024) detail << " oldHash=" << rta::net::fnv_hex(std::string(ob.begin(), ob.end())).substr(0, 12);
+            }
+            detail << "\n";
+        }
+    }
+    for (const auto& kv : byDir) if (kv.second.size() > 1) ++nMultiDirs;
+
+    int dupAfterGroups = 0, dupBeforeGroups = 0;
+    for (const auto& kv : dupAfter) if (kv.second.size() > 1) ++dupAfterGroups;
+    for (const auto& kv : dupBefore) if (kv.second.size() > 1) ++dupBeforeGroups;
+
+    std::printf("AUDIT dirs=%zu multi-dirs=%d multi-albums=%d multi-tracks=%d multi-albums-would-be-nocover=%d\n",
+                byDir.size(), nMultiDirs, nMultiAlbums, nMultiTracks, nMultiNoCover);
+    std::printf("AUDIT NEW src[embed=%d dir=%d none=%d] net=%d covered=%d/%zu\n",
+                nEmbed, nDirFile, nNone, nNet, nNewCov, albums.size());
+    std::printf("AUDIT OLD(emulated: any cv=1) covered=%d/%zu net=%d covered+net=%d/%zu\n",
+                nOldCov, albums.size(), nNet, nOldCov + nNet, albums.size());
+    std::printf("AUDIT DUP same-dir-shared-image AFTER(groups>1)=%d BEFORE(emulated)=%d\n", dupAfterGroups, dupBeforeGroups);
+    std::printf("AUDIT EXTRACT-FAIL embed=%d dir=%d\n", nEmbedFail, nDirFail);
+    std::printf("%s", detail.str().c_str());
+    if (!dupBefore.empty()) {
+        int shown = 0;
+        for (const auto& kv : dupBefore) {
+            if (kv.second.size() < 2 || shown >= 20) continue;
+            ++shown;
+            std::printf("AUDIT SHARED-BEFORE dir=%s n=%d :", kv.first.substr(0, kv.first.find('\x1f')).c_str(), (int)kv.second.size());
+            for (const auto& n : kv.second) std::printf(" %s |", n.c_str());
+            std::printf("\n");
+        }
+    }
+    // 前 20 个多专辑目录
+    int shownDirs = 0;
+    for (const auto& kv : byDir) {
+        if (kv.second.size() < 2 || shownDirs >= 20) continue;
+        ++shownDirs;
+        std::printf("AUDIT MULTIDIR %s albums=%d :", kv.first.c_str(), (int)kv.second.size());
+        for (const auto& n : kv.second) std::printf(" %s |", n.c_str());
+        std::printf("\n");
+    }
+}
+
 int main() {
     SetConsoleOutputCP(CP_UTF8);
     std::printf("== 音乐库索引验证 ==\n");
+    // 真库审计模式（环境变量开启；ctest 不设 ⟹ 不参与门禁，见 coverAudit 的注释）
+    {
+        const std::string auditLib = rta::net::lib_env_utf8(L"RLPLAYER_COVER_AUDIT_LIB", "RLPLAYER_COVER_AUDIT_LIB");
+        if (!auditLib.empty()) { coverAudit(auditLib); std::printf("\n审计完成\n"); return 0; }
+    }
 
     const fs::path tmp = fs::temp_directory_path() / "rta_lib_test";
     std::error_code ec;
@@ -939,6 +1083,332 @@ int main() {
         ck(lib.isoKindOf(sSacd) == "sacd", "重启后 isoKindOf 仍答 sacd（读镜像头，随时可问）");
         fs::remove_all(tmp7, ec);
     }
+
+    // =======================================================================
+    // [8] 封面来源：一目录多专辑不得共用目录封面（2026-10-27，用户 2.0 发包前 BUG）
+    //
+    // 现场：D:\...\2023 一个目录里 **10 张不同专辑**（10 个 ALBUM 标签），只有一张 cover.jpg。
+    //   老实现 hasCover = 「任一曲目 cv=1」，而 cv 含「同目录有封面文件」⟹ 10 张专辑共用那张图；
+    //   那张图实测是「瓦依那 - 大梦.flac」（ALBUM=乐队的夏天3 第7期）自己的内嵌封面。
+    // 判据（铁律 3：每条都能被单独否定）：
+    //   ① 一目录多专辑：目录里的 cover.jpg **不得**外借 ⟹ 没有内嵌的专辑 hasCover=false、
+    //      albumCover() 返回 false（/api/lib/cover 据此 404、前端露首字母）；
+    //   ② 一目录一专辑：目录封面照旧可用（覆盖率不回归），且 albumCover 返回的**就是那个文件**；
+    //   ③ 多碟装 CD1/CD2：仍合成**一张**专辑、仍共享封面（目录归一不能误伤）；
+    //   ④ 一目录多专辑 + 其中一首有真内嵌：那张专辑取到的是**它自己的内嵌图**，不是目录那张。
+    // 库数据直接喂索引 TSV（= 扫描后的落盘形态），不需要 ffprobe；只有 ④ 要真 FLAC（有门禁）。
+    // =======================================================================
+    std::printf("\n== [8] 封面来源：一目录多专辑不得共用目录封面 ==\n");
+    {
+        auto writeJpg = [](const fs::path& p, size_t n, unsigned char fill) {
+            std::vector<char> b(n, (char)fill);
+            b[0] = (char)0xFF; b[1] = (char)0xD8; b[2] = (char)0xFF; b[3] = (char)0xE0;   // JPEG 魔数
+            std::ofstream f(p, std::ios::binary | std::ios::trunc);
+            f.write(b.data(), (std::streamsize)b.size());
+        };
+        auto readBytes = [](const fs::path& p) {
+            std::ifstream f(p, std::ios::binary);
+            return std::vector<unsigned char>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        const fs::path tmp8 = fs::temp_directory_path() / "rta_lib_covsrc";
+        fs::remove_all(tmp8, ec);
+        const fs::path libH  = tmp8 / U("libH");
+        const fs::path rootH = tmp8 / U("音乐库H");
+        const fs::path dirMix  = rootH / U("混装目录");
+        const fs::path dirOne  = rootH / U("单专辑目录");
+        const fs::path dirCD1  = rootH / U("双碟专辑") / U("CD1");
+        const fs::path dirCD2  = rootH / U("双碟专辑") / U("CD2");
+        const fs::path dirEmbd = rootH / U("内嵌混装");
+        for (const fs::path& d : { dirMix, dirOne, dirCD1, dirCD2, dirEmbd })
+            fs::create_directories(d, ec);
+        writeJpg(dirMix  / U("cover.jpg"), 4096, 0x11);   // 混装目录：只属于其中一张，不许外借
+        writeJpg(dirOne  / U("cover.jpg"), 2048, 0x22);
+        writeJpg(dirCD1  / U("cover.jpg"), 3072, 0x33);
+        writeJpg(dirCD2  / U("cover.jpg"), 5120, 0x44);
+        writeJpg(dirEmbd / U("cover.jpg"), 6144, 0x55);
+
+        // ④ 需要一份**真有内嵌封面**的 FLAC：用 ffmpeg 生成（全零音频，不开设备、不出声）
+        const std::string ffmpeg = rta::audio::find_tool("ffmpeg");
+        const fs::path flacEmb = dirEmbd / U("有内嵌.flac");
+        bool embdReady = false;
+        if (!ffmpeg.empty()) {
+            const fs::path tmpJpg = tmp8 / U("embed.jpg");
+            auto runFF = [&](const std::wstring& c) { return rta::audio::run_hidden(c, nullptr); };
+            // 用 testsrc2（细节丰富）而不是纯色：纯色 JPEG 只有几百字节，会被 albumCover 的
+            // "< 1 KB = 占位图"判据当成占位（那是既有的、正确的判据），夹具就测不出东西了。
+            runFF(L"\"" + rta::audio::widen(ffmpeg) + L"\" -v error -y -f lavfi -i \"testsrc2=s=320x320:d=1\""
+                  L" -frames:v 1 -c:v mjpeg -q:v 2 \"" + rta::audio::widen(p2u(tmpJpg)) + L"\"");
+            runFF(L"\"" + rta::audio::widen(ffmpeg) + L"\" -v error -y -f lavfi -i \"anullsrc=r=44100:cl=stereo\""
+                  L" -i \"" + rta::audio::widen(p2u(tmpJpg)) + L"\" -map 0:a -map 1:v -c:a flac -c:v copy"
+                  L" -disposition:v attached_pic -t 1 \"" + rta::audio::widen(p2u(flacEmb)) + L"\"");
+            std::string em0;
+            embdReady = fs::exists(flacEmb, ec) && rta::net::lib_cover_embedded_bytes(p2u(flacEmb), em0).size() > 1024;
+        }
+        ck(embdReady, "④ 夹具：生成了带内嵌封面的 FLAC（缺 ffmpeg 则本节只剩 ①②③ 有判定力）");
+
+        fs::create_directories(libH, ec);
+        {
+            std::ofstream f(libH / U("rlplayer-index.tsv"), std::ios::binary);
+            f << "#libIndexV\t5\n";
+            f << "#path\tmtime\tsize\talbum\talbumArtist\tartist\ttitle\ttrack\tdisc\tyear\tsr\tbits\tch\tdur\thasCover\tgenre"
+                 "\tcue\tcueN\tcueOff\tcueLen\n";
+            auto row = [&](const fs::path& p, const char* alb, const char* aa, const char* art,
+                           const char* ttl, int trk, int disc, int cov) {
+                f << p2u(p) << "\t111\t222\t" << alb << "\t" << aa << "\t" << art << "\t" << ttl
+                  << "\t" << trk << "\t" << disc << "\t0\t44100\t16\t2\t60.0\t" << cov
+                  << "\tRock\t\t0\t0\t0\n";
+            };
+            // ① 一目录多专辑（BUG 现场的最小复现）：hasCover=1 是因为**目录里有封面文件**
+            row(dirMix / U("01.flac"), "混装甲", "甲", "甲", "t1", 1, 1, 1);
+            row(dirMix / U("02.flac"), "混装乙", "乙", "乙", "t2", 1, 1, 1);
+            row(dirMix / U("03.flac"), "混装丙", "丙", "丙", "t3", 1, 1, 1);
+            // ② 一目录一专辑（回归基线：这里必须照旧能取到目录封面）
+            row(dirOne / U("a.flac"), "单人专辑", "单人", "单人", "a", 1, 1, 1);
+            row(dirOne / U("b.flac"), "单人专辑", "单人", "单人", "b", 2, 1, 1);
+            // ③ 多碟装：两个目录、同一个专辑名 ⟹ 必须仍是一张专辑、共享封面
+            row(dirCD1 / U("01.flac"), "双碟专辑", "双碟", "双碟", "c1", 1, 1, 1);
+            row(dirCD2 / U("01.flac"), "双碟专辑", "双碟", "双碟", "c2", 1, 2, 1);
+            // ④ 一目录多专辑 + 其中一首有真内嵌
+            if (embdReady) row(flacEmb, "有内嵌", "内", "内", "e1", 1, 1, 1);
+            row(dirEmbd / U("没内嵌.flac"), "没内嵌", "无", "无", "e2", 1, 1, 1);
+        }
+        // 切库：先清旧根、再指新库目录（顺序与 [5]/[6] 的 scanLib 一致，否则会扫到用户真实目录）
+        for (auto r : lib.roots()) lib.removeRoot(r);
+        _putenv_s("RLPLAYER_LIBRARY_DIR", p2u(libH).c_str());
+        _putenv_s("RLPLAYER_PORT", "");
+        lib.addRootEx(p2u(rootH));
+        lib.load();
+        ck(lib.trackCount() == (size_t)(embdReady ? 9 : 8), "夹具索引载入", std::to_string(lib.trackCount()));
+
+        auto albumByName = [&](const char* nm, rta::net::LibAlbum& out) {
+            for (const auto& a : lib.albums()) if (a.name == nm) { out = a; return true; }
+            return false;
+        };
+
+        // ---- ① 一目录多专辑：目录封面不得外借 ----
+        rta::net::LibAlbum a1;
+        ck(albumByName("混装甲", a1), "① 混装甲存在");
+        ck(a1.dirAlbums == 3, "① 该目录被认出有 3 张专辑（dirAlbums=3）", std::to_string(a1.dirAlbums));
+        ck(rta::net::lib_has_cover_file(p2u(dirMix / U("01.flac"))),
+           "① 夹具成立：该目录里确实有 cover.jpg（不是「本来就没图」）");
+        ck(!a1.hasCover && a1.coverSrc == rta::net::kCoverNone,
+           "① 目录封面不得外借 ⟹ hasCover=false、src=none",
+           std::string("hasCover=") + (a1.hasCover ? "1" : "0") + " src=" + std::to_string(a1.coverSrc));
+        {
+            std::vector<unsigned char> b; std::string m;
+            ck(!lib.albumCover(a1.key, b, m), "① albumCover() 返回 false（/api/lib/cover 会回 404，前端露首字母）");
+        }
+
+        // ---- ② 一目录一专辑：照旧可用（覆盖率不回归）----
+        rta::net::LibAlbum b1;
+        ck(albumByName("单人专辑", b1), "② 单人专辑存在");
+        ck(b1.hasCover && b1.coverSrc == rta::net::kCoverDirFile, "② 一目录一专辑：目录封面照旧可用（src=dir）",
+           std::string("src=") + std::to_string(b1.coverSrc));
+        {
+            std::vector<unsigned char> b; std::string m;
+            const bool ok = lib.albumCover(b1.key, b, m);
+            const auto exp = readBytes(dirOne / U("cover.jpg"));
+            ck(ok && !b.empty() && b == exp, "② albumCover() 返回的正是该目录的 cover.jpg（逐字节相同）",
+               std::to_string(b.size()) + " vs " + std::to_string(exp.size()));
+        }
+
+        // ---- ③ 多碟装：仍一张专辑、仍共享封面 ----
+        rta::net::LibAlbum c1;
+        ck(albumByName("双碟专辑", c1), "③ 双碟专辑存在");
+        ck(c1.nTracks == 2, "③ CD1/CD2 两个目录仍合成一张专辑（2 首）", std::to_string(c1.nTracks));
+        ck(c1.dirAlbums == 1, "③ 目录键归一后只有 1 张专辑（dirAlbums=1）", std::to_string(c1.dirAlbums));
+        ck(c1.hasCover && c1.coverSrc == rta::net::kCoverDirFile, "③ 多碟装仍用目录封面（src=dir，未被误伤）");
+        {
+            std::vector<unsigned char> b; std::string m;
+            const bool ok = lib.albumCover(c1.key, b, m);
+            const auto exp = readBytes(dirCD1 / U("cover.jpg"));
+            ck(ok && !b.empty() && b == exp, "③ 共享的是第一张碟自己目录里的封面", std::to_string(b.size()));
+            bool orderOk = c1.idx.size() == 2;
+            if (orderOk) {
+                rta::net::LibTrack t0, t1;
+                lib.trackAt(c1.idx[0], t0); lib.trackAt(c1.idx[1], t1);
+                orderOk = (t0.discNo == 1 && t1.discNo == 2);
+            }
+            ck(orderOk, "③ 合并后仍按碟号排序（CD1 在前、CD2 在后）");
+        }
+
+        // ---- ④ 一目录多专辑 + 真内嵌：取自己的图，不是目录那张 ----
+        if (embdReady) {
+            rta::net::LibAlbum d1;
+            ck(albumByName("有内嵌", d1), "④ 有内嵌的专辑存在");
+            ck(d1.hasCover && d1.coverSrc == rta::net::kCoverEmbedded,
+               "④ 同目录两张专辑：有内嵌的那张判为 embed",
+               std::string("hasCover=") + (d1.hasCover ? "1" : "0") + " src=" + std::to_string(d1.coverSrc));
+            std::vector<unsigned char> b; std::string m;
+            const bool ok = lib.albumCover(d1.key, b, m);
+            const auto dirCov = readBytes(dirEmbd / U("cover.jpg"));
+            ck(ok && b.size() > 1024 && b != dirCov,
+               "④ 取到的是它自己的内嵌图，绝不是同目录那张 cover.jpg",
+               std::to_string(b.size()) + " vs dir=" + std::to_string(dirCov.size()));
+            std::string em;
+            const auto emb = rta::net::lib_cover_embedded_bytes(p2u(flacEmb), em);
+            ck(!emb.empty() && b == emb, "④ 与该 FLAC 的内嵌封面逐字节相同", std::to_string(emb.size()));
+            rta::net::LibAlbum d2;
+            ck(albumByName("没内嵌", d2), "④ 同目录里没内嵌的那张存在");
+            ck(!d2.hasCover && d2.coverSrc == rta::net::kCoverNone,
+               "④ 同目录里没内嵌的那张：不显示（而不是显示别人的图）",
+               std::string("hasCover=") + (d2.hasCover ? "1" : "0"));
+            std::vector<unsigned char> b2; std::string m2;
+            ck(!lib.albumCover(d2.key, b2, m2), "④ 它的 albumCover() 也是 false（端点 404，不是共享图）");
+        }
+
+        // ---- ⑤ 重读索引后判定不变（来源不落盘、由路径 + 目录计数现算）----
+        lib.load();
+        rta::net::LibAlbum again;
+        ck(albumByName("混装甲", again) && !again.hasCover && again.coverSrc == rta::net::kCoverNone,
+           "⑤ 重新载入索引后 ① 的结论不变（不依赖任何落盘的新列）");
+        rta::net::LibAlbum again2;
+        ck(albumByName("单人专辑", again2) && again2.hasCover && again2.coverSrc == rta::net::kCoverDirFile,
+           "⑤ 重新载入索引后 ② 的结论不变");
+        fs::remove_all(tmp8, ec);
+    }
+
+
+    // =======================================================================
+    // [9] 单文件封面（GET /api/cover?file=）：库内文件按专辑来源取图，库外保持旧行为
+    //
+    // 为什么单开一节（2026-10-27 第二轮）：/api/cover 是**单文件**接口，老实现直接 get_cover()，
+    //   而它第 1 步就是"同目录 cover.jpg 优先" ⟹ 一目录多专辑时底栏/单曲页会把别人那张图发给这首
+    //   （与 /api/lib/cover 同源，只是入口不同；实测 2023 目录 10 首都返回 229855B/63d90cda…）。
+    // 判据：
+    //   ① 多专辑目录里有内嵌的那首 ⟹ 返回**它自己**的内嵌图（≠ 目录那张）；
+    //   ② 同专辑里没内嵌的那首 ⟹ 退到**同一张专辑**的内嵌图（仍是同一张碟，不是目录图）；
+    //   ③ 同目录里没内嵌的那张专辑 ⟹ 返回空（不借别人的），而不是目录图；
+    //   ④ 一目录一专辑 ⟹ 照旧用目录封面（覆盖率不回归）；
+    //   ⑤ 不在库里的文件（拖进来的临时文件）⟹ trackCover 返回 false，调用方仍走 get_cover（同目录优先）。
+    // =======================================================================
+    std::printf("\n== [9] 单文件封面：库内按来源、库外保持旧行为 ==\n");
+    {
+        auto writeJpg = [](const fs::path& p, size_t n, unsigned char fill) {
+            std::vector<char> b(n, (char)fill);
+            b[0] = (char)0xFF; b[1] = (char)0xD8; b[2] = (char)0xFF; b[3] = (char)0xE0;
+            std::ofstream f(p, std::ios::binary | std::ios::trunc);
+            f.write(b.data(), (std::streamsize)b.size());
+        };
+        auto readBytes = [](const fs::path& p) {
+            std::ifstream f(p, std::ios::binary);
+            return std::vector<unsigned char>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        const fs::path tmp9 = fs::temp_directory_path() / "rta_lib_filecover";
+        fs::remove_all(tmp9, ec);
+        const fs::path libJ   = tmp9 / U("libJ");
+        const fs::path rootJ  = tmp9 / U("音乐库J");
+        const fs::path dirMix = rootJ / U("混装单曲");
+        const fs::path dirOne = rootJ / U("单专辑");
+        const fs::path dirOut = tmp9 / U("库外目录");
+        for (const fs::path& d : { dirMix, dirOne, dirOut }) fs::create_directories(d, ec);
+        writeJpg(dirMix / U("cover.jpg"), 4096, 0x77);
+        writeJpg(dirOne / U("cover.jpg"), 2048, 0x88);
+        writeJpg(dirOut / U("cover.jpg"), 3072, 0x99);
+
+        // 真 FLAC：① 有内嵌封面 ② 同专辑但无内嵌（要 ffmpeg；缺工具则 ①② 只能跳过）
+        const std::string ffmpeg = rta::audio::find_tool("ffmpeg");
+        const fs::path flacEmb   = dirMix / U("有内嵌.flac");
+        const fs::path flacNoPic = dirMix / U("无内嵌.flac");
+        bool ffOk = false;
+        if (!ffmpeg.empty()) {
+            const fs::path tmpJpg = tmp9 / U("embed.jpg");
+            auto runFF = [&](const std::wstring& c) { return rta::audio::run_hidden(c, nullptr); };
+            runFF(L"\"" + rta::audio::widen(ffmpeg) + L"\" -v error -y -f lavfi -i \"testsrc2=s=320x320:d=1\""
+                  L" -frames:v 1 -c:v mjpeg -q:v 2 \"" + rta::audio::widen(p2u(tmpJpg)) + L"\"");
+            runFF(L"\"" + rta::audio::widen(ffmpeg) + L"\" -v error -y -f lavfi -i \"anullsrc=r=44100:cl=stereo\""
+                  L" -i \"" + rta::audio::widen(p2u(tmpJpg)) + L"\" -map 0:a -map 1:v -c:a flac -c:v copy"
+                  L" -disposition:v attached_pic -t 1 \"" + rta::audio::widen(p2u(flacEmb)) + L"\"");
+            runFF(L"\"" + rta::audio::widen(ffmpeg) + L"\" -v error -y -f lavfi -i \"anullsrc=r=44100:cl=stereo\""
+                  L" -c:a flac -t 1 \"" + rta::audio::widen(p2u(flacNoPic)) + L"\"");
+            std::string em0;
+            ffOk = fs::exists(flacEmb, ec) && fs::exists(flacNoPic, ec) &&
+                   rta::net::lib_cover_embedded_bytes(p2u(flacEmb), em0).size() > 1024;
+        }
+        ck(ffOk, "夹具：两份真 FLAC（一份有内嵌、一份没有）");
+
+        fs::create_directories(libJ, ec);
+        {
+            std::ofstream f(libJ / U("rlplayer-index.tsv"), std::ios::binary);
+            f << "#libIndexV\t5\n";
+            f << "#path\tmtime\tsize\talbum\talbumArtist\tartist\ttitle\ttrack\tdisc\tyear\tsr\tbits\tch\tdur\thasCover\tgenre"
+                 "\tcue\tcueN\tcueOff\tcueLen\n";
+            auto row = [&](const fs::path& p, const char* alb, const char* ttl, int trk, int cov) {
+                f << p2u(p) << "\t111\t222\t" << alb << "\t" << alb << "\t" << alb << "\t" << ttl
+                  << "\t" << trk << "\t1\t0\t44100\t16\t2\t60.0\t" << cov << "\tRock\t\t0\t0\t0\n";
+            };
+            if (ffOk) { row(flacEmb, "甲", "a1", 1, 1); row(flacNoPic, "甲", "a2", 2, 1); }
+            row(dirMix / U("幽灵.flac"), "乙", "b1", 1, 1);          // 不存在 + hasCover=1（只有目录文件）
+            row(dirOne / U("单曲.flac"), "单", "c1", 1, 1);
+        }
+        for (auto r : lib.roots()) lib.removeRoot(r);
+        _putenv_s("RLPLAYER_LIBRARY_DIR", p2u(libJ).c_str());
+        _putenv_s("RLPLAYER_PORT", "");
+        lib.addRootEx(p2u(rootJ));
+        lib.load();
+
+        const auto dirCovMix = readBytes(dirMix / U("cover.jpg"));
+        const auto dirCovOne = readBytes(dirOne / U("cover.jpg"));
+        // 负向对照：get_cover 本身仍"同目录优先" —— 这正是必须由 trackCover 接管的原因
+        {
+            std::string m; const auto g = rta::audio::get_cover(p2u(dirMix / U("幽灵.flac")), m);
+            ck(g == dirCovMix, "负向对照：get_cover() 对多专辑目录仍返回目录那张图（旧行为本身没改）");
+        }
+        {
+            std::vector<unsigned char> b; std::string m;
+            const bool known = lib.trackCover(p2u(dirMix / U("幽灵.flac")), b, m);
+            ck(known, "③ 库内文件 → trackCover 认领（返回 true）");
+            ck(b.empty(), "③ 同目录没有属于自己的图 ⟹ 返回空，绝不外借目录那张", std::to_string(b.size()));
+        }
+        {
+            std::vector<unsigned char> b; std::string m;
+            const bool known = lib.trackCover(p2u(dirOne / U("单曲.flac")), b, m);
+            ck(known && b == dirCovOne, "④ 一目录一专辑：仍返回该目录的 cover.jpg（覆盖率不回归）",
+               std::to_string(b.size()));
+        }
+        // ⑤ 库外文件：必须"认领失败"，由调用方走 get_cover（= 旧行为，同目录优先）
+        {
+            std::vector<unsigned char> b; std::string m;
+            const bool known = lib.trackCover(p2u(dirOut / U("临时曲.flac")), b, m);
+            ck(!known, "⑤ 不在库里的文件 → trackCover 返回 false（调用方保持旧行为）");
+            std::string m2;
+            const auto g = rta::audio::get_cover(p2u(dirOut / U("临时曲.flac")), m2);
+            ck(g == readBytes(dirOut / U("cover.jpg")), "⑤ 库外文件的旧行为仍是「同目录封面优先」（未被改动）");
+        }
+        if (ffOk) {
+            std::string em; const auto own = rta::net::lib_cover_embedded_bytes(p2u(flacEmb), em);
+            std::vector<unsigned char> b1; std::string m1;
+            const bool k1 = lib.trackCover(p2u(flacEmb), b1, m1);
+            ck(k1 && !own.empty() && b1 == own && b1 != dirCovMix,
+               "① 多专辑目录里：返回它**自己**的内嵌图，不是目录那张",
+               std::to_string(b1.size()) + " vs dir=" + std::to_string(dirCovMix.size()));
+            std::vector<unsigned char> b2; std::string m2;
+            const bool k2 = lib.trackCover(p2u(flacNoPic), b2, m2);
+            ck(k2 && b2 == own, "② 同专辑里没内嵌的那首：退到同一张专辑的内嵌图（不是目录图）",
+               std::to_string(b2.size()));
+        }
+        // ⑥ /api/meta 的 hasCover 口径（第三轮修）：与 /api/cover 同一份判据 —— 逐字复制那一行逻辑
+        auto metaHasCover = [&](const fs::path& p) {
+            std::vector<unsigned char> b; std::string m;
+            if (!lib.trackCover(p2u(p), b, m)) b = rta::audio::get_cover(p2u(p), m);
+            return b.size() > 128;
+        };
+        ck(!metaHasCover(dirMix / U("幽灵.flac")),
+           "⑥ /api/meta 口径：多专辑目录里没有自有图的那首 hasCover=false（旧口径 = true）");
+        ck(metaHasCover(dirOne / U("单曲.flac")),
+           "⑥ /api/meta 口径：一目录一专辑仍有图（hasCover=true，不回归）");
+        if (ffOk) ck(metaHasCover(flacEmb), "⑥ /api/meta 口径：有内嵌的那首 hasCover=true");
+
+        // 重启后一致
+        lib.load();
+        {
+            std::vector<unsigned char> b; std::string m;
+            const bool known = lib.trackCover(p2u(dirMix / U("幽灵.flac")), b, m);
+            ck(known && b.empty(), "重新载入索引后 ③ 的结论不变");
+        }
+        fs::remove_all(tmp9, ec);
+    }
+
     fs::remove_all(tmp2, ec);
 
     fs::current_path(oldCwd, ec);

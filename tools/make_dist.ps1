@@ -1,4 +1,4 @@
-﻿# make_dist.ps1 - build the ONE official release package (Full / self-contained).
+# make_dist.ps1 - build the ONE official release package (Full / self-contained).
 #
 # Policy since 1.0.2:
 #   * There is no "Lite" package any more. Every release is the official
@@ -200,6 +200,40 @@ $gpuOut = (& (Join-Path $stage 'test_gpu_bridge.exe') 2>&1) -join [char]10
 $env:PATH = $oldPath
 Write-Host $gpuOut
 if ($gpuOut -notmatch '\[PASS\]') { Fail "bundled GPU runtime did not initialise (see output above)" }
+
+# === 发布包洁净度：绝不允许把开发机的运行状态打进去（2026-10-28 用户反馈）===
+# 事故：dist\RLPlayer-2.0-win64 里带上了我这台开发机的 rlplayer-library.conf
+#   （内容就一行 D:\RTA-hqplayer\MUSIC），用户装完打开「设置-高级-本地音乐库」
+#   直接看到开发机的目录；同批还带进了 rlplayer-playback.log(85KB)、rlplayer-index.tsv、
+#   artistimg/、covercache/、rlplayer-meta/、webview2/ 等运行时状态。
+# 规则：发布包只允许「程序 + 静态资源 + 空数据目录」，任何运行时状态一律不许进包。
+# 做法：先清理，再硬校验 —— 少了这一步，换个人手工往 $out 里拷东西就会再犯。
+$devStateDirs = @('artistimg', 'covercache', 'rlplayer-meta', 'webview2', 'lyricscache', 'roomcorr')
+foreach ($d in $devStateDirs) {
+    $p = Join-Path $out $d
+    if (Test-Path $p) { Write-Host ("purge dev-state dir: " + $d); Remove-Item $p -Recurse -Force }
+}
+$devStateGlobs = @('rlplayer-*.conf', 'rlplayer-*.log', 'rlplayer-*.tsv', 'rlplayer-*.txt',
+                   'rlplayer-*.json', 'launcher.log', '*.log')
+foreach ($g in $devStateGlobs) {
+    Get-ChildItem -Path $out -Filter $g -File -ErrorAction SilentlyContinue |
+        ForEach-Object { Write-Host ("purge dev-state file: " + $_.Name); Remove-Item $_.FullName -Force }
+}
+# 硬校验 ①：清完还剩下任何一个运行时状态文件 ⟹ 拒绝出包
+$leak = Get-ChildItem -Path $out -Recurse -File -Include 'rlplayer-library.conf', 'rlplayer-settings.conf',
+        'rlplayer-sources.conf', 'rlplayer-index.tsv', 'launcher.log', 'rlplayer-playback.log' -ErrorAction SilentlyContinue
+if ($leak) {
+    $leak | ForEach-Object { Write-Host ("LEAK: " + $_.FullName) }
+    Fail "发布包里仍存在开发机运行状态文件（见上面 LEAK 行）"
+}
+# 硬校验 ②：包内任何文本都不许出现开发机绝对路径
+$pathHits = Get-ChildItem -Path $out -Recurse -File -Include '*.txt', '*.conf', '*.json', '*.md', '*.tsv' -ErrorAction SilentlyContinue |
+            Select-String -Pattern 'RTA-hqplayer' -SimpleMatch -ErrorAction SilentlyContinue
+if ($pathHits) {
+    $pathHits | Select-Object -First 10 | ForEach-Object { Write-Host ("PATH-LEAK: " + $_.Path + ":" + $_.LineNumber + " -> " + $_.Line.Trim()) }
+    Fail "发布包内出现开发机绝对路径（见上面 PATH-LEAK 行）"
+}
+Write-Host 'release hygiene: no dev-state files, no dev absolute paths'
 
 $zip = Join-Path $dist ($name + '.zip')
 if (Test-Path $zip) { Remove-Item $zip -Force }
