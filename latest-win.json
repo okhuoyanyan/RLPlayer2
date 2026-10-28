@@ -1,0 +1,4474 @@
+{
+ "version": "2.0.0",
+ "notes": "2.0.0 正式版。检索质量修复（单曲查询带专辑名，召回 rerank 0.26→1.30）；提示词新增归属校验与「字段值禁止裸 URL」；封面归属改「文件夹名才是权威」；修复音频分析总开关不生效；构建脚本支持无 N 卡编译；随包提供 28 页使用说明书。",
+ "download_url": "https://github.com/okhuoyanyan/RLPlayer2/releases/download/v2.0.0/RLPlayer-2.0-win64.zip",
+ "delta_url": "",
+ "sha256": "3ac59c1b1d9ce9b0f95b3027a6db6680a6307f1d8f389f24b73aa9def893164e",
+ "size": 401423644,
+ "delta_sha256": "",
+ "delta_size": 0,
+ "delta_from": "",
+ "published_at": "2026-10-28T06:40:01Z",
+ "files": [
+  {
+   "path": "LICENSE",
+   "sha256": "5a71a93555fcb7992706086b31abe8e73e1aa0a5d552d2abed8728ac6dd2912c",
+   "size": 35191
+  },
+  {
+   "path": "README.txt",
+   "sha256": "6ab1679113c4d60611fdddf27902dabc53d4be52ee94a772ec1244a7cb029fe8",
+   "size": 6574
+  },
+  {
+   "path": "RLPlayer-2.0-使用说明书.pdf",
+   "sha256": "16e68555fbabec4a9fa48688ba769ed71de8c9c1cecc3afdee5e5435a3bb475f",
+   "size": 4277632
+  },
+  {
+   "path": "RLPlayer-2.0-技术白皮书.pdf",
+   "sha256": "060dc9823b6bf68366c2be99891d7d5939a2d1021e2ee10d6012e19a5272f5de",
+   "size": 9519088
+  },
+  {
+   "path": "RLPlayer.exe",
+   "sha256": "8e3e9c0eb9b1ff6139e8ede91e03c7ccb7216a196c60e4b6ef81b6974f18bd07",
+   "size": 671232
+  },
+  {
+   "path": "THIRD-PARTY-NOTICES.txt",
+   "sha256": "a47b10df14022764ec1c02ee054ba20bc180805a76a5dcdcbce89d81a169c949",
+   "size": 5683
+  },
+  {
+   "path": "WebView2Loader.dll",
+   "sha256": "462b36fd1be6ca9f7563466a89e57c41ef4a4def3e0a84fa885d203aea4a3aaf",
+   "size": 165968
+  },
+  {
+   "path": "WebView2Runtime\\155.0.4283.62.manifest",
+   "sha256": "723e5f48c55ddc5419b7d144400a15c4d757173400104ffcbb3bd025a90ff315",
+   "size": 226
+  },
+  {
+   "path": "WebView2Runtime\\AdSelectionAttestationsPreloaded\\ad-selection-attestations.dat",
+   "sha256": "dc94c97fb9437a5137a1d47b376e212732a15cb1266148792b94da6fa9939d17",
+   "size": 63
+  },
+  {
+   "path": "WebView2Runtime\\AdSelectionAttestationsPreloaded\\manifest.json",
+   "sha256": "e92ad2a1a517ec4c6db1538513b0a529966249182b3a571fab3941ea3eff5ff0",
+   "size": 128
+  },
+  {
+   "path": "WebView2Runtime\\BHO\\ie_to_edge_bho.dll",
+   "sha256": "4bba5bc254ebd5169670786cd9b88d4ddbac22b16bd6bf014c28c1ab531a17b7",
+   "size": 474480
+  },
+  {
+   "path": "WebView2Runtime\\BHO\\ie_to_edge_bho_64.dll",
+   "sha256": "2b3d549418f400c164ae851e08bb640eed8d1fe66f54b1ac8cd0b436eb2624d0",
+   "size": 593264
+  },
+  {
+   "path": "WebView2Runtime\\BHO\\ie_to_edge_stub.exe",
+   "sha256": "2aa6e53c7b94cc4ee97c59f6785c5a06db55f2357c6c8df991f1d1460d2181df",
+   "size": 532848
+  },
+  {
+   "path": "WebView2Runtime\\Copilot.dat",
+   "sha256": "d79e27858722fcb4c2db9a7fa6bb4fb958eb90c2ab12fd35370be8c05dee7878",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\BrowserMetrics\\BrowserMetrics-6AD8A7C8-53D8.pma",
+   "sha256": "6de39ce0375c77a13be6770850db10dbb8ab7bb6623417da1b5d83a0379889a4",
+   "size": 1310720
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Crashpad\\settings.dat",
+   "sha256": "36811c5fd1f888a4e5a8d2581b4053e099dd12f33d089cb8ab07b45a97efe218",
+   "size": 288
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Crashpad\\throttle_store.dat",
+   "sha256": "41c91a9c93d76295746a149dce7ebb3b9ee2cb551d84365fff108e59a61cc304",
+   "size": 20
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\BookmarkMergedSurfaceOrdering",
+   "sha256": "4489f9e3e454748b3521eb214e0a5694d562cff3d9ff511cb456953c8f534c00",
+   "size": 6
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Cache\\Cache_Data\\data_0",
+   "sha256": "468456974fd86b33647942820dce7284879acfab9e9e6eca008e1fdcf9006fb5",
+   "size": 45056
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Cache\\Cache_Data\\data_1",
+   "sha256": "77f311179486d695289f38f54cf722b8d193d01c5f7f552328467743f694c542",
+   "size": 270336
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Cache\\Cache_Data\\data_2",
+   "sha256": "ec1702806f4cc7c42a82fc2b38e89835fde7c64bb32060e0823c9077ca92efb7",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Cache\\Cache_Data\\data_3",
+   "sha256": "e09f42c398d688dce168570291f1f92d079987deda3099a34adb9e8c0522b30c",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Cache\\Cache_Data\\index",
+   "sha256": "321a135c1012805ec6cc8886c947466082ef58c6605446e34c5372564468a32f",
+   "size": 524656
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Cache\\No_Vary_Search\\journal.baj",
+   "sha256": "9c169428d852e25bd59b27652ed533d2a1f09f96e4c329fa5e06f47e16731543",
+   "size": 4
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Cache\\No_Vary_Search\\snapshot.baf",
+   "sha256": "0c2dd377ed0cc66161e9db8f89f7d8bcb3ad8c06c4a054bdcba214ab05f58c9a",
+   "size": 20
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Code Cache\\js\\3032af25c2e1f0c3_0",
+   "sha256": "693957cf74c82423cac4f5db417c1fcb26971b887553fb02887bb068c72c233a",
+   "size": 339
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Code Cache\\js\\index",
+   "sha256": "fbcfe23a2ecb82b7100c50811691dde0a33aa3da8d176be9882a9db485dc0f2d",
+   "size": 24
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Code Cache\\js\\index-dir\\the-real-index",
+   "sha256": "a31e32f716d1883d48a697473f96a063ba38393b845fc135efcc8a853bd6e626",
+   "size": 72
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Code Cache\\wasm\\index",
+   "sha256": "fbcfe23a2ecb82b7100c50811691dde0a33aa3da8d176be9882a9db485dc0f2d",
+   "size": 24
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Code Cache\\wasm\\index-dir\\the-real-index",
+   "sha256": "135661c11045d9a16967efda85ab2f2d674673a942dce58e670b0fcb74b17ded",
+   "size": 48
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\DawnGraphiteCache\\data_0",
+   "sha256": "d6a5fe39cd672781b256e0e3102f7022635f1d4bb7cfcc90a80fffe4d0f3877e",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\DawnGraphiteCache\\data_1",
+   "sha256": "b1e963d702392fb7224786e7d56d43973e9b9efd1b89c17814d7c558ffc0cdec",
+   "size": 270336
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\DawnGraphiteCache\\data_2",
+   "sha256": "ec1702806f4cc7c42a82fc2b38e89835fde7c64bb32060e0823c9077ca92efb7",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\DawnGraphiteCache\\data_3",
+   "sha256": "e09f42c398d688dce168570291f1f92d079987deda3099a34adb9e8c0522b30c",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\DawnGraphiteCache\\index",
+   "sha256": "ac4db47713b9b864c464eb8e9cd1ee40d9075635fedd15aaef41fb1a43678134",
+   "size": 262512
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\DawnWebGPUCache\\data_0",
+   "sha256": "d6a5fe39cd672781b256e0e3102f7022635f1d4bb7cfcc90a80fffe4d0f3877e",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\DawnWebGPUCache\\data_1",
+   "sha256": "b1e963d702392fb7224786e7d56d43973e9b9efd1b89c17814d7c558ffc0cdec",
+   "size": 270336
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\DawnWebGPUCache\\data_2",
+   "sha256": "ec1702806f4cc7c42a82fc2b38e89835fde7c64bb32060e0823c9077ca92efb7",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\DawnWebGPUCache\\data_3",
+   "sha256": "e09f42c398d688dce168570291f1f92d079987deda3099a34adb9e8c0522b30c",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\DawnWebGPUCache\\index",
+   "sha256": "60162b5520e2d3717839038a746557f233ae60a0d114221cf38f4b9c217221a0",
+   "size": 262512
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Extension Rules\\000003.log",
+   "sha256": "1c43a1bda1e458863c46dfae7fb43bfb3e27802169f37320399b1dd799a819ac",
+   "size": 38
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Extension Rules\\CURRENT",
+   "sha256": "0f1bad70c7bd1e0a69562853ec529355462fcd0423263a3d39d6d0d70b780443",
+   "size": 16
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Extension Rules\\LOG",
+   "sha256": "30bcf849cd2f6ee2dfa9a3a88b4db8fe2ae560ffa91363e9401f8f67ae89ca02",
+   "size": 255
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Extension Rules\\MANIFEST-000001",
+   "sha256": "f9d31b278e215eb0d0e9cd709edfa037e828f36214ab7906f612160fead4b2b4",
+   "size": 41
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Extension Scripts\\000003.log",
+   "sha256": "1c43a1bda1e458863c46dfae7fb43bfb3e27802169f37320399b1dd799a819ac",
+   "size": 38
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Extension Scripts\\CURRENT",
+   "sha256": "0f1bad70c7bd1e0a69562853ec529355462fcd0423263a3d39d6d0d70b780443",
+   "size": 16
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Extension Scripts\\LOG",
+   "sha256": "a4d83a5b5c528566d0e0b4cc18409dfe5fd3f7e60e83220e4ff9421c45d3ced2",
+   "size": 259
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Extension Scripts\\MANIFEST-000001",
+   "sha256": "f9d31b278e215eb0d0e9cd709edfa037e828f36214ab7906f612160fead4b2b4",
+   "size": 41
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Extension State\\000003.log",
+   "sha256": "e2610960c3757d1757f206c7b84378efa22d86dcf161a98096a5f0e56e1a367e",
+   "size": 114
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Extension State\\CURRENT",
+   "sha256": "0f1bad70c7bd1e0a69562853ec529355462fcd0423263a3d39d6d0d70b780443",
+   "size": 16
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Extension State\\LOG",
+   "sha256": "385a904cc1905a8fcbbb1994daed62380d060bb8082ef2f45020a63f17a87151",
+   "size": 255
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Extension State\\MANIFEST-000001",
+   "sha256": "f9d31b278e215eb0d0e9cd709edfa037e828f36214ab7906f612160fead4b2b4",
+   "size": 41
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Favicons",
+   "sha256": "70b7107fc95f62a47247c6521b8d55811143dba6cf83751d3ea0970ffa299a93",
+   "size": 24576
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\GPUCache\\data_0",
+   "sha256": "2af48b46c6e4c56a24084b42246ab05f69e393a2ac68a3158891ab1803dd9723",
+   "size": 45056
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\GPUCache\\data_1",
+   "sha256": "c9527ea60a4dd3317648b999140a7a7696ef57b1d57b926bef73239f4d63e0e5",
+   "size": 270336
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\GPUCache\\data_2",
+   "sha256": "b4c013d5c4aa918661b9e7bae01ea3662e9edb88d8af474b108d797bd652ae53",
+   "size": 1056768
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\GPUCache\\data_3",
+   "sha256": "e09f42c398d688dce168570291f1f92d079987deda3099a34adb9e8c0522b30c",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\GPUCache\\index",
+   "sha256": "ac1ee104b2edbc9382eb35fdbba8c07723783b4763cd06acc948fcbcabcaea4f",
+   "size": 262512
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\History",
+   "sha256": "6ddcadf5c1619784039ef7269b85ab6d1455b52ae9272753b8d53e9ab1220e50",
+   "size": 249856
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Local Storage\\leveldb\\000003.log",
+   "sha256": "289dccfdd397145623f34ce85cfa306a0966e5a77be88c2509f2da3f022ec772",
+   "size": 174
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Local Storage\\leveldb\\CURRENT",
+   "sha256": "0f1bad70c7bd1e0a69562853ec529355462fcd0423263a3d39d6d0d70b780443",
+   "size": 16
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Local Storage\\leveldb\\LOG",
+   "sha256": "196ba8cc242e8c51c78cb0f5c7526eee64fd66704e959c8719103da7b0d644ae",
+   "size": 267
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Local Storage\\leveldb\\MANIFEST-000001",
+   "sha256": "f9d31b278e215eb0d0e9cd709edfa037e828f36214ab7906f612160fead4b2b4",
+   "size": 41
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Login Data",
+   "sha256": "3a8415fcec60041b0f9f8f3f2ea48a84002a0a169e9c56f07f4415ff2f81cfe5",
+   "size": 43008
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Login Data For Account",
+   "sha256": "3a8415fcec60041b0f9f8f3f2ea48a84002a0a169e9c56f07f4415ff2f81cfe5",
+   "size": 43008
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Network\\Cookies",
+   "sha256": "8da294027e6ff01d4253e19f529e9af6f4ddf89ae08a4b50225a007ddffb43e4",
+   "size": 20480
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Network\\Device Bound Sessions",
+   "sha256": "6a22ff7ca6e53a73bc4578271e5f5bf34cdd7c1c9e8e13aea5db31ae5b2618d2",
+   "size": 20480
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Network\\Network Persistent State",
+   "sha256": "88c9590388d22bb0bd8da3f7d50389311957024ee5c2dfe562e2649ad427fd7d",
+   "size": 111
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Network\\Reporting and NEL",
+   "sha256": "2d6dada0da20730019917ab502a8189099aa5ad98a1b23cd30715d6f9689ef11",
+   "size": 36864
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Network\\SCT Auditing Pending Reports",
+   "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+   "size": 2
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Network\\Sdch Dictionaries",
+   "sha256": "6028bd681dbf11a0a58dde8a0cd884115c04caa59d080ba51bde1b086ce0079d",
+   "size": 40
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Network\\Trust Tokens",
+   "sha256": "88bafa2a265212152b2405502209d64438a416ff594a040e666f031ef442a812",
+   "size": 36864
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Preferences",
+   "sha256": "ed00d4db5accfabeafa4985f6c56e2eba084df27608afcc75d0d0a48ea4c021a",
+   "size": 7811
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\README",
+   "sha256": "a0c9abae18599f0a65fc654ad36251f6330794bea66b718a09d8b297f3e38e87",
+   "size": 182
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Secure Preferences",
+   "sha256": "641dff1c3fa94203821c1c1d81d3eb78fca0f8e8fe1ba811e8b95e8d8f33d7d8",
+   "size": 9856
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\ServerCertificate",
+   "sha256": "180ffbc2a4f10b5563f5a7bfe62d23909f0aa77572a06e59a9be4c6fca7176f7",
+   "size": 20480
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Session Storage\\000003.log",
+   "sha256": "ffd700cf04be6fe8d51e2ffb8a2e37bc3fa95a6679a4102fa35e8494c2350eae",
+   "size": 49
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Session Storage\\CURRENT",
+   "sha256": "0f1bad70c7bd1e0a69562853ec529355462fcd0423263a3d39d6d0d70b780443",
+   "size": 16
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Session Storage\\LOG",
+   "sha256": "d84f9eaef75a1190ad84160f966be18a4ee5e6b866176d2be18b891cf345c678",
+   "size": 255
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Session Storage\\MANIFEST-000001",
+   "sha256": "f9d31b278e215eb0d0e9cd709edfa037e828f36214ab7906f612160fead4b2b4",
+   "size": 41
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Shared Dictionary\\cache\\index",
+   "sha256": "fbcfe23a2ecb82b7100c50811691dde0a33aa3da8d176be9882a9db485dc0f2d",
+   "size": 24
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Shared Dictionary\\cache\\index-dir\\the-real-index",
+   "sha256": "c8e02b9bd549bed99fc2cb86aa9f48d063bd1d388c77ff09f330e5033c07cbcc",
+   "size": 48
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Shared Dictionary\\db",
+   "sha256": "0d6287fecedbc44ed9f51ded9de88629ec9f385ecff5da9a34e47e96fd5a9cba",
+   "size": 45056
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Site Characteristics Database\\000003.log",
+   "sha256": "f096bc366a931fba656bdcd77b24af15a5f29fc53281a727c79f82c608ecfab8",
+   "size": 40
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Site Characteristics Database\\CURRENT",
+   "sha256": "0f1bad70c7bd1e0a69562853ec529355462fcd0423263a3d39d6d0d70b780443",
+   "size": 16
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Site Characteristics Database\\LOG",
+   "sha256": "d4a326fa89794a5af6eff946ba60922d9f4114224580838ba2cb1cc0373a63ff",
+   "size": 283
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Site Characteristics Database\\MANIFEST-000001",
+   "sha256": "f9d31b278e215eb0d0e9cd709edfa037e828f36214ab7906f612160fead4b2b4",
+   "size": 41
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Sync Data\\LevelDB\\000003.log",
+   "sha256": "8ff00d859349a3ea206706cdd3fa2762ae7c8efe2fdd33a95a72fee45aac6bc4",
+   "size": 65
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Sync Data\\LevelDB\\CURRENT",
+   "sha256": "0f1bad70c7bd1e0a69562853ec529355462fcd0423263a3d39d6d0d70b780443",
+   "size": 16
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Sync Data\\LevelDB\\LOG",
+   "sha256": "4229124b637ba39bb28ea0f5f84de3fe44c83efe88150746ba044c5a2c735784",
+   "size": 259
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Sync Data\\LevelDB\\MANIFEST-000001",
+   "sha256": "f9d31b278e215eb0d0e9cd709edfa037e828f36214ab7906f612160fead4b2b4",
+   "size": 41
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Vpn Tokens",
+   "sha256": "0750267321d06309dfd0bc3957b29483fe4f76cdb105e02e64dbe9ec240ddc03",
+   "size": 28672
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\Web Data",
+   "sha256": "123ed0d974fed6c1ac8d0106cdd03eb4fe78f2fa37b4db056b983d7ac0b44012",
+   "size": 223232
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\declarative_performance_observer.db",
+   "sha256": "eda4c9567974174f08a1dbcd8badf4d6199a7e9a8b78b8826548f49e20e7badf",
+   "size": 32768
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\shared_proto_db\\000003.log",
+   "sha256": "ab5c71347d95f319781df230012713c7819ac0d69373e8c9a7302cae3f9a04b7",
+   "size": 19
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\shared_proto_db\\CURRENT",
+   "sha256": "0f1bad70c7bd1e0a69562853ec529355462fcd0423263a3d39d6d0d70b780443",
+   "size": 16
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\shared_proto_db\\LOG",
+   "sha256": "4112ab72fc01ab5b027de520ea9829d68bc0e5c706416a36d1253505c6d19630",
+   "size": 255
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\shared_proto_db\\MANIFEST-000001",
+   "sha256": "f9d31b278e215eb0d0e9cd709edfa037e828f36214ab7906f612160fead4b2b4",
+   "size": 41
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\shared_proto_db\\metadata\\000003.log",
+   "sha256": "b3b20e958aa7cca1e4c41be209d3c809948fc767ff20b8f66415a622957fad14",
+   "size": 474
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\shared_proto_db\\metadata\\CURRENT",
+   "sha256": "0f1bad70c7bd1e0a69562853ec529355462fcd0423263a3d39d6d0d70b780443",
+   "size": 16
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\shared_proto_db\\metadata\\LOG",
+   "sha256": "8b7f9d6e42d46491634907e6724ccc009247609f6eb6a73b8891d4aaa401891c",
+   "size": 273
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Default\\shared_proto_db\\metadata\\MANIFEST-000001",
+   "sha256": "f9d31b278e215eb0d0e9cd709edfa037e828f36214ab7906f612160fead4b2b4",
+   "size": 41
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\GrShaderCache\\data_0",
+   "sha256": "06ed93c95915274aadfa4963b8a7b7de0ef6229e3c3850cae287be97260de2dc",
+   "size": 45056
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\GrShaderCache\\data_1",
+   "sha256": "2456fe3d61101667e0154df3375797d112f7cf8ab539c37f4c785c459bb1ace0",
+   "size": 270336
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\GrShaderCache\\data_2",
+   "sha256": "ec1702806f4cc7c42a82fc2b38e89835fde7c64bb32060e0823c9077ca92efb7",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\GrShaderCache\\data_3",
+   "sha256": "234a43d6464cb1e31c850a28938facd774b26900decb3f0fd9cc46d0d8162883",
+   "size": 4202496
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\GrShaderCache\\f_000001",
+   "sha256": "1a2220e9cd9898f37a8d8ab6e837ad04cce6467604891d777b6d939ab1cc54bd",
+   "size": 16468
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\GrShaderCache\\f_000002",
+   "sha256": "e1be78eeef8b9cbe534e69cdad3f977aa83a9f9dfa5ac0270294bf46094fe88b",
+   "size": 19176
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\GrShaderCache\\f_000003",
+   "sha256": "dfda77316238fe2a7001f1d4978e0570b703e318160c46371a7cffc67ac77229",
+   "size": 16748
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\GrShaderCache\\f_000004",
+   "sha256": "01f8ff867444b0fbadbb64fa652d14eb1831a0ed2cfc514e706b1c55a9555e50",
+   "size": 19164
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\GrShaderCache\\f_000005",
+   "sha256": "3d16cb76cdd30a86182e78f5835346fc46db7307c9db2213bdc87917d336f05e",
+   "size": 17076
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\GrShaderCache\\f_000006",
+   "sha256": "854c896ff8be31288806008120f373a68e3321739e52a9344ad8246a4abdcd83",
+   "size": 24820
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\GrShaderCache\\index",
+   "sha256": "bc5f4246acb2be5b8a4592a6c7c8def9dd317d59a95ee1b8620ce10872935578",
+   "size": 262512
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Last Version",
+   "sha256": "4b61b66b2dd42e850a25bcc229e999974a874f8681a9c4f3db784ba51f973288",
+   "size": 13
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Local State",
+   "sha256": "cbe8b05bb452eefe5bbf486e266d036f65311085c7d1286bd56a12592c4c51b8",
+   "size": 4278
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\ShaderCache\\data_0",
+   "sha256": "d6a5fe39cd672781b256e0e3102f7022635f1d4bb7cfcc90a80fffe4d0f3877e",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\ShaderCache\\data_1",
+   "sha256": "b1e963d702392fb7224786e7d56d43973e9b9efd1b89c17814d7c558ffc0cdec",
+   "size": 270336
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\ShaderCache\\data_2",
+   "sha256": "ec1702806f4cc7c42a82fc2b38e89835fde7c64bb32060e0823c9077ca92efb7",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\ShaderCache\\data_3",
+   "sha256": "e09f42c398d688dce168570291f1f92d079987deda3099a34adb9e8c0522b30c",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\ShaderCache\\index",
+   "sha256": "6ad9a54f20a9df13697998b393c0c2e288bb97cd525789e89bd0920b3685e504",
+   "size": 262512
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\SmartScreen\\RemoteData\\edgeSettings",
+   "sha256": "42ccb5159b168dbe5d5ddf026e5f7ed3dbf50873cfe47c7c3ef0677bb07b90d4",
+   "size": 18
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\SmartScreen\\RemoteData\\edgeSettings_2.0-0",
+   "sha256": "e6beb5ac43dfa3e05ca3c40c4e5de7d763e2e0580203ad9034c6f0527ac0e45b",
+   "size": 3552
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\Variations",
+   "sha256": "b26da4f8c7e283aa74386da0229d66af14a37986b8ca828e054fc932f68dd557",
+   "size": 85
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\VariationsRuntimeSeedV2",
+   "sha256": "1560b22b2264f7cb6b7f6910164813f76c5e8a06fb1acf85b375e687ee49c1ad",
+   "size": 19
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\VariationsSafeSeedV2",
+   "sha256": "1560b22b2264f7cb6b7f6910164813f76c5e8a06fb1acf85b375e687ee49c1ad",
+   "size": 19
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\VariationsSeedV2",
+   "sha256": "b4cc4174735c28360b9081be3c3d0552d8a4b3cdb54431ac00ed0d622bab6296",
+   "size": 11
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\x64\\EmbeddedBrowserWebView.dll",
+   "sha256": "4c0d799ae06d2de2fce8cb56d11b4e0046832476562074246a17a6e702a9f951",
+   "size": 9082224
+  },
+  {
+   "path": "WebView2Runtime\\EBWebView\\x86\\EmbeddedBrowserWebView.dll",
+   "sha256": "1aae79b774920d3662d0b7827caa1e76e6016fdd99f0570225806fc1ee6007a0",
+   "size": 5773680
+  },
+  {
+   "path": "WebView2Runtime\\Edge.dat",
+   "sha256": "aad5a84356ee96f3d6ca9742b23b6124eafba558f6d60ceed6c3067dac459c81",
+   "size": 12288
+  },
+  {
+   "path": "WebView2Runtime\\EdgeWebView.dat",
+   "sha256": "482297326005fcb6e961e9b3e327e4cbb151901e7ca55cbe2bf982823bc06934",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\Extensions\\external_extensions.json",
+   "sha256": "a68cafd7d78d5c671c2560656653f2a4d83ab66d87a8728356a88fb1f477b3e6",
+   "size": 99
+  },
+  {
+   "path": "WebView2Runtime\\Installer\\msedge_7z.data",
+   "sha256": "bcae04974789ea9d1a8c2a6ec9dd0b65b67fae6be15d67aa538015a9f08803e2",
+   "size": 6346
+  },
+  {
+   "path": "WebView2Runtime\\Installer\\setup.exe",
+   "sha256": "1eb1edd4029de15d354476606c8e51edb7922ba6664f0d8135ceeafe508843fc",
+   "size": 6591344
+  },
+  {
+   "path": "WebView2Runtime\\Locales\\en-US.pak",
+   "sha256": "8572244169c608f659611617b0d12cfee528375e1cd124cf414a95c7e9e1d54a",
+   "size": 956742
+  },
+  {
+   "path": "WebView2Runtime\\Locales\\zh-CN.pak",
+   "sha256": "cad80f5ba53f32690b7ebbe4857b8c125f1b19bdbebd30496852e8475eb90e9e",
+   "size": 918085
+  },
+  {
+   "path": "WebView2Runtime\\MEIPreload\\manifest.json",
+   "sha256": "44844cf3dde6e80087ae0e6bf0d9326d7ef7d23326d24ac83af0850be26923d2",
+   "size": 238
+  },
+  {
+   "path": "WebView2Runtime\\MEIPreload\\preloaded_data.pb",
+   "sha256": "c6070a157b4e28d16fbccbd233e93846ddb070c85e1a1bc64469b7a5f1424fad",
+   "size": 8254
+  },
+  {
+   "path": "WebView2Runtime\\PdfPreview\\PdfPreviewHandler.dll",
+   "sha256": "463bcc308ee44bbdba55a91996643ec223dd704648d51cd17516342fe8451cae",
+   "size": 259952
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\AdSelectionAttestationsPreloaded\\ad-selection-attestations.dat.DATA",
+   "sha256": "dc94c97fb9437a5137a1d47b376e212732a15cb1266148792b94da6fa9939d17",
+   "size": 63
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\AdSelectionAttestationsPreloaded\\manifest.json.DATA",
+   "sha256": "e92ad2a1a517ec4c6db1538513b0a529966249182b3a571fab3941ea3eff5ff0",
+   "size": 128
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Copilot.dat.DATA",
+   "sha256": "d79e27858722fcb4c2db9a7fa6bb4fb958eb90c2ab12fd35370be8c05dee7878",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Edge.dat.DATA",
+   "sha256": "aad5a84356ee96f3d6ca9742b23b6124eafba558f6d60ceed6c3067dac459c81",
+   "size": 12288
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\EdgeWebView.dat.DATA",
+   "sha256": "482297326005fcb6e961e9b3e327e4cbb151901e7ca55cbe2bf982823bc06934",
+   "size": 8192
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Extensions\\external_extensions.json.DATA",
+   "sha256": "a68cafd7d78d5c671c2560656653f2a4d83ab66d87a8728356a88fb1f477b3e6",
+   "size": 99
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\af.pak.DATA",
+   "sha256": "0d73224b6b7cc264e5d5a5be0213793fa15775af3881be61c7396f081ae074d5",
+   "size": 1070931
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\am.pak.DATA",
+   "sha256": "2c97aaf9bbc4188dafb061361f63893c34698122da18f1669b8ed235abf15422",
+   "size": 1574830
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ar.pak.DATA",
+   "sha256": "ea5d7a36db96645b35dff318649914747fbd73f589ab9e7f8e03ed95244b4246",
+   "size": 1634343
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\as.pak.DATA",
+   "sha256": "e2f1fda1f358e13b8571384c879245dfc7c0b2b528273694018f419afeaa72d5",
+   "size": 2326014
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\az.pak.DATA",
+   "sha256": "74b17a19f641603352287825e6586d3f484c87de5b5bc0ca745839e7c7a10090",
+   "size": 1229273
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\bg.pak.DATA",
+   "sha256": "be5fec4fa4a233e20dfa33d0e7309bc19eb780d7427a4951c7f72c4163305fa8",
+   "size": 1836488
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\bn-IN.pak.DATA",
+   "sha256": "f5e07695de651bbfe8fe9123c0cd5af576c684b8282f0bf3714728a796d3c73c",
+   "size": 2404189
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\bs.pak.DATA",
+   "sha256": "fa9e1d7db6305e0148d2182d5d11243bf590f629a502fb0ec22eba03b5afe75e",
+   "size": 1144756
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ca-Es-VALENCIA.pak.DATA",
+   "sha256": "b60d8196197efcaae03807233f4cbe8968776c68467edd8efa2a3fec1d4af6e3",
+   "size": 1199408
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ca.pak.DATA",
+   "sha256": "84d13e390579585de8d26fd7fe4f4a3090ed5091d4e436780e9e50d9a46ba764",
+   "size": 1202139
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_af.pak.DATA",
+   "sha256": "f3f52bfda7861acbc0531ff5ebd0269126dfa2945e1dd09da38fb58b66a8cbb8",
+   "size": 65224
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_am.pak.DATA",
+   "sha256": "052b950317eb4e45d1ba6cb89b9020b1792dcf411a937c1b6e7ef8c95d4b9215",
+   "size": 95344
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ar.pak.DATA",
+   "sha256": "b2e64d1766da937169488f904123ef7555fc30506e94e1f877c03a5b6d9d35ee",
+   "size": 92234
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_as.pak.DATA",
+   "sha256": "a0f3461cb288dd41aac9831d24e4a32e96659c51a2985ea902a848d704b2b8b9",
+   "size": 142178
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_az.pak.DATA",
+   "sha256": "bd707525cc33ef884b4e2bf87f2db2aa1179c354ac31ec93fde7e7acbe646efb",
+   "size": 73304
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_bg.pak.DATA",
+   "sha256": "08d7d1fc448eec05f72f57e5e8bb6fa9581245728d015bacfbb9d30af3b95d0a",
+   "size": 108216
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_bn-IN.pak.DATA",
+   "sha256": "0482b808a195eb069d1d43abdcc01f743ee2f6e920f58a2b5042def3b98b5c2a",
+   "size": 148598
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_bs.pak.DATA",
+   "sha256": "233fb80d2168dd8a15fb36631b14b6512b2511b300079755836cf69f78db607d",
+   "size": 67854
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ca-Es-VALENCIA.pak.DATA",
+   "sha256": "d56d8f05f769dead50e1ae050b8b7b44ec82b62f41f85440adc011744e700442",
+   "size": 71491
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ca.pak.DATA",
+   "sha256": "250c6d14285c9fe58572c08dd57b9b94b0521f1e43fe35a113e5187cb4172f7e",
+   "size": 71278
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_cs.pak.DATA",
+   "sha256": "9f4399b81737aaf76d3aaa4e5cd31722d7a4994f891084d2a0a726e513a1cdaf",
+   "size": 69425
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_cy.pak.DATA",
+   "sha256": "bace2b6db84dcb031ed8bf84a42f987413d52fe9aa80fbd5d8509091ecf3114c",
+   "size": 69567
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_da.pak.DATA",
+   "sha256": "ae772e70500e206244d9bca324b17c0f4cbfad52bd66e75cd0427780aaee1a4e",
+   "size": 64745
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_de.pak.DATA",
+   "sha256": "a5bb7cc717d74d8e2fdb809a37662fc9a9806c7bebfe880cfa097f5f02f43b7f",
+   "size": 72276
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_el.pak.DATA",
+   "sha256": "4c0b7a22ec9a8944e28657ac96e9825a95af905da29155bff1ab7c3f9b98791c",
+   "size": 122576
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_en-GB.pak.DATA",
+   "sha256": "bd93c707a12dc187eb93c0f4783cdfcde06c49cc3e2663d842185e1b507cfca5",
+   "size": 59626
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_en-US.pak.DATA",
+   "sha256": "b44fc809ed4bcc35ccca053787c5f137b46e8097dfa87f883e1c3bf1d19cdadb",
+   "size": 58982
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_es-419.pak.DATA",
+   "sha256": "b7887328e370d214a5be496a1ef62d97855c0a745259b420dfa75e4ebcde3f74",
+   "size": 69764
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_es.pak.DATA",
+   "sha256": "edf392ecff64692e4c06abe8abb17426a56d28c890e8f85733d36988251c3169",
+   "size": 69569
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_et.pak.DATA",
+   "sha256": "06af60657ec1687fcac95064f56216d5da596c8346e0a73563cc3a1fb98a01fb",
+   "size": 63577
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_eu.pak.DATA",
+   "sha256": "b8868bdbca2f4de253af330693c820857e7541c1ced81a76dd7a02b6db5ae113",
+   "size": 65539
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_fa.pak.DATA",
+   "sha256": "28e5aa3a76e33f5947a4525ca7b9eb587eef277f4052baeabdebd4c221d2bdec",
+   "size": 101857
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_fi.pak.DATA",
+   "sha256": "094d45dc71ae4a2f81395bc8030dea721f00aca16723c50e56bfbb566f32f9f9",
+   "size": 67083
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_fil.pak.DATA",
+   "sha256": "37de4d16af33d42cf55705b1e0e6d70dca100467a082a169f36034eb735ab927",
+   "size": 72988
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_fr-CA.pak.DATA",
+   "sha256": "4b3831a134fd381895914d6ff31ad3655cbcd4c9302b7d86e9ad71fc782c8f07",
+   "size": 76856
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_fr.pak.DATA",
+   "sha256": "1f26f5eca791f05cc415fadc3505ba917f52984882a5b020cb83f9761ee821ca",
+   "size": 76343
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ga.pak.DATA",
+   "sha256": "2e8354dad62865ff662b35eae74d173475b923e5fe23437349a76ace8346405a",
+   "size": 76313
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_gd.pak.DATA",
+   "sha256": "664bdb35dc9a26575658da02b197e7a63b26a1225dac14482683ae117e82e660",
+   "size": 78138
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_gl.pak.DATA",
+   "sha256": "b0b5af30f54bca09670af17ac845ae8fbe60f25449a5a2ebdc15b8c9ba54feaf",
+   "size": 68012
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_gu.pak.DATA",
+   "sha256": "57829a8ff17336fc342ac740c58bb558d9bc9408665f3331b5c9cfb1d219b4b7",
+   "size": 143763
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_he.pak.DATA",
+   "sha256": "137102d3243585617126903104e07d876438d11d4d22097160da026b669257d7",
+   "size": 82537
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_hi.pak.DATA",
+   "sha256": "3bec082dd017049b1fa5e18bcbe6c64eefba377fe31f57c6116aa11e0157eaac",
+   "size": 140654
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_hr.pak.DATA",
+   "sha256": "a0a1904d3c34d94d5b9bb860ae304b7480672b5a2fec5b2672d6aec1f005f33c",
+   "size": 68385
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_hu.pak.DATA",
+   "sha256": "e48271860bb42e078a8055b0f2d7c35376d018b6dbd7304ad85f56d73dc5b195",
+   "size": 73293
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_id.pak.DATA",
+   "sha256": "9f50c5f517ccb82d5054d28c0c1932ecea0e685e0b7cc379858e7c4b90beaa50",
+   "size": 64864
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_is.pak.DATA",
+   "sha256": "5cf2bb5fcfb10accedc8ac12bcd618fea21ede1e0eeb38995b428037a3b11471",
+   "size": 68910
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_it.pak.DATA",
+   "sha256": "cc60ecc3525fab6159b70291b3b9f7f4be1cb557a87196680e397c987bf096d8",
+   "size": 69402
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ja.pak.DATA",
+   "sha256": "e179e03b98e654f255c83af883a1c4882098922dbd9e1bfc06a90e4d100b66f7",
+   "size": 84022
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ka.pak.DATA",
+   "sha256": "1cfc233f9e5118487d3900e2a0539341b3b4bb6018e9b73aa482ef0190813a32",
+   "size": 151553
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_kk.pak.DATA",
+   "sha256": "3ec3b6c4f9a6eba105ca3e28b313a9ff7d7daec5be60cef80e228bc443418aaf",
+   "size": 111515
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_km.pak.DATA",
+   "sha256": "0260cd0b4590e59dcaa700436abe709aa2e8e051f136444a99d4e96223544c77",
+   "size": 152600
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_kn.pak.DATA",
+   "sha256": "347cf1dbff7397faaea4fe60bdc5f795b5ee2cc0b8ef11e63410d9bec2d2af49",
+   "size": 154855
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ko.pak.DATA",
+   "sha256": "82ffef91535c79409a52b302ba794a054bf97553dc51351df44afa2d0df8feb4",
+   "size": 72473
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_kok.pak.DATA",
+   "sha256": "b69c890ba066d90d492b6ce51dd2642e09491d4141c8373497acf10985741050",
+   "size": 134190
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_lb.pak.DATA",
+   "sha256": "e20b8db9cd58ef2f32399871949e8a785a7d2f21314c7ea98fcb939d9205b355",
+   "size": 70131
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_lo.pak.DATA",
+   "sha256": "be9a889785217e436dfb368d234da6a319af78f161ef309170bfd45c30f00e33",
+   "size": 138125
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_lt.pak.DATA",
+   "sha256": "3b5ccbe1ca55c29052ab2355079cbe02a7c30dabb0896d2610a5c7887753db64",
+   "size": 72455
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_lv.pak.DATA",
+   "sha256": "17d9fe265ae1f3e493a46e114f727591f45ed588e926c8c0708f92ce1d3f7860",
+   "size": 69858
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_mi.pak.DATA",
+   "sha256": "c56ba1c34fa210d53e6b61da3046553b7dc0926bd18e279eb951149ba3f1f325",
+   "size": 70726
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_mk.pak.DATA",
+   "sha256": "a74a8ba0329558bbb1a53269b2c87ea36e1dec94d2685218f5eb7100a91205de",
+   "size": 109695
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ml.pak.DATA",
+   "sha256": "23d3cb1acf51c2f4426a50f5ba2f5dec3a382f420e23a7577def25fc029f5cf3",
+   "size": 171856
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_mr.pak.DATA",
+   "sha256": "25b743cc5b6de35e8a5225e50447bbc5ff5979c948a29a1173ac54a3ec74075e",
+   "size": 144311
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ms.pak.DATA",
+   "sha256": "4e045da8cf77652c55f15a9d0e5109ec538cba8f317cd2ee0870d644fe2fea94",
+   "size": 67209
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_mt.pak.DATA",
+   "sha256": "52e9afb37600d3f6877e16c69bed864de1856a12f30d8f048cb6132d1044c98c",
+   "size": 72837
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_nb.pak.DATA",
+   "sha256": "67dbbfafaa299befd4fdd9c503a9731b7fcf6942c6643f7adc3d5a40fd83c2cc",
+   "size": 63118
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ne.pak.DATA",
+   "sha256": "4fd666ac94d318f0dae939c7f5a447a11b43447d7bfba20e8c5f52c9eda99ecb",
+   "size": 148237
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_nl.pak.DATA",
+   "sha256": "8b6b6ff6bdd500504e59febf08f6f5da2e438581836083e9333ae3fc6cda7029",
+   "size": 67921
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_nn.pak.DATA",
+   "sha256": "006a38d073a4fcb6c1aec44230013bdd571fc8d14979b0c5a39c99ea94eea949",
+   "size": 62982
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_or.pak.DATA",
+   "sha256": "882ab7a0b6e91d50dda0b228e46fca3ee497038206e613587e6bf86b0a8a9006",
+   "size": 154794
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_pa.pak.DATA",
+   "sha256": "56c263dd7af8e9c5881079c704768c86f3fed1e999c15d73691eb2f0cf398c1c",
+   "size": 147474
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_pl.pak.DATA",
+   "sha256": "8af0fdd47df04c4409b803bf391f7e7d55440c25d7c1345ad6b139c7c4e2953b",
+   "size": 74828
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_pt-BR.pak.DATA",
+   "sha256": "08c4b867944f784d1540f88bcf9f86250f87692acfc33bc4b6e3aa4da06ac51b",
+   "size": 68218
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_pt-PT.pak.DATA",
+   "sha256": "b5461ab070f20e596a041b5e1e8c5b7278835fcaaa81b881474c15826b83221c",
+   "size": 70463
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_qu.pak.DATA",
+   "sha256": "3565b7809f9885316f8ba1abe325c1d34b7f2ed7ed9f0f057953db6f90dc7647",
+   "size": 70427
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ro.pak.DATA",
+   "sha256": "91b8479c2f3480d9ae8133677f7ca0ead7c16002d17b4e61db0496f502f554af",
+   "size": 71385
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ru.pak.DATA",
+   "sha256": "724c612a5c26eedd2e75930eb4ca3189a138a3c664da165988e69a670d004811",
+   "size": 109777
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_sk.pak.DATA",
+   "sha256": "87425f243b5094b3d04662f69254e08d632adfeed680082fb844d3ea978e9928",
+   "size": 70935
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_sl.pak.DATA",
+   "sha256": "204e597584fffc4c7da5e855dc870218eedb26519492e852497c42a1e0354d88",
+   "size": 68610
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_sq.pak.DATA",
+   "sha256": "e19d9d388da76322d5bd692378151b8112f0de70175bfc2389383fad4c92b311",
+   "size": 70504
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_sr-Cyrl-BA.pak.DATA",
+   "sha256": "ffd251e087a90ef7733a82867610836d609c262621e33ccbd96489878cf1ac80",
+   "size": 105627
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_sr-Latn-RS.pak.DATA",
+   "sha256": "327aa05d950119930575a03dc2c8c9f7413dfb98022f17669f7a9a16a55d7689",
+   "size": 68588
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_sr.pak.DATA",
+   "sha256": "92612843fc5e265512daea40c5ceae85e784e8ec641fce1ac7f8252ae50c513e",
+   "size": 107250
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_sv.pak.DATA",
+   "sha256": "419bf7ab7aa6375c2e38f8babf4634c60a1b6d9fa608c82bf4f1d0dbd4123066",
+   "size": 64234
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ta.pak.DATA",
+   "sha256": "0d55af7cb7ca3d3c7e94c3a6b3c5e334c4887e91f549e012cad32ce9ade9df88",
+   "size": 167001
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_te.pak.DATA",
+   "sha256": "2ab0172f7fb92472840cf4ae3591b147685ff622667b3e2cf1a8c6d69545c58b",
+   "size": 153779
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_th.pak.DATA",
+   "sha256": "b31eb8ad2f4c2e3688eaafea6f7a2c06ef27e0c92d696ddef40ab53c78d7cc56",
+   "size": 135739
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_tr.pak.DATA",
+   "sha256": "59de8805a40e4c903133e96aa0ba68c8e314c4f536aca9eb6532928f7b049f23",
+   "size": 69997
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_tt.pak.DATA",
+   "sha256": "fe887022c0e28f1fb9023f9c5058cc5732c3d3db09913ffef7e9e98fe8ec259f",
+   "size": 106655
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ug.pak.DATA",
+   "sha256": "31644120a32da2e2674118c3944342ee63078b25d716072328fb260ce8efdcbe",
+   "size": 107862
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_uk.pak.DATA",
+   "sha256": "f24da7eaa7a3f1edec3fd3168bf20f3948d8e5d992793782d6d523b6001f2dbe",
+   "size": 106069
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_ur.pak.DATA",
+   "sha256": "68041b6950b1f7528b4a7fb1b39250a293768e034bb5e3e120a36a5b2fe417aa",
+   "size": 104050
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_vi.pak.DATA",
+   "sha256": "9e59567f19de792dad9b6a9f5124e42e12d7bb483b0fb53f3a4dafc10626dd83",
+   "size": 80135
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_zh-CN.pak.DATA",
+   "sha256": "2e868dfb92e95e75831ca97e44272f3e3a3f3ad5a1b2be93d907285d3b697762",
+   "size": 56015
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\copilot_overlay_strings_zh-TW.pak.DATA",
+   "sha256": "7084dfe4be33990cdab05db975d74c6f7e67800429a58e16fa050b1eaf934714",
+   "size": 58231
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\cs.pak.DATA",
+   "sha256": "358b631c2a43f1d2b0a6f0a0dd99c97af6fc6e2a5ae06b4c875134d8e2c95a88",
+   "size": 1195655
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\cy.pak.DATA",
+   "sha256": "9e32cb4eb016f23e75a9169daa27094063dd1e76ede7be6a6e96534887fe30fd",
+   "size": 1184523
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\da.pak.DATA",
+   "sha256": "9a0c3310610955ac2e2dd02b95f3c6e763c5a66a69e13704af359b04e164e2f0",
+   "size": 1071779
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\de.pak.DATA",
+   "sha256": "a2d51f9e7a0978017adbc19c167b7a0960450483a02cc2f3716768fd3391758c",
+   "size": 1195057
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\el.pak.DATA",
+   "sha256": "160232278ab48ca159990d825feb0c93047eebfdf78394b50952ef2a79e2c339",
+   "size": 2032565
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\en-GB.pak.DATA",
+   "sha256": "0a0a5d60d3ec0572a38a5d7d709af205f64117af4172fcde42564aafd23077f3",
+   "size": 975845
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\en-US.pak.DATA",
+   "sha256": "8572244169c608f659611617b0d12cfee528375e1cd124cf414a95c7e9e1d54a",
+   "size": 956742
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\es-419.pak.DATA",
+   "sha256": "ff4e0f4fa215830fb7434562f3ee2a2e90ea182ce80047933a2f966eb4ea97f9",
+   "size": 1186218
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\es.pak.DATA",
+   "sha256": "a16ae1a13398bfdd2ca642045b7ce112af691fd6bf418f39d00b6aedad327bb6",
+   "size": 1186888
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\et.pak.DATA",
+   "sha256": "cc94f202fa8f22113c7ea566acf3092345f30f019df8e002aa4c3778bcdb5be2",
+   "size": 1061237
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\eu.pak.DATA",
+   "sha256": "c1045af7996cc831c69ab3b1e3f7cc2cb11d17901f3d4d108fbc31bca386b467",
+   "size": 1103363
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\fa.pak.DATA",
+   "sha256": "2949fce5e32b9338e910848ed12198441cebd5a0e1f3a0f68b09cc4c683c9f2a",
+   "size": 1656150
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\fi.pak.DATA",
+   "sha256": "834032c13b15f974a97fac7035d8f2e199f38a6a65830269b8265cc1a4bf03dd",
+   "size": 1108252
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\fil.pak.DATA",
+   "sha256": "d0e7ba7112abee400711741552d67c202cbcc69fa947e6365d0b55ed98c4b1a1",
+   "size": 1194591
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\fr-CA.pak.DATA",
+   "sha256": "8246453663b13536bfbd1757bebb812c4e220ab4dc616b881ce0f003e1fce031",
+   "size": 1277765
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\fr.pak.DATA",
+   "sha256": "5a892d6e8abd190cfde501bac06d929d8090013c0304528e984b12e36358f7cb",
+   "size": 1268737
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ga.pak.DATA",
+   "sha256": "2dd564c603eb0e4189524a67b4b54f0885698a91d797cc15f07c553da98f54e7",
+   "size": 1272079
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\gd.pak.DATA",
+   "sha256": "8164d602982f951a85ebcfbe43b8e38d8ba1b2a929000d2a5db7c417d88f6b7a",
+   "size": 1339962
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\gl.pak.DATA",
+   "sha256": "f61abde4eab1535c233110ccae0f15decbfb105f305ec3104a53cf20a4300836",
+   "size": 1136211
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\gu.pak.DATA",
+   "sha256": "b09a4673592201da0b149ca24ea7563e33dd43ca448915a39cf6613001cd3867",
+   "size": 2277394
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\he.pak.DATA",
+   "sha256": "f8853243fa3c1c1a8395b2eede2ebd6217936d5b7b6c1f16dc29d2a4c0b29421",
+   "size": 1377490
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\hi.pak.DATA",
+   "sha256": "ff9d46d623bfce5e55bd4e81608e7cf4489372012e428cacbe07268177e97592",
+   "size": 2273153
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\hr.pak.DATA",
+   "sha256": "3f48ea4cffd6f514f7bd78c22fd31a46c73dbdc92678cd204a0b164317a2d16c",
+   "size": 1158148
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\hu.pak.DATA",
+   "sha256": "dde66ce2ec1212e527c52b7882ac122f6dfbe247c57bbfd702baee9f08b3d73e",
+   "size": 1224439
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\id.pak.DATA",
+   "sha256": "b0c369b3f73b47de023a868801a24adc6643eed8f98bd304969eb5b7c686ee23",
+   "size": 1046869
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\is.pak.DATA",
+   "sha256": "b3b63b6f1c5f07ab7d4f142ececdb8895db8322fd7dcce1d690c68773d8e6dc9",
+   "size": 1124425
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\it.pak.DATA",
+   "sha256": "c6592eb646c0d60b1e41484053ecb50b099407c5c03dc364c2569fa1b1d962d4",
+   "size": 1170314
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ja.pak.DATA",
+   "sha256": "ee1da73c61568784033517f7ab7322a933ea063bf547764516de3539ff80424b",
+   "size": 1365026
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ka.pak.DATA",
+   "sha256": "b67633c9f4f577e00124614c98e5324b4768762e688f41ff39ddea399db83c4d",
+   "size": 2540160
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\kk.pak.DATA",
+   "sha256": "4c0fa823101503fca7e722bd166fa74f72c182cdd1e0ba4b128f2766ec93e86f",
+   "size": 1798884
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\km.pak.DATA",
+   "sha256": "c8ba2b920e0ce4a5fd341eecce65c3416e54ffb1243cde55be3ec61382faa363",
+   "size": 2445366
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\kn.pak.DATA",
+   "sha256": "5a8e224ac370b21bd2f208b81847dbdb76f6e90c24f8b60e918eb41ce3b14c9e",
+   "size": 2543597
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ko.pak.DATA",
+   "sha256": "c611511b4ca19f22fcebde0f89f74da45c9472c403e725fff771a95e2224de0f",
+   "size": 1150241
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\kok.pak.DATA",
+   "sha256": "f6cceb0926b50439e484e268f06a42483835429e1597f9200e57b01c4fb7eaf9",
+   "size": 2193680
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\lb.pak.DATA",
+   "sha256": "625f338628581beff43facc3f4950bd979ef2a672ba19161598fffb0fb69e969",
+   "size": 1155103
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\lo.pak.DATA",
+   "sha256": "c267dae3012179c8748920a5ec95f0175e5379230a582e2c4f5adf559c5595e9",
+   "size": 2220191
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\lt.pak.DATA",
+   "sha256": "5e648c6335175426c16f9f1966310a9f929c70fb121f7ff5545fdcf898014731",
+   "size": 1211994
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\lv.pak.DATA",
+   "sha256": "9ea6195cb3bd048c1e07e1cd19d1a17008bdf7dfa14b43545d0f03ae5aea560b",
+   "size": 1180056
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\mi.pak.DATA",
+   "sha256": "2e32a8a68374c834f03ebc0ee47218d180f9e0418f52156380ce83fbcdf8fa16",
+   "size": 1155491
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\mk.pak.DATA",
+   "sha256": "b1d3fde75b286ebd4735ac629cdeba91da8448b9c2b7f44df9b22bcde004b373",
+   "size": 1832963
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ml.pak.DATA",
+   "sha256": "53a0cd6c6cd7dfdcea7d2ea5a324dab8623a66cc08fa55e44d9e26113520631b",
+   "size": 2784688
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\mr.pak.DATA",
+   "sha256": "1abda265562fb888ec408ad7962f0c08b38ab8b532e33b37d44d6409f2f5d00e",
+   "size": 2297020
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ms.pak.DATA",
+   "sha256": "6f61f6dbb66f034ee2070d335461864a33f3f7ab025853a0a91cda5460f61dbb",
+   "size": 1079720
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\mt.pak.DATA",
+   "sha256": "aafc61750a0ce656ddd74e0a9fbc935b2925782602d3ac7e027283226a62dbdd",
+   "size": 1231618
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\nb.pak.DATA",
+   "sha256": "f92456de89558d092cf5c7d5f3d20ecec2dbd5ec94bb97eb4f2d1415ed664aef",
+   "size": 1044421
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ne.pak.DATA",
+   "sha256": "9ae27370c0c70817eb139762a514319adc3720db8b0185df7f78639ac30c3a20",
+   "size": 2439594
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\nl.pak.DATA",
+   "sha256": "2cd3cedace8e8b83ed96de0c6bb474d12fb6df43ccd55a71f31f413efa3b5beb",
+   "size": 1116098
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\nn.pak.DATA",
+   "sha256": "ff0a7f818010f027353b0a1cbe89ba357df1dae50ef318fd31a15a9d7448c2f7",
+   "size": 1048372
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\or.pak.DATA",
+   "sha256": "3e319dfc9b237b69804beb1c2daa277a80713f50339bf5fdd2cc892059da15c5",
+   "size": 2533424
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\pa.pak.DATA",
+   "sha256": "3b0a7b3fbb1834baaa7057f96bbe75fab07e9c8fc2415663accd5fac286addc7",
+   "size": 2319126
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\pl.pak.DATA",
+   "sha256": "9812fa74c1fd74e4d9d7c5d582dca55469c9ad2ceb761d0c9205e93e3f2f43a9",
+   "size": 1242483
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\pt-BR.pak.DATA",
+   "sha256": "875c8d9973c44016f8061b180a571b71aad6bea16af66645e7bf86c7d50467cf",
+   "size": 1151359
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\pt-PT.pak.DATA",
+   "sha256": "1a787f3d1d509ff009ff8312253974760cfa48d04aea84494c1ca37c0263c52c",
+   "size": 1184681
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\qu.pak.DATA",
+   "sha256": "5f17fbbb4340d921439e7181ce1f6e204074947a2875f70e4451a3556d2febe3",
+   "size": 1186548
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ro.pak.DATA",
+   "sha256": "1746e398487d4fea3efb9d3eeacb7f998157c478e9205c88ea3fe5fa392ca4a1",
+   "size": 1198581
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ru.pak.DATA",
+   "sha256": "4e5695e5a274f8d2d6a6298a19ddbec3592758d342e136f7f8510c869e7c6583",
+   "size": 1879188
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\sk.pak.DATA",
+   "sha256": "72a1ce646d0da76f7a3508e27682f50b368cd91727cce1df3801ce0332214099",
+   "size": 1217624
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\sl.pak.DATA",
+   "sha256": "f21f8c6fcd32e8ca31bb417241c3af7980e97861d1f26d4c728e513b35ae662e",
+   "size": 1156434
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\sq.pak.DATA",
+   "sha256": "06de1a9046f396fe09c1f2eb8bdce9074b89e3601526ca99e73e7fb13a5e912f",
+   "size": 1173796
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\sr-Cyrl-BA.pak.DATA",
+   "sha256": "0af137ddbfb302ba9c4c17d06d1a5239c30bbc24b937662e804cbd18c563e95c",
+   "size": 1774695
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\sr-Latn-RS.pak.DATA",
+   "sha256": "0af5d64889fbd0ecf8bffc0b7b1cd09efa46da4beedb0d88541433d066cae15c",
+   "size": 1149047
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\sr.pak.DATA",
+   "sha256": "70cda022653d817023fc3341fbea84c20ce40f7c128ed53ecd05e4e975a3e669",
+   "size": 1792726
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\sv.pak.DATA",
+   "sha256": "18806a741e9bfceea85b5499bb5dd03e0a922f5a4d247682f67ccae457162fc2",
+   "size": 1073056
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ta.pak.DATA",
+   "sha256": "a6f6e4175b028018c11bc986c5222735f753b9fbb490e627551f67dd8e6f7324",
+   "size": 2775922
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\te.pak.DATA",
+   "sha256": "dc39f22ec49e64bf57b59937d6a7da14d9c27d3d41385b2d69b9c865b43c1281",
+   "size": 2510149
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\th.pak.DATA",
+   "sha256": "575674f9070e5b087e493b53bf042162a8bf164df3b61680b3c08afe4f706d03",
+   "size": 2195392
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\tr.pak.DATA",
+   "sha256": "16b7a8fbbeb336b7f1b973b6ab259a50911e13ff77676920fe0fa75ea99102af",
+   "size": 1149255
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\tt.pak.DATA",
+   "sha256": "4fe7cc55ff93d9fcc0be3dabc31a048984979af9714881a95415ea30379463d2",
+   "size": 1804778
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ug.pak.DATA",
+   "sha256": "9e05bf8b36d1fb39943076bf84222193ef69bc40e2d55cb1b3b097072c1f98b8",
+   "size": 1747252
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\uk.pak.DATA",
+   "sha256": "46c73b75e2ef5c255e3e3c6c51972f720ae4d48b3befa26f6baebd3692a1743c",
+   "size": 1845105
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\ur.pak.DATA",
+   "sha256": "76db12220468818bb27f45d4e26ce6a0c503d5a853643a1d080b65e5684caf2a",
+   "size": 1676790
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\vi.pak.DATA",
+   "sha256": "f0dce081e9259d8779e7f3f3310b3f7016d91a3b2b47abce7e29937b216bf3da",
+   "size": 1312172
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\zh-CN.pak.DATA",
+   "sha256": "cad80f5ba53f32690b7ebbe4857b8c125f1b19bdbebd30496852e8475eb90e9e",
+   "size": 918085
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Locales\\zh-TW.pak.DATA",
+   "sha256": "b421b90fc8e5a676016507600b3383328bd148e9c6b936c982b1c74ad2fd1cd2",
+   "size": 949069
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\MEIPreload\\manifest.json.DATA",
+   "sha256": "44844cf3dde6e80087ae0e6bf0d9326d7ef7d23326d24ac83af0850be26923d2",
+   "size": 238
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\MEIPreload\\preloaded_data.pb.DATA",
+   "sha256": "c6070a157b4e28d16fbccbd233e93846ddb070c85e1a1bc64469b7a5f1424fad",
+   "size": 8254
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Mu\\Advertising.DATA",
+   "sha256": "231be4e0be45f588b161634c816b9a5a49f530c0dcb55461d37715a94482dca1",
+   "size": 19889
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Mu\\Analytics.DATA",
+   "sha256": "bba2063d20d70f4ab06dc2ae04c2564cc2b8c631b6dab68248957dbdf107fdd2",
+   "size": 4036
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Mu\\CompatExceptions.DATA",
+   "sha256": "5b462316a51c918d0bae95959bf827cb9c72bbd84ffb0e43b750aa91fbf3ba53",
+   "size": 689
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Mu\\Content.DATA",
+   "sha256": "9a63f38e22b8573cbd47a4ef7b67ccb0934b87239e075c5cfafc7a1014e340c6",
+   "size": 4486
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Mu\\Cryptomining.DATA",
+   "sha256": "bdee796bf07922c152d770cd5928955f1b12c12515c4db6fc0ab8d2ad0c44c4e",
+   "size": 552
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Mu\\Entities.DATA",
+   "sha256": "f6e93c83d9e3cfdff064535647cee76fc85aa1c86fd22a93dcf3d2c377346d94",
+   "size": 69999
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Mu\\Fingerprinting.DATA",
+   "sha256": "05b29240a28bb75b4535d558edc510eb92df0ac27e9502498b99cdbc576b8298",
+   "size": 1113
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Mu\\LICENSE.DATA",
+   "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+   "size": 35147
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Mu\\Other.DATA",
+   "sha256": "2b4a47b82cbe70e34407c7df126a24007aff8b45d5716db384d27cc1f3b30707",
+   "size": 34
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Mu\\Social.DATA",
+   "sha256": "4955c3e7f56641a4ae0ce9c79b4ceee4b21733b0f6dedc980bf8d822a792eba2",
+   "size": 754
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Mu\\TransparentAdvertisers.DATA",
+   "sha256": "d2cd0bef5f45daf490c53e705d6f67dfe12390c72a00efa6f5117432bd8edb8c",
+   "size": 105
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Sigma\\Advertising.DATA",
+   "sha256": "5c62ee354070033dba1bad40dcde115a81db45943b2274fae7059a5aa5c61d33",
+   "size": 21511
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Sigma\\Analytics.DATA",
+   "sha256": "d303be86132f8d7131941d41736694c2e29647ebaeccb38c0976fe66616ec8af",
+   "size": 3349
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Sigma\\Content.DATA",
+   "sha256": "70c295600066e9d3feeacd6bfc735bbcac6243694e4259477822d3db252729e1",
+   "size": 5938
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Sigma\\Cryptomining.DATA",
+   "sha256": "696e930706b5d391eb8778f73b0627ffc2be7f6c9a3e7659170d9d37fc4a97b5",
+   "size": 32
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Sigma\\Entities.DATA",
+   "sha256": "a5409d2c6a8cbd9339a95a5e09fcaedd4546a49d47fc4ebeda2d8749cfc66987",
+   "size": 131834
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Sigma\\Fingerprinting.DATA",
+   "sha256": "5306139881e81eebffd97de016130fdbb04e3ae976d94ad7a74e5dee63fbafcd",
+   "size": 2307
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Sigma\\LICENSE.DATA",
+   "sha256": "44071e0fcffb9a9a32e8fa7010bb18dbc41afd0b176f81bf700b15b638a88a51",
+   "size": 66
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Sigma\\Other.DATA",
+   "sha256": "2b4a47b82cbe70e34407c7df126a24007aff8b45d5716db384d27cc1f3b30707",
+   "size": 34
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Sigma\\Social.DATA",
+   "sha256": "28ac79097cf67587a228fdfe4746a1a9b31dae94d5a63bb3fcaa82443d69e7af",
+   "size": 3434
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\Sigma\\Staging.DATA",
+   "sha256": "f90f4cb0976a046e93978971b58fba24bc93b0129e8612fdd0e5646a1bebed22",
+   "size": 1361
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\Trust Protection Lists\\manifest.json.DATA",
+   "sha256": "de864bf0ab8abacfba536d4e9764eca658f903bd2457f955e128c4ee181c7e58",
+   "size": 132
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square150x150Logo.scale-100.png.DATA",
+   "sha256": "3e1e8531b44780927616ba57ed049739b0688054cf79902f316d728121b30c20",
+   "size": 5679
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square150x150Logo.scale-125.png.DATA",
+   "sha256": "24dca41c8493f5489ede402fc1db1fba4cf352ce1c97b2f457d439e05f009aec",
+   "size": 9097
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square150x150Logo.scale-150.png.DATA",
+   "sha256": "de0b8248d74d0842f134759a42df2effbd09fda27329094771547b1911768906",
+   "size": 11516
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square150x150Logo.scale-200.png.DATA",
+   "sha256": "46d2a464c7a68e42dd2fd94786062097886b92ff774bfb3e81b2637c2a47fac9",
+   "size": 16451
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square150x150Logo.scale-400.png.DATA",
+   "sha256": "be286065381c7f3cf76d16b9edbe138fcfdf54121636d73e8b81ea61bda4c230",
+   "size": 51853
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square310x310Logo.scale-100.png.DATA",
+   "sha256": "216dd7f008b2db23c8b52154431cbafacffd5369922c6f770444a461468fc470",
+   "size": 13312
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square310x310Logo.scale-125.png.DATA",
+   "sha256": "e0a2a162d7af07f90a9c61390868b5b45b224b7efe217a9536ae983aa4558331",
+   "size": 21388
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square310x310Logo.scale-150.png.DATA",
+   "sha256": "19238e710039b72ca9a5c90aadf19f9b2ade248ff11fbb1da40eb00658cb417c",
+   "size": 25891
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square310x310Logo.scale-200.png.DATA",
+   "sha256": "20c8ef43c52f9b73ec06fa21dfdcf1c4f2eff383ba585cc9eb126509928ddcfb",
+   "size": 42326
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square310x310Logo.scale-400.png.DATA",
+   "sha256": "466c3da61c83b21a05a17936a51193ec4d3144e4a05807e11daeca808a25bbeb",
+   "size": 141040
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.scale-100.png.DATA",
+   "sha256": "1f89f703e128486a60ca278656237c9a2f0565cdedd47032668b769bea0161d9",
+   "size": 1729
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.scale-125.png.DATA",
+   "sha256": "9e45a0e43debaff3e0658dd14eacc60e20e58be33531107a5c9d5e13279873d4",
+   "size": 2119
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.scale-150.png.DATA",
+   "sha256": "bfca667f88a471d52df94892f94f13f99f4f843dad99861802d8096990e873e8",
+   "size": 2879
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.scale-200.png.DATA",
+   "sha256": "19524b0d0620625343d6d405215b53145e19ab65c87a6538505d899c3d0a52a2",
+   "size": 4393
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.scale-400.png.DATA",
+   "sha256": "8105a8f455ee67c4e0dbe36357213d8ad1c6ce9c3b8b83ef37514738a693a33c",
+   "size": 12215
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-16.png.DATA",
+   "sha256": "7178dd5bc48d6ff995828f3f2a7906065d793ce4970f85afc1e77b2790ae49d4",
+   "size": 712
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-16_altform-lightunplated.png.DATA",
+   "sha256": "7178dd5bc48d6ff995828f3f2a7906065d793ce4970f85afc1e77b2790ae49d4",
+   "size": 712
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-16_altform-unplated.png.DATA",
+   "sha256": "7178dd5bc48d6ff995828f3f2a7906065d793ce4970f85afc1e77b2790ae49d4",
+   "size": 712
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-24.png.DATA",
+   "sha256": "64f6457f930d6f430f8b3406e21975e3ad6fd02b6e3a3e87f89859482af44553",
+   "size": 1094
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-24_altform-lightunplated.png.DATA",
+   "sha256": "64f6457f930d6f430f8b3406e21975e3ad6fd02b6e3a3e87f89859482af44553",
+   "size": 1094
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-24_altform-unplated.png.DATA",
+   "sha256": "64f6457f930d6f430f8b3406e21975e3ad6fd02b6e3a3e87f89859482af44553",
+   "size": 1094
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-256.png.DATA",
+   "sha256": "f9d61c7401470e90dca42059ceab50cd0c205e3831d087e6208a333ee3f88191",
+   "size": 36011
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-256_altform-lightunplated.png.DATA",
+   "sha256": "f9d61c7401470e90dca42059ceab50cd0c205e3831d087e6208a333ee3f88191",
+   "size": 36011
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-256_altform-unplated.png.DATA",
+   "sha256": "f9d61c7401470e90dca42059ceab50cd0c205e3831d087e6208a333ee3f88191",
+   "size": 36011
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-32.png.DATA",
+   "sha256": "8fd64f98c8f3895a2937fd7ae858fa148f7d629c9099d058c4ad04079e6577e4",
+   "size": 1673
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-32_altform-lightunplated.png.DATA",
+   "sha256": "8fd64f98c8f3895a2937fd7ae858fa148f7d629c9099d058c4ad04079e6577e4",
+   "size": 1673
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-32_altform-unplated.png.DATA",
+   "sha256": "8fd64f98c8f3895a2937fd7ae858fa148f7d629c9099d058c4ad04079e6577e4",
+   "size": 1673
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-48.png.DATA",
+   "sha256": "b990991aa8214801f70c972eab9ac5bc51b86661e23dfe2ebb42dce717122570",
+   "size": 2737
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-48_altform-lightunplated.png.DATA",
+   "sha256": "b990991aa8214801f70c972eab9ac5bc51b86661e23dfe2ebb42dce717122570",
+   "size": 2737
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-48_altform-unplated.png.DATA",
+   "sha256": "b990991aa8214801f70c972eab9ac5bc51b86661e23dfe2ebb42dce717122570",
+   "size": 2737
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square71x71Logo.scale-100.png.DATA",
+   "sha256": "39bcefbfe5d46cb4dedfc36177c91aa5ca5cd42e05531e75c7a5f1355b870c35",
+   "size": 3769
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square71x71Logo.scale-125.png.DATA",
+   "sha256": "4ff1db37946cb4d34c11545aff788a39fdbbfd143dcbf8222f4ac99a10fbbba6",
+   "size": 6049
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square71x71Logo.scale-150.png.DATA",
+   "sha256": "614bd7e65dabd5f203e34f074f5c18c6dd42ff7073c40c0c2b72a9e69f6a04f8",
+   "size": 7594
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square71x71Logo.scale-200.png.DATA",
+   "sha256": "b2f760b68afc7bb7707ca22113a1d7d768f5d526e2ed9a312e1ae87706ef5802",
+   "size": 10936
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Square71x71Logo.scale-400.png.DATA",
+   "sha256": "0ce42ff7cb2160610c72406faf179ba97abafb1e3a41af0c72c53667500eff3f",
+   "size": 32337
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\StoreLogo.scale-100.png.DATA",
+   "sha256": "d8b68b8f2b711d6d0e6c70e3eefb9849b230eab09898ba2cc41f875147dc88e5",
+   "size": 1924
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\StoreLogo.scale-125.png.DATA",
+   "sha256": "89f442b13a396dca2e5dced1b163a97ec0135cacba3852d197ef059a42173048",
+   "size": 2870
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\StoreLogo.scale-150.png.DATA",
+   "sha256": "372d66f1f3f98b6bb73cd390ea536d264bfcac2013a8006d4ff120b0a9c4c6fd",
+   "size": 3581
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\StoreLogo.scale-200.png.DATA",
+   "sha256": "9b9227b3cad28d7588336fdaa347a7549a3287e956d05f1800cb1f5836292a0a",
+   "size": 4807
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\StoreLogo.scale-400.png.DATA",
+   "sha256": "8e1c8b92bf111e1031b04ace4bc7f445c5d99ee6ae9bd1a15254044276d10be2",
+   "size": 13726
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Wide310x150Logo.scale-100.png.DATA",
+   "sha256": "af9949879e4219aeacd0fab8508396eec04f92eba203831bc5ba0f656ad59d47",
+   "size": 5958
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Wide310x150Logo.scale-125.png.DATA",
+   "sha256": "4d5d40e86ffaf34ba6ae66a5f1e77aef14c191326d940d1da5073142d124b318",
+   "size": 9551
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Wide310x150Logo.scale-150.png.DATA",
+   "sha256": "fb163ab50c56a128e4134ab2ec7c1285d7f029a8840071f364af72837be0ea75",
+   "size": 12372
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Wide310x150Logo.scale-200.png.DATA",
+   "sha256": "96778a1c701d12fa2f008cb66cf25faeb22d6d2b6b8436b461a02d7869c530a4",
+   "size": 17896
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotAppStable\\Wide310x150Logo.scale-400.png.DATA",
+   "sha256": "da0549ed8ef2b50a129d306551b3f2a92635fe382b3dd1370ede55b01563cab2",
+   "size": 57790
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square150x150Logo.scale-100.png.DATA",
+   "sha256": "c47bac6254a1bfba81c4ee148996190d50dbe1d7e8852d4c15a15264be536932",
+   "size": 5959
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square150x150Logo.scale-125.png.DATA",
+   "sha256": "803ac015d066b56113372cbe6ced289408abaf6e4db8b394e9662917faa342f0",
+   "size": 8755
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square150x150Logo.scale-150.png.DATA",
+   "sha256": "444f1a53274b4056b6c2af899405169b6013d3b850ee244e17fcf3fa3e613be6",
+   "size": 12117
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square150x150Logo.scale-200.png.DATA",
+   "sha256": "9bf6222c685b307badb8652f15c98f69ceb667f358815322316a1cb9ea19ab70",
+   "size": 16994
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square150x150Logo.scale-400.png.DATA",
+   "sha256": "aba3aed7773b241d6afb5990f816abf41f470a1798d015e843f20a2c7f4ce697",
+   "size": 52538
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square310x310Logo.scale-100.png.DATA",
+   "sha256": "fa5f9a6131c990b77b14b78191f5a2cc2e1a895bc25d2938b4a0a1cbf673bd45",
+   "size": 13761
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square310x310Logo.scale-125.png.DATA",
+   "sha256": "e78953da3c55b2c236a1cc3d90c62e0d98ed15e3ac65adeefa400286bd42b7dc",
+   "size": 21317
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square310x310Logo.scale-150.png.DATA",
+   "sha256": "ca6938203e564469501c05f9d8ca8bf974151c300aa2e435b8724638e4c3ff99",
+   "size": 26515
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square310x310Logo.scale-200.png.DATA",
+   "sha256": "770d0ae1859f7fe2416aac9e2334f9463d3e6872b798b6a9b75acf7118559c98",
+   "size": 42558
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square310x310Logo.scale-400.png.DATA",
+   "sha256": "d1f3cee65852cf462ed497e031063655f7e772bc19e3f7b2a2ea7060ebb8b5d1",
+   "size": 138820
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.scale-100.png.DATA",
+   "sha256": "08d903ae8340ddfeb6a021165b98aa22934c8af88284e024fbdc929ae81adff9",
+   "size": 1666
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.scale-125.png.DATA",
+   "sha256": "70b13c68a18b67a7c90ff9170d8d22c88a1d869bb617ebe37fefac3f7dc2cadd",
+   "size": 2264
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.scale-150.png.DATA",
+   "sha256": "b9e9c91121bc1fea270de92a65a0775bbf1f2dfd082a06d5913234f83c9764f6",
+   "size": 2972
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.scale-200.png.DATA",
+   "sha256": "8562b604ae1fa2f28b294233892007036cfa2cfdcee893dbbc4680372f566f97",
+   "size": 4320
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.scale-400.png.DATA",
+   "sha256": "20eb0f54833a93cc7cb018db080fa607dd9ccdd9142e4e183343b07c3e4a12d5",
+   "size": 11841
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-16.png.DATA",
+   "sha256": "d4c83595780905a7a802103e51890b5943d27dd6ddf39b585571ab99db3bb448",
+   "size": 676
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-16_altform-lightunplated.png.DATA",
+   "sha256": "6bd79374381bf669360e2c852b2f5cf4680d972c30eff7f861d1959f2c48c2ee",
+   "size": 694
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-16_altform-unplated.png.DATA",
+   "sha256": "d4c83595780905a7a802103e51890b5943d27dd6ddf39b585571ab99db3bb448",
+   "size": 676
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-24.png.DATA",
+   "sha256": "75cc3b4fa4a6df9e814aed8604185044cabf5672fefbba78abc9040c72e8f23b",
+   "size": 1158
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-24_altform-lightunplated.png.DATA",
+   "sha256": "9d0f3e54761f32ed4f059159a191f4237435eeb5f3f03079b1888fa734e5e23f",
+   "size": 1191
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-24_altform-unplated.png.DATA",
+   "sha256": "75cc3b4fa4a6df9e814aed8604185044cabf5672fefbba78abc9040c72e8f23b",
+   "size": 1158
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-256.png.DATA",
+   "sha256": "39f15d2cf5c8890dc30ffe124c6087255c1574911671ba58ea01da34166960ef",
+   "size": 33527
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-256_altform-lightunplated.png.DATA",
+   "sha256": "3cdc34a70bb08eaded4060ba1ce9e4cfa73757bba21ac9820dd8b3e700d1b204",
+   "size": 36221
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-256_altform-unplated.png.DATA",
+   "sha256": "39f15d2cf5c8890dc30ffe124c6087255c1574911671ba58ea01da34166960ef",
+   "size": 33527
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-32.png.DATA",
+   "sha256": "730a6b7e4b84888b7516f3dbe556537e40a70e863e5a415c3684219d10843225",
+   "size": 1611
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-32_altform-lightunplated.png.DATA",
+   "sha256": "501d1e99a8e938dfbc73b51198061181f9703faf4e5c8b565f57edf379851303",
+   "size": 1685
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-32_altform-unplated.png.DATA",
+   "sha256": "730a6b7e4b84888b7516f3dbe556537e40a70e863e5a415c3684219d10843225",
+   "size": 1611
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-48.png.DATA",
+   "sha256": "37f6102ec9df23e3986a290f9f115303132b7802f928a7f8ec6ec9e0f4f7293d",
+   "size": 2833
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-48_altform-lightunplated.png.DATA",
+   "sha256": "2b5a2a018feb24cc73e451cb9d84680e3f15493e0c3e8475cc1f2c613fac842c",
+   "size": 3022
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-48_altform-unplated.png.DATA",
+   "sha256": "37f6102ec9df23e3986a290f9f115303132b7802f928a7f8ec6ec9e0f4f7293d",
+   "size": 2833
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square71x71Logo.scale-100.png.DATA",
+   "sha256": "ecaab46aa6b66cdb4d3b5039c963ac3dd183c5bd24dda44bc818abadf2757a4d",
+   "size": 4147
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square71x71Logo.scale-125.png.DATA",
+   "sha256": "ecc7817c43fe29c39b6240fdcc842b6f455d54f4b9271b04bdfc426abe980a99",
+   "size": 6172
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square71x71Logo.scale-150.png.DATA",
+   "sha256": "39c3bb03fdf0a67ad52c403b757d56834dc6dd383f894be5b88efae1ad1ec604",
+   "size": 7758
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square71x71Logo.scale-200.png.DATA",
+   "sha256": "7a1258f62a217c872daa8433c7a5605bdba7d991270d338780641aad2456ad71",
+   "size": 11788
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Square71x71Logo.scale-400.png.DATA",
+   "sha256": "73aac844e1168bb5ca688de8a99e8ba637ae1bfa24183689b4c7756aafb0f245",
+   "size": 34198
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\StoreLogo.scale-100.png.DATA",
+   "sha256": "91f2bc06ac2aadb4c1aa858d55b1cae5914b92b16df9db2b0ec730b5ddd82bd7",
+   "size": 2061
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\StoreLogo.scale-125.png.DATA",
+   "sha256": "43ba6a64ad6fcd8fabf356f61844f731d62ac8cfd13f8685e01e9da5edece12b",
+   "size": 2941
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\StoreLogo.scale-150.png.DATA",
+   "sha256": "887f65825e2ea1d1b752a0bcbb941628a46b6721815a906852fb533c30d606a7",
+   "size": 3608
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\StoreLogo.scale-200.png.DATA",
+   "sha256": "f6bdf46def2efcc0895deae0e67a217cd05a24cdadefd0c4cd5ef4d8c46f2a02",
+   "size": 5141
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\StoreLogo.scale-400.png.DATA",
+   "sha256": "b63f98724bc1e380f2f4d76a5a7b167a2df285fdc49f151e36011e2ac485c2ee",
+   "size": 14499
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Wide310x150Logo.scale-100.png.DATA",
+   "sha256": "2dc22368cd31e0e4405e95de122e6a4d3757cc54e87ec981e5975f1ed7129b0a",
+   "size": 6215
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Wide310x150Logo.scale-125.png.DATA",
+   "sha256": "0b70c28419c41f2097659fcdd9766918337813d43f74ea280e223f4e193d078c",
+   "size": 9400
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Wide310x150Logo.scale-150.png.DATA",
+   "sha256": "b404219aca8d899a658247f5c355030217673fa1f24c8b1d735af81c790b79fc",
+   "size": 12960
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Wide310x150Logo.scale-200.png.DATA",
+   "sha256": "09818bd6f958fe66255b78d94fcbeda453d95a8593b7befd9cf72eee67475f17",
+   "size": 18432
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotDev\\Wide310x150Logo.scale-400.png.DATA",
+   "sha256": "3e62242d121fbfd45f13c9a89c115e5a8f5f547eda88394dc536c0f43d3cf230",
+   "size": 59010
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square150x150Logo.scale-100.png.DATA",
+   "sha256": "dfd4c03450db10284801be677afd8124ff78ca84605bd00c527b008e472abd97",
+   "size": 3332
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square150x150Logo.scale-125.png.DATA",
+   "sha256": "5fb6f0a532bbb0e6bc6853324c203fabcdfa7347bd0497c7ad725b81aab6513f",
+   "size": 4364
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square150x150Logo.scale-150.png.DATA",
+   "sha256": "9e9229cbb0b7e17bf689f2171bdb2046367867ae083991ca7eed306c61629ec7",
+   "size": 5690
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square150x150Logo.scale-200.png.DATA",
+   "sha256": "584afa296caff0c21eb276e5fc001f95c12db5c5edcf01a3e6df5fa1d4f6a68c",
+   "size": 8255
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square150x150Logo.scale-400.png.DATA",
+   "sha256": "b314b8f57783772973d5ecd23fa73871a987f34ce417cf81467a30327390e84a",
+   "size": 21941
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square310x310Logo.scale-100.png.DATA",
+   "sha256": "5b174f22a2f1de898a07b68852dadbc13c20f366271839a98a0f3b9669cfc926",
+   "size": 8500
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square310x310Logo.scale-125.png.DATA",
+   "sha256": "5302514b2ce7575cc9cd6493b550489ed47bd791a55ae3b860dd13af05163348",
+   "size": 11809
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square310x310Logo.scale-150.png.DATA",
+   "sha256": "6f49b090e1a529aa77a3791da20dcd812f21eba3676573354169f98fdfd82414",
+   "size": 15054
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square310x310Logo.scale-200.png.DATA",
+   "sha256": "417c9c3430433c4258ec6f8e8e2bdb805907fa432b735c081cdd90c98f842663",
+   "size": 23015
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square310x310Logo.scale-400.png.DATA",
+   "sha256": "2f7a260eb90e460544d4f19cfd07d37311804c8dc196a794bbf0b724d9200fbe",
+   "size": 67290
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.scale-100.png.DATA",
+   "sha256": "622da209a7d65d1ca1bcbe7cd30530394a08ede7ad5d5c216880f1bd4e16cec7",
+   "size": 1854
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.scale-125.png.DATA",
+   "sha256": "319872a38d59fe8ed44fee0f0f1f3563fc346bca6541cbe887bc187f6aa039e3",
+   "size": 2526
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.scale-150.png.DATA",
+   "sha256": "e2674d714196905d3dbd17f2d7ca959c85ed3cd96ce109a6346a9a50fdeb23d9",
+   "size": 3214
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.scale-200.png.DATA",
+   "sha256": "e2c82b79b4a0eff6f68e0c735efd914b45aa217c7e7577dd799e010852c6a65b",
+   "size": 4530
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.scale-400.png.DATA",
+   "sha256": "654b8a18e9babbfb9cd165fae3c78e09ea5ee339670a772ae56ed430ffb772d7",
+   "size": 11211
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-16.png.DATA",
+   "sha256": "e350f572722e0283882cc0b025a017e0d2af86f27f7bc4aa0d43a947f7f34b9f",
+   "size": 733
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-16_altform-lightunplated.png.DATA",
+   "sha256": "e350f572722e0283882cc0b025a017e0d2af86f27f7bc4aa0d43a947f7f34b9f",
+   "size": 733
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-16_altform-unplated.png.DATA",
+   "sha256": "765fd8cc48b6a4b1555241bf891b268761d157a16677c66f22a3b870dffb2c80",
+   "size": 693
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-24.png.DATA",
+   "sha256": "99b7b5b3c4e65cd3698b84f63843b46c3fed43890acedacb0a8a1216c780de0c",
+   "size": 1242
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-24_altform-lightunplated.png.DATA",
+   "sha256": "99b7b5b3c4e65cd3698b84f63843b46c3fed43890acedacb0a8a1216c780de0c",
+   "size": 1242
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-24_altform-unplated.png.DATA",
+   "sha256": "2d1afaa893144238ed0ba9029d790aca78ee6be545ec3abfce16ebcaf9b3ad42",
+   "size": 1069
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-256.png.DATA",
+   "sha256": "0c9d897605c2d7f3d8651af5da42f4cddcafeb5e3723e70ce8be43fad23ac938",
+   "size": 18522
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-256_altform-lightunplated.png.DATA",
+   "sha256": "82f48acd1a1f01068015f1cbbbff6e824680654865cef25d51f1b93172c00a7d",
+   "size": 26968
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-256_altform-unplated.png.DATA",
+   "sha256": "0c9d897605c2d7f3d8651af5da42f4cddcafeb5e3723e70ce8be43fad23ac938",
+   "size": 18522
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-32.png.DATA",
+   "sha256": "587931975cfa3e99eb58c0eb9dda54426570a168fe1069f947cf28b0bce9d01d",
+   "size": 1815
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-32_altform-lightunplated.png.DATA",
+   "sha256": "587931975cfa3e99eb58c0eb9dda54426570a168fe1069f947cf28b0bce9d01d",
+   "size": 1815
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-32_altform-unplated.png.DATA",
+   "sha256": "e4002fa6646b95ee9b10a8007643afdd1c3cd25b1ebe63a82a5c9223be6040f4",
+   "size": 1567
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-48.png.DATA",
+   "sha256": "0cc26eeb19dff61cf0c5b28d10d89eaa771b1596a95d3a469a79262fad7c283c",
+   "size": 2999
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-48_altform-lightunplated.png.DATA",
+   "sha256": "0cc26eeb19dff61cf0c5b28d10d89eaa771b1596a95d3a469a79262fad7c283c",
+   "size": 2999
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-48_altform-unplated.png.DATA",
+   "sha256": "fc0d83820988419f8e6e952fff4e48b5641b5398af639829456d5b0af2d99ce0",
+   "size": 2739
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square71x71Logo.scale-100.png.DATA",
+   "sha256": "eb9fb4ba49edfb0559ea7166eefb92ee2225abce94f7fdba00568b1c407ca01c",
+   "size": 2111
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square71x71Logo.scale-125.png.DATA",
+   "sha256": "25ad779810d29bd6b4c7b21ec15a252274576ba716b82189c476689100ba1e86",
+   "size": 2811
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square71x71Logo.scale-150.png.DATA",
+   "sha256": "c8c1a3b483f2b0ba57a3e6aff7ee52ff242910904191f44019b480e592c336ac",
+   "size": 3474
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square71x71Logo.scale-200.png.DATA",
+   "sha256": "f72572d70b0cea3840083908bc650351d220e5cb03a7927841dfa2d96a2a97d9",
+   "size": 5001
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Square71x71Logo.scale-400.png.DATA",
+   "sha256": "1ea542ef282247fce202b78eab5d9aa8b3d9da45186a4e2d7f55e9eff2643064",
+   "size": 12960
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\StoreLogo.scale-100.png.DATA",
+   "sha256": "1183fb06941b6bc0e9c39bd104747c4856698fe4fed92f1f0d650551bccf7e13",
+   "size": 3125
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\StoreLogo.scale-125.png.DATA",
+   "sha256": "d3bf18a9679edddb80c36eb99a157e8dc96491554f80d74573560090009e4163",
+   "size": 4198
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\StoreLogo.scale-150.png.DATA",
+   "sha256": "8b2f72912f932be07dc8f45bd9e13b1c8eaf0a7fa6ecbc9af344d61b1f7d0701",
+   "size": 5285
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\StoreLogo.scale-200.png.DATA",
+   "sha256": "6838afa2acf4c942c34b53a6abc752d53f136d519dbc3cb73813b9c6f8092cf4",
+   "size": 7520
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\StoreLogo.scale-400.png.DATA",
+   "sha256": "cf7108ee6a3520ac4562aff7c337787804f9794aaa31ef694de31aa9c019ef70",
+   "size": 19029
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Wide310x150Logo.scale-100.png.DATA",
+   "sha256": "419a4851e4011a2b3ad6bc8f489c0d82af9ec619832dd2c1e81a9febf6c4c21e",
+   "size": 3534
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Wide310x150Logo.scale-125.png.DATA",
+   "sha256": "a27e88c0fa96c7a6344e65cd72b9764e9a9278b2944b69a000e073c7f0943335",
+   "size": 4649
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Wide310x150Logo.scale-150.png.DATA",
+   "sha256": "0738922ba4f22b6ce38097d2645055ec40fc89d1ee31cb0b9a33728efd7badc6",
+   "size": 6113
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Wide310x150Logo.scale-200.png.DATA",
+   "sha256": "24cfa266b8c42244c590aeb01f9ccabfbc02cf2cbcb7a7f96e4fdb097aba03f9",
+   "size": 8972
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\CopilotStable\\Wide310x150Logo.scale-400.png.DATA",
+   "sha256": "1a9f83fa021f98046e2793c6bcadd8ce58606b80146a3911782fc058f1db5d7d",
+   "size": 24709
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\Logo.png.DATA",
+   "sha256": "4eaf8c7a247db0985bb8c0412c00c9cdda927f27b5c333f855f0b4f5043fd120",
+   "size": 29175
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\LogoBeta.png.DATA",
+   "sha256": "d2c06cae33602d7a49c718f5e079f9c0abdeab899d26c4c1ff7f0fbeb37ecf30",
+   "size": 27112
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\LogoCanary.png.DATA",
+   "sha256": "86b786370f51a6cec29b7cc6092a56274a60bbaf361391e1844263b09c7012c7",
+   "size": 27333
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\LogoCopilot.png.DATA",
+   "sha256": "b314b8f57783772973d5ecd23fa73871a987f34ce417cf81467a30327390e84a",
+   "size": 21941
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\LogoCopilotApp.png.DATA",
+   "sha256": "be286065381c7f3cf76d16b9edbe138fcfdf54121636d73e8b81ea61bda4c230",
+   "size": 51853
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\LogoCopilotDev.png.DATA",
+   "sha256": "aba3aed7773b241d6afb5990f816abf41f470a1798d015e843f20a2c7f4ce697",
+   "size": 52538
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\LogoDev.png.DATA",
+   "sha256": "cc5674d80cb4484f16c03b273662b732c4465d34cdd5038990983601589456d6",
+   "size": 27104
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\ResearcherOn.png.DATA",
+   "sha256": "af406717e7ae9f3b33da27fd9572ddfd193818a3d6f729bd0319c6818fe11f04",
+   "size": 7057
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\SmallLogo.png.DATA",
+   "sha256": "b228b0337b1a34287b92d8bc3df91ba817a358d07ffc610e452244873b0b317c",
+   "size": 14830
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\SmallLogoBeta.png.DATA",
+   "sha256": "9d1a28640320bd4560a3f43127be8df02e5c4a0a18da725db359ab8b262a3bee",
+   "size": 14316
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\SmallLogoCanary.png.DATA",
+   "sha256": "d9c92117542208cc96b91f78deef5c1f44369e2fd4a8bfde80a83cb2c7c7d6bc",
+   "size": 13874
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\SmallLogoCopilot.png.DATA",
+   "sha256": "654b8a18e9babbfb9cd165fae3c78e09ea5ee339670a772ae56ed430ffb772d7",
+   "size": 11211
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\SmallLogoCopilotApp.png.DATA",
+   "sha256": "8105a8f455ee67c4e0dbe36357213d8ad1c6ce9c3b8b83ef37514738a693a33c",
+   "size": 12215
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\SmallLogoCopilotDev.png.DATA",
+   "sha256": "20eb0f54833a93cc7cb018db080fa607dd9ccdd9142e4e183343b07c3e4a12d5",
+   "size": 11841
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\SmallLogoDev.png.DATA",
+   "sha256": "38069508ca742cf17efe8dd8ba5ac5686ebcf7b8387ad9ea48b4d006e857380e",
+   "size": 13783
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\resources.dev.pri.DATA",
+   "sha256": "2f38fd92ce7af301490481e42eec2dac76ff46bc450b8a3ef0e6839b8d81bc20",
+   "size": 79368
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\resources.internal.pri.DATA",
+   "sha256": "629a2bfbb123b06b7950454069c4dd23569aa279351e34fa18285e56a5baa065",
+   "size": 79384
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\resources.officehub.dev.pri.DATA",
+   "sha256": "bed8fcb733b93fcf58151da68d676498bba64a4d268a734442dad5eaa9d00c8b",
+   "size": 79408
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\resources.officehub.internal.pri.DATA",
+   "sha256": "0355e331ac51ea9b84b51953a990d7ba8a591981b6dae0437d5fd685f8ff64df",
+   "size": 79432
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\resources.officehub.pri.DATA",
+   "sha256": "4184810aa8ce32c54ce658e8a01ef2ee3581818a926cc4b6b54f4c844672cc71",
+   "size": 79392
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\resources.pri.DATA",
+   "sha256": "074327df71135fc55d9589eacdfd0a55571e217d0cdd1d9ef9ed0d3987f2300a",
+   "size": 79352
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\vision.contrast-black.svg.DATA",
+   "sha256": "d0e67f345be87b0b594769487c2058783dc64be0ce486ee4ce2b0d982eaa388b",
+   "size": 1697
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\vision.contrast-white.svg.DATA",
+   "sha256": "4574b3b61dcbfe4b9910ef218ce308c363a6d4a5629e47384b34b36d2d4b1758",
+   "size": 1697
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\vision.svg.DATA",
+   "sha256": "2643fc75bcc01ab8df55ca53690d3b3b6f0c3f734747055c0deb4dfdc1f9e790",
+   "size": 1702
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\vision.theme-dark.svg.DATA",
+   "sha256": "d0e67f345be87b0b594769487c2058783dc64be0ce486ee4ce2b0d982eaa388b",
+   "size": 1697
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\vision.theme-light.svg.DATA",
+   "sha256": "2643fc75bcc01ab8df55ca53690d3b3b6f0c3f734747055c0deb4dfdc1f9e790",
+   "size": 1702
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\voice.contrast-black.svg.DATA",
+   "sha256": "6682eabc1213a4a061acfa0eb120f28a858ed5d781d4eea0e0002da0cd8f4a4a",
+   "size": 1155
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\voice.contrast-white.svg.DATA",
+   "sha256": "b53e2ffcc3b495c639255961d4e250591e33d71e17b60346b3fce281f2f77c55",
+   "size": 1155
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\voice.svg.DATA",
+   "sha256": "3bce7881de3bb31c51c4632c5a663069f634f3012979fca3fdf1ce47f940fdfe",
+   "size": 1160
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\voice.theme-dark.svg.DATA",
+   "sha256": "6682eabc1213a4a061acfa0eb120f28a858ed5d781d4eea0e0002da0cd8f4a4a",
+   "size": 1155
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\VisualElements\\voice.theme-light.svg.DATA",
+   "sha256": "3bce7881de3bb31c51c4632c5a663069f634f3012979fca3fdf1ce47f940fdfe",
+   "size": 1160
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\WidevineCdm\\LICENSE.DATA",
+   "sha256": "20de375707692099b3132084695377ce5fec0aec05813dedcce094b8eda44386",
+   "size": 473
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\WidevineCdm\\_platform_specific\\win_x64\\widevinecdm.dll.sig.DATA",
+   "sha256": "35c4755a8127d34b4ca271934c928fa0e5537974dd31628edb947636a169dafa",
+   "size": 1389
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\WidevineCdm\\manifest.json.DATA",
+   "sha256": "dca3cd7a673d0776a085c0b8958a85bdd8392923db21a0b55f4d37210f752322",
+   "size": 1002
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\copilot_overlay_images_100_percent.pak.DATA",
+   "sha256": "3f201f2f03aa37efe782ac8dfaf562d270afcd4bd7f22fcc0c18c0bcaa3790f3",
+   "size": 8684
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\copilot_overlay_images_200_percent.pak.DATA",
+   "sha256": "fcd36cc1d28982cbadcf6e816568b5a1134e9dbaa3ada9b18c23bd34db69d819",
+   "size": 23614
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\copilot_overlay_unscaled_images.pak.DATA",
+   "sha256": "56ee1d4392cfd1e16fd3fe3ee64ba0e4cae268c7e3d54eb0ff82b9ad1f908523",
+   "size": 38789
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\edge_feedback\\camera_mf_trace.wprp.DATA",
+   "sha256": "3f2eb6455f54365c27829f85dd64ca0bafaa8577a6c8e79a54a6dd4c67df6470",
+   "size": 24910
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\edge_feedback\\mf_trace.wprp.DATA",
+   "sha256": "79a228f8f85310c27c292055d9e0e9b827c319c2472b4ba5b40e88851bc4b4f3",
+   "size": 12735
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\edge_game_assist\\EdgeGameAssist.msix.DATA",
+   "sha256": "09cc15820436b7192bad340b9a202f0e30c295dcf8b642cd691b3eb790aceda6",
+   "size": 1019266
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\edge_game_assist\\VERSION.DATA",
+   "sha256": "01ead2a790d96684b49de8a573713763e33ae2798f07b479f4fde1e26b303d7a",
+   "size": 10
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\icudtl.dat.DATA",
+   "sha256": "8fa69fc9ebcce09fa8ffac89afcf8088e8f70a177fa90d80a90668f5389f2579",
+   "size": 12409424
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\resources.pri.DATA",
+   "sha256": "e689383d49a50dd886a43b6921e586f0c15007f8296213d3c0fcf00b220483e8",
+   "size": 3744
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\copilot.identity_helper.Sparse.Dev.msixbundle.DATA",
+   "sha256": "0656f5c13b48e92cdf41887a97def75c5ef0803aa61e1124a6e8a1c04d62694b",
+   "size": 19706
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\copilot.identity_helper.Sparse.Dev.p7x.DATA",
+   "sha256": "603912098878b6aa579029fad6429b33e58cac1cc667296703a598a040881613",
+   "size": 10226
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\copilot.identity_helper.Sparse.Internal.msixbundle.DATA",
+   "sha256": "86131080d06c630f209ecd4a785d3d820e6639484ed1305adc50d9cb654742bb",
+   "size": 19725
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\copilot.identity_helper.Sparse.Internal.p7x.DATA",
+   "sha256": "ea03475bbe3ffb2a8304bf8b333f53eab4c9654d9551f55d67975ccf706358c2",
+   "size": 10226
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\copilot.identity_helper.Sparse.Stable.msixbundle.DATA",
+   "sha256": "cb7e7d5b599e9c78565ac4bd2d9415627dc1325a9711caa44aedc96e67100e63",
+   "size": 19658
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\copilot.identity_helper.Sparse.Stable.p7x.DATA",
+   "sha256": "423ae78124708aeef0da1e43fc676670736e4a03280efaabf7e60069a0d824f5",
+   "size": 10226
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\identity_helper.Sparse.Beta.msix.DATA",
+   "sha256": "c7106a56bd3aebc2cbfb213594f144ed66828fe491451336b153271e2b1dc167",
+   "size": 51391
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\identity_helper.Sparse.Beta.p7x.DATA",
+   "sha256": "61b6a25c862462d69c218101d51bfa56fff875f23f353be0a3eda989599f2cd5",
+   "size": 10497
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\identity_helper.Sparse.Canary.msix.DATA",
+   "sha256": "6dbc96be6a5b0748622d8b13e11c4ac169ccb89854b5ff9b7f88c80a165266b7",
+   "size": 51177
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\identity_helper.Sparse.Canary.p7x.DATA",
+   "sha256": "0e80ce00ad3db6b95ca10827f76b98dc6d8a83145d468de813092308043a0ddc",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\identity_helper.Sparse.Dev.msix.DATA",
+   "sha256": "3698cc61f7d3a6a63ba284dd8f4e19cf4d79ad1185acf6696efc1b47cb860ba6",
+   "size": 50836
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\identity_helper.Sparse.Dev.p7x.DATA",
+   "sha256": "003c0e7ca7248166bd19f487691c019e6a16ceeb13660a31e78fa2bf3f7a4437",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\identity_helper.Sparse.Internal.msix.DATA",
+   "sha256": "a2ed37424341610e039906d2a01d96aac4df44173e9454b62940fcbd178dcef5",
+   "size": 53941
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\identity_helper.Sparse.Internal.p7x.DATA",
+   "sha256": "568447c21dabdbd3d3f6505a370897d263ab6d91a8a151fa4a4ea2605aec5264",
+   "size": 10493
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\identity_helper.Sparse.Stable.msix.DATA",
+   "sha256": "099d34e8bc0fe6fd0bc5828315474b90d24afc672ccfe59d4ed98e8b32ba6cb6",
+   "size": 53942
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\identity_helper.Sparse.Stable.p7x.DATA",
+   "sha256": "5fd0d27b69af4b0221220b19a4b3ab1d2e5a3c3f6a55ea45db50f1fdd2cea45f",
+   "size": 10497
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\officehub.identity_helper.Sparse.Dev.msixbundle.DATA",
+   "sha256": "612488441904b39cb037ff0d00785e88f39751b394660b7c60608c75266985e0",
+   "size": 54491
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\officehub.identity_helper.Sparse.Dev.p7x.DATA",
+   "sha256": "b9b3f277687f1d0688edd7ba162ec1233cb8bb75b656db040f586871250d4e8f",
+   "size": 10497
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\officehub.identity_helper.Sparse.Internal.msixbundle.DATA",
+   "sha256": "f40b2e8b9e5bca3936440ced14f2a3b250b13fafbb1f2c794dfdeb039eda1906",
+   "size": 54515
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\officehub.identity_helper.Sparse.Internal.p7x.DATA",
+   "sha256": "fb13535de80f6a0085f7d22760d660eed9dbf858656b5bee074f08cc4d62fc88",
+   "size": 10497
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\officehub.identity_helper.Sparse.Stable.msixbundle.DATA",
+   "sha256": "af696f5a80545db9de023593aceaf378bf6de2ef416447104d067f8483791cb2",
+   "size": 54518
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win10\\officehub.identity_helper.Sparse.Stable.p7x.DATA",
+   "sha256": "94f7e5849aa2bb8cbb09f7f8e868a5df2a5093df02d75f2b668008612c078c31",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\copilot.identity_helper.Sparse.Dev.msixbundle.DATA",
+   "sha256": "44886fa341a62c470d2b7d1aab89fa8ea4afba6cac9bcaef43c02ebc84e0ef3f",
+   "size": 21082
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\copilot.identity_helper.Sparse.Dev.p7x.DATA",
+   "sha256": "a19ab8a4dc897ee7c4ba45817dcc7c2f549d48b5521fc803caa242d82e00dd00",
+   "size": 10226
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\copilot.identity_helper.Sparse.Internal.msixbundle.DATA",
+   "sha256": "5231fc131db6d39b70fd45a5b734ed3a5915519c347a6d1a366d3d55427c66f9",
+   "size": 21098
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\copilot.identity_helper.Sparse.Internal.p7x.DATA",
+   "sha256": "2c0eb01ad4da1629d91d88ab775c4323e0c065097a0b7f92bc997ee377024782",
+   "size": 10226
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\copilot.identity_helper.Sparse.Stable.msixbundle.DATA",
+   "sha256": "86e7131ae0df00c88b354d84a3743e33d9507566a029db8f31b70ef8465746fc",
+   "size": 21006
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\copilot.identity_helper.Sparse.Stable.p7x.DATA",
+   "sha256": "732d6f297eb7322e73e0cd4b6fe79b7c3f225984afa013119a77c19099a534e3",
+   "size": 10226
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\identity_helper.Sparse.Beta.msix.DATA",
+   "sha256": "130d97e716f2bb7c7c19cd7b088ed512911187ca97784ad31834766b7c4e999b",
+   "size": 51379
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\identity_helper.Sparse.Beta.p7x.DATA",
+   "sha256": "c4ba84489138265cc21c36892d44dfd682722ac657045a0fdb9a3c8eb992698f",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\identity_helper.Sparse.Canary.msix.DATA",
+   "sha256": "ad09c80410344dec5e1a829b58b95d6e2b2d8cb6c386004fdc71c72c075f6daa",
+   "size": 51173
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\identity_helper.Sparse.Canary.p7x.DATA",
+   "sha256": "746c163b197797a95d5d8925408c9040be5712193f2279e8d22aa229ca748bfb",
+   "size": 10493
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\identity_helper.Sparse.Dev.msix.DATA",
+   "sha256": "744c4fb993bb76249c1372aa9bb99ef64457a9d21148832b103b9e5142fa8e00",
+   "size": 50836
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\identity_helper.Sparse.Dev.p7x.DATA",
+   "sha256": "4bb49338be94b86feae1388a9c0e8e2d9b490f977d53058dba577e78bc0f888a",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\identity_helper.Sparse.Internal.msix.DATA",
+   "sha256": "3f5aa2a097b1ce283dda00b2ff2293607e021f5c33c66b2da9ad8177d1af2ea9",
+   "size": 53941
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\identity_helper.Sparse.Internal.p7x.DATA",
+   "sha256": "9288af9b2ad084dde4c227a5750ffddacda585ffcb7e7e03f8ae813dfcf081f5",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\identity_helper.Sparse.Stable.msix.DATA",
+   "sha256": "8934da2b0ac84f9b01b2df51317ac19c374748322a569b2377d7f39a447d3912",
+   "size": 53930
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\identity_helper.Sparse.Stable.p7x.DATA",
+   "sha256": "4575ca40fc1073f1e57b6f32bd8ede9aeeb48ab27cdd8aa003fa359d499520cb",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\officehub.identity_helper.Sparse.Dev.msixbundle.DATA",
+   "sha256": "4ef81047f7e2b62c91cdb7b4194b7ffb519855df5b4731e2a71128ca79995a44",
+   "size": 56856
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\officehub.identity_helper.Sparse.Dev.p7x.DATA",
+   "sha256": "cbb2692451b44e8b51a959d2204e5470d6cc8e50df478a7710eca98106e03f27",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\officehub.identity_helper.Sparse.Internal.msixbundle.DATA",
+   "sha256": "6699737d5fbf1c50288787a810ebc1a02926d9629e0b0d5b167565e82d706904",
+   "size": 56885
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\officehub.identity_helper.Sparse.Internal.p7x.DATA",
+   "sha256": "8b95fd95dcf8c321aada6a3ba4986104e39139f42859350412b2a5019fd28bc5",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\officehub.identity_helper.Sparse.Stable.msixbundle.DATA",
+   "sha256": "beea67390f6336a3a6b95a218c263b17e8a9103a8a46b7fdc49d948e2706f143",
+   "size": 56877
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\identity_proxy\\win11\\officehub.identity_helper.Sparse.Stable.p7x.DATA",
+   "sha256": "92b80b9e2c67eff9ce504b0c54837004f1c14b87b821554ba0e0df6aee1e04ec",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\msedge.dll.sig.DATA",
+   "sha256": "0891155e516ac29f2487a94005c43c773b89f707097d36b622b6f6dac0177b60",
+   "size": 1389
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\msedge.exe.sig.DATA",
+   "sha256": "967b787e6d994e1c37e8f81f2e6a365434bde2653150eb7e25395133ece20110",
+   "size": 1389
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\msedge_100_percent.pak.DATA",
+   "sha256": "fb01e3c7563a79ef3287cbe9e92688390130cb9d6222f336dfbf880b51b52a3c",
+   "size": 1577934
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\msedge_200_percent.pak.DATA",
+   "sha256": "adff1210ea5548e802701fe70f234f81024053424e69231e10e75d0525745bf8",
+   "size": 2288580
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\msedgewebview2.exe.sig.DATA",
+   "sha256": "7cd075f1c01530d3165001ce1b5f712dcc1044c396c9720c83ebc0f7f5388893",
+   "size": 1389
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\resources.pak.DATA",
+   "sha256": "6cdf501dc386c2835268df2df8eef19bf38b4bd77499b33b028e43a61d47f9e5",
+   "size": 34374996
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\textInputMethod.sccd.DATA",
+   "sha256": "f88664c021237bbc0299b5ae3f5686b915e3007bf2902be8186ad847476447bf",
+   "size": 18615
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\v8_context_snapshot.bin.DATA",
+   "sha256": "03b79a0c86d5caccf6bb52bdf85173cc6d189929a089aece804536f29075870c",
+   "size": 771432
+  },
+  {
+   "path": "WebView2Runtime\\ResiliencyLinks\\vk_swiftshader_icd.json.DATA",
+   "sha256": "32d83ff113fef532a9f97e0d2831f8656628ab1c99e9060f0332b1532839afd9",
+   "size": 106
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Mu\\Advertising",
+   "sha256": "231be4e0be45f588b161634c816b9a5a49f530c0dcb55461d37715a94482dca1",
+   "size": 19889
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Mu\\Analytics",
+   "sha256": "bba2063d20d70f4ab06dc2ae04c2564cc2b8c631b6dab68248957dbdf107fdd2",
+   "size": 4036
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Mu\\CompatExceptions",
+   "sha256": "5b462316a51c918d0bae95959bf827cb9c72bbd84ffb0e43b750aa91fbf3ba53",
+   "size": 689
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Mu\\Content",
+   "sha256": "9a63f38e22b8573cbd47a4ef7b67ccb0934b87239e075c5cfafc7a1014e340c6",
+   "size": 4486
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Mu\\Cryptomining",
+   "sha256": "bdee796bf07922c152d770cd5928955f1b12c12515c4db6fc0ab8d2ad0c44c4e",
+   "size": 552
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Mu\\Entities",
+   "sha256": "f6e93c83d9e3cfdff064535647cee76fc85aa1c86fd22a93dcf3d2c377346d94",
+   "size": 69999
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Mu\\Fingerprinting",
+   "sha256": "05b29240a28bb75b4535d558edc510eb92df0ac27e9502498b99cdbc576b8298",
+   "size": 1113
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Mu\\LICENSE",
+   "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+   "size": 35147
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Mu\\Other",
+   "sha256": "2b4a47b82cbe70e34407c7df126a24007aff8b45d5716db384d27cc1f3b30707",
+   "size": 34
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Mu\\Social",
+   "sha256": "4955c3e7f56641a4ae0ce9c79b4ceee4b21733b0f6dedc980bf8d822a792eba2",
+   "size": 754
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Mu\\TransparentAdvertisers",
+   "sha256": "d2cd0bef5f45daf490c53e705d6f67dfe12390c72a00efa6f5117432bd8edb8c",
+   "size": 105
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Sigma\\Advertising",
+   "sha256": "5c62ee354070033dba1bad40dcde115a81db45943b2274fae7059a5aa5c61d33",
+   "size": 21511
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Sigma\\Analytics",
+   "sha256": "d303be86132f8d7131941d41736694c2e29647ebaeccb38c0976fe66616ec8af",
+   "size": 3349
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Sigma\\Content",
+   "sha256": "70c295600066e9d3feeacd6bfc735bbcac6243694e4259477822d3db252729e1",
+   "size": 5938
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Sigma\\Cryptomining",
+   "sha256": "696e930706b5d391eb8778f73b0627ffc2be7f6c9a3e7659170d9d37fc4a97b5",
+   "size": 32
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Sigma\\Entities",
+   "sha256": "a5409d2c6a8cbd9339a95a5e09fcaedd4546a49d47fc4ebeda2d8749cfc66987",
+   "size": 131834
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Sigma\\Fingerprinting",
+   "sha256": "5306139881e81eebffd97de016130fdbb04e3ae976d94ad7a74e5dee63fbafcd",
+   "size": 2307
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Sigma\\LICENSE",
+   "sha256": "44071e0fcffb9a9a32e8fa7010bb18dbc41afd0b176f81bf700b15b638a88a51",
+   "size": 66
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Sigma\\Other",
+   "sha256": "2b4a47b82cbe70e34407c7df126a24007aff8b45d5716db384d27cc1f3b30707",
+   "size": 34
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Sigma\\Social",
+   "sha256": "28ac79097cf67587a228fdfe4746a1a9b31dae94d5a63bb3fcaa82443d69e7af",
+   "size": 3434
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\Sigma\\Staging",
+   "sha256": "f90f4cb0976a046e93978971b58fba24bc93b0129e8612fdd0e5646a1bebed22",
+   "size": 1361
+  },
+  {
+   "path": "WebView2Runtime\\Trust Protection Lists\\manifest.json",
+   "sha256": "de864bf0ab8abacfba536d4e9764eca658f903bd2457f955e128c4ee181c7e58",
+   "size": 132
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square150x150Logo.scale-100.png",
+   "sha256": "3e1e8531b44780927616ba57ed049739b0688054cf79902f316d728121b30c20",
+   "size": 5679
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square150x150Logo.scale-125.png",
+   "sha256": "24dca41c8493f5489ede402fc1db1fba4cf352ce1c97b2f457d439e05f009aec",
+   "size": 9097
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square150x150Logo.scale-150.png",
+   "sha256": "de0b8248d74d0842f134759a42df2effbd09fda27329094771547b1911768906",
+   "size": 11516
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square150x150Logo.scale-200.png",
+   "sha256": "46d2a464c7a68e42dd2fd94786062097886b92ff774bfb3e81b2637c2a47fac9",
+   "size": 16451
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square150x150Logo.scale-400.png",
+   "sha256": "be286065381c7f3cf76d16b9edbe138fcfdf54121636d73e8b81ea61bda4c230",
+   "size": 51853
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square310x310Logo.scale-100.png",
+   "sha256": "216dd7f008b2db23c8b52154431cbafacffd5369922c6f770444a461468fc470",
+   "size": 13312
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square310x310Logo.scale-125.png",
+   "sha256": "e0a2a162d7af07f90a9c61390868b5b45b224b7efe217a9536ae983aa4558331",
+   "size": 21388
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square310x310Logo.scale-150.png",
+   "sha256": "19238e710039b72ca9a5c90aadf19f9b2ade248ff11fbb1da40eb00658cb417c",
+   "size": 25891
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square310x310Logo.scale-200.png",
+   "sha256": "20c8ef43c52f9b73ec06fa21dfdcf1c4f2eff383ba585cc9eb126509928ddcfb",
+   "size": 42326
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square310x310Logo.scale-400.png",
+   "sha256": "466c3da61c83b21a05a17936a51193ec4d3144e4a05807e11daeca808a25bbeb",
+   "size": 141040
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.scale-100.png",
+   "sha256": "1f89f703e128486a60ca278656237c9a2f0565cdedd47032668b769bea0161d9",
+   "size": 1729
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.scale-125.png",
+   "sha256": "9e45a0e43debaff3e0658dd14eacc60e20e58be33531107a5c9d5e13279873d4",
+   "size": 2119
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.scale-150.png",
+   "sha256": "bfca667f88a471d52df94892f94f13f99f4f843dad99861802d8096990e873e8",
+   "size": 2879
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.scale-200.png",
+   "sha256": "19524b0d0620625343d6d405215b53145e19ab65c87a6538505d899c3d0a52a2",
+   "size": 4393
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.scale-400.png",
+   "sha256": "8105a8f455ee67c4e0dbe36357213d8ad1c6ce9c3b8b83ef37514738a693a33c",
+   "size": 12215
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-16.png",
+   "sha256": "7178dd5bc48d6ff995828f3f2a7906065d793ce4970f85afc1e77b2790ae49d4",
+   "size": 712
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-16_altform-lightunplated.png",
+   "sha256": "7178dd5bc48d6ff995828f3f2a7906065d793ce4970f85afc1e77b2790ae49d4",
+   "size": 712
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-16_altform-unplated.png",
+   "sha256": "7178dd5bc48d6ff995828f3f2a7906065d793ce4970f85afc1e77b2790ae49d4",
+   "size": 712
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-24.png",
+   "sha256": "64f6457f930d6f430f8b3406e21975e3ad6fd02b6e3a3e87f89859482af44553",
+   "size": 1094
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-24_altform-lightunplated.png",
+   "sha256": "64f6457f930d6f430f8b3406e21975e3ad6fd02b6e3a3e87f89859482af44553",
+   "size": 1094
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-24_altform-unplated.png",
+   "sha256": "64f6457f930d6f430f8b3406e21975e3ad6fd02b6e3a3e87f89859482af44553",
+   "size": 1094
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-256.png",
+   "sha256": "f9d61c7401470e90dca42059ceab50cd0c205e3831d087e6208a333ee3f88191",
+   "size": 36011
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-256_altform-lightunplated.png",
+   "sha256": "f9d61c7401470e90dca42059ceab50cd0c205e3831d087e6208a333ee3f88191",
+   "size": 36011
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-256_altform-unplated.png",
+   "sha256": "f9d61c7401470e90dca42059ceab50cd0c205e3831d087e6208a333ee3f88191",
+   "size": 36011
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-32.png",
+   "sha256": "8fd64f98c8f3895a2937fd7ae858fa148f7d629c9099d058c4ad04079e6577e4",
+   "size": 1673
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-32_altform-lightunplated.png",
+   "sha256": "8fd64f98c8f3895a2937fd7ae858fa148f7d629c9099d058c4ad04079e6577e4",
+   "size": 1673
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-32_altform-unplated.png",
+   "sha256": "8fd64f98c8f3895a2937fd7ae858fa148f7d629c9099d058c4ad04079e6577e4",
+   "size": 1673
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-48.png",
+   "sha256": "b990991aa8214801f70c972eab9ac5bc51b86661e23dfe2ebb42dce717122570",
+   "size": 2737
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-48_altform-lightunplated.png",
+   "sha256": "b990991aa8214801f70c972eab9ac5bc51b86661e23dfe2ebb42dce717122570",
+   "size": 2737
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square44x44Logo.targetsize-48_altform-unplated.png",
+   "sha256": "b990991aa8214801f70c972eab9ac5bc51b86661e23dfe2ebb42dce717122570",
+   "size": 2737
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square71x71Logo.scale-100.png",
+   "sha256": "39bcefbfe5d46cb4dedfc36177c91aa5ca5cd42e05531e75c7a5f1355b870c35",
+   "size": 3769
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square71x71Logo.scale-125.png",
+   "sha256": "4ff1db37946cb4d34c11545aff788a39fdbbfd143dcbf8222f4ac99a10fbbba6",
+   "size": 6049
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square71x71Logo.scale-150.png",
+   "sha256": "614bd7e65dabd5f203e34f074f5c18c6dd42ff7073c40c0c2b72a9e69f6a04f8",
+   "size": 7594
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square71x71Logo.scale-200.png",
+   "sha256": "b2f760b68afc7bb7707ca22113a1d7d768f5d526e2ed9a312e1ae87706ef5802",
+   "size": 10936
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Square71x71Logo.scale-400.png",
+   "sha256": "0ce42ff7cb2160610c72406faf179ba97abafb1e3a41af0c72c53667500eff3f",
+   "size": 32337
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\StoreLogo.scale-100.png",
+   "sha256": "d8b68b8f2b711d6d0e6c70e3eefb9849b230eab09898ba2cc41f875147dc88e5",
+   "size": 1924
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\StoreLogo.scale-125.png",
+   "sha256": "89f442b13a396dca2e5dced1b163a97ec0135cacba3852d197ef059a42173048",
+   "size": 2870
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\StoreLogo.scale-150.png",
+   "sha256": "372d66f1f3f98b6bb73cd390ea536d264bfcac2013a8006d4ff120b0a9c4c6fd",
+   "size": 3581
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\StoreLogo.scale-200.png",
+   "sha256": "9b9227b3cad28d7588336fdaa347a7549a3287e956d05f1800cb1f5836292a0a",
+   "size": 4807
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\StoreLogo.scale-400.png",
+   "sha256": "8e1c8b92bf111e1031b04ace4bc7f445c5d99ee6ae9bd1a15254044276d10be2",
+   "size": 13726
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Wide310x150Logo.scale-100.png",
+   "sha256": "af9949879e4219aeacd0fab8508396eec04f92eba203831bc5ba0f656ad59d47",
+   "size": 5958
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Wide310x150Logo.scale-125.png",
+   "sha256": "4d5d40e86ffaf34ba6ae66a5f1e77aef14c191326d940d1da5073142d124b318",
+   "size": 9551
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Wide310x150Logo.scale-150.png",
+   "sha256": "fb163ab50c56a128e4134ab2ec7c1285d7f029a8840071f364af72837be0ea75",
+   "size": 12372
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Wide310x150Logo.scale-200.png",
+   "sha256": "96778a1c701d12fa2f008cb66cf25faeb22d6d2b6b8436b461a02d7869c530a4",
+   "size": 17896
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotAppStable\\Wide310x150Logo.scale-400.png",
+   "sha256": "da0549ed8ef2b50a129d306551b3f2a92635fe382b3dd1370ede55b01563cab2",
+   "size": 57790
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square150x150Logo.scale-100.png",
+   "sha256": "c47bac6254a1bfba81c4ee148996190d50dbe1d7e8852d4c15a15264be536932",
+   "size": 5959
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square150x150Logo.scale-125.png",
+   "sha256": "803ac015d066b56113372cbe6ced289408abaf6e4db8b394e9662917faa342f0",
+   "size": 8755
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square150x150Logo.scale-150.png",
+   "sha256": "444f1a53274b4056b6c2af899405169b6013d3b850ee244e17fcf3fa3e613be6",
+   "size": 12117
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square150x150Logo.scale-200.png",
+   "sha256": "9bf6222c685b307badb8652f15c98f69ceb667f358815322316a1cb9ea19ab70",
+   "size": 16994
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square150x150Logo.scale-400.png",
+   "sha256": "aba3aed7773b241d6afb5990f816abf41f470a1798d015e843f20a2c7f4ce697",
+   "size": 52538
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square310x310Logo.scale-100.png",
+   "sha256": "fa5f9a6131c990b77b14b78191f5a2cc2e1a895bc25d2938b4a0a1cbf673bd45",
+   "size": 13761
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square310x310Logo.scale-125.png",
+   "sha256": "e78953da3c55b2c236a1cc3d90c62e0d98ed15e3ac65adeefa400286bd42b7dc",
+   "size": 21317
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square310x310Logo.scale-150.png",
+   "sha256": "ca6938203e564469501c05f9d8ca8bf974151c300aa2e435b8724638e4c3ff99",
+   "size": 26515
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square310x310Logo.scale-200.png",
+   "sha256": "770d0ae1859f7fe2416aac9e2334f9463d3e6872b798b6a9b75acf7118559c98",
+   "size": 42558
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square310x310Logo.scale-400.png",
+   "sha256": "d1f3cee65852cf462ed497e031063655f7e772bc19e3f7b2a2ea7060ebb8b5d1",
+   "size": 138820
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.scale-100.png",
+   "sha256": "08d903ae8340ddfeb6a021165b98aa22934c8af88284e024fbdc929ae81adff9",
+   "size": 1666
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.scale-125.png",
+   "sha256": "70b13c68a18b67a7c90ff9170d8d22c88a1d869bb617ebe37fefac3f7dc2cadd",
+   "size": 2264
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.scale-150.png",
+   "sha256": "b9e9c91121bc1fea270de92a65a0775bbf1f2dfd082a06d5913234f83c9764f6",
+   "size": 2972
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.scale-200.png",
+   "sha256": "8562b604ae1fa2f28b294233892007036cfa2cfdcee893dbbc4680372f566f97",
+   "size": 4320
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.scale-400.png",
+   "sha256": "20eb0f54833a93cc7cb018db080fa607dd9ccdd9142e4e183343b07c3e4a12d5",
+   "size": 11841
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-16.png",
+   "sha256": "d4c83595780905a7a802103e51890b5943d27dd6ddf39b585571ab99db3bb448",
+   "size": 676
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-16_altform-lightunplated.png",
+   "sha256": "6bd79374381bf669360e2c852b2f5cf4680d972c30eff7f861d1959f2c48c2ee",
+   "size": 694
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-16_altform-unplated.png",
+   "sha256": "d4c83595780905a7a802103e51890b5943d27dd6ddf39b585571ab99db3bb448",
+   "size": 676
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-24.png",
+   "sha256": "75cc3b4fa4a6df9e814aed8604185044cabf5672fefbba78abc9040c72e8f23b",
+   "size": 1158
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-24_altform-lightunplated.png",
+   "sha256": "9d0f3e54761f32ed4f059159a191f4237435eeb5f3f03079b1888fa734e5e23f",
+   "size": 1191
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-24_altform-unplated.png",
+   "sha256": "75cc3b4fa4a6df9e814aed8604185044cabf5672fefbba78abc9040c72e8f23b",
+   "size": 1158
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-256.png",
+   "sha256": "39f15d2cf5c8890dc30ffe124c6087255c1574911671ba58ea01da34166960ef",
+   "size": 33527
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-256_altform-lightunplated.png",
+   "sha256": "3cdc34a70bb08eaded4060ba1ce9e4cfa73757bba21ac9820dd8b3e700d1b204",
+   "size": 36221
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-256_altform-unplated.png",
+   "sha256": "39f15d2cf5c8890dc30ffe124c6087255c1574911671ba58ea01da34166960ef",
+   "size": 33527
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-32.png",
+   "sha256": "730a6b7e4b84888b7516f3dbe556537e40a70e863e5a415c3684219d10843225",
+   "size": 1611
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-32_altform-lightunplated.png",
+   "sha256": "501d1e99a8e938dfbc73b51198061181f9703faf4e5c8b565f57edf379851303",
+   "size": 1685
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-32_altform-unplated.png",
+   "sha256": "730a6b7e4b84888b7516f3dbe556537e40a70e863e5a415c3684219d10843225",
+   "size": 1611
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-48.png",
+   "sha256": "37f6102ec9df23e3986a290f9f115303132b7802f928a7f8ec6ec9e0f4f7293d",
+   "size": 2833
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-48_altform-lightunplated.png",
+   "sha256": "2b5a2a018feb24cc73e451cb9d84680e3f15493e0c3e8475cc1f2c613fac842c",
+   "size": 3022
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square44x44Logo.targetsize-48_altform-unplated.png",
+   "sha256": "37f6102ec9df23e3986a290f9f115303132b7802f928a7f8ec6ec9e0f4f7293d",
+   "size": 2833
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square71x71Logo.scale-100.png",
+   "sha256": "ecaab46aa6b66cdb4d3b5039c963ac3dd183c5bd24dda44bc818abadf2757a4d",
+   "size": 4147
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square71x71Logo.scale-125.png",
+   "sha256": "ecc7817c43fe29c39b6240fdcc842b6f455d54f4b9271b04bdfc426abe980a99",
+   "size": 6172
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square71x71Logo.scale-150.png",
+   "sha256": "39c3bb03fdf0a67ad52c403b757d56834dc6dd383f894be5b88efae1ad1ec604",
+   "size": 7758
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square71x71Logo.scale-200.png",
+   "sha256": "7a1258f62a217c872daa8433c7a5605bdba7d991270d338780641aad2456ad71",
+   "size": 11788
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Square71x71Logo.scale-400.png",
+   "sha256": "73aac844e1168bb5ca688de8a99e8ba637ae1bfa24183689b4c7756aafb0f245",
+   "size": 34198
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\StoreLogo.scale-100.png",
+   "sha256": "91f2bc06ac2aadb4c1aa858d55b1cae5914b92b16df9db2b0ec730b5ddd82bd7",
+   "size": 2061
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\StoreLogo.scale-125.png",
+   "sha256": "43ba6a64ad6fcd8fabf356f61844f731d62ac8cfd13f8685e01e9da5edece12b",
+   "size": 2941
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\StoreLogo.scale-150.png",
+   "sha256": "887f65825e2ea1d1b752a0bcbb941628a46b6721815a906852fb533c30d606a7",
+   "size": 3608
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\StoreLogo.scale-200.png",
+   "sha256": "f6bdf46def2efcc0895deae0e67a217cd05a24cdadefd0c4cd5ef4d8c46f2a02",
+   "size": 5141
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\StoreLogo.scale-400.png",
+   "sha256": "b63f98724bc1e380f2f4d76a5a7b167a2df285fdc49f151e36011e2ac485c2ee",
+   "size": 14499
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Wide310x150Logo.scale-100.png",
+   "sha256": "2dc22368cd31e0e4405e95de122e6a4d3757cc54e87ec981e5975f1ed7129b0a",
+   "size": 6215
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Wide310x150Logo.scale-125.png",
+   "sha256": "0b70c28419c41f2097659fcdd9766918337813d43f74ea280e223f4e193d078c",
+   "size": 9400
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Wide310x150Logo.scale-150.png",
+   "sha256": "b404219aca8d899a658247f5c355030217673fa1f24c8b1d735af81c790b79fc",
+   "size": 12960
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Wide310x150Logo.scale-200.png",
+   "sha256": "09818bd6f958fe66255b78d94fcbeda453d95a8593b7befd9cf72eee67475f17",
+   "size": 18432
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotDev\\Wide310x150Logo.scale-400.png",
+   "sha256": "3e62242d121fbfd45f13c9a89c115e5a8f5f547eda88394dc536c0f43d3cf230",
+   "size": 59010
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square150x150Logo.scale-100.png",
+   "sha256": "dfd4c03450db10284801be677afd8124ff78ca84605bd00c527b008e472abd97",
+   "size": 3332
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square150x150Logo.scale-125.png",
+   "sha256": "5fb6f0a532bbb0e6bc6853324c203fabcdfa7347bd0497c7ad725b81aab6513f",
+   "size": 4364
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square150x150Logo.scale-150.png",
+   "sha256": "9e9229cbb0b7e17bf689f2171bdb2046367867ae083991ca7eed306c61629ec7",
+   "size": 5690
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square150x150Logo.scale-200.png",
+   "sha256": "584afa296caff0c21eb276e5fc001f95c12db5c5edcf01a3e6df5fa1d4f6a68c",
+   "size": 8255
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square150x150Logo.scale-400.png",
+   "sha256": "b314b8f57783772973d5ecd23fa73871a987f34ce417cf81467a30327390e84a",
+   "size": 21941
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square310x310Logo.scale-100.png",
+   "sha256": "5b174f22a2f1de898a07b68852dadbc13c20f366271839a98a0f3b9669cfc926",
+   "size": 8500
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square310x310Logo.scale-125.png",
+   "sha256": "5302514b2ce7575cc9cd6493b550489ed47bd791a55ae3b860dd13af05163348",
+   "size": 11809
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square310x310Logo.scale-150.png",
+   "sha256": "6f49b090e1a529aa77a3791da20dcd812f21eba3676573354169f98fdfd82414",
+   "size": 15054
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square310x310Logo.scale-200.png",
+   "sha256": "417c9c3430433c4258ec6f8e8e2bdb805907fa432b735c081cdd90c98f842663",
+   "size": 23015
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square310x310Logo.scale-400.png",
+   "sha256": "2f7a260eb90e460544d4f19cfd07d37311804c8dc196a794bbf0b724d9200fbe",
+   "size": 67290
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.scale-100.png",
+   "sha256": "622da209a7d65d1ca1bcbe7cd30530394a08ede7ad5d5c216880f1bd4e16cec7",
+   "size": 1854
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.scale-125.png",
+   "sha256": "319872a38d59fe8ed44fee0f0f1f3563fc346bca6541cbe887bc187f6aa039e3",
+   "size": 2526
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.scale-150.png",
+   "sha256": "e2674d714196905d3dbd17f2d7ca959c85ed3cd96ce109a6346a9a50fdeb23d9",
+   "size": 3214
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.scale-200.png",
+   "sha256": "e2c82b79b4a0eff6f68e0c735efd914b45aa217c7e7577dd799e010852c6a65b",
+   "size": 4530
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.scale-400.png",
+   "sha256": "654b8a18e9babbfb9cd165fae3c78e09ea5ee339670a772ae56ed430ffb772d7",
+   "size": 11211
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-16.png",
+   "sha256": "e350f572722e0283882cc0b025a017e0d2af86f27f7bc4aa0d43a947f7f34b9f",
+   "size": 733
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-16_altform-lightunplated.png",
+   "sha256": "e350f572722e0283882cc0b025a017e0d2af86f27f7bc4aa0d43a947f7f34b9f",
+   "size": 733
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-16_altform-unplated.png",
+   "sha256": "765fd8cc48b6a4b1555241bf891b268761d157a16677c66f22a3b870dffb2c80",
+   "size": 693
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-24.png",
+   "sha256": "99b7b5b3c4e65cd3698b84f63843b46c3fed43890acedacb0a8a1216c780de0c",
+   "size": 1242
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-24_altform-lightunplated.png",
+   "sha256": "99b7b5b3c4e65cd3698b84f63843b46c3fed43890acedacb0a8a1216c780de0c",
+   "size": 1242
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-24_altform-unplated.png",
+   "sha256": "2d1afaa893144238ed0ba9029d790aca78ee6be545ec3abfce16ebcaf9b3ad42",
+   "size": 1069
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-256.png",
+   "sha256": "0c9d897605c2d7f3d8651af5da42f4cddcafeb5e3723e70ce8be43fad23ac938",
+   "size": 18522
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-256_altform-lightunplated.png",
+   "sha256": "82f48acd1a1f01068015f1cbbbff6e824680654865cef25d51f1b93172c00a7d",
+   "size": 26968
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-256_altform-unplated.png",
+   "sha256": "0c9d897605c2d7f3d8651af5da42f4cddcafeb5e3723e70ce8be43fad23ac938",
+   "size": 18522
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-32.png",
+   "sha256": "587931975cfa3e99eb58c0eb9dda54426570a168fe1069f947cf28b0bce9d01d",
+   "size": 1815
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-32_altform-lightunplated.png",
+   "sha256": "587931975cfa3e99eb58c0eb9dda54426570a168fe1069f947cf28b0bce9d01d",
+   "size": 1815
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-32_altform-unplated.png",
+   "sha256": "e4002fa6646b95ee9b10a8007643afdd1c3cd25b1ebe63a82a5c9223be6040f4",
+   "size": 1567
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-48.png",
+   "sha256": "0cc26eeb19dff61cf0c5b28d10d89eaa771b1596a95d3a469a79262fad7c283c",
+   "size": 2999
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-48_altform-lightunplated.png",
+   "sha256": "0cc26eeb19dff61cf0c5b28d10d89eaa771b1596a95d3a469a79262fad7c283c",
+   "size": 2999
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square44x44Logo.targetsize-48_altform-unplated.png",
+   "sha256": "fc0d83820988419f8e6e952fff4e48b5641b5398af639829456d5b0af2d99ce0",
+   "size": 2739
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square71x71Logo.scale-100.png",
+   "sha256": "eb9fb4ba49edfb0559ea7166eefb92ee2225abce94f7fdba00568b1c407ca01c",
+   "size": 2111
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square71x71Logo.scale-125.png",
+   "sha256": "25ad779810d29bd6b4c7b21ec15a252274576ba716b82189c476689100ba1e86",
+   "size": 2811
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square71x71Logo.scale-150.png",
+   "sha256": "c8c1a3b483f2b0ba57a3e6aff7ee52ff242910904191f44019b480e592c336ac",
+   "size": 3474
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square71x71Logo.scale-200.png",
+   "sha256": "f72572d70b0cea3840083908bc650351d220e5cb03a7927841dfa2d96a2a97d9",
+   "size": 5001
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Square71x71Logo.scale-400.png",
+   "sha256": "1ea542ef282247fce202b78eab5d9aa8b3d9da45186a4e2d7f55e9eff2643064",
+   "size": 12960
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\StoreLogo.scale-100.png",
+   "sha256": "1183fb06941b6bc0e9c39bd104747c4856698fe4fed92f1f0d650551bccf7e13",
+   "size": 3125
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\StoreLogo.scale-125.png",
+   "sha256": "d3bf18a9679edddb80c36eb99a157e8dc96491554f80d74573560090009e4163",
+   "size": 4198
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\StoreLogo.scale-150.png",
+   "sha256": "8b2f72912f932be07dc8f45bd9e13b1c8eaf0a7fa6ecbc9af344d61b1f7d0701",
+   "size": 5285
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\StoreLogo.scale-200.png",
+   "sha256": "6838afa2acf4c942c34b53a6abc752d53f136d519dbc3cb73813b9c6f8092cf4",
+   "size": 7520
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\StoreLogo.scale-400.png",
+   "sha256": "cf7108ee6a3520ac4562aff7c337787804f9794aaa31ef694de31aa9c019ef70",
+   "size": 19029
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Wide310x150Logo.scale-100.png",
+   "sha256": "419a4851e4011a2b3ad6bc8f489c0d82af9ec619832dd2c1e81a9febf6c4c21e",
+   "size": 3534
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Wide310x150Logo.scale-125.png",
+   "sha256": "a27e88c0fa96c7a6344e65cd72b9764e9a9278b2944b69a000e073c7f0943335",
+   "size": 4649
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Wide310x150Logo.scale-150.png",
+   "sha256": "0738922ba4f22b6ce38097d2645055ec40fc89d1ee31cb0b9a33728efd7badc6",
+   "size": 6113
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Wide310x150Logo.scale-200.png",
+   "sha256": "24cfa266b8c42244c590aeb01f9ccabfbc02cf2cbcb7a7f96e4fdb097aba03f9",
+   "size": 8972
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\CopilotStable\\Wide310x150Logo.scale-400.png",
+   "sha256": "1a9f83fa021f98046e2793c6bcadd8ce58606b80146a3911782fc058f1db5d7d",
+   "size": 24709
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\Logo.png",
+   "sha256": "4eaf8c7a247db0985bb8c0412c00c9cdda927f27b5c333f855f0b4f5043fd120",
+   "size": 29175
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\LogoBeta.png",
+   "sha256": "d2c06cae33602d7a49c718f5e079f9c0abdeab899d26c4c1ff7f0fbeb37ecf30",
+   "size": 27112
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\LogoCanary.png",
+   "sha256": "86b786370f51a6cec29b7cc6092a56274a60bbaf361391e1844263b09c7012c7",
+   "size": 27333
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\LogoCopilot.png",
+   "sha256": "b314b8f57783772973d5ecd23fa73871a987f34ce417cf81467a30327390e84a",
+   "size": 21941
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\LogoCopilotApp.png",
+   "sha256": "be286065381c7f3cf76d16b9edbe138fcfdf54121636d73e8b81ea61bda4c230",
+   "size": 51853
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\LogoCopilotDev.png",
+   "sha256": "aba3aed7773b241d6afb5990f816abf41f470a1798d015e843f20a2c7f4ce697",
+   "size": 52538
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\LogoDev.png",
+   "sha256": "cc5674d80cb4484f16c03b273662b732c4465d34cdd5038990983601589456d6",
+   "size": 27104
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\ResearcherOn.png",
+   "sha256": "af406717e7ae9f3b33da27fd9572ddfd193818a3d6f729bd0319c6818fe11f04",
+   "size": 7057
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\SmallLogo.png",
+   "sha256": "b228b0337b1a34287b92d8bc3df91ba817a358d07ffc610e452244873b0b317c",
+   "size": 14830
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\SmallLogoBeta.png",
+   "sha256": "9d1a28640320bd4560a3f43127be8df02e5c4a0a18da725db359ab8b262a3bee",
+   "size": 14316
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\SmallLogoCanary.png",
+   "sha256": "d9c92117542208cc96b91f78deef5c1f44369e2fd4a8bfde80a83cb2c7c7d6bc",
+   "size": 13874
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\SmallLogoCopilot.png",
+   "sha256": "654b8a18e9babbfb9cd165fae3c78e09ea5ee339670a772ae56ed430ffb772d7",
+   "size": 11211
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\SmallLogoCopilotApp.png",
+   "sha256": "8105a8f455ee67c4e0dbe36357213d8ad1c6ce9c3b8b83ef37514738a693a33c",
+   "size": 12215
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\SmallLogoCopilotDev.png",
+   "sha256": "20eb0f54833a93cc7cb018db080fa607dd9ccdd9142e4e183343b07c3e4a12d5",
+   "size": 11841
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\SmallLogoDev.png",
+   "sha256": "38069508ca742cf17efe8dd8ba5ac5686ebcf7b8387ad9ea48b4d006e857380e",
+   "size": 13783
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\resources.dev.pri",
+   "sha256": "2f38fd92ce7af301490481e42eec2dac76ff46bc450b8a3ef0e6839b8d81bc20",
+   "size": 79368
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\resources.internal.pri",
+   "sha256": "629a2bfbb123b06b7950454069c4dd23569aa279351e34fa18285e56a5baa065",
+   "size": 79384
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\resources.officehub.dev.pri",
+   "sha256": "bed8fcb733b93fcf58151da68d676498bba64a4d268a734442dad5eaa9d00c8b",
+   "size": 79408
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\resources.officehub.internal.pri",
+   "sha256": "0355e331ac51ea9b84b51953a990d7ba8a591981b6dae0437d5fd685f8ff64df",
+   "size": 79432
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\resources.officehub.pri",
+   "sha256": "4184810aa8ce32c54ce658e8a01ef2ee3581818a926cc4b6b54f4c844672cc71",
+   "size": 79392
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\resources.pri",
+   "sha256": "074327df71135fc55d9589eacdfd0a55571e217d0cdd1d9ef9ed0d3987f2300a",
+   "size": 79352
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\vision.contrast-black.svg",
+   "sha256": "d0e67f345be87b0b594769487c2058783dc64be0ce486ee4ce2b0d982eaa388b",
+   "size": 1697
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\vision.contrast-white.svg",
+   "sha256": "4574b3b61dcbfe4b9910ef218ce308c363a6d4a5629e47384b34b36d2d4b1758",
+   "size": 1697
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\vision.svg",
+   "sha256": "2643fc75bcc01ab8df55ca53690d3b3b6f0c3f734747055c0deb4dfdc1f9e790",
+   "size": 1702
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\vision.theme-dark.svg",
+   "sha256": "d0e67f345be87b0b594769487c2058783dc64be0ce486ee4ce2b0d982eaa388b",
+   "size": 1697
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\vision.theme-light.svg",
+   "sha256": "2643fc75bcc01ab8df55ca53690d3b3b6f0c3f734747055c0deb4dfdc1f9e790",
+   "size": 1702
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\voice.contrast-black.svg",
+   "sha256": "6682eabc1213a4a061acfa0eb120f28a858ed5d781d4eea0e0002da0cd8f4a4a",
+   "size": 1155
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\voice.contrast-white.svg",
+   "sha256": "b53e2ffcc3b495c639255961d4e250591e33d71e17b60346b3fce281f2f77c55",
+   "size": 1155
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\voice.svg",
+   "sha256": "3bce7881de3bb31c51c4632c5a663069f634f3012979fca3fdf1ce47f940fdfe",
+   "size": 1160
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\voice.theme-dark.svg",
+   "sha256": "6682eabc1213a4a061acfa0eb120f28a858ed5d781d4eea0e0002da0cd8f4a4a",
+   "size": 1155
+  },
+  {
+   "path": "WebView2Runtime\\VisualElements\\voice.theme-light.svg",
+   "sha256": "3bce7881de3bb31c51c4632c5a663069f634f3012979fca3fdf1ce47f940fdfe",
+   "size": 1160
+  },
+  {
+   "path": "WebView2Runtime\\WidevineCdm\\LICENSE",
+   "sha256": "20de375707692099b3132084695377ce5fec0aec05813dedcce094b8eda44386",
+   "size": 473
+  },
+  {
+   "path": "WebView2Runtime\\WidevineCdm\\_platform_specific\\win_x64\\widevinecdm.dll",
+   "sha256": "51f909747cd2caa39ab4f4fff0289c8e6e2177a42b6341b9e29084498e18f233",
+   "size": 22716152
+  },
+  {
+   "path": "WebView2Runtime\\WidevineCdm\\_platform_specific\\win_x64\\widevinecdm.dll.sig",
+   "sha256": "35c4755a8127d34b4ca271934c928fa0e5537974dd31628edb947636a169dafa",
+   "size": 1389
+  },
+  {
+   "path": "WebView2Runtime\\WidevineCdm\\manifest.json",
+   "sha256": "dca3cd7a673d0776a085c0b8958a85bdd8392923db21a0b55f4d37210f752322",
+   "size": 1002
+  },
+  {
+   "path": "WebView2Runtime\\concrt140.dll",
+   "sha256": "eae8d7858c9989e2a351eb650ee1663fd8e3fd59c6c5afe09d50f2f2bd5ccc75",
+   "size": 384304
+  },
+  {
+   "path": "WebView2Runtime\\cookie_exporter.exe",
+   "sha256": "a9c182f6b93e77c799072acf0f80416711afaad5034bbff9b77e426108c9efde",
+   "size": 122224
+  },
+  {
+   "path": "WebView2Runtime\\copilot_overlay_images_100_percent.pak",
+   "sha256": "3f201f2f03aa37efe782ac8dfaf562d270afcd4bd7f22fcc0c18c0bcaa3790f3",
+   "size": 8684
+  },
+  {
+   "path": "WebView2Runtime\\copilot_overlay_images_200_percent.pak",
+   "sha256": "fcd36cc1d28982cbadcf6e816568b5a1134e9dbaa3ada9b18c23bd34db69d819",
+   "size": 23614
+  },
+  {
+   "path": "WebView2Runtime\\copilot_overlay_unscaled_images.pak",
+   "sha256": "56ee1d4392cfd1e16fd3fe3ee64ba0e4cae268c7e3d54eb0ff82b9ad1f908523",
+   "size": 38789
+  },
+  {
+   "path": "WebView2Runtime\\d3dcompiler_47.dll",
+   "sha256": "82764c2e07b54f1331af89e3e8c3821a7eaad4582560e0d43b1b78f5d4847ce2",
+   "size": 4763984
+  },
+  {
+   "path": "WebView2Runtime\\dual_engine_adapter_x64.dll",
+   "sha256": "934381840d704c48c88727cc4c804fc6fd77e6de46a6c1bc55aff4f577b98fa0",
+   "size": 5439256
+  },
+  {
+   "path": "WebView2Runtime\\dxcompiler.dll",
+   "sha256": "e04d7761fb4f4f15ed4c34d70244922c2c53d932be023f08db3ead674b030877",
+   "size": 20487536
+  },
+  {
+   "path": "WebView2Runtime\\edge_feedback\\camera_mf_trace.wprp",
+   "sha256": "3f2eb6455f54365c27829f85dd64ca0bafaa8577a6c8e79a54a6dd4c67df6470",
+   "size": 24910
+  },
+  {
+   "path": "WebView2Runtime\\edge_feedback\\mf_trace.wprp",
+   "sha256": "79a228f8f85310c27c292055d9e0e9b827c319c2472b4ba5b40e88851bc4b4f3",
+   "size": 12735
+  },
+  {
+   "path": "WebView2Runtime\\edge_game_assist\\EdgeGameAssist.msix",
+   "sha256": "09cc15820436b7192bad340b9a202f0e30c295dcf8b642cd691b3eb790aceda6",
+   "size": 1019266
+  },
+  {
+   "path": "WebView2Runtime\\edge_game_assist\\VERSION",
+   "sha256": "01ead2a790d96684b49de8a573713763e33ae2798f07b479f4fde1e26b303d7a",
+   "size": 10
+  },
+  {
+   "path": "WebView2Runtime\\elevated_tracing_service.exe",
+   "sha256": "0fb64cdedbd1c9691586350cfe70f658ce248949da65fd56a6f9271e52812ef5",
+   "size": 5529968
+  },
+  {
+   "path": "WebView2Runtime\\elevation_service.exe",
+   "sha256": "83721b2497edf6b2e9e016d578b079f3abba4ca2b2157a0e82e1bb6dab8d1b2a",
+   "size": 4312432
+  },
+  {
+   "path": "WebView2Runtime\\eventlog_provider.dll",
+   "sha256": "8e4ca2b2c88388ffe6e0559795a271a49deebd3b8f27a760a6ad3ff510707c16",
+   "size": 16240
+  },
+  {
+   "path": "WebView2Runtime\\ffmpeg.dll",
+   "sha256": "06c015032e0786a3217d09d9760e2c808205e9a4c99ba23fec0bc58b939ced47",
+   "size": 3105648
+  },
+  {
+   "path": "WebView2Runtime\\icudtl.dat",
+   "sha256": "8fa69fc9ebcce09fa8ffac89afcf8088e8f70a177fa90d80a90668f5389f2579",
+   "size": 12409424
+  },
+  {
+   "path": "WebView2Runtime\\identity_helper.exe",
+   "sha256": "992b15b6d3c0f3e8e215deef76e47d551e7e8faa21236fead965e8bec0eb00e9",
+   "size": 2587504
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\beta.identity_helper.exe.manifest",
+   "sha256": "8b6f3769fc0367421e2748c9775bbf16645b502621a8aeef4974c58bfa067864",
+   "size": 1447
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\canary.identity_helper.exe.manifest",
+   "sha256": "752501569cc4654ab70553d4b5df8bb24f7d234392085ce4e5cb3b53015278f7",
+   "size": 1449
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\dev.copilot.identity_helper.exe.manifest",
+   "sha256": "f17b7ba4dc3f9707f08fb2565ba45028e834b2f27899ea8f225d5ebc4ec5da52",
+   "size": 1440
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\dev.identity_helper.exe.manifest",
+   "sha256": "cb0972f33728eca989501b59578a0e28a4f5608e2d04862ca184a408425b61b9",
+   "size": 1446
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\dev.officehub.identity_helper.exe.manifest",
+   "sha256": "8fcec1e071830c0e13cdc79f5e5fcd3c943ffbf226b20a038ee4464ebe3d2de6",
+   "size": 1476
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\internal.copilot.identity_helper.exe.manifest",
+   "sha256": "3f9f1e327986139edc43c44db3bb197fd51865d8ad89abd63256c0997c7c6110",
+   "size": 1445
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\internal.identity_helper.exe.manifest",
+   "sha256": "4c803818803f8271add36596b7b55d68dfc5a277d7f9757c7d49e571feff66cf",
+   "size": 1451
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\internal.officehub.identity_helper.exe.manifest",
+   "sha256": "021ef7e0ad7a5f62f249c3fb34e26e155fdfdde6e234ad212cfedc2870ea9190",
+   "size": 1481
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\resources.pri",
+   "sha256": "e689383d49a50dd886a43b6921e586f0c15007f8296213d3c0fcf00b220483e8",
+   "size": 3744
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\stable.copilot.identity_helper.exe.manifest",
+   "sha256": "18fd5f38e38ae47d6749b8a47aead0c000c3af506a57113e5916c6a3bddb43c2",
+   "size": 1436
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\stable.identity_helper.exe.manifest",
+   "sha256": "4a048d22363e0ec10fad2bab34adcd0edceba732d29f993ff897ed28a5653dda",
+   "size": 1449
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\stable.officehub.identity_helper.exe.manifest",
+   "sha256": "8653555f6645412d48bdb40b44c01545eea4bd12ebd46747e61b5777a5d920b7",
+   "size": 1472
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\copilot.identity_helper.Sparse.Dev.msixbundle",
+   "sha256": "0656f5c13b48e92cdf41887a97def75c5ef0803aa61e1124a6e8a1c04d62694b",
+   "size": 19706
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\copilot.identity_helper.Sparse.Dev.p7x",
+   "sha256": "603912098878b6aa579029fad6429b33e58cac1cc667296703a598a040881613",
+   "size": 10226
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\copilot.identity_helper.Sparse.Internal.msixbundle",
+   "sha256": "86131080d06c630f209ecd4a785d3d820e6639484ed1305adc50d9cb654742bb",
+   "size": 19725
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\copilot.identity_helper.Sparse.Internal.p7x",
+   "sha256": "ea03475bbe3ffb2a8304bf8b333f53eab4c9654d9551f55d67975ccf706358c2",
+   "size": 10226
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\copilot.identity_helper.Sparse.Stable.msixbundle",
+   "sha256": "cb7e7d5b599e9c78565ac4bd2d9415627dc1325a9711caa44aedc96e67100e63",
+   "size": 19658
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\copilot.identity_helper.Sparse.Stable.p7x",
+   "sha256": "423ae78124708aeef0da1e43fc676670736e4a03280efaabf7e60069a0d824f5",
+   "size": 10226
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\identity_helper.Sparse.Beta.msix",
+   "sha256": "c7106a56bd3aebc2cbfb213594f144ed66828fe491451336b153271e2b1dc167",
+   "size": 51391
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\identity_helper.Sparse.Beta.p7x",
+   "sha256": "61b6a25c862462d69c218101d51bfa56fff875f23f353be0a3eda989599f2cd5",
+   "size": 10497
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\identity_helper.Sparse.Canary.msix",
+   "sha256": "6dbc96be6a5b0748622d8b13e11c4ac169ccb89854b5ff9b7f88c80a165266b7",
+   "size": 51177
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\identity_helper.Sparse.Canary.p7x",
+   "sha256": "0e80ce00ad3db6b95ca10827f76b98dc6d8a83145d468de813092308043a0ddc",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\identity_helper.Sparse.Dev.msix",
+   "sha256": "3698cc61f7d3a6a63ba284dd8f4e19cf4d79ad1185acf6696efc1b47cb860ba6",
+   "size": 50836
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\identity_helper.Sparse.Dev.p7x",
+   "sha256": "003c0e7ca7248166bd19f487691c019e6a16ceeb13660a31e78fa2bf3f7a4437",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\identity_helper.Sparse.Internal.msix",
+   "sha256": "a2ed37424341610e039906d2a01d96aac4df44173e9454b62940fcbd178dcef5",
+   "size": 53941
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\identity_helper.Sparse.Internal.p7x",
+   "sha256": "568447c21dabdbd3d3f6505a370897d263ab6d91a8a151fa4a4ea2605aec5264",
+   "size": 10493
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\identity_helper.Sparse.Stable.msix",
+   "sha256": "099d34e8bc0fe6fd0bc5828315474b90d24afc672ccfe59d4ed98e8b32ba6cb6",
+   "size": 53942
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\identity_helper.Sparse.Stable.p7x",
+   "sha256": "5fd0d27b69af4b0221220b19a4b3ab1d2e5a3c3f6a55ea45db50f1fdd2cea45f",
+   "size": 10497
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\officehub.identity_helper.Sparse.Dev.msixbundle",
+   "sha256": "612488441904b39cb037ff0d00785e88f39751b394660b7c60608c75266985e0",
+   "size": 54491
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\officehub.identity_helper.Sparse.Dev.p7x",
+   "sha256": "b9b3f277687f1d0688edd7ba162ec1233cb8bb75b656db040f586871250d4e8f",
+   "size": 10497
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\officehub.identity_helper.Sparse.Internal.msixbundle",
+   "sha256": "f40b2e8b9e5bca3936440ced14f2a3b250b13fafbb1f2c794dfdeb039eda1906",
+   "size": 54515
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\officehub.identity_helper.Sparse.Internal.p7x",
+   "sha256": "fb13535de80f6a0085f7d22760d660eed9dbf858656b5bee074f08cc4d62fc88",
+   "size": 10497
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\officehub.identity_helper.Sparse.Stable.msixbundle",
+   "sha256": "af696f5a80545db9de023593aceaf378bf6de2ef416447104d067f8483791cb2",
+   "size": 54518
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win10\\officehub.identity_helper.Sparse.Stable.p7x",
+   "sha256": "94f7e5849aa2bb8cbb09f7f8e868a5df2a5093df02d75f2b668008612c078c31",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\copilot.identity_helper.Sparse.Dev.msixbundle",
+   "sha256": "44886fa341a62c470d2b7d1aab89fa8ea4afba6cac9bcaef43c02ebc84e0ef3f",
+   "size": 21082
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\copilot.identity_helper.Sparse.Dev.p7x",
+   "sha256": "a19ab8a4dc897ee7c4ba45817dcc7c2f549d48b5521fc803caa242d82e00dd00",
+   "size": 10226
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\copilot.identity_helper.Sparse.Internal.msixbundle",
+   "sha256": "5231fc131db6d39b70fd45a5b734ed3a5915519c347a6d1a366d3d55427c66f9",
+   "size": 21098
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\copilot.identity_helper.Sparse.Internal.p7x",
+   "sha256": "2c0eb01ad4da1629d91d88ab775c4323e0c065097a0b7f92bc997ee377024782",
+   "size": 10226
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\copilot.identity_helper.Sparse.Stable.msixbundle",
+   "sha256": "86e7131ae0df00c88b354d84a3743e33d9507566a029db8f31b70ef8465746fc",
+   "size": 21006
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\copilot.identity_helper.Sparse.Stable.p7x",
+   "sha256": "732d6f297eb7322e73e0cd4b6fe79b7c3f225984afa013119a77c19099a534e3",
+   "size": 10226
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\identity_helper.Sparse.Beta.msix",
+   "sha256": "130d97e716f2bb7c7c19cd7b088ed512911187ca97784ad31834766b7c4e999b",
+   "size": 51379
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\identity_helper.Sparse.Beta.p7x",
+   "sha256": "c4ba84489138265cc21c36892d44dfd682722ac657045a0fdb9a3c8eb992698f",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\identity_helper.Sparse.Canary.msix",
+   "sha256": "ad09c80410344dec5e1a829b58b95d6e2b2d8cb6c386004fdc71c72c075f6daa",
+   "size": 51173
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\identity_helper.Sparse.Canary.p7x",
+   "sha256": "746c163b197797a95d5d8925408c9040be5712193f2279e8d22aa229ca748bfb",
+   "size": 10493
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\identity_helper.Sparse.Dev.msix",
+   "sha256": "744c4fb993bb76249c1372aa9bb99ef64457a9d21148832b103b9e5142fa8e00",
+   "size": 50836
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\identity_helper.Sparse.Dev.p7x",
+   "sha256": "4bb49338be94b86feae1388a9c0e8e2d9b490f977d53058dba577e78bc0f888a",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\identity_helper.Sparse.Internal.msix",
+   "sha256": "3f5aa2a097b1ce283dda00b2ff2293607e021f5c33c66b2da9ad8177d1af2ea9",
+   "size": 53941
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\identity_helper.Sparse.Internal.p7x",
+   "sha256": "9288af9b2ad084dde4c227a5750ffddacda585ffcb7e7e03f8ae813dfcf081f5",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\identity_helper.Sparse.Stable.msix",
+   "sha256": "8934da2b0ac84f9b01b2df51317ac19c374748322a569b2377d7f39a447d3912",
+   "size": 53930
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\identity_helper.Sparse.Stable.p7x",
+   "sha256": "4575ca40fc1073f1e57b6f32bd8ede9aeeb48ab27cdd8aa003fa359d499520cb",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\officehub.identity_helper.Sparse.Dev.msixbundle",
+   "sha256": "4ef81047f7e2b62c91cdb7b4194b7ffb519855df5b4731e2a71128ca79995a44",
+   "size": 56856
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\officehub.identity_helper.Sparse.Dev.p7x",
+   "sha256": "cbb2692451b44e8b51a959d2204e5470d6cc8e50df478a7710eca98106e03f27",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\officehub.identity_helper.Sparse.Internal.msixbundle",
+   "sha256": "6699737d5fbf1c50288787a810ebc1a02926d9629e0b0d5b167565e82d706904",
+   "size": 56885
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\officehub.identity_helper.Sparse.Internal.p7x",
+   "sha256": "8b95fd95dcf8c321aada6a3ba4986104e39139f42859350412b2a5019fd28bc5",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\officehub.identity_helper.Sparse.Stable.msixbundle",
+   "sha256": "beea67390f6336a3a6b95a218c263b17e8a9103a8a46b7fdc49d948e2706f143",
+   "size": 56877
+  },
+  {
+   "path": "WebView2Runtime\\identity_proxy\\win11\\officehub.identity_helper.Sparse.Stable.p7x",
+   "sha256": "92b80b9e2c67eff9ce504b0c54837004f1c14b87b821554ba0e0df6aee1e04ec",
+   "size": 10494
+  },
+  {
+   "path": "WebView2Runtime\\learning_tools.dll",
+   "sha256": "54062ccc2b099d8f2db0c6d203e46d373d97c33c2170f473b924e5779c24e8f2",
+   "size": 1310576
+  },
+  {
+   "path": "WebView2Runtime\\microsoft_shell_integration.dll",
+   "sha256": "fa50e818612dbb854508585bd57db349ca9f129185355668b05a58e5956292d6",
+   "size": 462192
+  },
+  {
+   "path": "WebView2Runtime\\mip_core_gn.dll",
+   "sha256": "c453cff0f8c5a79981e84df824b9d0a7a76983f6bfd507fdcf48e3d7d4a09bfc",
+   "size": 8700272
+  },
+  {
+   "path": "WebView2Runtime\\msedge.dll",
+   "sha256": "1906b766460da798672a9845e2772130674f7d3d866e8c63140ed88a1fe1c88d",
+   "size": 353102192
+  },
+  {
+   "path": "WebView2Runtime\\msedge.dll.sig",
+   "sha256": "0891155e516ac29f2487a94005c43c773b89f707097d36b622b6f6dac0177b60",
+   "size": 1389
+  },
+  {
+   "path": "WebView2Runtime\\msedge.exe.sig",
+   "sha256": "967b787e6d994e1c37e8f81f2e6a365434bde2653150eb7e25395133ece20110",
+   "size": 1389
+  },
+  {
+   "path": "WebView2Runtime\\msedge_100_percent.pak",
+   "sha256": "fb01e3c7563a79ef3287cbe9e92688390130cb9d6222f336dfbf880b51b52a3c",
+   "size": 1577934
+  },
+  {
+   "path": "WebView2Runtime\\msedge_200_percent.pak",
+   "sha256": "adff1210ea5548e802701fe70f234f81024053424e69231e10e75d0525745bf8",
+   "size": 2288580
+  },
+  {
+   "path": "WebView2Runtime\\msedge_elf.dll",
+   "sha256": "ca447464b1ac49577409ca46e2c17cbcea691b56914cabe5b47e1951a7d991dc",
+   "size": 4062576
+  },
+  {
+   "path": "WebView2Runtime\\msedge_proxy.exe",
+   "sha256": "8e90fbab1fb353651b79f1aabda6b072b8ff0d71b5024f9b9cf27579ec30b95e",
+   "size": 2807152
+  },
+  {
+   "path": "WebView2Runtime\\msedge_wer.dll",
+   "sha256": "8317bca999d00a0a279780ea7546202a40035eb993b6371f775f66dc4d8b6a36",
+   "size": 125808
+  },
+  {
+   "path": "WebView2Runtime\\msedgewebview2.exe",
+   "sha256": "93acbcad0b6f390ae1ce6a1dbf1e09e165520a7f1196eb22323afa64a9bba96b",
+   "size": 4897136
+  },
+  {
+   "path": "WebView2Runtime\\msedgewebview2.exe.sig",
+   "sha256": "7cd075f1c01530d3165001ce1b5f712dcc1044c396c9720c83ebc0f7f5388893",
+   "size": 1389
+  },
+  {
+   "path": "WebView2Runtime\\mspdf.dll",
+   "sha256": "f902b1f1411c34123fb559369e9a3c9a68cef0aed0729fb48577e62c9a7c5797",
+   "size": 18904944
+  },
+  {
+   "path": "WebView2Runtime\\msvcp140.dll",
+   "sha256": "14447a4e5593e482adda23a615c451ccd62fe5850c8f8d31643491b0be970a43",
+   "size": 653616
+  },
+  {
+   "path": "WebView2Runtime\\msvcp140_codecvt_ids.dll",
+   "sha256": "fed92762621038597f0bb3fc839e9d585855caca15a3a9c20f722d31414942c6",
+   "size": 41264
+  },
+  {
+   "path": "WebView2Runtime\\notification_helper.exe",
+   "sha256": "0f5637476fad365b1b4c1e97c6eb3f422864fc0f4b9904501deb496fe11f9170",
+   "size": 2874736
+  },
+  {
+   "path": "WebView2Runtime\\oneauth.dll",
+   "sha256": "4207f6a7cc2324d79ec008d2a2a31e3c66250842b1865507be2a2743a8dc5cc1",
+   "size": 6460784
+  },
+  {
+   "path": "WebView2Runtime\\oneds.dll",
+   "sha256": "2fccd3764fbd087655487bea0012fb0c9e562e70ada76de02c550beb5b018d54",
+   "size": 3535728
+  },
+  {
+   "path": "WebView2Runtime\\onnxruntime.dll",
+   "sha256": "558d8472cd1355f45e59e1aa18b14e0efab289784f272b2b5050a25809cf7f8b",
+   "size": 11088752
+  },
+  {
+   "path": "WebView2Runtime\\onramp.dll",
+   "sha256": "07a264c3df0745eb11ba30844fa0b8f6b03e712886f89a35b55be7df22984353",
+   "size": 472432
+  },
+  {
+   "path": "WebView2Runtime\\platform_experiences_helper.exe",
+   "sha256": "f397f586697523978a4f8316d6a7f0c664f1fe49e09a8edb5e878fd52d5a0df7",
+   "size": 3189616
+  },
+  {
+   "path": "WebView2Runtime\\prefs_enclave_x64.dll",
+   "sha256": "c49cd6049f97c0de2aceda3718db3bea5f702daf48ef2b0a66420c38d1e5019c",
+   "size": 116536
+  },
+  {
+   "path": "WebView2Runtime\\resources.pak",
+   "sha256": "6cdf501dc386c2835268df2df8eef19bf38b4bd77499b33b028e43a61d47f9e5",
+   "size": 34374996
+  },
+  {
+   "path": "WebView2Runtime\\show_third_party_software_licenses.bat",
+   "sha256": "3e867e263b64592b2dad5c334b6aa46d0bb46a20aa0db01c5ff08c707c3e148d",
+   "size": 270
+  },
+  {
+   "path": "WebView2Runtime\\telclient.dll",
+   "sha256": "40d599d31489567eb6e8998c62495ee038f882879b9bf7189b91929dab6a020f",
+   "size": 4099952
+  },
+  {
+   "path": "WebView2Runtime\\textInputMethod.sccd",
+   "sha256": "f88664c021237bbc0299b5ae3f5686b915e3007bf2902be8186ad847476447bf",
+   "size": 18615
+  },
+  {
+   "path": "WebView2Runtime\\v8_context_snapshot.bin",
+   "sha256": "03b79a0c86d5caccf6bb52bdf85173cc6d189929a089aece804536f29075870c",
+   "size": 771432
+  },
+  {
+   "path": "WebView2Runtime\\vccorlib140.dll",
+   "sha256": "2d3870ee4bb1deff665a296bf911d8b83a1a4a393b3402187baf04b20e09d1b8",
+   "size": 360752
+  },
+  {
+   "path": "WebView2Runtime\\vcruntime140.dll",
+   "sha256": "03ace324db6329112dffcf50409048ce64dc2378246f8686512a00b639976ace",
+   "size": 188720
+  },
+  {
+   "path": "WebView2Runtime\\vcruntime140_1.dll",
+   "sha256": "cd94474bf6dd5617ede6a1cc8363e79afe656d42538e8d350e5c52ae1cf354e0",
+   "size": 60208
+  },
+  {
+   "path": "WebView2Runtime\\vk_swiftshader.dll",
+   "sha256": "a635fd5b2580a43c7fa1af16a47dc12accaf9416b9e75436b53b597aa6a97794",
+   "size": 4559216
+  },
+  {
+   "path": "WebView2Runtime\\vk_swiftshader_icd.json",
+   "sha256": "32d83ff113fef532a9f97e0d2831f8656628ab1c99e9060f0332b1532839afd9",
+   "size": 106
+  },
+  {
+   "path": "WebView2Runtime\\vulkan-1.dll",
+   "sha256": "3e09c3558aa71182555c7058871afca25805fad1cef123bfd54d266b2dd24579",
+   "size": 973680
+  },
+  {
+   "path": "WebView2Runtime\\wdag.dll",
+   "sha256": "a7ba9c9dd38ec69ddc04748b2f8fc4d1f7dbe5e7da73627dfea27645bb89a87c",
+   "size": 249200
+  },
+  {
+   "path": "WebView2Runtime\\webview2_integration.dll",
+   "sha256": "431200895db06e8496634064f94fcb9c3b30ab91070e7bffeaf9c0942ff58bcc",
+   "size": 31600
+  },
+  {
+   "path": "amdhip64_7.dll",
+   "sha256": "b558d1e23023e925c69b3a398f1d9a95e9c268bd347b7e596fbd08f013e84593",
+   "size": 17492744
+  },
+  {
+   "path": "asio_probe.exe",
+   "sha256": "cd69929b5db70c0e40b5ba07293cb09163d121ca2981cc35f4dafbec870689eb",
+   "size": 287232
+  },
+  {
+   "path": "data\\opra_index.json",
+   "sha256": "bdd86bbcf0829835a0d7cac4aa007e535e1340b9e018858dab635cd509487197",
+   "size": 319917
+  },
+  {
+   "path": "ffmpeg.exe",
+   "sha256": "dad33fa51b94b2a482581e8de8d4b8224104fbc81d738ad41fa427d3db085cad",
+   "size": 12768256
+  },
+  {
+   "path": "ffprobe.exe",
+   "sha256": "af6a53071c14aa5464077c755214a3c22ccfbfd4d97e52055f737d0818588a9c",
+   "size": 12555264
+  },
+  {
+   "path": "rtagpu.dll",
+   "sha256": "60dc5abcfbc070c9205ee441b40ad488398b34cc8263f2579d8ebad1ce12fda6",
+   "size": 700928
+  },
+  {
+   "path": "rtagpu_cuda.dll",
+   "sha256": "411a9fd2f02850e35843b163c580c6cdb8c46864c68cfee7d21c2fdaadb442b4",
+   "size": 1009664
+  },
+  {
+   "path": "rtaweb.exe",
+   "sha256": "5a3d33ba1ef8eecf9cece9b182734b36c156713463e7c30e33c05b752ead072d",
+   "size": 9310720
+  },
+  {
+   "path": "tools\\aidecode.exe",
+   "sha256": "7e233d259274187b25ab1d2895bfccf4383505a7fd579f4881ea4b01a726110d",
+   "size": 488960
+  },
+  {
+   "path": "tools\\dopinfo.exe",
+   "sha256": "1154e8d11d8151c448c62fddd7335abbc3606cc1e12a7eb18610a203b98b938c",
+   "size": 208896
+  },
+  {
+   "path": "tools\\dsdconv.exe",
+   "sha256": "b76f280e8196094c1dbe276c426d7e323950848d64388d3a97306af9fd20c7e1",
+   "size": 297984
+  },
+  {
+   "path": "tools\\filter_report.exe",
+   "sha256": "dc91b78a21eb744dcade5d538152d2bc88d213be71ed4b9dd1fcc3091b915a23",
+   "size": 409600
+  },
+  {
+   "path": "tools\\gpubench_conv.exe",
+   "sha256": "cfcf0c3a6f3f4084cabc071e25a1ec3db57d97450d882412b342d56aab7a6057",
+   "size": 185856
+  },
+  {
+   "path": "tools\\make_dsd.exe",
+   "sha256": "a64fd15098836464a81ad4b9a3e37e6841b4e9ce3d09c0320a7a8c4d45f8c1ca",
+   "size": 388608
+  },
+  {
+   "path": "tools\\rtacapture.exe",
+   "sha256": "505696bc1aecc532e82a2973c46834afc7d02a5f69ef186672d2b467f9f84f2b",
+   "size": 304128
+  },
+  {
+   "path": "tools\\rtacast.exe",
+   "sha256": "dbd10219916bb25d15903dd313782352e197e21f52b684257a148ded6c93abf8",
+   "size": 816640
+  },
+  {
+   "path": "tools\\rtanet_rx.exe",
+   "sha256": "3f5d063cebeab1398f1a51d38e43ff0c3f5977ed84fad44b8319ba07698b774c",
+   "size": 397312
+  },
+  {
+   "path": "tools\\rtaplay.exe",
+   "sha256": "79218bef1bf3784d305baacf8c68bb36dea440ba1e2f3ac6865241138efe7dac",
+   "size": 1017856
+  },
+  {
+   "path": "tools\\rtatag.exe",
+   "sha256": "7bc475f407ab994f0dd5023a1f80a39f51ffb3f76f42dae8477b47593f10b0f3",
+   "size": 2247680
+  },
+  {
+   "path": "tools\\upnp_scan.exe",
+   "sha256": "274c75993a035196968d9923ee690c6f56101abadd2527323237f7e505bd0fa9",
+   "size": 229888
+  },
+  {
+   "path": "tools\\wasapi_ex_probe.exe",
+   "sha256": "7eb7f55a9144492f5b2786be24c9fe20f409b72224ede79cba269a185a6dcb54",
+   "size": 164864
+  },
+  {
+   "path": "tools\\wasapi_probe.exe",
+   "sha256": "56e7b14f53235c0ee7f12a207de16587b68f0f6f880dbf50b702b52793333257",
+   "size": 159744
+  },
+  {
+   "path": "tools\\wavcmp.exe",
+   "sha256": "d8a6620572daff710ab0de590a9305366c0aae72c0c87e46eab8eb21ea7af62c",
+   "size": 194560
+  }
+ ]
+}
