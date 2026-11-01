@@ -462,15 +462,25 @@ int main() {
         check(!lossy_container_of("folder.v1/song"), "lossy_container_of: 路径带点但无扩展名（Linux）不命中");
         check(!lossy_container_of("C:\\dir.v2\\song"), "lossy_container_of: 路径带点但无扩展名（Windows）不命中");
 
-        // 10b. 真实 .mp3 文件体检断言
-        std::string mp3Target = "D:\\RTA-hqplayer\\MUSIC\\专辑-感动我的&RainLain\\2021\\天门 (てんもん) - レトロスペクティブ京都.mp3";
-        bool generatedMp3 = false;
-        if (!fsx::exists(rta::audio::widen(mp3Target))) {
-            mp3Target = tmpDir + "\\rtahealth_fallback.mp3";
-            std::string cmd = "D:\\RTA-hqplayer\\build\\ffmpeg-lite\\ffmpeg.exe -y -f lavfi -i sine=frequency=440:duration=3 -b:a 320k \"" + mp3Target + "\" >nul 2>&1";
-            std::system(cmd.c_str());
-            generatedMp3 = true;
-        }
+        // 10b. 每次从合成音生成 MP3，不读开发机曲库、不依赖本机 vendor 路径。
+        // 先删除旧产物，避免上次留下的文件掩盖本次编码失败；环境缺失必须红灯。
+        const std::string wavTarget = tmpDir + "\\rtahealth_lossy_source.wav";
+        const std::string mp3Target = tmpDir + "\\rtahealth_fallback.mp3";
+        std::error_code fixtureEc;
+        fsx::remove(fsx::u8path(mp3Target), fixtureEc);
+        check(write_wav44(wavTarget, tone16), "MP3 合成源 WAV 写出成功", wavTarget);
+        const std::string ffmpeg = rta::audio::find_tool("ffmpeg");
+        check(!ffmpeg.empty(), "夹具编码器 ffmpeg 可用（包内或 PATH）", ffmpeg);
+        std::string encodeLog;
+        const std::wstring cmd = L"\"" + rta::audio::widen(ffmpeg) +
+            L"\" -nostdin -hide_banner -loglevel error -y -i \"" + rta::audio::widen(wavTarget) +
+            L"\" -c:a libmp3lame -b:a 320k \"" + rta::audio::widen(mp3Target) + L"\"";
+        const int encodeRc = ffmpeg.empty() ? -1 : rta::audio::run_hidden(cmd, &encodeLog);
+        check(encodeRc == 0, "ffmpeg 合成 MP3 退出码 = 0", std::to_string(encodeRc) + " " + encodeLog);
+        fixtureEc.clear();
+        const bool mp3Exists = fsx::is_regular_file(fsx::u8path(mp3Target), fixtureEc);
+        const auto mp3Bytes = mp3Exists ? fsx::file_size(fsx::u8path(mp3Target), fixtureEc) : 0;
+        check(mp3Exists && !fixtureEc && mp3Bytes > 0, "本次 MP3 夹具存在且非空", std::to_string(mp3Bytes) + " bytes");
 
         const TrackHealth hMp3 = analyze_file(mp3Target);
         check(hMp3.status == "ready", "MP3 文件体检成功（status=ready）", hMp3.error);
@@ -484,14 +494,11 @@ int main() {
         printf("   MP3 诊断: fakeVerdict=%d tag=%s reason=%s\n",
                hMp3.fakeVerdict, detail::fake_verdict_tag(hMp3.fakeVerdict), hMp3.reason.c_str());
 
-        // 10c. 真实无损 .wav 文件体检断言
-        std::string wavTarget = "D:\\RTA-hqplayer\\MUSIC\\专辑-原创&同人\\Static World 会场限定CD @ Static World\\01. Clear Sky.wav";
-        if (fsx::exists(rta::audio::widen(wavTarget))) {
-            const TrackHealth hWav = analyze_file(wavTarget);
-            check(hWav.status == "ready", "WAV 文件体检成功（status=ready）", hWav.error);
-            check(hWav.fakeVerdict != 4, "WAV: fakeVerdict != 4（无损容器绝不判为源本身有损）", std::to_string(hWav.fakeVerdict));
-            printf("   WAV 诊断: fakeVerdict=%d tag=%s\n", hWav.fakeVerdict, detail::fake_verdict_tag(hWav.fakeVerdict));
-        }
+        // 10c. 同一个合成 WAV 必须通过无损对照，云机与本机覆盖完全相同。
+        const TrackHealth hWav = analyze_file(wavTarget);
+        check(hWav.status == "ready", "WAV 文件体检成功（status=ready）", hWav.error);
+        check(hWav.fakeVerdict != 4, "WAV: fakeVerdict != 4（无损容器绝不判为源本身有损）", std::to_string(hWav.fakeVerdict));
+        printf("   WAV 诊断: fakeVerdict=%d tag=%s\n", hWav.fakeVerdict, detail::fake_verdict_tag(hWav.fakeVerdict));
 
         // 10d. HealthStore 往返持久化支持 source_lossy 标签（fake_verdict_from_tag ⟹ 4）
         {
@@ -513,10 +520,9 @@ int main() {
             fsx::remove(sPath, ec);
         }
 
-        if (generatedMp3) {
-            std::error_code ec;
-            fsx::remove(mp3Target, ec);
-        }
+        std::error_code cleanupEc;
+        fsx::remove(fsx::u8path(mp3Target), cleanupEc);
+        fsx::remove(fsx::u8path(wavTarget), cleanupEc);
     }
 
     printf("\n%s (失败项 %d)\n", fails == 0 ? "全部通过" : "存在失败", fails);

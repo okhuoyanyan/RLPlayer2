@@ -34,11 +34,22 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      # CMake 现已要求 Python3；两个 Python CLI 测试只用标准库，无 pip 依赖。
+      # CMake 要求 Python3；dsp_measure_cli 调用 mpmath 高精度参考核对。
       - name: 准备 Python（CMake / CLI 回归 / 合成媒体夹具）
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+
+      - name: 准备高精度测量参考依赖
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --index-url https://pypi.tuna.tsinghua.edu.cn/simple mpmath==1.3.0
+          if ($LASTEXITCODE -ne 0) {
+            python -m pip install --disable-pip-version-check --index-url https://pypi.org/simple mpmath==1.3.0
+          }
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -c "import mpmath; assert mpmath.__version__ == '1.3.0'; print('mpmath', mpmath.__version__)"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # A 类失败（writeback / media_duration / decode_retry）的真因：云机本来没有 ffmpeg/ffprobe，
       # 而这三条用例把"缺工具"判为 FAIL（这是正确的门禁设计，绝不改成跳过）。
@@ -111,6 +122,10 @@ jobs:
       - name: 测试（ctest）
         shell: pwsh
         run: |
+          # 先验证外部依赖和合成 MP3，避免等完整 DSP 矩阵结束才发现测试前提缺失。
+          # 下方完整回归仍包含这两项，不跳过任何判据。
+          ctest --test-dir build -R "^(track_health|dsp_measure_cli)$" --output-on-failure 2>&1 | Tee-Object -FilePath fixture-regression-log.txt
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           # ctest --output-on-failure 只在失败时打印用例 stdout ⟹ test_parallel 的
           # "[SKIP] 硬件线程=2 < 4，跳过加速比断言（正确性断言已 PASS，非放水）" 会被吞掉。
           # 单独用 -V 跑一次 parallel，让"有条件跳过"在 CI 日志里【可见】（铁律 3）。
@@ -130,6 +145,7 @@ jobs:
             ctest-log.txt
             parallel-log.txt
             fixtures-log.txt
+            fixture-regression-log.txt
             build/testdata/ci-synthetic/manifest.json
             build/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
