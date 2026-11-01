@@ -18,6 +18,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <vector>
+#include <cstdint>
 
 #ifdef _WIN32
 #define RTA_EXPORT extern "C" __declspec(dllexport)
@@ -57,62 +60,122 @@ __global__ void resample_kernel(const double* __restrict__ hist,   // [ch][histL
 }
 
 // 每次改变滤波器/采样率配置后调用一次，把相位表固化到显存
-static bool phasesCached_ = false;
+// The exported ABI is shared by all resampler instances and channels. Protect
+// the shared device buffers and compare the actual coefficient bytes: L/T (or
+// the source pointer, whose allocation can be reused) cannot identify a filter.
+static std::mutex resampleMutex_;
+// Two bounded slots keep a two-stage cascade warm without pointer-only keys.
+// Callers hold resampleMutex_ across acquisition and kernel completion.
+struct PhaseSlot {
+    double* device = nullptr;
+    size_t capacity = 0;
+    std::vector<double> content;
+};
+static PhaseSlot phaseSlots_[2];
+static unsigned phaseMostRecent_ = 0;
+static void invalidate_phase_slots() {
+    for (auto& slot : phaseSlots_) slot.content.clear();
+}
+static double* acquire_phases(const double* phases, size_t count) {
+    if (!phases || count == 0 || count > SIZE_MAX / sizeof(double)) return nullptr;
+    const size_t bytes = count * sizeof(double);
+    for (unsigned i = 0; i < 2; ++i) {
+        auto& slot = phaseSlots_[i];
+        if (slot.content.size() == count &&
+            std::memcmp(slot.content.data(), phases, bytes) == 0) {
+            phaseMostRecent_ = i;
+            return slot.device;
+        }
+    }
+    unsigned victim = 1u - phaseMostRecent_;
+    for (unsigned i = 0; i < 2; ++i)
+        if (phaseSlots_[i].content.empty()) { victim = i; break; }
+    auto& slot = phaseSlots_[victim];
+    // Prepare the host identity first; allocation failure must not escape the ABI.
+    std::vector<double> identity;
+    try { identity.assign(phases, phases + count); }
+    catch (...) { return nullptr; }
+    if (count > slot.capacity) {
+        double* replacement = nullptr;
+        if (cudaMalloc(&replacement, bytes) != cudaSuccess) return nullptr;
+        if (slot.device) cudaFree(slot.device);
+        slot.device = replacement;
+        slot.capacity = count;
+    }
+    // A partial copy invalidates this slot, but never the other cascade stage.
+    slot.content.clear();
+    if (cudaMemcpy(slot.device, phases, bytes, cudaMemcpyHostToDevice) != cudaSuccess) return nullptr;
+    slot.content.swap(identity);
+    phaseMostRecent_ = victim;
+    return slot.device;
+}
 
-RTA_EXPORT void rta_gpu_resample_invalidate(void) { phasesCached_ = false; }
+RTA_EXPORT void rta_gpu_resample_invalidate(void) {
+    std::lock_guard<std::mutex> lock(resampleMutex_);
+    invalidate_phase_slots();
+}
 
 RTA_EXPORT int rta_gpu_resample(const double* hist, int ch, long long histLen,
                                 const double* phases, int L, int T,
                                 const int* bases, const int* phIdx, long long nOut,
                                 double* outInterleaved)
 {
-    if (nOut <= 0 || ch <= 0 || T <= 0) return 0;
+    if (nOut <= 0 || ch <= 0 || T <= 0 || L <= 0) return 0;
+    std::lock_guard<std::mutex> lock(resampleMutex_);
 
     static double* d_hist = nullptr;
-    static double* d_phases = nullptr;
     static int*    d_bases = nullptr;
     static int*    d_phIdx = nullptr;
     static double* d_out = nullptr;
-    static long long capHist = 0, capPhases = 0, capN = 0;
+    static long long capHist = 0, capN = 0, capOut = 0;
 
     const long long needHist = (long long)ch * histLen;
     const long long needPh   = (long long)L * T;
+    const long long needOut  = nOut * (long long)ch;
 
     if (needHist > capHist) {
+        double* replacement = nullptr;
+        if (cudaMalloc(&replacement, needHist * sizeof(double)) != cudaSuccess) return -1;
         if (d_hist) cudaFree(d_hist);
-        if (cudaMalloc(&d_hist, needHist * sizeof(double)) != cudaSuccess) return -1;
+        d_hist = replacement;
         capHist = needHist;
     }
-    if (needPh > capPhases) {
-        if (d_phases) cudaFree(d_phases);
-        if (cudaMalloc(&d_phases, needPh * sizeof(double)) != cudaSuccess) return -1;
-        capPhases = needPh;
-    }
     if (nOut > capN) {
+        int* replacementBases = nullptr;
+        int* replacementPhIdx = nullptr;
+        if (cudaMalloc(&replacementBases, nOut * sizeof(int)) != cudaSuccess) return -1;
+        if (cudaMalloc(&replacementPhIdx, nOut * sizeof(int)) != cudaSuccess) {
+            cudaFree(replacementBases);
+            return -1;
+        }
+        // Commit the pair together. A failed second allocation must retain
+        // both old pointers and their common capacity for a smaller retry.
         if (d_bases) cudaFree(d_bases);
         if (d_phIdx) cudaFree(d_phIdx);
-        if (d_out)   cudaFree(d_out);
-        if (cudaMalloc(&d_bases, nOut * sizeof(int)) != cudaSuccess) return -1;
-        if (cudaMalloc(&d_phIdx, nOut * sizeof(int)) != cudaSuccess) return -1;
-        if (cudaMalloc(&d_out,   nOut * (long long)ch * sizeof(double)) != cudaSuccess) return -1;
+        d_bases = replacementBases;
+        d_phIdx = replacementPhIdx;
         capN = nOut;
+    }
+    // Output capacity counts samples, not frames: mono -> stereo can require
+    // growth even when the frame count stays the same (or decreases).
+    if (needOut > capOut) {
+        double* replacement = nullptr;
+        if (cudaMalloc(&replacement, needOut * sizeof(double)) != cudaSuccess) return -1;
+        if (d_out) cudaFree(d_out);
+        d_out = replacement;
+        capOut = needOut;
     }
 
     if (cudaMemcpy(d_hist, hist, needHist * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
-    // 相位表在整首歌里不变 —— 由 setup 函数预先上传一次即可。
-    {
-        static int cachedL = -1, cachedT = -1;
-        if (cachedL != L || cachedT != T || !phasesCached_) {
-            if (cudaMemcpy(d_phases, phases, needPh * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
-            cachedL = L; cachedT = T; phasesCached_ = true;
-        }
-    }
+    double* d_phases = acquire_phases(phases, (size_t)needPh);
+    if (!d_phases) return -1;
     if (cudaMemcpy(d_bases, bases, nOut * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
     if (cudaMemcpy(d_phIdx, phIdx, nOut * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return -1;
 
     const long long total = nOut * (long long)ch;
     const int threads = 256;
     const long long blocks = (total + threads - 1) / threads;
+    (void)cudaGetLastError(); // Clear earlier sticky errors before this launch.
     resample_kernel<<<(unsigned)blocks, threads>>>(d_hist, ch, histLen, d_phases, T,
                                                    d_bases, d_phIdx, nOut, d_out);
 

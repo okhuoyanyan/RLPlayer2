@@ -128,7 +128,10 @@ $srcs = @(
   (Join-Path $root 'src\gpu\gpu_resample_cuda.cu')
 )
 
-$nvArgs = @('-shared', '-cudart', 'static', '-O3', '-std=c++17', '-ccbin', $ccbin)
+# ★ 2026-10-31（DEBUG-DSP 检查 3，与 build_gpu.ps1 对称）：device 默认 --fmad=true，
+#   而 host 是 -ffp-contract=off ⟹ GPU 与 CPU 不逐位一致。实测 CUDA resample kernel
+#   默认有 5 条 fma.rn.f64，加 --fmad=false 后 0 条。
+$nvArgs = @('-shared', '-cudart', 'static', '-O3', '--fmad=false', '-std=c++17', '-ccbin', $ccbin)
 # 静态 CRT + 不做本机专属优化（分发基线）
 $nvArgs += @('-Xcompiler=/MT', '-Xcompiler=/O2', '-Xcompiler=/EHsc', '-Xcompiler=/utf-8')
 foreach ($sm in $archs) {

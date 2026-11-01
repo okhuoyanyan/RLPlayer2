@@ -41,7 +41,13 @@
 //      - 反馈累加器 w[n] 处于微幅线性区，7 阶在 DSD64 下亦能无过载稳定运行；
 //      - 带外噪声积分从 1-bit 的 -0.6 dB 降至 -37~-49 dB，极大减轻后级模拟滤波负担。
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（见该头注释）
+// ★ 2026-10-29（两轮审查 C02）：本头文件直接使用 uint64_t / uint32_t 等定长整数，
+//   必须**自己**包含 <cstdint>，不能依赖别的头偶然传递包含 —— 单独编译本头的最小 TU
+//   在 AMD Clang19/Linux 上曾因此报 6 个错误（评审 original_tests/modulator.compile.log）。
+#include <cstdint>
 #include "kaiser.h"
+#include "sdm_sections.h"
 #include <vector>
 #include <complex>
 #include <cmath>
@@ -49,8 +55,20 @@
 #include <string>
 #include <algorithm>
 #include <cstddef>
+#if defined(RTA_SDM_STEREO_DIAGNOSTICS)
+#include <atomic>
+#endif
+#if !defined(RTA_DISABLE_SDM_STEREO_SIMD) && (defined(__SSE2__) || defined(_M_X64))
+#include <emmintrin.h>
+#endif
 
 namespace rta::dsp {
+#if defined(RTA_SDM_STEREO_DIAGNOSTICS)
+// Evidence builds only. One relaxed update per completed stereo block; no
+// production CMake definition, no per-sample atomics or audio-path settings.
+inline std::atomic<uint64_t> sdmStereoDiagnosticFrames{0};
+inline std::atomic<uint64_t> sdmStereoDitherDiagnosticFrames{0};
+#endif
 
 inline bool mod_finite_bits_u64(uint64_t b) {
     return ((b >> 52) & 0x7FFull) != 0x7FFull;
@@ -97,6 +115,7 @@ struct NtfPoly {
     std::vector<double> d;   // 分母，d[0] = 1
     std::vector<double> p;   // P = B - D（p[0] = 0，严格真）
     int order = 0;
+    SdmNtfSections sections; // Present only for the factor-preserving realization.
 };
 
 // 经典数字 Butterworth 高通 NTF
@@ -196,6 +215,7 @@ inline NtfPoly design_chebyshev_ntf_poly(int order, double fcHz, double fs, doub
 
 // NTF 在归一化频率（1.0 = Nyquist）上的线性增益
 inline double ntf_gain_lin(const NtfPoly& n, double freqNorm) {
+    if (n.sections.count) return n.sections.gain(freqNorm);
     const double w = kPi * freqNorm;
     std::complex<double> num(0.0, 0.0), den(0.0, 0.0);
     for (size_t k = 0; k < n.b.size(); ++k) num += n.b[k] * std::polar(1.0, -w * (double)k);
@@ -423,8 +443,18 @@ inline constexpr double kSdm1bitHinfMax   = 1.36;    // |NTF|∞ 上限（线性
 inline constexpr double kSdm1bitRootMax   = 0.999;   // D(z) 最大根半径上限（退化网）
 inline constexpr double kSdmHighOrderMinOsr = 128.0; // 1-bit 7 阶的质量门（OSR = fs/2fB）
 
+inline double ntf_max_root_radius(const NtfPoly& n) {
+    return n.sections.count ? n.sections.max_radius() : ntf_max_root_radius(n.d);
+}
+
+inline NtfPoly design_sdm_ntf(int order, double cutoff, double fs) {
+    auto n=design_ntf_poly(order, cutoff, fs);
+    if (order==7 && fs>=40000000.0) n.sections=SdmNtfSections::butterworth(order,cutoff,fs);
+    return n;
+}
+
 inline bool sdm_1bit_ntf_ok(const NtfPoly& n) {
-    return ntf_hinf_lin(n) <= kSdm1bitHinfMax && ntf_max_root_radius(n.d) <= kSdm1bitRootMax;
+    return ntf_hinf_lin(n) <= kSdm1bitHinfMax && ntf_max_root_radius(n) <= kSdm1bitRootMax;
 }
 
 // 该采样率下【实际可用】的调制器阶数（= 构造函数内部判据的廉价预估版；权威判定在
@@ -439,9 +469,11 @@ inline int stable_sdm_order(int requested, double fs, int levels = 2, ModulatorF
     //    Chebyshev 族的极点阻尼按 oobGainDb 固定，7 阶在四档速率的 |NTF|∞ 为
     //    1.08~1.89、根半径 0.985~0.998，且带内噪声比 5 阶差 17~27 dB ⟹ 1-bit 不提供 7 阶。
     if (family == ModulatorFamily::Chebyshev) return 5;
+    // DSD1024 uses a factor-preserving realization; retain the design guard.
     //    Dsd 族的 corner 是绝对频率（cutoffHz），|NTF|∞ 随 fs 变化，用文档默认
     //    corner=100 kHz 预检（构造函数会用调用方实际参数再检一次）。
-    if (family == ModulatorFamily::Dsd && !sdm_1bit_ntf_ok(design_ntf_poly(want, 100000.0, fs))) return 5;
+    if ((family == ModulatorFamily::Dsd || family == ModulatorFamily::Ahm) &&
+        !sdm_1bit_ntf_ok(design_sdm_ntf(want, 100000.0, fs))) return 5;
     // ② 质量门：EC 族 |NTF|∞ 被综合钉在预算 1.35 ≤ 1.36，稳定性恒过；但实测
     //    DSD64（OSR≈70）上 7 阶的带内噪声比 5 阶**差 6.5 dB**（-90.2 vs -96.7 dBFS），
     //    从 DSD128 起才打平/互有胜负 ⟹ 默认只在 OSR ≥ 128 时用 7 阶。
@@ -449,12 +481,39 @@ inline int stable_sdm_order(int requested, double fs, int levels = 2, ModulatorF
     return want;
 }
 
-// 调制器前级余量（dB，<=0）
+// ★ 2026-10-31（稳定性矩阵实测，tools/sdm_matrix.cpp）：**1-bit 调制器的安全峰值随速率变**。
+//
+// 矩阵（稳态最后 0.5 s 的限幅次数，0 = 干净）实测：
+//   0.50（−6.0 dBFS）：DSD/EC/AHM 全速率都是 0；**Chebyshev@DSD64 仍有 5 次**；
+//   0.45：该 1981 Hz 单音矩阵全部族 × 全部速率都是 0；这是经验工作点，不是任意输入的稳定性证明。
+//   0.62（−4.2 dBFS）：DSD5@DSD64 = 8 次、Cheb5@DSD64 = 11061 次，DSD128 起才全部为 0；
+//   0.80（−1.9 dBFS）：几乎全线失守；1.00（0 dBFS）：全线 10 万~250 万次（必然削波）。
+//
+// 所以旧默认 target=0.62 在 **DSD64** 上正好压在稳定边界上 —— 5 阶 @ OSR=64 余量本来就小。
+// 处理：按速率给目标峰值，DSD64（< 4 MHz）取 0.45，其余保持 0.62。
+// 代价：DSD64 比旧 0.62 工作点低 2.78 dB；已测带限刺激零限幅，不承诺任意波形均安全。
+// 2026-10-31 审计边界：峰值 0.45 的全带白噪（含超声能量）在 DSD64 最后 0.1 s 内
+// DSD5/Cheb5 仍有 6/148 次限幅。不能把单音余量外推为无条件保证；目标值不因此盲改。
+inline double sdm_target_peak(double fs) {
+    // 0.50 对 DSD5/EC5/AHM8 已经干净，但 Chebyshev 5 阶 @DSD64 在 0.50 仍有 5 次
+    // （Chebyshev NTF 的 |NTF|∞ 更高）。取 0.45 覆盖该单音矩阵的全部族；DSD64 再多 0.9 dB 衰减。
+    // fs <= 0（未知速率）取**保守**的一档 0.45 —— 宁可多衰减 1.9 dB，也不要在 DSD64 上偶发限幅。
+    // （DEBUG-SDM 报告 G-3：旧写法把 0 归到 0.62，是更不保守的那一侧。）
+    return (fs <= 0.0 || fs < 4000000.0) ? 0.45 : 0.62;   // < 4 MHz ≈ DSD64 及以下
+}
+
+// 调制器前级余量（dB，<=0）。target 省略时按 0.62（DSD128 及以上的实测安全点）；
+// **DSD64 必须用带 fs 的重载**，否则会落在稳定边界上。
 inline double sdm_headroom_db(double peak, double target = 0.62, double marginDb = 0.2) {
     if (peak <= 0.0) return 0.0;
     const double g = target / peak;
     if (g >= 1.0) return 0.0;
     return 20.0 * std::log10(g) - marginDb;
+}
+
+// 按调制器采样率自动选目标峰值（推荐入口）。
+inline double sdm_headroom_db_for_fs(double peak, double fs, double marginDb = 0.2) {
+    return sdm_headroom_db(peak, sdm_target_peak(fs), marginDb);
 }
 
 struct SdmConfig {
@@ -476,6 +535,18 @@ struct SdmConfig {
     // 7 阶出现 26 次轨饱和、1.50 时 5.9 万次。SNR 全线（DSD64 105 / DSD256 105 /
     // DSD512 121~127 dB）且跨速率方差最小。
     double ntfHinf      = 1.35;
+    // ★ 2026-10-29（两轮审查 F03）：输出通道能力声明 —— true = 下游只能接 1-bit。
+    //
+    // 为什么需要它：AHM 族的电平数由 ahmBits 决定（1<<b，默认 256 电平），与 cfg.levels
+    // 无关。而本项目的 DoP / ASIO LSB1、MSB1 输出只能承载 1-bit 流，dop_pack() 只取符号 ⟹
+    // 恒定输入 0.2 经过 256 电平 AHM 再取符号，解包后均值是 1.0（直流 +1），
+    // marker 却完全合法 —— 这是一条"看起来成功、声音全错"的路径。
+    //
+    // 现在的契约：1-bit 输出路径必须置 oneBitOutput=true，此时 AHM 按【同一个 NTF】
+    // 的 1-bit 量化运行（等价于 DSD 标准族，因为 designNtf 里 AHM 与 Dsd 用的是同一条
+    // design_ntf_poly），并通过 levelsClamped()/levelsClampReason() 如实上报降级，
+    // 绝不静默换族、也绝不把多电平流当 1-bit 发出去。
+    bool   oneBitOutput = false;
     // 诊断/测试专用：true = 跳过 1-bit 高阶降阶守卫，按请求阶数原样运行。
     // 生产链路绝不应置 true —— 守卫的职责是不把未通过稳定性体检的 NTF 送上输出。
     // 存在的理由是「阶数 × 速率」矩阵必须能实测被守卫拒掉的那些格子（铁律 3/4）。
@@ -496,6 +567,15 @@ public:
             if (b < 2) b = 8;
             if (b > 16) b = 16;
             levels_ = 1 << b;
+            // ★ F03：下游只接 1-bit 时必须降到 2 电平，并留下可查的原因。
+            if (cfg_.oneBitOutput && levels_ != 2) {
+                levelsClampReason_ = "AHM 请求 " + std::to_string(levels_) +
+                    " 电平（ahmBits=" + std::to_string(b) +
+                    "），但本次输出是 1-bit（DoP / 原生 DSD）⟹ "
+                    "按同一条 NTF 的 1-bit 量化运行（等效 DSD 标准族）。要真正听多电平请等"
+                    "多电平输出通路；当前不会把多电平流按符号伪装成 1-bit。";
+                levels_ = 2;
+            }
         } else {
             levels_ = cfg_.levels < 2 ? 2 : cfg_.levels;
         }
@@ -509,7 +589,7 @@ public:
                 // cfg_.ntfHinf ⟹ 稳定性随预算可控，不再依赖采样率硬门。
                 return synthesize_ntf(ord, cfg_.fs, 20000.0, cfg_.ntfHinf);
             }
-            return design_ntf_poly(ord, cfg_.cutoffHz, cfg_.fs);
+            return design_sdm_ntf(ord, cfg_.cutoffHz, cfg_.fs);
         };
         auto isEc = [&]() { return cfg_.family == ModulatorFamily::Ec || cfg_.ecCorrection; };
 
@@ -538,7 +618,7 @@ public:
         //      比 5 阶差 6.5 dB，故默认 OSR<128 时仍降 5 阶 —— 这是质量取舍，不是稳定性。
         if (effectiveOrder_ >= 7 && levels_ == 2 && !cfg_.bypassOrderGuard) {
             const double hinf = ntf_hinf_lin(ntf_);
-            const double rad  = ntf_max_root_radius(ntf_.d);
+            const double rad  = ntf_max_root_radius(ntf_);
             const double osr  = cfg_.fs / (2.0 * 20000.0);
             char buf[256];
             bool down = false;
@@ -567,17 +647,21 @@ public:
         if (isEc()) hinfUsed_ = ntf_hinf_lin(ntf_);
 
         const size_t sz = (size_t)effectiveOrder_ + 1;
-        eBuf_.assign(sz, 0.0);
-        wBuf_.assign(sz, 0.0);
+        for (auto& v : eHist_) v = 0.0;
+        for (auto& v : wHist_) v = 0.0;
     }
 
     const NtfPoly& ntf() const { return ntf_; }
     int order() const { return cfg_.order; }
     int effectiveOrder() const { return effectiveOrder_; }
+    bool uses_sections() const { return ntf_.sections.count != 0; }
     bool steppedDown() const { return steppedDown_; }
     const std::string& stepDownReason() const { return stepDownReason_; }
     ModulatorFamily family() const { return cfg_.family; }
     int levels() const { return levels_; }
+    // ★ F03：多电平被降成 1-bit 时非空（给信号链 / 日志用，不许静默）
+    bool levels_clamped() const { return !levelsClampReason_.empty(); }
+    const std::string& levels_clamp_reason() const { return levelsClampReason_; }
     // EC 族综合后实际命中的 H∞（其它族 = -1）。供测试/信号链核对设计预算有没有被
     // 二分过程打穿（正常应 ≈ cfg.ntfHinf，偏差 < 0.05）。
     double ntf_hinf_used() const { return hinfUsed_; }
@@ -589,15 +673,21 @@ public:
         const size_t sz = (size_t)effectiveOrder_ + 1;
 
         // w[n]：只用到 e[n-1..] 与 w[n-1..]
+        // ★ 2026-10-31（性能，审核报 DSD512/1024 不足 1× 实时）：
+        //   旧写法每个抽头都要一次 `% sz` 取环形缓冲，每样本 12 次整数除法。
+        //   实测 DSD1024 只有 0.488× 实时 —— 瓶颈就在这里（整数除法 ~20-30 周期）。
+        //   改成**倒序线性历史**：eHist_[0] = e[n-1]、eHist_[1] = e[n-2]…，插入时整体后移。
+        //   阶数 ≤ 8，移位是 8 次 store，比 12 次除法便宜一个数量级。
         double acc = 0.0;
-        for (size_t k = 1; k < sz; ++k)
-            acc += ntf_.p[k] * eBuf_[(epos_ + sz - k) % sz];
-        for (size_t k = 1; k < sz; ++k)
-            acc -= ntf_.d[k] * wBuf_[(wpos_ + sz - k) % sz];
+        if (uses_sections()) acc=sectionState_.feedback(ntf_.sections.count);
+        else {
+            for (size_t k = 1; k < sz; ++k) acc += ntf_.p[k] * eHist_[k - 1];
+            for (size_t k = 1; k < sz; ++k) acc -= ntf_.d[k] * wHist_[k - 1];
+        }
 
         // 防 NaN/Inf：坏 IR/EQ 或上游错误不能把环路历史永久污染成噪音。
         { uint64_t ab = 0; std::memcpy(&ab, &acc, sizeof(ab));
-          if (!mod_finite_bits_u64(ab)) { acc = 0.0; wBuf_[wpos_] = 0.0; } }
+          if (!mod_finite_bits_u64(ab)) { acc = 0.0; wHist_[0] = 0.0; sectionState_.reset(); } }
         double u = x + acc;
         { uint64_t ub = 0; std::memcpy(&ub, &u, sizeof(ub));
           if (!mod_finite_bits_u64(ub)) { u = 0.0; ++nonFinite_; } }
@@ -629,10 +719,11 @@ public:
         if (levels_ == 2) {
             y = (u >= 0.0) ? 1.0 : -1.0;
         } else {
-            const double step = 2.0 / (double)(levels_ - 1);
-            y = step * std::round(u / step);
-            if (y >  1.0) y =  1.0;
-            if (y < -1.0) y = -1.0;
+            // Offset the index grid: even L has exactly L equally spaced levels
+            // including +/-1, with no extra zero level. Keep 1-bit separate above.
+            const double last = (double)(levels_ - 1);
+            const double index = std::clamp(std::round((u + 1.0) * (0.5 * last)), 0.0, last);
+            y = 2.0 * index / last - 1.0;
         }
 
         double e = y - u;
@@ -641,28 +732,432 @@ public:
         if (e < -eMax) { e = -eMax; ++clamped_; }
         e += dith;   // ★ 抖动只进比较器不进误差 ⟹ 进历史前补回（见上方注入点注释；钳位语义不变）
 
-        eBuf_[epos_] = e; epos_ = (epos_ + 1) % sz;
-        wBuf_[wpos_] = acc; wpos_ = (wpos_ + 1) % sz;
+        if (uses_sections()) sectionState_.advance(ntf_.sections,e);
+        else {
+        for (size_t k = sz - 1; k > 0; --k) { eHist_[k] = eHist_[k - 1]; wHist_[k] = wHist_[k - 1]; }
+        eHist_[0] = e; wHist_[0] = acc;
+        }
         return y;
     }
 
+    // Compile-time order dispatch occurs once per block. The scalar process()
+    // remains the independent reference; expression/order/guards are identical.
+    // Sink receives the local block index and the actual quantizer output.
+    template<class Sink>
+    void process_block(const double* input, size_t frames, Sink&& sink) {
+        if (uses_sections()) {
+            for (size_t i=0;i<frames;++i) sink(i,process(input[i]));
+            return;
+        }
+        switch (effectiveOrder_) {
+            case 1: return process_block_order<1>(input, frames, sink);
+            case 2: return process_block_order<2>(input, frames, sink);
+            case 3: return process_block_order<3>(input, frames, sink);
+            case 4: return process_block_order<4>(input, frames, sink);
+            case 5: return process_block_order<5>(input, frames, sink);
+            case 6: return process_block_order<6>(input, frames, sink);
+            case 7: return process_block_order<7>(input, frames, sink);
+            case 8: return process_block_order<8>(input, frames, sink);
+            default:
+                for (size_t i = 0; i < frames; ++i) sink(i, process(input[i]));
+        }
+    }
+
+    // Fast streaming path: private working state stays local during the block.
+    // Sink must not inspect/mutate this modulator or re-enter it. State commits
+    // on normal return and before propagating a sink exception. Scalar process
+    // remains the independent numerical reference and the general fallback.
+    template<class Sink>
+    void process_binary_block(const double* input, size_t frames, Sink&& sink) {
+        if (!uses_sections() && levels_ == 2 && (effectiveOrder_ == 5 || effectiveOrder_ == 7)) {
+            if (effectiveOrder_ == 5) {
+                if (cfg_.ditherLsb > 0.0) return process_binary_local<5, true>(input, frames, sink);
+                return process_binary_local<5, false>(input, frames, sink);
+            }
+            if (cfg_.ditherLsb > 0.0) return process_binary_local<7, true>(input, frames, sink);
+            return process_binary_local<7, false>(input, frames, sink);
+        }
+        for (size_t i = 0; i < frames; ++i) sink(i, process(input[i]));
+    }
+
+#if !defined(RTA_DISABLE_SDM_STEREO_SIMD) && (defined(__SSE2__) || defined(_M_X64))
+
+    // One SSE2 lane per independent channel. Returns false
+    // without consuming input for unsupported configurations. Sink must not
+    // reenter either modulator. A throwing sink consumes the current stereo
+    // sample and commits both histories before propagating the exception.
+    // Sink receives (index, bool leftPositive, bool rightPositive): the output
+    // type enforces the binary transport contract after the levels check.
+    template <class Sink>
+    static bool
+    try_process_binary_stereo_bits_block(SdmModulator &a, SdmModulator &b,
+                                    const double *x, const double *z,
+                                    size_t frames, Sink &&sink) {
+      if (&a == &b || a.levels_ != 2 || b.levels_ != 2 ||
+          a.effectiveOrder_ != b.effectiveOrder_)
+        return false;
+      if (a.uses_sections() || b.uses_sections()) {
+        if (a.ntf_.sections.count!=4 || b.ntf_.sections.count!=4) return false;
+        process_binary_stereo_dispatch<7,true>(a,b,x,z,frames,sink);
+        return true;
+      }
+      if (a.effectiveOrder_ == 5) {
+        process_binary_stereo_dispatch<5>(a, b, x, z, frames, sink);
+        return true;
+      }
+      if (a.effectiveOrder_ == 7) {
+        process_binary_stereo_dispatch<7>(a, b, x, z, frames, sink);
+        return true;
+      }
+      return false;
+    }
+#endif
+
+#if defined(RTA_SDM_STEREO_DIAGNOSTICS)
+    static uint64_t stereo_simd_frames_for_diagnostics() {
+        return sdmStereoDiagnosticFrames.load(std::memory_order_relaxed);
+    }
+    static uint64_t stereo_simd_dither_frames_for_diagnostics() {
+        return sdmStereoDitherDiagnosticFrames.load(std::memory_order_relaxed);
+    }
+#endif
+
     void reset() {
-        std::fill(eBuf_.begin(), eBuf_.end(), 0.0);
-        std::fill(wBuf_.begin(), wBuf_.end(), 0.0);
-        epos_ = wpos_ = 0; clamped_ = 0; overload_ = 0; nonFinite_ = 0;
+        sectionState_.reset();
+        for (auto& v : eHist_) v = 0.0;
+        for (auto& v : wHist_) v = 0.0;
+        clamped_ = 0; overload_ = 0; nonFinite_ = 0;
     }
 
 private:
+#if !defined(RTA_DISABLE_SDM_STEREO_SIMD) && (defined(__SSE2__) || defined(_M_X64))
+    template <size_t N, bool Sections=false, class Sink>
+    static void process_binary_stereo_dispatch(SdmModulator& a, SdmModulator& b,
+            const double* x, const double* z, size_t frames, Sink& sink) {
+        if (a.cfg_.ditherLsb > 0.0) {
+            if (b.cfg_.ditherLsb > 0.0) return process_binary_stereo_local<N, true, true, Sections>(a,b,x,z,frames,sink);
+            return process_binary_stereo_local<N, true, false, Sections>(a,b,x,z,frames,sink);
+        }
+        if (b.cfg_.ditherLsb > 0.0) return process_binary_stereo_local<N, false, true, Sections>(a,b,x,z,frames,sink);
+        return process_binary_stereo_local<N, false, false, Sections>(a,b,x,z,frames,sink);
+    }
+    template <size_t N, bool DitherLeft, bool DitherRight, bool Sections, class Sink>
+    static void process_binary_stereo_local(SdmModulator &a, SdmModulator &b,
+                                            const double *x, const double *z,
+                                            size_t frames, Sink &sink) {
+      __m128d eh[N + 1], wh[N + 1], pc[N + 1], dc[N + 1], gc1[4],gc2[4];
+      if constexpr (Sections) {
+        for (size_t k=0;k<4;++k) {
+          eh[k]=_mm_set_pd(b.sectionState_.z1[k],a.sectionState_.z1[k]);
+          wh[k]=_mm_set_pd(b.sectionState_.z2[k],a.sectionState_.z2[k]);
+          const auto& ca=a.ntf_.sections.c[k]; const auto& cb=b.ntf_.sections.c[k];
+          pc[k]=_mm_set_pd(cb.a1,ca.a1); dc[k]=_mm_set_pd(cb.a2,ca.a2);
+          gc1[k]=_mm_set_pd(cb.g1,ca.g1); gc2[k]=_mm_set_pd(cb.g2,ca.g2);
+        }
+      } else for (size_t k = 0; k <= N; ++k) {
+        eh[k] = _mm_set_pd(b.eHist_[k], a.eHist_[k]);
+        wh[k] = _mm_set_pd(b.wHist_[k], a.wHist_[k]);
+        pc[k] = _mm_set_pd(b.ntf_.p[k], a.ntf_.p[k]);
+        dc[k] = _mm_set_pd(b.ntf_.d[k], a.ntf_.d[k]);
+      }
+      const auto zero = _mm_setzero_pd(), one = _mm_set1_pd(1.),
+                 minus = _mm_set1_pd(-1.);
+      // Intrinsics may have been parsed by windows.h before fp_strict.h.
+      // Their inlined bodies can retain fast-math reassociation flags. These
+      // local vector expressions are parsed under the actual DSP strict scope.
+      const auto strictAdd = [](__m128d l, __m128d r) {
+#if defined(__clang__)
+#pragma clang fp reassociate(off) contract(off) reciprocal(off)
+        return (__m128d)((__v2df)l + (__v2df)r);
+#else
+        return _mm_add_pd(l, r);
+#endif
+      };
+      const auto strictSub = [](__m128d l, __m128d r) {
+#if defined(__clang__)
+#pragma clang fp reassociate(off) contract(off) reciprocal(off)
+        return (__m128d)((__v2df)l - (__v2df)r);
+#else
+        return _mm_sub_pd(l, r);
+#endif
+      };
+      const auto strictMul = [](__m128d l, __m128d r) {
+#if defined(__clang__)
+#pragma clang fp reassociate(off) contract(off) reciprocal(off)
+        return (__m128d)((__v2df)l * (__v2df)r);
+#else
+        return _mm_mul_pd(l, r);
+#endif
+      };
+      auto select = [](__m128d mask, __m128d yes, __m128d no) {
+        return _mm_or_pd(_mm_and_pd(mask, yes), _mm_andnot_pd(mask, no));
+      };
+      // Exponent-all-ones mask: one full 64-bit mask per non-finite lane.
+      auto nonFiniteMask = [](__m128d v) {
+        auto exp = _mm_and_si128(_mm_castpd_si128(v),
+                                 _mm_set1_epi64x(0x7ff0000000000000ll));
+        auto cmp = _mm_cmpeq_epi32(exp, _mm_set1_epi64x(0x7ff0000000000000ll));
+        return _mm_castsi128_pd(
+            _mm_shuffle_epi32(cmp, _MM_SHUFFLE(3, 3, 1, 1)));
+      };
+      auto count = [](int mask, long long &ca, long long &cb) {
+        if (mask & 1)
+          ++ca;
+        if (mask & 2)
+          ++cb;
+      };
+      auto rngLeft = a.s_, rngRight = b.s_;
+      auto clampedLeft = a.clamped_, clampedRight = b.clamped_;
+      auto overloadedLeft = a.overload_, overloadedRight = b.overload_;
+      auto badLeft = a.nonFinite_, badRight = b.nonFinite_;
+      const double ditherLeft = a.cfg_.ditherLsb, ditherRight = b.cfg_.ditherLsb;
+      const auto rngNext = [](uint64_t& rng) {
+        rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27;
+        return rng * 2685821657736338717ull;
+      };
+      const auto commit = [&] {
+        if constexpr (Sections) {
+          for (size_t k=0;k<4;++k) {
+            a.sectionState_.z1[k]=_mm_cvtsd_f64(eh[k]);
+            b.sectionState_.z1[k]=_mm_cvtsd_f64(_mm_unpackhi_pd(eh[k],eh[k]));
+            a.sectionState_.z2[k]=_mm_cvtsd_f64(wh[k]);
+            b.sectionState_.z2[k]=_mm_cvtsd_f64(_mm_unpackhi_pd(wh[k],wh[k]));
+          }
+        } else for (size_t k = 0; k <= N; ++k) {
+          a.eHist_[k] = _mm_cvtsd_f64(eh[k]);
+          b.eHist_[k] = _mm_cvtsd_f64(_mm_unpackhi_pd(eh[k], eh[k]));
+          a.wHist_[k] = _mm_cvtsd_f64(wh[k]);
+          b.wHist_[k] = _mm_cvtsd_f64(_mm_unpackhi_pd(wh[k], wh[k]));
+        }
+        a.s_ = rngLeft; b.s_ = rngRight;
+        a.clamped_ = clampedLeft; b.clamped_ = clampedRight;
+        a.overload_ = overloadedLeft; b.overload_ = overloadedRight;
+        a.nonFinite_ = badLeft; b.nonFinite_ = badRight;
+      };
+      try {
+        for (size_t i = 0; i < frames; ++i) {
+          // Keep the scalar p-term sum, then d-term subtraction order.
+          // Do not reassociate these operations or contract them into FMA.
+          auto acc = zero;
+          if constexpr (Sections) {
+            for (size_t k=0;k<4;++k) acc=strictAdd(acc,eh[k]);
+          } else {
+            for (size_t k = 1; k <= N; ++k)
+              acc = strictAdd(acc, strictMul(pc[k], eh[k - 1]));
+            for (size_t k = 1; k <= N; ++k)
+              acc = strictSub(acc, strictMul(dc[k], wh[k - 1]));
+          }
+          auto bad = nonFiniteMask(acc);
+          if (_mm_movemask_pd(bad)) {
+            acc = _mm_andnot_pd(bad, acc);
+            if constexpr (Sections) {
+              for (size_t k=0;k<4;++k) { eh[k]=_mm_andnot_pd(bad,eh[k]); wh[k]=_mm_andnot_pd(bad,wh[k]); }
+            } else wh[0] = _mm_andnot_pd(bad, wh[0]);
+          }
+          auto u = strictAdd(_mm_set_pd(z[i], x[i]), acc);
+          bad = nonFiniteMask(u);
+          if (int mask = _mm_movemask_pd(bad)) {
+            u = _mm_andnot_pd(bad, u);
+            count(mask, badLeft, badRight);
+          }
+          auto hi = _mm_cmpgt_pd(u, _mm_set1_pd(1.5));
+          auto lo = _mm_cmplt_pd(u, _mm_set1_pd(-1.5));
+          if (int mask = _mm_movemask_pd(_mm_or_pd(hi, lo))) {
+            count(mask, overloadedLeft, overloadedRight);
+            u = select(hi, _mm_set1_pd(1.5), u);
+            u = select(lo, _mm_set1_pd(-1.5), u);
+          }
+          double dl = 0.0, dr = 0.0;
+          if constexpr (DitherLeft)
+            dl = ditherLeft * 2.0 * ((double)(rngNext(rngLeft) >> 11) / 9007199254740992.0 - 0.5);
+          if constexpr (DitherRight)
+            dr = ditherRight * 2.0 * ((double)(rngNext(rngRight) >> 11) / 9007199254740992.0 - 0.5);
+          const auto dith = _mm_set_pd(dr, dl);
+          if constexpr (DitherLeft || DitherRight) {
+            const auto dithered = strictAdd(u, dith);
+            if constexpr (DitherLeft && DitherRight) u = dithered;
+            else if constexpr (DitherLeft) u = _mm_move_sd(u, dithered);
+            else u = _mm_move_sd(dithered, u);
+            hi = _mm_cmpgt_pd(u, _mm_set1_pd(1.5));
+            lo = _mm_cmplt_pd(u, _mm_set1_pd(-1.5));
+            if (int mask = _mm_movemask_pd(_mm_or_pd(hi, lo))) {
+              count(mask, overloadedLeft, overloadedRight);
+              u = select(hi, _mm_set1_pd(1.5), u);
+              u = select(lo, _mm_set1_pd(-1.5), u);
+            }
+          }
+          const auto positive = _mm_cmpge_pd(u, zero);
+          auto y = select(positive, one, minus);
+          auto e = strictSub(y, u);
+          hi = _mm_cmpgt_pd(e, _mm_set1_pd(2.5));
+          lo = _mm_cmplt_pd(e, _mm_set1_pd(-2.5));
+          if (int mask = _mm_movemask_pd(_mm_or_pd(hi, lo))) {
+            count(mask, clampedLeft, clampedRight);
+            e = select(hi, _mm_set1_pd(2.5), e);
+            e = select(lo, _mm_set1_pd(-2.5), e);
+          }
+          // Match scalar feedback correction, including +0.0 signed-zero behavior.
+          e = strictAdd(e, dith);
+          if constexpr (Sections) {
+            for (size_t k=0;k<4;++k) {
+              auto out=strictAdd(e,eh[k]);
+              auto next1=strictAdd(strictSub(strictMul(gc1[k],e),strictMul(pc[k],eh[k])),wh[k]);
+              auto next2=strictSub(strictMul(gc2[k],e),strictMul(dc[k],eh[k]));
+              eh[k]=next1; wh[k]=next2; e=out;
+            }
+          } else {
+            for (size_t k = N; k > 0; --k) {
+              eh[k] = eh[k - 1]; wh[k] = wh[k - 1];
+            }
+            eh[0] = e; wh[0] = acc;
+          }
+          const int bits = _mm_movemask_pd(positive);
+          sink(i, (bits & 1) != 0, (bits & 2) != 0);
+        }
+      } catch (...) {
+        commit();
+        throw;
+      }
+      commit();
+#if defined(RTA_SDM_STEREO_DIAGNOSTICS)
+      sdmStereoDiagnosticFrames.fetch_add(frames, std::memory_order_relaxed);
+      if constexpr (DitherLeft || DitherRight)
+        sdmStereoDitherDiagnosticFrames.fetch_add(frames, std::memory_order_relaxed);
+#endif
+    }
+
+#endif
+    template<size_t N, bool Dither, class Sink>
+    void process_binary_local(const double* input, size_t frames, Sink& sink) {
+        double eh[N + 1], wh[N + 1], pc[N + 1], dc[N + 1];
+        for (size_t k = 0; k <= N; ++k) {
+            eh[k] = eHist_[k]; wh[k] = wHist_[k];
+            pc[k] = ntf_.p[k]; dc[k] = ntf_.d[k];
+        }
+        auto rng = s_;
+        auto clipped = clamped_, overloaded = overload_, bad = nonFinite_;
+        const double ditherLsb = cfg_.ditherLsb;
+        const auto commit = [&] {
+            for (size_t k = 0; k <= N; ++k) { eHist_[k] = eh[k]; wHist_[k] = wh[k]; }
+            s_ = rng; clamped_ = clipped; overload_ = overloaded; nonFinite_ = bad;
+        };
+        try {
+            for (size_t i = 0; i < frames; ++i) {
+                double acc = 0.0;
+                for (size_t k = 1; k <= N; ++k) acc += pc[k] * eh[k - 1];
+                for (size_t k = 1; k <= N; ++k) acc -= dc[k] * wh[k - 1];
+                { uint64_t bits; std::memcpy(&bits, &acc, sizeof(bits));
+                  if (!mod_finite_bits_u64(bits)) { acc = 0.0; wh[0] = 0.0; } }
+                double u = input[i] + acc;
+                { uint64_t bits; std::memcpy(&bits, &u, sizeof(bits));
+                  if (!mod_finite_bits_u64(bits)) { u = 0.0; ++bad; } }
+                if (u > 1.5) { u = 1.5; ++overloaded; }
+                if (u < -1.5) { u = -1.5; ++overloaded; }
+                double dith = 0.0;
+                if constexpr (Dither) {
+                    rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27;
+                    const uint64_t next = rng * 2685821657736338717ull;
+                    dith = ditherLsb * 2.0 * ((double)(next >> 11) / 9007199254740992.0 - 0.5);
+                    u += dith;
+                    if (u > 1.5) { u = 1.5; ++overloaded; }
+                    if (u < -1.5) { u = -1.5; ++overloaded; }
+                }
+                const double y = (u >= 0.0) ? 1.0 : -1.0;
+                double e = y - u;
+                if (e > 2.5) { e = 2.5; ++clipped; }
+                if (e < -2.5) { e = -2.5; ++clipped; }
+                e += dith;
+                for (size_t k = N; k > 0; --k) { eh[k] = eh[k - 1]; wh[k] = wh[k - 1]; }
+                eh[0] = e; wh[0] = acc;
+                sink(i, y);
+            }
+        } catch (...) { commit(); throw; }
+        commit();
+    }
+
+    template<size_t N, class Sink>
+    void process_block_order(const double* input, size_t frames, Sink& sink) {
+        for (size_t i = 0; i < frames; ++i) sink(i, process_order<N>(input[i]));
+    }
+
+    template<size_t N>
+    double process_order(double x) {
+        constexpr size_t sz = N + 1;
+
+        // w[n]：只用到 e[n-1..] 与 w[n-1..]
+        // ★ 2026-10-31（性能，审核报 DSD512/1024 不足 1× 实时）：
+        //   旧写法每个抽头都要一次 `% sz` 取环形缓冲，每样本 12 次整数除法。
+        //   实测 DSD1024 只有 0.488× 实时 —— 瓶颈就在这里（整数除法 ~20-30 周期）。
+        //   改成**倒序线性历史**：eHist_[0] = e[n-1]、eHist_[1] = e[n-2]…，插入时整体后移。
+        //   阶数 ≤ 8，移位是 8 次 store，比 12 次除法便宜一个数量级。
+        double acc = 0.0;
+        for (size_t k = 1; k < sz; ++k) acc += ntf_.p[k] * eHist_[k - 1];
+        for (size_t k = 1; k < sz; ++k) acc -= ntf_.d[k] * wHist_[k - 1];
+
+        // 防 NaN/Inf：坏 IR/EQ 或上游错误不能把环路历史永久污染成噪音。
+        { uint64_t ab = 0; std::memcpy(&ab, &acc, sizeof(ab));
+          if (!mod_finite_bits_u64(ab)) { acc = 0.0; wHist_[0] = 0.0; } }
+        double u = x + acc;
+        { uint64_t ub = 0; std::memcpy(&ub, &u, sizeof(ub));
+          if (!mod_finite_bits_u64(ub)) { u = 0.0; ++nonFinite_; } }
+
+        // 环路限幅器：允许内部瞬时过冲，绝不发散
+        const double uLim = 1.5;
+        if (u >  uLim) { u =  uLim; ++overload_; }
+        if (u < -uLim) { u = -uLim; ++overload_; }
+
+        // ★ 抖动注入点（2026-10-25 修复，探针实测定位）：
+        // 抖动必须加在【比较器输入】（去相关量化噪声、打散空闲音），但必须从
+        // 【反馈误差】中扣除。旧实现 e = y - u（含抖动），代数上
+        //   Y(z) = X(z) + D(z) + NTF(z)·E(z)
+        // ——抖动项 D 以增益 1 直达输出、完全未被整形。实测后果：ditherLsb=0.0005
+        // 把 EC-7@DSD256 的带内底噪从 -123.9 dB 抬到 -92.2 dB，且与阶数/零点优化
+        // 完全无关（所有 1-bit 族卡在 ~86 dB、每倍采样率恰 +3 dB 的白噪声签名）。
+        // 正确写法：u = x + w + d 参与量化，e = y - (u - d) = y - u + d 进历史 ⟹
+        //   Y(z) = X(z) + NTF(z)·(E + D)，抖动与量化噪声一样被 NTF 整形。
+        double dith = 0.0;
+        if (cfg_.ditherLsb > 0.0) {
+            const double step = (levels_ == 2) ? 2.0 : 2.0 / (double)(levels_ - 1);
+            dith = cfg_.ditherLsb * step * ((double)(rngNext() >> 11) / 9007199254740992.0 - 0.5);
+            u += dith;
+            if (u >  uLim) { u =  uLim; ++overload_; }
+            if (u < -uLim) { u = -uLim; ++overload_; }
+        }
+
+        double y;
+        if (levels_ == 2) {
+            y = (u >= 0.0) ? 1.0 : -1.0;
+        } else {
+            // Offset the index grid: even L has exactly L equally spaced levels
+            // including +/-1, with no extra zero level. Keep 1-bit separate above.
+            const double last = (double)(levels_ - 1);
+            const double index = std::clamp(std::round((u + 1.0) * (0.5 * last)), 0.0, last);
+            y = 2.0 * index / last - 1.0;
+        }
+
+        double e = y - u;
+        const double eMax = 2.5;
+        if (e >  eMax) { e =  eMax; ++clamped_; }
+        if (e < -eMax) { e = -eMax; ++clamped_; }
+        e += dith;   // ★ 抖动只进比较器不进误差 ⟹ 进历史前补回（见上方注入点注释；钳位语义不变）
+
+        for (size_t k = sz - 1; k > 0; --k) { eHist_[k] = eHist_[k - 1]; wHist_[k] = wHist_[k - 1]; }
+        eHist_[0] = e; wHist_[0] = acc;
+        return y;
+    }
+
+
     uint64_t rngNext() { s_ ^= s_ >> 12; s_ ^= s_ << 25; s_ ^= s_ >> 27; return s_ * 2685821657736338717ull; }
     SdmConfig cfg_;
     NtfPoly ntf_;
+    SdmSectionState sectionState_;
     int levels_ = 2;
     int effectiveOrder_ = 5;
     bool steppedDown_ = false;
+    std::string levelsClampReason_;   // F03：AHM 多电平 → 1-bit 的降级说明（空 = 未降级）
     double hinfUsed_ = -1.0;   // EC 族：综合后实测 H∞；其它族保持 -1
     std::string stepDownReason_;
-    std::vector<double> eBuf_, wBuf_;
-    size_t epos_ = 0, wpos_ = 0;
+    double eHist_[16] = {}, wHist_[16] = {};   // 倒序历史（[0] = 最近），阶数 ≤ 8，留余量
     long long clamped_ = 0;
     long long overload_ = 0;
     long long nonFinite_ = 0;
@@ -671,6 +1166,7 @@ private:
 
 // 按多项式计算 NTF 幅频响应(dB)，用于验证设计
 inline double ntf_poly_response_db(const NtfPoly& n, double freqNorm) {
+    if (n.sections.count) return 20.0*std::log10(n.sections.gain(freqNorm)+1e-300);
     const double w = kPi * freqNorm;
     std::complex<double> num(0.0, 0.0), den(0.0, 0.0);
     for (size_t k = 0; k < n.b.size(); ++k) num += n.b[k] * std::polar(1.0, -w * (double)k);

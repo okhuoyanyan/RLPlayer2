@@ -126,6 +126,28 @@ inline long asio_dsd_bytes_per_buffer(long bufferSize) {
     return b > 0 ? b : 1;
 }
 
+// A zero byte is full negative DC in packed 1-bit DSD, not silence.
+inline uint8_t asio_silence_value(ASIOSampleType type, size_t sample = 0) {
+    if (asio_is_dsd_1bit(type)) return 0x69; // Four ones / four zeros.
+    if (type == ASIOSTDSDInt8NER8) return (uint8_t)(sample & 1); // One 0/1 sample per byte.
+    return 0;
+}
+
+inline void asio_write_silence(void* destination, size_t samples, ASIOSampleType type) {
+    if (asio_is_dsd_1bit(type)) {
+        std::memset(destination, asio_silence_value(type), samples);
+    } else if (type == ASIOSTDSDInt8NER8) {
+        auto* bytes = static_cast<uint8_t*>(destination);
+        for (size_t i = 0; i < samples; ++i) bytes[i] = asio_silence_value(type, i);
+    } else {
+        size_t width = 4; // Preserve the existing unknown-type fallback.
+        if (type == ASIOSTInt16MSB || type == ASIOSTInt16LSB) width = 2;
+        else if (type == ASIOSTInt24MSB || type == ASIOSTInt24LSB) width = 3;
+        else if (type == ASIOSTFloat64MSB || type == ASIOSTFloat64LSB) width = 8;
+        std::memset(destination, 0, samples * width);
+    }
+}
+
 // 位序转换：内部（DsdStream / 调制器输出）一律 MSB-first 打包，即字节 bit7 = 最早样本。
 // 驱动要 LSB1（最早样本在 bit0）时逐字节反序；MSB1 直接拷。
 inline uint8_t asio_reverse_bits8(uint8_t b) {
@@ -383,7 +405,7 @@ inline std::vector<AsioDriverEntry> asio_enum_drivers() {
 }
 
 // ---------------- 输出驱动 ----------------
-// 回调在驱动线程里跑，这里用互斥保护的环形缓冲；欠载时补零并计数。
+// 回调在驱动线程里跑，这里用互斥保护的环形缓冲；欠载按格式补静音并计数。
 class AsioDriver {
 public:
     static constexpr size_t kRingFrames = 1 << 16;
@@ -691,6 +713,15 @@ public:
     const AsioDsdInfo& dsd_info() const { return dsd_; }
     // 每个回调周期写入的字节数（= 驱动 bufferSize/8）；rtaplay 按它切片
     long dsd_buffer_bytes() const { return dsdBufBytes_; }
+    // 实时音量微调（与 WASAPI 同语义：相对播放起点的差值 dB，0 = 逐位原路径）。
+    // ★ F24：以前 OutSink::set_live_gain_db 在 ASIO 上是空实现 ⟹ 拖动滑块被静默忽略。
+    //   DSD（原生）模式下本函数不产生任何效果（on_buffer 的 DSD 分支不碰 gain_）。
+    void set_live_gain_db(double db) {
+        if (db <= -144.0) { gain_.store(0.0, std::memory_order_relaxed); return; }
+        gain_.store(db == 0.0 ? 1.0 : std::pow(10.0, db / 20.0), std::memory_order_relaxed);
+    }
+    double live_gain() const { return gain_.load(std::memory_order_relaxed); }
+
     const char* dsd_pack_name() const {
         if (!dsdMode_) return "PCM";
         return packing_ == DsdPack::Lsb1 ? "ASIOSTDSDInt8LSB1（bit0 最早）" : "ASIOSTDSDInt8MSB1（bit7 最早）";
@@ -780,6 +811,7 @@ public:
     long pref_buf() const { return prefBuf_; }
 
 private:
+    friend struct AsioDriverTestAccess; // Offline callback fixture; never opens a driver.
     // DSD 打包方式（由驱动 getChannelInfo 报的类型决定，不是我们挑的）
     enum class DsdPack { Msb1, Lsb1 };
 
@@ -849,8 +881,8 @@ private:
             ringCount_ -= take;
             if (take < period) {
                 ++underruns_;
-                std::memset(tmp.data() + take * (size_t)ch_, 0,
-                            (period - take) * (size_t)ch_ * sizeof(int32_t));
+                const int32_t silence = dsdMode_ ? asio_silence_value(ASIOSTDSDInt8MSB1) : 0;
+                for (size_t i = take * (size_t)ch_; i < tmp.size(); ++i) tmp[i] = silence;
             }
         }
         if (dsdMode_) {
@@ -872,27 +904,38 @@ private:
             }
             return;
         }
+        // ★ 2026-10-29（两轮审查 F24）：实时音量。旧实现 AsioSink 根本没有覆盖
+        //   OutSink::set_live_gain_db，基类默认是空函数 ⟹ 播放中拖动音量滑块
+        //   在 ASIO 后端上被静默忽略（"看起来成功了"，声音一点没变）。
+        //   这里在【装箱阶段】施加，与 WASAPI 独占同一语义：0 dB ⟹ gain==1.0 ⟹
+        //   乘法精确、逐位不变。DSD 模式绝不走这条（1-bit 流被 PCM 增益缩放会毁掉
+        //   每一位，见 F04），所以下面 dsdMode_ 分支直接 return，碰不到 gain。
+        const double g = gain_.load(std::memory_order_relaxed);
         for (int c = 0; c < ch_; ++c) {
             void* dst = bufs_[(size_t)c].buffers[idx];
             if (!dst) continue;
             const int32_t* src = tmp.data() + (size_t)c;
             const size_t stride = (size_t)ch_;
-            write_channel(dst, src, stride, (size_t)bufSize_, types_[(size_t)c], srcBits_);
+            write_channel(dst, src, stride, (size_t)bufSize_, types_[(size_t)c], srcBits_, g);
         }
         // outputReady() 只在"写入方"线程调用（见 push 之后），
         // 绝不能在驱动回调里调：会重入驱动（实测 2 秒左右访问冲突）。
     }
 
     static void write_channel(void* dst, const int32_t* src, size_t stride, size_t n,
-                              ASIOSampleType t, int srcBits) {
+                              ASIOSampleType t, int srcBits, double gain = 1.0) {
         // 归一化因子：管线 int32 = srcBits 位定标
         const double inv = 1.0 / (double)(1LL << (srcBits - 1));
+        // gain == 1.0 时下面每一次乘法都是精确的（IEEE ×1.0 不改值），
+        // 所以 0 dB 的逐位契约与是否走这个参数无关 —— 但这里仍然显式短路，
+        // 让"未启用微调"这条路径与改造前逐条指令一致（也便于断言）。
+        const bool unity = (gain == 1.0);
         switch (t) {
             case ASIOSTInt32LSB: {
                 int32_t* d = (int32_t*)dst;
                 for (size_t i = 0; i < n; ++i) {
                     const double v = (double)src[i * stride] * inv;
-                    d[i] = (int32_t)llround(v * 2147483647.0);
+                    d[i] = (int32_t)llround((unity ? v : v * gain) * 2147483647.0);
                 }
                 break;
             }
@@ -901,7 +944,7 @@ private:
                 for (size_t i = 0; i < n; ++i) {
                     const double v = (double)src[i * stride] * inv;
                     // 24-bit 满幅：DoP 的标记位在最低 8 位，round-trip 必须精确
-                    const int32_t q = (int32_t)llround(v * 8388607.0);
+                    const int32_t q = (int32_t)llround((unity ? v : v * gain) * 8388607.0);
                     const uint32_t u = (uint32_t)q;
                     d[i * 3 + 0] = (unsigned char)(u & 0xFF);
                     d[i * 3 + 1] = (unsigned char)((u >> 8) & 0xFF);
@@ -913,23 +956,29 @@ private:
                 int16_t* d = (int16_t*)dst;
                 for (size_t i = 0; i < n; ++i) {
                     const double v = (double)src[i * stride] * inv;
-                    d[i] = (int16_t)llround(v * 32767.0);
+                    d[i] = (int16_t)llround((unity ? v : v * gain) * 32767.0);
                 }
                 break;
             }
             case ASIOSTFloat32LSB: {
                 float* d = (float*)dst;
-                for (size_t i = 0; i < n; ++i) d[i] = (float)((double)src[i * stride] * inv);
+                for (size_t i = 0; i < n; ++i) {
+                    const double v = (double)src[i * stride] * inv;
+                    d[i] = (float)(unity ? v : v * gain);
+                }
                 break;
             }
             default: {
-                // 不认识的类型（含 DSD 类型）：写零，避免把 PCM 当 DSD 塞进去出噪声
-                std::memset(dst, 0, n * (t == ASIOSTDSDInt8LSB1 || t == ASIOSTDSDInt8MSB1 || t == ASIOSTDSDInt8NER8 ? 1 : 4));
+                // Never reinterpret PCM as DSD. Use the actual format's silence code.
+                asio_write_silence(dst, n, t);
                 break;
             }
         }
     }
 
+    // ★ F24：实时音量（相对播放起点的差值 dB；0 ⟹ gain 1.0 ⟹ 逐位不变）。
+    //   跨线程：渲染线程写、驱动回调线程读 ⟹ 必须是原子量。
+    std::atomic<double> gain_{1.0};
     IASIO* drv_ = nullptr;
     std::string name_;
     ASIOSampleRate rate_ = 48000.0;

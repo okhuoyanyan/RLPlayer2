@@ -20,6 +20,7 @@
 // 本文件只做纯算法：不碰设备、不开线程、不 include src/audio/*（铁律 1）。
 // 播放扫频与录音回传的接线由上层（C2，经回调注入）负责。
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include "fft.h"      // rta::dsp::fft / cplx / kPi（kPi 由 kaiser.h 经 fft.h 提供）
 #include <algorithm>
 #include <cmath>

@@ -1,11 +1,34 @@
-# RLPlayer 2.0
+# RLPlayer 3.0.10
 
 > **免费、开源（GPL-3.0）、面向 Windows 的本地高保真播放器。**
 > 升频、滤波、DSD、房间校正、耳机 EQ —— 全链路可调、可测、可自证。
 
 ![平台](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
 ![协议](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
-![版本](https://img.shields.io/badge/version-2.0.0-green)
+![版本](https://img.shields.io/badge/version-3.0.10-green)
+
+## 最新正式版
+
+[下载 3.0.10](https://github.com/okhuoyanyan/RLPlayer2/releases/latest) · [官网](https://rlplayer.rainlain.com)
+
+- [使用说明书 PDF（25 页）](docs/3.0.10/RLPlayer-3.0.10-使用说明书.pdf) / [可编辑 Word](docs/3.0.10/RLPlayer-3.0.10-使用说明书.docx)
+- [技术白皮书 PDF（13 页）](docs/3.0.10/RLPlayer-3.0.10-技术白皮书.pdf) / [可编辑 Word](docs/3.0.10/RLPlayer-3.0.10-技术白皮书.docx)
+
+正式包内置 FFmpeg、GPU 运行时和 WebView2，解压后运行 `RLPlayer.exe`。
+旧版进入 **设置 → 关于与更新 → 检查更新 → 下载更新**；下载完成按提示安装，程序退出后重新打开即完成升级。
+升级保留用户设置、音乐库路径、队列与收藏。3.0.10 修复了旧版启动器跳过六种语言资源的问题，确认升级前按构建绑定的 SHA256 补齐并校验。
+旧 2.0 的文件校验不支持中文安装路径；这类安装请退出播放器，将完整正式包解压覆盖原安装目录（包内不含用户配置）。3.0.10 已修正中文路径校验，后续升级可正常使用该路径。
+
+本版集中改进 PCM 同族采样率策略、多相重采样、定点精确累加、双声道调制和异步输出；修复高倍率标准 7 阶调制的数值退化、AHM 偶数电平数量错误，以及 DSD 分块、尾部排空、静音位型和 GPU 缓存等问题。
+
+精度与性能数字须结合输入信号、输出率、滤波参数和测量方法阅读，详见新版白皮书。
+设计阻带目标不等于端到端动态范围；目前不宣称全面超越 HQPlayer。
+项目 DoP / ASIO LSB1、MSB1 输出仍是单比特，AHM 硬件多电平输出尚未实现。
+
+开发者需使用支持 C++23 的 Clang、MSVC/Windows SDK、CMake、Ninja、Python 3 及 FFmpeg/FFprobe。
+测试前运行 `python tools/prepare_ci_testdata.py --root .` 生成纯静音测试素材。
+
+以下保留 2.0 时期的产品介绍与历史测试数字；当前行为和测量边界以新版说明书及白皮书为准。
 
 ---
 

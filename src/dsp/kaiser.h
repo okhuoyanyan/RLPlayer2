@@ -1,6 +1,7 @@
 // kaiser.h — Kaiser 窗与零阶修正贝塞尔函数 I0
 // 用于设计高质量 windowed-sinc 低通原型滤波器（HQPlayer poly-sinc 家族的同族做法）
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include <cmath>
 #include <vector>
 

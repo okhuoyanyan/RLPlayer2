@@ -101,6 +101,7 @@
 //   或升频带来 inter-sample 过冲，仍需 pipeline 的 preAttenDb / ISP 保护（互不替代）。
 // ---------------------------------------------------------------------------
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include <algorithm>
 #include <cctype>
 #include <cmath>

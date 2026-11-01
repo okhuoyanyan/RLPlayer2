@@ -710,6 +710,69 @@ inline bool unzip_to(const std::string& zip, const std::string& dst, std::string
     return true;
 }
 
+// ===========================================================================
+// ★ 2026-10-29（两轮审查 F08）：staging 的"完成状态"必须是**可验证的持久事实**，
+//   不能靠"目录非空"推测。
+//
+// 缺陷：下载中途失败/断电后，staging 里留着半套文件；restore_staging_state() 只判
+//   is_dir(st) && count_files(st) > 0 就恢复成 staged=true/phase=ready，而
+//   write_ready_plan() 又把"目录里现有文件"枚举成安装清单 ⟹ 一个不完整暂存被当成
+//   可安装版本，启动器换掉一半文件。实测（评审证据）：两个目标文件只取得一个，
+//   重启后仍被标成 ready。
+//
+// 契约：下载全部成功后写 complete.txt（版本 + 每个文件的字节数与清单 sha256）。
+//   restore_staging_state() 与 apply 的写台账都**必须**先过 staging_verify()：
+//   缺标记 / 缺文件 / 大小不符 / sha256 不符 ⟹ 一律不具备安装资格。
+// ===========================================================================
+inline std::string staging_marker_path(const std::string& staging) {
+    return join_path(staging, "complete.txt");
+}
+
+inline bool staging_verify(const std::string& staging, std::string& err) {
+    err.clear();
+    if (!is_dir(staging)) { err = "暂存目录不存在"; return false; }
+    const std::string text = read_text_file(staging_marker_path(staging));
+    if (text.empty()) {
+        err = "暂存未完成：缺少完成标记 complete.txt（下载未跑完或被中断）";
+        return false;
+    }
+    int n = 0;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t e = text.find('\n', pos);
+        if (e == std::string::npos) e = text.size();
+        std::string line = text.substr(pos, e - pos);
+        pos = e + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("file=", 0) != 0) continue;
+        const std::string rest = line.substr(5);
+        const size_t t1 = rest.find('\t');
+        if (t1 == std::string::npos) { err = "完成标记格式损坏"; return false; }
+        const size_t t2 = rest.find('\t', t1 + 1);
+        const std::string rel = rest.substr(0, t1);
+        const std::string sizeS = rest.substr(t1 + 1, (t2 == std::string::npos ? rest.size() : t2) - t1 - 1);
+        const std::string wantSha = (t2 == std::string::npos) ? std::string() : rest.substr(t2 + 1);
+        const std::string p = join_path(staging, rel);
+        if (!path_exists(p)) { err = "暂存缺少文件：" + rel; return false; }
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size(std::filesystem::u8path(p), ec);
+        if (ec) { err = "暂存文件不可读：" + rel; return false; }
+        if (sizeS != "-1" && std::to_string((long long)sz) != sizeS) {
+            err = "暂存文件大小不符：" + rel + "（实际 " + std::to_string((long long)sz) +
+                  "，标记 " + sizeS + "）";
+            return false;
+        }
+        if (!wantSha.empty()) {
+            std::string hex, e2;
+            if (!sha256_file(p, hex, e2)) { err = "暂存文件读取失败：" + rel; return false; }
+            if (!hex_equals_ci(hex, wantSha)) { err = "暂存文件校验不符（sha256）：" + rel; return false; }
+        }
+        ++n;
+    }
+    if (n == 0) { err = "完成标记里没有文件清单"; return false; }
+    return true;
+}
+
 inline void download_worker() {
     auto& s = state();
     ManifestExt man;
@@ -851,6 +914,30 @@ inline void download_worker() {
         for (const auto& r : rels) man_txt += "file=" + r + "\r\n";
         write_text_file(join_path(dir, "manifest.txt"), man_txt);
     }
+    // ★ F08：写完成标记（清单 + 每个文件的字节数与 sha256），apply / 重启恢复都以它为准
+    {
+        std::string mk = "version=" + ver + "\r\n";
+        std::vector<std::string> rels;
+        list_files_rel(staging, "", rels);
+        for (const auto& r : rels) {
+            std::error_code ec;
+            const auto sz = std::filesystem::file_size(std::filesystem::u8path(join_path(staging, r)), ec);
+            const auto it = want.find(lower_ascii(r));
+            const std::string sha = (it == want.end()) ? std::string() : it->second;
+            mk += "file=" + r + "\t" + std::to_string((long long)(ec ? -1 : (long long)sz)) +
+                  "\t" + sha + "\r\n";
+        }
+        mk += "at=" + std::to_string((long long)time(nullptr)) + "\r\n";
+        write_text_file(staging_marker_path(staging), mk);
+    }
+    {
+        std::string verr;
+        if (!staging_verify(staging, verr)) {
+            // 标记写完立刻自检一次：不自洽就不许标 ready（宁可让用户重下）
+            fail("暂存自检失败：" + verr);
+            return;
+        }
+    }
     {
         std::lock_guard<std::mutex> lk(s.mtx);
         s.phase = "ready";
@@ -954,7 +1041,9 @@ inline void restore_staging_state() {
         if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
         const std::string v = rta::platform::detail::narrow(nm);
         const std::string st = join_path(join_path(updates_root(), v), "staging");
-        if (is_dir(st) && count_files(st) > 0) {
+        // ★ F08：只认"完成标记通过校验"的暂存；目录非空不算（半套文件会被当成可安装版本）
+        std::string verr;
+        if (is_dir(st) && count_files(st) > 0 && staging_verify(st, verr)) {
             const std::string bare = (v.size() && (v[0] == 'v' || v[0] == 'V')) ? v.substr(1) : v;
             if (best.empty() || cmp_versions(bare, best) > 0) best = bare;
         }

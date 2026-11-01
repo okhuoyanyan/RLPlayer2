@@ -265,7 +265,11 @@ int main() {
                     r.ctorMs, r.scanMs, r.ms, r.totalMs, r.realtimeFactor);
         std::printf("  srcPeak %.4f / 余量 %.2f dB / 生效阶数 %d%s\n", r.srcPeak, r.headroomDb, r.effectiveOrder,
                     r.steppedDown ? "（已降阶保护）" : "");
-        check(r.outBits == (uint64_t)nBits * 2ull, "输出位数 = 输入位数 × 2（不多不少）",
+        // EOF now preserves the real causal filter tail, beyond the rate-ratio
+        // duration. Edge-impulse tests independently verify this is audio, not
+        // arbitrary padding added merely to satisfy a length assertion.
+        check(r.outBits > (uint64_t)nBits * 2ull && r.outBits < (uint64_t)nBits * 2ull + 56448,
+              "输出保留倍速时长及有限自然尾（<10ms）",
               std::to_string(r.outBits) + " vs " + std::to_string((uint64_t)nBits * 2ull));
         std::printf("  基线 DSD64 原样：信号 %.3f dBFS  带内噪声 %.2f dBFS  THD+N %.2f dB\n",
                     base3.signalDb, base3.noiseDb, base3.thdnDb);
@@ -327,14 +331,16 @@ int main() {
             const double a = 2.0 * std::sqrt(re * re + im * im) / (double)x.size();
             return 20.0 * std::log10(a + 1e-300);
         };
-        const size_t lenB = ((pb.size() - skip) / 9) * 9;
-        const double ab = tone_db(std::vector<double>(pb.begin() + (long long)skip,
-                                                     pb.begin() + (long long)(skip + lenB)), 176400.0, 19600.0);
         DsdRateConvertConfig cfg;
         DsdStream out;
         convert_dsd_stream(probe, 5644800, cfg, out, false);
         const auto pc = measure_pcm(out, 176400, 0);
-        const size_t lenC = ((pc.size() - skip) / 9) * 9;
+        // Compare identical steady-state windows. Including the new natural EOF
+        // tail would measure a switched-off probe transient, not alias rejection.
+        const size_t lenB = ((std::min(pb.size(), pc.size()) - skip - 1024) / 9) * 9;
+        const size_t lenC = lenB;
+        const double ab = tone_db(std::vector<double>(pb.begin() + (long long)skip,
+                                                     pb.begin() + (long long)(skip + lenB)), 176400.0, 19600.0);
         const double ac = tone_db(std::vector<double>(pc.begin() + (long long)skip,
                                                      pc.begin() + (long long)(skip + lenC)), 176400.0, 19600.0);
         std::printf("    基线 DSD64 原样 . : %.2f dBFS（%zu 样本）\n", ab, lenB);
@@ -414,7 +420,8 @@ int main() {
                     rb.thdnDb, rc.thdnDb, rc.thdnDb - rb.thdnDb, r.effectiveOrder);
         std::printf("    位数 %llu → %llu（应 = 1/2），余量 %.2f dB，耗时 %.1f ms（%.2f× 实时）\n",
                     (unsigned long long)r.inBits, (unsigned long long)r.outBits, r.headroomDb, r.ms, r.realtimeFactor);
-        check(r.outBits == (uint64_t)nBits / 2ull, "降速输出位数 = 输入位数 / 2",
+        check(r.outBits > (uint64_t)nBits / 2ull && r.outBits < (uint64_t)nBits / 2ull + 28224,
+              "降速保留分频时长及有限自然尾（<10ms）",
               std::to_string(r.outBits) + " vs " + std::to_string((uint64_t)nBits / 2ull));
         // 降速的参照不是"源 DSD128"（DSD64 的 1-bit 量化压根到不了 106.8 dB），
         // 而是【原生 DSD64】本身的带内成绩（base3 = 同一音、同一幅度、原生 DSD64）
@@ -433,11 +440,11 @@ int main() {
         DsdRateConvertConfig cfg;
         DsdStream d128, d256dir, d256cas;
         const double t0 = now_ms();
-        convert_dsd_stream(src, 5644800, cfg, d128, true);
+        const auto r128 = convert_dsd_stream(src, 5644800, cfg, d128, true);
         const double t1 = now_ms();
-        convert_dsd_stream(d128, 11289600, cfg, d256cas, true);
+        const auto rcas = convert_dsd_stream(d128, 11289600, cfg, d256cas, true);
         const double t2 = now_ms();
-        convert_dsd_stream(src, 11289600, cfg, d256dir, true);
+        const auto rdir = convert_dsd_stream(src, 11289600, cfg, d256dir, true);
         const double t3 = now_ms();
         std::printf("  64→128 %.0f ms | 128→256 %.0f ms | 64→256 直接 %.0f ms\n", t1 - t0, t2 - t1, t3 - t2);
         const auto pdir = measure_pcm(d256dir, 176400, 0);
@@ -448,6 +455,23 @@ int main() {
         std::printf("  级联  DSD256：信号 %.3f  带内噪声 %.2f  THD+N %.2f\n", rc.signalDb, rc.noiseDb, rc.thdnDb);
         std::printf("  Δ信号 %.4f dB / Δ噪声 %+.3f dB / ΔTHD+N %+.3f dB\n",
                     rc.signalDb - rd.signalDb, rc.noiseDb - rd.noiseDb, rc.thdnDb - rd.thdnDb);
+        // Automatic safety attenuation is part of the production contract.
+        // A second conversion can observe a larger reconstruction peak and
+        // legitimately choose additional headroom. Its source noise is scaled
+        // by the SAME gain. Compare at the same explicit gain, never normalize
+        // by the measured fundamental (which would conceal real gain errors).
+        const double cascadeGainDb = r128.headroomDb + rcas.headroomDb;
+        const double directGainDb = rdir.headroomDb;
+        const double gainDifferenceDb = cascadeGainDb - directGainDb;
+        const double signalDifferenceDb = rc.signalDb - rd.signalDb - gainDifferenceDb;
+        const double noiseDifferenceDb = rc.noiseDb - rd.noiseDb - gainDifferenceDb;
+        std::printf("  自动余量：64→128 %.9f dB（峰%.9f），128→256 %.9f dB（峰%.9f），直接 %.9f dB（峰%.9f）\n",
+                    r128.headroomDb, r128.srcPeak, rcas.headroomDb, rcas.srcPeak, rdir.headroomDb, rdir.srcPeak);
+        std::printf("  扣除API已知累计增益差 %.9f dB：Δ信号 %+.9f dB / Δ噪声 %+.9f dB\n",
+                    gainDifferenceDb, signalDifferenceDb, noiseDifferenceDb);
+        auto casGainMatched = pcas, dirGainMatched = pdir;
+        for (auto& x : casGainMatched) x *= std::pow(10.0, -cascadeGainDb / 20.0);
+        for (auto& x : dirGainMatched) x *= std::pow(10.0, -directGainDb / 20.0);
         // ★ 差多少怎么量：不做时域逐点相减。
         //   两条路径的 1-bit 量化噪声互不相关，且延迟差是【亚样本】（实测换算 0.045 样本
         //   = -39 dB 的假残差），逐点相减测的是延迟估计精度，不是级联误差
@@ -471,16 +495,16 @@ int main() {
             B = (xs * cc - xc * cs) / det;
         };
         double Ac = 0, Bc = 0, Ad = 0, Bd = 0;
-        fit(pcas, Ac, Bc);
-        fit(pdir, Ad, Bd);
+        fit(casGainMatched, Ac, Bc);
+        fit(dirGainMatched, Ad, Bd);
         // 差信号必须【带限到 20 Hz…20 kHz】再算功率：测量链输出到 176.4 kHz，
         // 20 kHz 以上是 1-bit 噪声整形的废热（全带宽算出来是 -45 dBFS，会冒充"级联误差"）
         std::vector<cplx> spec(N);
         double sumW2 = 0;
         for (size_t n = 0; n < N; ++n) {
             const double c = std::cos(w0 * (double)n), s = std::sin(w0 * (double)n);
-            const double rc = pcas[from + n] - (Ac * c + Bc * s);
-            const double rd = pdir[from + n] - (Ad * c + Bd * s);
+            const double rc = casGainMatched[from + n] - (Ac * c + Bc * s);
+            const double rd = dirGainMatched[from + n] - (Ad * c + Bd * s);
             const double w = 0.5 - 0.5 * std::cos(2.0 * kPi * (double)n / (double)(N - 1));
             sumW2 += w * w;
             spec[n] = cplx((rc - rd) * w, 0.0);
@@ -494,16 +518,33 @@ int main() {
         const double residDb = 10.0 * std::log10(pdiff / (psig + 1e-300));
         std::printf("  扣基波后两条路径的差信号（带限 20 Hz…20 kHz）：%.2f dBFS，相对信号 %.2f dB\n",
                     10.0 * std::log10(pdiff + 1e-300), residDb);
-        const double theory = rc.noiseDb + 10.0 * std::log10(2.0);   // 两条独立噪声相加
+        const double matchedNoiseDb = rc.noiseDb - cascadeGainDb;
+        const double theory = matchedNoiseDb + 10.0 * std::log10(2.0);   // 两条独立噪声相加
         std::printf("  [理论] 两条独立、各 %.2f dBFS 的带内噪声相加 = %.2f dBFS；实测 %.2f dBFS（%+.2f dB）\n",
-                    rc.noiseDb, theory, 10.0 * std::log10(pdiff + 1e-300),
+                    matchedNoiseDb, theory, 10.0 * std::log10(pdiff + 1e-300),
                     10.0 * std::log10(pdiff + 1e-300) - theory);
         std::printf("  [注] 差信号不是级联误差（它含两条路径各自的量化噪声）；\n");
-        std::printf("       级联误差的判据是 ΔTHD+N / Δ带内噪声，两者都在 0.0004 dB。\n");
+        std::printf("       判据分别检查THD+N、扣已知安全增益后的噪声与基波；阈值不随观测值改变。\n");
         check(std::fabs(rc.thdnDb - rd.thdnDb) < 0.1, "级联与直接的 THD+N 相差 < 0.1 dB",
               std::to_string(rc.thdnDb - rd.thdnDb) + " dB");
-        check(std::fabs(rc.noiseDb - rd.noiseDb) < 0.1, "级联与直接的带内噪声相差 < 0.1 dB",
-              std::to_string(rc.noiseDb - rd.noiseDb) + " dB");
+        check(std::fabs(signalDifferenceDb) < 0.01, "基波差等于API已知累计安全增益差（误差 < 0.01 dB）",
+              std::to_string(signalDifferenceDb) + " dB");
+        check(std::fabs(noiseDifferenceDb) < 0.1, "扣除API已知安全增益后带内噪声相差 < 0.1 dB",
+              std::to_string(noiseDifferenceDb) + " dB");
+        // Negative controls must still reject unreported gain and added noise.
+        auto gainFault = pcas, noiseFault = pcas;
+        for (size_t n = 0; n < pcas.size(); ++n) {
+            gainFault[n] *= std::pow(10.0, 0.2 / 20.0);
+            noiseFault[n] += 1e-5 * std::sin(2.0 * kPi * 3271.0 * n / 176400.0);
+        }
+        const auto rg = measure_thdn(std::vector<double>(gainFault.begin()+4096,gainFault.end()),176400.0,f0);
+        const auto rn = measure_thdn(std::vector<double>(noiseFault.begin()+4096,noiseFault.end()),176400.0,f0);
+        const double unreportedGainDb = rg.signalDb - rd.signalDb - gainDifferenceDb;
+        const double addedNoiseDb = rn.noiseDb - rd.noiseDb - gainDifferenceDb;
+        check(std::fabs(unreportedGainDb) >= 0.01, "负控：未报告的+0.2dB增益仍被独立基波判据拒绝",
+              std::to_string(unreportedGainDb) + " dB");
+        check(std::fabs(addedNoiseDb) >= 0.1, "负控：额外带内噪声仍被原0.1dB判据拒绝",
+              std::to_string(addedNoiseDb) + " dB");
         check(residDb < -80.0, "扣基波后两条路径的差信号 < −80 dB（相对信号）", std::to_string(residDb) + " dB");
     }
 

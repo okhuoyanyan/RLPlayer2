@@ -332,17 +332,36 @@ void test_no_startup_blast() {
     check(out.size() == 4800 * (size_t)ch && peak == 0.0,
           fmt("第一块输出帧数 %zu、峰值 %.3g（必须逐样本 0）", out.size() / ch, peak));
 
-    // 判据自证（铁律 3）：关掉预跑就必须漏音 —— 否则上面那条"峰值 0"可能只是
-    // 因为测试根本没喂进满幅信号，而不是防爆音真的生效。
-    mc.primeMs = 0.0;
+    // 判据自证（铁律 3）：同样的满幅输入、0 dB 音量必须输出接近满幅 ——
+    // 否则上面那条"峰值 0"可能只是信号根本没进到输出。
+    //
+    // ★ 2026-10-29（两轮审查 F01）：旧版的自证是「关掉预跑就必须漏音」，
+    //   而 F01 把起播音量改成【prepare_stream 里直接 snap 到目标】之后，
+    //   这个漏音在源头就不存在了（预跑因此变成冗余保险，保留无害）。
+    //   旧断言「旧缺陷必须存在」在新语义下必然红，所以改成断言**正确行为**：
+    //   0 dB 时同一信号确实满幅通过 —— 这同样证明判据有区分力。
+    rta::audio::MonitorDspConfig mc2 = mc;
+    mc2.volumeDb = 0.0;
+    mc2.primeMs = 0.0;
     rta::audio::MonitorDspChain raw;
-    check(raw.configure(mc, &err), "对照组 configure()（关掉预跑）");
+    check(raw.configure(mc2, &err), "自证组 configure()（0 dB，关掉预跑）");
     std::vector<float> outRaw;
     raw.process(in.data(), 4800, outRaw);
     double peakRaw = 0.0;
     for (float v : outRaw) peakRaw = std::max(peakRaw, (double)std::fabs(v));
     check(peakRaw > 0.5,
-          fmt("对照组（primeMs=0）第一块峰值 %.3f（应明显 > 0.5，证明该漏音真实存在）", peakRaw));
+          fmt("自证：0 dB + 同一满幅信号 → 第一块峰值 %.3f（必须 > 0.5，否则判据没有区分力）", peakRaw));
+    // 附：关掉预跑也不再漏音（F01 的 snap 语义；这一条防止有人把 snap 改回去）
+    rta::audio::MonitorDspConfig mc3 = mc;
+    mc3.primeMs = 0.0;
+    rta::audio::MonitorDspChain raw2;
+    check(raw2.configure(mc3, &err), "对照组 configure()（−144 dB，关掉预跑）");
+    std::vector<float> outRaw2;
+    raw2.process(in.data(), 4800, outRaw2);
+    double peakRaw2 = 0.0;
+    for (float v : outRaw2) peakRaw2 = std::max(peakRaw2, (double)std::fabs(v));
+    check(peakRaw2 == 0.0,
+          fmt("−144 dB 且关掉预跑：第一块峰值 %.3g（F01 起播直接到位 ⟹ 不得漏音）", peakRaw2));
 }
 
 } // namespace

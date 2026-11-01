@@ -215,7 +215,11 @@ int main() {
         check(same_bits(a, b, bits, &why), "读回的 1-bit 流逐位一致", why);
 
         // 独立核对：按 DSDIFF 块链表走到 "DSD " 块（不能直接找 "DSD "，
-        // 因为 FRM8 的 form type 与 CMPR 的压缩类型也都是 "DSD "），按声道连续排列检查
+        // 因为 FRM8 的 form type 与 CMPR 的压缩类型也都是 "DSD "）。
+        // ★ 2026-10-29（两轮审查 F02）：规范 §3.3 要求 Channel Byte **交错** ——
+        //   第 i 个 Channel Byte 的声道 c 在 i*numChannels + c。旧断言写的是
+        //   「声道 0 全部 → 声道 1 全部」（body[i] / body[bits/8+i]），与规范相反，
+        //   而且与 read_dff 共享同一个错误前提 ⟹ 自写自读永远"通过"。
         const auto raw = slurp(pDff);
         bool layoutOk = false;
         size_t off = 16;
@@ -227,17 +231,139 @@ int main() {
                 layoutOk = (sz == bits / 8 * 2);
                 const uint8_t* body = raw.data() + off + 12;
                 for (size_t i = 0; layoutOk && i < bits / 8; i += 331)
-                    if (body[i] != a.data[0][i] || body[bits / 8 + i] != a.data[1][i]) layoutOk = false;
+                    if (body[i * 2] != a.data[0][i] || body[i * 2 + 1] != a.data[1][i]) layoutOk = false;
                 break;
             }
             off += 12 + (size_t)sz + (size_t)(sz & 1);
         }
-        check(layoutOk, "文件内 DSD 块「声道 0 全部 → 声道 1 全部」独立校验");
+        check(layoutOk, "文件内 DSD 块按规范「Channel Byte 交错」独立校验");
         const DsdInfo pi = probe_dsd(pDff);
         check(pi.rate == 2822400u && pi.channels == 2 && pi.bits == bits && pi.container == "dff",
               "probe_dsd 只读 DFF 头结果与完整读取一致",
               std::to_string(pi.rate) + " Hz / " + std::to_string(pi.channels) + " ch / " +
               std::to_string(pi.bits) + " 位");
+    }
+
+
+    printf("\n=== 3b. DFF 独立参考：手工按 DSDIFF 1.5 §3.3 构造 6 声道文件 ===\n");
+    {
+        // 本段【一个字节都不调用 write_dff】：完全按规范手工拼 FRM8 / FVER / PROP(FS,CHNL,CMPR) / DSD。
+        // 判据是 read_dff 读出的每声道字节必须等于这里写进去的那一份（而不是"自写自读一致"）。
+        const uint32_t CH = 6;
+        const uint64_t PER = 64;                      // 每声道 64 个 Channel Byte
+        std::vector<std::vector<uint8_t>> chn((size_t)CH, std::vector<uint8_t>((size_t)PER));
+        for (uint32_t c = 0; c < CH; ++c)
+            for (uint64_t i = 0; i < PER; ++i)
+                chn[(size_t)c][(size_t)i] = (uint8_t)(0x11u * (c + 1u) + (uint8_t)(i * 3u));
+        // 自检：6 个声道的字节序列两两不同（否则"读对了"这个判据没有区分力）
+        bool distinct = true;
+        for (uint32_t a = 0; a < CH && distinct; ++a)
+            for (uint32_t b = a + 1; b < CH && distinct; ++b)
+                if (chn[(size_t)a] == chn[(size_t)b]) distinct = false;
+        check(distinct, "夹具：6 个声道的字节序列两两不同");
+
+        auto be32 = [](std::vector<uint8_t>& v, uint32_t x) {
+            for (int i = 3; i >= 0; --i) v.push_back((uint8_t)((x >> (8 * i)) & 0xFF)); };
+        auto be64 = [](std::vector<uint8_t>& v, uint64_t x) {
+            for (int i = 7; i >= 0; --i) v.push_back((uint8_t)((x >> (8 * i)) & 0xFF)); };
+        auto putTag = [](std::vector<uint8_t>& v, const char* t) {
+            for (int i = 0; i < 4; ++i) v.push_back((uint8_t)t[i]); };
+        auto chunk = [&](const char* id, const std::vector<uint8_t>& body) {
+            std::vector<uint8_t> o; putTag(o, id); be64(o, body.size());
+            o.insert(o.end(), body.begin(), body.end());
+            if (body.size() & 1) o.push_back(0);
+            return o; };
+
+        std::vector<uint8_t> fverBody; be32(fverBody, 0x01050000u);
+        const auto fverChunk = chunk("FVER", fverBody);
+        std::vector<uint8_t> fsBody; be32(fsBody, 2822400u);
+        const auto fsChunk = chunk("FS  ", fsBody);
+        std::vector<uint8_t> chBody;
+        chBody.push_back((uint8_t)((CH >> 8) & 0xFF)); chBody.push_back((uint8_t)(CH & 0xFF));
+        const char* ids6[6] = { "MLFT", "MRGT", "C   ", "LFE ", "LS  ", "RS  " };
+        for (uint32_t c = 0; c < CH; ++c) putTag(chBody, ids6[c]);
+        const auto chnlChunk = chunk("CHNL", chBody);
+        std::vector<uint8_t> cmpBody; putTag(cmpBody, "DSD ");
+        for (const char* s = "not compressed"; *s; ++s) cmpBody.push_back((uint8_t)*s);
+        if (cmpBody.size() & 1) cmpBody.push_back(0);
+        const auto cmprChunk = chunk("CMPR", cmpBody);
+        std::vector<uint8_t> propBody; putTag(propBody, "SND ");
+        propBody.insert(propBody.end(), fsChunk.begin(), fsChunk.end());
+        propBody.insert(propBody.end(), chnlChunk.begin(), chnlChunk.end());
+        propBody.insert(propBody.end(), cmprChunk.begin(), cmprChunk.end());
+        const auto propChunk = chunk("PROP", propBody);
+
+        // ★ 规范核心：Clustered Frame = numChannels 个 Channel Byte，按 CHNL 顺序交错
+        std::vector<uint8_t> dsdBody;
+        for (uint64_t i = 0; i < PER; ++i)
+            for (uint32_t c = 0; c < CH; ++c) dsdBody.push_back(chn[(size_t)c][(size_t)i]);
+        const auto dsdChunk = chunk("DSD ", dsdBody);
+
+        std::vector<uint8_t> file;
+        putTag(file, "FRM8");
+        be64(file, (uint64_t)(4 + fverChunk.size() + propChunk.size() + dsdChunk.size()));
+        putTag(file, "DSD ");
+        file.insert(file.end(), fverChunk.begin(), fverChunk.end());
+        file.insert(file.end(), propChunk.begin(), propChunk.end());
+        file.insert(file.end(), dsdChunk.begin(), dsdChunk.end());
+
+        const std::string pSpec = temp_path("rta_dsd_spec_ref.dff");
+        { FILE* f = std::fopen(pSpec.c_str(), "wb");
+          if (f) { std::fwrite(file.data(), 1, file.size(), f); std::fclose(f); } }
+
+        DsdStream r;
+        std::string err;
+        bool ok = true;
+        try { r = read_dff(pSpec); } catch (const std::exception& e) { ok = false; err = e.what(); }
+        check(ok, "read_dff 能读入按规范手工构造的 6 声道 DFF", err);
+        if (ok) {
+            check(r.channels == (int)CH && r.rate == 2822400u && r.bits == PER * 8,
+                  "元数据正确（6 声道 / 2822400 Hz / 512 位）",
+                  std::to_string(r.channels) + " ch / " + std::to_string(r.rate) + " Hz / " +
+                  std::to_string(r.bits) + " 位");
+            check(r.channelIds.size() == 6 && r.channelIds[0] == "MLFT" && r.channelIds[3] == "LFE ",
+                  "CHNL 声道 ID 按序读回", r.channelIds.empty() ? "?" : r.channelIds[0]);
+            bool bytesOk = (r.data.size() == (size_t)CH);
+            int firstBad = -1;
+            for (uint32_t c = 0; c < CH && bytesOk; ++c) {
+                if (r.data[(size_t)c].size() != (size_t)PER) { bytesOk = false; break; }
+                for (uint64_t i = 0; i < PER; ++i)
+                    if (r.data[(size_t)c][(size_t)i] != chn[(size_t)c][(size_t)i]) {
+                        bytesOk = false; firstBad = (int)c; break; }
+            }
+            char b2[200];
+            std::snprintf(b2, sizeof(b2), "(逐字节比对 %u 声道 x %llu 字节, 首个不符声道=%d)",
+                          CH, (unsigned long long)PER, firstBad);
+            check(bytesOk, "每个声道的字节与规范参考逐字节一致（解交错正确）", b2);
+        }
+        DeleteFileA(pSpec.c_str());
+
+        // ---- 反方向：write_dff 的字节布局也必须与规范一致（独立解析，不看 read_dff）----
+        const std::string pW = temp_path("rta_dsd_wref.dff");
+        DsdStream w;
+        w.rate = 2822400u; w.channels = 2; w.bits = 8ull * 32;
+        w.channelIds = { "SLFT", "SRGT" };
+        w.data.assign(2, std::vector<uint8_t>(32));
+        for (size_t i = 0; i < 32; ++i) { w.data[0][i] = (uint8_t)(0x10 + i); w.data[1][i] = (uint8_t)(0x80 + i); }
+        write_dff(pW, w);
+        const auto wr = slurp(pW);
+        bool wOk = false;
+        size_t o2 = 16;
+        while (o2 + 12 <= wr.size()) {
+            uint64_t sz = 0;
+            for (int i = 0; i < 8; ++i) sz = (sz << 8) | wr[o2 + 4 + (size_t)i];
+            if (o2 + 12 + (size_t)sz > wr.size()) break;
+            if (std::memcmp(wr.data() + o2, "DSD ", 4) == 0) {
+                const uint8_t* body = wr.data() + o2 + 12;
+                wOk = (sz == 64);
+                for (size_t i = 0; wOk && i < 32; ++i)
+                    if (body[i * 2] != w.data[0][i] || body[i * 2 + 1] != w.data[1][i]) wOk = false;
+                break;
+            }
+            o2 += 12 + (size_t)sz + (size_t)(sz & 1);
+        }
+        check(wOk, "write_dff 输出按规范交错（L0,R0,L1,R1…）");
+        DeleteFileA(pW.c_str());
     }
 
     printf("\n=== 4. 坏文件必须明确报错 ===\n");

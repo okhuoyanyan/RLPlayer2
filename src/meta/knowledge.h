@@ -302,7 +302,8 @@ inline bool knowledge_from_json(const std::string& text,
                                 std::string& entity_id_out,
                                 std::string& subject_out,
                                 std::string* err_out = nullptr) {
-    const rta::net::Json j = rta::net::json_parse(text);
+    rta::net::Json j;
+    if (!rta::net::json_parse_strict(text, j, err_out)) return false;
     if (j.type != rta::net::Json::Obj) {
         if (err_out) *err_out = "knowledge cache corrupted: not a JSON object";
         return false;
@@ -368,6 +369,44 @@ inline bool knowledge_has_unexpired(const std::vector<KnowledgeMaterial>& materi
     return false;
 }
 
+// ★ 2026-10-29（两轮审查 F30）：缓存命中必须按【语言】筛选。
+//
+// 缺陷：缓存文件是 entities/<id>/knowledge.json，里面是**所有语言**的材料混在一起，
+//   而命中判定只看"有没有未过期材料"、完全不看请求语言。实测：预存 zh 之后请求 en，
+//   返回 from_cache=1、language=zh、HTTP 请求数 0 —— 用户要英文资料，拿到的是中文，
+//   而且系统根本没去查（"没发生被禁止的联网"是真的，但"语言串用"也是真的）。
+//
+// 契约：
+//   · lang 为空 ⟹ 不筛（老调用方行为不变）；
+//   · 否则只认 lang 完全相同的材料，以及 lang 为空的历史材料（旧缓存没写 lang 时
+//     无法判定归属，按"语言中立"处理而不是丢弃 —— 丢弃会让老缓存全部失效）。
+inline bool knowledge_material_matches_lang(const KnowledgeMaterial& m, const std::string& lang) {
+    if (lang.empty()) return true;
+    if (m.lang.empty()) return true;
+    return m.lang == lang;
+}
+
+// 该语言是否已有未过期材料（决定"能否直接用缓存"）
+inline bool knowledge_has_unexpired_for_lang(const std::vector<KnowledgeMaterial>& materials,
+                                             const std::string& lang,
+                                             long long now_sec = 0) {
+    for (const auto& m : materials) {
+        if (!knowledge_material_matches_lang(m, lang)) continue;
+        if (!knowledge_is_expired(m, now_sec)) return true;
+    }
+    return false;
+}
+
+// 只保留与请求语言相容的材料（缓存命中时用它裁剪返回值）
+inline std::vector<KnowledgeMaterial> knowledge_filter_by_lang(const std::vector<KnowledgeMaterial>& in,
+                                                               const std::string& lang) {
+    if (lang.empty()) return in;
+    std::vector<KnowledgeMaterial> out;
+    out.reserve(in.size());
+    for (const auto& m : in) if (knowledge_material_matches_lang(m, lang)) out.push_back(m);
+    return out;
+}
+
 inline bool knowledge_save_cache(const std::string& baseDir,
                                  const std::string& entity_id,
                                  const std::string& subject,
@@ -407,12 +446,21 @@ inline fsx::path knowledge_miss_path(const std::string& baseDir, const std::stri
 }
 
 inline bool knowledge_recent_miss(const std::string& baseDir, const std::string& entity_id,
-                                  long long ttl_sec, long long* at_out = nullptr) {
+                                  long long ttl_sec, long long* at_out = nullptr,
+                                  const std::string& lang = std::string()) {
     if (entity_id.empty() || ttl_sec <= 0) return false;
     std::string text;
     if (!entity_read_file(knowledge_miss_path(baseDir, entity_id), text)) return false;
-    const rta::net::Json j = rta::net::json_parse(text);
+    rta::net::Json j;
+    // ★ F30：负缓存同样必须严格解析 —— 半写文件不能当成"有效失败记录"
+    if (!rta::net::json_parse_strict(text, j, nullptr)) return false;
     if (j.type != rta::net::Json::Obj) return false;
+    // ★ F30：负缓存必须按语言区分。zh 查不到不代表 en 查不到；
+    //   旧实现只按实体 ID 记，一次 zh 失败会让 en 请求也直接"近期未找到"（连网都不查）。
+    if (!lang.empty()) {
+        const std::string cachedLang = j.has("lang") ? j["lang"].s() : std::string();
+        if (!cachedLang.empty() && cachedLang != lang) return false;
+    }
     const long long at = (long long)j["at"].n();
     if (at <= 0) return false;
     if (at_out) *at_out = at;
@@ -420,10 +468,12 @@ inline bool knowledge_recent_miss(const std::string& baseDir, const std::string&
 }
 
 inline void knowledge_mark_miss(const std::string& baseDir, const std::string& entity_id,
-                                const std::string& subject, const std::string& error) {
+                                const std::string& subject, const std::string& error,
+                                const std::string& lang = std::string()) {
     if (entity_id.empty()) return;
     std::ostringstream o;
     o << "{\"entity_id\":\"" << meta_jesc(entity_id) << "\",\"subject\":\"" << meta_jesc(subject)
+      << "\",\"lang\":\"" << meta_jesc(lang)
       << "\",\"at\":" << (long long)std::time(nullptr) << ",\"error\":\"" << meta_jesc(error) << "\"}\n";
     entity_write_atomic(knowledge_miss_path(baseDir, entity_id), o.str());
 }
@@ -827,12 +877,13 @@ inline KnowledgeResult knowledge_get(const std::string& entity_id,
     }
 
     const long long now_sec = (long long)std::time(nullptr);
-    const bool has_unexpired = cache_valid && knowledge_has_unexpired(cached_materials, now_sec);
+    // ★ F30：命中判定必须按【请求语言】筛 —— 见 knowledge_has_unexpired_for_lang 的注。
+    const bool has_unexpired = cache_valid && knowledge_has_unexpired_for_lang(cached_materials, opts.lang, now_sec);
 
     // 0) 失败负缓存（6 小时）：上一次已经确认「没有权威材料」→ 直接返回，不再联网
     //    （用户 261023-04 #14：每次打开艺术家页都重打维基，既慢又什么都出不来）
     long long miss_at = 0;
-    if (!opts.refresh && knowledge_recent_miss(baseDir, entity_id, 6 * 3600, &miss_at)) {
+    if (!opts.refresh && knowledge_recent_miss(baseDir, entity_id, 6 * 3600, &miss_at, opts.lang)) {
         res.from_cache = true;
         res.offline = false;
         res.error = "近期未找到权威材料（6 小时内不再重试；可在资料页点「刷新资料」强制重试）";
@@ -842,7 +893,8 @@ inline KnowledgeResult knowledge_get(const std::string& entity_id,
     // 1) 命中未过期缓存且未要求 refresh -> 直接返回缓存
     if (!opts.refresh && has_unexpired) {
         knowledge_clear_miss(baseDir, entity_id);
-        res.materials = cached_materials;
+        // ★ F30：只返回与请求语言相容的材料（zh 缓存不能冒充 en 结果）。
+        res.materials = knowledge_filter_by_lang(cached_materials, opts.lang);
         res.from_cache = true;
         res.offline = false;
         return res;
@@ -876,19 +928,24 @@ inline KnowledgeResult knowledge_get(const std::string& entity_id,
     // 3) 处理网络拉取成功结果
     if (!fresh_materials.empty()) {
         knowledge_clear_miss(baseDir, entity_id);
-        std::vector<KnowledgeMaterial> merged = cached_materials;
+        // Reload and merge under the same file lock as the atomic writer: concurrent
+        // language fetches must preserve each other, even if both started from cold cache.
+        std::lock_guard<std::recursive_mutex> lk(entity_file_mutex(cache_path));
+        std::vector<KnowledgeMaterial> merged;
+        if (!knowledge_load_cache(baseDir, entity_id, merged)) merged = cached_materials;
         knowledge_merge_materials(merged, fresh_materials);
         knowledge_save_cache(baseDir, entity_id, subject, merged);
 
-        res.materials = std::move(merged);
+        res.materials = knowledge_filter_by_lang(merged, opts.lang);
         res.from_cache = false;
         res.offline = false;
         return res;
     }
 
     // 4) 网络未产出新材料时：若有缓存（即使过期），离线回退！
-    if (cache_valid && !cached_materials.empty()) {
-        res.materials = std::move(cached_materials);
+    const auto compatible_cache = knowledge_filter_by_lang(cached_materials, opts.lang);
+    if (cache_valid && !compatible_cache.empty()) {
+        res.materials = compatible_cache;
         res.from_cache = true;
         res.offline = true;
         if (!net_errors.empty()) {
@@ -913,7 +970,7 @@ inline KnowledgeResult knowledge_get(const std::string& entity_id,
         res.error = "未找到任何相关权威材料";
     }
     // 落失败标记：下一次（6 小时内）不再联网重试
-    if (!opts.refresh) knowledge_mark_miss(baseDir, entity_id, subject, res.error);
+    if (!opts.refresh) knowledge_mark_miss(baseDir, entity_id, subject, res.error, opts.lang);
     return res;
 }
 

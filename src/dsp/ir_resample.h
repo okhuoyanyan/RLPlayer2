@@ -12,6 +12,7 @@
 //  * inRate == outRate 时逐位透传（绝不"顺手"过一次滤波器）
 //  * 尾部补 T 个零把重采样器的尾巴冲出来（T = 每相位抽头数 = 原型在输入域的长度）
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include "resampler.h"
 
 #include <algorithm>

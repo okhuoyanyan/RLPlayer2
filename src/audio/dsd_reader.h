@@ -9,8 +9,13 @@
 //   DSF：小端；头 28 字节（"DSD " 4 + 块长 8 + 文件长 8 + 元数据指针 8）；
 //        fmt 块 52 字节（含 12 字节块头）；data 按「每声道 blockSize 字节」分块交错；
 //        **位序 LSB-first**（Sony 规范；ffmpeg 用 dsd_lsbf 解码器）。
-//   DFF：DSDIFF，大端；FRM8("DSD ") → PROP("SND ") → FS / CHNL / CMPR；DSD 块按声道
-//        独立连续存放；**位序 MSB-first**（ffmpeg 用 dsd_msbf）。DST 压缩块不支持。
+//   DFF：DSDIFF，大端；FRM8("DSD ") → PROP("SND ") → FS / CHNL / CMPR；DSD 块里的
+//        **Channel Byte 按声道交错**（Clustered Frame = numChannels 个字节，2 声道即
+//        L0,R0,L1,R1…，见 DSDIFF 1.5 §3.3 第 18 页与 §1.2 的「Clustered Frame」定义）；
+//        **位序 MSB-first**（ffmpeg 用 dsd_msbf）。DST 压缩块不支持。
+//        ★ 2026-10-29（两轮审查 F02）：旧实现按「每声道连续」读/写，而读写共享同一个
+//        错误前提 ⟹ 自写自读的往返测试是假阳性。对标准 DFF，左声道被读成
+//        11 a1 22 b2，而正确值是 11 22 33 44（声道数据被错切成了前后半段）。
 //
 // 统一内部表示：每声道一份 **MSB-first** 打包字节流（bit7 = 时间上更早的位）。
 // 这样 DoP 打包时「每 16 位一组」正好等于两个相邻字节 (b0<<8)|b1，不需要再翻转位序。
@@ -377,11 +382,15 @@ inline DsdStream read_dff(const std::string& path) {
 
     const uint32_t ch = declaredCh ? declaredCh : 2;
     if (ch < 1 || ch > 8) throw std::runtime_error("DFF 声道数异常: " + std::to_string(ch));
-    if (dataSize == 0 || dataSize % ch != 0)
+    // ★ F02：规范允许 DSDsoundData[] 为奇数长度时在末尾补一个 pad 字节（不参与播放）。
+    //   多声道时这意味着 dataSize 可能是 N*k+1 —— 不能因此判成"文件坏了"。
+    uint64_t effSize = dataSize;
+    if (ch > 1 && effSize % ch == 1) effSize -= 1;
+    if (effSize == 0 || effSize % ch != 0)
         throw std::runtime_error("DFF DSD 数据长度 " + std::to_string(dataSize) +
                                  " 不能被声道数 " + std::to_string(ch) + " 整除");
 
-    const uint64_t perCh = dataSize / ch;
+    const uint64_t perCh = effSize / ch;
     DsdStream s;
     s.rate = rate;
     s.channels = (int)ch;
@@ -390,9 +399,13 @@ inline DsdStream read_dff(const std::string& path) {
     s.channelType = 0;
     s.channelIds = ids.size() == (size_t)ch ? ids : dsf_channel_ids((int)ch);
     s.bits = perCh * 8;
-    s.data.assign((size_t)ch, {});
-    for (uint32_t c = 0; c < ch; ++c)
-        s.data[(size_t)c].assign(dataPtr + (size_t)c * perCh, dataPtr + (size_t)(c + 1) * perCh);
+    // ★ F02（DSDIFF 1.5 §3.3）：Channel Byte 交错 —— 第 i 个 Channel Byte 的声道 c
+    //   在文件里的偏移是 i*numChannels + c。旧代码按 c*perCh 取整段连续数据，
+    //   2 声道时左声道拿到的是"文件前半段"（L0,R0,L1,R1…），不是左声道。
+    s.data.assign((size_t)ch, std::vector<uint8_t>((size_t)perCh, 0));
+    for (uint64_t i = 0; i < perCh; ++i)
+        for (uint32_t c = 0; c < ch; ++c)
+            s.data[(size_t)c][(size_t)i] = dataPtr[(size_t)(i * ch + c)];
     return s;
 }
 
@@ -548,7 +561,8 @@ inline void write_dsf(const std::string& path, const DsdStream& s, uint32_t bloc
     write_file_bytes(path, o);
 }
 
-// DFF：大端，按声道连续存放，MSB-first 直通。
+// DFF：大端，Channel Byte 按声道**交错**（DSDIFF 1.5 §3.3），MSB-first 直通。
+// ★ 2026-10-30：注释原本写「按声道连续存放」—— 那是 F02 修复前的错误前提，一并改正。
 inline void write_dff(const std::string& path, const DsdStream& s) {
     using namespace dsd_detail;
     if (s.channels < 1 || s.channels > 8) throw std::runtime_error("write_dff: 声道数非法");
@@ -605,8 +619,13 @@ inline void write_dff(const std::string& path, const DsdStream& s) {
     const auto propChunk = chunk("PROP", propFmt);
     std::vector<uint8_t> dsd;
     dsd.reserve((size_t)(bytesPerCh * (uint64_t)s.channels));
-    for (int c = 0; c < s.channels; ++c)
-        dsd.insert(dsd.end(), s.data[(size_t)c].begin(), s.data[(size_t)c].begin() + (long long)bytesPerCh);
+    // ★ F02（DSDIFF 1.5 §3.3）：写出必须与读入用同一条交错规则 ——
+    //   Clustered Frame 里依次是 ch0、ch1、… 的同一个 Channel Byte。
+    //   旧代码按声道整段拼接（ch0 全部、再 ch1 全部），对任何标准 DFF 播放器都是
+    //   错位的；而旧测试用同一个错误前提回读，所以一直"通过"。
+    for (uint64_t i = 0; i < bytesPerCh; ++i)
+        for (int c = 0; c < s.channels; ++c)
+            dsd.push_back(s.data[(size_t)c][(size_t)i]);
     const auto dsdChunk = chunk("DSD ", dsd);
 
     std::vector<uint8_t> out;

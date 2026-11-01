@@ -228,13 +228,25 @@ inline std::string wide_to_utf8(const std::wstring& w) {
     return s;
 }
 
-// 找到 ffmpeg / ffprobe：先看 exe 同目录（自带），再退回 PATH。
+// Bundled decoder lookup: same directory, then the package root for tools/*.exe,
+// then PATH. CLI tools live one level below the shared ffmpeg/ffprobe binaries.
 inline std::string find_tool(const char* name) {
+    const auto is_file = [](const std::wstring& path) {
+        const DWORD attr = GetFileAttributesW(path.c_str());
+        return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+    };
     const std::wstring dir = exe_dir_w();
     if (!dir.empty()) {
         const std::wstring local = dir + L"\\" + widen(name) + L".exe";
-        if (GetFileAttributesW(local.c_str()) != INVALID_FILE_ATTRIBUTES)
+        if (is_file(local))
             return wide_to_utf8(local);
+        const size_t slash = dir.find_last_of(L"\\/");
+        if (slash != std::wstring::npos && _wcsicmp(dir.substr(slash + 1).c_str(), L"tools") == 0) {
+            const std::wstring package = dir.substr(0, slash);
+            const std::wstring bundled = package + L"\\" + widen(name) + L".exe";
+            if (is_file(package + L"\\RLPlayer.exe") && is_file(bundled))
+                return wide_to_utf8(bundled);
+        }
     }
     wchar_t buf[4096];
     const std::wstring w = widen(name);
@@ -603,6 +615,13 @@ inline DsdFileLayout probe_dsd_layout(const std::string& path) {
         if (_fseeki64(f, (long long)off, SEEK_SET) != 0) return 0;
         return std::fread(buf, 1, n, f);
     };
+    // ★ 2026-10-29（两轮审查 F16）：必须先拿到真实文件长度，才能判断"头部声明的数据区
+    //   是否真的在文件里"。旧代码只信头里的长度 ⟹ 截断文件在流式路径上被当成完整文件。
+    uint64_t fileBytes = 0;
+    if (_fseeki64(f, 0, SEEK_END) == 0) {
+        const long long sz = _ftelli64(f);
+        if (sz > 0) fileBytes = (uint64_t)sz;
+    }
 
     if (ext == ".dsf") {
         uint8_t h[28];
@@ -659,6 +678,17 @@ inline DsdFileLayout probe_dsd_layout(const std::string& path) {
         L.bytesPerChannel = needBytes;
         L.blockSize = blockSize;
         L.paddedLastBlock = (L.dataSize >= needData);
+        // ★ F16：DSF 也要校验"声明的数据区真的在文件里"。
+        //   合法末块 padding（paddedLastBlock=true）与"文件被截断"必须区分开：
+        //     · 按整块补齐 ⟹ 需要 blocks*ch*blockSize
+        //     · 紧排（无补齐）⟹ 需要 fullBlocks*ch*blockSize + ch*remBytes
+        const uint64_t needActual = L.paddedLastBlock
+            ? needData
+            : fullBlocks * (uint64_t)chNum * blockSize + (uint64_t)chNum * remBytes;
+        if (fileBytes && L.dataOffset + needActual > fileBytes)
+            throw std::runtime_error("DSF 数据区被截断：头部声明每声道 " + std::to_string(needBytes) +
+                                     " 字节，文件只剩 " + std::to_string(fileBytes > L.dataOffset
+                                         ? fileBytes - L.dataOffset : 0) + " 字节");
         L.container = "dsf";
         return L;
     }
@@ -720,10 +750,19 @@ inline DsdFileLayout probe_dsd_layout(const std::string& path) {
         }
         const uint32_t ch = declaredCh ? declaredCh : 2;
         if (ch < 1 || ch > 8) throw std::runtime_error("DFF 声道数异常");
-        if (L.dataSize == 0 || L.dataSize % ch != 0) throw std::runtime_error("DFF DSD 数据长度异常");
+        // ★ F02：规范允许末尾 1 个 pad 字节（不参与播放）；多声道时 dataSize 可能是 N*k+1。
+        uint64_t effSize = L.dataSize;
+        if (ch > 1 && effSize % ch == 1) effSize -= 1;
+        if (effSize == 0 || effSize % ch != 0) throw std::runtime_error("DFF DSD 数据长度异常");
+        // ★ F16：声明的数据区必须真的在文件里。
+        if (fileBytes && L.dataOffset + effSize > fileBytes)
+            throw std::runtime_error("DFF 数据区被截断：头部声明 " + std::to_string(effSize) +
+                                     " 字节，文件只剩 " + std::to_string(fileBytes > L.dataOffset
+                                         ? fileBytes - L.dataOffset : 0) + " 字节");
         L.isDsf = false;
         L.rate = rate; L.channels = (int)ch;
-        L.bytesPerChannel = L.dataSize / ch;
+        L.dataSize = effSize;
+        L.bytesPerChannel = effSize / ch;
         L.bitsPerChannel = L.bytesPerChannel * 8;
         L.blockSize = 0;
         L.paddedLastBlock = true;
@@ -782,6 +821,7 @@ public:
         dec_.clear();
         pending_.clear();
         curBit_ = 0; absFrames_ = 0; totalFrames_ = 0;
+        failed_ = false; failWhy_.clear();
     }
     bool is_open() const { return f_ != nullptr; }
     uint32_t rate() const { return outRate_; }
@@ -793,9 +833,16 @@ public:
 
     // 读取 [pos, pos+n) 帧，写入 out（rate/channels/bits 会被填好）。
     // 返回实际产出的帧数（到文件末尾会变短）。
+    // ★ 2026-10-29（两轮审查 F16）：错误通道。
+    //   旧实现在短读时 std::memset 补零，然后照常返回"读到 declared 帧数"⟹ 截断文件
+    //   在流式路径上被当成完整成功（整曲路径会拒绝，两条路给出相反结论）。
+    //   现在：短读/seek 失败一律置错误并停止产出，调用方必须查 error()。
+    bool error(std::string* why = nullptr) const { if (why) *why = failWhy_; return failed_; }
+
     size_t read(size_t pos, size_t n, AudioBuffer& out) {
         out.rate = outRate_; out.channels = ch_; out.bits = 32; out.isFloat = false; out.raw.clear();
         if (!f_ || ch_ <= 0 || n == 0 || pos >= totalFrames_) return 0;
+        if (failed_) return 0;                       // 已损坏：不再假装能读
         if (n > totalFrames_ - pos) n = totalFrames_ - pos;
         const uint64_t wantEnd = (uint64_t)pos + (uint64_t)n;
         const uint64_t haveBegin = pendStart_;
@@ -824,7 +871,13 @@ public:
     }
 
 private:
-    size_t pendCount() const { return pending_.empty() ? 0 : pending_[0].size(); }
+    // ★ 2026-10-29（F16）：取【所有声道里最短的那个】。只要有一个声道落后，
+    //   用 pending_[0].size() 当可用量就会越界读（错误路径下曾经真实发生）。
+    size_t pendCount() const {
+        size_t n = (size_t)-1;
+        for (const auto& v : pending_) n = std::min(n, v.size());
+        return pending_.empty() ? 0 : n;
+    }
 
     void reset_to(uint64_t bitIndex) {
         const uint64_t blockBits = (uint64_t)readBlock_ * 8ull;
@@ -836,31 +889,70 @@ private:
         for (auto& v : pending_) v.clear();
     }
 
+    void fail(const std::string& why) { failed_ = true; failWhy_ = why; }
+
+    // 从文件读 thisBlock 字节到 scratch_（不足即判失败，绝不补零）
+    bool read_exact(uint64_t src, size_t bytes, const char* what, uint64_t perChByte) {
+        if (scratch_.size() < bytes) scratch_.resize(bytes, 0);
+        if (_fseeki64(f_, (long long)src, SEEK_SET) != 0) {
+            fail(std::string("DSD 流式读取失败：seek 到 ") + std::to_string(src) + " 失败（" + what + "）");
+            return false;
+        }
+        const size_t got = std::fread(scratch_.data(), 1, bytes, f_);
+        if (got < bytes) {
+            fail(std::string("DSD 数据被截断：") + what + " 需要 " + std::to_string(bytes) +
+                 " 字节，只读到 " + std::to_string(got) + " 字节（每声道声明 " +
+                 std::to_string(perChByte) + " 字节）");
+            return false;
+        }
+        return true;
+    }
+
     bool feed_next_block() {
-        if (!f_) return false;
+        if (!f_ || failed_) return false;
         const uint64_t blockBytes = readBlock_;
         if (curBit_ / 8ull >= layout_.bytesPerChannel) return false;
         const uint64_t b = curBit_ / (blockBytes * 8ull);
         const uint64_t byteOff = b * blockBytes;
         if (byteOff >= layout_.bytesPerChannel) return false;
         const size_t thisBlock = (size_t)std::min<uint64_t>(blockBytes, layout_.bytesPerChannel - byteOff);
-        for (int c = 0; c < ch_; ++c) {
-            uint64_t src = 0;
-            if (layout_.isDsf) {
+        if (layout_.isDsf) {
+            // ★ 2026-10-29（F16 修正）：必须【先把所有声道的字节都读成功，再喂抽取器】。
+            //   旧写法边读边喂：第 0 声道喂完、第 1 声道才失败 ⟹ pending_[0] 比 pending_[1]
+            //   多出一块，而 pendCount() 只看 pending_[0] ⟹ read() 里 v[skip+i] 越界
+            //   （实测 0xC0000005 崩溃）。错误路径同样不能破坏不变量。
+            if (bufs_.size() != (size_t)ch_) bufs_.assign((size_t)ch_, {});
+            for (auto& bb : bufs_) if (bb.size() < thisBlock) bb.resize(thisBlock, 0);
+            for (int c = 0; c < ch_; ++c) {
                 const uint64_t base = layout_.dataOffset + b * (uint64_t)ch_ * (uint64_t)layout_.blockSize;
                 const uint64_t stride = layout_.paddedLastBlock ? (uint64_t)layout_.blockSize : (uint64_t)thisBlock;
-                src = base + (uint64_t)c * stride;
-            } else {
-                src = layout_.dataOffset + (uint64_t)c * layout_.bytesPerChannel + byteOff;
+                const uint64_t src = base + (uint64_t)c * stride;
+                if (!read_exact(src, thisBlock, ("DSF 声道 " + std::to_string(c)).c_str(),
+                                layout_.bytesPerChannel))
+                    return false;
+                std::memcpy(bufs_[(size_t)c].data(), scratch_.data(), thisBlock);
             }
-            if (scratch_.size() < thisBlock) scratch_.resize(thisBlock, 0);
-            size_t got = 0;
-            if (_fseeki64(f_, (long long)src, SEEK_SET) == 0)
-                got = std::fread(scratch_.data(), 1, thisBlock, f_);
-            if (got < thisBlock) std::memset(scratch_.data() + got, 0, thisBlock - got);
-            if (layout_.isDsf)
-                for (size_t i = 0; i < thisBlock; ++i) scratch_[i] = dsd_detail::reverse_bits8(scratch_[i]);
-            dec_[(size_t)c]->process_bits(scratch_.data(), thisBlock * 8, pending_[(size_t)c]);
+            for (int c = 0; c < ch_; ++c) {
+                for (size_t i = 0; i < thisBlock; ++i)
+                    scratch_[i] = dsd_detail::reverse_bits8(bufs_[(size_t)c][i]);
+                dec_[(size_t)c]->process_bits(scratch_.data(), thisBlock * 8, pending_[(size_t)c]);
+            }
+        } else {
+            // ★ F02（DSDIFF 1.5 §3.3）：DFF 的 Channel Byte 是**交错**的 ——
+            //   一个「每声道 thisBlock 字节」的块在文件里是 thisBlock*ch 个连续字节，
+            //   第 i 个 Channel Byte 的声道 c 在 i*ch+c。旧代码按 c*bytesPerChannel 取，
+            //   等于把文件按声道数切成前后两半（2 声道时左声道其实是 L,R,L,R…）。
+            const size_t need = thisBlock * (size_t)ch_;
+            const uint64_t src = layout_.dataOffset + byteOff * (uint64_t)ch_;
+            if (!read_exact(src, need, "DFF 交错块", layout_.bytesPerChannel)) return false;
+            if (scratch_.size() < need) scratch_.resize(need, 0);   // read_exact 已保证
+            if (ilv_.size() < need) ilv_.resize(need, 0);
+            std::memcpy(ilv_.data(), scratch_.data(), need);
+            for (int c = 0; c < ch_; ++c) {
+                for (size_t i = 0; i < thisBlock; ++i)
+                    scratch_[i] = ilv_[i * (size_t)ch_ + (size_t)c];
+                dec_[(size_t)c]->process_bits(scratch_.data(), thisBlock * 8, pending_[(size_t)c]);
+            }
         }
         curBit_ += (uint64_t)thisBlock * 8ull;
         absFrames_ = curBit_ / (uint64_t)M_;
@@ -882,6 +974,10 @@ private:
     std::vector<std::unique_ptr<dsp::DsdDecimator>> dec_;
     std::vector<std::vector<double>> pending_;
     std::vector<uint8_t> scratch_;
+    std::vector<uint8_t> ilv_;        // DFF 交错块的原始缓冲（F02）
+    std::vector<std::vector<uint8_t>> bufs_;   // DSF 每声道块缓冲（先全读成功再喂抽取器）
+    bool        failed_ = false;      // F16：已检出损坏（截断/seek 失败），不再产出数据
+    std::string failWhy_;
 };
 
 

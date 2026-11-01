@@ -435,13 +435,34 @@ inline std::vector<SearchHit> filter_hits(const std::vector<SearchHit>& hits,
 // 提示词构造：build_synthesis_prompt
 // ---------------------------------------------------------------------------
 
+// Natural-language output follows the request even when the schema/examples are Chinese.
+inline std::string summary_language_rule(const std::string& lang) {
+    const std::string target = lang.empty() ? "zh" : lang;
+    return "\n[OUTPUT LANGUAGE: " + target + "]\n"
+        "Write all generated prose, section headings, disclaimers, and fields values in the language "
+        "identified by this BCP-47 tag. This language requirement overrides the language of examples "
+        "and any fixed disclaimer wording: translate their meaning into the requested language. "
+        "Preserve structural JSON property names and schema field keys exactly as specified; "
+        "do not translate source URLs, citation IDs, or proper names without established translations. "
+        "Language changes never authorize adding unsupported facts.\n";
+}
+
+inline void summary_apply_language(std::vector<LlmMessage>& messages, const std::string& lang) {
+    for (auto& message : messages) {
+        if (message.role != "system") continue;
+        if (message.content.find("[OUTPUT LANGUAGE:") == std::string::npos)
+            message.content += summary_language_rule(lang);
+        return;
+    }
+    messages.insert(messages.begin(), LlmMessage{"system", summary_language_rule(lang)});
+}
+
 inline std::vector<LlmMessage> build_synthesis_prompt(
     const std::string& entity,
     const std::vector<KnowledgeMaterial>& materials,
     const std::vector<SearchHit>& hits,
     const std::string& lang = "zh",
     const std::string& kindLabel = "") {
-    (void)lang;
     const std::string schema = field_schema_for_kind(kindLabel);
     std::string sys =
         "你是一个严谨的音乐资料整理与综合专家。你的任务是根据给定的权威材料与检索网页，为音乐实体编写结构化的背景介绍与艺术评价。\n\n"
@@ -490,6 +511,7 @@ inline std::vector<LlmMessage> build_synthesis_prompt(
         "  ]\n"
         "}\n";
 
+    sys += summary_language_rule(lang);
     std::ostringstream u;
     u << "请为音乐实体【" << entity << "】整理结构化音乐资料概述。\n\n"
       << "【给定参考材料列表】（编号 [M1], [M2] ...）：\n";
@@ -877,10 +899,13 @@ inline std::vector<LlmMessage> build_profile_synthesis_prompt(
     const std::string& kindLabel,
     const std::vector<KnowledgeMaterial>& materials,
     const std::vector<SearchHit>& hits,
-    const std::vector<std::pair<std::string, std::string>>& known_tags = {}) {
+    const std::vector<std::pair<std::string, std::string>>& known_tags = {},
+    const std::string& lang = "zh") {
     const ProfilePrompt pp = build_profile_prompt(dec, entity, kindLabel,
                                                   summary_materials_block(materials, hits), known_tags);
-    return { LlmMessage{ "system", pp.system }, LlmMessage{ "user", pp.user } };
+    std::vector<LlmMessage> messages = { LlmMessage{ "system", pp.system }, LlmMessage{ "user", pp.user } };
+    summary_apply_language(messages, lang);
+    return messages;
 }
 
 // ProfileDoc → SummaryResult：doc 里的每一条都进结果（不排序、不裁剪标签、不因为没引用而丢内容）
@@ -1060,11 +1085,68 @@ inline SummaryResult summary_build_from_profile_reply(const std::string& reply,
 // 缓存序列化、反序列化、落盘与路径
 // ---------------------------------------------------------------------------
 
+// ★ 2026-10-29（两轮审查 F14）：lang 是**请求参数**，直接拼进文件名会越出缓存目录。
+//
+// 缺陷：/api/entity/summary?lang=... 的值原样进 summary_cache_path()，于是
+//   lang = "../../evil" 会写到 entities/<id>/../../evil-summary.json（缓存根之外），
+//   lang = "a/b" 会试图创建子目录。影响受 .json 后缀与账户权限限制，但越界就是越界。
+//
+// 修法：**无损百分号编码**成单一文件名组件（不是"删掉 ../"，那会让不同语言撞成同一个
+//   缓存身份）；超长标识退化为 FNV-1a 摘要，仍然不碰撞。
+inline std::string summary_lang_token(const std::string& lang) {
+    const std::string l = lang.empty() ? std::string("zh") : lang;
+    std::string out;
+    out.reserve(l.size() + 8);
+    for (unsigned char c : l) {
+        const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (safe) out += (char)c;
+        else { char b[8]; std::snprintf(b, sizeof(b), "%%%02X", (unsigned)c); out += b; }
+    }
+    if (out.empty()) out = "zh";
+    if (out.size() > 64) {                       // 超长：退化到摘要（仍无目录语义、仍不碰撞）
+        uint64_t h = 1469598103934665603ull;
+        for (unsigned char c : l) { h ^= (uint64_t)c; h *= 1099511628211ull; }
+        char b[32];
+        std::snprintf(b, sizeof(b), "h%016llx", (unsigned long long)h);
+        out = b;
+    }
+    return out;
+}
+
+// 请求边界用的语言标识校验（BCP-47 的最小子集：空 / xx / xx-YYY）。
+// 只做"形状"校验，不做白名单 —— 语言集合会变，硬白名单迟早挡住正常用法。
+inline bool summary_lang_valid(const std::string& lang) {
+    if (lang.empty()) return true;
+    if (lang.size() > 32) return false;
+    size_t i = 0, seg = 0;
+    while (i < lang.size()) {
+        if (seg > 2) return false;
+        size_t n = 0;
+        while (i < lang.size() && lang[i] != '-') {
+            const char c = lang[i];
+            const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+            if (!ok) return false;
+            ++i; ++n;
+        }
+        if (n < 1 || n > 8) return false;
+        ++seg;
+        if (i < lang.size()) ++i;               // 跳过 '-'
+        else break;
+    }
+    return true;
+}
+
+// ★ F31：缓存格式/语义版本的**唯一**来源。写入与读取都引用它，
+//   禁止再出现"这里写 7、那里判 3"的两套规则（那正是 F31 的根因）。
+//   每次因为「旧内容可能是错的」而改提示词/清洗规则时，把这里 +1。
+inline constexpr int kSummaryCacheVer = 8;
+
 inline fsx::path summary_cache_path(const std::string& baseDir,
                                     const std::string& entity_id,
                                     const std::string& lang) {
     const std::string b = baseDir.empty() ? EntityStore::instance().baseDir() : baseDir;
-    const std::string l = lang.empty() ? "zh" : lang;
+    const std::string l = summary_lang_token(lang);
     return meta_path_of(b) / "entities" / entity_id / ("summary-" + l + ".json");
 }
 
@@ -1082,7 +1164,7 @@ inline std::string summary_to_json(const SummaryResult& sr) {
       //   而那个页面实际是完全不相干的《火花》。这类错误带可点击链接、看起来像已核实的事实，
       //   比"没查到"更有害 ⟹ v4 缓存一律不复用，下次打开重新生成一次。
       //   （代价：已整理过的资料会重算一次，消耗一次额度。用户已确认接受。）
-      << "  \"v\": 6,\n"
+      << "  \"v\": " << kSummaryCacheVer << ",\n"
       << "  \"ok\": " << (sr.ok ? "true" : "false") << ",\n"
       << "  \"ai\": " << (sr.ai ? "true" : "false") << ",\n"
       << "  \"model\": \"" << meta_jesc(sr.model) << "\",\n"
@@ -1159,7 +1241,8 @@ inline std::string summary_to_json(const SummaryResult& sr) {
 inline bool summary_from_json(const std::string& text,
                               SummaryResult& sr_out,
                               std::string* err_out = nullptr) {
-    const rta::net::Json j = rta::net::json_parse(text);
+    rta::net::Json j;
+    if (!rta::net::json_parse_strict(text, j, err_out)) return false;
     if (j.type != rta::net::Json::Obj) {
         if (err_out) *err_out = "summary cache corrupted: not a JSON object";
         return false;
@@ -1177,10 +1260,20 @@ inline bool summary_from_json(const std::string& text,
     // 2026-10-24（261024-01 #4）：v2 之前的缓存没有结构化标签 → 视为已过期，重新生成一次
     //（否则升级后老用户永远看不到标签网格）。
     sr_out.cache_ver = (int)j["v"].n();
-    // v3：消歧义过滤 + 400 降级链 + 输出精简（旧内容可能质量差/来自误判，统一重生成一次）
-    // 注意用 1（1970 年）而不是 0：summary_is_expired 对 expires_at<=0 会回退到 generated_at+7d，
-    // 设 0 等于"永不过期"（2026-10-24 实测：缓存 v2 文件一直 cache-hit，v3 失效没生效）。
-    if ((int)j["v"].n() < 3) sr_out.expires_at = 1;
+    // ★ 2026-10-29（两轮审查 F31）：**所有**缓存命中路径必须执行同一条版本规则。
+    //
+    // 缺陷：这里只淘汰 v<3，而另外两条"综合失败回退缓存"的分支各自写着 cache_ver>=7
+    //   ⟹ 同一个 v4/v5/v6 缓存，走正常命中路径会被当成有效（直接返回），走回退路径却
+    //   被拒。v4 是文件头里明确写"一律不复用"的版本（提示词规则 9 归属校验前的错误断言），
+    //   它居然能从主命中路径直接返回 —— 这正是实测里"改成 v4 后 retrieval_fetch 直接
+    //   cache hit、expired=0、HTTP=0"的原因。
+    //
+    // 现在只有一个常量：低于它一律 expires_at=1（= 立即过期，下次请求重新生成）。
+    // v5（规则 10：字段值里禁止裸 URL）、v6/v7（261029-01 的渲染期清洗 + 标注体系变更）
+    // 都改变了内容的语义，所以最低可接受版本就是当前写入版本。
+    // 注意用 1（1970 年）而不是 0：summary_is_expired 对 expires_at<=0 会回退到
+    //   generated_at+7d，设 0 等于"永不过期"（2026-10-24 实测：缓存 v2 文件一直 cache-hit）。
+    if ((int)j["v"].n() < kSummaryCacheVer) sr_out.expires_at = 1;
     sr_out.disclaimer = j["disclaimer"].s();
     if (j.has("from_cache")) sr_out.from_cache = j["from_cache"].b;
     if (j.has("offline")) sr_out.offline = j["offline"].b;
@@ -1746,7 +1839,6 @@ inline std::vector<LlmMessage> build_ai_only_prompt(const std::string& entityLab
                                                     const std::string& kindLabel,
                                                     const std::string& lang,
                                                     const std::string& evidence = std::string()) {
-    (void)lang;
     const bool has_ev = !evidence.empty();
     std::string sys =
         std::string("你是严谨的音乐资料编辑。") +
@@ -1767,6 +1859,7 @@ inline std::vector<LlmMessage> build_ai_only_prompt(const std::string& entityLab
         "{\"sections\":[{\"heading\":\"简介\",\"paragraphs\":[{\"text\":\"……\"}]}],\"fields\":{\"发行时间\":\"……\"}}\n";
     std::string user = "请为" + kindLabel + "【" + entityLabel + "】写 2~3 段简介，"
                        "可用小标题（如 风格与定位 / 代表作品 / 影响与评价）。直接输出 JSON。";
+    sys += summary_language_rule(lang);
     return { LlmMessage{ "system", sys }, LlmMessage{ "user", user } };
 }
 
@@ -1847,6 +1940,7 @@ inline SummaryResult summary_ai_only_generate(const std::string& entityName,
     } else {
         base_msgs = build_ai_only_prompt(entityName, kindLabel, lang, evidence);
     }
+    summary_apply_language(base_msgs, lang);
     SummaryResult parsed;
     std::string last_err;
     for (int attempt = 0; attempt < 2; ++attempt) {
@@ -1896,7 +1990,6 @@ inline std::vector<LlmMessage> build_track_prompt(const std::string& title,
                                                   const std::string& artist,
                                                   const std::vector<SearchHit>& hits,
                                                   const std::string& lang) {
-    (void)lang;
     const std::string schema = field_schema_for_kind("歌曲");
     std::string sys =
         "你是严谨的音乐资料编辑。请依据下方提供的检索材料，为这首歌曲整理结构化资料。\n"
@@ -1919,7 +2012,16 @@ inline std::vector<LlmMessage> build_track_prompt(const std::string& title,
         idx++;
     }
     u << "\n直接输出 JSON。";
+    sys += summary_language_rule(lang);
     return { LlmMessage{ "system", sys }, LlmMessage{ "user", u.str() } };
+}
+
+// Album is part of recording identity: two albums can both contain an Intro.
+// Empty-album requests retain the old key; known albums never reuse that ambiguous cache.
+inline std::string summary_track_entity_id(const std::string& title, const std::string& artist,
+                                            const std::string& album = {}) {
+    const std::string key = entity_norm(artist) + "\x1f" + entity_norm(title);
+    return entity_make_id("track", album.empty() ? key : key + "\x1f" + entity_norm(album));
 }
 
 inline SummaryResult retrieval_fetch_track(const std::string& title,
@@ -1929,7 +2031,7 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
                                            ProgressFn on_progress = nullptr) {
     SummaryProgressEmitter progress(on_progress);   // 拷贝（不是 move）：嵌套兜底路径还要复用同一个回调
     const std::string baseDir = !opts.metabase.empty() ? opts.metabase : EntityStore::instance().baseDir();
-    const std::string eid = entity_make_id("track", entity_norm(artist) + "\x1f" + entity_norm(title));
+    const std::string eid = summary_track_entity_id(title, artist, opts.album);
     SummaryResult cached;
     if (summary_load_cache(baseDir, eid, lang, cached) && cached.ok && !opts.refresh &&
         !summary_is_expired(cached)) {
@@ -2057,6 +2159,7 @@ inline SummaryResult retrieval_fetch_track(const std::string& title,
             retrieval_rate_limiter().acquire();
             progress.begin_attempt(attempt, "track llm attempt=" + std::to_string(attempt));
             const auto t_l0 = std::chrono::steady_clock::now();
+            summary_apply_language(msgs, lang);
             const LlmReply rep = retrieval_chat(cfg, msgs, trk_profile ? 3200 : 2200, 0.3f, true, progress);
             trk_llm_ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t_l0).count();
@@ -2496,7 +2599,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     //   结果写缓存 7 天，第二次打开不再调用。有材料时仍走严格引用路径，不受影响。
     if (kr.materials.empty() && fetched_hits.empty()) {
         // 2026-10-24（261024-02 #1）：同样只回退 v3+ 缓存（旧缓存可能是消歧义垃圾，见下方说明）
-        if (have_cache && cached.ok && cached.cache_ver >= 6) {
+        if (have_cache && cached.ok && cached.cache_ver >= kSummaryCacheVer) {
             cached.from_cache = true;
             cached.offline = true;
             cached.error = "未检索到任何权威材料，已回退至本地缓存";
@@ -2588,7 +2691,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     const LinkIndex link_idx = summary_link_index(kr.materials, fetched_hits);
     const bool use_profile = opts.use_profile_prompts;
     const std::vector<LlmMessage> msgs = use_profile
-        ? build_profile_synthesis_prompt(prof_dec, promptEntityName, kindLabel, kr.materials, fetched_hits, known_tags)
+        ? build_profile_synthesis_prompt(prof_dec, promptEntityName, kindLabel, kr.materials, fetched_hits, known_tags, lang)
         : build_synthesis_prompt(promptEntityName, kr.materials, fetched_hits, lang, kindLabel);
     SummaryResult parsed;
     std::string last_err;
@@ -2615,7 +2718,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
             attempt_msgs = msgs;
         } else if (attempt == 1) {
             attempt_msgs = use_profile
-                ? build_profile_synthesis_prompt(prof_dec, promptEntityName, kindLabel, reduced_mats, reduced_hits, known_tags)
+                ? build_profile_synthesis_prompt(prof_dec, promptEntityName, kindLabel, reduced_mats, reduced_hits, known_tags, lang)
                 : build_synthesis_prompt(promptEntityName, reduced_mats, reduced_hits, lang, kindLabel);
             attempt_tokens = use_profile ? 3200 : 2000;
             attempt_msgs.push_back(LlmMessage{ "user",
@@ -2650,7 +2753,7 @@ inline SummaryResult retrieval_fetch(EntityKind kind,
     if (!parsed.ok) {
         // 2026-10-24（261024-02 #1）：只回退 **v3+** 的缓存。旧格式缓存内容可能是消歧义垃圾
         //（实测 Irotas：v2 缓存里是"页面仅显示多个候选标题…"），拿它当兜底等于把坏内容永久固化。
-        if (have_cache && cached.ok && cached.cache_ver >= 6) {
+        if (have_cache && cached.ok && cached.cache_ver >= kSummaryCacheVer) {
             cached.from_cache = true;
             cached.offline = true;
             cached.error = "综合校验失败 (" + last_err + ")，已回退至本地缓存";

@@ -447,6 +447,78 @@ int main() {
         std::error_code ec; fsx::remove(p, ec);
     }
 
+    printf("\n=== 10. 源本身有损格式判定（第 5 档 kFakeVerdictSourceLossy = 4）===\n");
+    {
+        // 10a. lossy_container_of 纯函数用例：.MP3（大写）、.flac、.wav、无扩展名、路径带点但无扩展名
+        using rta::analysis::detail::lossy_container_of;
+        check(lossy_container_of("track.MP3"), "lossy_container_of: .MP3 大写扩展名命中");
+        check(lossy_container_of("song.mp3"), "lossy_container_of: .mp3 小写命中");
+        check(lossy_container_of("audio.opus"), "lossy_container_of: .opus 命中");
+        check(lossy_container_of("music.m4a"), "lossy_container_of: .m4a 命中");
+        check(!lossy_container_of("song.flac"), "lossy_container_of: .flac 无损容器不命中");
+        check(!lossy_container_of("track.wav"), "lossy_container_of: .wav 无损容器不命中");
+        check(!lossy_container_of("album.ape"), "lossy_container_of: .ape 无损容器不命中");
+        check(!lossy_container_of("no_extension"), "lossy_container_of: 无扩展名不命中");
+        check(!lossy_container_of("folder.v1/song"), "lossy_container_of: 路径带点但无扩展名（Linux）不命中");
+        check(!lossy_container_of("C:\\dir.v2\\song"), "lossy_container_of: 路径带点但无扩展名（Windows）不命中");
+
+        // 10b. 真实 .mp3 文件体检断言
+        std::string mp3Target = "D:\\RTA-hqplayer\\MUSIC\\专辑-感动我的&RainLain\\2021\\天门 (てんもん) - レトロスペクティブ京都.mp3";
+        bool generatedMp3 = false;
+        if (!fsx::exists(rta::audio::widen(mp3Target))) {
+            mp3Target = tmpDir + "\\rtahealth_fallback.mp3";
+            std::string cmd = "D:\\RTA-hqplayer\\build\\ffmpeg-lite\\ffmpeg.exe -y -f lavfi -i sine=frequency=440:duration=3 -b:a 320k \"" + mp3Target + "\" >nul 2>&1";
+            std::system(cmd.c_str());
+            generatedMp3 = true;
+        }
+
+        const TrackHealth hMp3 = analyze_file(mp3Target);
+        check(hMp3.status == "ready", "MP3 文件体检成功（status=ready）", hMp3.error);
+        check(hMp3.fakeVerdict == 4, "MP3: fakeVerdict == 4 (kFakeVerdictSourceLossy)", std::to_string(hMp3.fakeVerdict));
+        check(!hMp3.losslessSuspected, "MP3: losslessSuspected == false（源本身有损不判假）");
+        check(hMp3.reason.find("有损") != std::string::npos, "MP3: reason 包含「有损」", hMp3.reason);
+        // 其余指标照常计算，未跳过分析
+        check(std::isfinite(hMp3.drDb) && hMp3.drDb > 0.0, "MP3: dr_db 正常计算（未跳过）", std::to_string(hMp3.drDb));
+        check(std::isfinite(hMp3.lufs) && hMp3.lufs < 0.0, "MP3: lufs 正常计算（未跳过）", std::to_string(hMp3.lufs));
+        check(hMp3.hasQuality && hMp3.quality.valid, "MP3: quality.available 正常生成（未跳过）");
+        printf("   MP3 诊断: fakeVerdict=%d tag=%s reason=%s\n",
+               hMp3.fakeVerdict, detail::fake_verdict_tag(hMp3.fakeVerdict), hMp3.reason.c_str());
+
+        // 10c. 真实无损 .wav 文件体检断言
+        std::string wavTarget = "D:\\RTA-hqplayer\\MUSIC\\专辑-原创&同人\\Static World 会场限定CD @ Static World\\01. Clear Sky.wav";
+        if (fsx::exists(rta::audio::widen(wavTarget))) {
+            const TrackHealth hWav = analyze_file(wavTarget);
+            check(hWav.status == "ready", "WAV 文件体检成功（status=ready）", hWav.error);
+            check(hWav.fakeVerdict != 4, "WAV: fakeVerdict != 4（无损容器绝不判为源本身有损）", std::to_string(hWav.fakeVerdict));
+            printf("   WAV 诊断: fakeVerdict=%d tag=%s\n", hWav.fakeVerdict, detail::fake_verdict_tag(hWav.fakeVerdict));
+        }
+
+        // 10d. HealthStore 往返持久化支持 source_lossy 标签（fake_verdict_from_tag ⟹ 4）
+        {
+            const std::string sPath = tmpDir + "\\rtahealth_lossy_store.json";
+            std::error_code ec;
+            fsx::remove(sPath, ec);
+            {
+                HealthStore hs(sPath);
+                hs.upsert(mp3Target, 12345, 67890, hMp3);
+                check(hs.save(), "HealthStore 保存含 fakeVerdict=4 的记录成功");
+            }
+            {
+                HealthStore hs(sPath);
+                TrackHealth out;
+                check(hs.lookup(mp3Target, 12345, 67890, out), "HealthStore 回读命中");
+                check(out.fakeVerdict == 4, "HealthStore 回读 fakeVerdict == 4 (source_lossy 往返正确)", std::to_string(out.fakeVerdict));
+                check(!out.losslessSuspected, "HealthStore 回读 losslessSuspected == false");
+            }
+            fsx::remove(sPath, ec);
+        }
+
+        if (generatedMp3) {
+            std::error_code ec;
+            fsx::remove(mp3Target, ec);
+        }
+    }
+
     printf("\n%s (失败项 %d)\n", fails == 0 ? "全部通过" : "存在失败", fails);
     return fails == 0 ? 0 : 1;
 }

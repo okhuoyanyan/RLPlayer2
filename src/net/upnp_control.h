@@ -159,6 +159,9 @@ struct UpnpDidlItem {
     int         bits = 0;
     int         channels = 0;
     double      durationSec = 0.0;
+    // 2026-10-29：res@size。多数渲染器不看它也能播，但一部分（严格 DLNA 实现 / 需要预分配或
+    // 按大小算 seek 的设备）会因为它缺失而拒绝或无法拖动。填的是实际供源字节数。
+    int64_t     sizeBytes = 0;
 };
 
 inline std::string format_time_hh_mm_ss(double seconds) {
@@ -222,6 +225,9 @@ inline std::string build_didl_lite(const UpnpDidlItem& item) {
     }
     if (item.durationSec > 0.0) {
         ss << " duration=\"" << format_time_hh_mm_ss(item.durationSec) << "\"";
+    }
+    if (item.sizeBytes > 0) {
+        ss << " size=\"" << item.sizeBytes << "\"";
     }
     ss << ">" << xml_escape(item.uri) << "</res>";
     ss << "</item></DIDL-Lite>";
@@ -613,6 +619,10 @@ struct SamplingRateAnalysis {
     }
 };
 
+// ⚠️ 2026-10-29 遗留函数（仍有离线单测断言它，故保留行为不动）：
+//   它把 media.currentUriMetaData（渲染器回显的、我们自己发过去的 DIDL）当成"渲染器能力"，
+//   那份 DIDL 里的 sampleFrequency/bitsPerSample 就是源格式 ⟹ 第一分支恒为 Match（同一律），
+//   证明不了任何事。投放链路已改用 judge_upnp_bit_perfect()（只认 GetProtocolInfo 的 Sink）。
 inline SamplingRateAnalysis analyze_sampling_rate(const AudioSourceFormat& src,
                                                  const UpnpMediaInfo& media,
                                                  const UpnpPositionInfo& pos,
@@ -720,6 +730,253 @@ inline SamplingRateAnalysis analyze_sampling_rate(const AudioSourceFormat& src,
     return a;
 }
 
+// ---------------- 渲染器 Sink 能力解析与 bit-perfect 三态判定（2026-10-29）----------------
+//
+// 背景（用户原话）：「UPNP 投流，默认显示『非 bit-perfect』。这很离谱……你不能不知道就说不是」。
+// 旧实现有两处硬伤：
+//   ① 结论根本不在投放链路里算 —— rtaweb.cpp 的 upnp_mark_player_state() 直接写死 ps.bpState="no"；
+//   ② 本文件的 analyze_sampling_rate() 把 GetMediaInfo 回显的 CurrentURIMetaData 当成"渲染器能力"，
+//      而那份 DIDL 正是我们自己按源格式填好发过去的 —— 拿它比源格式永远是 Match（同一律），
+//      同一次会话里于是能同时出现「匹配（Bit-Perfect）」与「非 bit-perfect」两个相反结论。
+// 现在只认两件可证的事实：
+//   A) 软件侧：供出去的 PCM 是否与源解码结果逐位相同（无重采样/无位深转换/无音量/无 EQ/无抖动）；
+//   B) 渲染器侧：ConnectionManager.GetProtocolInfo 的 Sink 到底声明了什么（MIME + 显式 rate/channels）。
+// 两条都成立才给 yes；能证明不成立给 no；其余一律 unknown —— 宁可不显示，也不给错误结论。
+
+inline std::string upnp_lower_ascii(std::string s) {
+    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+    return s;
+}
+inline std::string upnp_trim(const std::string& s) {
+    const size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    const size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+struct UpnpSinkEntry {
+    std::string protocol;     // http-get
+    std::string network;      // *
+    std::string mime;         // audio/wav、audio/L16（已小写）
+    uint32_t    rate = 0;     // contentFormat 里显式写的 rate=，0 = 未声明
+    int         channels = 0; // 显式 channels=，0 = 未声明
+    int         bits = 0;     // 由 L16/L24/L32 或 DLNA PN 推出，0 = 未声明
+    std::string pn;           // DLNA.ORG_PN=
+    bool is_audio() const { return mime.rfind("audio/", 0) == 0; }
+    bool is_wav() const { return mime == "audio/wav" || mime == "audio/x-wav" || mime == "audio/wave"; }
+    bool is_lpcm() const {
+        return mime.rfind("audio/l16", 0) == 0 || mime.rfind("audio/l24", 0) == 0 ||
+               mime.rfind("audio/l32", 0) == 0;
+    }
+};
+
+inline UpnpSinkEntry parse_sink_entry(const std::string& token) {
+    UpnpSinkEntry e;
+    const std::string t = token;
+    const size_t c1 = t.find(':');
+    if (c1 == std::string::npos) { e.mime = upnp_lower_ascii(upnp_trim(t)); return e; }
+    e.protocol = upnp_lower_ascii(upnp_trim(t.substr(0, c1)));
+    const size_t c2 = t.find(':', c1 + 1);
+    if (c2 == std::string::npos) { e.mime = upnp_lower_ascii(upnp_trim(t.substr(c1 + 1))); return e; }
+    e.network = upnp_trim(t.substr(c1 + 1, c2 - c1 - 1));
+    const size_t c3 = t.find(':', c2 + 1);
+    const std::string content = (c3 == std::string::npos) ? t.substr(c2 + 1)
+                                                          : t.substr(c2 + 1, c3 - c2 - 1);
+    const std::string extra = (c3 == std::string::npos) ? std::string() : t.substr(c3 + 1);
+
+    size_t semi = content.find(';');
+    e.mime = upnp_lower_ascii(upnp_trim(content.substr(0, semi)));
+    while (semi != std::string::npos) {
+        const size_t next = content.find(';', semi + 1);
+        const std::string kv = upnp_trim(content.substr(semi + 1,
+                                     next == std::string::npos ? std::string::npos : next - semi - 1));
+        const size_t eq = kv.find('=');
+        if (eq != std::string::npos) {
+            const std::string k = upnp_lower_ascii(upnp_trim(kv.substr(0, eq)));
+            const std::string v = upnp_trim(kv.substr(eq + 1));
+            if (k == "rate") e.rate = (uint32_t)std::strtoul(v.c_str(), nullptr, 10);
+            else if (k == "channels") e.channels = std::atoi(v.c_str());
+        }
+        semi = next;
+    }
+    if (e.mime.rfind("audio/l16", 0) == 0) e.bits = 16;
+    else if (e.mime.rfind("audio/l24", 0) == 0) e.bits = 24;
+    else if (e.mime.rfind("audio/l32", 0) == 0) e.bits = 32;
+
+    const std::string ex = upnp_lower_ascii(extra);
+    const size_t pn = ex.find("dlna.org_pn=");
+    if (pn != std::string::npos) {
+        const size_t end = ex.find(';', pn);
+        e.pn = upnp_trim(extra.substr(pn + 12, end == std::string::npos ? std::string::npos : end - pn - 12));
+        if (e.bits == 0 && e.pn == "wav") e.bits = 16;   // DLNA WAV 档 = 16-bit LPCM
+    }
+    return e;
+}
+
+struct UpnpSinkCaps {
+    bool ok = false;                                  // 是否拿到非空 Sink
+    std::vector<UpnpSinkEntry> entries;
+    std::string raw;
+
+    enum class Answer { Yes, No, Unknown };
+
+    // 我们的流是 PCM WAV（http-get audio/wav，显式 16/24-bit）。渲染器能不能原样收，看 Sink：
+    //   Yes     = 有一条 wav/LPCM 声明，速率/位深/声道都写得下且与我们一致
+    //   No      = 它明确声明了 wav/LPCM 但没有一条能装下我们的格式（或压根没声明 WAV）
+    //   Unknown = 只有通配 audio/wav:*（没写 rate）── 绝大多数设备的实际情况
+    Answer match_stream(uint32_t rate, int bits, int channels) const {
+        if (!ok) return Answer::Unknown;
+        bool saw_wav_family = false;
+        bool saw_unconstrained = false;
+        bool saw_explicit = false;
+        bool saw_any_wildcard = false;
+        for (const auto& e : entries) {
+            if (e.mime == "*") { saw_any_wildcard = true; continue; }
+            if (!(e.is_wav() || e.is_lpcm())) continue;
+            saw_wav_family = true;
+            if (e.rate == 0 && e.channels == 0) { saw_unconstrained = true; continue; }
+            saw_explicit = true;
+            const bool rate_ok = (e.rate == 0) || (rate == 0) || (e.rate == rate);
+            const bool bits_ok = (e.bits == 0) || (bits == 0) || (e.bits == bits);
+            const bool ch_ok = (e.channels == 0) || (channels == 0) || (e.channels == channels);
+            if (rate_ok && bits_ok && ch_ok) return Answer::Yes;
+        }
+        if (!saw_wav_family) {
+            if (saw_any_wildcard) return Answer::Unknown;
+            return Answer::No;              // Sink 里根本没有 wav/LPCM ⟹ 我们的 WAV 它不收
+        }
+        if (saw_unconstrained) return Answer::Unknown;
+        if (saw_explicit) return Answer::No;   // 全部带显式约束，且没有一条匹配
+        return Answer::Unknown;
+    }
+
+    std::string summary() const {
+        if (!ok) return "(空)";
+        std::string s;
+        size_t n = 0;
+        for (const auto& e : entries) {
+            if (!(e.is_audio() || e.mime == "*")) continue;
+            if (n++) s += ", ";
+            s += e.mime;
+            if (e.rate) s += "/" + std::to_string(e.rate) + "Hz";
+            if (e.channels) s += "/" + std::to_string(e.channels) + "ch";
+            if (e.bits) s += "/" + std::to_string(e.bits) + "bit";
+            if (n >= 8) { s += ", …"; break; }
+        }
+        return s.empty() ? "(无音频条目)" : s;
+    }
+};
+
+inline UpnpSinkCaps parse_sink_caps(const std::string& sink) {
+    UpnpSinkCaps caps;
+    caps.raw = sink.size() > 1200 ? sink.substr(0, 1200) + "…" : sink;
+    if (sink.empty()) return caps;
+    size_t pos = 0;
+    while (pos <= sink.size()) {
+        const size_t comma = sink.find(',', pos);
+        const std::string tok = upnp_trim(sink.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
+        if (!tok.empty()) {
+            caps.entries.push_back(parse_sink_entry(tok));
+            caps.ok = true;
+        }
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return caps;
+}
+
+enum class BitPerfectState { Yes, No, Unknown };
+
+struct BitPerfectVerdict {
+    BitPerfectState state = BitPerfectState::Unknown;
+    std::string why;
+    std::string sourceDesc;
+    std::string rendererDesc;
+    const char* str() const {
+        switch (state) {
+            case BitPerfectState::Yes: return "yes";
+            case BitPerfectState::No:  return "no";
+            default: return "unknown";
+        }
+    }
+};
+
+struct BitPerfectInput {
+    AudioSourceFormat src;
+    UpnpSinkCaps      caps;
+    bool        softwareBitExact = true;   // 软件侧：供源 PCM == 源解码样本（无重采样/位深转换/音量/EQ/抖动）
+    std::string softwareWhy;               // 软件侧结论的人话（"逐位直通…" / "已重采样 44.1k→192k…"）
+    bool        dop = false;               // DSD over PCM 载波
+    bool        fetched = false;           // 渲染器是否已经来取过流
+    bool        playing = false;           // 渲染器是否报告 PLAYING/PAUSED
+};
+
+inline BitPerfectVerdict judge_upnp_bit_perfect(const BitPerfectInput& in) {
+    BitPerfectVerdict v;
+    {
+        char b[160];
+        std::snprintf(b, sizeof(b), "%u Hz / %d bit / %d ch (%s)",
+                      in.src.sampleRate, in.src.bits, in.src.channels, in.src.encoding.c_str());
+        v.sourceDesc = b;
+    }
+    v.rendererDesc = in.caps.ok ? in.caps.summary() : "(渲染器未返回 Sink)";
+
+    // 1) 软件侧已经确定改过数据 ⟹ 铁定不是 bit-perfect，且原因是我们自己的
+    if (!in.softwareBitExact) {
+        v.state = BitPerfectState::No;
+        v.why = "软件侧已改动：" + (in.softwareWhy.empty() ? std::string("供源链做了转换") : in.softwareWhy);
+        return v;
+    }
+
+    // 2) DSD/DoP：软件侧逐位（DoP 载波），但 UPnP 没有"我支持 DoP"的表达能力
+    if (in.dop) {
+        v.state = BitPerfectState::Unknown;
+        v.why = "软件侧：DSD 以 DoP v1.1 打包（" + v.sourceDesc +
+                "），载波逐位无损；渲染器侧：UPnP 协议无法声明 DoP 能力，载波是否被原样送到 DAC 探测不到"
+                "（不支持 DoP 的渲染器会把它当 24bit PCM 解码成噪声）。";
+        return v;
+    }
+
+    // 3) 没拿到 Sink ⟹ 不知道
+    if (!in.caps.ok) {
+        v.state = BitPerfectState::Unknown;
+        v.why = "软件侧：" + (in.softwareWhy.empty() ? std::string("逐位直通") : in.softwareWhy) +
+                "；渲染器侧：GetProtocolInfo 未返回可用的 Sink 能力，无法判断设备是否原样接收 " + v.sourceDesc + "。";
+        return v;
+    }
+
+    const auto ans = in.caps.match_stream(in.src.sampleRate, in.src.bits, in.src.channels);
+    if (ans == UpnpSinkCaps::Answer::No) {
+        v.state = BitPerfectState::No;
+        v.why = "渲染器 Sink 未声明支持 " + v.sourceDesc + "（Sink: " + v.rendererDesc +
+                "）⟹ 设备会拒收或自行转换，不可能 bit-perfect。";
+        return v;
+    }
+    if (ans == UpnpSinkCaps::Answer::Yes) {
+        if (!in.fetched) {
+            v.state = BitPerfectState::Unknown;
+            v.why = "渲染器尚未来取流（Sink 声明支持，但没有实际取流证据）。";
+            return v;
+        }
+        if (!in.playing) {
+            v.state = BitPerfectState::Unknown;
+            v.why = "渲染器 Sink 声明支持 " + v.sourceDesc + "，但当前没有报告 PLAYING，无法确认在播。";
+            return v;
+        }
+        v.state = BitPerfectState::Yes;
+        v.why = "软件侧：" + (in.softwareWhy.empty() ? std::string("逐位直通") : in.softwareWhy) +
+                "；渲染器 Sink 显式声明支持 " + v.sourceDesc + "（" + v.rendererDesc +
+                "）且已取流并在播放。设备内部是否再处理（音量/DSP）无法从 UPnP 探测。";
+        return v;
+    }
+
+    v.state = BitPerfectState::Unknown;
+    v.why = "软件侧：" + (in.softwareWhy.empty() ? std::string("逐位直通") : in.softwareWhy) +
+            "；渲染器侧：Sink 只有通配声明（" + v.rendererDesc +
+            "），没给采样率/位深 ⟹ 设备内部是否重采样无法从 UPnP 探测。";
+    return v;
+}
+
 // ---------------- HTTP Range 语义与 Token 防遍历纯函数 ----------------
 
 struct HttpRange {
@@ -793,7 +1050,8 @@ struct StreamResponseHeaders {
 
 inline StreamResponseHeaders build_stream_response_headers(const HttpRange& range,
                                                            int64_t totalSize,
-                                                           const std::string& mimeType = "audio/wav") {
+                                                           const std::string& mimeType = "audio/wav",
+                                                           const std::string& extraHeaders = "") {
     StreamResponseHeaders h;
     h.totalSize = totalSize;
 
@@ -809,6 +1067,7 @@ inline StreamResponseHeaders build_stream_response_headers(const HttpRange& rang
            << "Content-Type: " << mimeType << "\r\n"
            << "Content-Length: " << totalSize << "\r\n"
            << "Accept-Ranges: bytes\r\n"
+           << extraHeaders
            << "Connection: close\r\n\r\n";
         h.headerString = ss.str();
         return h;
@@ -840,6 +1099,7 @@ inline StreamResponseHeaders build_stream_response_headers(const HttpRange& rang
        << "Content-Range: bytes " << h.rangeStart << "-" << h.rangeEnd << "/" << totalSize << "\r\n"
        << "Content-Length: " << h.contentLength << "\r\n"
        << "Accept-Ranges: bytes\r\n"
+       << extraHeaders
        << "Connection: close\r\n\r\n";
     h.headerString = ss.str();
     return h;

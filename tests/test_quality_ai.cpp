@@ -833,8 +833,9 @@ int main() {
         dd.profile = m::MusicProfile::Doujin;
         const m::ProfilePrompt pr =
             m::build_profile_prompt(dd, "Static World 会场限定CD", "专辑", "[M1] 组织页", {});
-        check(pr.system.find("（AI 知识）") != std::string::npos,
-              "prompt 允许用模型知识补全并标注「（AI 知识）」");
+    // 2026-10-29（261029-01 #4）：用户要求删掉正文里的「（AI 知识）」标注。
+    check(pr.system.find("整条不要输出") != std::string::npos,
+          "prompt 要求不确定的信息整条不输出（不再贴「（AI 知识）」免责）");
         check(pr.system.find("材料未给出") != std::string::npos,
               "prompt 明确禁止「材料未给出」式回答");
         check(pr.system.find("匹配情况") != std::string::npos,

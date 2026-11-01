@@ -24,6 +24,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <vector>
+#include <memory>
 
 namespace rta::net {
 
@@ -50,10 +52,30 @@ private:
         size_t i = 0; while (i < s.size() && s[i] == ' ') ++i;
         return s.substr(i);
     }
+    // ★ 2026-10-29（两轮审查 F06）：worker 生命周期必须由 WebUi 自己拥有。
+    //
+    // 缺陷：旧 loop() 用 std::thread(...).detach()，worker 捕获 this 后跑 handle()。
+    //   stop() 只 join accept 线程就返回，随后对象析构 —— 还在跑的 worker 访问 this
+    //   （handler_、listen_、stop_）就是 heap-use-after-free（评审用真实 WebUi +
+    //   假 WinSock 的 ASAN 复现：接收阻塞 → stop/delete → 放行接收 ⟹ use-after-free）。
+    //
+    // 修法：不再 detach。每个 worker 记在 workers_ 里（带"已完成"标记），
+    //   · 正常运行时由 accept 循环回收已结束的（vector 不会无限增长）；
+    //   · stop() 在 join accept 线程之后 **join 全部 worker**，之后才 WSACleanup。
+    //   自 join 保护：reap 时跳过当前线程（worker 内部调用 stop 的极端情况不会死锁）。
+    struct Worker {
+        std::thread th;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    void reap_workers(bool all);
+
     SOCKET listen_ = INVALID_SOCKET;
     uint16_t port_ = 0;
     std::atomic<bool> stop_{true};
     std::thread thread_;
+    std::mutex wkMx_;
+    std::vector<Worker> workers_;
+    std::atomic<int> active_{0};
     Handler handler_;
     // 监听范围与 Host 白名单（见 start()）
     bool  lan_ = false;
@@ -106,10 +128,22 @@ inline bool webui_host_allowed_impl(const std::string& host, const std::string& 
 }
 
 // handler 想把状态行写成 405/4xx 时调它（默认一律 200）。
-// 为什么不用类成员：WebUi 是"每个进程一个实例"的基础设施，而 handler 是自由函数；
-// 用 inline 函数 + 函数内 static（C++11 起线程安全初始化）比暴露 extern WebUi* 更省心。
+//
+// ★ 2026-10-29（两轮审查 F25）：状态码必须属于**本请求**，不能是全局共享槽。
+//
+// 缺陷：旧实现是一个进程级 std::atomic<int>，而 loop() 会并发跑最多 kMaxWorkers(6) 个
+//   worker。合法交错下 A 请求写 405、B 请求写 200、B 先 exchange ⟹ A 收到 200、
+//   B 收到 405（实测 rejected=200 / success=405）。atomic 只保证不撕裂，不保证归属。
+//
+// 修法：thread_local。审计（为什么这里够用）：
+//   · 一个连接从 accept 到 send 全程在**同一个线程**上，handle() 是同步调用链；
+//   · 槽只被 handle() 自己 reset/exchange，以及同线程内同步调用的 handler 写；
+//   · 不存在跨线程读该槽的路径（响应状态行由 handle() 本线程拼）。
+//   ⟹ 每个请求天然独占一个槽，且没有生命周期问题（thread_local 无悬垂）。
+// 不用"改 Handler 签名传 int&"是因为 handler 是自由函数、内部还有多层 helper
+// 要写状态码（rtaweb 的 8 处调用点跨函数），签名改造会把状态码变成一个到处穿透的参数。
 inline std::atomic<int>* webui_status_slot() {
-    static std::atomic<int> s{200};
+    static thread_local std::atomic<int> s{200};
     return &s;
 }
 inline void webui_set_status(int code) { webui_status_slot()->store(code); }
@@ -150,7 +184,29 @@ inline void WebUi::stop() {
     // 只有 shutdown 才能确定性地唤醒（close 唤醒是平台相关的"可能"）。签名换 SD_BOTH 让 accept 立刻返回。
     if (listen_ != INVALID_SOCKET) { ::shutdown(listen_, SD_BOTH); ::closesocket(listen_); listen_ = INVALID_SOCKET; }
     if (thread_.joinable()) thread_.join();
+    // ★ F06：等全部 worker 真正退出，再释放 handler_/listen_（否则就是 use-after-free）。
+    //   每个连接的 recv/send 都有超时（500ms / 5s），所以这里的等待有界。
+    reap_workers(true);
     WSACleanup();
+}
+
+// all=false：只回收已结束的；all=true：join 全部（stop 时用）。
+// 跳过当前线程：worker 内部触发 stop 的极端路径不会自 join。
+inline void WebUi::reap_workers(bool all) {
+    std::vector<Worker> keep;
+    std::vector<Worker> joinNow;
+    {
+        std::lock_guard<std::mutex> lk(wkMx_);
+        const auto self = std::this_thread::get_id();
+        keep.reserve(workers_.size());
+        for (auto& w : workers_) {
+            const bool fin = w.done && w.done->load();
+            if ((all || fin) && w.th.joinable() && w.th.get_id() != self) joinNow.push_back(std::move(w));
+            else keep.push_back(std::move(w));
+        }
+        workers_.swap(keep);
+    }
+    for (auto& w : joinNow) if (w.th.joinable()) w.th.join();
 }
 
 // 2026-10-26（261026-02 #3「加载失败，网络异常或服务响应超时」的根因）：
@@ -163,24 +219,33 @@ inline void WebUi::stop() {
 static constexpr int kMaxWorkers = 6;
 
 inline void WebUi::loop() {
-    // 用 shared_ptr 持有计数：worker 是 detached 的，loop() 退出后它可能还在跑，
-    // 按引用捕获会变成悬垂引用（这类崩溃以前踩过一次，不能再犯）。
-    auto active = std::make_shared<std::atomic<int>>(0);
     while (!stop_.load()) {
+        // ★ F06：先回收已结束的 worker（不 detach，所以必须自己 join，否则 vector 只涨不落）
+        reap_workers(false);
         SOCKET c = ::accept(listen_, nullptr, nullptr);
         if (c == INVALID_SOCKET) { if (stop_.load()) break; continue; }
-        if (active->load() < kMaxWorkers) {
-            active->fetch_add(1);
-            std::thread([this, c, active] {
+        if (active_.load() < kMaxWorkers) {
+            active_.fetch_add(1);
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            Worker w;
+            w.done = done;
+            w.th = std::thread([this, c, done] {
                 handle(c);
                 ::closesocket(c);
-                active->fetch_sub(1);
-            }).detach();
+                active_.fetch_sub(1);
+                done->store(true);
+            });
+            {
+                std::lock_guard<std::mutex> lk(wkMx_);
+                workers_.push_back(std::move(w));
+            }
             continue;
         }
         handle(c);
         ::closesocket(c);
     }
+    // 退出前把剩下的 worker 全部 join —— 这是"对象可以安全销毁"的前提
+    reap_workers(true);
 }
 
 

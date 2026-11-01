@@ -9,7 +9,13 @@
 //
 // 三档口径（字段名就是 /api/play 的请求键名，也是 /api/preset/apply 的 applied 字段）：
 //   bitperfect（原音直通）：完全不动数据
-//       rate=follow（跟随源，不重采样）· volume=0 dB · shaper=none · 无 EQ/IR/等响度/每声道增益/ISP 预衰减
+//       rate=src（保持源采样率，不重采样）· volume=0 dB · shaper=none · 无 EQ/IR/等响度/每声道增益/ISP 预衰减
+//
+//   ⚠️ 2026-10-29（管理员 261029-02 新功能1）：这里原来写的是 rate=follow，注释还标成「跟随源」，
+//     但 src/audio/rate_pick.h:113 里 follow 的真实语义是「跟随**系统混音**采样率」。
+//     后果：源 48k + 声卡默认 44.1k 时，原音直通会把输出钉在 44.1k ⟹ 重采样 ⟹ 永远不 bit-perfect。
+//     bit-perfect 的正确取值是 src（rate_pick.h:104：requested=="src" ⟹ rate=sourceRate）。
+//     本文件所有原本想表达「跟随源」的 follow 已统一改为 src。
 //       源是 PCM ⟹ dsd=0；源是 DSD 且设备能承载 ⟹ dsd=<源位率>，同速率 ⟹ directSdm=1（1-bit 直通）
 //   pcm（PCM 升频）：
 //       rate = 设备当前后端支持的最高档（**不超过 384000**）· filter=poly-sinc-tight-lp · tapsPerInput=512
@@ -19,7 +25,7 @@
 //       不能靠"预设自带 taps"隐式满足。
 //   dsd（DSD 升频）：
 //       dsd = 设备原生支持的最高 DSD 档（没有原生则退 DoP 的最高档）· modfamily=ec · modorder=7
-//       filter=poly-sinc-tight-lp · tapsPerInput=512 · rate=follow · shaper=none（DoP 强制无抖动）
+//       filter=poly-sinc-tight-lp · tapsPerInput=512 · rate=src · shaper=none（DoP 强制无抖动）
 //       源 DSD 与目标同速率 ⟹ directSdm=1
 //
 // 为什么 shaper 在 dsd 档写 none：DoP 路径在 rtaweb 里是 `cfg.shaper = Shaper::None`
@@ -143,7 +149,7 @@ struct SourceInfo {
 
 // 设置：字段名与 /api/play 的请求键名同义（applied JSON 由 rtaweb 从这里生成）
 struct PresetSettings {
-    std::string rate = "follow";         // "follow" | "src" | "max" | "384000"（数字串）
+    std::string rate = "src";         // "follow" | "src" | "max" | "384000"（数字串）
     int dsd = 0;                         // 0 = PCM；64/128/256/512 = DSD 输出档
     std::string modFamily;               // "" = 不改（默认 dsd）；dsd 档写 "ec"
     int modOrder = 0;                    // 0 = 不改；dsd 档写 7
@@ -220,11 +226,20 @@ inline PresetSettings plan_preset(PresetProfile prof, const DeviceCaps& caps, co
 
     // ---------------- ① 原音直通 ----------------
     if (prof == PresetProfile::BitPerfect) {
-        s.rate = "follow";
+        s.rate = "src";
         s.filter.clear();
         s.minTapsPerInput = 0;
         s.dsd = 0;
         s.directSdm = 0;
+        // 2026-10-30：本档不改后端（PresetSettings 没有 backend 字段，preset_profiles.h:151-164），
+        //   所以「共享还是独占」只能由 caps.exclusive 反映，必须提前告知 —— 否则用户点了原音直通，
+        //   实际输出仍被共享混音率重采样（日志「共享模式按系统混音率 48000 Hz 输出（请求 44100 Hz，
+        //   非 bit-perfect）」），而界面只显示本档的 notes。放在所有提前 return 之前，DSD 源也覆盖。
+        //   不写具体混音率：DeviceCaps 没有这个字段，编一个数字比不写更坏。
+        if (!caps.exclusive) {
+            s.notes.push_back("当前后端是共享模式：本档无法做到逐位直通，请切到 WASAPI 独占或 ASIO"
+                              "（共享模式下输出采样率由系统混音率决定，会重采样）");
+        }
         if (!src.isDsd) {
             s.notes.push_back("源是 PCM ⟹ dsd=0：不调制、不重采样、不动数据");
             if (!capsUnknown && !caps.rates.empty()) {
@@ -279,7 +294,7 @@ inline PresetSettings plan_preset(PresetProfile prof, const DeviceCaps& caps, co
         const uint32_t devBest = caps.rates.empty() ? 0u : caps.rates.back();
         const uint32_t target = preset_max_pcm_rate(caps.rates, kPresetRateCap);
         if (target == 0) {
-            s.rate = "follow";
+            s.rate = "src";
             s.notes.push_back("设备能力探测为空（未能确认独占支持的采样率）：升频档降级为「跟随源」，"
                               "不写死 384000（不假装支持）");
             return s;
@@ -310,14 +325,14 @@ inline PresetSettings plan_preset(PresetProfile prof, const DeviceCaps& caps, co
         s.filter = "poly-sinc-tight-lp";
         s.minTapsPerInput = 512;
         s.shaper = "none";            // 抖动交给 1-bit 量化（与 DSD 档一致）
-        s.rate = "follow";
+        s.rate = "src";
         s.directSdm = 0;              // PCM 源没有"直通"可言
         if (capLevel == 0) {
             const uint32_t target = preset_max_pcm_rate(caps.rates, kPresetRateCap);
             s.dsd = 0;
             s.modFamily.clear();
             s.modOrder = 0;
-            s.rate = target == 0 ? std::string("follow") : detail::num(target);
+            s.rate = target == 0 ? std::string("src") : detail::num(target);
             s.shaper = target == 0 ? std::string("none") : std::string("auto");
             s.notes.push_back("✗ 设备没有 DSD 通路（原生 " +
                               (caps.dsdNativeMax.empty() ? std::string("无") : caps.dsdNativeMax) +
@@ -343,7 +358,7 @@ inline PresetSettings plan_preset(PresetProfile prof, const DeviceCaps& caps, co
     s.filter = "poly-sinc-tight-lp";
     s.minTapsPerInput = 512;
     s.shaper = "none";                // DoP 路径强制无抖动（抖动交给 1-bit 量化）
-    s.rate = "follow";                // 原生 DSD 要求跟随源；DoP 忽略 rate（载波由 dsd 档决定）
+    s.rate = "src";                // 原生 DSD 要求跟随源（src=源采样率）；DoP 忽略 rate（载波由 dsd 档决定）
     if (capLevel == 0) {
         // 设备完全没有 DSD 通路：保守降级为 PCM 升频（让声音出来），并把事实写清
         const uint32_t target = preset_max_pcm_rate(caps.rates, kPresetRateCap);
@@ -352,7 +367,7 @@ inline PresetSettings plan_preset(PresetProfile prof, const DeviceCaps& caps, co
         s.modFamily.clear();
         s.modOrder = 0;
         if (target == 0) {
-            s.rate = "follow";
+            s.rate = "src";
         } else {
             s.rate = detail::num(target);
             s.shaper = "auto";
@@ -391,14 +406,21 @@ inline PresetSettings plan_preset(PresetProfile prof, const DeviceCaps& caps, co
     return s;
 }
 
-// ---------------- bit-perfect 七条件自检 ----------------
+// ---------------- bit-perfect 八条件自检 ----------------
 // 判据与 rtaweb 信号链的 bitPerfect 结论（rtaweb.cpp 的「三态 direct/yes/no」）同口径：
-//   ① 不重采样（rate 跟随源）        ② 音量 0 dB
+//   ① 不重采样（rate=src，保持源采样率）        ② 音量 0 dB
 //   ③ 无抖动/噪声整形                ④ 无预衰减（ISP/调制器余量）
 //   ⑤ 无 EQ / IR 卷积                ⑥ 非 DoP 载波（DSD 源必须 1-bit 直通）
-//   ⑦ 位深未降（源真实位深 ≤ 输出位深）
+//   ⑦ 位深未降（源真实位深 ≤ 输出位深）        ⑧ 后端独占/直连（WASAPI 独占或 ASIO）
 // ⑥ 的写法说明：DSD 源若不直通，1-bit 流会被解成 PCM 再调制 —— 那已经不逐位了；
 // 所以这里要求 directSdm=1（DirectSDM 与原生 DSD 都算），与 rtaweb 的 bpState="direct" 同义。
+// ⑧ 为什么不能省（2026-10-30 补）：共享模式的采样率由系统混音格式决定（WASAPI 共享走
+//   GetMixFormat），与我们请求什么无关；所以共享后端下「不重采样」这条**不可能**由 rate=src 保证 ——
+//   ① 只约束「我们请求的采样率」，⑧ 才约束「设备实际跑的采样率」。
+//   实测（管理员 261029-02 新功能1 复测）：声卡混音 48k + 44.1k 源 + 原音直通，日志
+//   「共享模式按系统混音率 48000 Hz 输出（请求 44100 Hz，非 bit-perfect）」，而旧判据仍判 ok，
+//   自检与事实相反。另：PresetSettings 没有 backend 字段（preset_profiles.h:151-164，预设不改后端
+//   是既有设计），所以这条只能读调用方探测后填的 DeviceCaps.exclusive（preset_profiles.h:135）。
 struct BitPerfectCheck {
     bool ok = true;
     std::vector<std::string> violations;
@@ -408,7 +430,11 @@ inline BitPerfectCheck check_bit_perfect(const PresetSettings& s, const DeviceCa
                                          const SourceInfo& src) {
     BitPerfectCheck r;
     auto bad = [&r](const std::string& why) { r.ok = false; r.violations.push_back(why); };
-    if (s.rate != "follow") bad("①重采样：rate=" + (s.rate.empty() ? std::string("(空)") : s.rate));
+    // 2026-10-29（261029-02 新功能1）：旧判据只认 "follow"，但 follow 的真实语义是
+    //   「跟随系统混音率」，它本身就会重采样。不重采样的只有 src（保持源采样率）。
+    //   同时接受 follow（历史值 / 用户手动选「跟随系统」且源率与系统一致时仍可能逐位）。
+    if (s.rate != "src" && s.rate != "follow")
+        bad("①重采样：rate=" + (s.rate.empty() ? std::string("(空)") : s.rate));
     if (std::fabs(s.volumeDb) > 1e-9) bad("②音量非 0 dB");
     if (s.shaper != "none") bad("③抖动/整形：" + s.shaper);
     if (!s.clearEqIr) bad("④⑤EQ/IR/预衰减未清空");
@@ -423,6 +449,12 @@ inline BitPerfectCheck check_bit_perfect(const PresetSettings& s, const DeviceCa
             bad("⑦位深降低：" + detail::numi(outBits) + " bit < 源 " + detail::numi(src.srcBits) + " bit");
         }
     }
+    // 2026-10-30（管理员 261029-02 新功能1 补漏）：前七条全是对**设置**的要求，它们全满足也证明不了
+    //   不重采样 —— 共享后端的输出格式由系统混音决定（WASAPI 共享走 GetMixFormat），rate=src 只是「请求」。
+    //   实测：声卡混音 48k + 44.1k 源，日志「共享模式按系统混音率 48000 Hz 输出（请求 44100 Hz，
+    //   非 bit-perfect）」，旧判据却判 ok ⟹ 必须单列一条，不能由 ① 推出。
+    if (!caps.exclusive)
+        bad("⑧后端非独占/直连：共享模式下系统混音率会重采样（共享混音 48k 时 44.1k 源必然重采样）");
     return r;
 }
 

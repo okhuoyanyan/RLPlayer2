@@ -456,7 +456,7 @@ int main() {
 
     printf("\n=== 7. DSD 异速率支路（engine/pipeline.h: dsd_rate_branch）===\n");
     {
-        // 判据只钉"支路接线正确"：决策（同速率/可转换/拒绝）与一条端到端（位数×2 + DoP 合法）。
+        // 支路接线：同速率/可转换/拒绝；异速率输出含真实自然尾及独立稳态静音尾。
         // 完整判据（THD+N / 平坦度 / 折叠残留 / 级联 / 满幅恢复）在 tests/test_dsd_rate_convert.cpp。
         const auto d1 = rta::engine::dsd_rate_branch(fs, fs);
         check(!d1.handled, "同速率不进异速率支路（仍走 DirectSDM 直通）", d1.why);
@@ -470,8 +470,8 @@ int main() {
         DsdStream o1;
         const rta::engine::DsdRateBranchResult r =
             rta::engine::dsd_rate_convert(s1, fs * 2u, rta::dsp::DsdRateConvertConfig{}, o1);
-        check(r.ok && o1.rate == fs * 2u && o1.bits == s1.bits * 2ull,
-              "支路整段转换：位数 ×2、位率标注正确",
+        check(r.ok && o1.rate == fs * 2u && o1.bits > s1.bits * 2ull && o1.bits < s1.bits * 2ull + 56448,
+              "支路整段转换：倍速时长及有限自然/静音尾、位率标注正确",
               std::to_string(o1.bits) + " 位 @" + std::to_string(o1.rate));
         std::vector<int32_t> pk;
         DopPackState dps;

@@ -12,6 +12,17 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Bind update migration to the exact application assets in this build.
+set(RLPLAYER_UPDATE_ASSET_ENTRIES "")
+foreach(lang ar en es fr ja ru)
+  set(asset "${CMAKE_SOURCE_DIR}/data/i18n/${lang}.json")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${asset}")
+  file(SHA256 "${asset}" digest)
+  string(APPEND RLPLAYER_UPDATE_ASSET_ENTRIES "    {\"data/i18n/${lang}.json\", \"${digest}\"},\n")
+endforeach()
+configure_file(src/net/update_assets_hashes.h.in generated/net/update_assets_hashes.h @ONLY)
+
+
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -112,6 +123,17 @@ add_executable(update_probe tools/update_probe.cpp)
 target_include_directories(update_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(update_probe PRIVATE winhttp ws2_32)
 add_test(NAME update_selftest COMMAND update_probe --selftest)
+add_executable(test_update_assets tests/test_update_assets.cpp)
+target_include_directories(test_update_assets PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_update_assets PRIVATE winhttp ws2_32)
+target_compile_definitions(test_update_assets PRIVATE UPDATE_ASSET_SOURCE="${CMAKE_SOURCE_DIR}")
+add_test(NAME update_assets COMMAND test_update_assets)
+add_executable(test_update_unicode tests/test_update_unicode.cpp)
+target_include_directories(test_update_unicode PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME update_unicode COMMAND test_update_unicode)
+
+target_include_directories(update_probe PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_include_directories(test_update_assets PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 # ---------------- 桌面启动器（Win32 GUI，双击即用）----------------
 # 产品名：RLPlayer
@@ -121,7 +143,7 @@ set_target_properties(rta_launcher PROPERTIES OUTPUT_NAME "RLPlayer")
 # winhttp：261027-02 #5 起启动器要 include src/net/update_apply.h（→ net/update.h → platform/http.h），
 # 在线更新的"落地"就发生在启动器 main() 开头（此刻 rtaweb 还没起来，文件都不被占用）。
 target_link_libraries(rta_launcher PRIVATE ws2_32 shell32 user32 ole32 uuid mmdevapi dbghelp winhttp)
-target_include_directories(rta_launcher PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(rta_launcher PRIVATE ${CMAKE_SOURCE_DIR}/src "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_compile_definitions(rta_launcher PRIVATE UNICODE _UNICODE)
 # 内置 WebView2：官方 SDK 头文件（third_party/webview2/include），运行时用同目录的 WebView2Loader.dll
 target_include_directories(rta_launcher PRIVATE ${CMAKE_SOURCE_DIR}/third_party/webview2/include)
@@ -143,6 +165,11 @@ if(RC_EXE)
   # 2026-10-25：版本号单一来源 —— 从 src/version.h 解析，代入 res/rlplayer.rc.in。
   # 之前 rc 里四处（FILEVERSION / PRODUCTVERSION / FileVersion 字符串 / ProductVersion 字符串）
   # 靠手改，结果 1.3.17~1.5.0 的包属性里一直写着 1.3.16.0。
+  # ★ 2026-10-30：version.h 必须是**配置依赖**，否则改版本号不会重新 configure_file，
+  #   rlplayer.rc 还是上一次的值，而自定义命令只按 DEPENDS 重跑 rc.exe ⟹ 会编出一个
+  #   「包名 2.0.7、exe 资源 2.0.6」的包（实测踩到：make_dist 报 2.0.7，文件属性 2.0.6.0）。
+  #   铁律 10.4「版本号单一来源」只有在它真的能传播时才成立。
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/version.h")
   file(STRINGS "${CMAKE_SOURCE_DIR}/src/version.h" RL_VER_LINE REGEX "#define[ ]+RLPLAYER_VERSION")
   string(REGEX MATCH "\"([0-9]+)\\.([0-9]+)\\.([0-9]+)\"" RL_VER_MATCH "${RL_VER_LINE}")
   set(RL_VER_MAJOR "${CMAKE_MATCH_1}")
@@ -267,6 +294,11 @@ add_executable(test_pipeline tests/test_pipeline.cpp)
 target_link_libraries(test_pipeline PRIVATE rtadsp)
 add_test(NAME pipeline COMMAND test_pipeline)
 
+# 2026-10-29（两轮审查 F17）：DSP 流结束排空 —— 末尾源内容不得丢在卷积/重采样内部缓冲里。
+add_executable(test_pipeline_drain tests/test_pipeline_drain.cpp)
+target_link_libraries(test_pipeline_drain PRIVATE rtadsp)
+add_test(NAME pipeline_drain COMMAND test_pipeline_drain)
+
 add_executable(test_conv_matrix tests/test_conv_matrix.cpp)
 target_link_libraries(test_conv_matrix PRIVATE rtadsp)
 add_test(NAME conv_matrix COMMAND test_conv_matrix)
@@ -377,6 +409,20 @@ add_test(NAME gpu_bridge COMMAND test_gpu_bridge)
 add_executable(test_dsd_reader tests/test_dsd_reader.cpp)
 target_link_libraries(test_dsd_reader PRIVATE rtadsp)
 add_test(NAME dsd_reader COMMAND test_dsd_reader)
+
+# 2026-10-29（两轮审查 F16）：DSD 流式解码的「损坏必须明确失败」门禁。
+# 同一份截断夹具以前整曲读拒绝、流式 open=true 且 read=declared、err 为空（补零）。
+# 判据：头部伪造长度 / 播放中截短 / DFF 截断 都必须失败；合法末块 padding 仍须通过。
+add_executable(test_dsd_stream_corrupt tests/test_dsd_stream_corrupt.cpp)
+target_include_directories(test_dsd_stream_corrupt PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME dsd_stream_corrupt COMMAND test_dsd_stream_corrupt)
+
+# 2026-10-29（两轮审查 F28/F29/F30/F32）：JSON 严格解析 + 代理对 + Knowledge 语言身份
+# + HealthStore 全字段往返。全部离线（不联网、不开设备、只写 %TEMP%）。
+add_executable(test_review2_json_cache tests/test_review2_json_cache.cpp)
+target_include_directories(test_review2_json_cache PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_review2_json_cache PRIVATE winhttp ws2_32)
+add_test(NAME review2_json_cache COMMAND test_review2_json_cache)
 
 # 满幅 PCM 走完整管线的稳定性（2026-10-21 现场"播几秒变噪音"回归）
 add_executable(test_fullscale tests/test_fullscale.cpp)
@@ -500,6 +546,13 @@ add_test(NAME ratepick COMMAND test_ratepick)
 add_executable(test_rate_decision tests/test_rate_decision.cpp)
 target_include_directories(test_rate_decision PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME rate_decision COMMAND test_rate_decision)
+add_executable(test_rate_family_policy tests/test_rate_family_policy.cpp)
+target_include_directories(test_rate_family_policy PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME rate_family_policy COMMAND test_rate_family_policy)
+# 261030-01 规格 v2.1：预设指标与排除规则（家族天花板 / D-15 排除判据）
+add_executable(test_preset_metrics tests/test_preset_metrics.cpp)
+target_include_directories(test_preset_metrics PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME preset_metrics COMMAND test_preset_metrics)
 
 # 最小 ZIP（STORE）打包结构（2026-10-22 功能3「导出诊断 = 一个压缩包」）。
 # 纯内存、零外部依赖、不调 PowerShell（理由见 src/net/zipstore.h 头注）。
@@ -708,6 +761,11 @@ add_executable(measure_quality_lib tests/measure_quality_lib.cpp)
 target_link_libraries(measure_quality_lib PRIVATE rtadsp)
 target_include_directories(measure_quality_lib PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+add_executable(test_lyrics_ai tests/test_lyrics_ai.cpp)
+target_include_directories(test_lyrics_ai PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_lyrics_ai PRIVATE winhttp)
+add_test(NAME lyrics_ai COMMAND test_lyrics_ai)
+
 add_executable(test_track_health tests/test_track_health.cpp)
 target_link_libraries(test_track_health PRIVATE rtadsp)
 target_include_directories(test_track_health PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -796,3 +854,338 @@ target_link_libraries(health_fuzz PRIVATE psapi winhttp)
 
 # tools/wv2_shot.cpp 故意不登记：它是一次性取证用的最小 WebView2 宿主，
 # 与产品无关，进构建只会拖慢全量。
+
+# ---------------- 离线滤波器全量测量工具（261030-01） ----------------
+add_executable(filter_sweep tools/filter_sweep.cpp)
+target_link_libraries(filter_sweep PRIVATE rtadsp)
+# Strict production quality: original F1, DD dense scan and peak refinement.
+# No failure allowance; historical known failures remain in the identity fixture.
+add_test(NAME filter_sweep COMMAND filter_sweep --output ${CMAKE_CURRENT_BINARY_DIR}/filter_sweep_audit.tsv)
+
+add_executable(apod_check tools/apod_check.cpp)
+target_include_directories(apod_check PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME apod_design COMMAND apod_check)
+# ---------------- int64/int128 精确卷积验收（261030-01 D-11） ----------------
+add_executable(test_fixed_conv tests/test_fixed_conv.cpp)
+target_include_directories(test_fixed_conv PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME fixed_conv COMMAND test_fixed_conv)
+# 261030-01：1-bit 调制器前级余量目标的安全性验收
+add_executable(test_sdm_headroom tests/test_sdm_headroom.cpp)
+target_include_directories(test_sdm_headroom PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME sdm_headroom COMMAND test_sdm_headroom)
+
+# 261030-01：SDM 稳定性/裕度矩阵（诊断工具，不注册 add_test —— 29 秒，判据已由 sdm_headroom 覆盖）
+add_executable(sdm_matrix tools/sdm_matrix.cpp)
+target_include_directories(sdm_matrix PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# 2026-10-31 集中审核：真实生产路径的离线回归，不打开音频设备。
+add_executable(test_audit_dsd tests/test_audit_dsd.cpp)
+target_link_libraries(test_audit_dsd PRIVATE rtadsp)
+add_test(NAME audit_dsd COMMAND test_audit_dsd)
+add_executable(test_audit_app tests/test_audit_app.cpp)
+target_include_directories(test_audit_app PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_audit_app PRIVATE winhttp ws2_32)
+add_test(NAME audit_app COMMAND test_audit_app)
+add_executable(test_audit_pcm tests/test_audit_pcm.cpp)
+target_link_libraries(test_audit_pcm PRIVATE rtadsp)
+add_test(NAME audit_pcm COMMAND test_audit_pcm)
+
+# Independent DSP fixes and negative-control regressions.
+foreach(name dsp_phase dsp_linear_quality dsp_apod_quality)
+  add_executable(test_${name} tests/test_${name}.cpp)
+  target_include_directories(test_${name} PRIVATE src tools)
+  add_test(NAME ${name} COMMAND test_${name})
+endforeach()
+
+add_executable(review2_spectrum tools/review2_spectrum.cpp)
+target_link_libraries(review2_spectrum PRIVATE rtadsp)
+foreach(name review2_spectrum review2_apod sdm_block)
+  add_executable(test_${name} tests/test_${name}.cpp)
+  target_include_directories(test_${name} PRIVATE src tools)
+  add_test(NAME ${name} COMMAND test_${name})
+endforeach()
+add_executable(test_review2_apod_mutant tests/test_review2_apod.cpp)
+target_include_directories(test_review2_apod_mutant PRIVATE src)
+target_compile_definitions(test_review2_apod_mutant PRIVATE REVIEW2_APOD_MUTANT_WEAK_BOUNDARY)
+add_test(NAME review2_apod_mutant COMMAND test_review2_apod_mutant)
+set_tests_properties(review2_apod_mutant PROPERTIES WILL_FAIL TRUE)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME dsp_measure_cli COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_dsp_measure_cli.py --exe $<TARGET_FILE:filter_sweep>)
+add_test(NAME filter_report_cli COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/test_filter_report_cli.py --exe $<TARGET_FILE:filter_report>
+    --sweep $<TARGET_FILE:filter_sweep>)
+
+add_executable(test_dsp_routing tests/test_dsp_routing.cpp)
+target_link_libraries(test_dsp_routing PRIVATE rtadsp)
+add_test(NAME dsp_routing COMMAND test_dsp_routing)
+add_executable(dsp_pipeline_benchmark tools/dsp_pipeline_benchmark.cpp)
+target_link_libraries(dsp_pipeline_benchmark PRIVATE rtadsp psapi)
+
+add_executable(test_dsp_phase_even tests/test_dsp_phase_even.cpp)
+target_include_directories(test_dsp_phase_even PRIVATE src tools)
+add_test(NAME dsp_phase_even COMMAND test_dsp_phase_even)
+add_executable(dsp_measure_dsd tools/dsp_measure_dsd.cpp)
+target_include_directories(dsp_measure_dsd PRIVATE src tools)
+add_test(NAME dsd_streamed_fft COMMAND dsp_measure_dsd --selftest)
+
+# Reference envelopes are regenerated from current production coefficients at build time.
+add_executable(dsp_ringing_reference tools/dsp_ringing_reference.cpp)
+target_include_directories(dsp_ringing_reference PRIVATE src tools)
+target_link_libraries(dsp_ringing_reference PRIVATE bcrypt)
+set(RING_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/dsp_ringing_reference.h)
+file(GLOB RING_DSP_DEPENDENCIES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/dsp/*.h)
+add_custom_command(OUTPUT ${RING_HEADER}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/generated
+  COMMAND dsp_ringing_reference --production --header ${RING_HEADER}
+          --json ${CMAKE_CURRENT_BINARY_DIR}/generated/dsp_ringing_reference.json
+  DEPENDS dsp_ringing_reference ${RING_DSP_DEPENDENCIES}
+  VERBATIM)
+add_custom_target(generate_ringing_reference DEPENDS ${RING_HEADER})
+add_dependencies(rtaweb generate_ringing_reference)
+target_include_directories(rtaweb PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+
+add_test(NAME dsp_ringing_definition COMMAND dsp_ringing_reference --selftest)
+
+add_executable(test_dsp_measure_stages tests/test_dsp_measure_stages.cpp)
+target_include_directories(test_dsp_measure_stages PRIVATE src tools)
+add_test(NAME dsp_measure_stages COMMAND test_dsp_measure_stages)
+
+add_executable(dsp_dop_benchmark tools/dsp_dop_benchmark.cpp)
+target_link_libraries(dsp_dop_benchmark PRIVATE rtadsp bcrypt)
+add_executable(dsp_sdm_block_benchmark tools/dsp_sdm_block_benchmark.cpp)
+target_link_libraries(dsp_sdm_block_benchmark PRIVATE rtadsp)
+# GPU observation fixture integration: append to source/CMakeLists.txt.
+# All test DLLs live in private executable directories. Never copy them to
+# a release directory or the root build directory containing production DLLs.
+add_executable(test_dsp_gpu_observation tests/test_dsp_gpu_observation.cpp)
+target_link_libraries(test_dsp_gpu_observation PRIVATE rtadsp)
+set_target_properties(test_dsp_gpu_observation PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gpu-observation/common")
+
+function(add_gpu_observation_fixture fixture_name fixture_mode)
+    set(fixture_target "gpu_observation_fixture_${fixture_name}")
+    set(fixture_dir "${CMAKE_BINARY_DIR}/gpu-observation/${fixture_name}")
+    add_library(${fixture_target} SHARED tests/test_dsp_gpu_observation_fixture.cpp)
+    target_compile_definitions(${fixture_target} PRIVATE FIXTURE_MODE=${fixture_mode})
+    set_target_properties(${fixture_target} PROPERTIES
+        OUTPUT_NAME rtagpu PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${fixture_dir}"
+        LIBRARY_OUTPUT_DIRECTORY "${fixture_dir}"
+        ARCHIVE_OUTPUT_DIRECTORY "${fixture_dir}")
+    # A custom target runs every build so the copied executable cannot lag
+    # behind a header-only production change when the fixture DLL did not relink.
+    add_custom_target(gpu_observation_prepare_${fixture_name} ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:test_dsp_gpu_observation>"
+            "$<TARGET_FILE_DIR:${fixture_target}>/test_dsp_gpu_observation.exe"
+        DEPENDS test_dsp_gpu_observation ${fixture_target}
+        VERBATIM)
+    add_test(NAME dsp_gpu_observation_${fixture_name}
+        COMMAND "$<TARGET_FILE_DIR:${fixture_target}>/test_dsp_gpu_observation.exe"
+                "${fixture_name}")
+    set_tests_properties(dsp_gpu_observation_${fixture_name} PROPERTIES
+        WORKING_DIRECTORY "$<TARGET_FILE_DIR:${fixture_target}>")
+endfunction()
+
+add_gpu_observation_fixture(fail 0)
+add_gpu_observation_fixture(first 1)
+add_gpu_observation_fixture(second 2)
+add_gpu_observation_fixture(success 3)
+
+# Hardware verification is explicit; the four injected cases do not need GPU
+# hardware and remain normal gates. This workstation already passed 'real'.
+option(RTA_GPU_OBSERVATION_REAL_TEST "Run real GPU dispatch observation test" OFF)
+set(RTA_GPU_OBSERVATION_REAL_DLL "${CMAKE_SOURCE_DIR}/build/rtagpu.dll"
+    CACHE FILEPATH "Production HIP backend for isolated observation test")
+set(RTA_GPU_OBSERVATION_HIP_RUNTIME "${CMAKE_SOURCE_DIR}/build/amdhip64_7.dll"
+    CACHE FILEPATH "Bundled HIP runtime for isolated observation test")
+if(RTA_GPU_OBSERVATION_REAL_TEST)
+    if(NOT EXISTS "${RTA_GPU_OBSERVATION_REAL_DLL}" OR
+       NOT EXISTS "${RTA_GPU_OBSERVATION_HIP_RUNTIME}")
+        message(FATAL_ERROR "Real GPU observation requested but backend/runtime is missing")
+    endif()
+    set(real_dir "${CMAKE_BINARY_DIR}/gpu-observation/real")
+    add_custom_target(gpu_observation_prepare_real ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${real_dir}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:test_dsp_gpu_observation>"
+            "${real_dir}/test_dsp_gpu_observation.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${RTA_GPU_OBSERVATION_REAL_DLL}" "${real_dir}/rtagpu.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${RTA_GPU_OBSERVATION_HIP_RUNTIME}" "${real_dir}/amdhip64_7.dll"
+        DEPENDS test_dsp_gpu_observation
+        VERBATIM)
+    add_test(NAME dsp_gpu_observation_real
+        COMMAND "${real_dir}/test_dsp_gpu_observation.exe" real)
+    set_tests_properties(dsp_gpu_observation_real PROPERTIES WORKING_DIRECTORY "${real_dir}")
+endif()
+
+
+add_executable(test_dsp_fixed_quality tests/test_dsp_fixed_quality.cpp)
+target_include_directories(test_dsp_fixed_quality PRIVATE src tools)
+target_link_libraries(test_dsp_fixed_quality PRIVATE rtadsp)
+add_test(NAME dsp_fixed_quality COMMAND test_dsp_fixed_quality)
+
+# Append to the project's test section. Production source has no fault switches.
+add_executable(test_dsp_gpu_compact tests/test_dsp_gpu_compact.cpp)
+target_link_libraries(test_dsp_gpu_compact PRIVATE rtadsp)
+set_target_properties(test_dsp_gpu_compact PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gpu-compact/common")
+
+function(add_gpu_compact_fixture fixture_name export_compact)
+    set(fixture_target "gpu_compact_fixture_${fixture_name}")
+    set(fixture_dir "${CMAKE_BINARY_DIR}/gpu-compact/${fixture_name}")
+    add_library(${fixture_target} SHARED tests/test_dsp_gpu_compact_fixture.cpp)
+    target_link_libraries(${fixture_target} PRIVATE rtadsp)
+    target_compile_definitions(${fixture_target} PRIVATE COMPACT_EXPORT=${export_compact})
+    set_target_properties(${fixture_target} PROPERTIES
+        OUTPUT_NAME rtagpu PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${fixture_dir}"
+        LIBRARY_OUTPUT_DIRECTORY "${fixture_dir}"
+        ARCHIVE_OUTPUT_DIRECTORY "${fixture_dir}")
+    add_custom_target(gpu_compact_prepare_${fixture_name} ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:test_dsp_gpu_compact>"
+            "$<TARGET_FILE_DIR:${fixture_target}>/test_dsp_gpu_compact.exe"
+        DEPENDS test_dsp_gpu_compact ${fixture_target}
+        VERBATIM)
+    add_test(NAME dsp_gpu_compact_${fixture_name}
+        COMMAND "$<TARGET_FILE_DIR:${fixture_target}>/test_dsp_gpu_compact.exe" "${fixture_name}")
+    set_tests_properties(dsp_gpu_compact_${fixture_name} PROPERTIES
+        WORKING_DIRECTORY "$<TARGET_FILE_DIR:${fixture_target}>")
+endfunction()
+add_gpu_compact_fixture(legacy 0)
+add_gpu_compact_fixture(fail 1)
+
+
+# Private real-HIP failure injection is built from current source, never packaged.
+option(RTA_GPU_COMPACT_FAULT_TEST "Enable developer-only real HIP fault fixture" OFF)
+set(RTA_GPU_COMPACT_HIP_RUNTIME "${CMAKE_SOURCE_DIR}/build/amdhip64_7.dll"
+    CACHE FILEPATH "HIP runtime for the private developer test")
+if(RTA_GPU_COMPACT_FAULT_TEST)
+    find_program(RTA_HIPCC NAMES hipcc.bat hipcc
+        HINTS "$ENV{HIP_PATH}/bin" "C:/Program Files/AMD/ROCm/7.2/bin" REQUIRED)
+    if(NOT EXISTS "${RTA_GPU_COMPACT_HIP_RUNTIME}")
+        message(FATAL_ERROR "Real HIP fault test requested but runtime is missing")
+    endif()
+    set(fault_dir "${CMAKE_BINARY_DIR}/gpu-compact/real")
+    set(fault_dll "${fault_dir}/rtagpu.dll")
+    add_custom_command(OUTPUT "${fault_dll}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${fault_dir}"
+        COMMAND "${RTA_HIPCC}" --offload-arch=gfx1201 -O3 -march=x86-64-v2
+            -ffp-contract=off -shared -I "${CMAKE_SOURCE_DIR}/src"
+            "${CMAKE_SOURCE_DIR}/tests/test_dsp_gpu_compact_fault_fixture.cpp" -o "${fault_dll}"
+        DEPENDS tests/test_dsp_gpu_compact_fault_fixture.cpp src/gpu/gpu_resample_hip.cpp
+        VERBATIM)
+    add_custom_target(gpu_compact_prepare_real ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:test_dsp_gpu_compact>" "${fault_dir}/test_dsp_gpu_compact.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${RTA_GPU_COMPACT_HIP_RUNTIME}" "${fault_dir}/amdhip64_7.dll"
+        DEPENDS test_dsp_gpu_compact "${fault_dll}"
+        VERBATIM)
+    add_test(NAME dsp_gpu_compact_fault_real COMMAND "${fault_dir}/test_dsp_gpu_compact.exe" real)
+    set_tests_properties(dsp_gpu_compact_fault_real PROPERTIES WORKING_DIRECTORY "${fault_dir}")
+endif()
+
+add_executable(test_dop_render_seek tests/test_dop_render_seek.cpp)
+target_include_directories(test_dop_render_seek PRIVATE src)
+add_test(NAME dop_render_seek COMMAND test_dop_render_seek)
+
+# Exact-output performance regression gates (offline; no device API).
+add_executable(test_resampler_simd tests/test_resampler_simd.cpp)
+target_link_libraries(test_resampler_simd PRIVATE rtadsp)
+add_test(NAME resampler_simd COMMAND test_resampler_simd)
+add_executable(test_resampler_rational_simd tests/test_resampler_rational_simd.cpp)
+target_link_libraries(test_resampler_rational_simd PRIVATE rtadsp)
+add_test(NAME resampler_rational_simd COMMAND test_resampler_rational_simd)
+add_executable(test_resampler_rational_scalar tests/test_resampler_rational_simd.cpp)
+target_compile_definitions(test_resampler_rational_scalar PRIVATE RTA_RESAMPLER_DISABLE_AVX2=1)
+target_link_libraries(test_resampler_rational_scalar PRIVATE rtadsp)
+add_test(NAME resampler_rational_scalar COMMAND test_resampler_rational_scalar)
+add_executable(test_resampler_simd_early tests/test_resampler_simd.cpp)
+target_compile_definitions(test_resampler_simd_early PRIVATE RTA_TEST_EARLY_INTRINSICS=1)
+target_link_libraries(test_resampler_simd_early PRIVATE rtadsp)
+add_test(NAME resampler_simd_early COMMAND test_resampler_simd_early)
+add_executable(test_resampler_rational_early tests/test_resampler_rational_simd.cpp)
+target_compile_definitions(test_resampler_rational_early PRIVATE RTA_TEST_EARLY_INTRINSICS=1)
+target_link_libraries(test_resampler_rational_early PRIVATE rtadsp)
+add_test(NAME resampler_rational_early COMMAND test_resampler_rational_early)
+add_executable(test_fixed_resampler_simd tests/test_fixed_resampler_simd.cpp)
+target_link_libraries(test_fixed_resampler_simd PRIVATE rtadsp)
+add_test(NAME fixed_resampler_simd COMMAND test_fixed_resampler_simd)
+add_executable(test_resampler_fixed_simd tests/test_resampler_fixed_simd.cpp)
+target_link_libraries(test_resampler_fixed_simd PRIVATE rtadsp)
+add_test(NAME resampler_fixed_simd COMMAND test_resampler_fixed_simd)
+add_executable(test_resampler_fixed_scalar tests/test_resampler_fixed_simd.cpp)
+target_compile_definitions(test_resampler_fixed_scalar PRIVATE RTA_RESAMPLER_DISABLE_AVX2=1)
+target_link_libraries(test_resampler_fixed_scalar PRIVATE rtadsp)
+add_test(NAME resampler_fixed_scalar COMMAND test_resampler_fixed_scalar)
+add_executable(test_fft_precision tests/test_fft_precision.cpp)
+target_link_libraries(test_fft_precision PRIVATE rtadsp)
+add_test(NAME fft_precision COMMAND test_fft_precision)
+add_executable(filter_numerical_audit tools/filter_numerical_audit.cpp)
+target_link_libraries(filter_numerical_audit PRIVATE rtadsp)
+add_executable(test_parallel_pool tests/test_parallel_pool.cpp)
+target_link_libraries(test_parallel_pool PRIVATE rtadsp)
+add_test(NAME parallel_pool COMMAND test_parallel_pool)
+add_executable(test_sdm_fast tests/test_sdm_fast.cpp)
+target_link_libraries(test_sdm_fast PRIVATE rtadsp)
+add_test(NAME sdm_fast COMMAND test_sdm_fast)
+add_executable(test_sdm_round2 tests/test_sdm_round2.cpp)
+target_link_libraries(test_sdm_round2 PRIVATE rtadsp)
+add_test(NAME sdm_stereo_state COMMAND test_sdm_round2)
+add_executable(test_sdm_sections tests/test_sdm_sections.cpp)
+target_link_libraries(test_sdm_sections PRIVATE rtadsp)
+add_test(NAME sdm_sections COMMAND test_sdm_sections)
+add_executable(test_sdm_multilevel tests/test_sdm_multilevel.cpp)
+target_link_libraries(test_sdm_multilevel PRIVATE rtadsp)
+add_test(NAME sdm_multilevel COMMAND test_sdm_multilevel)
+add_test(NAME sdm_multilevel_441_1024 COMMAND test_sdm_multilevel --rate 45158400)
+add_test(NAME sdm_multilevel_48_1024 COMMAND test_sdm_multilevel --rate 49152000)
+add_executable(test_sdm_highrate_quality tests/test_sdm_highrate_quality.cpp)
+target_link_libraries(test_sdm_highrate_quality PRIVATE rtadsp)
+add_test(NAME sdm_highrate_quality COMMAND test_sdm_highrate_quality --full)
+add_test(NAME sdm_highrate_ahm_quality COMMAND test_sdm_highrate_quality --full --ahm)
+add_executable(test_dop_stereo tests/test_dop_stereo.cpp)
+target_link_libraries(test_dop_stereo PRIVATE rtadsp)
+add_test(NAME dop_stereo COMMAND test_dop_stereo)
+add_executable(test_dop_stereo_scalar tests/test_dop_stereo.cpp)
+target_compile_definitions(test_dop_stereo_scalar PRIVATE RTA_DISABLE_SDM_STEREO_SIMD=1)
+target_link_libraries(test_dop_stereo_scalar PRIVATE rtadsp)
+add_test(NAME dop_stereo_scalar COMMAND test_dop_stereo_scalar)
+add_executable(dsp_efficiency_benchmark tools/dsp_efficiency_benchmark.cpp)
+target_link_libraries(dsp_efficiency_benchmark PRIVATE rtadsp psapi bcrypt)
+add_test(NAME dsp_efficiency_selftest COMMAND dsp_efficiency_benchmark --selftest)
+
+add_executable(test_dop_async tests/test_dop_async.cpp)
+target_link_libraries(test_dop_async PRIVATE rtadsp)
+add_test(NAME dop_async COMMAND test_dop_async)
+
+add_executable(test_dop_async_integration tests/test_dop_async_integration.cpp)
+target_link_libraries(test_dop_async_integration PRIVATE rtadsp)
+add_test(NAME dop_async_integration COMMAND test_dop_async_integration)
+
+add_executable(test_pcm_pack tests/test_pcm_pack.cpp)
+target_link_libraries(test_pcm_pack PRIVATE rtadsp)
+add_test(NAME pcm_pack COMMAND test_pcm_pack)
+add_executable(test_dsd_native_fast tests/test_dsd_native_fast.cpp)
+target_link_libraries(test_dsd_native_fast PRIVATE rtadsp)
+add_test(NAME dsd_native_fast COMMAND test_dsd_native_fast)
+
+# Optional developer-only real HIP cache regression; never shipped in the app.
+option(RTA_GPU_MULTIPHASE_CACHE_TEST "Enable developer HIP cache regression" OFF)
+if(RTA_GPU_MULTIPHASE_CACHE_TEST)
+  find_program(RTA_CACHE_HIPCC NAMES hipcc.bat hipcc
+    HINTS "$ENV{HIP_PATH}/bin" "C:/Program Files/AMD/ROCm/7.2/bin" REQUIRED)
+  set(cache_test "${CMAKE_BINARY_DIR}/test_gpu_multiphase_cache.exe")
+  add_custom_command(OUTPUT "${cache_test}"
+    COMMAND "${RTA_CACHE_HIPCC}" --offload-arch=gfx1201 -O3
+      -march=x86-64-v2 -ffp-contract=off -std=c++17
+      "${CMAKE_SOURCE_DIR}/tests/test_gpu_multiphase_cache.cpp" -o "${cache_test}"
+    DEPENDS tests/test_gpu_multiphase_cache.cpp src/gpu/gpu_resample_hip.cpp
+    VERBATIM)
+  add_custom_target(gpu_multiphase_cache_prepare ALL DEPENDS "${cache_test}")
+  add_test(NAME gpu_multiphase_cache_real COMMAND "${cache_test}")
+endif()

@@ -37,6 +37,51 @@ static int bit_of(const std::vector<uint8_t>& b, size_t n) {
     return (b[n >> 3] >> (7 - (n & 7))) & 1;
 }
 
+namespace rta::audio {
+struct AsioDriverTestAccess {
+    static void configure(AsioDriver& driver, bool dsd, ASIOSampleType type, size_t period,
+                          size_t queued, std::vector<std::vector<uint8_t>>& output) {
+        driver.ch_ = 2; driver.bufSize_ = (long)period; driver.dsdBufBytes_ = (long)period;
+        driver.dsdMode_ = dsd; driver.types_.assign(2, type);
+        driver.packing_ = type == ASIOSTDSDInt8LSB1 ? AsioDriver::DsdPack::Lsb1 : AsioDriver::DsdPack::Msb1;
+        driver.bufs_.resize(2);driver.ring_.assign(AsioDriver::kRingFrames * 2, 0);
+        for (size_t c = 0; c < 2; ++c) {
+            driver.bufs_[c].buffers[0] = output[c].data() + 1;
+            driver.bufs_[c].buffers[1] = output[c].data() + 1;
+        }
+        for (size_t i = 0; i < queued; ++i) for (size_t c = 0; c < 2; ++c)
+            driver.ring_[i * 2 + c] = (int32_t)((i * 37 + c * 11 + 3) & 255);
+        driver.ringR_ = 0; driver.ringW_ = queued;driver.ringCount_ = queued;
+    }
+    static void callback(AsioDriver& driver) { driver.on_buffer(0); }
+};
+}
+
+static void test_callback_silence() {
+    const size_t period = 16;
+    for (ASIOSampleType type : {ASIOSTDSDInt8MSB1, ASIOSTDSDInt8LSB1}) {
+        AsioDriver driver; std::vector<std::vector<uint8_t>> output(2, std::vector<uint8_t>(period + 2, 0xCC));
+        AsioDriverTestAccess::configure(driver,true,type,period,period+2,output);
+        AsioDriverTestAccess::callback(driver);bool preserved=true;
+        for(size_t c=0;c<2;++c)for(size_t i=0;i<period;++i){uint8_t want=(uint8_t)((i*37+c*11+3)&255);if(type==ASIOSTDSDInt8LSB1)want=asio_reverse_bits8(want);if(output[c][i+1]!=want)preserved=false;}
+        check(preserved&&driver.buffered()==2&&driver.underruns()==0,"real DSD callback preserves queued data and leaves two units unconsumed");
+        AsioDriverTestAccess::callback(driver);preserved=true;size_t ones=0;
+        for(size_t c=0;c<2;++c)for(size_t i=0;i<period;++i){uint8_t want=i<2?(uint8_t)(((period+i)*37+c*11+3)&255):0x69;if(type==ASIOSTDSDInt8LSB1)want=asio_reverse_bits8(want);if(output[c][i+1]!=want)preserved=false;if(i>=2)ones+=(size_t)__builtin_popcount(output[c][i+1]);}
+        const double density=(double)ones/(2*(period-2)*8);printf("  callback type=%ld partial_tail_density=%.3f DC=%.3f buffered=%zu underruns=%llu\n",type,density,2*density-1,driver.buffered(),driver.underruns());
+        check(preserved&&density==0.5&&driver.buffered()==0&&driver.underruns()==1,"real partial DSD underrun keeps real samples then fills balanced silence");
+        AsioDriverTestAccess::callback(driver);ones=0;bool guards=true;
+        for(size_t c=0;c<2;++c){guards=guards&&output[c].front()==0xCC&&output[c].back()==0xCC;for(size_t i=0;i<period;++i)ones+=(size_t)__builtin_popcount(output[c][i+1]);}
+        check(ones==2*period*4&&guards&&driver.underruns()==2,"real empty DSD callback has 50% bit density, zero DC and intact buffer guards");
+    }
+    for(ASIOSampleType type:std::vector<ASIOSampleType>{ASIOSTDSDInt8MSB1,ASIOSTDSDInt8LSB1,ASIOSTDSDInt8NER8,ASIOSTInt32LSB,(ASIOSampleType)999}){
+        const size_t width=(asio_is_dsd_1bit(type)||type==ASIOSTDSDInt8NER8)?1:4;AsioDriver driver;std::vector<std::vector<uint8_t>> output(2,std::vector<uint8_t>(period*width+2,0xCC));
+        AsioDriverTestAccess::configure(driver,false,type,period,0,output);AsioDriverTestAccess::callback(driver);bool valid=true;size_t ones=0;
+        for(size_t c=0;c<2;++c){valid=valid&&output[c].front()==0xCC&&output[c].back()==0xCC;for(size_t i=0;i<period*width;++i){const uint8_t actual=output[c][i+1];const uint8_t want=asio_is_dsd_1bit(type)?0x69:(type==ASIOSTDSDInt8NER8?(uint8_t)(i&1):0);if(actual!=want)valid=false;if(type==ASIOSTDSDInt8NER8)ones+=actual;}}
+        if(type==ASIOSTDSDInt8NER8){printf("  NER8 callback density=%.3f DC=%.3f\n",(double)ones/(2*period),2.0*ones/(2*period)-1.0);check(valid&&ones==period,"real default callback NER8 uses only balanced 0/1 samples, never packed 0x69");}
+        else check(valid,"real default/PCM callback uses format-specific silence with intact guards");
+    }
+}
+
 int main() {
     SetConsoleOutputCP(CP_UTF8);
     printf("=== 原生 DSD（ASIO）纯函数门禁 ===\n");
@@ -171,6 +216,7 @@ int main() {
               "peak=" + std::to_string(o.peakDbfs));
     }
 
+    test_callback_silence();
     printf("\n=== 结果：%d 通过 / %d 失败 ===\n", g_pass, g_fail);
     if (g_fail) {
         printf("⚠️ 本测试是纯函数门禁：它只能证明打包规则/数值/相位是对的，\n"

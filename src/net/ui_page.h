@@ -689,6 +689,9 @@ h += ".ctxmenu{position:fixed;z-index:9000;min-width:132px;padding:4px;border-ra
 h += ".ctxitem{padding:7px 11px;border-radius:6px;font-size:12.5px;cursor:pointer;white-space:nowrap}";
 h += ".ctxitem:hover{background:var(--hov);color:var(--acc)}";
     h += "#bpBadge.bp-direct{display:inline-flex;color:var(--bp-direct);border-color:currentColor;background:var(--hov)}";
+    // 2026-10-30：第四态「链路逐位·源有损」。用中性的青蓝，不用黄色 —— 黄色是"出问题了"，
+    // 而这一态恰恰说明链路没问题、只是源本身有损（mp3/aac）。染成警告色会继续误导用户。
+    h += "#bpBadge.bp-lossy{display:inline-flex;color:#38bdf8;border-color:currentColor;background:var(--hov)}";
     // 窄屏（1024 级）：中间控制组收窄、右侧只压缩音量条与格式徽标 —— 歌词/信号链/音量必须还在。
     h += "@media (max-width:1180px){.bar{gap:10px;padding:0 12px}.ctr{width:300px}.np{max-width:260px}.np .cv2{width:48px;height:48px}.vol{gap:6px}.vol input[type=range]{width:64px}#fmt{display:none}}";
     h += "#bRep{position:relative}";
@@ -821,7 +824,21 @@ h += "#npPage .npedge{display:none}";
     h += ".nplyric2::before,.nplyric2::after{content:'';display:block;height:var(--nppad,0px);pointer-events:none}";
     // 纯文本歌词（无时间轴）的显式提示：旧版只是"不滚动"，用户看起来像坏了
     h += ".ly-hint{position:sticky;top:0;z-index:2;font-size:10.5px;letter-spacing:.3px;color:var(--mut2);background:var(--bg);border-bottom:1px solid var(--line);padding:3px 0;margin-bottom:4px;pointer-events:none}";
-    h += ".npline{font-size:clamp(13px,1.9vh,17px);line-height:2.05;color:var(--mut);transition:.18s}";
+    // 2026-10-30（261029-03 #5 字号）：字号改由 #npLyric 上的 --ly-size 决定（右键菜单四档），
+    //   没设过就退回原来的 clamp()，老用户观感零变化。
+    h += ".npline{font-size:var(--ly-size,clamp(13px,1.9vh,17px));line-height:2.05;color:var(--mut);transition:.18s}";
+    // 译文行：比正文小一号、更淡；不参与高亮加粗（高亮的是原文那一行）
+    h += ".ly-tr{font-size:.8em;line-height:1.5;color:var(--mut2);margin-top:2px;font-weight:400;transform:none}";
+    // 音译行：斜体，进一步弱化，避免和译文抢视线
+    h += ".ly-ph{font-size:.76em;line-height:1.45;color:var(--mut2);font-style:italic;margin-top:1px;font-weight:400;transform:none}";
+    // 假名注音：行内小字，放在汉字之前（行内注音而不是 ruby，避免逐字对齐把行高撑乱）
+    h += ".ly-furi{font-size:.62em;color:var(--mut2);margin-right:6px;letter-spacing:.02em;font-weight:400}";
+    // 右键菜单的分组标题与分隔线（歌词菜单用；之前只有 ctxitem）
+    h += ".ctxhead{padding:5px 11px 3px;font-size:11px;color:var(--mut2);letter-spacing:.03em}";
+    h += ".ctxsep{height:1px;background:var(--line);margin:5px 4px}";
+    h += ".ctxitem.on{color:var(--acc)}";
+    h += ".ctxmk{display:inline-block;width:14px;opacity:.85}";
+    h += ".ctxnote{padding:4px 11px 6px;font-size:10.5px;color:var(--mut2);letter-spacing:.02em}";
     h += ".npline.on{color:var(--txt);font-weight:650;transform:scale(1.03)}";
     // 行3：控制区（261024-01 #3b ①：音量不再是底部独立一行）——
     //   进度条一行；下面**同一行**放「时间（左）/ 控制键（中）/ 音量（右）」，
@@ -1262,19 +1279,27 @@ h += "#npPage .npedge{display:none}";
     h += "<option value=nat1024>DSD1024 · Native</option>";
     h += "</select>";
     h += "<div id=devName></div>";
-    // 首次默认 = follow（跟随系统）。理由见 src/audio/rate_pick.h 的 "follow" 注：
-    // 默认 max 会挑设备最高率（例如 384k），而声卡当前配置常常是 48k，独占按 384k
-    // 开流在某些设备上直接不出声（用户 2026-10-22 功能1 的原话）。
-    h += "<select id=sRate><option value=follow>跟随系统</option><option value=max>自动（设备最高）</option><option value=src>源采样率</option>";
+    // 首次默认 = **src（源采样率直通）** —— 261030-01 规格 D-17：
+    //   「软件默认 = 源采样率直通（不滤波）；升频默认 = poly-sinc-short-lp」。
+    //
+    // 历史：2026-10-22 用户反馈「默认 max 会挑设备最高率（384k），某些设备独占直接不出声」，
+    // 当时把默认改成了 follow。但 follow 在「源 44.1k + 系统混音 48k」时会**必然重采样**，
+    // 那等于默认就破坏了逐位直通 —— 与 D-17 冲突。
+    // src 与 max 的区别正在这里：src 只要设备支持源率就逐位直通，不支持时由
+    // rate_pick.h 的降级逻辑处理（不会去挑 384k），所以 10-22 那个坑不会被重新踩到。
+    h += "<select id=sRate><option value=src>源采样率（直通）</option><option value=follow>跟随系统</option><option value=max>自动（按族策略选最高）</option>";
     for (int r : {44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000}) {
         h += "<option value=" + std::to_string(r) + ">" + std::to_string(r) + "</option>";
     }
     h += "</select>";
-    h += "<select id=sFilt>FILTER_OPTS</select>";
-    h += "<select id=sFiltNx>FILTER_OPTS</select>";
+    h += "<select id=sRateFamilyPolicy><option value=prefer>同族优先（默认）</option><option value=strict>严格同族</option><option value=compatible>兼容重采样</option></select>";
+    // 261030-01：两个下拉各自的源类型固定（1x=44.1/48k，Nx=88.2k+），
+    // 选项列表分开生成 —— 排除规则与「A dB · t ms」都在服务端算，前端零逻辑。
+    h += "<select id=sFilt>FILTER_OPTS_1X</select>";
+    h += "<select id=sFiltNx>FILTER_OPTS_NX</select>";
     h += "<select id=sShap>SHAPER_OPTS</select>";
     h += "<input id=sBuf type=number value=100>";
-    h += "<input type=checkbox id=sLoud><input type=checkbox id=sIsp checked><input type=checkbox id=s2s checked>";
+    h += "<input type=checkbox id=sLoud><input type=checkbox id=sIsp checked><select id=s2s><option value=auto>自动</option><option value=1>开启</option><option value=0>关闭</option></select>";
     h += "<select id=sGpu><option value=auto>自动</option><option value=amd>AMD</option><option value=nvidia>NVIDIA</option><option value=off>关闭</option></select>";
     h += "<input type=checkbox id=sShuf>";
     // 2026-10-26（用户 261026-08 #2）：循环 + 随机合并成**一个四态模式**。
@@ -1356,7 +1381,10 @@ h += "#npPage .npedge{display:none}";
     //   点标签 → 从右侧滑出抽屉看内容（.npdrawer，默认 translateX(102%) + visibility:hidden）。
     h += "<div class=npbody id=npBody>";
     h += "<div class=nplyric2 id=npLyric><div class=npline>还没有在播放</div></div>";
-    h += "<aside class=nprail id=npRail><div class=nprailcard><div class=nprailcap id=npRailCap>AI 整理</div>";
+    // 2026-10-29（管理员 261029-02 #4：「怎么还是三行字，我不是说改成两行么」）：
+    //   第三行是这里写死的卡片标题「AI 整理」。用户要求只留「曲目信息」+「整理中…」两行，
+    //   所以整个标题元素删掉（它唯一的作用就是重复一遍 AI）。
+    h += "<aside class=nprail id=npRail><div class=nprailcard>";
     h += "<div class=npchipwrap id=npTabs></div>";
     // 261024-04 #7：自动加载的状态/失败重试行（正常态 display:none，不打扰版面）
     h += "<div id=npSummHint class=nprailhint style='display:none'></div></div></aside>";

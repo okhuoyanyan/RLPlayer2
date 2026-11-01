@@ -1,4 +1,4 @@
-# make_dist.ps1 - build the ONE official release package (Full / self-contained).
+﻿# make_dist.ps1 - build the ONE official release package (Full / self-contained).
 #
 # Policy since 1.0.2:
 #   * There is no "Lite" package any more. Every release is the official
@@ -13,10 +13,17 @@
 #   * The GPU runtime is smoke-tested from a staging directory with a PATH that
 #     contains only System32, i.e. exactly what a clean user machine sees.
 #
-# Usage: powershell -File tools/make_dist.ps1 [-Version 1.0.2] [-SkipGpuBuild]
+# Usage: powershell -File tools/make_dist.ps1 [-Version 2.0.5] [-SkipGpuBuild]
+#
+# ★ 2026-10-29（两轮审查 M01）：默认版本号**不再手写**。
+#   旧默认值是 1.3.13，而 src/version.h 早已是 2.0.x ⟹ 不带参数出包会产出一个
+#   名字与文件属性都写着旧版本的包（版本号单一来源被破坏）。
+#   现在：默认从 src/version.h 的 RLPLAYER_VERSION 读取（与 CMake 生成 rc 资源同一个来源）；
+#   显式 -Version 仍然可用，但会与实际产物版本核对，不一致直接失败。
 param(
-    [string]$Version = "1.3.13",
-    [switch]$SkipGpuBuild
+    [string]$Version = "",
+    [switch]$SkipGpuBuild,
+    [string]$DocumentationDir = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,9 +35,69 @@ $rocm = 'C:\Program Files\AMD\ROCm\7.2'
 
 function Fail($msg) { Write-Host "FAILED: $msg"; exit 1 }
 
+# Validate every recursive cleanup against its precise parent in this checkout.
+# Junctions/symlinks could redirect a lexically safe path outside the workspace.
+function Get-SafeCleanupDirectory([string]$Target, [string]$Parent) {
+    $rootAbs=(Resolve-Path -LiteralPath $root -ErrorAction Stop).ProviderPath.TrimEnd('\','/')
+    $targetAbs=(Resolve-Path -LiteralPath $Target -ErrorAction Stop).ProviderPath.TrimEnd('\','/')
+    $parentAbs=(Resolve-Path -LiteralPath $Parent -ErrorAction Stop).ProviderPath.TrimEnd('\','/')
+    $buildAbs=[IO.Path]::GetFullPath((Join-Path $rootAbs 'build')).TrimEnd('\','/')
+    $distAbs=[IO.Path]::GetFullPath((Join-Path $rootAbs 'dist')).TrimEnd('\','/')
+    $insideBuild=$parentAbs.Equals($buildAbs,[StringComparison]::OrdinalIgnoreCase) -or $parentAbs.StartsWith($buildAbs + '\',[StringComparison]::OrdinalIgnoreCase)
+    $insideDist=$parentAbs.Equals($distAbs,[StringComparison]::OrdinalIgnoreCase) -or $parentAbs.StartsWith($distAbs + '\',[StringComparison]::OrdinalIgnoreCase)
+    if (-not ($insideBuild -or $insideDist)) { throw "Unsafe cleanup parent outside checkout build/dist: $parentAbs" }
+    if (-not $targetAbs.StartsWith($parentAbs + '\',[StringComparison]::OrdinalIgnoreCase)) {
+        throw "Unsafe recursive cleanup target (must be a strict child): $targetAbs; parent=$parentAbs"
+    }
+    $cursor=$targetAbs
+    while ($cursor.Length -ge $rootAbs.Length) {
+        $entry=Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+        if (-not $entry.PSIsContainer) { throw "Cleanup target/ancestor is not a directory: $cursor" }
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Cleanup refuses reparse point: $cursor" }
+        if ($cursor.Equals($rootAbs,[StringComparison]::OrdinalIgnoreCase)) { break }
+        $cursor=Split-Path -Parent $cursor
+    }
+    return $targetAbs
+}
+
+# ---- 版本号单一来源：src/version.h ----
+$verHeader = Join-Path $root 'src\version.h'
+if (-not (Test-Path $verHeader)) { Fail "src/version.h missing" }
+$verLine = Select-String -Path $verHeader -Pattern '#define\s+RLPLAYER_VERSION\s+"([0-9]+\.[0-9]+\.[0-9]+)"' |
+           Select-Object -First 1
+if (-not $verLine) { Fail "cannot parse RLPLAYER_VERSION from src/version.h" }
+$srcVersion = $verLine.Matches[0].Groups[1].Value
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = $srcVersion
+    Write-Host "version: $Version (from src/version.h)"
+} else {
+    if ($Version -ne $srcVersion) {
+        Fail "explicit -Version $Version does not match src/version.h ($srcVersion); the package name and the exe resource version would diverge"
+    }
+    Write-Host "version: $Version (explicit, matches src/version.h)"
+}
+
 Write-Host "=== build ==="
-& cmake --build $B
-if ($LASTEXITCODE -ne 0) { Fail "cmake build failed" }
+# ★ 2026-10-30（F35 同源问题，出包时踩到）：本脚本 $ErrorActionPreference = Stop，
+#   而 PowerShell 把**原生命令写到 stderr 的任何内容**（包括 ninja 的 warning）
+#   变成 NativeCommandError 终止脚本 —— 实测 ninja 打一句
+#   "ninja: warning: premature end of file; recovering" 就把整个出包流程打断，
+#   而构建其实完全成功。判据必须是退出码，不是输出文本。
+#   做法：捕获输出（保留诊断）、临时把 ErrorActionPreference 放回 Continue，
+#   再用 $LASTEXITCODE 判定。
+$savedEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+$buildOut = (& cmake --build $B 2>&1 | Out-String)
+$buildExit = $LASTEXITCODE
+$ErrorActionPreference = $savedEap
+$buildOut | Out-File -FilePath (Join-Path $B "make_dist_build.log") -Encoding utf8
+if ($buildExit -ne 0) {
+    Write-Host $buildOut
+    Fail "cmake build failed (exit=$buildExit)"
+}
+# 有 warning 不算失败，但必须显示出来（不隐藏事实）
+$warnLines = @($buildOut -split [Environment]::NewLine | Where-Object { $_ -match "warning:" })
+if ($warnLines.Count -gt 0) { Write-Host ("build warnings: " + $warnLines.Count + " lines (see build\make_dist_build.log)") }
 
 Write-Host "=== GPU backend ==="
 $gpuDll = Join-Path $B 'rtagpu.dll'
@@ -73,7 +140,10 @@ if (-not (Test-Path $ffPath) -or -not (Test-Path $fpPath)) { Fail "精简版产�
 
 $name = "RLPlayer-$Version-win64"
 $out = Join-Path $dist $name
-if (Test-Path $out) { Remove-Item $out -Recurse -Force }
+if (Test-Path -LiteralPath $out) {
+    $safeOut=Get-SafeCleanupDirectory $out $dist
+    Remove-Item -LiteralPath $safeOut -Recurse -Force
+}
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $out 'tools') | Out-Null
 
@@ -161,11 +231,14 @@ if (Test-Path $clang) {
 $tools = @('rtaplay.exe', 'dsdconv.exe', 'make_dsd.exe', 'rtanet_rx.exe', 'dopinfo.exe',
            'wavcmp.exe', 'wasapi_probe.exe', 'upnp_scan.exe',
            'aidecode.exe', 'rtatag.exe', 'rtacapture.exe', 'rtacast.exe', 'filter_report.exe',
-           'wasapi_ex_probe.exe', 'gpubench_conv.exe')
+           'wasapi_ex_probe.exe', 'gpubench_conv.exe',
+           'filter_sweep.exe', 'filter_numerical_audit.exe', 'apod_check.exe', 'dsp_measure_dsd.exe', 'dsp_ringing_reference.exe',
+           'dsp_pipeline_benchmark.exe', 'dsp_dop_benchmark.exe', 'dsp_sdm_block_benchmark.exe',
+           'dsp_efficiency_benchmark.exe')
 foreach ($f in $tools) {
     $p = Join-Path $B $f
     if (Test-Path $p) { Copy-Item $p (Join-Path $out 'tools') -Force }
-    else { Write-Host "WARN: tool not built: $f" }
+    else { Fail "required FULL-package tool missing: $f" }
 }
 
 # 2026-10-24：模板改放 tools\（dist\ 被 .gitignore 忽略，模板不进仓库的话别人 clone 后打不了包）；
@@ -183,23 +256,48 @@ $dataOut = Join-Path $out 'data'
 New-Item -ItemType Directory -Force -Path $dataOut | Out-Null
 Copy-Item $opraIndexSrc (Join-Path $dataOut 'opra_index.json') -Force
 
+# 界面语言包（2026-10-30 用户 261029-03）：data\i18n\<code>.json
+# 缺了不会让程序崩（界面回落中文），但用户就看不到译文 ⟹ 出包时必须查在位，缺一个就 Fail。
+$i18nSrc = Join-Path $root 'data\i18n'
+if (-not (Test-Path $i18nSrc)) { Fail "语言包源目录缺失: $i18nSrc" }
+$i18nOut = Join-Path $dataOut 'i18n'
+New-Item -ItemType Directory -Force -Path $i18nOut | Out-Null
+foreach ($lc in @('en', 'ja', 'fr', 'ru', 'es', 'ar')) {
+    $src = Join-Path $i18nSrc ($lc + '.json')
+    if (-not (Test-Path $src)) { Fail ("语言包缺失: " + $src) }
+    Copy-Item $src (Join-Path $i18nOut ($lc + '.json')) -Force
+}
+Write-Host ("i18n: 6 个语言包已复制到 data\i18n")
+
 $opraNoticeSrc = Join-Path $root 'OPRA-NOTICE.txt'
 if (-not (Test-Path $opraNoticeSrc)) { Fail "OPRA 归属文件缺失: $opraNoticeSrc" }
 Copy-Item $opraNoticeSrc (Join-Path $out 'OPRA-NOTICE.txt') -Force
 
 Write-Host "=== GPU staging smoke (PATH = System32 only) ==="
 $stage = Join-Path $B '_gpustage_dist'
-if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+if (Test-Path -LiteralPath $stage) {
+    $safeStage=Get-SafeCleanupDirectory $stage $B
+    Remove-Item -LiteralPath $safeStage -Recurse -Force
+}
 New-Item -ItemType Directory -Path $stage | Out-Null
 Copy-Item (Join-Path $B 'test_gpu_bridge.exe') $stage
 Copy-Item (Join-Path $out 'rtagpu.dll') $stage
 Copy-Item (Join-Path $out 'amdhip64_7.dll') $stage
 $oldPath = $env:PATH
-$env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
-$gpuOut = (& (Join-Path $stage 'test_gpu_bridge.exe') 2>&1) -join [char]10
-$env:PATH = $oldPath
+$gpuEap = $ErrorActionPreference
+$gpuExit = -1
+try {
+    $env:PATH = Join-Path $env:SystemRoot 'System32'
+    $ErrorActionPreference = 'Continue'
+    $gpuOut = (& (Join-Path $stage 'test_gpu_bridge.exe') 2>&1 | Out-String)
+    $gpuExit = $LASTEXITCODE
+} finally {
+    $env:PATH = $oldPath
+    $ErrorActionPreference = $gpuEap
+}
 Write-Host $gpuOut
-if ($gpuOut -notmatch '\[PASS\]') { Fail "bundled GPU runtime did not initialise (see output above)" }
+$gpuOk = ($gpuExit -eq 0) -and ($gpuOut -match '\[PASS\]') -and ($gpuOut -notmatch '\[FAIL\]|\[SKIP\]')
+if (-not $gpuOk) { Fail "bundled GPU smoke failed/unverified (exit=$gpuExit; requires PASS and forbids FAIL/SKIP)" }
 
 # === 发布包洁净度：绝不允许把开发机的运行状态打进去（2026-10-28 用户反馈）===
 # 事故：dist\RLPlayer-2.0-win64 里带上了我这台开发机的 rlplayer-library.conf
@@ -211,13 +309,17 @@ if ($gpuOut -notmatch '\[PASS\]') { Fail "bundled GPU runtime did not initialise
 $devStateDirs = @('artistimg', 'covercache', 'rlplayer-meta', 'webview2', 'lyricscache', 'roomcorr')
 foreach ($d in $devStateDirs) {
     $p = Join-Path $out $d
-    if (Test-Path $p) { Write-Host ("purge dev-state dir: " + $d); Remove-Item $p -Recurse -Force }
+    if (Test-Path -LiteralPath $p) {
+        $safeState=Get-SafeCleanupDirectory $p $out
+        Write-Host ("purge dev-state dir: " + $d)
+        Remove-Item -LiteralPath $safeState -Recurse -Force
+    }
 }
 $devStateGlobs = @('rlplayer-*.conf', 'rlplayer-*.log', 'rlplayer-*.tsv', 'rlplayer-*.txt',
                    'rlplayer-*.json', 'launcher.log', '*.log')
 foreach ($g in $devStateGlobs) {
     Get-ChildItem -Path $out -Filter $g -File -ErrorAction SilentlyContinue |
-        ForEach-Object { Write-Host ("purge dev-state file: " + $_.Name); Remove-Item $_.FullName -Force }
+        ForEach-Object { Write-Host ("purge dev-state file: " + $_.Name); Remove-Item -LiteralPath $_.FullName -Force }
 }
 # 硬校验 ①：清完还剩下任何一个运行时状态文件 ⟹ 拒绝出包
 $leak = Get-ChildItem -Path $out -Recurse -File -Include 'rlplayer-library.conf', 'rlplayer-settings.conf',
@@ -235,20 +337,48 @@ if ($pathHits) {
 }
 Write-Host 'release hygiene: no dev-state files, no dev absolute paths'
 
-$zip = Join-Path $dist ($name + '.zip')
-if (Test-Path $zip) { Remove-Item $zip -Force }
-# tar.exe (bsdtar, built into Win10/11) handles a ~1 GB tree much faster than
-# Compress-Archive and does not buffer the whole archive in memory.
-$tar = Join-Path $env:SystemRoot 'System32/tar.exe'
-if (Test-Path $tar) {
-    Push-Location $out
-    & $tar -a -c -f $zip *
-    $tarRc = $LASTEXITCODE
-    Pop-Location
-    if ($tarRc -ne 0) { Fail "tar failed to create zip" }
-} else {
-    Compress-Archive -Path (Join-Path $out '*') -DestinationPath $zip -CompressionLevel Optimal
+# Optional explicit documentation input. If requested, require both current
+# manuals in editable and printable form; never silently package an old PDF.
+if (-not [string]::IsNullOrWhiteSpace($DocumentationDir)) {
+    # Legacy 2.0 updaters hash files through a narrow Windows path API. Keep
+    # archive paths ASCII so they can verify and install the documentation.
+    $docOut = Join-Path $out 'docs'
+    New-Item -ItemType Directory -Force -Path $docOut | Out-Null
+    foreach ($kind in @('使用说明书', '技术白皮书')) {
+        foreach ($ext in @('docx', 'pdf')) {
+            $docName = "RLPlayer-$Version-$kind.$ext"
+            $docSource = Join-Path $DocumentationDir $docName
+            if (-not (Test-Path -LiteralPath $docSource -PathType Leaf)) { Fail "requested documentation missing: $docSource" }
+            $docSlug = if ($kind -eq '使用说明书') { 'user-guide' } else { 'technical-whitepaper' }
+            Copy-Item -LiteralPath $docSource -Destination (Join-Path $docOut "RLPlayer-$Version-$docSlug.$ext")
+        }
+    }
 }
+
+$zip = Join-Path $dist ($name + '.zip')
+if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+# Stream files with explicit UTF-8 entry names and portable '/' separators.
+# Windows tar can emit CP936 names without the ZIP UTF-8 flag, which corrupts
+# Chinese documentation names in standards-compliant readers on other systems.
+Add-Type -AssemblyName System.IO.Compression
+$zipStream = [IO.File]::Open($zip, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+try {
+    $archive = [IO.Compression.ZipArchive]::new($zipStream, [IO.Compression.ZipArchiveMode]::Create, $true, [Text.Encoding]::UTF8)
+    try {
+        $entryPrefix = [IO.Path]::GetFullPath($out).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+        foreach ($file in (Get-ChildItem -LiteralPath $out -Recurse -File | Sort-Object FullName)) {
+            if (-not $file.FullName.StartsWith($entryPrefix, [StringComparison]::OrdinalIgnoreCase)) { Fail "ZIP entry outside package: $($file.FullName)" }
+            $entryName = $file.FullName.Substring($entryPrefix.Length).Replace('\', '/')
+            $entry = $archive.CreateEntry($entryName, [IO.Compression.CompressionLevel]::Optimal)
+            $inputStream = $file.OpenRead()
+            try {
+                $entryStream = $entry.Open()
+                try { $inputStream.CopyTo($entryStream) }
+                finally { $entryStream.Dispose() }
+            } finally { $inputStream.Dispose() }
+        }
+    } finally { $archive.Dispose() }
+} finally { $zipStream.Dispose() }
 
 Write-Host ''
 Get-ChildItem $out | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host

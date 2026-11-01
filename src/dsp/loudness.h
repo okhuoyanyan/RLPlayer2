@@ -14,6 +14,7 @@
 // 实现：低音用低架滤波器、高音用高架滤波器；提升量按音量在
 // [下界, 上界] 之间线性插值（下界及以下取满提升，上界及以上为 0 dB）。
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include "matrix.h"
 #include <algorithm>
 #include <cmath>
@@ -30,6 +31,20 @@ struct LoudnessConfig {
     double lowerBoundDb= -30.0;   // P7 下界：此音量及以下取满提升
     double upperBoundDb=   0.0;   // P8 上界：此音量及以上为 0 dB
 };
+
+// 给定配置与听音音量，实际会施加的最大提升量（dB，0 = 完全旁路）。
+// ★ 2026-10-29（两轮审查 F21 顺带）：管线判「是否逐位直通」时必须在**不构造对象**的前提下
+//   知道 Loudness 到底动不动样本 —— 音量 >= 上界时提升为 0、process() 直接 return，
+//   这时 loudness 是纯旁路（可以逐位直通）；音量低时必须判成"有处理"。
+//   旧 hasAnyProcessing() 完全没看 loudnessEnabled ⟹ 开着等响度补偿也能报 bit-perfect=yes。
+inline double loudness_effect_db(const LoudnessConfig& c, double volDb) {
+    const double span = c.upperBoundDb - c.lowerBoundDb;
+    double t = (span <= 1e-12) ? 1.0 : (volDb - c.lowerBoundDb) / span;
+    t = std::clamp(t, 0.0, 1.0);
+    const double mx = std::max(c.bassMaxDb, c.trebleMaxDb);
+    const double v = mx * (1.0 - t);
+    return (v > 0.0) ? v : 0.0;
+}
 
 class Loudness {
 public:

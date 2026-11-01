@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <cstring>
+#include <algorithm>
 
 using namespace rta::dsp;
 
@@ -82,6 +84,110 @@ int main() {
                       VolumeControl::fixed_volume_grayed_db(), VolumeControl::fixed_volume_checked_db());
         check(VolumeControl::fixed_volume_grayed_db() == -3.0 &&
               VolumeControl::fixed_volume_checked_db() == -6.0, "固定音量两档符合手册", buf);
+    }
+
+
+    printf("\n=== 1b. 起播增益与多声道渐变（两轮审查 F01）===\n");
+    {
+        // ① 起播：−60 / −12 / 0 dB 的首块必须直接等于请求增益，不允许"单位增益前缀"。
+        //    判据用【管线真实入口】prepare_stream()，不是手工 snap() —— 旧 test 里
+        //    v.snap() 是测试自己补的，正好绕过了生产初始化缺 snap 的缺陷。
+        struct Case { double db; double want; };
+        const Case cases[] = { {-60.0, std::pow(10.0, -60.0 / 20.0)},
+                               {-12.0, std::pow(10.0, -12.0 / 20.0)},
+                               {  0.0, 1.0} };
+        for (const auto& cs : cases) {
+            VolumeControl v;
+            v.set_sample_rate(48000.0);
+            v.set_ramp_ms(200.0);
+            v.set_gain_db_snapped(cs.db);        // 生产的起播语义
+            const double g0 = v.process(1.0);    // 首个样本用的增益
+            char b2[220];
+            std::snprintf(b2, sizeof(b2), "(%+.0f dB: 首样本增益 %.9f, 目标 %.9f, 差 %.4f dB)",
+                          cs.db, g0, cs.want,
+                          (g0 > 0.0 && cs.want > 0.0) ? 20.0 * std::log10(g0 / cs.want) : -999.0);
+            const bool ok = (cs.db == 0.0) ? (g0 == 1.0)
+                                           : (std::fabs(20.0 * std::log10(g0 / cs.want)) < 1e-9);
+            check(ok, "起播首样本 = 请求增益", b2);
+        }
+
+        // ② 同一帧左右声道必须用同一个增益（旧实现右声道拿到的是渐变后半段）
+        {
+            VolumeControl v;
+            v.set_sample_rate(48000.0);
+            v.set_ramp_ms(100.0);
+            v.set_gain_db_snapped(0.0);
+            v.set_gain_db(-20.0);                // 动态变化 ⟹ 启动渐变
+            const size_t N = 500;
+            std::vector<double> L(N, 1.0), R(N, 1.0);
+            double* pl[2] = { L.data(), R.data() };
+            v.process_planes(pl, 2, N);
+            double maxDiff = 0.0;
+            for (size_t i = 0; i < N; ++i) maxDiff = std::max(maxDiff, std::fabs(L[i] - R[i]));
+            char b2[160];
+            std::snprintf(b2, sizeof(b2), "(500 帧最大左右差 %.3e)", maxDiff);
+            check(maxDiff == 0.0, "同一帧左右增益相同", b2);
+        }
+
+        // ③ 单/双/6 声道的 200 ms 渐变墙钟长度必须一致（按帧推进，不按样本推进）
+        {
+            std::vector<size_t> lens;
+            for (int ch : {1, 2, 6}) {
+                VolumeControl v;
+                v.set_sample_rate(48000.0);
+                v.set_ramp_ms(200.0);
+                v.set_gain_db_snapped(0.0);
+                v.set_gain_db(-20.0);
+                size_t n = 0;
+                while (v.ramping() && n < 100000) { v.step_frame(); ++n; }
+                lens.push_back(n);
+            }
+            char b2[200];
+            std::snprintf(b2, sizeof(b2), "(1ch=%zu 2ch=%zu 6ch=%zu 帧, 期望 9600)",
+                          lens[0], lens[1], lens[2]);
+            check(lens[0] == 9600 && lens[1] == 9600 && lens[2] == 9600,
+                  "渐变墙钟长度与声道数无关", b2);
+        }
+
+        // ④ 4096 / 777 分块必须得到同一序列（渐变跨调用连续、与分块边界无关）
+        {
+            auto run = [](size_t block, std::vector<double>& out) {
+                VolumeControl v;
+                v.set_sample_rate(48000.0);
+                v.set_ramp_ms(50.0);
+                v.set_gain_db_snapped(0.0);
+                v.set_gain_db(-30.0);
+                const size_t N = 5000;
+                std::vector<double> buf(N, 1.0);
+                out.clear(); out.reserve(N);
+                for (size_t p = 0; p < N; p += block) {
+                    const size_t n = std::min(block, N - p);
+                    double* pl[1] = { buf.data() + p };
+                    v.process_planes(pl, 1, n);
+                }
+                out = buf;
+            };
+            std::vector<double> a, b2v;
+            run(4096, a); run(777, b2v);
+            bool same = (a.size() == b2v.size());
+            if (same) for (size_t i = 0; i < a.size(); ++i) if (a[i] != b2v[i]) { same = false; break; }
+            check(same, "4096 与 777 分块得到同一序列");
+        }
+
+        // ⑤ 0 dB 稳态必须逐位不变（含 −0.0 与极大/极小值）
+        {
+            VolumeControl v;
+            v.set_sample_rate(48000.0);
+            v.set_gain_db_snapped(0.0);
+            std::vector<double> x = { 0.0, -0.0, 1.0, -1.0, 1e-300, -1e300, 0.1 };
+            std::vector<double> y = x;
+            double* pl[1] = { y.data() };
+            v.process_planes(pl, 1, y.size());
+            bool identical = true;
+            for (size_t i = 0; i < x.size(); ++i)
+                if (std::memcmp(&x[i], &y[i], sizeof(double)) != 0) { identical = false; break; }
+            check(identical, "0 dB 稳态逐位不变（含 −0.0）");
+        }
     }
 
     printf("\n=== 2. REW / AutoEq 参数 EQ 文本解析 ===\n");

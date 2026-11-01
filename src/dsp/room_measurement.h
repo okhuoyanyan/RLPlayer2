@@ -25,7 +25,9 @@
 #define _CRT_SECURE_NO_WARNINGS   // write_wav_f32 用 std::fopen（同 wasapi_capture.h 的做法）
 #endif
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include "room_correction.h"
+#include "mic_cal.h"     // 测量麦克风校准曲线：解析 / 插值 / 频域补偿（2026-10-29）
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -70,6 +72,11 @@ struct MeasurementSessionResult {
     SubAlign subAlign;              // 布局含超低时填
     std::vector<std::string> warnings;   // 人话警告（见质检规则）
     bool   aborted = false;
+    // 本次测量用的**测量麦克风校准曲线**（空 name / applied=false = 没用）。
+    // 供 /api/roomcorr/status 透出：用户得能确认「这次校正有没有扣掉话筒的频响」。
+    std::string micCalName;
+    bool   micCalApplied = false;
+    std::string micCalNote;         // 范围外按端点值处理等人话说明（空 = 无特别说明）
 };
 struct CorrectionSet {              // 应用侧产物
     std::vector<std::string> channelNames;
@@ -121,10 +128,17 @@ public:
     MeasurementSession(const SweepSpec& s, const RoomLayout& layout, double sweepLevelDbfs = -20.0)
         : spec_(s), layout_(layout), levelDbfs_(sweepLevelDbfs) {}
 
+    // 测量麦克风校准（可选）：设了才会在反卷积之后补偿；不设 = 老行为，一个样本都不改。
+    // 存曲线副本（几百个点，拷贝成本可忽略），会话不持有外部对象的生命周期。
+    void set_mic_calibration(const MicCalCurve& c) { micCal_ = c; hasMicCal_ = true; }
+    void clear_mic_calibration() { micCal_ = MicCalCurve{}; hasMicCal_ = false; }
+    bool has_mic_calibration() const { return hasMicCal_; }
+
     // 逐声道 扫频→采集→反卷积→质检；每声道开始前检查 cancelled，
     // 中止时已完成的声道保留在结果里（aborted=true 供 UI 区分「测完」与「测了一半」）。
     MeasurementSessionResult run(MeasurementTransport& tx) const {
         MeasurementSessionResult res;
+        res.micCalName = hasMicCal_ ? micCal_.name : std::string();
         const std::vector<double> sweep = generate_sweep(spec_);
         if (sweep.empty() || layout_.chCount <= 0) {
             res.warnings.push_back("测量配置无效（扫频参数或声道布局为空），未执行测量");
@@ -143,7 +157,7 @@ public:
             ChannelMeasurement cm;
             cm.channelName = name;
             cm.isSub = is_sub_name(name);
-            measure_one(tx, out, captureN, cm, res.warnings);
+            measure_one(tx, out, captureN, cm, res);
             res.channels.push_back(std::move(cm));
         }
         align_sub(res);
@@ -154,18 +168,21 @@ private:
     SweepSpec spec_;
     RoomLayout layout_;
     double levelDbfs_;
+    MicCalCurve micCal_;          // 测量麦克风校准曲线（hasMicCal_=false 时为空曲线）
+    bool hasMicCal_ = false;
 
     // 布局预置里超低一律叫 LFE；自定义布局沿用此约定
     static bool is_sub_name(const char* n) { return n && std::string(n) == "LFE"; }
 
+    // res 传引用（而不是只传 warnings）：补偿结果要写回 res.micCalApplied / micCalNote。
     void measure_one(MeasurementTransport& tx, const std::vector<double>& out, size_t captureN,
-                     ChannelMeasurement& cm, std::vector<std::string>& warns) const {
+                     ChannelMeasurement& cm, MeasurementSessionResult& res) const {
         const double fs = spec_.fs;
         std::vector<double> rec = tx.play_and_capture(out, captureN);
         if (rec.size() < captureN) {
             cm.valid = false;
             cm.note = "采集样本不足";
-            warns.push_back(cm.channelName + " 采集样本不足（传输层提前返回），该声道测量无效");
+            res.warnings.push_back(cm.channelName + " 采集样本不足（传输层提前返回），该声道测量无效");
             return;
         }
         // 削波质检放在反卷积之前：原始采集一旦触顶，后面的 IR 幅度都不可信，先记账
@@ -177,7 +194,7 @@ private:
         if (cm.roomIr.empty()) {
             cm.valid = false;
             cm.note = "反卷积失败";
-            warns.push_back(cm.channelName + " 反卷积失败（录音全零或扫频无效），该声道测量无效");
+            res.warnings.push_back(cm.channelName + " 反卷积失败（录音全零或扫频无效），该声道测量无效");
             return;
         }
         const size_t peak = ir_peak_index(cm.roomIr);
@@ -185,17 +202,31 @@ private:
         cm.snrDb = snr_db(cm.roomIr, fs, peak);
         cm.valid = true;
 
+        // ---- 测量麦克风校准补偿（2026-10-29）----
+        // 位置：deconvolve_ir 产出 roomIr 之后、build_corrections 里的 psychoacoustic_smooth /
+        // compute_correction_ir 之前 —— 后面每一步（平滑、目标曲线、限升、最小相位、截断）
+        // 都必须看到「房间」而不是「房间 + 话筒」。
+        // 只改幅度：mic_cal_apply_ir 对每个频点乘正实数增益，相位逐 bin 不变（见 mic_cal.h）。
+        // 放在 peakMs/snrDb 之后：那两个指标描述**这次采集**的质量，不该被补偿改写。
+        if (hasMicCal_) {
+            const MicCalApply ap = mic_cal_apply_ir(cm.roomIr, fs, micCal_);
+            if (ap.applied) {
+                res.micCalApplied = true;
+                if (!ap.note.empty() && res.micCalNote.empty()) res.micCalNote = ap.note;
+            }
+        }
+
         if (cm.snrDb < 20.0) {
             char b[64];
             std::snprintf(b, sizeof(b), "%.1f", cm.snrDb);
             cm.note += "信噪比不足";
-            warns.push_back(cm.channelName + " 环境噪声偏大（SNR " + b +
-                            " dB），建议关闭空调冰箱后重测");
+            res.warnings.push_back(cm.channelName + " 环境噪声偏大（SNR " + b +
+                                   " dB），建议关闭空调冰箱后重测");
         }
         if (clipped) {
             if (!cm.note.empty()) cm.note += "；";
             cm.note += "录音接近削波";
-            warns.push_back(cm.channelName + " 录音接近削波，请调低话筒/功放增益重测");
+            res.warnings.push_back(cm.channelName + " 录音接近削波，请调低话筒/功放增益重测");
         }
     }
 

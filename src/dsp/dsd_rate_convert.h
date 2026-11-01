@@ -51,10 +51,12 @@
 //      −165.3 dBFS；单样本 +2.0 越界：overload 53 次，尾部带限 RMS 与参考差 0.000 dB
 //   6. 真实 .dsf（258.6 MB / DSD64 / 384 s）：流式 3.11× 实时（双声道单线程），内存 +15.6 MB
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include "audio/dsd_reader.h"
 #include "dsd_integrator.h"
 #include "kaiser.h"
 #include "modulator.h"
+#include "parallel.h"
 #include "resampler.h"
 #include <algorithm>
 #include <cmath>
@@ -87,10 +89,13 @@ inline const char* dsd_rate_family_name(uint32_t rate) {
 // DSD64→176400、DSD128→352800、DSD256→705600）。
 inline constexpr uint32_t kDsdMidDivisor = 16;
 
-// 安全余量：调用方没做峰值预扫时用「满幅 + Gibbs 过冲 1.05」求上界，
-// 复用 modulator.h 的 sdm_headroom_db（target=0.62 / margin=0.2，既有档位）。
-inline double dsd_convert_safety_headroom_db(double assumedPeak = 1.05) {
-    return sdm_headroom_db(assumedPeak);
+// 安全余量：调用方没做峰值预扫时用「满幅 + Gibbs 过冲 1.05」求上界。
+//
+// ★ 2026-10-31（DEBUG-SDM 报告 G-3）：必须按**目标位率**取目标峰值 —— DSD64 的安全峰值是 0.45，
+//   旧实现一律 0.62 ⟹ 构造函数在 measureHeadroom=false 时会给 DSD64 少 2.56 dB 余量。
+//   生产链路走 measureHeadroom=true 所以碰不到，但这是条「结构上可能错」的路径，补掉。
+inline double dsd_convert_safety_headroom_db(double assumedPeak = 1.05, double targetFs = 0.0) {
+    return sdm_headroom_db_for_fs(assumedPeak, targetFs);
 }
 
 // ---------------- 规划（纯算术，无状态） ----------------
@@ -217,9 +222,11 @@ struct DsdRateConvertConfig {
     double modDitherLsb = 0.0005;                       // rtaweb 的既有默认（-34 dBFS 的 0.01 会毁掉 SNR）
     double modCutoffHz = 100000.0;                      // Dsd/Chebyshev 族用；Ec 族由 H∞ 预算决定
     double ntfHinf = 1.35;                              // SdmConfig 默认
+    double modOobGainDb = 4.5;                         // Preserve the prior SdmConfig default.
+    int    modAhmBits = 8;
 
     // 余量：负数 dB（<=0）。0 = 不衰减（调用方保证峰值 ≤ 0.62）。
-    // 默认给满幅安全值（-4.78 dB），需要更高质量时用 measure_peak() 后重设。
+    // 默认按目标率给满幅经验余量：DSD64 -7.56 dB，其余 -4.78 dB；预扫后可重设。
     double preAttenDb = 0.0;                            // 由构造函数按 headroomAuto 决定
     bool   headroomAuto = true;                         // true = 用 dsd_convert_safety_headroom_db()
 };
@@ -252,7 +259,7 @@ public:
         : plan_(plan), cfg_(cfg), ch_(channels < 1 ? 1 : channels) {
         if (!plan_.ok() && plan_.mode != DsdRateMode::Direct)
             throw std::runtime_error("DSD→DSD 速率转换不可用：" + plan_.note);
-        gainDb_ = cfg_.headroomAuto ? dsd_convert_safety_headroom_db()
+        gainDb_ = cfg_.headroomAuto ? dsd_convert_safety_headroom_db(1.05, (double)plan_.dstRate)
                                     : std::min(0.0, cfg_.preAttenDb);
         gain_ = std::pow(10.0, gainDb_ / 20.0);
         if (!plan_.needs_dsp()) return;
@@ -296,10 +303,13 @@ public:
         mc.fs       = (double)plan_.dstRate;
         mc.family   = cfg_.modFamily;
         mc.levels   = 2;
-        mc.order    = stable_sdm_order(cfg_.modOrder, mc.fs, 2, mc.family);
+        mc.oneBitOutput = true;  // Packed DSD cannot carry AHM multilevel samples.
+        mc.order    = cfg_.modOrder;  // Constructor guards retain the actual step-down reason.
         mc.cutoffHz = cfg_.modCutoffHz;
         mc.ditherLsb = cfg_.modDitherLsb;
         mc.ntfHinf  = cfg_.ntfHinf;
+        mc.oobGainDb = cfg_.modOobGainDb;
+        mc.ahmBits = cfg_.modAhmBits;
         // ★ 只综合一次 NTF，其余声道拷贝（EC 族的 synthesize_ntf 实测 410 ms/声道；
         //   拷贝不改变任何行为：既有 modulator 各声道本来就用同一个固定种子的抖动序列）。
         mod_.push_back(std::make_unique<SdmModulator>(mc));
@@ -353,6 +363,8 @@ public:
             st_.stepDownReason = mod_[0]->stepDownReason();
         }
         outBits_ = 0;
+        headConfigured_ = false; finished_ = false; dsdInput_ = false;
+        skipLeft_ = 0;
         init_sink(ch_);
     }
 
@@ -378,8 +390,15 @@ public:
                     rta::audio::DsdStream& out) {
         if (!plan_.needs_dsp()) return 0;
         if ((int)pcm.size() != ch_) throw std::runtime_error("DsdRateConverter::push_pcm 声道数不匹配");
+        if (finished_) throw std::runtime_error("DsdRateConverter::push_pcm after finish; reset first");
         if (frames == 0) return 0;
         if (sinkStream_ != &out) { sinkStream_ = &out; align_sink(out); }
+        if (!headConfigured_) {
+            double delay = rs_ ? rs_->latencyInputSamples() * plan_.interpolation : 0.0;
+            if (dsdInput_) delay += dec_[0]->latencyInputBits() * (double)plan_.dstRate / plan_.srcRate;
+            skipLeft_ = (size_t)std::llround(delay);
+            headConfigured_ = true;
+        }
 
         std::vector<const double*> ip((size_t)ch_);
         for (int c = 0; c < ch_; ++c) ip[(size_t)c] = pcm[(size_t)c].data();
@@ -393,19 +412,43 @@ public:
             for (int c = 0; c < ch_; ++c) op[(size_t)c] = resampled[(size_t)c].data();
             produced = rs_->process(ip.data(), frames, op.data());
         }
-        for (size_t n = 0; n < produced; ++n) {
-            for (int c = 0; c < ch_; ++c) {
-                const double x = ((rs_ ? resampled[(size_t)c][n] : pcm[(size_t)c][n])) * gain_;
+        const size_t drop = std::min(skipLeft_, produced);
+        const size_t written = produced - drop;
+        const uint64_t firstBit = (uint64_t)outBits_;
+        const size_t need = (size_t)((firstBit + written + 7) / 8);
+        // Resize every output before workers start; each channel owns its bytes.
+        for (auto& channel : out.data)
+            if (channel.size() < need) channel.resize(need, 0);
+        // Interpolated samples are already owned here. Without an interpolator,
+        // allocate private scaled planes rather than modifying the caller's PCM.
+        if (!rs_) resampled.assign((size_t)ch_, std::vector<double>(produced));
+        std::vector<double> peaks((size_t)ch_, 0.0);
+        ParallelFor::instance().run((size_t)ch_, [&](size_t c) {
+            auto& scaled = resampled[c];
+            double peak = 0.0;
+            for (size_t n = 0; n < produced; ++n) {
+                const double x = (rs_ ? scaled[n] : pcm[c][n]) * gain_;
+                scaled[n] = x;
                 const double ax = std::fabs(x);
-                if (ax > st_.inPeak) st_.inPeak = ax;
-                const double y = mod_[(size_t)c]->process(x);
-                put_bit((uint64_t)(outBits_ + (long long)n), (size_t)c, y > 0.0);
+                if (ax > peak) peak = ax; // As before, NaN never replaces peak.
             }
-        }
-        outBits_ += (long long)produced;
+            auto& target = out.data[c];
+            mod_[c]->process_binary_block(scaled.data(), produced, [&](size_t n, double y) {
+                if (n < drop) return; // Dropped samples still advance SDM and RNG.
+                const uint64_t bit = firstBit + n - drop;
+                const size_t byte = (size_t)(bit >> 3);
+                const uint8_t mask = (uint8_t)(0x80u >> (bit & 7u));
+                if (y > 0.0) target[byte] = (uint8_t)(target[byte] | mask);
+                else target[byte] = (uint8_t)(target[byte] & (uint8_t)~mask);
+            });
+            peaks[c] = peak;
+        });
+        for (double peak : peaks) if (peak > st_.inPeak) st_.inPeak = peak;
+        skipLeft_ -= drop;
+        outBits_ += (long long)written;
         st_.outBits = outBits_;
         collect_mod_stats();
-        return produced;
+        return written;
     }
 
     // ---- 一条龙：1-bit@源位率 → 1-bit@目标位率 ----
@@ -414,14 +457,59 @@ public:
             copy_bits(in, out);
             return (size_t)in.bits;
         }
+        if (finished_) throw std::runtime_error("DsdRateConverter::process_bits after finish; reset first");
+        dsdInput_ = true;
         std::vector<std::vector<double>> pcm((size_t)ch_);
         const size_t got = to_pcm(in, pcm);
         if (got == 0) return 0;
         return push_pcm(pcm, got, out);
     }
 
-    // 收尾：把最后不足 8 位的字节补零并把 out.bits 写成真实位数
+    // Finish preserves the complete causal decimator/interpolator tail, while
+    // trimming only linear-phase delay at the head. Converted duration includes
+    // natural ringing; it is no longer exactly source duration * rate ratio.
+    // Repeated finish calls are idempotent. IIR tails use a documented -300 dB bound.
     void finish(rta::audio::DsdStream& out) {
+        if (!finished_ && plan_.needs_dsp()) {
+            if (dsdInput_) {
+                std::vector<std::vector<double>> tail((size_t)ch_);
+                for (int c = 0; c < ch_; ++c) dec_[(size_t)c]->drain(tail[(size_t)c]);
+                if (!tail.empty() && !tail[0].empty()) push_pcm(tail, tail[0].size(), out);
+            }
+            if (rs_ && headConfigured_) {
+                const size_t zeros = (size_t)std::ceil(rs_->tailInputSamples());
+                if (zeros) {
+                    std::vector<std::vector<double>> tail((size_t)ch_, std::vector<double>(zeros, 0.0));
+                    push_pcm(tail, zeros, out);
+                }
+            }
+            // A 1-bit modulator keeps producing shaped idle bits at zero input;
+            // it cannot be emptied like a finite FIR. Preserve a 2ms quiet tail
+            // so stopping the bitstream does not cut its post-transient error
+            // cancellation. This is settling silence, not a claim of zero state.
+            if (headConfigured_) {
+                const size_t settle = (size_t)std::ceil(0.002 * plan_.dstRate);
+                const uint64_t firstBit = (uint64_t)outBits_;
+                const size_t need = (size_t)((firstBit + settle + 7) / 8);
+                for (auto& channel : sinkStream_->data)
+                    if (channel.size() < need) channel.resize(need, 0);
+                const std::vector<double> zeros(settle, 0.0);
+                ParallelFor::instance().run((size_t)ch_, [&](size_t c) {
+                    auto& target = sinkStream_->data[c];
+                    mod_[c]->process_binary_block(zeros.data(), settle, [&](size_t n, double y) {
+                        const uint64_t bit = firstBit + n;
+                        const size_t byte = (size_t)(bit >> 3);
+                        const uint8_t mask = (uint8_t)(0x80u >> (bit & 7u));
+                        if (y > 0.0) target[byte] = (uint8_t)(target[byte] | mask);
+                        else target[byte] = (uint8_t)(target[byte] & (uint8_t)~mask);
+                    });
+                });
+                outBits_ += (long long)settle;
+                st_.outBits = outBits_;
+                collect_mod_stats();
+            }
+            finished_ = true;
+        }
         if (sinkStream_ != &out) { sinkStream_ = &out; align_sink(out); }
         out.rate = plan_.dstRate;
         out.channels = ch_;
@@ -469,11 +557,24 @@ private:
     }
 
     void copy_bits(const rta::audio::DsdStream& in, rta::audio::DsdStream& out) {
-        out.rate = plan_.dstRate;
-        out.channels = in.channels;
-        out.bits = in.bits;
-        out.data = in.data;
-        outBits_ = (long long)in.bits;
+        if (in.channels != ch_) throw std::runtime_error("DsdRateConverter::copy_bits channel mismatch");
+        if (sinkStream_ != &out) { sinkStream_ = &out; align_sink(out); }
+        // process_bits appends. Replacing the destination here silently discarded
+        // every earlier chunk when convert_dsd_stream took the Direct branch.
+        for (int c = 0; c < ch_; ++c) {
+            if ((outBits_ & 7) == 0) {
+                const size_t start = (size_t)outBits_ / 8;
+                const size_t bytes = (size_t)((in.bits + 7) / 8);
+                out.data[(size_t)c].resize(start + bytes);
+                std::copy_n(in.data[(size_t)c].begin(), bytes, out.data[(size_t)c].begin() + start);
+            } else {
+                for (uint64_t n = 0; n < in.bits; ++n)
+                    put_bit((uint64_t)outBits_ + n, (size_t)c,
+                            ((in.data[(size_t)c][(size_t)(n >> 3)] >> (7 - (n & 7))) & 1u) != 0);
+            }
+        }
+        outBits_ += (long long)in.bits;
+        out.bits = (uint64_t)outBits_;
         st_.outBits = outBits_;
     }
 
@@ -487,6 +588,8 @@ private:
     long long outBits_ = 0;
     rta::audio::DsdStream* sinkStream_ = nullptr;
     DsdRateStats st_;
+    size_t skipLeft_ = 0;
+    bool headConfigured_ = false, finished_ = false, dsdInput_ = false;
     std::vector<std::unique_ptr<DsdDecimator>> dec_;
     std::unique_ptr<PolyphaseResampler> rs_;
     std::vector<std::unique_ptr<SdmModulator>> mod_;
@@ -546,7 +649,10 @@ inline DsdConvertResult convert_dsd_stream(const rta::audio::DsdStream& in, uint
         const auto t_s0 = std::chrono::steady_clock::now();
         r.srcPeak = dsd_convert_measure_peak(in, plan, cfg);
         r.scanMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_s0).count();
-        const double hd = sdm_headroom_db(r.srcPeak);   // 既有档位：target 0.62 / margin 0.2
+        // ★ 2026-10-31：按**目标 DSD 位率**取经验工作峰值（DSD64 用 0.45，DSD128+ 用 0.62），
+        //   否则 DSD64 输出会落在稳定边界上（见 modulator.h 的 sdm_target_peak 注释）。
+        const double targetFs = (double)plan.dstRate;
+        const double hd = sdm_headroom_db_for_fs(r.srcPeak, targetFs);
         conv.set_pre_atten_db(hd);
         r.headroomDb = conv.gain_db();
     } else {

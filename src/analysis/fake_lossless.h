@@ -61,10 +61,14 @@ namespace rta::analysis {
 //                 （依据：320k MP3 实测 19979 Hz = 0.906×Nyq @44.1k，正落此档；
 //                   库内 98 首 18~20 kHz 被旧的绝对门 20500 一刀切成"有损"，改档后不再判假）
 //   3 证据不足 —— 素材过短（谱窗填充 <50%）或置信度擦线（0.40~0.50）：不给确定结论
+//   4 源本身有损 —— 源文件容器本身为有损格式（如 .mp3/.aac 等）。与前四档并列，但本质是
+//                   「问题不适用」而非第五种"证据强度"：假无损问题讨论的是有损内容转制进无损容器，
+//                   源本身即有损时不存在被欺骗的前提，故直接判定不适用且不判假（不猜疑）。
 constexpr int kFakeVerdictNone       = 0;
 constexpr int kFakeVerdictLossy      = 1;
 constexpr int kFakeVerdictBandLimited = 2;
 constexpr int kFakeVerdictInconclusive = 3;
+constexpr int kFakeVerdictSourceLossy = 4;
 
 struct LosslessCheck {
     bool   suspected = false;   // 疑似有损源转制（假无损）⟺ fakeVerdict == kFakeVerdictLossy

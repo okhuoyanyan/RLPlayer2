@@ -12,6 +12,7 @@
 // 关键性质：**零延迟**。H[0] 与"当前"输入块相乘，其贡献立刻出现在本块输出的
 // 前 B 个样本里，尾巴进溢出缓冲。不需要额外的一整块缓冲延迟。
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include "fft.h"
 #include <vector>
 #include <cmath>

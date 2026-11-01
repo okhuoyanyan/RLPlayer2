@@ -49,7 +49,7 @@ var ADV = {
   // 输出后端与多声道
   // 261024-01 #9/#11：upnpDev = UPnP/DLNA 渲染器（设备描述 URL）；naaHost 自动发现填，
   // 手动框只是折叠兜底（用户原话：NAA 端点这个选项不应该出现，应该自动获取）。
-  backend: 'wasapi', channels: 0, naaHost: '127.0.0.1:43210', upnpDev: '',
+  backend: 'wasapi', channels: 0, upnpDev: '',
   trim0: 0, trim1: 0, trim2: 0, trim3: 0, trim4: 0, trim5: 0, trim6: 0, trim7: 0,
   // 输入
   inBackend: 'none', inDev: '', inOffset: 0, inBuf: 100, inMonitor: 0, inSeconds: 0, inOut: '',
@@ -82,6 +82,191 @@ var SEP = String.fromCharCode(92);
   try { t = localStorage.getItem('rta-theme'); } catch (e) { }
   if (t === 'light' || t === 'blue') document.documentElement.dataset.theme = t;
 })();
+
+/* ---------------- 界面多语言（i18n，2026-10-30 用户 261029-03） ----------------
+   为什么用「中文原文当键」而不是给每个字面量改成 t("key")：
+     本仓 UI 有 1 万多个中文字面量（ui_page.h + ui_script.h），逐处替换等于重写界面，
+     而且任何一处漏改都会在切换语言时露出中文。改成「渲染后替换文本节点」：
+       · 语言包 = { 中文原文: 译文 }，来自 /api/i18n（后端读 data\i18n\<code>.json）；
+       · applyI18n(root) 遍历文本节点 + title/placeholder/aria-label/alt，命中就换掉；
+       · 原文记在 WeakMap 里，切语言时先按原文重算（否则第二次翻译会拿英文当中文查）；
+       · MutationObserver 监听 DOM 变化 —— 这个界面几乎全是 innerHTML 重建的，
+         不监听的话切页/换歌后新内容又会变回中文。
+   没命中的字符串保持中文（首批未覆盖的词条），这是有意的降级，不是 bug。 */
+var I18N = { lang: "zh", map: {}, orig: new WeakMap(), attrOrig: new WeakMap(), observer: null, timer: 0 };
+function i18nNorm(s) { return String(s == null ? "" : s).replace(/\s+/g, " ").trim(); }
+function t(s) { var k = i18nNorm(s); var m = I18N.map; return (m && m[k]) || s; }
+// 计数/拼装串的规则表（键以 ~ 开头的是正则，值是替换串，$1 取捕获组）。
+// 为什么需要它：界面上大量文本是 "共 6 首" "14 张专辑" 这种运行时拼的，
+// 整串当键永远查不到；把数字当通配符才能翻。规则同样放在语言包 JSON 里（数据驱动，
+// 加一条规则不用改 JS）。
+function i18nPatterns() {
+  if (I18N.pats) return I18N.pats;
+  I18N.pats = [];
+  var m = I18N.map || {};
+  for (var k in m) {
+    if (k.charAt(0) !== "~") continue;
+    try { I18N.pats.push([new RegExp(k.slice(1)), m[k]]); } catch (e) { }
+  }
+  return I18N.pats;
+}
+function i18nByPattern(s) {
+  var ps = i18nPatterns();
+  for (var i = 0; i < ps.length; i++) {
+    if (ps[i][0].test(s)) return s.replace(ps[i][0], ps[i][1]);
+  }
+  return null;
+}
+// ★ 2026-10-31（DEBUG-UI 报告 §三-1）：原列表漏了 `data-tip` ⟹ 设置页 43 处帮助浮层
+//   在外语界面下原样显示中文（属性不在扫描列表里，DOM 文本节点替换根本碰不到）。
+//   `data-tip` 必须一起进列表；同时 tipPlace() 里也要过 t()（见该函数）。
+function i18nAttrs() { return ["title", "placeholder", "aria-label", "alt", "data-tip"]; }
+function i18nNode(n) {
+  var o = n.nodeValue; if (!o) return;
+  var rec = I18N.orig.get(n);
+  // 值被程序改过（时钟/进度）⟹ 旧原文作废，重新记一份
+  if (!rec || rec.trans !== o) { rec = { orig: o, trans: null }; I18N.orig.set(n, rec); }
+  var key = i18nNorm(rec.orig); if (!key) return;
+  var tr = I18N.map[key];
+  // 2026-10-30：整串没命中时，按 " · " / " | " 拆开逐段译（实测界面上大量文本是
+  //   「未知艺术家 · 44.1k/16」「艺术家 · 年份 · 44.1k/16」这种拼装串，
+  //   整串永远查不到，拆开后至少能把「未知艺术家」这类词条译掉）。
+  if (!tr || tr === key) {
+    // 规则要拿**归一化后**的串去试：DOM 里 "年份 2011" 中间可能是不换行空格或换行，
+    // 直接对原始串跑正则永远不匹配（实测英文界面里这一条一直是中文）。
+    var byPat = i18nByPattern(key);
+    if (!byPat || byPat === key) byPat = i18nByPattern(String(rec.orig));
+    if (byPat && byPat !== rec.orig) {
+      rec.trans = byPat;
+      if (n.nodeValue !== byPat) n.nodeValue = byPat;
+      return;
+    }
+    var parts = String(rec.orig).split(/( \u00b7 | \| )/);
+    if (parts.length > 1) {
+      var changed = false, buf = "";
+      for (var pi = 0; pi < parts.length; pi++) {
+        var pk = i18nNorm(parts[pi]);
+        var pv = I18N.map[pk];
+        // 拆开的每一段同样要过一遍规则表：像「队列末尾 · 共 7 首」这种，
+        // 前半段是词条、后半段是计数串，只做精确查表会把后半段漏成中文。
+        if (!pv || pv === pk) { var pp = i18nByPattern(pk); if (!pp || pp === pk) pp = i18nByPattern(parts[pi]); if (pp && pp !== pk) pv = pp; }
+        if (pv && pv !== pk) { buf += pv; changed = true; }
+        else buf += parts[pi];
+      }
+      if (changed) {
+        var l0 = rec.orig.match(/^\s*/)[0], t0 = rec.orig.match(/\s*$/)[0];
+        var nv0 = l0 + buf + t0;
+        rec.trans = nv0;
+        if (n.nodeValue !== nv0) n.nodeValue = nv0;
+        return;
+      }
+    }
+    return;
+  }
+  var lead = rec.orig.match(/^\s*/)[0], tail = rec.orig.match(/\s*$/)[0];
+  var nv = lead + tr + tail;
+  rec.trans = nv;
+  if (n.nodeValue !== nv) n.nodeValue = nv;
+}
+function i18nEl(e) {
+  if (!e || e.nodeType !== 1) return;
+  var at = i18nAttrs();
+  var store = I18N.attrOrig.get(e); if (!store) { store = {}; I18N.attrOrig.set(e, store); }
+  for (var i = 0; i < at.length; i++) {
+    var a = at[i], v = e.getAttribute(a); if (!v) continue;
+    if (store[a] === undefined) store[a] = v;
+    var key = i18nNorm(store[a]), tr = I18N.map[key];
+    if (tr && tr !== key) { if (v !== tr) e.setAttribute(a, tr); }
+  }
+}
+function applyI18n(root) {
+  root = root || document.body; if (!root) return;
+  if (I18N.lang === "zh" && !Object.keys(I18N.map).length) return;
+  if (root.nodeType === 3) { i18nNode(root); return; }
+  i18nEl(root);
+  var w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, null);
+  var n = w.currentNode;
+  while (n) { if (n.nodeType === 3) i18nNode(n); else i18nEl(n); n = w.nextNode(); }
+}
+function i18nSchedule() {
+  if (!I18N.observer) return;
+  clearTimeout(I18N.timer);
+  I18N.timer = setTimeout(function () { applyI18n(document.body); }, 60);
+}
+function i18nWatch() {
+  if (I18N.observer || !window.MutationObserver) return;
+  I18N.observer = new MutationObserver(function (muts) {
+    for (var i = 0; i < muts.length; i++) {
+      var m = muts[i];
+      if (m.type === "childList" && m.addedNodes && m.addedNodes.length) {
+        for (var k = 0; k < m.addedNodes.length; k++) applyI18n(m.addedNodes[k]);
+      } else if (m.type === "characterData") { applyI18n(m.target); }
+    }
+    i18nSchedule();
+  });
+  I18N.observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+  // 兜底扫描：MutationObserver 只报"新增/改动"，但本界面有大量**预先渲染好、之后只切
+  // display** 的区块（单曲页的芯片就是），那些节点从来没有 DOM 变更事件 ⟹ 永远译不到
+  // （实测英文界面里「年份 2011」「专辑艺术家」一直是中文）。
+  // 每 1.5 s 全量扫一遍；单次遍历几千个节点约 1 ms，比漏译划算。
+  setInterval(function () {
+    if (I18N.lang && I18N.lang !== "zh") applyI18n(document.body);
+  }, 1500);
+}
+function i18nApplyRtl() {
+  var rtl = (I18N.lang === "ar");
+  document.documentElement.dir = rtl ? "rtl" : "ltr";
+  document.documentElement.lang = I18N.lang;
+}
+// 切语言前必须**先把译文还原成中文**，否则新语言包会把旧译文当成原文去查（永远查不到）。
+// 这是「用渲染结果当键」这套方案的唯一陷阱，必须显式处理。
+function i18nRestore(root) {
+  root = root || document.body; if (!root) return;
+  var w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, null);
+  var n = w.currentNode;
+  while (n) {
+    if (n.nodeType === 3) {
+      var rec = I18N.orig.get(n);
+      if (rec && rec.trans !== null && n.nodeValue === rec.trans) n.nodeValue = rec.orig;
+    } else {
+      var store = I18N.attrOrig.get(n);
+      if (store) {
+        var at = i18nAttrs();
+        for (var i = 0; i < at.length; i++) {
+          var a = at[i];
+          if (store[a] !== undefined) n.setAttribute(a, store[a]);
+        }
+      }
+    }
+    n = w.nextNode();
+  }
+}
+// 切语言：先按原文还原（把上次的译文换回中文），再套新包，最后整页重译。
+function i18nSetLang(code, persist) {
+  return apiGetRaw("/api/i18n?lang=" + encodeURIComponent(code || "auto")).then(function (j) {
+    i18nRestore(document.body);
+    I18N.lang = j.lang || "zh";
+    I18N.map = j.map || {};
+    I18N.orig = new WeakMap(); I18N.attrOrig = new WeakMap(); I18N.pats = null;
+    i18nApplyRtl();
+    applyI18n(document.body);
+    if (D("sp_uilang")) D("sp_uilang").value = code || "auto";
+    if (persist !== false) { ADV.uiLang = code || "auto"; saveSettings(true); }
+    return j;
+  });
+}
+function i18nBoot() {
+  return apiGetRaw("/api/i18n").then(function (j) {
+    I18N.lang = j.lang || "zh";
+    I18N.map = j.map || {};
+    I18N.pats = null;
+    i18nApplyRtl();
+    applyI18n(document.body);
+    i18nWatch();
+    if (D("sp_uilang") && j.setting) D("sp_uilang").value = j.setting;
+    return j;
+  }).catch(function () { /* 语言包拿不到就保持中文，不影响其它功能 */ });
+}
 
 function toast(m) {
   var t = D('toast'); if (!t) return;
@@ -204,16 +389,38 @@ function apiGetRaw(u) {
   });
 }
  
-function api(u, body) {
+// ★ 2026-10-29（两轮审查 F27）：非幂等动作**不许**自动重试。
+//
+// 缺陷：api() 把任何"非 4xx"的失败都当成"服务端肯定没执行"并原样重发一次。
+//   而 /api/skip、/api/qdel、/api/play、/api/sq/delete 这类端点一旦执行过就改变状态：
+//   请求送达、响应丢了（超时/连接被重置）时重发 ⟹ 切两首、删两条。实测（评审用原始
+//   api 函数 + 替身调度）：calls=2、index 0→2。
+//
+// 契约：
+//   · 只读请求（GET 语义）照旧重试 —— 重发不会改变任何状态；
+//   · 非幂等动作默认**不重试**，并把"结果未知"如实反馈给调用方（err.uncertain=true），
+//     由 UI 提示用户而不是替用户猜；
+//   · 需要重试时调用方显式传 {retry:true}（例如服务端已支持幂等键的场景）。
+function api(u, body, opts) {
+  var o = opts || {};
+  var idem = (o.idempotent === true) || (body === undefined || body === null);
   return apiRaw(u, body).catch(function (err) {
     if (err && err.status && err.status >= 400 && err.status < 500) {
       throw err;
+    }
+    if (!idem && o.retry !== true) {
+      // 结果未知：明确告诉调用方"可能已执行、可能没有"，绝不自动重放
+      var e2 = new Error((err && err.message ? err.message : "网络异常") + "（结果未知，请刷新确认）");
+      e2.uncertain = true;
+      throw e2;
     }
     return new Promise(function (res) { setTimeout(res, 200); }).then(function () {
       return apiRaw(u, body);
     });
   });
 }
+// 非幂等动作的显式入口：语义与 api(u, body) 相同，但"永不自动重试"是硬约定。
+function apiAct(u, body) { return api(u, body, { retry: false }); }
 
 function renderPanelError(viewName, retryFn, err) {
   if (S.view !== viewName) return;
@@ -228,6 +435,24 @@ function renderPanelError(viewName, retryFn, err) {
     };
   }
 }
+// 隐藏源控件是唯一保存值；设置页重建、切歌都复用它，避免策略只停留在界面上。
+function normalizeRateFamilyPolicy(value) {
+  return value === 'strict' || value === 'compatible' ? value : 'prefer';
+}
+function rateFamilyPolicyValue() {
+  return normalizeRateFamilyPolicy(D('sRateFamilyPolicy') && D('sRateFamilyPolicy').value);
+}
+function syncRateFamilyPolicy() {
+  var policy = rateFamilyPolicyValue();
+  if (D('sRateFamilyPolicy')) D('sRateFamilyPolicy').value = policy;
+  if (D('sp_rateFamilyPolicy')) D('sp_rateFamilyPolicy').value = policy;
+  var hint = D('sp_rateFamilyHint');
+  if (hint) hint.textContent = t(policy === 'strict'
+    ? '只允许源采样率同族输出，手动跨族目标也会拒绝。同族升降频仍是重采样，非逐位直通。'
+    : policy === 'compatible'
+    ? '自动档优先同族；设备没有可用同族档位时允许跨族回退。发生转换时显示重采样，非逐位直通。'
+    : '自动档只选择源采样率同族；手动指定跨族是你的主动选择，会保留目标并显示真实转换：重采样，非逐位直通。');
+}
 function params() {
   var dv = D('sDSD').value;              // 0 | dop64 | dop128 | dop256 | nat64 | nat128 | nat256
   var dsdN = 0, native = 0;
@@ -237,6 +462,7 @@ function params() {
   return 'dsd=' + dsdN + '&dsdnative=' + native +
          '&gpuvendor=' + ((D('sGpu') && D('sGpu').value) || 'auto') +
          '&rate=' + D('sRate').value +
+         '&rateFamilyPolicy=' + rateFamilyPolicyValue() +
          '&filter=' + encodeURIComponent(D('sFilt').value) +
          '&filterNx=' + encodeURIComponent(D('sFiltNx').value) +
          '&shaper=' + encodeURIComponent(D('sShap').value) +
@@ -245,7 +471,7 @@ function params() {
          // ReplayGain：off / track / album + 防削波（后端 decide() → cfg.replayGainDb）
          '&rgmode=' + (ADV.rgmode || 'off') + '&rgclip=' + (ADV.rgclip ? 1 : 0) +
          '&isp=' + (D('sIsp').checked ? 1 : 0) +
-         '&twostage=' + (D('s2s').checked ? 1 : 0) +
+         '&twostage=' + D('s2s').value +
          '&buffer=' + D('sBuf').value +
          '&modorder=' + (ADV.modorder || 5) +
           '&modfamily=' + encodeURIComponent(ADV.modfamily || 'dsd') +
@@ -266,7 +492,6 @@ function params() {
          '&ramp=' + (ADV.ramp || 0) +
          '&backend=' + encodeURIComponent(ADV.backend || 'wasapi') +
          '&channels=' + (ADV.channels || 0) +
-         '&naahost=' + encodeURIComponent(ADV.naaHost || '') +
          '&upnpdev=' + encodeURIComponent(ADV.upnpDev || '') +
          '&trim=' + [0, 1, 2, 3, 4, 5, 6, 7].map(function (i) { return ADV['trim' + i] || 0; }).join(',') +
          '&sdmfilt=' + encodeURIComponent(ADV.sdmFilt || '') +
@@ -614,7 +839,22 @@ function pollCoverProgress() {
       if (!g.running) {
         clearInterval(COVP.timer); COVP.timer = 0;
         if (el && g.done > 0) setTimeout(function () { el.style.display = 'none'; }, 2500);
-        if (g.hit > 0) { toast('封面已补齐 ' + g.hit + ' 张'); loadAlbums(); }
+        if (g.hit > 0) {
+          toast('封面已补齐 ' + g.hit + ' 张');
+          // Refresh only images in the current album grid. Reloading the library here
+          // steals tracks/artist/detail pages and discards the user's search/subset.
+          // No asynchronous list request means no later response can steal the view either.
+          if (S.view === 'albums') {
+            var stamp = String(Date.now());
+            Array.prototype.forEach.call(document.querySelectorAll('#list .card .cv img'), function (im) {
+              if (!im.getAttribute('src')) return;
+              var imageUrl = new URL(im.src, location.href);
+              imageUrl.searchParams.set('_cov', stamp);
+              im.style.display = ''; // A previous 404 hid the image; retry the completed cover.
+              im.src = imageUrl.href;
+            });
+          }
+        }
       }
     }).catch(function () { });
   }, 700);
@@ -659,6 +899,9 @@ function loadAlbums(q, title) {
       };
       e.oncontextmenu = function (ev) { ev.preventDefault(); enqueueAlbum(a.k); };
     });
+    // 2026-10-29（#2）：曲库渲染完就开始后台预热艺术家头像。
+    // 不放在 loadArtists 里，是因为用户可能一直在专辑页——那样头像永远不会被抓。
+    artaWarmSoon();
   }).catch(function (e) {
     renderPanelError('albums', function () { loadAlbums(q, title); }, e);
   });
@@ -758,9 +1001,34 @@ var EF_ORDER = {
 // 长文本标签：独占整行并保留换行（这些一定不是一格能装下的）
 // 只有"一定是一整段/一整列"的标签才独占整行；代表作品/合作这类是短列表，留在网格里更紧凑（信息密度）。
 var EF_WIDE = { '简介': 1, '专辑介绍': 1, '曲目列表': 1, '制作人员': 1, '歌词赏析': 1, '关联': 1, '衍生作品': 1, '版本说明': 1 };
+// 2026-10-29（管理员 261029-01 #4）：「曲目信息 AI 整理里有大量（AI 知识）标志，还加在正文里，请全部删除」。
+//   AI 可不可信应该由界面顶部那个 AI 标记统一表达，正文里再挂一遍纯属噪声。
+//   这里做**渲染期清洗**：即便后端缓存里还是旧提示词生成的脏内容，显示出来也干干净净。
+var AI_MARK_RE = /[（(]\s*(?:AI\s*知识|AI\s*推测|AI\s*推断|AI\s*整理|AI\s*补全|据推测|推测|存疑|待核实|未核实)\s*[)）]/gi;
+function stripAiMarks(s) {
+  s = String(s == null ? '' : s);
+  if (!s) return '';
+  var o = s.replace(AI_MARK_RE, '');
+  // 去掉标记后常留下「… 」或「…，」这类残渣，顺手收干净
+  o = o.replace(/[ \t]{2,}/g, ' ').replace(/[ \t]+([，。；、,;])/g, '$1');
+  return o.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
+}
+// 2026-10-29（#5）：「不同的名盘分行显示，不要只用『；』隔开」。
+//   列举型字段（≥3 段被分号隔开）拆成多行，每行一条；普通句子不动，避免把散文拆烂。
+function splitListValue(v) {
+  v = String(v == null ? '' : v);
+  if (!v) return [v];
+  if (v.indexOf('\n') >= 0) return v.split(/\n+/);
+  var parts = v.split(/[；;]/), out = [];
+  for (var i = 0; i < parts.length; ++i) {
+    var p = parts[i].replace(/^\s+|\s+$/g, '');
+    if (p) out.push(p);
+  }
+  return out.length >= 3 ? out : [v];
+}
 function efValueText(v) {
   if (v === null || v === undefined) return '';
-  if (typeof v === 'string') return v.replace(/\s+$/, '').replace(/^\s+/, '');
+  if (typeof v === 'string') return stripAiMarks(v.replace(/\s+$/, '').replace(/^\s+/, ''));
   if (typeof v === 'number' || typeof v === 'boolean') return String(v);
   if (Object.prototype.toString.call(v) === '[object Array]') {
     var out = [];
@@ -899,9 +1167,17 @@ function renderFieldGrid(fields, kind, opts) {
     var v = efValueText(fields[lb]);
     if (local[lb] !== undefined && local[lb] !== null && local[lb] !== '') v = efValueText(local[lb]);
     if (!v) return;                              // 空值 = 后端不知道 ⟹ 不占位
-    var wide = !!EF_WIDE[lb] || v.length > 46 || v.indexOf('\n') >= 0;
+    // 2026-10-29（#5）：列举型字段按分号拆行 → 每条一行，URL 逐行挂链接（linkify 必须在拆行后逐个做，
+    // 否则整段先转义会把 <br> 一起转义掉）。
+    var lines = splitListValue(v);
+    var vlHtml = '';
+    for (var li = 0; li < lines.length; ++li) {
+      if (li) vlHtml += '<br>';
+      vlHtml += linkifyEscaped(lines[li], opts && opts.links);
+    }
+    var wide = !!EF_WIDE[lb] || v.length > 46 || lines.length > 1;
     rows += '<div class="efrow' + (wide ? ' wide' : '') + '">' +
-            '<div class=lb>' + esc(lb) + '</div><div class=vl>' + linkifyEscaped(v, opts && opts.links) + '</div></div>';
+            '<div class=lb>' + esc(lb) + '</div><div class=vl>' + vlHtml + '</div></div>';
   });
   // 261024-02 #3：曲目列表用本地曲库逐行渲染（序号 / 曲名 / 时长三列对齐），不再用 AI 的一行文本。
   // 只有调用方真的传了本地曲目（opts.tracklist）才渲染；否则保留 AI 的文本版（并在末尾标注 AI 推测）。
@@ -1477,15 +1753,54 @@ var ARTAV = { total: 0, ok: 0, miss: 0, timer: 0, round: 0, gen: 0, queue: [], d
      · 失败按 0.9 s→8 s 退避重试，超过次数或总时限（150 s）才定案成「暂无图源」；
      · 进度 = 已定案（成功 + 确定没有）/ 总数 ⟹ 数字一直在动，且有明确终态。 */
 var ARTA_CONC = 6;                 // 同时最多 6 张（后端 WebUi 是 6 个 worker，再多只是排队）
-var ARTA_RETRIES = 40;             // 单张最多重试次数
+var ARTA_RETRIES = 4;      // 2026-10-29：后端有负缓存，缺图会稳定 404，重试 40 次纯属拖延             // 单张最多重试次数
 var ARTA_MAXWAIT_MS = 150000;      // 单页总时限：到点就如实收尾，不再无限转
 // 「多久没有新图落地就收尾」：冷缓存时预热还在供货（一张 1~3 s），不能过早判死；
 // 供货停了 25 s 就定案成「暂无图源」，进度条进入完成态（用户要求：失败也要有终态）。
-var ARTA_IDLE_MS = 25000;
+var ARTA_IDLE_MS = 8000;     // 2026-10-29：25 s 太久，用户看到的就是「卡在 114」
+// 2026-10-29（管理员反馈 261029-01 #1 #2）：头像进度条每次切页都重置、且卡在 112/128。
+//   根因：每进一次艺术家页 artaStart() 都把计数清零重跑，而「确实没有图源」的那十几位
+//   要走完 25 s 空闲判定才定案 ⟹ 观感就是「进度条归零 → 又卡在 112」。
+//   修法：把已定案的「无图源」记进内存负缓存 ARTA_MISS，重进页面直接出完成态，不再重跑。
+//   只有用户主动点「重试」才清空它，真去重新抓一遍。
+// 2026-10-29（管理员 261029-02 #1/#2 复测：仍然卡 114/128、切页仍重置）：
+//   上一版只加了「已定案无图源」的负缓存，但真因在别处：切页后 DOM 消失 ⟹ artaTick 里
+//   `if (!D('artProgWrap')) { artaStop(); return; }` 把泵停掉 ⟹ 那 14 张 pending **永远走不到定案**
+//   ⟹ 负缓存从来没被写入过 ⟹ 每次进来都从 0 重算、又卡在 114。
+//   本轮三处一起改：① 泵不再因切页而停；② 正/负缓存都持久化；③ 定案时间从 25 s 收到 8 s。
+var ARTA_MISS = {};   // name -> 1：已定案「没有图源」
+var ARTA_OK = {};     // name -> 1：已成功过（重进页面直接计 ok，不再从 0 重算）
 function artaStop() {
   if (ARTAV.timer) { clearInterval(ARTAV.timer); ARTAV.timer = 0; }
   ARTAV.gen++;
   ARTAV.queue = [];
+}
+
+// 2026-10-29（用户反馈 FB-20261028-CMGW7 #2）：
+//   「加载文件夹后，头像不会自动加载，非要我点击艺术家页面后才会启动加载。而且切换页面后，还会打断。」
+//   旧行为有两处问题：
+//     ① 预热只在 loadArtists() 里发 ⟹ 别的页面永远不会去抓；
+//     ② loadArtists() 开头就 artaStop() ⟹ 每次切页都把正在跑的泵掐掉，退回重来。
+//   修法：
+//     · 曲库就绪后就**后台预热一次**（与当前在哪个页面无关）；
+//     · 泵本身不再随页面切换而死 —— 页面离开只是没有 DOM 可画，泵继续把图喂进浏览器缓存，
+//       回来时直接命中，肉眼就是「一进艺术家页就有图」。
+var ARTA_BG = { started: 0, timer: 0 };
+
+// 后台预热：只发一次。失败不重试（后端自己有并发上限，重复发只是排队）。
+function artaWarmBackground() {
+  if (ARTA_BG.started) return;
+  ARTA_BG.started = 1;
+  api('/api/artist/prefetch').catch(function () { ARTA_BG.started = 0; });
+}
+
+// 曲库刚扫完/刚加载时调用：给它一点时间，别和首屏抢带宽。
+function artaWarmSoon() {
+  if (ARTA_BG.timer) return;
+  ARTA_BG.timer = setTimeout(function () {
+    ARTA_BG.timer = 0;
+    artaWarmBackground();
+  }, 3000);
 }
 function artaRender() {
   var box = D('artProgWrap');
@@ -1508,7 +1823,11 @@ function artaRender() {
                   '<span class=bar><i style="width:' + pct + '%"></i></span>' +
                   (done && ARTAV.miss ? '<button class="btn artagain" id=artAgain>重试</button>' : '') +
                   '</div>';
-  if (D('artAgain') && !D('artAgain').onclick) D('artAgain').onclick = function () { artaStart(); };
+  if (D('artAgain') && !D('artAgain').onclick) D('artAgain').onclick = function () {
+    // 用户主动重试：清掉负缓存，真去重新抓一遍（否则点了也还是那 112 位）
+    ARTA_MISS = {};
+    artaStart();
+  };
 }
 function artaSettle(st, ok) {
   if (st.state === 'ok' || st.state === 'miss') return;
@@ -1516,6 +1835,7 @@ function artaSettle(st, ok) {
     st.state = 'ok';
     st.im.classList.add('ok');
     st.im.classList.remove('err');
+    if (st.n) ARTA_OK[st.n] = 1;   // 记住成功过：重进页面直接计 ok，不再从 0 重算
     ARTAV.ok++;
     ARTAV.lastOkAt = Date.now();   // 有新图落地 ⟹ 供货还没停，别急着收尾
     artaRender();
@@ -1529,12 +1849,15 @@ function artaSettle(st, ok) {
   }
   st.state = 'miss';
   st.im.classList.add('err');
+  if (st.n) ARTA_MISS[st.n] = 1;    // 记入负缓存：下次进页面直接定案，见 #1/#2 注释
   ARTAV.miss++;
   artaRender();
 }
 function artaTick(gen) {
   if (gen !== ARTAV.gen) return;
-  if (!D('artProgWrap')) { artaStop(); return; }
+  // 2026-10-29（261029-02 #1/#2）：切页后 artProgWrap 不存在 —— 旧代码在这里 artaStop() 直接掐泵，
+  //   于是那十几张 pending 永远等不到「定案」，负缓存永远不写入，下次进来又从头跑一遍。
+  //   现在：没有 DOM 就只跳过渲染（artaRender 内部自带空判），**泵继续跑完定案**。
   var now = Date.now(), busy = 0, allDone = true;
   for (var i = 0; i < ARTAV.queue.length; i++) {
     var st = ARTAV.queue[i];
@@ -1551,6 +1874,10 @@ function artaTick(gen) {
       if (s3.state === 'ok' || s3.state === 'miss') continue;
       s3.state = 'miss';
       s3.im.classList.add('err');
+      // 2026-10-29（261029-02 #2 复测：切页后又回到「加载中 114/128」）：
+      //   定案分支**必须也写负缓存**，否则切页后 ARTAV 清零、负缓存还是空的，
+      //   于是又从头跑一遍再卡在同一个数字。上一版只写在 artaSettle 里，漏了这里。
+      if (s3.n) ARTA_MISS[s3.n] = 1;
       ARTAV.miss++;
     }
     if (ARTAV.timer) { clearInterval(ARTAV.timer); ARTAV.timer = 0; }
@@ -1583,8 +1910,30 @@ function artaStart() {
   ARTAV.lastOkAt = Date.now();
   var gen = ARTAV.gen;
   Array.prototype.forEach.call(imgs, function (im) {
-    var st = { im: im, n: im.getAttribute('data-n') || '', state: 'pending', tries: 0, due: 0 };
+    var nm = im.getAttribute('data-n') || '';
+    var st = { im: im, n: nm, state: 'pending', tries: 0, due: 0 };
     ARTAV.queue.push(st);
+    // #1/#2：上次已经定案「没有图源」的，直接判 miss —— 不再重走一遍退避等待，
+    // 这样重进页面时进度条立刻就是完成态，不会出现「从 0 重算再卡在 114」。
+    if (nm && ARTA_OK[nm]) {
+      st.state = 'ok';
+      im.classList.add('ok');
+      ARTAV.ok++;
+      // 图从浏览器缓存取；万一缓存被清/后端删了缓存，退回正常重试（不能让计数说谎）
+      im.onerror = function () {
+        if (gen !== ARTAV.gen) return;
+        delete ARTA_OK[nm];
+        setTimeout(function () { artaStart(); }, 0);
+      };
+      im.src = artistImgUrl(nm, 0);
+      return;
+    }
+    if (nm && ARTA_MISS[nm]) {
+      st.state = 'miss';
+      im.classList.add('err');
+      ARTAV.miss++;
+      return;
+    }
     im.onload = function () {
       if (gen !== ARTAV.gen) return;
       artaSettle(st, im.naturalWidth > 0);
@@ -1593,6 +1942,8 @@ function artaStart() {
   });
   artaRender();
   if (!ARTAV.total) return;
+  // 全都已定案（全部命中负缓存或本身没有 img）⟹ 不起泵，进度条直接停在完成态
+  if (ARTAV.ok + ARTAV.miss >= ARTAV.total) return;
   ARTAV.timer = setInterval(function () { artaTick(gen); }, 120);
   artaTick(gen);
 }
@@ -1615,14 +1966,16 @@ function artaPoll() { /* 轮询已被泵取代（见 artaStart）：保留空函
 function loadArtists(q) {
   S.view = 'artists';
   var kw = String(q || '').trim().toLowerCase();
-  artaStop();
+  // 2026-10-29：#2 不再在这里 artaStop() —— 切页就把泵掐掉是「切换页面还会打断」的根因。
+  // 预热也改成复用后台那一次（artaWarmBackground 自带去重）。
+  artaWarmBackground();
   head('艺术家', '加载中…', '');
   // 2026-10-26（261026-01 #1）：艺术家头像走外部源，但**抓取必须后台做** ——
   // WebUi 是单线程 accept，如果在图片请求里同步抓，246 个头像会把整站串行阻塞掉。
   // 这里只做一件事：告诉后端"开始预热这些名字"，图片端点本身只读缓存（未命中立刻 404）。
   // 2026-10-27（261027-03 #7）：预热照旧开跑，但**页面不再等它** —— 占位立刻渲染，
   // 图片由 artaStart() 的泵逐个喂（后端缓存命中的图几百毫秒内就到，缺图的按退避重试）。
-  api('/api/artist/prefetch').catch(function () {});
+  artaWarmBackground();   // 去重版（首次进艺术家页时后台可能已经在跑）
   api('/api/lib/albums').then(function (j) {
     var m = {}, order = [];
     (j.albums || []).forEach(function (a) {
@@ -3098,8 +3451,14 @@ function bpBadgeInfo() {
   if (bpv === 'direct') { t = 'BIT-PERFECT·1bit'; c = 'bp-direct'; title = title || 'DirectSDM：DSD 1-bit 直通，跳过 PCM 与调制'; }
   else if (!up) {
     if (bpv === 'yes') { t = 'bit-perfect'; c = 'bp-yes'; title = title || '不升频 · 0 dB · 无抖动/整形 · 无 EQ/IR'; }
+    // 2026-10-30：第四态。链路没改样本，但源本身有损（mp3/aac/ogg…）。
+    // 旧实现把它塞进 'no' ⟹ 用户看到"非 bit-perfect"就去改设置，怎么改都不变
+    // （实测：同一会话里 16bit WAV 报 yes、MP3 报 no，差别只在解码容器是 float32）。
+    else if (bpv === 'lossy') { t = '链路逐位·源有损'; c = 'bp-lossy'; title = title || '链路不改解码结果；源本身有损，无原始 PCM 可比'; }
     else if (bpv === 'no') { t = '非 bit-perfect'; c = 'bp-no'; title = title || '没有升频，但链路里有改动（原因见信号链）'; }
-    else { t = 'bit'; c = 'bp-no'; title = title || '直通，但没有拿到后端的 bit-perfect 结论'; }
+    // 2026-10-29（261029-01 #11）：探测不到就**不显示**，绝不落成红色的「非 bit-perfect」。
+  else if (bpv === 'unknown') { t = ''; c = 'bp-unknown'; title = title || '无法判定：渲染器未声明能力，本机不做猜测'; }
+  else { t = 'bit'; c = 'bp-no'; title = title || '直通，但没有拿到后端的 bit-perfect 结论'; }
   } else if (dsdOut) {
     t = srcDsd ? 'DSD-DSD 升频' : 'PCM-DSD 升频';
     c = 'bp-up'; title = title || (srcDsd ? 'DSD 源 → 更高 DSD 档（经解码 + 重新调制）' : 'PCM 源 → DSD（SDM 调制）');
@@ -3199,9 +3558,11 @@ function tick() {
     // 配色与显隐交给 CSS（三套主题各有一套颜色），这里不写死颜色、也不占中间列。
     if (D('bpBadge')) {
       var bi = bpBadgeInfo();
+      // #11：unknown 时 text 为空 ⟹ 整个徽标收起（不给错误结论）
       D('bpBadge').textContent = bi.text;
       D('bpBadge').className = bi.cls;
       D('bpBadge').title = bi.title;
+      D('bpBadge').style.display = bi.text ? '' : 'none';
     }
     if (j.error) D('nps').textContent = j.error;
     syncAlbPlayAllBtn();
@@ -3209,7 +3570,7 @@ function tick() {
 }
 
 /* ---------------- 播放设置持久化 ---------------- */
-var SET_KEYS = [['sRate','rate'], ['sFilt','filter'], ['sFiltNx','filterNx'], ['sShap','shaper'],
+var SET_KEYS = [['sRate','rate'], ['sRateFamilyPolicy','rateFamilyPolicy'], ['sFilt','filter'], ['sFiltNx','filterNx'], ['sShap','shaper'],
                 ['sDSD','dsd'], ['sBuf','buffer'], ['sIsp','isp'], ['s2s','twostage'], ['sGpu','gpuvendor']];
 function saveSettings(immediate) {
   var body = '';
@@ -3226,6 +3587,8 @@ function saveSettings(immediate) {
   // 2026-10-28：模块总开关也要落盘，否则重启后又冒出来。
   body += '&anlmaster=' + (ANL.master ? 1 : 0);
   body += '&theme=' + encodeURIComponent(S.theme || 'dark');
+  // 2026-10-30（用户 261029-03 #1/#3）：界面语言（conf 键 uilang；"auto" = 跟随系统）
+  body += '&uilang=' + encodeURIComponent(ADV.uiLang || 'auto');
   body += '&device=' + encodeURIComponent(ADV.device || '') + '&bits=' + (ADV.bits || 0)
         + '&taps=' + (ADV.taps || 0) + '&atten=' + (ADV.atten || 0)
         + '&transition=' + (ADV.transition || 0) + '&phase=' + encodeURIComponent(ADV.phase || '')
@@ -3237,7 +3600,6 @@ function saveSettings(immediate) {
         + '&ramp=' + (ADV.ramp || 0)
         + '&backend=' + encodeURIComponent(ADV.backend || 'wasapi')
         + '&channels=' + (ADV.channels || 0)
-        + '&naahost=' + encodeURIComponent(ADV.naaHost || '')
         + '&upnpdev=' + encodeURIComponent(ADV.upnpDev || '')
         + '&trim=' + [0, 1, 2, 3, 4, 5, 6, 7].map(function (i) { return ADV['trim' + i] || 0; }).join(',')
         + '&inbackend=' + encodeURIComponent(ADV.inBackend || 'none')
@@ -3277,6 +3639,13 @@ function loadSettings() {
   // 导致这里 kv 恒空 —— 设置控件全停在默认值，而 saveSettings() 又会把默认值写回 conf。
   apiGetRaw('/api/settings').then(function (j) {
     var kv = j.kv || {};
+    // 2026-10-30（用户 261029-03 #1/#3）：界面语言必须在**碰任何 DOM 之前**落定 ——
+    //   它是"界面能不能看懂"的前提，而本函数后面有一批裸 D(...) 调用（元素不在就抛 TypeError，
+    //   整个 .then 会从那一行中断，见下方 anlmaster 事故链）。放这里，任何后续错误都带不偏它。
+    if (kv.uilang !== undefined) {
+      ADV.uiLang = kv.uilang || 'auto';
+      if (D('sp_uilang')) D('sp_uilang').value = ADV.uiLang;
+    }
     // 2026-10-28（P0，真机定位）：**先落这两个开关，再碰任何 DOM**。
     //   事故链：本函数中间有一批「裸 D(...)」调用，例如
     //     3298: if (kv.loudness !== undefined) { D('sLoud').checked = ... }
@@ -3301,14 +3670,23 @@ function loadSettings() {
       if (e.type === 'checkbox') e.checked = (kv[p[1]] === '1');
       else e.value = kv[p[1]];
     });
+    // 老配置缺字段或无效枚举均使用同族优先；加载不回写用户配置。
+    if (D('sRateFamilyPolicy')) D('sRateFamilyPolicy').value = normalizeRateFamilyPolicy(kv.rateFamilyPolicy);
+    syncRateFamilyPolicy();
     // ---- 老用户配置迁移（功能1 的红线：不许悄悄改老用户行为）----
-    // 只有 conf 里【完全没有 rate 键】时才用新默认（follow）：
+    // 只有 conf 里【完全没有 rate 键】时才用新默认（**src 源采样率直通**）：
     //   老用户 conf 通常有 rate=max → kv.rate 有值 → 上面 SET_KEYS 已把它写回 <select>，
     //   所以 TA 的行为一点没变（继续按"设备最高"播，直到自己改）。
-    //   全新安装没有 conf → kv.rate 缺失 → 保持 HTML 第一项 follow。
+    //   全新安装没有 conf → kv.rate 缺失 → 用 src。
+    //
+    // ★ 2026-10-30（261030-01 D-17）：新默认由 follow 改为 src。
+    //   D-17 原文：「软件默认 = 源采样率直通（不滤波）；升频默认 = poly-sinc-short-lp」。
+    //   follow 在「源 44.1k + 系统混音 48k」时必然重采样 ⟹ 默认就破坏逐位直通，与 D-17 冲突。
+    //   2026-10-22 那个坑是「默认 max 会挑 384k 导致独占不出声」，src 不会挑设备最高率，
+    //   设备不支持源率时由 rate_pick.h 降级 —— 两个问题不是同一个。
     // 注意：这里【只改 DOM 初值，不立刻 saveSettings】，避免读到旧 conf 就回写。
     if (kv.rate === undefined) {
-      if (D('sRate')) D('sRate').value = 'follow';
+      if (D('sRate')) D('sRate').value = 'src';
     }
     // 2026-10-28：这两行原本是「裸 D(...)」，元素不存在时抛 TypeError 会把整个 .then 打断
     //   （上面注释里那条事故链就是它们触发的）。加判空，缺元素时只跳过 UI 同步，不影响状态。
@@ -3342,7 +3720,7 @@ function loadSettings() {
     if (kv.gpuvendor !== undefined) { ADV.gpuvendor = kv.gpuvendor || 'auto'; if (D('sGpu')) D('sGpu').value = ADV.gpuvendor; }
     if (kv.backend !== undefined) ADV.backend = kv.backend || 'wasapi';
     if (kv.channels !== undefined) ADV.channels = parseInt(kv.channels, 10) || 0;
-    if (kv.naahost !== undefined) ADV.naaHost = kv.naahost || '127.0.0.1:43210';
+    // naahost：NAA 已删除（261024-05）。老 conf 里有这行也直接忽略，不读进状态、不回写。
     if (kv.upnpdev !== undefined) ADV.upnpDev = kv.upnpdev || '';
     if (kv.trim !== undefined) {
       var tv = String(kv.trim).split(',');
@@ -3414,6 +3792,7 @@ function loadSettings() {
           if (e.type === 'checkbox') e.checked = (v === '1');
           else e.value = v;
         });
+        syncRateFamilyPolicy();
         // 这两个不在 SET_KEYS 里（它们由 ANL 状态机单独维护）
         var cm = D('sp_anlmaster'); if (cm) cm.checked = !!ANL.master;
         var ca = D('sp_autoanl');   if (ca) ca.checked = !!ANL.auto;
@@ -3624,7 +4003,7 @@ function loadRates() {
     var max = list[list.length - 1];
     var sel = D('sRate');
     Array.prototype.forEach.call(sel.options, function (o) {
-      if (o.value === 'max') { o.textContent = '\u81ea\u52a8\uff08\u8bbe\u5907\u6700\u9ad8 ' + max + '\uff09'; return; }
+      if (o.value === 'max') { o.textContent = t('自动（按族策略选最高）'); o.title = t('设备最高支持') + ' ' + max + ' Hz'; return; }
       // ★ 'follow' 必须在这里 return：它是枚举值、不是数字。漏掉这一条会让它
       //   掉进下面的 parseInt 分支（parseInt('follow') = NaN）⟹ 判为"设备不支持"
       //   ⟹ o.disabled=true 且 sel.value 被强制改成 'max'，于是"跟随系统"永远选不上。
@@ -3929,7 +4308,29 @@ function setView(v) {
   if (typeof searchTimer !== 'undefined' && searchTimer) { clearTimeout(searchTimer); searchTimer = 0; }
   // 作品页入口收进单曲页后，仍在内部使用 works 视图；离开 works 时清掉"从正在播放返回"的标记
   if (v !== 'works') S.worksFrom = '';
-  Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
+  // 设置页里「用户正在写、但重渲染会丢」的输入做快照/还原。
+// 为什么只认 text/textarea：select 与 checkbox 的真相在 ADV/S 状态里，重渲染本就应该按状态重建；
+// 如果把它们也快照回去，反而会出现「设置改了但控件显示旧值」的新 bug。
+var SET_DRAFT_IDS = ['sp_fbtitle', 'sp_fbbody', 'sp_fbsteps'];
+
+function settingsDraftSnapshot() {
+  var out = {};
+  for (var i = 0; i < SET_DRAFT_IDS.length; i++) {
+    var el = D(SET_DRAFT_IDS[i]);
+    if (el && typeof el.value === 'string' && el.value !== '') out[SET_DRAFT_IDS[i]] = el.value;
+  }
+  return out;
+}
+
+function settingsDraftRestore(snap) {
+  if (!snap) return;
+  for (var k in snap) {
+    if (!Object.prototype.hasOwnProperty.call(snap, k)) continue;
+    var el = D(k);
+    if (el) el.value = snap[k];
+  }
+}
+Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
     var on = e.dataset.v === v || (v === 'artist' && e.dataset.v === 'artists') || (v === 'work' && e.dataset.v === 'works');
     // #6：保存的队列是左栏的**二级条目**，只能亮当前那一个（否则所有 sqrow 会一起高亮）
     if (e.dataset.sq) on = (v === 'sq' && e.dataset.sq === S.sqName);
@@ -3949,7 +4350,17 @@ function setView(v) {
   // 不再依赖「上一个视图是什么」。
   if (D('list')) D('list').style.display = isSet ? 'none' : '';
   if (!isSet && D('scanbar')) D('scanbar').style.display = S.scanning ? '' : 'none';
-  if (isSet) { head('设置', '所有参数都在这里，改完点「保存」', ''); renderSettingsPage(); }
+  if (isSet) {
+    // 2026-10-29（用户反馈 FB-20261028-CMGW7 #1：「诊断这里，一旦切出去重新切回来，之前写的内容就不见了」）：
+    //   根因就是下面这句 renderSettingsPage() —— 它把 #setpage 整个 innerHTML 换掉，
+    //   输入框全部重建 ⟹ 用户填了一半的反馈内容清零。
+    //   修法：进页面前把「用户在编辑、且不会被设置值覆盖」的输入做一次快照，渲染完原样填回。
+    //   只快照**文本类**控件（input/textarea），不碰 select/checkbox —— 那些本来就该由设置值决定。
+    var snap = settingsDraftSnapshot();
+    head('设置', '所有参数都在这里，改完点「保存」', '');
+    renderSettingsPage();
+    settingsDraftRestore(snap);
+  }
   else if (D('scanbar')) D('scanbar').style.display = S.scanning ? '' : 'none';
 }
 
@@ -4157,7 +4568,7 @@ D('vol').oninput = function () {
 };
 D('sLoud').onchange = function () { S.loud = this.checked; saveSettings(); };
 // 参数类控件改动后自动落盘（下次启动还在）
-['sRate','sFilt','sFiltNx','sShap','sDSD','sIsp','s2s','sBuf'].forEach(function (id) {
+['sRate','sRateFamilyPolicy','sFilt','sFiltNx','sShap','sDSD','sIsp','s2s','sBuf'].forEach(function (id) {
   var e = D(id); if (!e) return;
   e.addEventListener('change', saveSettings);
 });
@@ -4505,6 +4916,8 @@ function showChain() {
       var label, color, icon;
       if (bp === 'direct') { label = 'BIT-PERFECT · 1-bit 直通'; color = '#a78bfa'; icon = '\u25c6'; }
       else if (bp === 'yes') { label = 'BIT-PERFECT'; color = '#34d399'; icon = '\u2713'; }
+      // 2026-10-30：第四态（链路逐位但源有损）—— 与 'no' 分开，否则用户会一直去调设置。
+      else if (bp === 'lossy') { label = '链路逐位 · 源本身有损'; color = '#38bdf8'; icon = '\u25cf'; }
       else if (bp === 'no') { label = '非 bit-perfect'; color = '#fbbf24'; icon = '!'; }
       else { label = 'BIT-PERFECT 状态未知'; color = '#94a3b8'; icon = '?'; }
       nodes.push({ k: icon + ' ' + label, v: why || '（本次未记录）', _bp: bp, _color: color });
@@ -4568,6 +4981,7 @@ function showChain() {
     }
     // 原生 DSD 失败回落 DoP：原因原样显示，绝不让用户以为这一曲是原生 DSD
     if (p.dsdFallback) nodes.push({ k: 'DoP 回落', v: p.dsdFallback });
+    if (p.modFallback) nodes.push({ k: 'DSD 实际处理说明', v: p.modFallback });
     if (p.preAtten && p.preAtten < 0) {
       nodes.push({ k: '峰值保护', v: '检测到过采样峰值 ' + (p.ispPeak * 100).toFixed(1) + '%（' + p.ispOver +
         ' 个点超出满幅）→ 预衰减 ' + p.preAtten.toFixed(1) + ' dB' });
@@ -4660,8 +5074,10 @@ function tipLayer() {
 }
 function tipPlace(el) {
   var L = tipLayer(); if (!L || !el) return;
-  var t = el.getAttribute('data-tip') || '';
-  if (L.textContent !== t) L.textContent = t;
+  // 属性里的原文是中文，浮层用 textContent 直接注入 ⟹ 必须显式过一遍 t()（ui_script.h:98），
+  // 否则 data-tip 就算进了 i18nAttrs 也只是把属性值换了、浮层还是旧值。
+  var tipText = t(el.getAttribute('data-tip') || '');
+  if (L.textContent !== tipText) L.textContent = tipText;
   L.classList.add('on');                       // 先上屏才能量到尺寸
   var side = document.querySelector('.side');
   var sr = side ? side.getBoundingClientRect() : null;
@@ -5152,7 +5568,12 @@ function discoverNaa() { clearTimeout(_naaPollTimer); /* 已删除 */ }
 // 声道微调**全都不参与**（投放按源文件原采样率供源，不经本机 DSP）。这些字段直接隐藏，而不是
 // 置灰摆着 —— 用户已反馈设置页控件/文本太多（261024-01 #7），没用就别占地方。
 // 注意：字段仍保留在 DOM 里（display:none），collectSettings / saveSettings 照旧读得到值。
-var _UPNP_IRRELEVANT = ['sp_device', 'sp_rate', 'sp_bits', 'sp_ch', 'sp_buffer', 'sp_ramp', 'sp_outmode'];
+// 2026-10-29（管理员反馈 261029-01 #10：「设置-PCM中，输出格式的设置选项不见了！」）：
+//   真因：backend=upnp 时这里连 sp_rate / sp_bits 一起隐藏，而「输出格式（PCM）」那一组只有这两个字段
+//   ⟹ sgroup 标题还在、字段全没了，看起来就是一个空框，用户以为功能被删了。
+//   采样率/位深是 **PCM 链路属性**（切回 WASAPI 立刻生效），跟当前后端无关，不该隐藏。
+//   仍然隐藏的这几项确实只对本机输出有意义（选设备/声道/缓冲/渐变/输出模式）。
+var _UPNP_IRRELEVANT = ['sp_device', 'sp_ch', 'sp_buffer', 'sp_ramp', 'sp_outmode'];
 function _setFieldVisible(id, on) {
   var e = D(id);
   if (!e) return;
@@ -5170,6 +5591,26 @@ function applyBackendState() {
   // #4（261026-09）：切换后端会改变"有效声道数"（共享 = 设备混音声道数；独占 = 设置项），
   // 所以这里也要重画一次微调网格，否则切到共享后行数还停留在 2。
   if (typeof repaintTrims === 'function' && D('sp_trimchmsg')) repaintTrims();
+  _collapseEmptySgroups();
+}
+
+// 2026-10-29（#10 的兜底）：某个 .sgroup 里的 .sfld 如果全被隐藏，就把整组一起收掉。
+// 为什么需要：sgroup 的标题是独立渲染的，字段被 display:none 后标题仍占位 ⟹ 出现"只有标题的空框"，
+// 用户会以为功能消失（这正是 #10 的现象）。按组收敛，比逐个字段打补丁更不容易再犯。
+function _collapseEmptySgroups() {
+  var page = D('setpage');
+  if (!page) return;
+  Array.prototype.forEach.call(page.querySelectorAll('.sgroup'), function (g) {
+    var body = g.querySelector('.sgbody');
+    if (!body) return;
+    var fields = body.querySelectorAll('.sfld');
+    if (!fields.length) return;                  // 没有字段的组（纯说明）不动
+    var anyVisible = false;
+    for (var i = 0; i < fields.length; i++) {
+      if (fields[i].style.display !== 'none') { anyVisible = true; break; }
+    }
+    g.style.display = anyVisible ? '' : 'none';
+  });
 }
 
 // 261024-02 #5：推送区块的控件绑定（旧版"填文件路径 + DoP 勾选 + 开始投放"已按用户要求删掉，
@@ -5261,6 +5702,17 @@ function pollCastState(once) {
               || (D('npPage') && D('npPage').classList.contains('on'))
               || (CAST.state && CAST.state.running);
   api('/api/cast/state').then(function (st) {
+    // 2026-10-29（#9 的连带）：投放失败后把后端回退，否则 ADV.backend 一直停在 upnp，
+    // 用户之后每次播放都会再走一次注定失败的投放（表现为「点了没反应 / 又自动暂停」）。
+    if (st && st.running) CAST.wasRunning = true;
+    else if (CAST.wasRunning && st && st.phase === 'error') {
+      CAST.wasRunning = false;
+      if (ADV.backend === 'upnp') {
+        ADV.backend = CAST.prevBackend || 'wasapi';
+        saveSettings();
+        toast('投放失败：' + (st.error || '未知原因') + '，已回到本机输出');
+      }
+    }
     applyCastUi(st);
     if (!once && wantLoop) _castPollTimer = setTimeout(function () { pollCastState(); }, 1000);
   }).catch(function () {
@@ -5301,7 +5753,7 @@ function npPickCastDevice(cb) {
   }).catch(function () { toast('设备发现失败（/api/cast/devices 无响应）'); cb(null); });
 }
 // 推送：落盘 backend=upnp + upnpdev，再按新参数重放当前曲
-function castPush(file) {
+function castPush(file, devOverride) {
   file = file || S.lastCur || '';
   if (!file) { toast('当前没有可推送的曲目'); return; }
   if (/^https?:/i.test(file)) { toast('网络曲目暂不支持投放'); return; }
@@ -5315,7 +5767,7 @@ function castPush(file) {
     toast('已推送到 ' + castDevNameOf(dev));
     pollCastState(true);
   };
-  var dev = (ADV.upnpDev || '').trim();
+  var dev = (devOverride || ADV.upnpDev || '').trim();
   if (dev) go(dev);
   else npPickCastDevice(function (d) { if (d) go(d); });
 }
@@ -5332,8 +5784,12 @@ function castStop() {
   }).catch(function () { toast('停止投放失败'); });
 }
 function castToggle() {
-  if (castRunning()) castStop();
-  else castPush(S.lastCur);
+  if (castRunning()) { castStop(); return; }
+  // 2026-10-29（管理员 261029-02 #3）：「点击推流按钮，仍然没有看到弹框选择推流对象。
+  //   我确实在主页看到了一个推流对象选择，但是推流按钮是在单曲页面的，你在外面搞一个对象选择有什么用？」
+  //   ⟹ 单曲页这个按钮**必须先让用户当场选设备**再推，不能沿用别处记忆的 upnpDev 直接推。
+  //   （设置-流媒体页的推送区块有自己的下拉，那条路径仍走 castPush(file) 的旧逻辑。）
+  npPickCastDevice(function (d) { if (d) castPush(S.lastCur, d); });
 }
 function npCastBtnHtml() {
   return '';
@@ -5417,7 +5873,9 @@ function sgroup(title, hint, body) {
 var FILTER_PHASES = null;      // name -> {phase, phaseName, taps}
 var FILTER_PHASES_WANT = 0;    // 还没到就记下，到了再补渲染
 function loadFilterPhases() {
-  return api('/api/filters').then(function (j) {
+  // 261030-01 规格 v2.1：带源参数取真相源（fs=源采样率，content=真实内容边缘）。
+  // 1x 路径按 CD（44.1k / 内容 20 kHz）算；Nx 路径另有一份（见 loadFilterPhasesNx）。
+  return api('/api/filters?fs=44100&content=20000').then(function (j) {
     if (!j || !j.ok || !j.items) return;
     FILTER_PHASES = {};
     j.items.forEach(function (it) { FILTER_PHASES[it.name] = it; });
@@ -5441,7 +5899,22 @@ function bindPhaseHint() {
     ? ({ linear: '线性相位', minimum: '最小相位', intermediate: '混合相位' }[override] || override)
     : it.phaseName;
   // 2026-10-24 #7：一行说清「预设 / 实际」，不再展开解释什么叫覆盖。
-  msg.textContent = '预设 ' + it.phaseName + '（抽头 ' + it.taps + '）· 实际输出 ' + actual + (override ? '（强制覆盖）' : '');
+  // 261030-01 规格 v2.1（D-13 / D-16）：名字后面挂「抑制 @ 预振铃」两个数字。
+  // 后端 preset_metrics() 是唯一真相源，前端不重算规则（否则必然漂移）。
+  var metrics = (typeof it.ceilingDb === 'number') ? (' · 目标抑制 ' + it.ceilingDb + ' dB') : '';
+  if (it.ringMeasured && typeof it.ringMs === 'number') {
+    metrics += ' · 峰前包络 ' + it.ringMs.toFixed(2) + ' ms（相对峰值 −60 dB；参考 '
+      + (it.ringReferenceInRate / 1000) + ' → ' + (it.ringReferenceOutRate / 1000)
+      + ' kHz，PCM 预设；不是群延迟）';
+  }
+  var tapTxt = (typeof it.T === 'number' && it.T > 0) ? ('（T=' + it.T + '）') : ('（抽头 ' + it.taps + '）');
+  // 261030-01：这行是运行时拼装串，i18n 的「文本节点整串匹配」抓不到 ⟹ 直接走 t()。
+  // 数字与单位（dB / ms / T=）语言无关，不进字典。
+  // ★ 2026-10-31（§7.4 L1）：选了「自动」时，先说清它到底解析成了哪个预设 ——
+  //   否则用户只看到「预设 线性相位」却不知道该预设叫什么。resolved 由后端给，前端不硬编码。
+  var autoPrefix = it.resolved ? (t('自动') + ' → ' + it.resolved + ' · ') : '';
+  msg.textContent = autoPrefix + t('预设') + ' ' + t(it.phaseName) + metrics + tapTxt
+    + ' · ' + t('实际输出') + ' ' + t(actual) + (override ? '（' + t('强制覆盖') + '）' : '');
 }
 
 // ---- 功能4（用户 2026-10-22）：DeepSeek API Key 的界面入口 ----
@@ -5747,11 +6220,18 @@ function applyPresetControls(applied, profile) {
   if (!applied || typeof applied !== 'object') return;
 
   var r = applied.rate !== undefined ? applied.rate : applied.sRate;
-  if (r === undefined && profile === 'bitperfect') r = 'follow';
+  // 2026-10-29（261029-02 新功能1）：原音直通必须「保持源采样率」才可能 bit-perfect。
+  //   旧值 'follow' 的真实语义是「跟随系统混音率」（rate_pick.h:113），
+  //   源 48k + 声卡默认 44.1k 时会重采样 ⟹ 永远不 bit-perfect。
+  if (r === undefined && profile === 'bitperfect') r = 'src';
   if (r !== undefined) {
     setSelectValue(D('sRate'), r);
     setSelectValue(D('sp_rate'), r);
   }
+  if (applied.rateFamilyPolicy !== undefined && D('sRateFamilyPolicy')) {
+    D('sRateFamilyPolicy').value = normalizeRateFamilyPolicy(applied.rateFamilyPolicy);
+  }
+  syncRateFamilyPolicy();
 
   var f = applied.filter !== undefined ? applied.filter : applied.sFilt;
   if (f !== undefined) {
@@ -5810,9 +6290,10 @@ function applyPresetControls(applied, profile) {
 
   var s2s = applied.twostage !== undefined ? applied.twostage : applied.s2s;
   if (s2s !== undefined) {
-    var s2sBool = (s2s === true || s2s === 1 || s2s === '1');
-    if (D('s2s')) D('s2s').checked = s2sBool;
-    if (D('sp_2s')) D('sp_2s').checked = s2sBool;
+    var s2sMode = (s2s === true || s2s === 1 || s2s === '1') ? '1'
+                : (s2s === false || s2s === 0 || s2s === '0') ? '0' : 'auto';
+    if (D('s2s')) D('s2s').value = s2sMode;
+    if (D('sp_2s')) D('sp_2s').value = s2sMode;
   }
 
   if (applied.backend !== undefined) {
@@ -6020,7 +6501,10 @@ function renderSettingsPage() {
      // 它们是 PCM 链路的属性（DSD 恒 1 bit、速率在 SDM 页），放在「输出」页里会让人以为
      // 输出页没有 SDM 的内容。id 不变（sRate/sBits），只挪 DOM 位置，保存/读取逻辑零改动。
      + sgroup('输出格式（PCM）', 'DSD 输出用 SDM 页的档位，这里只影响 PCM 链路',
-         sel('sp_rate', '输出采样率', D('sRate').innerHTML, '自动 = 所选设备的最高采样率')
+         sel('sp_rate', '输出采样率', D('sRate').innerHTML, '自动 = 按采样率族策略选择设备支持的最高档位；同族指 44.1 kHz 系列或 48 kHz 系列')
+       + sel('sp_rateFamilyPolicy', '采样率族策略', D('sRateFamilyPolicy').innerHTML,
+             '同族优先：自动档只选源族，手动目标保留明确选择；严格同族：手动跨族也拒绝；兼容重采样：允许自动跨族回退。')
+       + '<div class="sfld wide"><div class=hint id=sp_rateFamilyHint></div></div>'
        + sel('sp_bits', '输出位深（PCM）',
              opt(0, '24 bit', ADV.bits) + opt(16, '16 bit', ADV.bits) + opt(32, '32 bit', ADV.bits),
              'DSD 输出恒为 1 bit，此项只在 PCM 模式生效'))
@@ -6032,9 +6516,9 @@ function renderSettingsPage() {
              opt('', '跟随预设（用所选滤波器自带的相位）', ADV.phase) +
              opt('linear', '强制线性相位', ADV.phase) +
              opt('minimum', '强制最小相位', ADV.phase) +
-             opt('intermediate', '强制混合相位（线性/最小 各 50%）', ADV.phase),
+             opt('intermediate', '强制混合相位', ADV.phase),
              '「跟随预设」= 不覆盖滤波器自带相位。强制项会覆盖预设：' +
-             '线性 = 无相位失真、有前振铃；最小 = 无预振铃、群延迟低；混合 = 两者按 50:50 叠加（幅频不变）')
+             '线性：各频率延迟一致；最小：能量更靠前；混合：组合线性与最小相位响应。强制覆盖会改变滤波器，预设测量值仅供参考。')
        + '<div class="sfld wide"><div class=hint id=sp_phasemsg></div></div>'
        + num({ id: 'sp_taps', label: '原型抽头数（0 = 按预设自动）' }, ADV.taps, 0, 2097152, 1024,
              '多相分解后每一相的抽头数 ≈ 抽头数 ÷ 升频比；0 = 用所选滤波器预设自带长度')
@@ -6042,7 +6526,9 @@ function renderSettingsPage() {
              '目标阻带深度；实际能不能达到还要看抽头数')
        + num({ id: 'sp_transition', label: '过渡带占比（0 = 用预设）' }, ADV.transition, 0, 0.45, 0.005,
              '截止点相对理想奈奎斯特回退的比例，例如 0.04 = 回退 4%')
-       + chk('sp_2s', '两段式升频', D('s2s').checked, '大比率时 CPU 运算量约 1/4'))
+       + sel('sp_2s', '两段式升频',
+             opt('auto', '自动（推荐）', D('s2s').value) + opt('1', '开启', D('s2s').value) + opt('0', '关闭', D('s2s').value),
+             '自动：PCM 按滤波器预设，DSD 使用级联。开启或关闭会覆盖自动选择。'))
      + sgroup('抖动与保护', '按采样率自动重标定',
          sel('sp_shaper', '抖动 / 噪声整形', shaps, 'auto = 按输出位深自动选型')
        + chk('sp_isp', '过采样峰值保护（ISP）', D('sIsp').checked, '检测到插值峰值超满幅时预衰减'))
@@ -6064,7 +6550,7 @@ function renderSettingsPage() {
              opt('dop', 'DoP（WASAPI / ASIO 均可）', dsdPackOf()) +
              opt('nat', 'Native（仅 ASIO）', dsdPackOf()),
              '两者数值等价，差别只在传输方式；Native 走 ASIO 原生 DSD（1-bit 直送驱动）。' +
-             '前提：后端 ASIO、源为 DSD、音量 0 dB、无 EQ / 卷积 / 升频，否则会明确报错；' +
+             '前提：后端 ASIO、源为 DSD、音量 0 dB、无 EQ / 卷积；支持设备可用的同族整数倍率转换；同位率未转换时可 bit-perfect，转换后非 bit-perfect；' +
              '驱动拒绝原生 DSD 时自动回落 DoP，并在信号链里标出')
        // 2026-10-24（用户 261024-01 #12）：这两个控件不再灰掉（见 applyDsdState）。
        // 当前输出是 PCM 时，改这里会自动把输出模式联动到 DSD —— 一句常驻说明交代清楚。
@@ -6144,6 +6630,19 @@ function renderSettingsPage() {
      + sgroup('外观',
          '<div class=sfld><label>主题' + tip('顶栏右侧的小圆点也可以快速切换主题') + '</label><select id=sp_theme>'
        + opt('dark', '深色（默认）', S.theme) + opt('light', '白色', S.theme) + opt('blue', '浅蓝色', S.theme)
+       + '</select></div>'
+       // 2026-10-30（用户 261029-03 第 1/2/3 条）：界面语言。
+       // 「跟随系统」是默认值：后端按 Windows 显示语言（GetUserDefaultUILanguage）解析，
+       // 换一台机器不用改设置。首批 7 种；没译到的词条回落中文（见 i18n 注释）。
+       + '<div class=sfld><label>界面语言' + tip('默认「跟随系统」：按 Windows 的显示语言自动选择。切换立即生效并写入设置。没翻译到的词条保持中文。') + '</label><select id=sp_uilang>'
+       + opt('auto', '跟随系统（默认）', ADV.uiLang || 'auto')
+       + opt('zh', '中文', ADV.uiLang || 'auto')
+       + opt('en', 'English', ADV.uiLang || 'auto')
+       + opt('ja', '日本語', ADV.uiLang || 'auto')
+       + opt('fr', 'Français', ADV.uiLang || 'auto')
+       + opt('ru', 'Русский', ADV.uiLang || 'auto')
+       + opt('es', 'Español', ADV.uiLang || 'auto')
+       + opt('ar', 'العربية', ADV.uiLang || 'auto')
        + '</select></div>')
      + sgroup('GPU',
          sel('sp_gpu', 'GPU 后端',
@@ -6281,7 +6780,12 @@ function renderSettingsPage() {
        + '<textarea id=sp_fbsteps rows=3 placeholder="1. … 2. … 3. …" style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--field);color:var(--txt);font-size:12px;font-family:inherit;line-height:1.5;resize:vertical"></textarea></div>'
        + '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
        + '<button class="btn pri" id=sp_fbsubmit>提交反馈</button>'
+       + '<button class="btn" id=sp_fbpreview>先看会发送什么</button>'
        + '<span style="font-size:11.5px;color:var(--mut2)" id=sp_fbmsg></span></div>'
+       // 预览框与结果区放在 flex 行之外，各自整行，避免被挤成两列
+       + '<div id=sp_fbpreviewbox style="display:none;width:100%;box-sizing:border-box;margin-top:12px;padding:14px 16px;border-radius:10px;'
+       + 'background:rgba(107,138,253,.07);border:1px solid rgba(107,138,253,.22);font-size:12.5px;line-height:1.9;'
+       + 'color:var(--mut);word-break:break-word"></div>'
        + '<div class=hint id=sp_fbresult style="white-space:pre-wrap;word-break:break-all"></div>')
      + '</div>';
 
@@ -6300,7 +6804,7 @@ function renderSettingsPage() {
        + '更新只替换<b>程序文件</b>（RLPlayer.exe / rtaweb.exe / rtagpu*.dll / tools / 其余代码资产），'
        + '每个文件都校验 sha256。下面这些<b>一个字节都不会改</b>：'
        + 'rlplayer-settings.conf · rlplayer-library.conf · rlplayer-llm.conf · rlplayer-feedback.conf · '
-       + 'rlplayer-queue.txt · rlplayer-savedqueues.conf · rlplayer-favs.json · data\\（库索引/封面缓存/房间校正集） · '
+       + 'rlplayer-playlist.txt · rlplayer-savedqueues.conf · rlplayer-favs.json · data\\（库索引/封面缓存/房间校正集） · '
        + 'covercache\\ · WebView2Runtime\\ · playlists\\。'
        + '</div>'
        + '<div class="sfld wide" id=sp_updcard style="display:none;margin-top:14px">'
@@ -6420,7 +6924,7 @@ function renderSettingsPage() {
   // #5（261026-09）：sp_rep / sp_shuf 已删（见 sgroup('播放') 处的逐项核对），
   // 这里只剩还活着的镜像对。
   [['sp_filt', 'sFilt'], ['sp_filtNx', 'sFiltNx'], ['sp_shaper', 'sShap'],
-   ['sp_rate', 'sRate'], ['sp_buffer', 'sBuf'],
+   ['sp_rate', 'sRate'], ['sp_rateFamilyPolicy', 'sRateFamilyPolicy'], ['sp_buffer', 'sBuf'],
    ['sp_loud', 'sLoud'], ['sp_isp', 'sIsp'], ['sp_2s', 's2s']].forEach(function (pair) {
     var a = D(pair[0]), b = D(pair[1]);
     if (!a || !b) return;
@@ -6431,6 +6935,12 @@ function renderSettingsPage() {
       }
     } else { a.value = b.value; }
   });
+  syncRateFamilyPolicy();
+  if (D('sp_rateFamilyPolicy')) D('sp_rateFamilyPolicy').onchange = function () {
+    D('sRateFamilyPolicy').value = normalizeRateFamilyPolicy(this.value);
+    syncRateFamilyPolicy();
+    saveSettings();
+  };
   // #5（261026-09）：sp_shuf 兼容壳已删除（没有任何外部入口，也没有自检依赖它）。
   // 播放模式的唯一真相源仍是隐藏源控件 #sRep + 底栏 #bRep / 单曲页 #npRep。
 
@@ -6471,6 +6981,12 @@ function renderSettingsPage() {
     };
   });
 
+  // 2026-10-30（用户 261029-03）：界面语言切换（立即生效 + 落盘）
+  if (D('sp_uilang')) D('sp_uilang').onchange = function () {
+    var v = this.value || 'auto';
+    ADV.uiLang = v;
+    i18nSetLang(v, true);
+  };
   // 输出后端 / 声道 / 微调
   D('sp_backend').onchange = function () {
     ADV.backend = this.value;
@@ -6591,6 +7107,9 @@ function renderSettingsPage() {
   // exportDiagZip / exportDiag 两个函数仍保留（未来若要在别处挂入口可直接复用），这里不再绑定。
   // 一键反馈（261027-01 #1）：提交按钮 + 回车即交（在标题框里按 Enter 不提交空表单）
   if (D('sp_fbsubmit')) D('sp_fbsubmit').onclick = fbSubmit;
+  // 2026-10-28：提交前预览。让用户先看清这一条会带出去哪些东西 ——
+  // 这是本地软件敢让终端用户直接点提交的前提。
+  if (D('sp_fbpreview')) D('sp_fbpreview').onclick = fbPreview;
   // 关于与更新（261027-02 #5）：按钮 + 初始状态（进入设置页就把当前版本刷出来）
   updBind();
   if (D('sp_fbtitle')) D('sp_fbtitle').addEventListener('keydown', function (ev) {
@@ -6703,9 +7222,9 @@ function renderSettingsPage() {
     var m = D('sp_asiomsg'); if (!m) return;
     // 2026-10-24 #7：驱动清单收进 title，页面只留结论。
     // 2026-10-24（原生 DSD 接入）：Native DSD 已接通 ASIO 原生通道，这里只交代前提。
-    // 判据与后端 native_dsd_precheck() 一致（后端 ASIO / 源 DSD / 音量 0 dB / 无 PCM 处理 / 不升频）。
+    // 后端 ASIO / 源 DSD / 音量 0 dB / 无 PCM 处理；同族整数倍率转换还需设备接受目标位率。
     m.textContent = d.length
-      ? ('本机 ASIO 驱动 ' + d.length + ' 个 · Native DSD 可用（需后端 ASIO、源为 DSD、音量 0 dB、无 EQ / 卷积、采样率跟随源；驱动拒绝时回落 DoP）')
+      ? ('本机 ASIO 驱动 ' + d.length + ' 个 · Native DSD 需后端 ASIO、源为 DSD、音量 0 dB、无 EQ / 卷积；支持设备可用的同族整数倍率转换，同位率未转换时可 bit-perfect，转换后非 bit-perfect；驱动拒绝时回落 DoP')
       : '本机未检测到 ASIO 驱动 · Native DSD 不可用（DoP 仍可用）';
     m.title = d.length ? d.join('、') : '';
   }).catch(function () { });
@@ -6717,7 +7236,7 @@ function renderSettingsPage() {
   D('sp_reset').onclick = function () {
     if (!confirm('把所有参数恢复成默认值？')) return;
     ADV = { device: '', bits: 0, taps: 0, atten: 0, transition: 0, phase: '', modcut: 0, moddith: -1, ir: '', irgpu: 0, ramp: 0, theme: S.theme, modorder: 5, modfamily: 'dsd', directsdm: 0, dsdKind: 'fir', dsdConv: 'narrow',
-            backend: 'wasapi', channels: 0, naaHost: '127.0.0.1:43210',
+            backend: 'wasapi', channels: 0,
             inBackend: 'none', inDev: '', inOffset: 0, inBuf: 100, inMonitor: 0, inSeconds: 0, inOut: '',
             rgmode: 'off', rgclip: 1, autoAnl: 1 };
     // 元数据两键的默认：自动补全开；AI 增强关（联网计费项默认关，避免「恢复默认」反而产生费用）。
@@ -6727,8 +7246,8 @@ function renderSettingsPage() {
     // 261027-04 #4：「恢复默认」也要把自动分析恢复成「开」（ADV.autoAnl 与 ANL.auto 是同一个值的两份视图）
     ANL.auto = 1; ANL.autoDone = '';
     if (D('sp_autoanl')) D('sp_autoanl').checked = true;
-    D('sRate').value = 'max'; D('sFiltNx').value = ''; D('sShap').value = 'auto';
-    D('sBuf').value = 100; D('sDSD').value = 0; D('sIsp').checked = true; D('s2s').checked = true;
+    D('sRate').value = 'src'; D('sRateFamilyPolicy').value = 'prefer'; D('sFiltNx').value = ''; D('sShap').value = 'auto';
+    D('sBuf').value = 100; D('sDSD').value = 0; D('sIsp').checked = true; D('s2s').value = 'auto';
     saveSettings(); renderSettingsPage(); toast('已恢复默认');
   };
   D('sp_theme').onchange = function () { setTheme(this.value); };
@@ -7027,6 +7546,86 @@ function opraSectionHtml() {
         都是"用测量数据去校准这套回放系统"。
    命名理由（也是核对结论）：EQ 页的 PEQ/OPRA 是**手调**，校准页的全是**测量/外部文件导入**；
    原来那两个文件分组核实后**确实都是校正文件**（REW 一种软件能同时导出这两种，见下面的组标题）。 */
+/* ---------------- 测量麦克风校准（2026-10-29 261029-02 新功能2） ----------------
+   数据源：GET /api/miccal · POST /api/miccal（path= 或 name=+content=）· POST /api/miccal/clear
+   为什么走上传而不是让用户填路径：浏览器 <input type=file> 拿不到本地绝对路径，
+   让用户手抄路径对普通用户等于不可用。 */
+function micCalPaint(j) {
+  var nm = D('micCalName'), rg = D('micCalRange'), cr = D('micCalCorr');
+  var sub = D('micCalSub'), hint = D('micCalHint');
+  if (!nm) return;
+  if (!j || !j.ok || !j.present) {
+    nm.textContent = '未导入';
+    if (rg) rg.textContent = '-';
+    if (cr) cr.textContent = '-';
+    if (sub) sub.textContent = '没有校准文件时，测到的房间响应会带上麦克风自身的误差';
+    if (hint) hint.textContent = (j && j.error)
+      ? ('读取失败：' + j.error)
+      : '未导入校准文件：测量仍可进行，但结果会包含麦克风自身误差。';
+    return;
+  }
+  nm.textContent = j.name || '（已导入）';
+  if (sub) sub.textContent = j.path || '';
+  if (rg) rg.textContent = (j.minHz && j.maxHz)
+    ? (Math.round(j.minHz) + ' – ' + Math.round(j.maxHz) + ' Hz') : '-';
+  if (cr) {
+    var a = (typeof j.minDb === 'number') ? j.minDb.toFixed(2) : '-';
+    var b = (typeof j.maxDb === 'number') ? j.maxDb.toFixed(2) : '-';
+    cr.textContent = (j.points || 0) + ' 个点 · ' + a + ' ~ ' + b + ' dB';
+  }
+  if (hint) hint.textContent = '已导入：房间测量会按这条曲线扣除麦克风频响（只补偿幅度，相位不变）。';
+}
+function micCalLoad() {
+  if (!D('micCalName')) return;
+  // 2026-10-29：必须用 GET。api() 默认是 POST，而 /api/miccal 的 POST 是「导入」，
+  //   拿它读状态会被后端判成「缺少 path/content」⟹ 界面永远显示未导入 + 一行错误。
+  fetch('/api/miccal').then(function (r) { return r.json(); }).then(micCalPaint).catch(function () {
+    if (D('micCalHint')) D('micCalHint').textContent = '读取校准状态失败（/api/miccal 无响应）';
+  });
+}
+function micCalImportText(name, text) {
+  var msg = D('sp_miccal_msg');
+  if (msg) msg.textContent = '正在导入…';
+  fetch('/api/miccal', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'name=' + encodeURIComponent(name) + '&content=' + encodeURIComponent(text)
+  }).then(function (r) { return r.json(); }).then(function (j) {
+    if (!j || !j.ok) {
+      if (msg) msg.textContent = '导入失败：' + ((j && j.error) || '未知原因');
+      toast('校准文件导入失败');
+      return;
+    }
+    if (msg) msg.textContent = '';
+    toast('已导入校准：' + (j.name || '') + '（' + (j.points || 0) + ' 点）');
+    micCalPaint(j);
+  }).catch(function (e) {
+    if (msg) msg.textContent = '导入失败：' + (e && e.message ? e.message : '网络错误');
+  });
+}
+function micCalBind() {
+  var f = D('sp_miccal_file'), pick = D('sp_miccal_pick'), clr = D('sp_miccal_clear');
+  if (pick && f) pick.onclick = function () { f.value = ''; f.click(); };
+  if (f) f.onchange = function () {
+    var file = f.files && f.files[0];
+    if (!file) return;
+    if (file.size > 4 * 1024 * 1024) { toast('校准文件超过 4 MB，拒绝导入'); return; }
+    var fr = new FileReader();
+    fr.onload = function () { micCalImportText(file.name, String(fr.result || '')); };
+    fr.onerror = function () { toast('读取文件失败'); };
+    fr.readAsText(file);
+  };
+  if (clr) clr.onclick = function () {
+    var msg = D('sp_miccal_msg');
+    if (msg) msg.textContent = '';
+    api('/api/miccal/clear', '').then(function () {
+      toast('已清除麦克风校准');
+      micCalLoad();
+    }).catch(function () { toast('清除失败'); });
+  };
+  micCalLoad();
+}
+
 function calSettingsHtml() {
   var h = '';
 
@@ -7037,7 +7636,28 @@ function calSettingsHtml() {
   //   所以「预览」角标与「不会真的出声」的免责声明全部移除 —— 留着就是在骗用户。
   //   铁律 1 不变：向导最后一步必须弹授权横幅（设备名 / 时长 / 电平 / 会盖过系统声音）并要用户点确认，
   //   默认电平 −20 dBFS（MeasurementSession 缺省），不做任何放大。
-  h += '<div id=roomCorrCard>' + sgroup('房间校正（测量向导）', 'Farina 对数扫频 → 反卷积 → 心理声学平滑 → 目标曲线 → 最小相位校正 FIR · 多声道 2.0~7.1.4',
+  // 2026-10-29（管理员 261029-02 新功能2）：「设置-声音校准，缺少导入校正麦克风曲线功能，
+//   有一部分出厂校准的麦克风是自带校准文件的。」
+//   UMIK-1 / UMIK-2 / EMM-6 这类测量麦出厂带一份频响校准文件（频率 Hz + dB，可带相位）。
+//   房间测量测到的是「房间 + 麦克风」的合成响应，必须扣掉麦克风自身频响，否则校正结果带着麦克风的误差。
+//   放在房间校正**上面**：它是测量的前提条件，先有校准麦才谈得上准。
+h += sgroup('测量麦克风校准', '导入麦克风出厂校准文件（.txt / .csv），房间测量时自动扣除麦克风自身频响',
+    '<div class="sfld wide"><div class=in-stat-grid style="grid-template-columns:repeat(auto-fit,minmax(250px,1fr))">'
+  + '<div class=in-stat-item><span class=lbl>当前校准曲线</span><span class="val sm" id=micCalName>未导入</span>'
+  + '<div class=rcsub id=micCalSub>没有校准文件时，测到的房间响应会带上麦克风自身的误差</div></div>'
+  + '<div class=in-stat-item><span class=lbl>覆盖范围</span><span class="val sm" id=micCalRange>-</span>'
+  + '<div class=rcsub id=micCalCorr>-</div></div>'
+  + '</div></div>'
+  + '<div class="sfld wide" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
+  + '<input type=file id=sp_miccal_file accept=".txt,.csv,.cal,text/plain" style="display:none">'
+  + '<button class="btn pri" id=sp_miccal_pick type=button>选择校准文件…</button>'
+  + '<button class=btn id=sp_miccal_clear type=button>清除</button>'
+  + '<span class=hint id=sp_miccal_msg style="margin:0"></span></div>'
+  + '<div class="sfld wide"><div class=rcnote>支持两列（频率 Hz、dB）或三列（第三列相位，忽略）；'
+  + '常见来源：miniDSP UMIK-1 / UMIK-2、Dayton EMM-6、REW 导出的校准文件。'
+  + '校准只影响<strong>测量与校正生成</strong>，不改变播放链路。</div></div>')
+  + '<div class="sfld wide"><div class=rcnote id=micCalHint>正在读取当前校准状态…</div></div>';
+h += '<div id=roomCorrCard>' + sgroup('房间校正（测量向导）', 'Farina 对数扫频 → 反卷积 → 心理声学平滑 → 目标曲线 → 最小相位校正 FIR · 多声道 2.0~7.1.4',
       '<div class="sfld wide"><div class="in-stat-grid" style="grid-template-columns:repeat(auto-fit,minmax(250px,1fr))">'
     + '<div class=in-stat-item><span class=lbl>算法版本</span><span class="val sm">C1 算法 + C2 测量编排</span>' +
       '<div class=rcsub>room_correction.h · room_measurement.h · room_transport_wasapi.h</div></div>'
@@ -7341,6 +7961,8 @@ function rcWizClose() {
 }
 function initRoomCorr() {
   if (D('bRoomWiz')) D('bRoomWiz').onclick = rcWizOpen;
+  // 2026-10-29（261029-02 新功能2）：测量麦克风校准卡的绑定与状态刷新
+  micCalBind();
   // 下载校正集（261026-06）：直接给下载链接，浏览器原生下载，不走 fetch
   if (D('bRoomDl')) D('bRoomDl').onclick = function () {
     var lg = (RCW.layout || '2.0');
@@ -8501,6 +9123,13 @@ function anlFakeLine(h) {
   if (v === 'band_limited') {
     return { t: '有效带宽受限 ' + cut + ' kHz · 母带低通/升频，不判假', c: '' };
   }
+  // 2026-10-30：第五档「源本身有损」。它回答的是"问题不适用"，不是"证据不足"：
+  // 假无损的定义是【有损内容被转制进无损容器】，源本身就是 mp3 时不存在这个前提。
+  // 实测（天门 - レトロスペクティブ京都.mp3）：cutoff 15.4 kHz、置信度 0.42 ⟹ 旧实现给
+  // "证据不足"，用户完全无从判断；现在直接说清"它是 mp3，不用查"。
+  if (v === 'source_lossy') {
+    return { t: '源本身是有损格式 · 不存在假无损问题' + (cut ? '（截止 ' + cut + ' kHz 仅供参考）' : ''), c: '' };
+  }
   if (v === 'unclear') {
     if (fill < 0.5) return { t: '证据不足 · 素材过短（' + durTxt + '），不构成判据', c: 'mut' };
     return { t: '证据不足 · 置信度 ' + conf + '% < 50%，检出 ' + (cut || '?') + ' kHz', c: 'mut' };
@@ -8901,15 +9530,15 @@ function anlSyncCtl(has) {
           ANL_LVLS[lvl] + '</span>';
   if (lvl > 0) {
     h += '<button class=npanal-btn id=npAnlFold title="收起一级（' +
-         (lvl === 2 ? '回到指标格' : '收起回摘要') + '）">\u25B4 收起</button>';
+         (lvl === 2 ? '回到指标格' : '收起回摘要') + '）">\u25BE 收起</button>';
   }
   if (lvl < 2) {
     h += '<button class=npanal-btn id=npAnlMore title="' +
          (lvl === 0 ? '展开：三块 + 2×2 指标格' : '再展开：全部原始指标（19 项 + 判定依据）') + '">' +
-         (lvl === 0 ? '\u25BE 展开' : '\u25BE 展开全部') + '</button>';
+         (lvl === 0 ? '\u25B4 展开' : '\u25B4 展开全部') + '</button>';
   }
   if (lvl === 2) {
-    h += '<button class=npanal-btn id=npAnlMin title="直接折叠回摘要（L0）">\u23F6 全部收起</button>';
+    h += '<button class=npanal-btn id=npAnlMin title="直接折叠回摘要（L0）">\u23F7 全部收起</button>';
   }
   bar.innerHTML = h;
   var b;
@@ -9324,6 +9953,57 @@ function updBind() {
 // 返回的七个字段全部原样列出：uploaded / status / path / sha / local / error / message。
 // 无凭据时 uploaded=false 且 local=<本地绝对路径> —— 界面必须显示它，否则用户以为反馈丢了。
 // ============================================================================
+// 预览：把「会发送的」与「不会发送的」两栏摊开给用户看。
+// 数据来自后端 /api/feedback/preview —— 它走的正是提交时那个 build_payload()，
+// 所以预览里报的日志行数、脱敏规则数就是提交时的真实值，不是另拼的假清单。
+function fbPreview() {
+  var box = D('sp_fbpreviewbox'), btn = D('sp_fbpreview'), msg = D('sp_fbmsg');
+  if (!box) return;
+  if (btn) btn.disabled = true;
+  if (msg) msg.textContent = '正在生成预览…';
+  var payload = {
+    type:  (D('sp_fbtype')  || {}).value || 'bug',
+    title: ((D('sp_fbtitle') || {}).value || '').trim(),
+    body:  ((D('sp_fbbody')  || {}).value || '').trim(),
+    steps: ((D('sp_fbsteps') || {}).value || '').trim()
+  };
+  fetch('/api/feedback/preview', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }).then(function (r) { return r.json(); }).then(function (j) {
+    if (btn) btn.disabled = false;
+    if (msg) msg.textContent = '';
+    if (!j || !j.ok) {
+      box.style.display = 'block';
+      box.textContent = '预览失败：' + ((j && j.error) || '未知原因');
+      return;
+    }
+    var L = [];
+    L.push('<b style="color:var(--fg)">会发送这些</b>');
+    L.push('· 你填的内容：类型「' + j.type_label + '」、标题、详细描述、复现步骤');
+    L.push('· 版本：RLPlayer ' + j.version + '（' + j.build + '）');
+    L.push('· 系统：' + j.os + ' · ' + j.cpu + ' · ' + j.cpu_threads + ' 线程 · 内存 ' + j.ram_total_mb + ' MB');
+    L.push('· 显卡：' + (j.gpu || '（未探测）'));
+    L.push('· 播放状态：' + (j.playing ? '正在播放' : '未播放') + ' · 后端 ' + (j.backend || '-'));
+    L.push('· 设置快照（' + j.settings_keys + ' 项）与输出端点');
+    L.push('· 日志尾：' + j.log_lines + ' 行 / ' + j.log_kb + ' KB（播放日志 + 启动日志）');
+    L.push('');
+    L.push('<b style="color:var(--fg)">不会发送</b>');
+    L.push('· 你的音乐文件、封面缓存、曲库索引');
+    L.push('· 已自动打码：API Key、token、密码、Authorization 头（共 ' + j.redaction_rules + ' 条规则）');
+    L.push('· 用户名统一替换为 &lt;user&gt;');
+    L.push('');
+    L.push('<span style="color:var(--mut2)">预览就是最终内容。确认无误再点「提交反馈」。</span>');
+    box.innerHTML = L.join('<br>');
+    box.style.display = 'block';
+  }).catch(function (e) {
+    if (btn) btn.disabled = false;
+    if (msg) msg.textContent = '';
+    box.style.display = 'block';
+    box.textContent = '预览失败：' + (e && e.message ? e.message : '网络错误');
+  });
+}
+
 function fbSubmit() {
   var msg = D('sp_fbmsg'), out = D('sp_fbresult'), btn = D('sp_fbsubmit');
   var payload = {
@@ -9352,7 +10032,23 @@ function fbSubmit() {
       'local:    ' + (j.local || '-'),
       'error:    ' + (j.error || '-')
     ];
-    if (out) out.textContent = lines.join('\n') + (j.message ? ('\n\n' + j.message) : '');
+    // 2026-10-28：技术字段照旧原样保留（排查要用），但在它上面先给一段人话结论。
+    var head = [];
+    if (j.uploaded) {
+      head.push('✅ 已提交成功' + (j.path ? ('，编号 ' + j.path) : ''));
+      head.push('我们能看到你填的内容和附带的诊断信息，不需要你再单独发日志。');
+      head.push('有回访时请带上这个编号。');
+    } else if (j.local) {
+      head.push('⚠️ 没有自动上传（本机未配置上传凭据），反馈已保存到：');
+      head.push('　' + j.local);
+      head.push('把这个文件发到 Q 群 895816505 即可，内容与自动上传的完全一样。');
+    } else {
+      head.push('❌ 提交失败' + (j.error ? ('：' + j.error) : ''));
+      head.push('可以重试，或把下方内容截图发到 Q 群 895816505。');
+    }
+    head.push('');
+    head.push('—— 技术细节（反馈给开发者时贴这段即可）——');
+    if (out) out.textContent = head.join('\n') + '\n' + lines.join('\n') + (j.message ? ('\n\n' + j.message) : '');
     if (msg) msg.textContent = j.uploaded ? '已上传，感谢反馈！' : (j.local ? '已存到本地（无上传凭据）' : '提交失败');
     toast(j.message || (j.uploaded ? '反馈已上传' : '反馈已保存到本地'));
   }).catch(function (e) {
@@ -9522,12 +10218,14 @@ function collectSettings() {
   // 同步回快捷面板
 
   D('sRate').value = D('sp_rate').value;
+  D('sRateFamilyPolicy').value = normalizeRateFamilyPolicy(D('sp_rateFamilyPolicy').value);
+  syncRateFamilyPolicy();
   D('sFilt').value = D('sp_filt').value;
   D('sFiltNx').value = D('sp_filtNx').value;
   D('sShap').value = D('sp_shaper').value;
   D('sBuf').value = D('sp_buffer').value;
   D('sIsp').checked = D('sp_isp').checked;
-  D('s2s').checked = D('sp_2s').checked;
+  D('s2s').value = D('sp_2s').value;
   // #5：设置页「播放模式」下拉已删 ⟹ 不再从它回写；#sRep 自己就是真相源（底栏按钮改的就是它）。
   D('sLoud').checked = D('sp_loud').checked;
   S.loud = D('sLoud').checked;
@@ -10113,11 +10811,18 @@ function npAiLoadedCount() {
 function npAiStateLine() {
   if (!npAiReady() && !NP_DATA.tabs.length) return '';
   var c = npAiLoadedCount();
-  if (c.busy > 0) return '整理中…' + (c.seg > 0 ? (' · 已 ' + c.seg + ' 段') : '');
-  if (c.ok > 0) return '已整理 · ' + c.seg + ' 段' + (c.err > 0 ? ' · 部分缺失' : '');
-  if (c.err > 0) return '暂无资料 · 点开重试';
-  if (!npAiReady()) return '未开启 AI 整理';
-  return '点开查看';
+  // 2026-10-29（管理员 261029-01 #3）：「你过分强调AI了，毫无必要。这里只需要显示『曲目信息』
+  //   『整理中...』这两行信息就行了，多余的字只会影响观感。」
+  //   ⟹ 状态行只保留「整理中…」与失败提示；『已整理 · N 段』『点开查看』这类多余描述全部去掉。
+  if (c.busy > 0) return '整理中…';
+  if (c.err > 0 && c.ok === 0) return '暂无资料 · 点开重试';
+  if (c.ok > 0) return '';
+  // 2026-10-29（FB-20261028-CMGW7 #4，用户：未开启AI整理不用显示在外面，点进去后提示在下面就行）：
+  //   未开启时不再往入口下面挂文字；入口按钮本身保留，点进去才看到提示。
+  if (!npAiReady()) return '';
+  // 2026-10-29（261029-02 #4）：『点开查看』也是多余的一行，去掉；
+  //   于是静态时卡片只有「曲目信息」一行，加载时多一行「整理中…」，正好两行。
+  return '';
 }
 function npAiEntryHtml() {
   var c = npAiLoadedCount();
@@ -10125,10 +10830,12 @@ function npAiEntryHtml() {
   var isOpen = (NP_DATA.active === 'all' && npDrawerIsOpen());
   var line = npAiStateLine();
   return '<button class="npchip npai' + cls + (isOpen ? ' on' : '') + '" id=npAiEntry' +
-         ' title="' + esc(isOpen ? '收起 AI 整理' : '展开 AI 整理（这首歌 · 专辑 · 艺术家 一起看）') + '"' +
+         ' title="' + esc(isOpen ? '收起曲目信息'
+             : (npAiReady() ? '展开曲目信息（这首歌 · 专辑 · 艺术家 一起看）'
+                             : '曲目信息未整理 —— 点开看怎么开启')) + '"' +
          ' style="justify-content:flex-start;gap:7px">' +
-         '<i class=dot></i><span style="flex:1;text-align:left">AI 资料</span>' +
-         '<span class=npai-arr><svg width=13 height=13 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2.4 stroke-linecap=round stroke-linejoin=round><path d="M6 9l6 6 6-6"/></svg></span>' +
+         // 2026-10-29（#3）：不再强调 AI —— 标题就写「曲目信息」，去掉彩色圆点与箭头（多余装饰）
+         '<span style="flex:1;text-align:left">曲目信息</span>' +
          '</button>' +
          (line ? '<div id=npAiSum style="font-size:10.5px;line-height:1.45;color:var(--mut2);padding:1px 2px 0">' +
                  esc(line) + '</div>' : '');
@@ -10407,7 +11114,8 @@ function npAiBodyHtml() {
   if (!shown) {
     return '<div class=npdhint>' + (npAiReady()
       ? '正在整理这首歌的资料…（内容框会自动刷新，不用再点）'
-      : '未开启 AI 整理 —— 在 设置 · 元数据 里打开「AI 增强」并填入 API Key') + '</div>';
+      : 'AI 整理未开启。<b>设置 → 元数据</b> 里打开「AI 增强」并填入 API Key 后，'
+                            + '这一块会自动整理这首歌、专辑与艺术家的资料。') + '</div>';
   }
   h += '<div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">' +
        '<button class="btn" id=npAiRefreshTrack style="font-size:11px;padding:3px 10px" ' +
@@ -10829,7 +11537,7 @@ function updateNpData(m) {
   var tabs = npDataTargets(m);
   // 261024-05 A12：AI 不可用时「专辑」标签仍然保留（本地曲目就能填满抽屉）；其余标签是 AI 专属
   if (!can) tabs = tabs.filter(function (t) { return t.k === 'release'; });
-  if (D('npRailCap')) D('npRailCap').textContent = can ? 'AI 整理' : '专辑资料';
+  // 2026-10-29（261029-02 #4）：npRailCap 元素已删除（用户要求只留两行），这里不再赋值。
   if (!tabs.length) {
     // 没有任何可用资料：整个标签栏收起（不占版面、不留空白块），抽屉也收起
     rail.classList.remove('on');
@@ -10915,6 +11623,161 @@ function renderNp() {
 //   * 滚动 = 让 active 行在容器里垂直居中（lyricScrollTo），带平滑过渡，不是按百分比滚；
 //   * 纯文本歌词（无时间戳）⟹ 不高亮、不自动滚（LY.timed=false）；
 //   * 用户手动滚动后 3 秒内不抢滚动；seek / 切歌立刻重定位（lyricReposition 清保护）。
+/* ---------------- 歌词显示选项 + 右键菜单（2026-10-30 用户 261029-03 #4 #5） ----------------
+   参考 QQ 音乐：字号 / 时间偏移 / 翻译 / 音译 / 日语假名 / 繁体。
+   四条 AI 类（翻译·音译·假名·繁体）都走 /api/lyrics/ai，结果按「任务+语言+歌词内容」缓存到
+   data\lyrics-cache，同一首歌第二次点开是秒出、不再花钱。
+   为什么不在本地做繁体/音译：一简对多繁要按词义选字（发→髮/發），拼音/罗马字也要词典；
+   内置码表只能给出"最常见的那个字"，歌词里必然出错。 */
+var LYVIEW = { size: 1, offsetMs: 0, trans: 0, translit: 0, furi: 0, trad: 0, lang: "", data: {} };
+var LY_SIZE_PX = [13, 15, 18, 22];
+var LY_SIZE_TXT = ["小", "标准", "大", "特大"];
+function lyricViewLoad() {
+  try {
+    var s = localStorage.getItem("rta-lyview");
+    if (s) { var o = JSON.parse(s); for (var k in o) if (k in LYVIEW && k !== "data") LYVIEW[k] = o[k]; }
+  } catch (e) { }
+}
+function lyricViewSave() {
+  try {
+    localStorage.setItem("rta-lyview", JSON.stringify({
+      size: LYVIEW.size, offsetMs: LYVIEW.offsetMs, trans: LYVIEW.trans,
+      translit: LYVIEW.translit, furi: LYVIEW.furi, trad: LYVIEW.trad, lang: LYVIEW.lang
+    }));
+  } catch (e) { }
+}
+// 歌词内容指纹：换歌/换词就作废已翻译结果（否则会把上一首的译文贴到这一首）
+function lyricKey() {
+  if (!LY.lines.length) return "";
+  return LY.lines.length + "|" + (LY.lines[0] ? LY.lines[0].s : "") + "|" + (LY.raw ? LY.raw.length : 0);
+}
+function lyricTargetLang() {
+  if (LYVIEW.lang) return LYVIEW.lang;
+  return (I18N && I18N.lang && I18N.lang !== "zh") ? I18N.lang : "zh";
+}
+// 该任务当前可用的结果行（指纹不匹配就当没有）
+function lyricExtra(kind) {
+  var d = LYVIEW.data[kind];
+  if (!d || d.key !== lyricKey() || !d.lines || !d.lines.length) return null;
+  return d.lines;
+}
+function applyLyricView() {
+  var box = D("npLyric"); if (!box) return;
+  box.style.setProperty("--ly-size", LY_SIZE_PX[LYVIEW.size] + "px");
+  // 清掉 dataset.n 强制重建：字号/译文/繁体都会改变每一行的 DOM
+  box.dataset.n = "";
+  renderNpLyric();
+}
+function lyricAi(kind) {
+  var lines = [];
+  for (var i = 0; i < LY.lines.length; i++) lines.push(LY.lines[i].s);
+  if (!lines.length) { toast("还没有歌词"); return; }
+  // 界面里的开关名（trans/furi）与后端任务名（translate/furigana）不是一套词，
+  // 直接透传会 400「kind 非法」（实测踩到）。这里显式映射。
+  var apiKind = { trans: "translate", translit: "translit", furi: "furigana", trad: "trad" }[kind] || kind;
+  var body = "kind=" + encodeURIComponent(apiKind) +
+             "&lang=" + encodeURIComponent(lyricTargetLang()) +
+             "&lines=" + encodeURIComponent(JSON.stringify(lines));
+  toast(kind === "translate" ? "正在翻译歌词…" : "正在处理歌词…");
+  // 不能用 api()：apiRaw 里硬编码 8 秒超时（那是给普通设置/列表请求定的）。
+  // 一首 40 行歌词要 1~3 分钟（模型逐行推理），8 秒必然被 abort，用户只会看到"处理失败"。
+  // 这里单独给 180 秒，并按"非幂等"处理：失败就是失败，不自动重放（重放会重复花钱）。
+  var ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+  var opt = { method: "POST", body: body };
+  if (ctrl) opt.signal = ctrl.signal;
+  var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 180000);
+  fetch("/api/lyrics/ai", opt).then(function (r) {
+    return r.text().then(function (txt) {
+      var j = null;
+      try { j = JSON.parse(txt); } catch (e) { }
+      if (!r.ok || !j) {
+        throw new Error((j && j.error) ? j.error : ("HTTP " + r.status));
+      }
+      return j;
+    });
+  }).then(function (j) {
+    clearTimeout(timer);
+    if (!j.ok) {
+      // 2026-10-30 实测踩到：请求失败时开关留在"开"⟹ 用户再点一次变成"关"，
+      //   界面上什么都不会发生（既没译文也没提示），看起来像"点了没反应"。
+      //   失败必须把开关退回关，让下一次点击还能重新发起。
+      LYVIEW[kind] = 0; lyricViewSave(); applyLyricView();
+      toast(j.error || "处理失败");
+      return;
+    }
+    LYVIEW.data[kind] = { key: lyricKey(), lines: j.lines || [] };
+    applyLyricView();
+    toast(j.cached ? "已载入（缓存）" : "完成");
+  }).catch(function (e) {
+    clearTimeout(timer);
+    LYVIEW[kind] = 0; lyricViewSave(); applyLyricView();   // 同上：失败即回退开关
+    toast((e && e.message) ? e.message : "处理失败（网络或模型不可用）");
+  });
+}
+function lyricToggle(kind) {
+  if (LYVIEW[kind]) {
+    LYVIEW[kind] = 0; lyricViewSave(); applyLyricView(); return;
+  }
+  LYVIEW[kind] = 1; lyricViewSave();
+  // 已有同内容缓存就直接显示，否则现算
+  if (lyricExtra(kind)) { applyLyricView(); return; }
+  lyricAi(kind);
+}
+function showLyricMenu(x, y) {
+  hideContextMenu();
+  var m = document.createElement("div");
+  m.className = "ctxmenu";
+  m.style.left = Math.max(4, x) + "px";
+  m.style.top = Math.max(4, y) + "px";
+  m.style.minWidth = "188px";
+  function head(t) {
+    var d = document.createElement("div");
+    d.className = "ctxhead"; d.textContent = t; m.appendChild(d);
+  }
+  function item(label, on, fn) {
+    var d = document.createElement("div");
+    d.className = "ctxitem" + (on ? " on" : "");
+    // 勾选符必须**单独一个 span**：写进同一个文本节点会变成「✓ 标准」，
+    // i18n 按整串查表永远查不到（实测英文界面里"标准"没被译）。
+    var mk = document.createElement("span");
+    mk.className = "ctxmk";
+    mk.textContent = on ? "\u2713 " : "\u3000";
+    d.appendChild(mk);
+    d.appendChild(document.createTextNode(label));
+    d.onclick = function (ev) { ev.stopPropagation(); hideContextMenu(); fn(); };
+    m.appendChild(d);
+  }
+  function sep() { var d = document.createElement("div"); d.className = "ctxsep"; m.appendChild(d); }
+  head("字号");
+  for (var i = 0; i < LY_SIZE_PX.length; i++) {
+    (function (idx) {
+      item(LY_SIZE_TXT[idx], LYVIEW.size === idx, function () { LYVIEW.size = idx; lyricViewSave(); applyLyricView(); });
+    })(i);
+  }
+  sep(); head("时间偏移（正 = 歌词提前）");
+  [-500, -200, 0, 200, 500].forEach(function (ms) {
+    item((ms > 0 ? "+" : "") + (ms / 1000).toFixed(1) + " s", LYVIEW.offsetMs === ms,
+      function () { LYVIEW.offsetMs = ms; lyricViewSave(); applyLyricView(); });
+  });
+  sep();
+  item("翻译歌词", !!LYVIEW.trans, function () { lyricToggle("trans"); });
+  item("音译歌词", !!LYVIEW.translit, function () { lyricToggle("translit"); });
+  item("日语假名机器标注", !!LYVIEW.furi, function () { lyricToggle("furi"); });
+  item("显示繁体歌词", !!LYVIEW.trad, function () { lyricToggle("trad"); });
+  // 目标语言作为尾注（单独一行）：拼进「翻译歌词（EN）」会让整串查不到译文
+  (function () {
+    var d = document.createElement("div");
+    d.className = "ctxnote";
+    d.textContent = "\u2192 " + lyricTargetLang().toUpperCase();   // 语言中性：不写死任何一种语言的说明文字
+    m.appendChild(d);
+  })();
+  document.body.appendChild(m);
+  _activeCtxMenu = m;
+  var rr = m.getBoundingClientRect();
+  if (x + rr.width > window.innerWidth - 6) m.style.left = Math.max(4, window.innerWidth - rr.width - 6) + "px";
+  if (y + rr.height > window.innerHeight - 6) m.style.top = Math.max(4, window.innerHeight - rr.height - 6) + "px";
+}
+
 function renderNpLyric() {
   var box = D('npLyric'); if (!box) return;
   if (box.classList) box.classList.toggle('empty', !LY.lines.length);
@@ -10927,12 +11790,29 @@ function renderNpLyric() {
   }
   var timed = lyricTimed();
   // 行集合或"带轴/纯文本"状态变化才重建 DOM（否则每 400ms 轮询都重建会把用户正在读的行冲掉）
-  var key = LY.lines.length + ':' + (timed ? 1 : 0);
+  // 2026-10-30：字号/译文/音译/假名/繁体任一变化都必须重建 DOM，
+  // 否则用户点了右键菜单「翻译歌词」看不到任何变化（旧 key 只含行数与有无时间轴）。
+  var key = LY.lines.length + ':' + (timed ? 1 : 0) + ':' + LYVIEW.size + ':' +
+            (LYVIEW.trans ? 1 : 0) + (LYVIEW.translit ? 1 : 0) + (LYVIEW.furi ? 1 : 0) + (LYVIEW.trad ? 1 : 0);
   if (box.dataset.n !== key) {
     box.dataset.n = key;
     var h = timed ? ''
       : '<div class=ly-hint title="这份歌词没有 [mm:ss] 时间轴，无法按播放位置高亮/跟随">纯文本歌词（无时间轴）· 不会自动跟随滚动</div>';
-    LY.lines.forEach(function (l, i) { h += '<div class=npline data-i=' + i + '>' + esc(l.s) + '</div>'; });
+    // 2026-10-30（#4/#5）：每行可带三类附加行 + 假名注音。附加行只读 LYVIEW.data，
+    // 没算过就是 null ⟹ 与旧行为完全一致（不多占一行高度）。
+    var lvTr = LYVIEW.trans ? lyricExtra('trans') : null;
+    var lvPh = LYVIEW.translit ? lyricExtra('translit') : null;
+    var lvFu = LYVIEW.furi ? lyricExtra('furi') : null;
+    var lvTd = LYVIEW.trad ? lyricExtra('trad') : null;
+    LY.lines.forEach(function (l, i) {
+      var body = (lvTd && lvTd[i]) ? lvTd[i] : l.s;
+      if (lvFu && lvFu[i]) body = '<span class=ly-furi>' + esc(lvFu[i]) + '</span>' + esc(body);
+      else body = esc(body);
+      h += '<div class=npline data-i=' + i + '>' + body;
+      if (lvTr && lvTr[i]) h += '<div class=ly-tr>' + esc(lvTr[i]) + '</div>';
+      if (lvPh && lvPh[i]) h += '<div class=ly-ph>' + esc(lvPh[i]) + '</div>';
+      h += '</div>';
+    });
     box.innerHTML = h;
     box.dataset.at = '';
     // 纯文本：留空让下面的 !timed 分支跑一次（复位 scrollTop + 清高亮），
@@ -10950,7 +11830,9 @@ function renderNpLyric() {
     }
     return;
   }
-  var pos = S.pos || 0;
+  // 2026-10-30（#5「时间偏移」）：正偏移 = 歌词提前（与 LRC [offset:±ms] 同号约定）。
+  // 放在这里而不是改 LY.lines[i].t：改时间戳会让「切歌/重载」后偏移叠加，越调越偏。
+  var pos = (S.pos || 0) + (LYVIEW.offsetMs / 1000);
   // 进度跳变（seek / 上一首 / 拖动进度条）→ 立刻重定位，不受"手动滚动保护"影响
   // ⚠ 必须同时清 dataset.at：否则"跳到同一行"时 dataset.at 相等，会吞掉这次重定位
   if (LY.lastPos >= 0 && Math.abs(pos - LY.lastPos) > 2.5) { LYMAN.until = 0; box.dataset.at = ''; }
@@ -10969,6 +11851,17 @@ function renderNpLyric() {
   }
 }
 // 手动滚动保护（滚轮 / 触摸拖动）：3 秒内自动滚动不跟用户抢
+// 歌词右键菜单（2026-10-30 #5）：绑在 #npLyric 上，不影响其它区域的菜单。
+(function bindLyricMenu() {
+  var box = D('npLyric'); if (!box) return;
+  box.addEventListener('contextmenu', function (ev) {
+    if (!LY.lines.length) return;      // 没歌词时给系统菜单（用户可能想复制/检查）
+    ev.preventDefault();
+    ev.stopPropagation();
+    showLyricMenu(ev.clientX, ev.clientY);
+  });
+})();
+lyricViewLoad();
 (function bindLyricManual() {
   ['npLyric', 'lyricbox'].forEach(function (id) {
     var el = D(id);
@@ -11154,6 +12047,10 @@ fillMetaProviders();   // P1.5：数据源注册表（/api/providers）驱动元
 //   而他每点一次「保存设置」，就把这些默认值写回 conf，**覆盖掉自己的配置**。
 //   anlmaster / autoanl 之所以「改了不生效」，根子都在这一行缺失。
 loadSettings();
+// 2026-10-30（用户 261029-03）：界面语言。放在 loadSettings 之后 ——
+//   它要读 conf 里的 uilang（"auto" = 跟随系统），而那个值由 loadSettings 解析；
+//   但即使 loadSettings 还没回来，i18nBoot 也会先用 /api/i18n 的默认值把界面译好。
+i18nBoot();
 loadRates();
 loadAlbums('');
 loadQ();

@@ -11,7 +11,7 @@
 //     Work→Recording 写反会立刻被这条通用判据抓住（不需要为每条边手写断言）。
 //   * 【往返】写盘→读回后逐字段比对（name/norm/aliases 顺序/attrs 值/edges 六元组），
 //     并额外比一份 entity_json 全文；转义用中文+引号+反斜杠+换行样本。
-//   * 【原子写】用「在 <file>.tmp 位置放一个目录」让 ofstream 必然打不开，
+//   * 【原子写】用不允许删除共享的目标句柄制造原子替换失败，
 //     断言 ① 返回 false ② 旧文件内容一字不变 —— 这才是 tmp+rename 的保护语义，
 //     光测「写成功」证明不了「失败不破坏」。
 //   * 【真实样本】直接读 D:\RTA-hqplayer\MUSIC 的**真实目录名/文件名**（只读，不写、
@@ -494,10 +494,11 @@ int main() {
         const std::string v2 = read_bytes(f);
         ck(v2 != v1 && v2.find("第三个写法") != std::string::npos, "覆盖写后读到新内容");
 
-        // ★ 制造写失败：在 <file>.tmp 位置放一个目录 → ofstream 必然打不开
-        const fs::path tmpPath = fs::path(f.string() + ".tmp");
-        fs::create_directory(tmpPath, ec);
-        ck(fs::exists(tmpPath, ec), "已构造 .tmp 占位目录（制造写失败）");
+        // Deny target replacement with an OS file handle. This tests a real
+        // replacement failure without assuming a private temporary-file name.
+        HANDLE held = CreateFileW(f.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        ck(held != INVALID_HANDLE_VALUE, "打开旧文件并拒绝删除共享（制造替换失败）");
         e.updatedTs = 4;
         e.addAlias("不该落盘");
         const bool saved = st.save(e);
@@ -506,7 +507,7 @@ int main() {
         ck(v3 == v2, "写失败后旧文件内容一字不变（tmp+rename 的保护语义）",
            "len " + std::to_string(v3.size()) + " vs " + std::to_string(v2.size()));
         ck(v3.find("不该落盘") == std::string::npos, "失败写入的内容没有渗进旧文件");
-        fs::remove_all(tmpPath, ec);
+        if (held != INVALID_HANDLE_VALUE) CloseHandle(held);
 
         // 损坏文件：load 必须显式失败，而不是返回半截实体
         const fs::path bad = st.pathOf(EntityKind::Label, entity_id(EntityKind::Label, "坏文件"));

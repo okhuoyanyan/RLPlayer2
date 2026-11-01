@@ -12,6 +12,7 @@
 //   * 纯头文件、无第三方依赖；算法参考 RBJ Audio EQ Cookbook（见 WIP 文档链接），
 //     未复制任何 GPL 实现代码。
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 
 #include "matrix.h"          // 复用 kPi；Biquad 设计公式与本项目既有一致
 #include <algorithm>
@@ -300,19 +301,57 @@ public:
     PeqEngine& operator=(const PeqEngine&) = delete;
 
     // 播放开始 / 切歌切率：按新采样率重建系数并清状态（新曲起点，不需要交叉淡入）
+    //
+    // ★ 2026-10-29（两轮审查 F20 位置 A）：**每次调用都清滤波历史**。
+    //   旧实现只在「采样率变了 / 声道数变了」时重建，同采样率切歌时系数与状态全留着
+    //   ⟹ 前一首的 IIR 尾音直接串进下一首的开头（实测：前曲脉冲 → 新曲静音仍非零）。
+    //   这个函数的生产调用点只有 rtaweb 的「每曲开播前」一处（g_peq->prepare(in.rate, 8)），
+    //   语义本来就是「新播放会话」，所以清历史是它该做的事，而不是可选行为。
     void prepare(double fs, int channels) {
         std::lock_guard<std::mutex> lk(mu_);
-        const bool rateChanged = (std::fabs(fs - fs_) > 1e-9);
-        if (rateChanged) {
-            fs_ = (fs > 0.0) ? fs : 48000.0;
-            rebuild_locked(false);
-        }
+        const double wantFs = (fs > 0.0) ? fs : 48000.0;
         if (channels < 1) channels = 1;
-        if (channels != ch_) {
+        const bool rateChanged = (std::fabs(wantFs - fs_) > 1e-9);
+        const bool chChanged   = (channels != ch_);
+        fs_ = wantFs;
+        if (chChanged) {
             ch_ = channels;
             chans_.assign((size_t)ch_, Chan{});
-            rebuild_locked(false);
         }
+        // 无条件重建（不带交叉淡入）+ 清历史：新曲/新会话的起点
+        rebuild_locked(false);
+        for (auto& c : chans_) { for (auto& q : c.cur) q.reset(); }
+        (void)rateChanged;
+    }
+
+    // 只清滤波历史，不动系数（跳转 seek / 播放中断后续播用）。
+    // 为什么与 prepare() 分开：seek 不需要按采样率重建设计，但必须丢掉旧位置的尾音。
+    void reset_state() {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& c : chans_) {
+            for (auto& q : c.cur) q.reset();
+            c.prev.clear();          // 过渡中的旧链直接作废（它的状态已无意义）
+            c.fadeLeft = 0;
+        }
+    }
+
+    // 是否还有交叉淡入在跑（★ F20 位置 B）。
+    // 为什么需要它：has_effect() 回答的是「目标设置会不会改变声音」，而旁路开关的
+    // 交叉淡入期间「目标」已经是空的、但「实际输出」仍在从旧链过渡。管线如果只看
+    // has_effect() 就会在淡入中途退到逐位直通，产生阶跃（实测 0.125594378 → 0.5）。
+    bool transitioning() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const auto& c : chans_) {
+            if (c.fadeLeft <= 0) continue;
+            // ★ 只有"两条链真的不同"才算过渡：刚构造/刚 set_settings 时 prev 是空的、
+            //   两侧增益也相同 ⟹ 这个 fade 两边完全一样，等价于没有过渡。
+            //   不排除这种情况的话，全新的 PEQ（全 0 dB）也会报"仍在过渡"，
+            //   hasAnyProcessing() 于是恒为 true，逐位直通永远不成立
+            //   （tests/test_peq.cpp 第 10 节就是这么抓到的）。
+            if (c.prev.empty() && std::fabs(c.gainPrev - c.gainCur) < 1e-12) continue;
+            return true;
+        }
+        return false;
     }
 
     // 参数热更新：新链从零状态启动，与旧链交叉淡入，不打断音频线程
@@ -366,7 +405,11 @@ public:
             if (fading) {
                 const float a = run_chain(c.prev, x) * (float)c.gainPrev;
                 const float b = run_chain(c.cur, x) * (float)c.gainCur;
-                const float t = 1.0f - (float)c.fadeLeft / (float)c.fadeLen;
+                // ★ 2026-10-29（F20）：旧式 t = 1 − fadeLeft/fadeLen 在 128 样本淡入里
+                //   只取到 t = 0 … 127/128，最后一步从 0.9924·b 直接跳到 1.0·b ⟹
+                //   过渡"结束后仍有一次 1/128 的阶跃"。改成 k/fadeLen（k = 1…fadeLen），
+                //   末样本恰好等于新链输出，交接处严格连续。
+                const float t = (float)(c.fadeLen - c.fadeLeft + 1) / (float)c.fadeLen;
                 y = a * (1.0f - t) + b * t;
                 if (--c.fadeLeft <= 0) { fading = false; c.prev.clear(); }
             } else {

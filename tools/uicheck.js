@@ -12,8 +12,12 @@ const os = require('os');
 
 const URL_ = process.argv[2] || 'http://127.0.0.1:8902/';
 const OUT = process.argv[3] || path.join(os.tmpdir(), 'rta_uicheck');
+// Explicitly selected by verify.ps1. Only external-provider responses are
+// intercepted; local catalogue, settings, OPRA and queue APIs stay real.
+const OFFLINE_FIXTURES = (process.argv[4] || '') === 'offline-fixtures';
+const providerFixture = { versions: 'data', knowledgeCalls: 0, versionCalls: 0 };
 fs.mkdirSync(OUT, { recursive: true });
-const OUT_UI3 = path.join(__dirname, '..', 'build', 'ui3');
+const OUT_UI3 = OFFLINE_FIXTURES ? path.join(OUT, 'ui3') : path.join(__dirname, '..', 'build', 'ui3');
 fs.mkdirSync(OUT_UI3, { recursive: true });
 
 const EDGE = ['C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -53,6 +57,32 @@ function send(method, params) {
     pending.set(id, { res, rej });
     ws.send(JSON.stringify({ id, method, params: params || {} }));
   });
+}
+async function fulfilProviderFixture(params) {
+  const requestUrl = new URL(params.request.url);
+  let response;
+  if (requestUrl.pathname === '/api/entity/knowledge') {
+    providerFixture.knowledgeCalls++;
+    response = requestUrl.searchParams.get('name') === 'ZARD' ? {
+      ok: true, from_cache: true, offline: true,
+      materials: [{ kind: 'biography', source: 'offline-test-fixture', title: 'Explicit UI biography fixture',
+        text: 'This text is an offline UI fixture for biography rendering and source-copy interaction.',
+        fetched_at: 1767225600, url: 'https://example.invalid/ui-fixture/artist' }]
+    } : { ok: false, offline: true, error: 'Explicit offline provider fixture', materials: [] };
+  } else if (requestUrl.pathname === '/api/entity/versions') {
+    providerFixture.versionCalls++;
+    response = providerFixture.versions === 'offline' ?
+      { ok: false, offline: true, errors: ['Explicit offline Discogs fixture'], performances: [] } :
+      { ok: true, from_cache: true, offline: true, generated_at: 1767225600, distinctCount: 5, releaseCount: 5,
+        performances: Array.from({ length: 5 }, (_, i) => ({ title: 'UI version fixture ' + (i + 1),
+          year: 1980 + i, conductor: 'Fixture conductor ' + i, ensemble: 'Fixture orchestra ' + i,
+          label: 'Offline fixture', format: 'CD', url: 'https://example.invalid/ui-fixture/version/' + i })) };
+  } else {
+    return send('Fetch.continueRequest', { requestId: params.requestId });
+  }
+  return send('Fetch.fulfillRequest', { requestId: params.requestId, responseCode: 200,
+    responseHeaders: [{ name: 'Content-Type', value: 'application/json; charset=utf-8' }],
+    body: Buffer.from(JSON.stringify(response), 'utf8').toString('base64') });
 }
 async function evalJs(expr) {
   const r = await send('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true });
@@ -329,6 +359,8 @@ async function tipThemes(prefix) {
     if (m.id && pending.has(m.id)) {
       const p = pending.get(m.id); pending.delete(m.id);
       m.error ? p.rej(new Error(JSON.stringify(m.error))) : p.res(m.result);
+    } else if (m.method === 'Fetch.requestPaused' && OFFLINE_FIXTURES) {
+      fulfilProviderFixture(m.params).catch(e => errors.push('provider fixture: ' + e.message));
     } else if (m.method === 'Runtime.exceptionThrown') {
       errors.push('exception: ' + (m.params.exceptionDetails.exception && m.params.exceptionDetails.exception.description || m.params.exceptionDetails.text));
     } else if (m.method === 'Runtime.consoleAPICalled' && m.params.type === 'error') {
@@ -338,6 +370,13 @@ async function tipThemes(prefix) {
   await send('Runtime.enable');
   await send('Page.enable');
   await send('Log.enable');
+  if (OFFLINE_FIXTURES) {
+    console.log('[FIXTURE] External knowledge/Discogs responses only; not a live-provider integration test.');
+    await send('Fetch.enable', { patterns: [
+      { urlPattern: '*/api/entity/knowledge?*', requestStage: 'Request' },
+      { urlPattern: '*/api/entity/versions?*', requestStage: 'Request' }
+    ] });
+  }
 
   // ---- 模式 `tips`：全站 ? 浮层核查（261027-03 #6「帮助文档被左侧栏挡住」）----
   // 用法：node tools/uicheck.js <url> <截图目录> tips [截图前缀]
@@ -438,8 +477,8 @@ async function tipThemes(prefix) {
 
   // 曲目视图
   await evalJs("Array.from(document.querySelectorAll('.nav')).find(e=>e.dataset.v==='tracks').click()");
-  await sleep(700);
-  ck(await evalJs("document.querySelectorAll('.trow').length > 0"), '曲目视图有内容');
+  ck(await waitFor("S.view === 'tracks' && !!document.getElementById('trackSort') && document.querySelectorAll('#list .trow-track').length > 0", 10000),
+     '曲目视图有内容（当前视图、排序框与曲目行同时就绪）');
   const p3 = await shot('03-tracks');
 
   // ---- 验收 2：曲目页有排序控件，点收藏优先后顺序变化；点心形后 /api/fav/list 出现该文件，取消后消失 ----
@@ -503,6 +542,8 @@ async function tipThemes(prefix) {
   await sleep(800);
   ck(await waitFor("(function(){ return S.view === 'artist' && !!document.querySelector('.artist-head'); })()", 8000), '艺术家资料页可进入');
   ck(await evalJs("!!document.querySelector('.artist-head') && !!document.querySelector('.artist-head h1')"), '艺术家资料页头部区块存在');
+  ck(await waitFor("ARTIST_KNOW[S.artistWho] && ARTIST_KNOW[S.artistWho].state === 'done'", 35000),
+     '艺术家资料请求进入完成态后再验收内容/空态');
   // 区块检查：有数据时生平与来源芯片存在，无数据时空态卡与重试按钮存在（避免强依赖外网连接成功）
   const profileState = await evalJs(`(function(){
     var hasSources = document.querySelectorAll('.chip-copy').length > 0;
@@ -564,7 +605,7 @@ async function tipThemes(prefix) {
      '作品页搜索控件完整（作品名、作曲家输入框与查询按钮存在）');
   ck(await evalJs("document.querySelectorAll('.chip-work').length >= 3"),
      '常用古典作品快速芯片存在（≥3 个）');
-  ck(await waitFor("document.querySelectorAll('.version-row').length >= 5 || !!document.querySelector('.empty-card')", 15000),
+  ck(await waitFor("document.querySelectorAll('.version-row').length >= 5 || !!document.querySelector('.empty-card')", 25000),
      'Discogs 版本列表成功渲染或显示明确空态卡');
   const nVers = await evalJs("document.querySelectorAll('.version-row').length");
   if (nVers > 0) {
@@ -580,7 +621,23 @@ async function tipThemes(prefix) {
   }
   ck(await evalJs("document.querySelectorAll('a[href^=http]').length === 0"),
      '作品版本推荐页无 http 外链（永不跳转外部浏览器）');
+  if (OFFLINE_FIXTURES) {
+    providerFixture.versions = 'offline';
+    await evalJs("openWorkVersions('Offline UI fixture', 'Fixture composer', true)");
+    ck(await waitFor("!!document.querySelector('#worksResult .empty-card') && !!document.getElementById('bRetryVersions')", 6000),
+       '明确离线响应夹具显示空态与重试按钮（真实生产渲染器）');
+    providerFixture.versions = 'data';
+    await evalJs("document.getElementById('bRetryVersions').click()");
+    ck(await waitFor("document.querySelectorAll('#worksResult .version-row').length === 5", 6000),
+       '离线重试按钮可重新获取并显示5条版本夹具');
+    ck(providerFixture.knowledgeCalls >= 2 && providerFixture.versionCalls >= 3,
+       '外部响应夹具确实走过数据/空态/重试请求链', JSON.stringify(providerFixture));
+  }
   const pWorks = await shot('22-work-versions');
+  if (OFFLINE_FIXTURES) {
+    await send('Fetch.disable');
+    console.log('[FIXTURE] External-provider interception restored after artist/work assertions.');
+  }
 
   // 文件夹
   // 文件夹视图是异步 /api/files 渲染的；慢盘/慢网络下固定 sleep 700 会假失败（本环境实测偶发）。
@@ -1080,7 +1137,8 @@ async function tipThemes(prefix) {
   await shot('04-eq-hd600-results', true);
 
   // 判据 4：调音预设是卡片布局（至少 3 张卡）
-  await evalJs("Array.from(document.querySelectorAll('#eqModelCards .model-card')).find(c => c.dataset.name.indexOf('HD 600') >= 0 || c.dataset.id.indexOf('hd_600') >= 0).click()");
+  const hdSelected = await evalJs("(function(){var c=Array.from(document.querySelectorAll('#eqModelCards .model-card')).find(c => (c.dataset.name||'').indexOf('HD 600') >= 0 || (c.dataset.id||'').indexOf('hd_600') >= 0);if(!c)return false;c.click();return true;})()");
+  ck(hdSelected, 'HD 600 搜索结果包含可点击的匹配型号');
   await waitFor("document.querySelectorAll('#eqPresetCards .preset-card').length >= 3", 8000);
   const nPresets = await evalJs("document.querySelectorAll('#eqPresetCards .preset-card').length");
   ck(nPresets >= 3, '调音预设是卡片布局（至少 3 张卡）', 'count=' + nPresets);
@@ -1228,8 +1286,9 @@ async function tipThemes(prefix) {
   ck(await evalJs("(function(){var v=document.getElementById('npVol'),p=document.getElementById('npPlay');if(!v||!p)return false;var a=v.getBoundingClientRect(),b=p.getBoundingClientRect();return Math.abs((a.top+a.height/2)-(b.top+b.height/2))<=10;})()"),
      '音量与播放键同一行（不再单独占底部一行）');
   // 261024-02 #5：单曲页有「推送到设备」按钮（与流媒体页推送区块、底栏徽标同源）
-  ck(await evalJs("(function(){var b=document.getElementById('npCastBtn');return !!b && b.textContent.indexOf('推送')>=0 && !!b.onclick;})()"),
-     '单曲页有「推送到设备」按钮且已绑定');
+  const npCastControl = await evalJs("(function(){var b=document.getElementById('npCastBtn');if(!b)return null;var r=b.getBoundingClientRect(),s=getComputedStyle(b);return {name:b.getAttribute('aria-label')||b.title||b.textContent.trim(),button:b.tagName==='BUTTON',icon:!!b.querySelector('svg'),bound:typeof b.onclick==='function'&&b.onclick===castToggle,visible:r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'};})()");
+  ck(npCastControl && npCastControl.button && npCastControl.visible && npCastControl.icon && npCastControl.bound && npCastControl.name.indexOf('推送') >= 0,
+     '单曲页推送图标按钮可见、有语义名称且已绑定推送操作', JSON.stringify(npCastControl));
   // 空态文案要用「清掉歌词后的 renderNpLyric」来验：实例上可能正停着一首带在线歌词的曲子
   // （LY.lines 非空 → 显示的是歌词而不是空态），那是正常业务态，不是文案缺失。
   ck(await evalJs("(function(){var keep=LY.lines;LY.lines=[];renderNpLyric();var ok=document.getElementById('npLyric').innerHTML.indexOf('在线补全')>=0;LY.lines=keep;var b=document.getElementById('npLyric');if(b){b.dataset.n='';}renderNpLyric();return ok;})()"), '歌词空态提示「播放时自动在线补全」');
@@ -1439,8 +1498,9 @@ async function tipThemes(prefix) {
     await sleep(500);
     const npAdd = await evalJs(`(function(){var b=document.getElementById('npAddQ');if(!b)return null;
       var r=b.getBoundingClientRect(),cs=getComputedStyle(b);
-      return {visible:r.width>0&&r.height>0&&cs.display!=='none'&&cs.visibility!=='hidden', text:b.textContent.trim()};})()`);
-    ck(npAdd && npAdd.visible && npAdd.text.indexOf('加入队列')>=0, '单曲页有默认可见的「＋ 加入队列」按钮', JSON.stringify(npAdd));
+      return {visible:r.width>0&&r.height>0&&cs.display!=='none'&&cs.visibility!=='hidden',button:b.tagName==='BUTTON',icon:!!b.querySelector('svg'),bound:typeof b.onclick==='function',name:b.getAttribute('aria-label')||b.title||b.textContent.trim()};})()`);
+    ck(npAdd && npAdd.button && npAdd.visible && npAdd.icon && npAdd.bound && npAdd.name.indexOf('加入')>=0 && npAdd.name.indexOf('队列')>=0,
+       '单曲页入队图标按钮默认可见、有语义名称且已绑定', JSON.stringify(npAdd));
     await evalJs("document.getElementById('npClose').click()");
     await sleep(300);
     // =====================================================================================
@@ -1535,7 +1595,11 @@ async function tipThemes(prefix) {
      JSON.stringify(recentGeo && {n:recentGeo.n, min:recentGeo.min, max:recentGeo.max, uniq:recentGeo.uniq, heights:recentGeo.heights}));
   ck(recentGeo && recentGeo.n > 0 && recentGeo.det.every(function(d){return d.duWS==='nowrap' && d.duTO==='ellipsis';}),
      '最近播放专辑列单行省略（white-space:nowrap + text-overflow:ellipsis）',
-     JSON.stringify(recentGeo && recentGeo.det[0]));
+     JSON.stringify(recentGeo && recentGeo.det && recentGeo.det[0]));
+  if (OFFLINE_FIXTURES) {
+    ck(recentGeo && recentGeo.n === 3 && recentGeo.det.some(function(d){return d.duClipped;}),
+       '最近播放测到3条静音历史，且长专辑名确实被省略（非空转）', JSON.stringify(recentGeo));
+  }
   await shot('28-recent-rows', true);
 
   // =====================================================================================
@@ -1558,18 +1622,34 @@ async function tipThemes(prefix) {
       return {textX:+rg.getBoundingClientRect().left.toFixed(2), text:emp.textContent.trim()};
     })()`);
     ck(emptyGeo && Math.abs(emptyGeo.textX - 46) <= 1, '「我的歌单」空态「暂无歌单」缩进 == 46.00px（差 ≤1px）', JSON.stringify(emptyGeo));
-    // 临时建一个歌单（用当前队列）→ 量图标 → 删掉还原
+    // 临时建一个真实歌单。前面的队列验收已恢复原队列，隔离实例
+    // 原队列为空时必须先放入已存在的静音夹具；添加入队不启动播放。
     const mk = await evalJs(`(async()=>{
       var q = await (await fetch('/api/queue')).json();
-      if (!(q.items||[]).length) return {skip:true};
-      var r = await fetch('/api/sq/save?name=' + encodeURIComponent('自检临时歌单'), {method:'POST'});
-      var j = await r.json();
-      await new Promise(function(t){setTimeout(t,400);});
-      if (typeof renderSavedQueues === 'function') { renderSavedQueues(); await new Promise(function(t){setTimeout(t,700);}); }
-      return {ok:!!j.ok, rows:document.querySelectorAll('.side .sqrow').length};
+      var originallyEmpty=!(q.items||[]).length, seeded=false, restored=false, j={ok:false};
+      try {
+        if(originallyEmpty){
+          var catalogue=await (await fetch('/api/lib/search?q=')).json();
+          var path=((catalogue.tracks||[])[0]||{}).path;
+          if(!path) throw new Error('没有可用于创建歌单的真实曲目夹具');
+          seeded=true;
+          var added=await (await fetch('/api/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'file='+encodeURIComponent(path)})).json();
+          if(!added.ok) throw new Error(added.error||'静音夹具入队失败');
+        }
+        j=await (await fetch('/api/sq/save?name='+encodeURIComponent('自检临时歌单'),{method:'POST'})).json();
+      } catch(e){j={ok:false,error:String(e)};}
+      finally {
+        if(seeded) await fetch('/api/clear',{method:'POST'});
+        var after=await (await fetch('/api/queue')).json();
+        restored=(after.items||[]).join('|')===(q.items||[]).join('|');
+      }
+      if(typeof renderSavedQueues==='function')renderSavedQueues();
+      for(var i=0;i<40&&!document.querySelector('.side .sqrow');i++)await new Promise(r=>setTimeout(r,100));
+      return {ok:!!j.ok,error:j.error||'',rows:document.querySelectorAll('.side .sqrow').length,seeded:seeded,queueRestored:restored};
     })()`);
-    if (mk && mk.ok && mk.rows > 0) sqTempCreated = '自检临时歌单';
-    else ck(true, '「我的歌单」图标判据跳过（队列为空，无法建临时歌单）', JSON.stringify(mk));
+    if (mk && mk.ok) sqTempCreated = '自检临时歌单';
+    ck(mk && mk.ok && mk.rows > 0 && mk.queueRestored,
+       '用真实曲目夹具建立临时歌单，且创建后队列已恢复（未播放）', JSON.stringify(mk));
   }
   const sideGeo = await evalJs(`(function(){
     function txtX(el){ var tn=Array.prototype.filter.call(el.childNodes,function(n){return n.nodeType===3 && n.textContent.trim();})[0];

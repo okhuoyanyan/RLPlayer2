@@ -6,6 +6,7 @@
 //   3. CC BY-SA 4.0 归属声明 + 复制链接芯片（不打开浏览器）
 //   4. 平台边界纪律：禁止 include windows.h / winsock2.h
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 
 #include "dsp/matrix.h"
 #include "dsp/eq_text.h"

@@ -72,16 +72,29 @@ int main() {
         ck(d.ok && d.rate == 96000, "Case 7: 48k 族同族优先 ⟹ 选最小可用 96000（不选 44.1k 族）");
     }
 
-    // Case 8: autoMode=true 跨族就近（同族完全无可用档，选 >= wanted 的最小可用）
+    // Case 8（261030-01 D-12 改写）: 无同族档 ⟹ 跨族被禁止，必须硬失败
     {
         auto d = decide_rate(44100, {48000, 96000}, true, false);
-        ck(d.ok && d.rate == 48000, "Case 8: 无同族档 ⟹ 跨族就近选最小更高 48000（不盲目降级）");
+        ck(!d.ok && d.rate == 0 && std::string(d.reason).find("compatible") != std::string::npos,
+           "Case 8: 无同族档 ⟹ 跨族禁止，硬失败（D-12）");
     }
 
-    // Case 9: autoMode=true 跨族只有更大档
+    // Case 8b: 逃生口 allowCrossFamily=true ⟹ 恢复旧行为（兼容重采样，非 HIFI）
+    {
+        auto d = decide_rate(44100, {48000, 96000}, true, false, true);
+        ck(d.ok && d.rate == 48000, "Case 8b: 显式逃生口 ⟹ 跨族就近选 48000（兼容重采样）");
+    }
+
+    // Case 9（D-12 改写）: 跨族只有更大档 ⟹ 依然硬失败
     {
         auto d = decide_rate(44100, {96000, 192000}, true, false);
-        ck(d.ok && d.rate == 96000, "Case 9: 跨族只有更大档 ⟹ 选取最小可用 96000");
+        ck(!d.ok && d.rate == 0, "Case 9: 跨族只有更大档 ⟹ 硬失败（D-12）");
+    }
+
+    // Case 9b: 同族只有更大档（44.1k 族 88200）⟹ 允许，仍选同族
+    {
+        auto d = decide_rate(44100, {88200, 96000}, true, false);
+        ck(d.ok && d.rate == 88200, "Case 9b: 同族有更大档 ⟹ 选 88200，不碰 48k 族");
     }
 
     // Case 10: autoMode=true 只有更小档（没有更大档时选最大可用）
@@ -122,10 +135,24 @@ int main() {
 
     // Case 16: 支持列表无序、含 0、含重复时的健壮性
     {
-        auto d = decide_rate(88200, {192000, 0, 96000, 0, 96000}, true, false);
-        ck(d.ok && d.rate == 96000, "Case 16: 支持列表乱序/含0/含重复 ⟹ 健壮清洗并正确决策 96000");
+        auto d = decide_rate(88200, {176400, 0, 44100, 0, 44100}, true, false);
+        ck(d.ok && d.rate == 176400, "Case 16: 支持列表乱序/含0/含重复 ⟹ 健壮清洗并正确决策 176400（同族）");
     }
 
-    std::printf("=== test_rate_decision: %d 用例, %d 失败 ===\n", 16, g_fails);
+    // Real source must drive the family even when wanted already matches hardware.
+    {
+        auto d = decide_rate(96000, {44100, 96000}, true, false, false, 44100);
+        ck(d.ok && d.rate == 44100, "Case 17: real 44.1 source beats exact foreign wanted");
+        d = decide_rate(96000, {44100, 96000}, false, false, false, 44100,
+                        rta::audio::RateFamilyPolicy::Strict);
+        ck(!d.ok, "Case 18: strict rejects explicit foreign clock despite exact hardware support");
+        d = decide_rate(176400, {176400, 352800}, true, true, false, 48000,
+                        rta::audio::RateFamilyPolicy::Strict);
+        ck(d.ok && d.rate == 176400, "Case 19: DoP carrier bypasses PCM family policy");
+        d = decide_rate(176400, {352800}, true, true, true, 44100,
+                        rta::audio::RateFamilyPolicy::Compatible);
+        ck(!d.ok, "Case 20: compatible never changes unsupported DoP carrier");
+    }
+    std::printf("=== test_rate_decision: 22 checks, %d failures ===\n", g_fails);
     return g_fails ? 1 : 0;
 }

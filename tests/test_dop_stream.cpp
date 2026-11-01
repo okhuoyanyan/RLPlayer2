@@ -1,102 +1,93 @@
-// test_dop_stream.cpp — 流式 DoP（分块调制 + 打包 + 跨块标记相位）验证
-//
-// 为什么需要这个测试：网页播放器是"分块渲染"的，DoP 的两个坑只有在分块下才暴露：
-//   1) 标记必须在 0x05/0xFA 之间【连续交替】，每块重新从 A 开始会让接收端判定非法
-//   2) 每块的 DSD 样本数不一定能被 16 整除，余数必须留到下一块
-// 这里直接复刻播放器生产者线程的做法（调制 -> 打包 -> 残余），再解包验证。
-#include "dsp/dop.h"
-#include "dsp/modulator.h"
-#include <cstdio>
-#include <cmath>
-#include <vector>
-#include <memory>
-#include <string>
+// Real legacy-path differential oracle, including seek/EOF/multilevel rejection.
+#include "dsp/dop_stream.h"
+#include <iostream>
+#include <numeric>
+#include <limits>
 
 using namespace rta::dsp;
-static int fails = 0;
-static void check(bool ok, const std::string& what, const std::string& detail = "") {
-    printf("  [%s] %s %s\n", ok ? "PASS" : "FAIL", what.c_str(), detail.c_str());
-    if (!ok) ++fails;
-}
-static const double PI = 3.14159265358979323846;
+#define REQUIRE(x) do { if (!(x)) { std::cerr << "FAIL line " << __LINE__ << ": " #x "\n"; return 1; } } while (false)
 
-// 复刻 rtaweb 生产者：把一段 PCM 按 chunk 分块，调制 -> 打包 -> 残余
-static std::vector<int32_t> stream_pack(const std::vector<double>& pcm, size_t chunk,
-                                        int dsdMult, bool* markerOk) {
-    const uint32_t fs = dsd_rate(dsdMult);
-    SdmConfig cfg; cfg.fs = (double)fs; cfg.order = 5; cfg.levels = 2;
-    cfg.cutoffHz = 100000.0; cfg.ditherLsb = 0.01;
-    SdmModulator mod(cfg);
-    DopPackState st;
-    std::vector<double> carry;
-    std::vector<int32_t> out;
-    for (size_t pos = 0; pos < pcm.size(); pos += chunk) {
-        const size_t n = std::min(chunk, pcm.size() - pos);
-        std::vector<double> sd = carry;
-        sd.reserve(carry.size() + n);
-        for (size_t i = 0; i < n; ++i) sd.push_back(mod.process(pcm[pos + i]));
-        const size_t use = (sd.size() / 16) * 16;
-        const double* sp[1] = { sd.data() };
-        std::vector<int32_t> packed;
-        dop_pack(sp, 1, use, packed, st);
-        out.insert(out.end(), packed.begin(), packed.end());
-        carry.assign(sd.begin() + (long long)use, sd.end());
+struct Legacy {
+    std::vector<std::unique_ptr<SdmModulator>> mods;
+    std::vector<std::vector<double>> carry;
+    DopPackState state;
+    explicit Legacy(const SdmConfig& cfg, int channels) : carry(channels) {
+        for (int c=0;c<channels;++c) mods.push_back(std::make_unique<SdmModulator>(cfg));
     }
-    *markerOk = true;
-    return out;
-}
+    std::vector<int32_t> run(const std::vector<std::vector<double>>& in, size_t drop, bool finish) {
+        auto bits=carry;
+        for(size_t c=0;c<mods.size();++c)
+            if(!in.empty()) for(size_t i=0;i<in[c].size();++i) {
+                const auto v=mods[c]->process(in[c][i]);
+                if(i>=drop) bits[c].push_back(v);
+            }
+        const size_t total=bits[0].size(), use=(finish?(total+15)/16:total/16)*16;
+        if(finish) for(auto& b:bits) for(size_t i=total;i<use;++i)
+            b.push_back(((0x69u>>(7-(i&7)))&1u)?1.0:-1.0);
+        std::vector<const double*> ptr;
+        for(auto& b:bits) ptr.push_back(b.data());
+        std::vector<int32_t> result;
+        if(!dop_pack_checked(ptr.data(),int(mods.size()),use,result,state))
+            throw std::runtime_error("Legacy reference rejected valid bitstream");
+        for(size_t c=0;c<mods.size();++c) carry[c].assign(bits[c].begin()+use,bits[c].end());
+        return result;
+    }
+};
 
 int main() {
-    printf("=== 流式 DoP 验证 ===\n");
-
-    const int mult = 64;
-    const size_t N = 40000;                 // 输入 PCM 样本数
-    std::vector<double> pcm(N);
-    for (size_t n = 0; n < N; ++n)
-        pcm[n] = 0.5 * std::sin(2.0 * PI * 997.0 * (double)n / 44100.0);
-
-    // 1) 整块（参考）
-    bool okRef = false;
-    std::vector<int32_t> ref = stream_pack(pcm, pcm.size(), mult, &okRef);
-    std::vector<std::vector<double>> bitsRef;
-    const bool legalRef = dop_unpack(ref.data(), 1, ref.size(), bitsRef);
-    printf("  整块：%zu 个载波帧，标记合法=%d\n", ref.size(), (int)legalRef);
-    check(legalRef, "整块打包的 DoP 标记合法");
-
-    // 2) 分块（含不能整除 16 的块长）
-    for (size_t chunk : { (size_t)1000, (size_t)777, (size_t)4099, (size_t)64 }) {
-        bool ok = false;
-        std::vector<int32_t> got = stream_pack(pcm, chunk, mult, &ok);
-        std::vector<std::vector<double>> bits;
-        const bool legal = dop_unpack(got.data(), 1, got.size(), bits);
-        printf("  块长 %zu：%zu 个载波帧，标记合法=%d\n", chunk, got.size(), (int)legal);
-        check(legal, "分块打包的 DoP 标记仍然合法（跨块交替正确）", std::to_string(chunk));
-        check(got.size() == ref.size(), "载波帧数与整块一致", std::to_string(chunk));
-        size_t diff = 0;
-        const size_t m = std::min(got.size(), ref.size());
-        for (size_t i = 0; i < m; ++i) if (got[i] != ref[i]) ++diff;
-        check(diff == 0, "与整块打包结果逐位一致", std::to_string(diff) + " 个不同");
+    size_t samples=0, cases=0;
+    for(auto family:{ModulatorFamily::Dsd,ModulatorFamily::Chebyshev,ModulatorFamily::Ec,ModulatorFamily::Ahm})
+    for(double fs:{2822400.0,22579200.0,45158400.0})
+    for(int order:{3,5,7})
+    for(int channels:{1,2,6}) {
+        SdmConfig cfg;cfg.fs=fs;cfg.family=family;cfg.order=order;
+        cfg.oneBitOutput=true;cfg.cutoffHz=100000;cfg.ditherLsb=.0005;
+        Legacy old(cfg,channels), current(cfg,channels);DopModulationStream packed;
+        size_t position=0;
+        for(size_t block:{1u,2u,7u,16u,31u,4096u,15u,1001u}) {
+            std::vector<std::vector<double>> in(channels,std::vector<double>(block));
+            for(int c=0;c<channels;++c) for(size_t i=0;i<block;++i) {
+                const size_t k=position+i;
+                double v=.62*std::sin(2*kPi*(c+1)*997.0*double(k)/fs);
+                if(k==12) v=5.0;
+                if(k==18) v=std::numeric_limits<double>::quiet_NaN();
+                if(k==23) v=-std::numeric_limits<double>::infinity();
+                in[c][i]=v;
+            }
+            const size_t drop=block==31?7:0;
+            std::vector<int32_t> actual;
+            REQUIRE(packed.process(in,current.mods,drop,false,actual));
+            REQUIRE(actual==old.run(in,drop,false));
+            REQUIRE(packed.pending_bits()==old.carry[0].size());
+            position+=block;samples+=block*channels;
+        }
+        std::vector<int32_t> actual;
+        REQUIRE(packed.process({},current.mods,0,true,actual));
+        REQUIRE(actual==old.run({},0,true));REQUIRE(packed.pending_bits()==0);
+        for(int c=0;c<channels;++c) {
+            REQUIRE(current.mods[c]->clamped()==old.mods[c]->clamped());
+            REQUIRE(current.mods[c]->overload()==old.mods[c]->overload());
+            REQUIRE(current.mods[c]->nonFinite()==old.mods[c]->nonFinite());
+        }
+        // Preserve marker phase on seek, but discard old pending bits and SDM history.
+        std::vector<std::vector<double>> part(channels,std::vector<double>(21,.01));
+        REQUIRE(packed.process(part,current.mods,0,false,actual));
+        REQUIRE(actual==old.run(part,0,false));
+        packed.discard_pending();
+        for(auto& v:old.carry)v.clear();
+        for(auto& m:old.mods)m->reset();for(auto& m:current.mods)m->reset();
+        REQUIRE(packed.process(part,current.mods,3,true,actual));
+        REQUIRE(actual==old.run(part,3,true));
+        ++cases;
     }
-
-    // 3) 解包后的 1-bit 流前 4096 位应与"不打包直接取符号"一致
-    {
-        SdmConfig cfg; cfg.fs = (double)dsd_rate(mult); cfg.order = 5; cfg.levels = 2;
-        cfg.cutoffHz = 100000.0; cfg.ditherLsb = 0.01;
-        SdmModulator mod(cfg);
-        std::vector<double> direct;
-        for (size_t n = 0; n < N; ++n) direct.push_back(mod.process(pcm[n]));
-        size_t diff = 0;
-        for (size_t i = 0; i < std::min(bitsRef[0].size(), direct.size()); ++i)
-            if (bitsRef[0][i] != direct[i]) ++diff;
-        check(diff == 0, "解包还原的 1-bit 流与调制器输出一致", std::to_string(diff) + " 位不同");
-    }
-
-    // 4) 48k 家族的速率换算
-    check(dsd_rate(128, 48000) == 6144000u, "48k 家族 DSD128 = 6.144 MHz",
-          std::to_string(dsd_rate(128, 48000)));
-    check(dop_carrier_rate(64, 48000) == 192000u, "48k 家族 DSD64 载波 = 192 kHz",
-          std::to_string(dop_carrier_rate(64, 48000)));
-
-    printf("\n%s (失败项 %d)\n", fails == 0 ? "全部通过" : "存在失败", fails);
-    return fails == 0 ? 0 : 1;
+    SdmConfig multi;multi.family=ModulatorFamily::Ahm;multi.oneBitOutput=false;
+    Legacy invalid(multi,2);DopModulationStream stream;std::vector<int32_t> out{123,456};
+    std::string why;
+    REQUIRE(!stream.process({{.2},{.2}},invalid.mods,0,false,out,&why));
+    REQUIRE(!why.empty() && (out==std::vector<int32_t>{123,456}));
+    SdmConfig cfg;cfg.oneBitOutput=true;Legacy valid(cfg,2);
+    REQUIRE(!stream.process({{.2},{}},valid.mods,0,false,out));
+    REQUIRE(!stream.process({{.2},{.2}},valid.mods,2,false,out));
+    REQUIRE(stream.pending_bits()==0 && (out==std::vector<int32_t>{123,456}));
+    std::cout<<"PASS "<<cases<<" configurations "<<samples<<" SDM samples, byte-identical legacy output; seek/EOF/rejection checked\n";
 }

@@ -187,6 +187,68 @@ static int run_tests() {
         check(onGrid, "样本严格落在 16-bit 量化网格上");
     }
 
+
+    // ---------------------------------------------------------------
+    // 2026-10-30：bit-perfect 判定必须问「源有多深」，不是「容器有多宽」
+    //
+    // 缺陷（用户实测，同一会话内两种结论并存）：
+    //   16 bit WAV   in=16 out=24@44100 ⟹ bp=yes「源→解码→输出全程逐位一致」
+    //   MP3(float32) in=32 out=24@44100 ⟹ bp=no 「原因未归类」
+    // 真因：willBeBitPerfect/willBeZeroPad 见到 in.isFloat 就 return false，
+    //   而且拿 in.bits(容器=32) 去比 outBits(24)，把「16bit 源装进 float 容器」
+    //   当成了「32→24 位深降低」。
+    //
+    // 判据设计：同一个 16bit 源的两种解码形态（int16 缓冲 / float32 缓冲）必须得到
+    //   同一个结论 —— 这才是「判据问的是源、不是容器」的可证形式。
+    // ---------------------------------------------------------------
+    {
+        const size_t N = 1024;
+        AudioBuffer i16 = make_test(44100, 2, 16, N, 12345);
+
+        PipelineConfig c;
+        c.outRate = 44100;
+        c.outBits = 24;
+        c.outChannels = 2;
+        c.sourceBits = 16;                    // 真实源 16 bit
+        Pipeline p(c);
+
+        check(p.willBeZeroPad(i16) && !p.willBeBitPerfect(i16),
+              "16bit 源 → 24bit 输出：判为无损展宽（不是逐位同格式）");
+
+        // float32 容器 + 已知源位深 16：与上面的 int16 缓冲**必须同结论**
+        AudioBuffer f32 = i16;
+        f32.isFloat = true;
+        f32.bits = 32;
+        check(p.willBeZeroPad(f32) && !p.willBeBitPerfect(f32),
+              "同一份 16bit 源的 float32 容器：结论与 int16 容器一致（旧代码此处一律 false）");
+
+        // 源位深未知 + float ⟹ 不敢承诺（这是唯一该保守的情况）
+        PipelineConfig cu = c;
+        cu.sourceBits = 0;
+        Pipeline pu(cu);
+        check(!pu.willBeZeroPad(f32) && !pu.willBeBitPerfect(f32),
+              "float 容器且源位深未知：不承诺逐位（保守）");
+
+        // 真实的位深降低（32bit 源 → 24bit 输出）必须仍然判否
+        PipelineConfig cr = c;
+        cr.sourceBits = 32;
+        Pipeline pr(cr);
+        check(!pr.willBeZeroPad(f32) && !pr.willBeBitPerfect(f32),
+              "32bit 源 → 24bit 输出：仍判非逐位（新逻辑没有放宽到失真）");
+
+        // 同格式逐位：16bit 源 → 16bit 输出
+        PipelineConfig c16 = c;
+        c16.outBits = 16;
+        Pipeline p16(c16);
+        check(p16.willBeBitPerfect(i16), "16bit 源 → 16bit 输出：判为逐位一致");
+
+        // 重采样必须一票否决
+        PipelineConfig cs = c;
+        cs.outRate = 48000;
+        Pipeline ps2(cs);
+        check(!ps2.willBeZeroPad(i16) && !ps2.willBeBitPerfect(i16),
+              "重采样 44.1k→48k：即使位深无损也判否");
+    }
     printf("\n%s (失败项 %d)\n", fails == 0 ? "全部通过" : "存在失败", fails);
     return fails == 0 ? 0 : 1;
 }

@@ -494,8 +494,9 @@ static HWND make_hidden_window(HINSTANCE hInst) {
 static int check_test(const AsioDriverEntry& e, double rate, int ch) {
     AsioDriver drv;
     std::string err;
-    if (!drv.open(e.clsid, rate, ch, 24, err, nullptr, true)) { printf("open 失败: %s\n", err.c_str()); return 2; }
-    if (!drv.start(err)) { printf("start 失败: %s\n", err.c_str()); return 3; }
+    // 同 stream_test：这两个都是正常返回（进程没崩），父进程不该据此永久拉黑。
+    if (!drv.open(e.clsid, rate, ch, 24, err, nullptr, true)) { printf("open 失败: %s\n", err.c_str()); return 20; }
+    if (!drv.start(err)) { printf("start 失败: %s\n", err.c_str()); return 21; }
     drv.stop();
     drv.close();
     printf("OK\n");
@@ -506,14 +507,17 @@ static int stream_test(const AsioDriverEntry& e, double rate, int ch, void* hwnd
     printf("\n=== 推流测试（零样本，%d ms）%s @ %.0f Hz / %d ch ===\n", ms, e.name.c_str(), rate, ch);
     AsioDriver drv;
     std::string err;
-    if (!drv.open(e.clsid, rate, ch, 24, err, hwnd, nopCb)) { printf("open 失败: %s\n", err.c_str()); return 1; }
+    // 2026-10-28（261028-01 #2，SMSL DAC）：退出码要能区分「可恢复失败」与「真崩溃」，
+    //   否则父进程的预检只能一刀切，把"设备被占用"当成"驱动会崩"永久拉黑。
+    //   这里的 10/11 都是**正常返回**（进程没崩），父进程据此只记不拦。
+    if (!drv.open(e.clsid, rate, ch, 24, err, hwnd, nopCb)) { printf("open 失败: %s\n", err.c_str()); return 10; }
     printf("open OK: %s, 声道 %d（驱动输出 %d），缓冲 %ld 帧，outReady=%d\n",
            drv.name().c_str(), drv.channels(), drv.driver_out_channels(),
            drv.buffer_size(), (int)drv.out_ready_supported());
     for (int c = 0; c < drv.channels(); ++c)
         printf("   ch%d type=%ld %s\n", c, (long)drv.channel_type(c), type_str(drv.channel_type(c)));
 
-    if (!drv.start(err)) { printf("start 失败: %s\n", err.c_str()); return 1; }
+    if (!drv.start(err)) { printf("start 失败: %s\n", err.c_str()); return 11; }
     std::vector<int32_t> zeros((size_t)drv.buffer_size() * (size_t)drv.channels(), 0);
     const size_t total = (size_t)(rate * (double)ms / 1000.0);
     size_t pushed = 0;

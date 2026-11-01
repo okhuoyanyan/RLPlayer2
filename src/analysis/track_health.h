@@ -58,7 +58,7 @@ struct TrackHealth {
     double confidence = 0.0;
     std::string reason;          // 中文人话，UI 直接显示
     bool   fake24bit = false;
-    // 判定档：0 未发现 / 1 疑似有损 / 2 有效带宽受限（不判假）/ 3 证据不足
+    // 判定档：0 未发现 / 1 疑似有损 / 2 有效带宽受限（不判假）/ 3 证据不足 / 4 源本身有损（不判假）
     // （与 fake_lossless.h 的 kFakeVerdict* 一一对应；UI 不再自己拿比值/置信度猜）
     int    fakeVerdict = 0;
     double edgeDb = 0.0;         // 陡沿（各窗中位数，dB）
@@ -138,6 +138,7 @@ inline const char* fake_verdict_tag(int v) {
         case 1:  return "lossy";         // 疑似有损转码（判假）
         case 2:  return "band_limited";  // 有效带宽受限（不判假）
         case 3:  return "unclear";       // 证据不足
+        case 4:  return "source_lossy";  // 源本身有损格式（问题不适用，不判假）
         default: return "none";          // 未发现
     }
 }
@@ -279,6 +280,62 @@ inline void apply_completeness(TrackHealth& h, const std::string& path) {
     h.note = note;
 }
 
+// 提取小写扩展名（含前导点），无扩展名则返回空串。
+// 以最后一个路径分隔符之后的最后一个 '.' 为准，避免 "C:/dir.v1/song" 误把 ".v1/song" 当扩展名。
+inline std::string extension_lower_of(const std::string& path) {
+    const size_t sep = path.find_last_of("/\\");
+    const size_t start = (sep == std::string::npos) ? 0 : sep + 1;
+    const size_t dot = path.rfind('.');
+    if (dot == std::string::npos || dot < start) return {};
+    std::string ext = path.substr(dot);
+    for (char& c : ext) {
+        c = (char)std::tolower((unsigned char)c);
+    }
+    return ext;
+}
+
+// 判定容器是否为已知有损格式（大小写不敏感，按文件扩展名判定）。
+// 依据：音频体检中的假无损检测（fake_lossless.h）旨在发现「有损转制进无损容器」（欺诈/劣质升档）。
+// 若文件本身直接存放在有损格式容器（.mp3/.aac/.opus 等）中，则「假无损」前提在逻辑上不适用。
+// 且 VBR 有损帧截止频点波动大，跨窗一致性天然受损，频谱分析极易结构性误判为 unclear。
+inline bool lossy_container_of(const std::string& path) {
+    const std::string ext = extension_lower_of(path);
+    if (ext.empty()) return false;
+    static const char* const kLossyExts[] = {
+        ".mp3", ".mp2", ".aac", ".m4a", ".ogg", ".oga", ".opus",
+        ".wma", ".mpc", ".ac3", ".dts", ".spx", ".amr", ".ra"
+    };
+    for (const char* e : kLossyExts) {
+        if (ext == e) return true;
+    }
+    return false;
+}
+
+// 若源容器为已知有损格式，覆盖假无损结论：
+// 1) fakeVerdict 设为 4 (kFakeVerdictSourceLossy)，losslessSuspected 设为 false；
+// 2) reason 说明「源本身是有损格式：不存在假无损问题」，保留截止与置信度作为诊断信息；
+// 3) 其它体检指标（DR/LUFS/LRA/真峰/音质分析）完全保留不跳过。
+inline void apply_lossy_source(TrackHealth& h, const std::string& path) {
+    if (h.status == "error") return;
+    if (!lossy_container_of(path)) return;
+    const std::string ext = extension_lower_of(path);
+    h.fakeVerdict = kFakeVerdictSourceLossy;
+    h.losslessSuspected = false;
+    char b[384] = {0};
+    if (h.cutoffHz > 0.0) {
+        std::snprintf(b, sizeof(b),
+            "源本身是有损格式（%s）：不存在『假无损』问题（假无损指有损内容被转制进无损容器）。"
+            "频谱截止 %.1f kHz / 置信度 %.2f 仅作参考。",
+            ext.c_str(), h.cutoffHz * 1e-3, h.confidence);
+    } else {
+        std::snprintf(b, sizeof(b),
+            "源本身是有损格式（%s）：不存在『假无损』问题（假无损指有损内容被转制进无损容器）。"
+            "未见明显频谱截止（置信度 %.2f）仅作参考。",
+            ext.c_str(), h.confidence);
+    }
+    h.reason = b;
+}
+
 } // namespace detail
 
 // 核心入口（解码无关）：对已在内存里的 AudioBuffer 做体检。不抛异常。
@@ -296,6 +353,7 @@ inline TrackHealth analyze_file_whole(const std::string& path) {
         rta::audio::AudioBuffer buf = rta::audio::read_any(path, &note);
         TrackHealth h = analyze_buffer(buf);
         detail::apply_completeness(h, path);     // BUG-3：半截文件 → incomplete（指标照给）
+        detail::apply_lossy_source(h, path);     // 覆盖假无损结论（源本身有损）
         return h;
     } catch (const std::exception& e) {
         h.status = "error";
@@ -319,6 +377,7 @@ inline TrackHealth analyze_file(const std::string& path, const HealthStreamOptio
             TrackHealth h = detail::drive_health(src, opt.blockFrames, &ok);
             if (ok && h.status == "ready") {
                 detail::apply_completeness(h, path);   // BUG-3：流式路径同样要判（WAV/DSF）
+                detail::apply_lossy_source(h, path);   // 覆盖假无损结论（源本身有损）
                 return h;
             }
             // 短读/计划不成立/无样本：回退整段路径，用老实现的结论（错误信息也由它给）。

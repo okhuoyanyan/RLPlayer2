@@ -1,4 +1,4 @@
-# build_gpu.ps1 - build the multi-arch AMD HIP backend (rtagpu.dll).
+﻿# build_gpu.ps1 - build the multi-arch AMD HIP backend (rtagpu.dll).
 #
 # One fat binary with code objects for every AMD GPU family the compiler can
 # target. The runtime picks the matching image; if the actual GPU is not in the
@@ -32,7 +32,10 @@ $src = @((Join-Path $root 'src\gpu\gpu_conv_hip.cpp'), (Join-Path $root 'src\gpu
 $hipArgs = @()
 foreach ($a in $archs) { $hipArgs += "--offload-arch=$a" }
 # Host code stays at the x86-64-v2 distribution baseline (never native/AVX-512).
-$hipArgs += @('-O3', '-march=x86-64-v2', '-shared', '-I', (Join-Path $root 'src')) + $src + @('-o', $Out)
+# ★ 2026-10-31（DEBUG-DSP 检查 3）：device 默认 FMA 收缩，而 host 是 -ffp-contract=off ⟹
+#   GPU 升频与 CPU 升频**不是逐位相同**（实测 742004/1048576 样不同，max|Δ|=3.886e-16）。
+#   加 -ffp-contract=off 后实测 0/1048576、max|Δ|=0。
+$hipArgs += @('-O3', '-march=x86-64-v2', '-ffp-contract=off', '-shared', '-I', (Join-Path $root 'src')) + $src + @('-o', $Out)
 
 $log = Join-Path $root 'build\gpu_build.log'
 Write-Host ("building rtagpu.dll for " + $archs.Count + " archs ...")

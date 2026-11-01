@@ -23,6 +23,7 @@
 //     级数越低混叠抑制越差，测试里会打印实测值。
 //   * IIR 的高频阻带是渐进的，靠阶数堆；数值底噪大约 −150 dBFS 量级。
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include "audio/dsd_reader.h"
 #include "kaiser.h"
 #include "filter_design.h"
@@ -126,6 +127,30 @@ public:
     }
     const std::vector<double>& firTaps() const { return isTwoStage() ? h2_ : h_; }
     const std::vector<double>& compTaps() const { return comp_; }
+
+    // Exact finite support for FIR/CIC. IIR has infinite support: retain a
+    // conservative pole-decay tail to -300 dB amplitude, without trimming head.
+    size_t tailInputBits() const {
+        if (isTwoStage()) return (size_t)cicStages_ * (R1_ - 1) + (h2_.size() - 1) * R1_;
+        if (cfg_.kind == IntegratorKind::Fir) return h_.empty() ? 0 : h_.size() - 1;
+        if (cfg_.kind == IntegratorKind::Cic)
+            return (size_t)cicStages_ * (M_ - 1) + (comp_.empty() ? 0 : (comp_.size() - 1) * M_);
+        double radius = 0.0;
+        for (const auto& q : iir_) radius = std::max(radius, std::sqrt(q.a2));
+        return radius > 0.0 && radius < 1.0
+            ? (size_t)std::ceil(std::log(1e-15) / std::log(radius)) * std::max<size_t>(1, iir_.size()) + 64 : 0;
+    }
+    double latencyInputBits() const {
+        return cfg_.kind == IntegratorKind::Iir ? 0.0 : 0.5 * (double)tailInputBits();
+    }
+    // Drain with mathematical zero, not a packed all-zero (-1 DC) DSD stream.
+    void process_zeros(size_t inputBits, std::vector<double>& out) {
+        for (size_t i = 0; i < inputBits; ++i) {
+            if (isTwoStage()) step_two_stage_value(0, out);
+            else step(0.0, out);
+        }
+    }
+    void drain(std::vector<double>& out) { process_zeros(tailInputBits(), out); }
 
     // 设计响应（dB）。f 为 Hz；CIC 已含补偿（若启用）。
     double response_db(double f) const {
@@ -443,6 +468,9 @@ private:
 
     inline void step_two_stage(bool bit, std::vector<double>& out) {
         uint64_t x = bit ? 1ull : (uint64_t)-1ll;
+        step_two_stage_value(x, out);
+    }
+    inline void step_two_stage_value(uint64_t x, std::vector<double>& out) {
         integ6_[0] += x;
         integ6_[1] += integ6_[0];
         integ6_[2] += integ6_[1];
@@ -513,7 +541,7 @@ private:
             }
             case IntegratorKind::Cic: {
                 // ±1 用无符号 64 位表示：回绕是定义行为，且会在梳状差分里抵消
-                uint64_t x = (v > 0.0) ? 1ull : (uint64_t)-1ll;
+                uint64_t x = (v > 0.0) ? 1ull : (v < 0.0 ? (uint64_t)-1ll : 0ull);
                 for (auto& s : integ_) { s += x; x = s; }
                 if (inCount_ % (uint64_t)M_ == 0) {
                     uint64_t c = x;

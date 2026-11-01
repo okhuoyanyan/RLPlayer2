@@ -1,0 +1,6 @@
+#pragma once
+namespace rta::update {
+struct ApplicationUpdateAsset { const char* path; const char* sha256; };
+inline constexpr ApplicationUpdateAsset kApplicationUpdateAssets[] = {
+@RLPLAYER_UPDATE_ASSET_ENTRIES@};
+}

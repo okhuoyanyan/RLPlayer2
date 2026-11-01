@@ -43,9 +43,17 @@ public:
             loadError_ = readErr;      // 文件不存在时 readErr 为空 → 空库，不算错误
             return;
         }
-        const rta::net::Json root = rta::net::json_parse(text);
+        // ★ 2026-10-29（两轮审查 F32）：缓存文件必须【严格解析】。
+        //   宽松解析会把被截断的数组当成"合法数组"，只丢掉尾巴，其余条目照用 ——
+        //   而 save() 随后会用这份残缺结果覆盖原文件（把损坏固化）。
+        rta::net::Json root;
+        std::string perr;
+        if (!rta::net::json_parse_strict(text, root, &perr)) {
+            loadError_ = "缓存文件损坏（" + perr + "），已按空库处理且不会回写: " + jsonPath_;
+            return;
+        }
         if (root.type != rta::net::Json::Arr) {
-            loadError_ = "缓存文件损坏（不是合法 JSON 或根不是数组），已按空库处理且不会回写: " + jsonPath_;
+            loadError_ = "缓存文件损坏（根不是数组），已按空库处理且不会回写: " + jsonPath_;
             return;
         }
         for (size_t i = 0; i < root.size(); ++i) {
@@ -57,23 +65,78 @@ public:
             Entry en;
             en.mtime = (int64_t)std::llround(e["mtime"].n());
             en.size  = (int64_t)std::llround(e["size"].n());
+            // ★ F32：旧缓存只回填了"老字段"，true_peak_dbtp / fake_verdict / edge_db /
+            //   window_fill / declared_sec / incomplete / note / quality 全部丢失 ⟹
+            //   缓存命中与首次分析给出的 JSON 不一致（真峰被当成 0，过载提示永远不亮）。
+            //   而且**缺失字段不能当 0**：宁可判缓存失效（重算），也不能把"没测过"
+            //   伪装成"测得 0"。所以要求新字段必须存在，缺任何一个就跳过该条。
+            if (!hj.has("true_peak_dbtp") || !hj.has("quality") || !hj.has("fake_verdict")) {
+                ++skipped_;
+                continue;
+            }
             TrackHealth& h = en.health;
             h.drDb = hj["dr_db"].n();
             h.lufs = hj["lufs"].n();
             h.lra = hj["lra"].n();
             h.peakDbfs = hj["peak_dbfs"].n();
+            h.truePeakDbtp = hj["true_peak_dbtp"].n();
             h.losslessSuspected = hj["lossless_suspected"].b || hj["lossless_suspected"].n() != 0.0;
             h.cutoffHz = hj["cutoff_hz"].n();
             h.confidence = hj["confidence"].n();
             h.reason = hj["reason"].s();
             h.fake24bit = hj["fake24"].b || hj["fake24"].n() != 0.0;
+            h.fakeVerdict = fake_verdict_from_tag(hj["fake_verdict"].s());
+            h.edgeDb = hj["edge_db"].n();
+            h.windows = (int)std::llround(hj["spectral_windows"].n());
+            h.windowFill = hj.has("window_fill") ? hj["window_fill"].n() : 1.0;
             h.durationSec = hj["duration_sec"].n();
             h.fs = (uint32_t)std::llround(hj["fs"].n());
             h.channels = (int)std::llround(hj["channels"].n());
             h.bits = (int)std::llround(hj["bits"].n());
             h.status = hj["status"].s();
             h.error = hj["error"].s();
+            h.declaredSec = hj["declared_sec"].n();
+            h.incomplete = hj["incomplete"].b || hj["incomplete"].n() != 0.0;
+            h.note = hj["note"].s();
             h.analyzedAtMs = (int64_t)std::llround(hj["analyzed_at_ms"].n());
+            {
+                const rta::net::Json& q = hj["quality"];
+                h.hasQuality = q["available"].b || q["available"].n() != 0.0;
+                auto& r = h.quality;
+                r.valid = h.hasQuality;
+                r.thdnDb = q["thdn_db"].n();
+                r.thdnPct = q["thdn_pct"].n();
+                r.thdnAvailable = q["thdn_available"].b || q["thdn_available"].n() != 0.0;
+                r.thdnMethod = q["thdn_method"].s();
+                r.nonTonalDb = q["non_tonal_db"].n();
+                r.imdAvailable = q["imd_available"].b || q["imd_available"].n() != 0.0;
+                r.imdDb = q["imd_db"].n();
+                r.imdNote = q["imd_note"].s();
+                r.noiseFloorDbfs = q["noise_floor_dbfs"].n();
+                r.spectralMinDbfs = q["spectral_min_dbfs"].n();
+                r.snrDb = q["snr_db"].n();
+                r.centroidHz = q["centroid_hz"].n();
+                r.tiltDbPerOct = q["tilt_db_per_oct"].n();
+                r.rolloff95Hz = q["rolloff95_hz"].n();
+                r.hfRatio10kDb = q["hf_ratio_10k_db"].n();
+                r.peakDbfs = q["peak_dbfs_q"].n();
+                r.rmsDbfs = q["rms_dbfs"].n();
+                r.clippedSamples = (long long)std::llround(q["clipped_samples"].n());
+                r.clippedPct = q["clipped_pct"].n();
+                r.clippedRuns = (long long)std::llround(q["clipped_runs"].n());
+                r.longestClipRun = (long long)std::llround(q["longest_clip_run"].n());
+                r.crestDb = q["crest_db"].n();
+                r.stereo = q["stereo"].b || q["stereo"].n() != 0.0;
+                r.channelCorr = q["channel_corr"].n();
+                r.monoLossDb = q["mono_loss_db"].n();
+                r.sideMidDb = q["side_mid_db"].n();
+                r.dynP95P10Db = q["dyn_p95_p10_db"].n();
+                r.dynCentroidDbfs = q["dyn_centroid_dbfs"].n();
+                r.quietP10Dbfs = q["quiet_p10_dbfs"].n();
+                r.silencePct = q["silence_pct"].n();
+                r.spectralWindows = (int)std::llround(q["spectral_windows"].n());
+                r.note = q["note"].s();
+            }
             entries_[normalize_path_key(p)] = std::move(en);
         }
     }
@@ -134,6 +197,15 @@ public:
     int skippedEntries() const { return skipped_; }   // 解析时跳过的损坏条数（非致命）
 
 private:
+    // fake_verdict 的字符串标签 → 判定档（与 track_health.h 的 fake_verdict_tag 互逆）
+    static int fake_verdict_from_tag(const std::string& t) {
+        if (t == "lossy") return 1;
+        if (t == "band_limited") return 2;
+        if (t == "unclear") return 3;
+        if (t == "source_lossy") return 4;
+        return 0;
+    }
+
     struct Entry {
         int64_t mtime = 0;
         int64_t size = 0;

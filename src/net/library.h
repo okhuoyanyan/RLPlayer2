@@ -2091,12 +2091,17 @@ inline void Library::startScan(bool forceFull) {
 
         // 目录结构判据的按目录 memo（见 lib_dir_album_for / LibDirAlbumMemo 的注释）
         LibDirAlbumMemo dirMemo;
-        std::chrono::steady_clock::time_point lastMsg = std::chrono::steady_clock::now();
+        // ★ 2026-10-29（两轮审查 F26）：进度限频的时间戳被**多个工作者共享**，
+        //   旧实现是普通 time_point，在 msgMtx_ 之外被读写 ⟹ 数据竞争（UB，
+        //   C++ 内存模型下"偶尔文字错误"不是可接受的表现）。
+        //   改成原子毫秒时间戳；用 CAS 抢"更新权"，保证只有真正跨过 100ms 的线程写文案。
+        std::atomic<long long> lastMsgMs{ (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() };
 
         for (int i = 0; i < n; ++i) {
             if (cancel_.load()) break;
             const bool submitted = pool->submit([this, i, n, &walked, &oldByPath, &old, forceFull, &ffprobe,
-                                                 &fresh, &completed, &probedCount, &cachedCount, &dirMemo, &lastMsg,
+                                                 &fresh, &completed, &probedCount, &cachedCount, &dirMemo, &lastMsgMs,
                                                  &cueCand, &cueProbeMtx, &cueProbeMap]() {
                 if (cancel_.load()) return;
                 const std::string& p = walked[(size_t)i];
@@ -2169,11 +2174,15 @@ inline void Library::startScan(bool forceFull) {
                 scanned_.store(c);
                 // 进度文案：改为**限频**（每 100ms 一次）而不是每 8 首一次 —— 3000 首时旧实现要
                 // 抢 375 次全局锁，每次都会把 /api/lib/stats 顶到后面（铁律：状态查询不该被进度文案堵住）。
-                if (c == n || std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - lastMsg).count() >= 100.0) {
-                    lastMsg = std::chrono::steady_clock::now();
-                    std::lock_guard<std::mutex> lk(msgMtx_);
-                    scanMsg_ = "读取标签 " + std::to_string(c) + "/" + std::to_string(n);
+                // ★ F26：时间戳原子化 + CAS 抢"更新权"（见 lastMsgMs 声明处的注）
+                const long long nowMs = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                long long prevMs = lastMsgMs.load(std::memory_order_relaxed);
+                if (c == n || nowMs - prevMs >= 100) {
+                    if (c == n || lastMsgMs.compare_exchange_strong(prevMs, nowMs, std::memory_order_relaxed)) {
+                        std::lock_guard<std::mutex> lk(msgMtx_);
+                        scanMsg_ = "读取标签 " + std::to_string(c) + "/" + std::to_string(n);
+                    }
                 }
             });
             if (!submitted) break;
@@ -2188,6 +2197,29 @@ inline void Library::startScan(bool forceFull) {
         }
 
         if (cancel_.load()) {
+            scanning_.store(false);
+            return;
+        }
+
+        // ★ 2026-10-29（两轮审查 F12）：工作者抛出异常时**不得**发布新的索引。
+        //
+        // 缺陷：wait(false) 不重抛，而调用方从不看 hasError()。某个文件探测抛异常后，
+        //   那一条 fresh[i] 是空路径，扫描照样 tracks_.swap(fresh) 并写盘、报"完成"——
+        //   用户看到的是"扫了 3000 首"，实际少了那几首，而且旧索引已经被覆盖。
+        // 现在的契约：有异常 ⟹ 保留最后一份有效索引 + 明确报失败（并给出原因）；
+        //   要支持"部分扫描"必须另有完整性与合同，不能靠默认行为悄悄发生。
+        if (pool->hasError()) {
+            std::string why = "未知异常";
+            try {
+                pool->rethrowIfError();
+            } catch (const std::exception& e) {
+                why = e.what();
+            } catch (...) {
+            }
+            {
+                std::lock_guard<std::mutex> lk(msgMtx_);
+                scanMsg_ = "扫描失败：有任务抛出异常（索引保持扫描前的样子）：" + why;
+            }
             scanning_.store(false);
             return;
         }

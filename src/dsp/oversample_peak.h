@@ -7,6 +7,7 @@
 // 做法：用 8 抽头窗 sinc 在每两个采样之间插值 4 个点，取全局最大绝对值。
 // 只做检测，不做修改；要不要衰减由调用方决定（见 pipeline 的 preAttenDb）。
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include <cmath>
 #include <cstddef>
 #include <vector>

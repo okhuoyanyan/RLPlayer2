@@ -9,7 +9,7 @@ name: CI
 #    本项目在 clang 下开发，用 MSVC 编会引入「本地能过 CI 不能过」的假问题，反而失真。
 # 3. **不编 GPU**（rtagpu.dll 要 ROCm + hipcc，云机没有也没有 AMD 卡）：
 #    代码里 GPU 是可选后端，缺 rtagpu.dll 时自动纯 CPU，不影响 ctest 覆盖 DSP 正确性。
-# 4. **排除 wasapi_shared**：云机没有音频端点，该用例必然失败，且它验证的是设备交互而非算法。
+# 4. **仅排除 wasapi_shared / capture**：两项真实打开音频端点；云机没有音频设备。
 #    这不是「放水」——本地 verify.ps1 仍然是 11/11 的硬门禁。
 # 5. 失败时上传完整日志，方便协作者自己看是哪条挂了。
 
@@ -33,6 +33,12 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+
+      # CMake 现已要求 Python3；两个 Python CLI 测试只用标准库，无 pip 依赖。
+      - name: 准备 Python（CMake / CLI 回归 / 合成媒体夹具）
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
 
       # A 类失败（writeback / media_duration / decode_retry）的真因：云机本来没有 ffmpeg/ffprobe，
       # 而这三条用例把"缺工具"判为 FAIL（这是正确的门禁设计，绝不改成跳过）。
@@ -94,6 +100,14 @@ jobs:
           cmake --build build 2>&1 | Tee-Object -FilePath build-log.txt
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # tags_native 保留原有 >=12 文件与四种容器的 A/B 断言；素材完全由静音合成，
+      # 不依赖开发机 build/testdata、用户音乐或有版权的外部下载。
+      - name: 准备离线合成媒体夹具
+        shell: pwsh
+        run: |
+          python tools/prepare_ci_testdata.py --root . 2>&1 | Tee-Object -FilePath fixtures-log.txt
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       - name: 测试（ctest）
         shell: pwsh
         run: |
@@ -103,7 +117,7 @@ jobs:
           # 这条同样是硬门禁：正确性断言挂了一样红。
           ctest --test-dir build -R "^parallel$" -V 2>&1 | Tee-Object -FilePath parallel-log.txt
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          ctest --test-dir build --output-on-failure -E "wasapi_shared" 2>&1 | Tee-Object -FilePath ctest-log.txt
+          ctest --test-dir build --output-on-failure -E "^(wasapi_shared|capture)$" 2>&1 | Tee-Object -FilePath ctest-log.txt
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: 上传失败日志
@@ -115,6 +129,8 @@ jobs:
             build-log.txt
             ctest-log.txt
             parallel-log.txt
+            fixtures-log.txt
+            build/testdata/ci-synthetic/manifest.json
             build/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
           retention-days: 14

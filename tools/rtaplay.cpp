@@ -9,6 +9,7 @@
 #define NOMINMAX
 #include "audio/wav.h"
 #include "audio/audio_loader.h"
+#include "audio/rate_pick.h"
 #include "audio/wasapi_out.h"
 #include "audio/asio_out.h"      // ASIO 后端 + 原生 DSD（ASIO 2.3 IoFormat）
 #include "audio/dsd_reader.h"    // DirectSDM：.dsf/.dff 原始 1-bit 直通
@@ -328,11 +329,11 @@ static int play_asio_native_dsd(const AsioDriverEntry& e, const DsdStream& s, do
         pushed += w;
     }
     // 收尾：环里还压着约 0.18 秒数据。直接 stop 会让最后几个回调拿不到数据，
-    // 在统计里变成"假欠载"。正确做法是继续按实时节奏喂【全零字节】把尾巴冲干净。
+    // 在统计里变成"假欠载"。继续按实时节奏喂平衡 DSD 静音（全零是负满幅直流）。
     const size_t tailBytes = drv.buffered();
     const double tailMs = (double)tailBytes * 8.0 * 1000.0 / (double)s.rate;
     if (tailMs > 0.0 && tailMs < 1000.0) {
-        std::vector<uint8_t> zeros(period * (size_t)ch, 0);
+        std::vector<uint8_t> zeros(period * (size_t)ch, 0x69);
         const auto tTail = std::chrono::steady_clock::now();
         while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tTail).count()
                < tailMs + 20.0) {
@@ -373,7 +374,7 @@ static int play_asio_native_dsd(const AsioDriverEntry& e, const DsdStream& s, do
     return (okType && okRate && okCb && okSpeed) ? 0 : 4;
 }
 
-// 生成 DSD 素材（--gen-dsd）：--silent = 全零字节（恒定电平 = 数字静音，验证链路用）
+// DSD silence needs balanced +/-1 bits. All-zero bytes are full negative DC.
 static int gen_dsd(const std::string& path, double seconds, int multiple, bool silent,
                    double ampDb, double toneHz, int order) {
     if (multiple < 64) multiple = 64;
@@ -388,7 +389,8 @@ static int gen_dsd(const std::string& path, double seconds, int multiple, bool s
     s.data.assign(2, std::vector<uint8_t>((nBits + 7) / 8, 0));
     s.channelIds = {"SLFT", "SRGT"};
     if (silent) {
-        printf("生成全零 DSD：%zu 位/声道（全零字节 = 恒定电平 = 数字静音）\n", nBits);
+        for (auto& channel : s.data) std::fill(channel.begin(), channel.end(), 0x69);
+        printf("生成平衡 DSD 静音：%zu 位/声道（0x69，正负位数相等）\n", nBits);
     } else {
         const double amp = std::pow(10.0, ampDb / 20.0);
         if (ampDb > -20.0) {
@@ -440,6 +442,7 @@ int main(int argc, char** argv) {
         printf("  rtaplay <in.wav> [选项]\n");
         printf("选项:\n");
         printf("  --rate N          升频目标采样率        --taps N    滤波器抽头数\n");
+        printf("  --rate-policy prefer|strict|compatible  PCM采样率族策略（默认prefer，strict禁止手动跨族）\n");
         printf("  --bits N          输出位深              --shaper X  抖动/整形 (NS1/NS4/NS5/NS9/LNS15/TPDF/...)\n");
         printf("  --eq <file.txt>   REW/AutoEq 参数 EQ    --ir <ir.wav> 卷积脉冲响应\n");
         printf("  --matrix <spec>   路由, 如 0>0:0,1>1:0,0>1:-6\n");
@@ -484,19 +487,26 @@ int main(int argc, char** argv) {
     }
     if (first == "--asio-list") return asio_list_drivers();
     if (first == "--gen-dsd") {
-        if (argc < 3) { printf("--gen-dsd 需要输出文件名\n"); return 1; }
+        // ★ 2026-10-31：输出文件名原来是**位置参数且必须是 argv[2]**，于是
+        //   `--gen-dsd --rate 64 ...` 会把 "--rate" 当成输出文件名，报
+        //   「读回失败：不是 DSD 文件（按扩展名判断）: --rate」。
+        //   改成：选项与路径可以任意顺序，非 `--` 开头的第一个参数就是输出路径。
         bool silent = false; double sec = 10.0, ampDb = -60.0, tone = 1000.0; int mult = 64, order = 5;
-        for (int i = 3; i < argc; ++i) {
+        std::string outPath;
+        for (int i = 2; i < argc; ++i) {
             const std::string k = argv[i];
+            if (k.size() < 2 || k[0] != '-' || k[1] != '-') { if (outPath.empty()) outPath = k; continue; }
             auto nx = [&](const char* d) -> std::string { return (i + 1 < argc) ? std::string(argv[++i]) : std::string(d); };
             if (k == "--seconds") sec = atof(nx("10").c_str());
             else if (k == "--rate") mult = atoi(nx("64").c_str());
             else if (k == "--amp") ampDb = atof(nx("-60").c_str());
             else if (k == "--tone") tone = atof(nx("1000").c_str());
             else if (k == "--order") order = atoi(nx("5").c_str());
+            else if (k == "--out") outPath = nx("");
             else if (k == "--silent") silent = true;
         }
-        return gen_dsd(argv[2], sec, mult, silent, ampDb, tone, order);
+        if (outPath.empty()) { printf("--gen-dsd 需要输出文件名（位置参数或 --out）\n"); return 1; }
+        return gen_dsd(outPath, sec, mult, silent, ampDb, tone, order);
     }
     if (first == "--gen") {
         if (argc < 3) { printf("--gen 需要输出文件名\n"); return 1; }
@@ -509,7 +519,11 @@ int main(int argc, char** argv) {
 
     std::string inPath = first;
     std::string deviceId;
+    std::string rateFamilyPolicy = "prefer";
+    bool ratePolicyExplicit = false, rateMax = false;
     eng::PipelineConfig cfg;
+    cfg.useFixed = true;   // 261030-01 D-11：允许定点；真正闸门在 Pipeline::prepare（无处理+24bit 才生效）
+    cfg.autoTaps = true;   // 261030-01 §4.3：抽头反解（T 与输出率解耦）
     cfg.taps = 65536;
     double bufferMs = 100.0;
     double limitSec = 5.0;
@@ -536,18 +550,11 @@ int main(int argc, char** argv) {
         std::string k = argv[i];
         auto next = [&](const char* def) -> std::string { return (i + 1 < argc) ? std::string(argv[++i]) : std::string(def); };
         if (k == "--device")      deviceId = next("");
-        else if (k == "--rate")   cfg.outRate = (uint32_t)atoi(next("0").c_str());
+        else if (k == "--rate")   { cfg.outRate = (uint32_t)atoi(next("0").c_str()); rateMax = false; }
+        else if (k == "--rate-policy") { rateFamilyPolicy = next(""); ratePolicyExplicit = true; }
         else if (k == "--rate-max") {
-            // 自动选设备在独占模式下支持的最高采样率（只查询，不开流不发声）。
-            // 这正是「尽量升上去」的常见需求 —— 由设备能力决定，而不是靠猜。
-            // 注意：--rate-max 是【开关】，不能调用 next() —— 那会吃掉后面的参数，
-            // 导致位深取到 0、格式查询全部失败（本轮踩到）。位深固定用 24。
-            auto rs = rta::audio::WasapiOutput::exclusive_rates("", 24, 2);
-            if (rs.empty()) { printf("!! --rate-max: 探测不到设备支持的采样率，回退到源采样率\n"); }
-            else {
-                cfg.outRate = rs.back();
-                printf("--rate-max: 设备支持的最高采样率 = %u Hz\n", cfg.outRate);
-            }
+            // Resolve after reading the source and all CLI options, including --device.
+            rateMax = true;
         }
         else if (k == "--taps")   cfg.taps = atoi(next("65536").c_str());
         else if (k == "--bits")   cfg.outBits = atoi(next("0").c_str());
@@ -609,11 +616,11 @@ int main(int argc, char** argv) {
     // ================= DirectSDM：DSD 文件 → ASIO 原生 DSD（不经过 PCM） =================
     // 为什么必须在 read_any 之前拦截：read_any 会把 .dsf 抽成 PCM（多一层量化、
     // 丢掉原始 1-bit 流），那样就谈不上"原生 DSD"了。
-    if (nativeDsd && asioDevice.empty()) {
+    if (nativeDsd && !analyzeOnly && asioDevice.empty()) {
         printf("!! --native-dsd 需要配合 --asio-device（原生 DSD 只走 ASIO）\n");
         return 1;
     }
-    if (nativeDsd) {
+    if (nativeDsd && !analyzeOnly) {
         std::string ext;
         const size_t dot = inPath.find_last_of('.');
         if (dot != std::string::npos) {
@@ -651,18 +658,22 @@ int main(int argc, char** argv) {
 
     // ---- 命名滤波器（手册 4.6）----
     if (!filterName.empty()) {
+        // ★ 2026-10-31（§7.4 L1 一致性）：CLI 也要认 "auto"（GUI 早已支持）。
+        //   否则同一份配置在 GUI 能用、在 CLI 报「未知滤波器」——两条路径行为不同。
+        if (rta::dsp::is_auto_preset(filterName)) filterName = rta::dsp::auto_preset_name();
         const auto* fp = rta::dsp::find_preset(filterName, in.rate >= 88200);
         if (!fp) { printf("!! 未知滤波器 '%s'；用 --list-filters 查看全部\n", filterName.c_str()); return 1; }
-        cfg.taps         = fp->taps;
-        cfg.transition   = fp->transition;
-        cfg.attenDb      = fp->attenDb;
-        cfg.filterWindow = fp->window;
-        cfg.filterPhase  = fp->phase;
-        cfg.twoStage     = fp->twoStage;
-        cfg.minTapsPerInput = fp->tapsPerInput;   // 2026-10-25：每相位抽头地板（* -tight 预设靠它）
-        if (fp->twoStage && fp->stage2Taps > 0) cfg.stage2Taps = fp->stage2Taps;
-        printf("滤波器: %s (%d 抽头, 过渡 %.3f, 阻带 %.0f dB, %s%s)\n",
-               fp->name, fp->taps, fp->transition, fp->attenDb,
+        // ★ 2026-10-29（两轮审查 F22）：单一映射入口 —— 以前这里是第二份手工逐字段拷贝，
+        //   与 rtaweb/配置文件两处一起漏掉 apodizing/apodF1/apodF2 ⟹ CLI 选切趾等于没选。
+        rta::engine::apply_filter_preset(cfg, *fp);
+        // 261030-01 D-11：CLI 也打开定点闸门（真正条件由 Pipeline::prepare 判定）
+        cfg.useFixed = true;
+        // 阻带打印**设计实际用的值**（max(预设历史值, 家族天花板)），不是 fp->attenDb：
+        // 旧写法在 poly-sinc-short-lp 上打印「120 dB」，而实际按 280 dB 设计（实测 −308.5 dB），
+        // 用户拿 CLI 输出对照 UI 会看到两套数字 —— 与 2.1.6 修的 filter_report 同一类问题。
+        const double designAtten = std::max(fp->attenDb, rta::dsp::preset_ceiling_db(fp->window));
+        printf("滤波器: %s (%d 抽头, 过渡 %.3f, 设计阻带 %.0f dB, %s%s)\n",
+               fp->name, fp->taps, fp->transition, designAtten,
                fp->phase == rta::dsp::PhaseKind::Minimum ? "最小相位" :
                (fp->phase == rta::dsp::PhaseKind::Intermediate ? "混合相位" : "线性相位"),
                fp->twoStage ? ", 两段式" : "");
@@ -693,6 +704,7 @@ int main(int argc, char** argv) {
             key = tr(key); val = tr(val);
             if (key.empty() || val.empty()) continue;
             if      (key == "rate"   && cfg.outRate == 0)  { cfg.outRate = (uint32_t)atoi(val.c_str()); ++applied; }
+            else if (key == "rateFamilyPolicy" && !ratePolicyExplicit) { rateFamilyPolicy = val; ++applied; }
             else if (key == "bits"   && cfg.outBits == 0)  { cfg.outBits = atoi(val.c_str()); ++applied; }
             else if (key == "taps"   && cfg.taps == 65536){ cfg.taps = atoi(val.c_str()); ++applied; }
             else if (key == "shaper" && cfg.shaper == rta::dsp::Shaper::None) { cfg.shaper = parse_shaper(val); ++applied; }
@@ -705,13 +717,14 @@ int main(int argc, char** argv) {
             else if (key == "device" && deviceId.empty())  { deviceId = val; ++applied; }
             else if (key == "filter" && filterName.empty()) {
                 filterName = val;
+                // ★ 2026-10-31（§7.4 L1 一致性）：CLI 也要认 "auto"。
+                //   否则 `--filter auto` 在 GUI 里能用、在 CLI 里找不到预设而静默退回默认 Kaiser ——
+                //   同一份配置两条路径行为不同，正是 2.1.6 修的那类「假声明」。
+                if (rta::dsp::is_auto_preset(filterName)) filterName = rta::dsp::auto_preset_name();
                 const auto* fp = rta::dsp::find_preset(filterName, in.rate >= 88200);
                 if (fp) {
-                    cfg.taps = fp->taps; cfg.transition = fp->transition; cfg.attenDb = fp->attenDb;
-                    cfg.filterWindow = fp->window; cfg.filterPhase = fp->phase;
-                    cfg.twoStage = fp->twoStage;
-                    cfg.minTapsPerInput = fp->tapsPerInput;   // 2026-10-25：每相位抽头地板
-                    if (fp->twoStage && fp->stage2Taps > 0) cfg.stage2Taps = fp->stage2Taps;
+                    rta::engine::apply_filter_preset(cfg, *fp);   // ★ F22：同一映射入口
+                    cfg.useFixed = true;   // 261030-01 D-11：闸门在 prepare 里
                     ++applied;
                 }
             }
@@ -719,6 +732,30 @@ int main(int argc, char** argv) {
             else if (key == "modulator")                   { /* 预留：SDM 输出 */ }
         }
         printf("配置: %s -> 应用 %d 项\n", configFile.c_str(), applied);
+    }
+
+    if (rateFamilyPolicy != "prefer" && rateFamilyPolicy != "strict" && rateFamilyPolicy != "compatible") {
+        printf("!! --rate-policy / rateFamilyPolicy: use prefer, strict or compatible\n");
+        return 2;
+    }
+    if (dsdMultiple == 0) {
+        const auto policy = rta::audio::parse_rate_family_policy(rateFamilyPolicy);
+        if (rateMax && !analyzeOnly && outFile.empty() && asioDevice.empty() && netTarget.empty()) {
+            const auto rates = rta::audio::WasapiOutput::exclusive_rates(
+                deviceId, cfg.outBits ? cfg.outBits : 24, in.channels);
+            const auto pick = rta::audio::pick_output_rate("max", in.rate, rates, 0, policy);
+            if (!pick.decided) { printf("!! --rate-max: %s\n", pick.note.c_str()); return 2; }
+            cfg.outRate = pick.rate;
+        } else if (rateMax) {
+            cfg.outRate = in.rate;
+            printf("--rate-max: 当前离线/网络/ASIO路径不使用WASAPI能力，按源采样率 %u Hz；可用 --rate 明确指定目标\n", in.rate);
+        }
+        const auto decision = rta::audio::validate_pcm_rate(
+            in.rate, cfg.outRate ? cfg.outRate : in.rate, rateMax || cfg.outRate == 0, policy);
+        if (!decision.ok) { printf("!! %s\n", decision.reason); return 2; }
+        printf("RATE_POLICY mode=%s input=%u output=%u cross=%d\n", rateFamilyPolicy.c_str(),
+               in.rate, decision.rate, decision.crossFamily ? 1 : 0);
+        if (decision.crossFamily) printf("%s\n", decision.reason);
     }
 
     // ---- 装载 EQ / 卷积 IR / Matrix ----
@@ -774,6 +811,7 @@ int main(int argc, char** argv) {
         if (!sf) { printf("!! 无法写入配置: %s\n", saveConfigFile.c_str()); return 1; }
         sf << "# RLPlayer config (key=value). CLI options take precedence over this file.\n";
         sf << "rate="   << st0Rate(in, cfg) << "\n";
+        sf << "rateFamilyPolicy=" << rateFamilyPolicy << "\n";
         sf << "bits="   << (cfg.outBits ? cfg.outBits : in.bits) << "\n";
         sf << "taps="   << cfg.taps << "\n";
         sf << "shaper=" << rta::dsp::shaper_name(cfg.shaper) << "\n";
@@ -825,7 +863,7 @@ int main(int argc, char** argv) {
             if (done >= in.frames()) return false;
             const size_t n = std::min(CK, in.frames() - done);
             AudioBuffer seg;
-            seg.rate = in.rate; seg.channels = in.channels; seg.bits = in.bits; seg.isFloat = false;
+            seg.rate = in.rate; seg.channels = in.channels; seg.bits = in.bits; seg.isFloat = in.isFloat;
             seg.raw.assign(in.raw.begin() + (ptrdiff_t)(done * (size_t)in.channels),
                            in.raw.begin() + (ptrdiff_t)((done + n) * (size_t)in.channels));
             eng::PipelineStats s2;
@@ -894,13 +932,22 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // Match the source rate family, including --dsd read from a config file.
+    // Keep double DSP samples until the final 1-bit quantizer.
+    if (dsdMultiple > 0) {
+        cfg.outRate = rta::dsp::dsd_rate(dsdMultiple, (in.rate % 48000u == 0u) ? 48000u : 44100u);
+        cfg.shaper = rta::dsp::Shaper::None;
+        cfg.useFixed = false;
+        cfg.forceBitPerfect = false;
+    }
     eng::Pipeline pl(cfg);
     eng::PipelineStats st;
     AudioBuffer out;
+    std::vector<std::vector<double>> dsdPlanes;
 
     if (chunkFrames == 0 || chunkFrames >= in.frames()) {
         // 整块处理
-        out = pl.process(in, &st);
+        out = pl.process(in, &st, dsdMultiple > 0 ? &dsdPlanes : nullptr);
     } else {
         // ★ 分块处理：复用【同一个 Pipeline 实例】。
         //   流式改造（Round 33/34）后，分块与整块必须产生逐位相同的输出；
@@ -915,7 +962,13 @@ int main(int argc, char** argv) {
             seg.raw.assign(in.raw.begin() + (ptrdiff_t)(done * (size_t)in.channels),
                            in.raw.begin() + (ptrdiff_t)((done + n) * (size_t)in.channels));
             eng::PipelineStats s2;
-            AudioBuffer o = pl.process(seg, &s2);
+            std::vector<std::vector<double>> planes;
+            AudioBuffer o = pl.process(seg, &s2, dsdMultiple > 0 ? &planes : nullptr);
+            if (dsdMultiple > 0) {
+                if (dsdPlanes.empty()) dsdPlanes.resize(planes.size());
+                for (size_t c = 0; c < planes.size(); ++c)
+                    dsdPlanes[c].insert(dsdPlanes[c].end(), planes[c].begin(), planes[c].end());
+            }
             if (out.raw.empty()) {          // ★ 必须在插入【之前】取第一块的格式，
                 out.rate = o.rate;          //   否则 out 会一直是 AudioBuffer 的默认值(44100/16)
                 out.channels = o.channels;
@@ -927,7 +980,7 @@ int main(int argc, char** argv) {
             st = s2;                       // 保留最后一次的分段统计
         }
         st.inFrames = total;
-        st.outFrames = out.frames();
+        st.outFrames = dsdMultiple > 0 ? (dsdPlanes.empty() ? 0 : dsdPlanes[0].size()) : out.frames();
         st.inRate = in.rate; st.inBits = in.bits; st.inChannels = in.channels;
         const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         printf("分块处理: %zu 帧/块, 共 %zu 块, 耗时 %.3f 秒 (%.1fx 实时)\n",
@@ -935,13 +988,54 @@ int main(int argc, char** argv) {
                (double)total / (double)in.rate / (el > 0 ? el : 1e-9));
     }
 
+    // Offline/export paths retain the complete causal FIR/IR tail. Trim only
+    // compensable delay; MP/IP filters deliberately report zero head trimming.
+    {
+        const size_t delay = (size_t)std::llround(pl.algorithmic_latency_out_frames());
+        const size_t tail = (size_t)std::ceil(pl.convolution_tail_out_frames() + pl.resampler_tail_out_frames());
+        const size_t before = dsdMultiple > 0 ? (dsdPlanes.empty() ? 0 : dsdPlanes[0].size()) : out.frames();
+        const size_t requested = delay + tail;
+        size_t appended = 0;
+        while (appended < requested) {
+            const size_t nIn = std::min<size_t>(4096, std::max<size_t>(1,
+                (size_t)std::ceil((double)(requested - appended) * in.rate / out.rate)));
+            std::vector<std::vector<double>> planes;
+            AudioBuffer drained = pl.drain_chunk(nIn, dsdMultiple > 0 ? &planes : nullptr);
+            const size_t got = dsdMultiple > 0 ? (planes.empty() ? 0 : planes[0].size()) : drained.frames();
+            if (got == 0) break;
+            const size_t take = std::min(got, requested - appended);
+            if (dsdMultiple > 0) {
+                for (size_t c = 0; c < planes.size(); ++c)
+                    dsdPlanes[c].insert(dsdPlanes[c].end(), planes[c].begin(), planes[c].begin() + take);
+            } else out.raw.insert(out.raw.end(), drained.raw.begin(), drained.raw.begin() + take * (size_t)out.channels);
+            appended += take;
+        }
+        const size_t available = before + appended;
+        const size_t drop = std::min(delay, available);
+        if (dsdMultiple > 0) {
+            for (auto& plane : dsdPlanes) plane.erase(plane.begin(), plane.begin() + drop);
+        } else out.raw.erase(out.raw.begin(), out.raw.begin() + drop * (size_t)out.channels);
+        st.outFrames = available - drop;
+        printf("EOF drain: delay=%zu naturalTail=%zu appended=%zu frames=%zu -> %zu\n",
+               delay, tail, appended, before, st.outFrames);
+    }
+
     // ---- DSD 输出（DoP 封装）：调制 -> 打包 -> 写文件 ----
     if (dsdMultiple > 0) {
-        if (outFile.empty() && netTarget.empty() && asioDevice.empty()) {
+        if (!analyzeOnly && outFile.empty() && netTarget.empty() && asioDevice.empty()) {
             printf("!! --dsd 需要配合 --out（离线写出）/ --net（RTANet）/ --asio-device（ASIO 输出）\n");
             return 1;
         }
-        const uint32_t dsdRate = rta::dsp::dsd_rate(dsdMultiple);
+        const uint32_t dsdRate = out.rate;
+        const size_t sdmFrames = dsdPlanes.empty() ? 0 : dsdPlanes[0].size();
+        const size_t packFrames = ((sdmFrames + 15) / 16) * 16;
+        double modPeak = 0.0;
+        for (const auto& plane : dsdPlanes) for (double x : plane)
+            modPeak = std::max(modPeak, std::fabs(x));
+        const double modHeadroom = rta::dsp::sdm_headroom_db_for_fs(modPeak, dsdRate);
+        const double modGain = std::pow(10.0, modHeadroom / 20.0);
+        printf("SDM headroom: inputPeak=%.9f target=%.6f gainDb=%.6f (measured after DSP)\n",
+               modPeak, rta::dsp::sdm_target_peak(dsdRate), modHeadroom);
         printf("DSD: DSD%d (%.4f MHz) -> DoP 承载 PCM %u Hz\n",
                dsdMultiple, dsdRate / 1e6, out.rate / 16u);
         // 管线已把输入升频到 dsdRate；取回 double 样本送入调制器
@@ -950,48 +1044,62 @@ int main(int argc, char** argv) {
         // 阶数：默认 5 阶；用 --mod-order 7 时若采样率不够或 Chebyshev 1-bit 会自动退回 5 阶并提示
         const int wantOrder = (modOrder > 0) ? modOrder : 5;
         mcfg.family = rta::dsp::parse_modulator_family(modFamily);
-        mcfg.levels = (mcfg.family == rta::dsp::ModulatorFamily::Ahm ? (1 << ahmBits) : 2);
+        mcfg.levels = 2;
+        mcfg.oneBitOutput = true;
         const int useOrder  = rta::dsp::stable_sdm_order(wantOrder, mcfg.fs, mcfg.levels, mcfg.family);
         if (useOrder != wantOrder)
-            printf("!! %d 阶调制器在 %s / DSD%d 上不稳定（实测会饱和或失稳），已自动改用 %d 阶\n",
+            printf("!! %d 阶调制器在 %s / DSD%d 上触发稳定性/质量守卫，改用 %d 阶（详见实际原因）\n",
                    wantOrder, rta::dsp::modulator_family_name(mcfg.family), dsdMultiple, useOrder);
-        mcfg.order = useOrder;
+        mcfg.order = wantOrder;  // Let the constructor retain its numerical quality-guard reason.
         mcfg.oobGainDb = oobGain;
         mcfg.ahmBits = ahmBits;
         mcfg.cutoffHz = 100000.0;
-        mcfg.ditherLsb = 0.01;          // 依 Round 45 实验：抑制空闲音
+        mcfg.ditherLsb = 0.0005;       // Same production default as rtaweb.
+        const rta::dsp::SdmModulator prototype(mcfg);
+        if (prototype.levels_clamped()) printf("!! %s\n", prototype.levels_clamp_reason().c_str());
+        if (prototype.steppedDown()) printf("!! %s\n", prototype.stepDownReason().c_str());
+        std::vector<long long> overloads((size_t)out.channels, 0);
         std::vector<std::vector<double>> sdm((size_t)out.channels);
         {
             // 每个声道一把独立的调制器，彼此无共享状态 ⟹ 可以放心并行
             const auto t0 = std::chrono::steady_clock::now();
             rta::dsp::ParallelFor::instance().run((size_t)out.channels, [&](size_t c) {
-                rta::dsp::SdmModulator m(mcfg);
+                rta::dsp::SdmModulator m(prototype);
                 auto& v = sdm[c];
-                v.resize(out.frames());
-                for (size_t n = 0; n < out.frames(); ++n) v[n] = m.process(out.sample(n, (int)c));
+                v.resize(packFrames);
+                for (size_t n = 0; n < packFrames; ++n)
+                    v[n] = m.process(n < sdmFrames ? dsdPlanes[c][n] * modGain : 0.0);
+                overloads[c] = m.overload();
             });
             const auto t1 = std::chrono::steady_clock::now();
             const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             // 倍实时 = 音频时长 / 实际耗时
-            const double audioSec = (double)out.frames() / (double)dsdRate;
+            const double audioSec = (double)sdmFrames / (double)dsdRate;
             printf("SDM 调制完成：%d 声道 x %zu 帧（%.2f 秒音频），耗时 %.0f ms（%.1f 倍实时，%zu 线程可用）\n",
-                   out.channels, out.frames(), audioSec, ms,
+                   out.channels, sdmFrames, audioSec, ms,
                    ms > 0 ? audioSec * 1000.0 / ms : 0.0,
                    rta::dsp::hardware_threads());
+            for (size_t c = 0; c < overloads.size(); ++c)
+                printf("SDM channel=%zu effectiveOrder=%d levels=%d overload=%lld\n",
+                       c, prototype.effectiveOrder(), prototype.levels(), overloads[c]);
         }
         // ---- PCM → DSD 调制完成后，两条出口：原生 DSD（ASIO）或 DoP ----
-        if (nativeDsd) {
+        if (analyzeOnly && outFile.empty()) {
+            printf("(--analyze) DSD offline analysis complete; no output device opened\n");
+            return 0;
+        }
+        if (nativeDsd && !analyzeOnly) {
             AsioDriverEntry dev;
             std::string derr;
             if (!asio_resolve_driver(asioDevice, dev, derr)) { printf("!! %s\n", derr.c_str()); return 1; }
             DsdStream ds;
             ds.rate = dsdRate;
             ds.channels = out.channels;
-            ds.bits = out.frames();
+            ds.bits = sdmFrames;
             ds.container = "mod";
-            ds.data.assign((size_t)out.channels, std::vector<uint8_t>((out.frames() + 7) / 8, 0));
+            ds.data.assign((size_t)out.channels, std::vector<uint8_t>((sdmFrames + 7) / 8, 0));
             for (int c = 0; c < out.channels; ++c)
-                for (size_t n = 0; n < out.frames(); ++n)
+                for (size_t n = 0; n < sdmFrames; ++n)
                     if (sdm[(size_t)c][n] > 0.0) ds.setBit((size_t)c, n, true);
             printf("已把调制结果打包成 1-bit 流（%llu 位/声道），交给 ASIO 原生 DSD\n",
                    (unsigned long long)ds.bits);
@@ -1000,7 +1108,12 @@ int main(int argc, char** argv) {
         std::vector<const double*> ip;
         for (auto& v : sdm) ip.push_back(v.data());
         std::vector<int32_t> packed;
-        rta::dsp::dop_pack(ip.data(), out.channels, out.frames(), packed);
+        rta::dsp::DopPackState packState;
+        std::string packError;
+        if (!rta::dsp::dop_pack_checked(ip.data(), out.channels, packFrames, packed, packState, &packError)) {
+            printf("!! %s\n", packError.c_str());
+            return 1;
+        }
 
         rta::audio::AudioBuffer dp;
         // ★ 承载率是 DSD 率除以 16（16 个 DSD 位装进 1 个 24-bit 样本）。
@@ -1035,11 +1148,21 @@ int main(int argc, char** argv) {
     printf("  生效阶段: matrix=%d eq=%d(%d 个双二阶) delay=%d conv=%d%s resample=%d volume=%d\n",
            st.usedMatrix, st.usedEq, st.eqBiquads, st.usedDelay, st.usedConvolution,
            st.usedGpuConvolution ? "(GPU)" : "", st.usedResample, st.usedVolume);
+    // 261030-01 D-11：定点卷积是否真的生效（可观测证据，不靠「应该生效」推断）
+    printf("  定点卷积: %s\n", st.usedFixed ? "开（int128 累加，零舍入）" : "关（double）");
+    printf("  GPU 升频: %s\n", st.usedGpuResample ? "是" : "否（CPU）");
     if (!st.gpuStatus.empty()) printf("  GPU: %s\n", st.gpuStatus.c_str());
 
     // ---- Web 控制面（本地 HTTP + JSON API）----
+    // ★ 2026-10-29（两轮审查 F33）：WebUi 的**宿主作用域必须覆盖整个播放会话**。
+    //
+    // 缺陷：旧代码把 ui 建在 if (webEnabled) { ... } 这个块里，普通 --web 路径在块结束
+    //   （下面几行）就把 ui 析构了 —— 于是"启动了 Web 控制面，但一进入播放/网络发送
+    //   就再也连不上"。不是网络问题，是对象生命周期问题。
+    // 现在：ui 声明在播放逻辑之前，析构在函数返回时（晚于 pl/st，回调引用仍然有效）；
+    //   --web-hold 仍然按原语义显式 stop 后返回。
+    rta::net::WebUi ui;
     if (webEnabled) {
-        rta::net::WebUi ui;
         auto plPtr = &pl; auto stPtr = &st;
         const std::string cfgPath1 = configFile, cfgPath2 = saveConfigFile;
         bool ok = ui.start(webPort, [plPtr, stPtr, cfgPath1, cfgPath2](const rta::net::HttpRequest& rq, std::string& ct) -> std::string {

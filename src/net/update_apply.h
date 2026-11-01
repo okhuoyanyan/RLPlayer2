@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "net/update.h"
+#include "net/update_assets_hashes.h"
 
 namespace rta::update {
 
@@ -75,7 +76,11 @@ inline const std::vector<std::string>& protected_dirs() {
 
 // 保护目录里的**例外**：随包发布的纯应用资产（不更新会与新代码不匹配）
 inline const std::vector<std::string>& protected_allow() {
-    static const std::vector<std::string> v = { "data\\opra_index.json" };
+    static const std::vector<std::string> v = {
+        "data\\opra_index.json", "data\\i18n\\ar.json", "data\\i18n\\en.json",
+        "data\\i18n\\es.json", "data\\i18n\\fr.json", "data\\i18n\\ja.json",
+        "data\\i18n\\ru.json"
+    };
     return v;
 }
 
@@ -182,9 +187,20 @@ inline std::string backup_dir(const std::string& ver) { return join_path(version
 inline bool write_ready_plan(const std::string& ver, const std::string& from,
                              const std::string& staging, std::string& err) {
     if (!is_dir(staging)) { err = "暂存目录不存在：" + staging; return false; }
+    // ★ 2026-10-29（两轮审查 F08）：安装资格必须由**完成标记 + 逐文件校验**决定，
+    //   不能枚举目录里现有文件就当清单（半套文件会被当成完整安装集合）。
+    {
+        std::string verr;
+        if (!rta::update::staging_verify(staging, verr)) {
+            err = "暂存不完整，拒绝安装：" + verr;
+            return false;
+        }
+    }
     std::vector<std::string> rels;
     list_files_rel(staging, "", rels);
-    if (rels.empty()) { err = "暂存目录里没有文件"; return false; }
+    // 完成标记本身不是要安装的文件
+    rels.erase(std::remove(rels.begin(), rels.end(), std::string("complete.txt")), rels.end());
+    if (rels.empty()) { err = "暂存目录里没有可安装文件"; return false; }
     PendingPlan p;
     p.phase = "ready";
     p.version = ver;
@@ -242,19 +258,31 @@ inline std::string apply_pending_on_startup() {
 
     p.applied.clear();
     p.added.clear();
+    // ★ 2026-10-29（两轮审查 F07）：回滚必须**检查恢复动作本身的结果**。
+    //
+    // 缺陷：旧 abort() 对每个已登记文件做 DeleteFile + move_file(b, tgt)，但从不看
+    //   move_file 的返回值，最后无条件写"UPDATE 失败并已回滚"。恢复失败时用户以为
+    //   文件都回来了，实际安装目录里缺文件、备份还躺在 backup 里没人知道。
+    // 现在：恢复失败的文件逐个记下、写进台账 detail、并在返回文案里点名（备份保留）。
     auto abort = [&](const std::string& why) -> std::string {
+        std::string restoreFail;
         // 立刻按已做的记录回滚，绝不留半新半旧
         for (auto it = p.applied.rbegin(); it != p.applied.rend(); ++it) {
             const std::string tgt = join_path(inst, *it);
             const std::string b = join_path(bak, *it);
             ::DeleteFileW(rta::platform::from_utf8(tgt).c_str());
-            if (path_exists(b)) move_file(b, tgt);
+            if (path_exists(b)) {
+                if (!move_file(b, tgt)) restoreFail += (restoreFail.empty() ? "" : "; ") + *it;
+            }
         }
         for (const auto& a : p.added) ::DeleteFileW(rta::platform::from_utf8(join_path(inst, a)).c_str());
         p.phase = "apply_failed";
         p.detail = why;
+        if (!restoreFail.empty())
+            p.detail += "；恢复失败的文件（备份仍在 " + bak + "）：" + restoreFail;
         write_pending(p);
-        return "UPDATE 失败并已回滚：" + why;
+        if (restoreFail.empty()) return "UPDATE 失败并已回滚：" + why;
+        return "UPDATE 失败，且以下文件未能恢复（备份保留在 " + bak + "）：" + restoreFail + "；原因：" + why;
     };
 
     for (const auto& rel : todo) {
@@ -265,14 +293,31 @@ inline std::string apply_pending_on_startup() {
             if (!ensure_dir(tgt.substr(0, sp))) return abort("无法创建目录 " + tgt.substr(0, sp));
         }
         const bool existed = path_exists(tgt);
+        std::string curBackup;
         if (existed) {
             const std::string b = join_path(bak, rel);
             const size_t bs = b.find_last_of('\\');
             if (bs != std::string::npos) ensure_dir(b.substr(0, bs));
             ::DeleteFileW(rta::platform::from_utf8(b).c_str());
             if (!move_file(tgt, b)) return abort("备份失败：" + rel);
+            curBackup = b;
         }
-        if (!move_file(src, tgt)) return abort("安装失败：" + rel);
+        if (!move_file(src, tgt)) {
+            // ★ F07：当前文件已经被备份走了、新文件却没装上 —— 它还没进 p.applied，
+            //   旧 abort() 不会碰它 ⟹ 安装目录少一个文件却报"已回滚"。
+            //   必须先把它恢复回来，再回滚之前那些文件。
+            if (!curBackup.empty()) {
+                ::DeleteFileW(rta::platform::from_utf8(tgt).c_str());
+                if (!move_file(curBackup, tgt)) {
+                    p.phase = "apply_failed";
+                    p.detail = "安装失败且当前文件无法恢复：" + rel + "（备份在 " + curBackup + "）";
+                    write_pending(p);
+                    return "UPDATE 失败：安装 " + rel + " 失败，且无法恢复原文件（备份保留在 " +
+                           curBackup + "）";
+                }
+            }
+            return abort("安装失败：" + rel);
+        }
         p.applied.push_back(rel);
         if (!existed) p.added.push_back(rel);
     }
@@ -315,14 +360,93 @@ inline std::string rollback_pending(const std::string& why) {
 // ===========================================================================
 // 5. 确认（新 rtaweb 启动时调用）
 // ===========================================================================
+// Reject junctions/symlinks at every component below the installation root.
+// Both source and destination are derived here; pending.staging is never trusted.
+inline bool asset_path_without_reparse(const std::string& root, const std::string& rel) {
+    std::string path = root;
+    auto plain = [](const std::string& p) {
+        const DWORD a = GetFileAttributesW(rta::platform::from_utf8(p).c_str());
+        return a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_REPARSE_POINT);
+    };
+    if (!plain(path)) return false;
+    size_t begin = 0;
+    while (begin < rel.size()) {
+        const size_t end = rel.find_first_of("\\/", begin);
+        path = join_path(path, rel.substr(begin, end == std::string::npos ? end : end - begin));
+        if (!plain(path)) return false;
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+    return true;
+}
+
+inline bool migrate_application_update_assets(PendingPlan& p, std::string& err) {
+    const std::string inst = install_dir();
+    if (!safe_install_rel(p.version) || p.version.find_first_of("\\/") != std::string::npos) {
+        err = "更新版本目录非法"; return false;
+    }
+    const std::string stageRel = "updates/" + p.version + "/staging/";
+    const std::string backupRel = "updates/" + p.version + "/backup/";
+    std::vector<const ApplicationUpdateAsset*> todo;
+    // Preflight every file before writing any target. Old launchers do not write
+    // complete.txt, so the trusted digest is generated from this build's assets.
+    for (const auto& a : kApplicationUpdateAssets) {
+        if (!asset_path_without_reparse(inst, a.path) ||
+            !asset_path_without_reparse(inst, stageRel + a.path) ||
+            !asset_path_without_reparse(inst, backupRel + a.path)) {
+            err = std::string("应用资源路径含链接，拒绝迁移：") + a.path; return false;
+        }
+        std::string hash, e;
+        if (sha256_file(join_path(inst, a.path), hash, e) && hex_equals_ci(hash, a.sha256)) continue;
+        if (!sha256_file(join_path(inst, stageRel + a.path), hash, e) || !hex_equals_ci(hash, a.sha256)) {
+            err = std::string("应用资源缺失或校验失败：") + a.path + "（暂存已保留，可修复后重启重试）";
+            return false;
+        }
+        todo.push_back(&a);
+    }
+    for (const auto* a : todo) {
+        const std::string rel = norm_rel2(a->path);
+        const std::string target = join_path(inst, a->path);
+        const std::string backup = join_path(inst, backupRel + a->path);
+        const std::string source = join_path(inst, stageRel + a->path);
+        const bool existed = path_exists(target);
+        if (!ensure_dir(target.substr(0, target.find_last_of("\\/"))) ||
+            !ensure_dir(backup.substr(0, backup.find_last_of("\\/")))) {
+            err = std::string("无法创建应用资源目录：") + a->path; return false;
+        }
+        // Preserve any backup already made by a newer launcher.
+        if (existed && !path_exists(backup) &&
+            !CopyFileW(rta::platform::from_utf8(target).c_str(), rta::platform::from_utf8(backup).c_str(), TRUE)) {
+            err = std::string("应用资源备份失败：") + a->path; return false;
+        }
+        if (!CopyFileW(rta::platform::from_utf8(source).c_str(), rta::platform::from_utf8(target).c_str(), FALSE)) {
+            err = std::string("应用资源迁移失败：") + a->path; return false;
+        }
+        std::string hash, e;
+        if (!sha256_file(target, hash, e) || !hex_equals_ci(hash, a->sha256)) {
+            err = std::string("应用资源落盘校验失败：") + a->path; return false;
+        }
+        if (std::find(p.applied.begin(), p.applied.end(), rel) == p.applied.end()) p.applied.push_back(rel);
+        if (!existed && std::find(p.added.begin(), p.added.end(), rel) == p.added.end()) p.added.push_back(rel);
+        if (!write_pending(p)) { err = "应用资源迁移台账写入失败"; return false; }
+    }
+    return true;
+}
+
 inline std::string confirm_on_startup() {
     PendingPlan p = read_pending();
     if (!p.exists) return std::string();
     if (p.phase == "applied") {
         if (cmp_versions(p.version, current_version()) == 0) {
+            std::string assetError;
+            if (!migrate_application_update_assets(p, assetError)) {
+                p.detail = assetError;
+                write_pending(p);
+                return "UPDATE 未完成：" + assetError;
+            }
             p.phase = "done";
             p.time = now_text();
-            write_pending(p);
+            if (!write_pending(p)) return "UPDATE 未完成：确认台账写入失败（暂存已保留）";
             // 成功之后 staging 可以清；backup 保留（用户想手工回退还有料）
             rmtree(join_path(version_dir(p.version), "staging"));
             return "UPDATE ok " + p.from + " -> " + p.version + "（" + p.detail + "）";

@@ -27,6 +27,10 @@
 #pragma once
 // 2026-10-25（移植自协作者 mac 分支）：显式包含 —— 之前靠 MSVC STL 间接带进来，换 libc++/clang-cl 就断。
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include "meta/store.h"          // MetaStore::hashOf / MetaValue / meta_path_of / meta_jesc
 #include "meta/year.h"           // E-14：年份清洗复用统一纯函数 pv_year4
 #include <cmath>
@@ -474,7 +478,8 @@ inline std::string entity_json(const Entity& e) {
 // 解析落盘格式。判据：缺 id / kind 不认识 / aliases 不是数组 / edges 不是数组 → false
 //（"损坏"必须显式失败，不能默默返回半截实体 —— 同 store.h load 的口径）。
 inline bool entity_from_json(const std::string& text, Entity& out) {
-    const rta::net::Json j = rta::net::json_parse(text);
+    rta::net::Json j;
+    if (!rta::net::json_parse_strict(text, j, nullptr)) return false;
     if (j.type != rta::net::Json::Obj) return false;
     Entity e;
     e.id = j["id"].s();
@@ -520,23 +525,12 @@ inline bool entity_from_json(const std::string& text, Entity& out) {
 // ---------------------------------------------------------------------------
 
 // 与 store.h MetaStore::save / saveCover 完全同语义：
-//   ① 先写 <file>.tmp；② 写成功才 rename 覆盖；③ 写失败直接返回 false，旧文件保持原样。
+//   ① 先写唯一临时文件；② write/flush/close 均成功才 rename；③ 失败保持旧文件。
 // 为什么不能直接覆盖写：写到一半崩溃会留下截断的 JSON，整个实体（含全部 alias）就没了。
+// Compatibility wrappers: all metadata stores share one atomic writer and lock table.
+inline std::recursive_mutex& entity_file_mutex(const fsx::path& file) { return meta_file_mutex(file); }
 inline bool entity_write_atomic(const fsx::path& file, const std::string& bytes) {
-    std::error_code ec;
-    const fsx::path dir = file.parent_path();
-    if (!dir.empty()) fsx::create_directories(dir, ec);
-    fsx::path tmp = file;
-    tmp += ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f) return false;                       // 打不开临时文件：不动旧文件
-        f.write(bytes.data(), (std::streamsize)bytes.size());
-        if (!f) return false;                       // 写失败：不动旧文件
-    }
-    fsx::rename(tmp, file, ec);                     // 同盘 rename，原子生效
-    if (ec) { fsx::remove(tmp, ec); return false; }
-    return true;
+    return meta_write_atomic(file, bytes);
 }
 
 inline bool entity_read_file(const fsx::path& file, std::string& out) {
@@ -599,6 +593,7 @@ public:
     // 读旧 → 合并（alias 只增不删、属性按 mergeField 策略、边按 key 去重）→ 原子写回。
     // 这是「同一实体在几百首里反复出现」的落盘入口：重跑不会丢来源写法，也不会让边重复。
     bool upsert(Entity& e) {
+        std::lock_guard<std::recursive_mutex> lk(entity_file_mutex(pathOf(e.kind, e.id)));
         Entity old;
         if (loadAt(e.kind, e.id, old)) {
             e.createdTs = old.createdTs != 0 ? old.createdTs : e.createdTs;

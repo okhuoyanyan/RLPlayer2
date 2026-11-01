@@ -6,6 +6,7 @@
 //
 // 双二阶采用 RBJ Audio EQ Cookbook 公式，直接型转置 II（数值稳定性好）。
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include "kaiser.h"
 #include <vector>
 #include <cmath>

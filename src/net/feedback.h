@@ -459,16 +459,39 @@ inline void mask_emails(std::string& s) {
     }
 }
 
+// 敏感键名表（脱敏与结构化字段共用同一份，避免"文本里认、JSON 里不认"）
+inline const char* const* sensitive_key_list(size_t& n) {
+    static const char* kKeys[] = {"api_key", "apikey", "api-key", "x-api-key", "token",
+                                  "access_token", "refresh_token", "password", "passwd",
+                                  "secret", "client_secret", "auth", "key", "gh_token"};
+    n = sizeof(kKeys) / sizeof(kKeys[0]);
+    return kKeys;
+}
+
+// 这个键名是不是"值必须整值脱敏"的敏感字段（大小写不敏感，含子串匹配，
+// 与 mask_kv 的口径一致：access_token 命中 token、client_secret 命中 secret）。
+inline bool sensitive_key(const std::string& k) {
+    size_t n = 0;
+    const char* const* keys = sensitive_key_list(n);
+    std::string lk;
+    lk.reserve(k.size());
+    for (unsigned char c : k) lk += (char)std::tolower(c);
+    for (size_t i = 0; i < n; ++i) {
+        const std::string lit = keys[i];
+        if (lk.find(lit) != std::string::npos) return true;
+    }
+    return false;
+}
+
 // 公开入口：任何要进 payload 的文本都必须过它
 inline std::string redact(const std::string& in) {
     std::string s = in;
     mask_prefixed_tokens(s);
     mask_header_values(s);
     mask_bearer(s);
-    static const char* kKeys[] = {"api_key", "apikey", "api-key", "x-api-key", "token",
-                                  "access_token", "refresh_token", "password", "passwd",
-                                  "secret", "client_secret", "auth", "key", "gh_token"};
-    for (const char* k : kKeys) mask_kv(s, k);
+    size_t nk = 0;
+    const char* const* keys = sensitive_key_list(nk);
+    for (size_t i = 0; i < nk; ++i) mask_kv(s, keys[i]);
     mask_user_paths(s);
     mask_emails(s);
     return s;
@@ -484,7 +507,18 @@ inline std::string jq(const std::string& raw) {
 // ---------------------------------------------------------------------------
 namespace detail {
 
-inline void emit_value(const rta::net::Json& v, std::string& o) {
+// ★ 2026-10-29（两轮审查 F13）：结构化 JSON 的**键名上下文**必须传下去。
+//
+// 缺陷：sanitize_json_fragment() 先解析、再对每个字符串单独调 jq()（= redact()），
+//   于是 {"password":"ExampleDummy123"} 里的值被当成一段**没有键名**的普通文本 ——
+//   redact() 认不出它是密码，原样保留；而同一串在 "password=ExampleDummy123"
+//   这种纯文本形态里会被 mask_kv 打掉。同一个秘密，两种形态两种结果。
+//
+// 修法：emit_value 带 key 参数；键名敏感时**整值**替换成 <redacted>（不管值是
+//   字符串、对象还是数组 —— 整值脱敏比逐字段猜更安全）。
+inline void emit_value(const rta::net::Json& v, std::string& o,
+                       const std::string& key = std::string()) {
+    if (!key.empty() && sensitive_key(key)) { o += "\"<redacted>\""; return; }
     switch (v.type) {
         case rta::net::Json::Null: o += "null"; break;
         case rta::net::Json::Bool: o += (v.b ? "true" : "false"); break;
@@ -510,7 +544,7 @@ inline void emit_value(const rta::net::Json& v, std::string& o) {
                 first = false;
                 o += jq(kv.first);
                 o += ':';
-                emit_value(kv.second, o);
+                emit_value(kv.second, o, kv.first);   // ★ F13：键名上下文向下传
             }
             o += '}';
             break;
@@ -684,7 +718,10 @@ inline std::string settings_snapshot(const std::string& path, bool& present) {
         if (v.size() > 300) v = v.substr(0, 300) + "...";
         if (!first) o += ",";
         first = false;
-        o += jq(k) + ":" + jq(v);
+        // ★ F13：设置文件里的敏感键（password / token / api_key …）**整值**脱敏。
+        //   旧代码对键和值分别调 jq()：值没有键名上下文，一个不带任何可识别前缀的
+        //   密码（如 ExampleDummy123）会原样进诊断包。
+        o += jq(k) + ":" + (sensitive_key(k) ? std::string("\"<redacted>\"") : jq(v));
         ++n;
     }
     o += "}";
@@ -1380,6 +1417,101 @@ inline std::string result_json(const Result& r) {
 }
 
 // body 形如 {"type":"bug","title":"…","body":"…","steps":"…"}（都容忍缺失）
+// 2026-10-28（用户：让终端用户直接通过软件提交反馈）：
+//   /api/feedback/preview —— **不联网、不落盘**，只回报"这一条会带出去哪些东西"。
+//   实现上直接调用 build_payload()，与真提交是**同一个打包函数**：
+//   预览里报的日志行数、设置项数、脱敏规则数，就是提交时的真实值，不存在两套口径。
+//   只回摘要，不把整包 JSON 给前端 —— 已脱敏也没必要让浏览器持有。
+inline std::string preview_handler(const std::string& body, const LiveState& live) {
+    const rta::net::Json j = rta::net::json_parse(body);
+    UserReport u;
+    u.type  = j["type"].s();
+    u.title = j["title"].s();
+    u.body  = j["body"].s();
+    u.steps = j["steps"].s();
+
+    LiveState lv = live;
+    if (lv.source.empty()) lv.source = "rtaweb";
+
+    // 真打一遍包（含全部脱敏）。失败如实回报，不给空壳让用户误判。
+    // 用默认 Options：与 web_handler 真提交时**完全一致**（否则预览的日志行数会跟实际不同）
+    const Payload p = build_payload(u, lv, Options{});
+    if (p.json.empty()) return std::string("{\"ok\":false,\"error\":\"打包失败（内部错误）\"}");
+
+    const rta::net::Json pj = rta::net::json_parse(p.json);
+    if (!pj.has("app") || !pj.has("logs"))
+        return std::string("{\"ok\":false,\"error\":\"预览解析失败\"}");
+
+    // 日志：日志段是数组，取各文件的行数/字节数求和
+    long long logLines = 0, logBytes = 0;
+    if (pj["logs"].type == rta::net::Json::Arr) {
+        for (const auto& f : pj["logs"].arr) {
+            const std::string txt = f.has("text") ? f["text"].s() : std::string();
+            // 行数按实际换行统计（比 max_lines 更诚实：文件可能更短）
+            long long n = 0;
+            for (char c : txt) if (c == '\n') ++n;
+            if (!txt.empty() && txt.back() != '\n') ++n;
+            logLines += n;
+            logBytes += (long long)txt.size();
+        }
+    }
+
+    // 设置项数
+    int settingsKeys = 0;
+    if (pj.has("settings") && pj["settings"].type == rta::net::Json::Obj)
+        settingsKeys = (int)pj["settings"].obj.size();
+
+    // 脱敏规则条数（取 payload 自己报的清单长度，不硬编码）
+    int redactRules = 0;
+    if (pj.has("redaction")) {
+        const rta::net::Json& r = pj["redaction"];
+        if (r.has("rules") && r["rules"].type == rta::net::Json::Arr)
+            redactRules = (int)r["rules"].arr.size();
+    }
+
+    const std::string osStr  = pj["system"].has("os")  ? pj["system"]["os"].s()  : std::string();
+    const std::string cpuStr = pj["system"].has("cpu") ? pj["system"]["cpu"].s() : std::string();
+    long long threads = 0;
+    if (pj["system"].has("cpu_threads") && pj["system"]["cpu_threads"].type == rta::net::Json::Num)
+        threads = (long long)pj["system"]["cpu_threads"].n();
+    long long ramTotal = 0;
+    if (pj["system"].has("ram_total_mb") && pj["system"]["ram_total_mb"].type == rta::net::Json::Num)
+        ramTotal = (long long)pj["system"]["ram_total_mb"].n();
+    const std::string gpuStr = pj["system"].has("gpu") ? pj["system"]["gpu"].s() : std::string();
+
+    // 设备名可能含用户名路径，用脱敏后的值
+    std::string dev;
+    if (pj.has("playback")) {
+        const rta::net::Json& pb = pj["playback"];
+        if (pb.has("device")) dev = pb["device"].s();
+    }
+    std::string backend;
+    if (pj.has("playback") && pj["playback"].has("backend")) backend = pj["playback"]["backend"].s();
+    bool playing = false;
+    if (pj.has("playback") && pj["playback"].has("playing"))
+        playing = pj["playback"]["playing"].type == rta::net::Json::Bool && pj["playback"]["playing"].b;
+
+    std::ostringstream o;
+    o << "{\"ok\":true";
+    o << ",\"type_label\":" << jq(type_label(type_norm(u.type)));
+    o << ",\"version\":" << jq(pj["app"].has("version") ? pj["app"]["version"].s() : std::string());
+    o << ",\"build\":" << jq(pj["app"].has("build") ? pj["app"]["build"].s() : std::string());
+    o << ",\"os\":" << jq(osStr);
+    o << ",\"cpu\":" << jq(cpuStr);
+    o << ",\"cpu_threads\":" << threads;
+    o << ",\"gpu\":" << jq(gpuStr);
+    o << ",\"ram_total_mb\":" << ramTotal;
+    o << ",\"playing\":" << (playing ? "true" : "false");
+    o << ",\"backend\":" << jq(backend);
+    o << ",\"device\":" << jq(dev);
+    o << ",\"settings_keys\":" << settingsKeys;
+    o << ",\"log_lines\":" << logLines;
+    o << ",\"log_kb\":" << ((logBytes + 1023) / 1024);
+    o << ",\"redaction_rules\":" << redactRules;
+    o << "}";
+    return o.str();
+}
+
 inline std::string web_handler(const std::string& body, const LiveState& live,
                                const Options& optIn = Options{}) {
     const rta::net::Json j = rta::net::json_parse(body);

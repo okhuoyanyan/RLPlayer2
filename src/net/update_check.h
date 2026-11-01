@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -373,7 +374,7 @@ inline std::string sha256_hex(const std::string& s) { return sha256_hex(s.data()
 // 流式摘要一个文件（下载产物 7 MB 级，一次读完最简单也够快；
 // 判据见 tests：写文件后用官方向量核对，证明"读文件这条路"本身没错）。
 inline bool sha256_file(const std::string& path, std::string& outHex, std::string& err) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(std::filesystem::u8path(path), std::ios::binary);
     if (!f) { err = "无法打开文件"; return false; }
     std::string data;
     f.seekg(0, std::ios::end);
@@ -688,7 +689,7 @@ inline VerifyResult verify_downloaded_file(const std::string& path,
     }
     // ② 文件必须存在且可读
     {
-        std::ifstream probe(path, std::ios::binary);
+        std::ifstream probe(std::filesystem::u8path(path), std::ios::binary);
         if (!probe) {
             r.reason = VerifyFailReason::OpenFailed;
             r.error = "下载文件不存在或无法打开";
@@ -697,7 +698,7 @@ inline VerifyResult verify_downloaded_file(const std::string& path,
     }
     // ③ 大小（>0 才校验；0 表示清单没声明）
     if (expectedSize > 0) {
-        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        std::ifstream f(std::filesystem::u8path(path), std::ios::binary | std::ios::ate);
         if (!f) {
             r.reason = VerifyFailReason::OpenFailed;
             r.error = "无法读取下载文件大小";

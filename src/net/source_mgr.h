@@ -194,10 +194,32 @@ public:
     }
 
     // ★ 下载原始文件到缓存，返回本地路径。失败返回空串。
+    //
+    // ★ 2026-10-29（两轮审查 F10/F11）：身份与写入两处都修了。
+    //
+    //   F10 身份：旧缓存键只有远端对象 id。于是「A 服取过 42 号，切到 B 服再取 42 号」
+    //     会直接命中 A 的文件（实测：返回 A 的数据、下载次数 1）；文件名又把所有特殊字符
+    //     统一替换成 '_'，于是 "a:b" 和 "a?b" 落到同一个文件。
+    //     ⟹ 身份 = 服务器 id + 远端 id + base（base 影响服务端返回的字节）。
+    //     文件名 = 可读 id 前缀 + 身份摘要（FNV-1a 64），既无目录语义也不碰撞。
+    //   F11 写入：旧代码不检查 write/close 就登记缓存并返回路径 —— 磁盘满/权限失败时
+    //     返回一个半截文件，后续命中只判"非空"⟹ 用户听到损坏音频。
+    //     ⟹ 先写 .part、校验大小、再原子 rename，成功后才登记。
     std::string fetch(const std::string& id, const std::string& suffix, std::string& err) {
+        // ① 先取「当前启用服务器」的快照：下载与登记必须属于同一台（不能中途被切走）
+        std::string activeId, activeBase;
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            auto it = cache_.find(id);
+            const SourceConfig* c = active_locked();
+            if (!c) { err = "还没有启用任何流媒体服务器"; return ""; }
+            activeId = c->id;
+            activeBase = c->base;
+        }
+        const std::string cacheKey = activeId + "\x1f" + id + "\x1f" + activeBase;
+        // ② 命中判定（只认"存在且非空"的**完整**文件）
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = cache_.find(cacheKey);
             if (it != cache_.end()) {
                 std::error_code ec;
                 if (std::filesystem::exists(it->second, ec) && std::filesystem::file_size(it->second, ec) > 0)
@@ -209,6 +231,7 @@ public:
             std::lock_guard<std::mutex> lk(mtx_);
             const SourceConfig* c = active_locked();
             if (!c) { err = "还没有启用任何流媒体服务器"; return ""; }
+            if (c->id != activeId) { err = "启用服务器在下载期间被切换，请重试"; return ""; }
             apply_active_locked();
             r = (c->kind == "emby") ? emby_.download(id) : sub_.download(id);
         }
@@ -227,17 +250,49 @@ public:
 
         std::string safeId;
         for (char c : id) safeId += (isalnum((unsigned char)c) ? c : '_');
+        if (safeId.size() > 40) safeId = safeId.substr(0, 40);
+        // 身份摘要：同一 (服务器, 对象, base) 得到同一文件名；不同身份几乎不可能碰撞，
+        // 且摘要只含十六进制字符 ⟹ 没有目录语义（旧的"特殊字符统一换成 '_'"会碰撞）。
+        uint64_t hk = 1469598103934665603ull;
+        for (unsigned char c : cacheKey) { hk ^= (uint64_t)c; hk *= 1099511628211ull; }
+        char hb[32];
+        std::snprintf(hb, sizeof(hb), "%016llx", (unsigned long long)hk);
         std::string ext = suffix.empty() ? std::string(".audio") : ("." + suffix);
-        const auto u8p = (std::filesystem::path(dir) / (safeId + ext)).u8string();
+        const auto u8p = (std::filesystem::path(dir) / (safeId + "-" + hb + ext)).u8string();
         const std::string path(reinterpret_cast<const char*>(u8p.data()), u8p.size());
 
-        std::ofstream f(path, std::ios::binary);
-        if (!f) { err = "无法写入缓存"; return ""; }
-        f.write((const char*)r.body.data(), (std::streamsize)r.body.size());
-        f.close();
+        // ★ F11：先写独立临时文件并检查每一步，成功后才原子发布
+        const std::string tmp = path + ".part";
+        {
+            std::ofstream f(tmp, std::ios::binary);
+            if (!f) { err = "无法写入缓存（打开失败）"; return ""; }
+            f.write((const char*)r.body.data(), (std::streamsize)r.body.size());
+            f.flush();
+            if (!f) { f.close(); std::filesystem::remove(std::filesystem::u8path(tmp), ec);
+                      err = "缓存写入失败（磁盘满或权限不足）"; return ""; }
+            f.close();
+            if (f.fail()) { std::filesystem::remove(std::filesystem::u8path(tmp), ec);
+                            err = "缓存关闭失败"; return ""; }
+        }
+        {
+            std::error_code ec2;
+            const auto sz = std::filesystem::file_size(std::filesystem::u8path(tmp), ec2);
+            if (ec2 || sz != (uintmax_t)r.body.size()) {
+                std::filesystem::remove(std::filesystem::u8path(tmp), ec2);
+                err = "缓存写入不完整（" + std::to_string((unsigned long long)(ec2 ? 0 : sz)) +
+                      "/" + std::to_string((unsigned long long)r.body.size()) + " 字节）";
+                return "";
+            }
+            std::filesystem::rename(std::filesystem::u8path(tmp), std::filesystem::u8path(path), ec2);
+            if (ec2) {
+                std::filesystem::remove(std::filesystem::u8path(tmp), ec2);
+                err = "缓存发布失败（改名）";
+                return "";
+            }
+        }
 
         std::lock_guard<std::mutex> lk(mtx_);
-        cache_[id] = path;
+        cache_[cacheKey] = path;
         return path;
     }
 

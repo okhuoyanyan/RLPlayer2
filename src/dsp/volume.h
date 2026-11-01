@@ -7,6 +7,7 @@
 //   * 本模块不做抖动/整形：管线末端的 Quantizer 才是正确的抖动注入点
 //     （在音量之后、量化之前注入，才能让抖动真正作用于最终量化误差）
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include "kaiser.h"
 #include <vector>
 #include <cmath>
@@ -34,23 +35,81 @@ public:
     // 立即跳到目标增益（用于开始播放前设定，避免开头一段渐变）
     void snap() { current_ = target_; remaining_ = 0; }
 
+    // ★ 2026-10-29（两轮审查 F01）：起播设定 = 「设目标 + 立刻到位」的显式组合。
+    //   为什么必须是一个具名操作：旧 prepare_stream() 只调 set_gain_db()，而 current_
+    //   初值是 1.0（单位增益），set_gain_db() 只启动一个从 1.0 降到目标的 200 ms 渐变
+    //   ⟹ 用户选 −60 dB 时，开头 200 ms 实际是**满幅**播放（首样本 0.499947969 vs
+    //   目标 0.0005，差 59.9991 dB）。这是起播电平事故（铁律 1 的直接来源），不是听感偏好。
+    //   起播用 snap 到位；播放中的拖动仍走 set_gain_db() 的渐变（防咔哒）。
+    void set_gain_db_snapped(double db) { set_gain_db(db); snap(); }
+
     double gain_db() const { return db_; }
     double current_gain() const { return current_; }
+    bool   ramping() const { return remaining_ > 0; }
+    size_t ramp_samples() const { return rampSamples_; }
 
-    double process(double x) {
+    // 推进一帧渐变，返回本帧应使用的公共增益
+    double step_frame() {
         if (remaining_ > 0) {
             const double step = (target_ - current_) / (double)remaining_;
             current_ += step;
             --remaining_;
             if (remaining_ == 0) current_ = target_;
         }
+        return current_;
+    }
+
+    double process(double x) {
+        const double g = step_frame();
         // 0 dB 直通：乘 1.0 是精确的，但为绝对保证逐位一致，这里显式短路
-        if (current_ == 1.0) return x;
-        return x * current_;
+        if (g == 1.0) return x;
+        return x * g;
     }
 
     void process(double* buf, size_t n) {
         for (size_t i = 0; i < n; ++i) buf[i] = process(buf[i]);
+    }
+
+    // ★ 2026-10-29（两轮审查 F01）：多声道必须【按帧】推进一次公共增益。
+    //   旧实现是 for (auto& w : work) vol->process(w.data(), w.size()) —— 同一个有状态
+    //   对象先跑完整块左声道、再跑右声道，每个样本都推进一次计数：
+    //     · 右声道拿到的是渐变的「后半段」⟹ 同一帧左右增益不同（声像会飘）；
+    //     · 渐变长度按【样本数】而不是【帧数】计 ⟹ 2 声道 200 ms 变 400 ms，
+    //       6 声道变 1200 ms（「单/双/多声道渐变墙钟长度一致」不成立）。
+    //   现在：一帧只推进一次，同一帧的全部声道用同一个增益。
+    void process_planes(double* const* planes, int channels, size_t frames) {
+        if (!planes || channels <= 0 || frames == 0) return;
+        // 0 dB 且无渐变：一个样本都不碰（逐位直通的最强保证）
+        if (remaining_ == 0 && current_ == 1.0) return;
+        // 完全静音：直接写 0（避免 x*0 把 −0.0/NaN 留在缓冲里）
+        if (remaining_ == 0 && current_ == 0.0) {
+            for (int c = 0; c < channels; ++c)
+                if (planes[c]) std::fill(planes[c], planes[c] + frames, 0.0);
+            return;
+        }
+        for (size_t i = 0; i < frames; ++i) {
+            const double g = step_frame();
+            for (int c = 0; c < channels; ++c) {
+                double* p = planes[c];
+                if (!p) continue;
+                p[i] = (g == 1.0) ? p[i] : p[i] * g;
+            }
+        }
+    }
+
+    // 交错缓冲版本（互操作 / 测试用；语义与 process_planes 完全一致）
+    void process_interleaved(double* buf, int channels, size_t frames) {
+        if (!buf || channels <= 0 || frames == 0) return;
+        if (remaining_ == 0 && current_ == 1.0) return;
+        if (remaining_ == 0 && current_ == 0.0) {
+            std::fill(buf, buf + frames * (size_t)channels, 0.0);
+            return;
+        }
+        for (size_t i = 0; i < frames; ++i) {
+            const double g = step_frame();
+            double* f = buf + i * (size_t)channels;
+            for (int c = 0; c < channels; ++c) f[c] = (g == 1.0) ? f[c] : f[c] * g;
+        }
     }
 
     // 手册 4.2：固定音量的两档

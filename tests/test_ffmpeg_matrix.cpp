@@ -201,8 +201,30 @@ bool write_dsf(const std::string& path, uint32_t rate, int ch, double seconds, d
     return write_file(path, f);
 }
 
-// DFF(DSDIFF)：FRM8("DSD ") → FVER → PROP(SND: FS/CHNL/CMPR) → DSD(每声道连续)
+// DFF(DSDIFF)：**直接调用生产实现** rta::audio::write_dff，测试不再自己拼字节。
+//
+// ★ 2026-10-30（F02 后续，出包守卫抓到的真回归）：这里原本有一份"自己写"的 DFF 打包器，
+//   按声道整段拼接（旧的非规范布局）。F02 把生产读写改成 DSDIFF 1.5 §3.3 的
+//   Channel Byte 交错之后，这份测试副本没跟着改 ⟹ 出包守卫的格式矩阵在 dff 项报
+//   「电平异常」（rms −21.0 dBFS、peak −9.8 dBFS，正常应 ≈ −52 dBFS）。
+//   教训：测试里复制容器打包器 = 两份实现必然漂移（评审要求「测试必须链接同一份
+//   生产实现」）。现在改成唯一来源。
 bool write_dff(const std::string& path, uint32_t rate, int ch, double seconds, double amp) {
+    try {
+        const int64_t bits = (int64_t)((double)rate * seconds);
+        rta::audio::DsdStream s;
+        s.rate = rate;
+        s.channels = ch;
+        s.bits = (uint64_t)bits;
+        s.container = "dff";
+        s.data = make_dsd(bits, ch, rate, amp);
+        rta::audio::write_dff(path, s);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+#if 0   // 旧的本地 DFF 打包器（保留备查；已由上面的生产实现取代）
     const int64_t bits = (int64_t)((double)rate * seconds);
     auto data = make_dsd(bits, ch, rate, amp);
     const uint64_t perCh = (uint64_t)((bits + 7) / 8);
@@ -231,6 +253,7 @@ bool write_dff(const std::string& path, uint32_t rate, int ch, double seconds, d
     f.insert(f.end(), body.begin(), body.end());
     return write_file(path, f);
 }
+#endif  // 旧本地 DFF 打包器结束
 
 // ---------------- 白名单 ----------------
 std::vector<std::string> read_required_list() {

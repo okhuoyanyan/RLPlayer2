@@ -160,6 +160,19 @@ inline int parse_wav_header(const uint8_t* data, size_t size, WavHeaderInfo& out
                 if (errorMsg) *errorMsg = "WAV 位深非法 (允许 8/16/24/32, 当前=" + std::to_string(bps) + ")";
                 return -1;
             }
+            // ★ 2026-10-29（两轮审查 C01）：IEEE float 只允许 32 位。
+            //
+            // 缺陷：这里放行 fmtTag=3 + bps=8/16/24，而 decode_sample() 对 float 一律读
+            //   4 字节、read_wav（整曲）在别处拒绝非 32 位 float ⟹ 流式解析器与整曲
+            //   解析器对同一份文件给出**相反**结论，且 24 位声明的 float 会让每帧
+            //   多读 1 字节（越界读/错位）。当前生产调用者只喂 ffmpeg 生成的规定格式，
+            //   所以是"可达但未被正常输入触发"的缺陷 —— 按评审要求统一校验、显式拒绝，
+            //   不放宽整曲侧。
+            if (fmtTag == 3 && bps != 32) {
+                if (errorMsg) *errorMsg = "WAV IEEE float 只支持 32 位 (当前 fmtTag=3, bps=" +
+                                          std::to_string(bps) + ")；整曲与流式解析器口径一致";
+                return -1;
+            }
             if (ch < 1 || ch > 32) {
                 if (errorMsg) *errorMsg = "WAV 声道数非法 (允许 1..32, 当前=" + std::to_string(ch) + ")";
                 return -1;

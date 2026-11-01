@@ -21,6 +21,10 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -95,6 +99,41 @@ inline int meta_source_rank(const std::string& source) {
 // ---------------------------------------------------------------------------
 // MetaStore（单例，仿 Library::instance 模式）
 // ---------------------------------------------------------------------------
+// Shared by atomic writers and read/merge/write transactions. Recursive locking lets
+// the transaction call the writer without unlocking. Stripes keep the lock table bounded.
+inline std::recursive_mutex& meta_file_mutex(const fsx::path& file) {
+    static std::array<std::recursive_mutex, 64> locks;
+    std::error_code ec;
+    const fsx::path absolute = fsx::absolute(file, ec);
+    const fsx::path normalized = (ec ? file : absolute).lexically_normal();
+    return locks[fsx::hash_value(normalized) % locks.size()];
+}
+
+inline bool meta_write_atomic(const fsx::path& file, const std::string& bytes) {
+    std::lock_guard<std::recursive_mutex> lk(meta_file_mutex(file));
+    std::error_code ec;
+    const fsx::path dir = file.parent_path();
+    if (!dir.empty()) fsx::create_directories(dir, ec);
+    static std::atomic<unsigned long long> serial{0};
+    fsx::path tmp = file;
+    tmp += ".tmp." + std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()) +
+           "." + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())) +
+           "." + std::to_string(serial.fetch_add(1));
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return false;                       // 打不开临时文件：不动旧文件
+        f.write(bytes.data(), (std::streamsize)bytes.size());
+        f.flush();
+        const bool flushed = f.good();
+        f.close();
+        if (!flushed || f.fail()) { fsx::remove(tmp, ec); return false; } // Keep old file on write/flush/close failure
+    }
+    fsx::rename(tmp, file, ec);                     // 同盘 rename，原子生效
+    if (ec) { fsx::remove(tmp, ec); return false; }
+    return true;
+}
+
+
 class MetaStore {
 public:
     static MetaStore& instance() { static MetaStore S; return S; }
@@ -137,7 +176,13 @@ public:
         if (!f) return false;
         std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         if (s.empty()) return false;
-        const rta::net::Json j = rta::net::json_parse(s);
+        // ★ 2026-10-29（两轮审查 F28）：缓存文件必须走【严格解析】。
+        //   旧代码用宽松解析：截断成 {"path":"track.wav","fields":{"title":{"value":"PARTIAL
+        //   的文本会被当成合法对象 ⟹ load() 返回 true、title=PARTIAL，下一次 save()
+        //   还会用这个残缺结果覆盖原文件（把损坏固化）。
+        rta::net::Json j;
+        std::string perr;
+        if (!rta::net::json_parse_strict(s, j, &perr)) return false;
         if (j.type != rta::net::Json::Obj) return false;
         // save() 永远写这两个键；缺 "fields" 或它不是对象 = 损坏/截断
         if (!j.has("fields") || j["fields"].type != rta::net::Json::Obj) return false;
@@ -181,20 +226,8 @@ public:
         }
         o << "}}";
 
-        const fsx::path dir = tracksDir();
-        std::error_code ec;
-        fsx::create_directories(dir, ec);
-        fsx::path file = dir / (hashOf(tm.path) + ".json");
-        fsx::path tmp  = file;
-        tmp += ".tmp";
-        {
-            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-            if (!f) return;
-            const std::string s = o.str();
-            f.write(s.data(), (std::streamsize)s.size());
-            if (!f) return;                 // 写失败：不动旧文件
-        }
-        fsx::rename(tmp, file, ec);         // 同盘 rename，原子生效
+        const fsx::path file = tracksDir() / (hashOf(tm.path) + ".json");
+        (void)meta_write_atomic(file, o.str());
     }
 
     // 字段级合并：
@@ -252,19 +285,8 @@ public:
         if (e == "jpeg") e = "jpg";
         if (e != "jpg" && e != "png") return "";
         const std::string h = hashOf(trackPath);
-        const fsx::path dir = coversDir();
-        std::error_code ec;
-        fsx::create_directories(dir, ec);
-        fsx::path file = dir / (h + "." + e);
-        fsx::path tmp  = file;
-        tmp += ".tmp";
-        {
-            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-            if (!f) return "";
-            f.write((const char*)data, (std::streamsize)n);
-            if (!f) return "";
-        }
-        fsx::rename(tmp, file, ec);
+        const fsx::path file = coversDir() / (h + "." + e);
+        if (!meta_write_atomic(file, std::string(reinterpret_cast<const char*>(data), n))) return "";
         return "covers/" + h + "." + e;
     }
 

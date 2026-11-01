@@ -27,7 +27,8 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include "wav.h"   // rta::audio::AudioBuffer
+#include "wav.h"        // rta::audio::AudioBuffer
+#include "dsp/dop.h"    // ★ F18：DoP 补齐必须用合法 marker（0x05/0xFA），不能补 PCM 零
 
 namespace rta::render {
 
@@ -117,6 +118,25 @@ struct RenderQ {
     std::atomic<uint64_t> epoch{1};        // 消费者每次跳转 +1
     std::atomic<long long> seekFrame{-1};  // 生产者看到就重建管线并从这里继续
     std::atomic<bool>     gpu{false};
+
+    // A seek's position and epoch are one request. Reading the global epoch
+    // after a slow pipeline/DoP reset can otherwise label old audio as new.
+    // Keep the public atomic fields for existing callers/tests, but production
+    // seek publication and consumption must use this paired mailbox.
+    uint64_t publish_seek(long long frame) {
+        uint64_t requestedEpoch;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            requestedEpoch=epoch.fetch_add(1)+1;
+            seekFrame.store(frame);
+        }
+        cv.notify_all();
+        return requestedEpoch;
+    }
+    std::pair<long long,uint64_t> consume_seek() {
+        std::lock_guard<std::mutex> lock(mtx);
+        return {seekFrame.exchange(-1),epoch.load()};
+    }
 };
 
 // ---------------- 渲染循环的宿主状态 ----------------
@@ -319,6 +339,10 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
     bool eos = false;
     bool padded = false;   // 末尾不足一个周期时只补一次静音（防共享模式无限尾音）
     uint64_t myEpoch = RQ.epoch.load();
+    // Device marker phase follows accepted carrier frames, not producer output.
+    // Seek may discard an odd number of already-packed frames from pend/RQ.q.
+    // Keep this phase across seek; zero/failed writes never advance it.
+    bool dopNextMarkerA = true;
 
     // ---- 开播自检 / 超时熔断状态（2026-10-24 N300 96k 掉 USB）----
     // 全部是本地量：不分配、不加锁、不改变写入调度；只在判罚时提前 break。
@@ -380,6 +404,20 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
             RQ.q.pop_front();
             lk.unlock();
             if (!b.raw.empty()) {
+                if (h.dop) {
+                    bool phaseA = dopNextMarkerA != ((pendFrames & 1u) != 0);
+                    for (size_t i = 0; i < b.frames(); ++i) {
+                        const uint32_t marker = (phaseA ? rta::dsp::DOP_MARKER_A
+                                                       : rta::dsp::DOP_MARKER_B) << 16;
+                        for (int c = 0; c < h.outCh; ++c) {
+                            auto& sample = b.raw[i * (size_t)h.outCh + (size_t)c];
+                            uint32_t v = marker | (uint32_t(sample) & 0xffffu);
+                            if (v & 0x800000u) v |= 0xff000000u;
+                            sample = (int32_t)v;
+                        }
+                        phaseA = !phaseA;
+                    }
+                }
                 pend.insert(pend.end(), b.raw.begin(), b.raw.end());
                 pendFrames += b.frames();
                 if (h.dbgPulls) h.dbgPulls->fetch_add(1);
@@ -422,8 +460,7 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
             // 不要调用 IAudioClient::Reset()：实测 Reset+Start 之后 GetCurrentPadding
             // 会一直停在满值，GetBuffer 永远拿不到空间，表现为"跳转后进度卡住"。
             // 代价是设备缓冲里最多 1 个周期（≈100 ms）的旧音频会先播完，可接受。
-            myEpoch = RQ.epoch.fetch_add(1) + 1;
-            RQ.seekFrame.store((long long)(sk * (double)h.inFrames));
+            myEpoch = RQ.publish_seek((long long)(sk * (double)h.inFrames));
             pend.clear(); pendFrames = 0; eos = false; padded = false;
             played = (size_t)(sk * (double)h.totalOut);
             h.played->store(played);
@@ -438,8 +475,14 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
         if (RQ.gpu.load() && !*h.gpuOut) *h.gpuOut = true;
 
         // 实时音量：只把「当前请求 - 起播时已应用的」这个差值交给设备层，
-        // 差值为 0 时完全走原路径（逐位不变）
-        sink.set_live_gain_db(h.volDb->load() - h.startDb->load());
+        // 差值为 0 时完全走原路径（逐位不变）。
+        // ★ 2026-10-29（两轮审查 F04）：DoP 载波上【绝对不能】做 PCM 增益。
+        //   24-bit 容器的高 8 位是 DoP marker（0x05 / 0xFA），低 16 位才是 DSD 位；
+        //   乘任何增益都会把 marker 改成别的值（实测 0x05aaaa 经 −6 dB 变成 0x02d70e），
+        //   接收端要么判非法、要么把噪音当 DSD 播出来 —— 而界面上音量滑块"正常工作"。
+        //   DSD 的实时音量只能做在【调制之前】的 PCM 域，由生产者的
+        //   Pipeline::set_volume_db() 负责（见 rtaweb 的 dop 分支）。
+        if (!h.dop) sink.set_live_gain_db(h.volDb->load() - h.startDb->load());
 
         // 先把待写缓冲填到至少一个周期（最多预攒 3 个周期，避免占内存）
         while (pendFrames < period * 3 && !eos) {
@@ -451,7 +494,30 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
         //   ≈20ms 空间，pendFrames 落回 period 以下若再次补齐，就会每 tick 凭空多出一段
         //   静音、0.5 秒的文件永远播不完（实测 pos 冲到 200 秒还在写）。
         if (eos && pendFrames > 0 && pendFrames < period && !padded) {
+            const size_t realFrames = pendFrames;
             pend.resize(period * (size_t)h.outCh, 0);
+            // ★ 2026-10-29（两轮审查 F18）：DoP 的补齐必须在 1-bit/DoP 域做。
+            //   旧代码无条件 pend.resize(..., 0) —— 对 DoP 而言那等于写入 marker=0x00
+            //   的非法帧（既不是 0x05 也不是 0xFA），实测 3 帧合法 DoP + 设备块 16
+            //   会补出 13 帧非法 marker，而 normalEnd=1（"正常结束"）。接收端要么丢锁、
+            //   要么把这些帧当噪音。这里按规范补「合法 DoP 静音」：
+            //     · marker 继续按 A/B 交替（相位从最后一个真实帧推出来，不能重置成 0x05，
+            //       否则接收端看到 A,A 判非法）；
+            //     · payload 用 DSD 静音字节 0x6969（4 个 0 / 4 个 1，规范定义的 Silence Pattern）。
+            if (h.dop) {
+                for (int c = 0; c < h.outCh; ++c) {
+                    const int32_t last = pend[(realFrames - 1) * (size_t)h.outCh + (size_t)c];
+                    bool phaseA = ((((uint32_t)last >> 16) & 0xFFu) == rta::dsp::DOP_MARKER_A);
+                    for (size_t i = realFrames; i < period; ++i) {
+                        phaseA = !phaseA;
+                        const uint32_t mk = (phaseA ? rta::dsp::DOP_MARKER_A
+                                                    : rta::dsp::DOP_MARKER_B) << 16;
+                        int32_t v = (int32_t)(mk | 0x6969u);
+                        if (v & 0x800000) v |= (int32_t)0xFF000000;      // 24-bit 符号扩展
+                        pend[i * (size_t)h.outCh + (size_t)c] = v;
+                    }
+                }
+            }
             pendFrames = period;
             padded = true;
         }
@@ -627,11 +693,15 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
         }
 
         if (w > 0) {
+            if (h.dop && (w & 1u)) dopNextMarkerA = !dopNextMarkerA;
             pend.erase(pend.begin(), pend.begin() + (long long)(w * (size_t)h.outCh));
             pendFrames -= w;
             played += w;
             writtenTotal += w;
-            h.played->store(played);
+            // ★ 2026-10-29（音质准则 → F17 尾部策略）：progress 表示"源内容播到哪"，
+            //   不包含卷积 IR 的混响尾巴。尾部必须完整放出（否则是可听截断），
+            //   但它不是源内容 ⟹ 进度条钳在 100%，实际多放的帧数由 END 的 tail= 交代。
+            h.played->store((h.totalOut > 0 && played > h.totalOut) ? h.totalOut : played);
             timeouts = 0;
             hangN = 0;          // 写进去了 ⟹ 「停止响应」串清零
             winWritten += w;

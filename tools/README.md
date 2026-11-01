@@ -32,8 +32,7 @@
 | `wasapi_ex_probe.exe` | 独占格式阶梯探测：24 紧凑 / float32 / 32 容器 / 32 int |
 | `asio_probe.exe` | ASIO 驱动预检（子进程里试开 0.7 s，崩溃结果写缓存） |
 | `upnp_scan.exe` | UPnP/DLNA 渲染器发现 |
-| `naa_scan.exe` | NAA 端点发现（只发现，握手未实现） |
-| `naa_probe.exe` | NAA 控制通道只读探测 |
+| ~~`naa_scan.exe` / `naa_probe.exe`~~ | **已删除（2026-10-24）**：NAA 只认 HQPlayer 私有握手，EULA 禁止逆向，8 种组合实测全部无回应 ⟹ 这条通路不可能对接成功（理由见 `CMakeLists.txt:191`）。**数播请走 UPnP/DLNA 投放**（`rtacast.exe` 或界面「投放」）；底层 RTANet 仍保留（`rtanet_rx.exe`） |
 | `rtanet_rx.exe` | 另一端接收 RTANet 网络音频 |
 | `rtacast.exe` | UPnP 投放（命令行） |
 | `rtacapture.exe` | WASAPI 采集 / 录制 |

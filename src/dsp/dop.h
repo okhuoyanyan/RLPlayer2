@@ -10,6 +10,8 @@
 //   于是 DSD64(2.8224 MHz) -> 176400 Hz，DSD128 -> 352800 Hz，DSD256 -> 705600 Hz
 #pragma once
 #include <cstdint>
+#include <cstdio>
+#include <string>
 #include <vector>
 #include <cstddef>
 
@@ -63,6 +65,55 @@ inline void dop_pack(const double* const* sdm, int channels, size_t frames,
                      std::vector<int32_t>& out) {
     DopPackState st;
     dop_pack(sdm, channels, frames, out, st);
+}
+
+// ===========================================================================
+// ★ 2026-10-29（两轮审查 F03）：1-bit 输出契约检查。
+//
+// 合法的 1-bit 调制器输出只有 +1.0 / −1.0 两个取值。任何其它值都说明上游把**多电平**
+// 流送到了 1-bit 打包口。旧 dop_pack() 只做「> 0.0」判断 ⟹ 256 电平的 AHM 流被按符号
+// 折成 1-bit：恒定输入 0.2 的平均值本来是 0.2，打包再解包后变成 1.0（直流 +1），
+// 而 DoP marker 依然完全合法 —— 从输出侧根本发现不了。
+//
+// 因此：生产调用一律走 dop_pack_checked()，非二值输入必须【明确失败】，
+// 由调用方把原因告诉用户（而不是"听起来像坏了"）。
+// ===========================================================================
+inline bool dop_check_binary(const double* const* sdm, int channels, size_t frames,
+                             size_t* badIndex = nullptr, double* badValue = nullptr) {
+    if (!sdm || channels <= 0) return true;
+    for (int c = 0; c < channels; ++c) {
+        const double* p = sdm[(size_t)c];
+        if (!p) continue;
+        for (size_t i = 0; i < frames; ++i) {
+            const double v = p[i];
+            if (v == 1.0 || v == -1.0) continue;
+            if (badIndex) *badIndex = i;
+            if (badValue) *badValue = v;
+            return false;
+        }
+    }
+    return true;
+}
+
+// 带契约检查的打包。返回 false = 输入不是 1-bit（多电平流混入），out 不被修改。
+inline bool dop_pack_checked(const double* const* sdm, int channels, size_t frames,
+                             std::vector<int32_t>& out, DopPackState& st,
+                             std::string* why = nullptr) {
+    size_t badI = 0;
+    double badV = 0.0;
+    if (!dop_check_binary(sdm, channels, frames, &badI, &badV)) {
+        if (why) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "DoP 打包被拒绝：输入不是 1-bit 流（第 %llu 个样本 = %.9f，只有 +1/-1 合法）。"
+                "这通常意味着多电平调制器（AHM 等）的输出被送进了 1-bit 通路。",
+                (unsigned long long)badI, badV);
+            *why = buf;
+        }
+        return false;
+    }
+    dop_pack(sdm, channels, frames, out, st);
+    return true;
 }
 
 // 解包：校验标记并还原 1-bit 流。返回 false 表示标记序列不合法（不是有效 DoP）

@@ -26,6 +26,7 @@
 //   NS5   5 阶，"相当激进"    NS9  9 阶，"非常激进"
 //   LNS15 15 阶，"平滑斜率"
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（见该头注释）
 #include "kaiser.h"          // 提供 kPi
 #include <vector>
 #include <cmath>

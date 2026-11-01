@@ -2,13 +2,24 @@
 //
 // 判据（铁律 3）：这里只测**决策**，不测设备。探测（WASAPI IsFormatSupported / ASIO
 // canSampleRate、kAsioCanDoIoFormat）在 rtaweb 里，验证靠 GET /api/preset/caps 的实测输出。
+//
+// ⚠️ 2026-10-29（管理员 261029-02 新功能1）：本文件所有「期望 rate=follow」的断言已改为 rate=src。
+//   原因：rate_pick.h:113 里 follow 的真实语义是「跟随**系统混音**采样率」，而预设一直想表达的是「跟随**源**」。
+//   结果：源 48k + 声卡默认 44.1k 时原音直通会被钉在 44.1k ⟹ 重采样 ⟹ 永远不 bit-perfect。
+//   bit-perfect 的正确取值是 src（rate_pick.h:104：requested=="src" ⟹ rate=sourceRate）。
 // 因此本文件不需要声卡、不开流、不出声，任何机器都能跑。
+//
+// ⚠️ 2026-10-30：判据⑧（后端独占/直连）落地 —— 旧版七条只约束"设置"，共享后端也判绿；
+//   现在 caps.exclusive=false 一律判红，BitPerfect 档的 notes 也会写明「当前后端是共享模式」。
+//   原因见 preset_profiles.h 的 check_bit_perfect 上方注释：共享模式的采样率由系统混音格式决定
+//   （WASAPI 共享走 GetMixFormat），rate=src 只是请求，保证不了设备实际不重采样。
 //
 // 覆盖的四类硬要求（用户 2026-10-25）：
 //   1) 无 DSD 能力的设备选 dsd 档必须**降级并给 note**（不是静默假装支持）；
 //   2) maxRate 只有 96k 时 pcm 档**不许写 384**；
 //   3) 源 DSD 与目标同速率 ⟹ directSdm=1（不同速率必须 0）；
-//   4) bitperfect 档在任何设备上都必须满足 bit-perfect 七条件（且负向对照能证明判据不是摆设）。
+//   4) bitperfect 档在**独占后端**上必须满足 bit-perfect 八条件；非独占必须被判红
+//      （且负向对照能证明判据不是摆设）。
 #include "engine/preset_profiles.h"
 #include <cstdio>
 #include <string>
@@ -97,38 +108,38 @@ int main() {
     const std::vector<uint32_t> k96k = {44100, 48000, 96000};
     const std::vector<uint32_t> k192k = {44100, 48000, 88200, 96000, 176400, 192000};
 
-    // ---- ① 原音直通：PCM 源必须满足七条件 ----
+    // ---- ① 原音直通：PCM 源必须满足八条件 ----
     {
         const DeviceCaps c = wasapi_caps(kFull);
         const SourceInfo src = pcm_src(44100, 16);
         const PresetSettings s = plan_preset(PresetProfile::BitPerfect, c, src);
-        ck(s.rate == "follow", "Case 1: bitperfect/PCM ⟹ rate=follow（不重采样）");
+        ck(s.rate == "src", "Case 1: bitperfect/PCM ⟹ rate=src（保持源采样率，不重采样）");
         ck(s.dsd == 0, "Case 1: bitperfect/PCM ⟹ dsd=0（不调制）");
         ck(s.volumeDb == 0.0, "Case 1: bitperfect/PCM ⟹ 音量 0 dB");
         ck(s.shaper == "none", "Case 1: bitperfect/PCM ⟹ shaper=none（无抖动/整形）");
         ck(s.clearEqIr, "Case 1: bitperfect/PCM ⟹ 清空 EQ/IR/预衰减");
         ck(s.directSdm == 0, "Case 1: bitperfect/PCM ⟹ directSdm=0");
         const BitPerfectCheck bp = check_bit_perfect(s, c, src);
-        ck(bp.ok && bp.violations.empty(), "Case 1: bitperfect/PCM ⟹ 七条件全过",
+        ck(bp.ok && bp.violations.empty(), "Case 1: bitperfect/PCM ⟹ 八条件全过",
            bp.violations.empty() ? std::string() : bp.violations[0]);
     }
 
-    // ---- ② 原音直通：设备只有 96k 也照样满足七条件（follow 不需要支持列表） ----
+    // ---- ② 原音直通：设备只有 96k 也照样满足八条件（src 不需要支持列表） ----
     {
         const DeviceCaps c = wasapi_caps(k96k);
         const SourceInfo src = pcm_src(44100, 24);
         const PresetSettings s = plan_preset(PresetProfile::BitPerfect, c, src);
         const BitPerfectCheck bp = check_bit_perfect(s, c, src);
-        ck(s.rate == "follow" && bp.ok, "Case 2: bitperfect/96k 设备 ⟹ 仍是 follow 且七条件全过");
+        ck(s.rate == "src" && bp.ok, "Case 2: bitperfect/96k 设备 ⟹ 仍是 src 且八条件全过");
     }
 
-    // ---- ③ 负向对照：位深降低必须被判出来（证明七条件不是摆设） ----
+    // ---- ③ 负向对照：位深降低必须被判出来（证明八条件不是摆设） ----
     {
         const DeviceCaps c = wasapi_caps(kFull, 16);
         const SourceInfo src = pcm_src(96000, 24);
         const PresetSettings s = plan_preset(PresetProfile::BitPerfect, c, src);
         const BitPerfectCheck bp = check_bit_perfect(s, c, src);
-        ck(!bp.ok, "Case 3: 24-bit 源 + 16-bit 输出 ⟹ 七条件判不过（负向对照）");
+        ck(!bp.ok, "Case 3: 24-bit 源 + 16-bit 输出 ⟹ 八条件判不过（负向对照）");
         ck(!bp.violations.empty() && bp.violations[0].find("⑦") != std::string::npos,
            "Case 3: 违例条目点名条件⑦（位深降低）",
            bp.violations.empty() ? std::string() : bp.violations[0]);
@@ -144,7 +155,7 @@ int main() {
         ck(has_note(s, "DirectSDM"), "Case 4: note 写明 DirectSDM 1-bit 直通");
         ck(has_note(s, "原生"), "Case 4: note 写明设备原生支持（可 1-bit 直送）");
         const BitPerfectCheck bp = check_bit_perfect(s, c, src);
-        ck(bp.ok, "Case 4: bitperfect/DSD64 ⟹ 七条件全过（⑥按 1-bit 直通判）");
+        ck(bp.ok, "Case 4: bitperfect/DSD64 ⟹ 八条件全过（⑥按 1-bit 直通判）");
     }
 
     // ---- ⑤ 原音直通：无原生但 DoP 够 ⟹ 仍按 1-bit 直通 ----
@@ -165,7 +176,7 @@ int main() {
         ck(s.directSdm == 0, "Case 6: 降级后 directSdm=0（不假装直通）");
         ck(has_note(s, "降级"), "Case 6: note 明确写「已降级」");
         const BitPerfectCheck bp = check_bit_perfect(s, c, src);
-        ck(!bp.ok, "Case 6: 降级后七条件当然不成立（不许静默宣称 bit-perfect）");
+        ck(!bp.ok, "Case 6: 降级后八条件当然不成立（不许静默宣称 bit-perfect）");
     }
 
     // ---- ⑦ 原音直通：能力未知（探测为空）⟹ 保守不承诺直通 ----
@@ -200,11 +211,11 @@ int main() {
         ck(rate_num(s.rate) <= kPresetRateCap, "Case 9: rate 数值 ≤ 384000");
     }
 
-    // ---- ⑩ PCM 升频：探测为空 ⟹ follow + note（不假装支持） ----
+    // ---- ⑩ PCM 升频：探测为空 ⟹ src + note（不假装支持） ----
     {
         const DeviceCaps c = wasapi_caps({});
         const PresetSettings s = plan_preset(PresetProfile::Pcm, c, pcm_src(44100, 16));
-        ck(s.rate == "follow", "Case 10: pcm/探测为空 ⟹ rate=follow", s.rate);
+        ck(s.rate == "src", "Case 10: pcm/探测为空 ⟹ rate=src", s.rate);
         ck(has_note(s, "探测为空"), "Case 10: note 写明探测为空、已降级");
     }
 
@@ -247,7 +258,7 @@ int main() {
         ck(s.modFamily == "ec" && s.modOrder == 7, "Case 13: dsd ⟹ modfamily=ec / modorder=7");
         ck(s.filter == "poly-sinc-tight-lp" && s.minTapsPerInput == 512,
            "Case 13: dsd ⟹ poly-sinc-tight-lp + 512 taps");
-        ck(s.rate == "follow", "Case 13: dsd ⟹ rate=follow");
+        ck(s.rate == "src", "Case 13: dsd ⟹ rate=src");
         ck(s.shaper == "none", "Case 13: dsd ⟹ shaper=none（DoP 强制无抖动）");
         ck(s.directSdm == 0, "Case 13: 源是 PCM ⟹ directSdm=0");
         ck(has_note(s, "原生"), "Case 13: note 写明走原生");
@@ -282,18 +293,14 @@ int main() {
         ck(has_note(s, "封顶"), "Case 16: note 写明按 DSD512 封顶");
     }
 
-    // ---- ⑰ bitperfect：多设备 × 多源矩阵都必须满足七条件（PCM 源） ----
+    // ---- ⑰ bitperfect：独占设备 × 多源矩阵都必须满足八条件（PCM 源） ----
     {
         struct Case { const char* name; DeviceCaps c; };
         std::vector<Case> cases;
         cases.push_back({ "wasapi-full", wasapi_caps(kFull) });
         cases.push_back({ "wasapi-96k", wasapi_caps(k96k) });
         cases.push_back({ "wasapi-192k", wasapi_caps(k192k) });
-        cases.push_back({ "wasapi-empty", wasapi_caps({}) });
         cases.push_back({ "asio-native-dsd512", asio_caps(kFull, "dsd512") });
-        DeviceCaps shared = wasapi_caps(kFull);
-        shared.exclusive = false;
-        cases.push_back({ "shared-non-exclusive", shared });
         std::vector<SourceInfo> srcs;
         srcs.push_back(pcm_src(44100, 16));
         srcs.push_back(pcm_src(44100, 24));
@@ -313,7 +320,35 @@ int main() {
                 }
             }
         }
-        ck(matrixFail == 0, "Case 17: 6 设备 × 4 源 ⟹ bitperfect 档七条件全部成立", firstBad);
+        ck(matrixFail == 0, "Case 17: 4 台独占设备 × 4 源 ⟹ bitperfect 档八条件全部成立", firstBad);
+
+        // 2026-10-30：判据⑧落地后，非独占（含"探测为空 ⟹ exclusive 默认 false"）本就不该全过。
+        //   这两组原来混在上面"必须全过"的矩阵里，正是旧判据漏掉⑧的证据 —— 共享后端也判绿。
+        std::vector<Case> sharedCases;
+        sharedCases.push_back({ "wasapi-empty", wasapi_caps({}) });
+        DeviceCaps shared = wasapi_caps(kFull);
+        shared.exclusive = false;
+        sharedCases.push_back({ "shared-non-exclusive", shared });
+        int sharedGreen = 0;
+        std::string sharedBad;
+        for (const auto& cs : sharedCases) {
+            for (const auto& src : srcs) {
+                DeviceCaps dc = cs.c;
+                if (src.srcBits == 32) dc.bits = 32;
+                const PresetSettings s = plan_preset(PresetProfile::BitPerfect, dc, src);
+                const BitPerfectCheck bp = check_bit_perfect(s, dc, src);
+                bool named8 = false;
+                for (const auto& v : bp.violations) if (v.find("⑧") != std::string::npos) named8 = true;
+                if (bp.ok || !named8) {
+                    ++sharedGreen;
+                    if (sharedBad.empty()) {
+                        sharedBad = std::string(cs.name) + ": " +
+                                    (bp.violations.empty() ? std::string("(ok, 无违例)") : bp.violations[0]);
+                    }
+                }
+            }
+        }
+        ck(sharedGreen == 0, "Case 17: 2 组非独占/未知 × 4 源 ⟹ 全部被⑧判红（旧判据会判绿）", sharedBad);
     }
 
     // ---- ⑱ 档位名 / 解析 / DoP 载波换算 ----
@@ -351,7 +386,7 @@ int main() {
         ck(s1.filter == "poly-sinc-tight-lp" && s1.minTapsPerInput == 512, "tight 滤波 + 512 抽头/相位",
            s1.filter + "/" + std::to_string(s1.minTapsPerInput));
         ck(s1.directSdm == 0, "PCM 源没有 DirectSDM 直通", std::to_string(s1.directSdm));
-        ck(s1.rate == "follow", "rate=follow（载波由 dsd 档决定）", s1.rate);
+        ck(s1.rate == "src", "rate=src（载波由 dsd 档决定）", s1.rate);
         // 只有 DoP 的设备
         DeviceCaps c2;
         c2.rates = {44100, 48000, 176400, 352800}; c2.maxRate = 352800;
@@ -372,6 +407,55 @@ int main() {
         ck(preset_profile_parse("pcm2dsd", pr) && pr == PresetProfile::PcmToDsd, "解析 pcm2dsd");
         ck(preset_profile_parse("PCM-DSD", pr) && pr == PresetProfile::PcmToDsd, "解析 PCM-DSD（大小写/连字符）");
         ck(std::string(preset_profile_name(PresetProfile::PcmToDsd)) == "pcm2dsd", "规范名 pcm2dsd");
+    }
+
+    // ---- [20] 判据⑧：后端非独占 ⟹ 必须判红（2026-10-30）----
+    {
+        std::printf("\n-- [20] 判据⑧ 后端非独占/直连 --\n");
+        const SourceInfo src = pcm_src(44100, 16);
+        DeviceCaps shared = wasapi_caps(kFull);        // 其余七条全部满足
+        shared.exclusive = false;
+        const PresetSettings s = plan_preset(PresetProfile::BitPerfect, shared, src);
+        const BitPerfectCheck bp = check_bit_perfect(s, shared, src);
+        ck(!bp.ok, "Case 20: 共享后端 + 其余全满足 ⟹ ok=false");
+        bool named8 = false;
+        for (const auto& v : bp.violations) if (v.find("⑧") != std::string::npos) named8 = true;
+        ck(named8, "Case 20: violations 里有含「⑧」的那条",
+           bp.violations.empty() ? std::string("(无违例)") : bp.violations[0]);
+        ck(bp.violations.size() == 1, "Case 20: 只差⑧这一条（其余七条确实全满足）",
+           std::to_string(bp.violations.size()));
+        ck(has_note(s, "共享"), "Case 20: BitPerfect + 共享后端 ⟹ notes 出现「共享」");
+        ck(has_note(s, "独占"), "Case 20: note 指明改走 WASAPI 独占或 ASIO");
+        // DSD 源也带同一条 note：BitPerfect 的 DSD 分支会提前 return，最容易漏
+        const PresetSettings ds = plan_preset(PresetProfile::BitPerfect, shared, dsd_src(64));
+        ck(has_note(ds, "共享"), "Case 20: DSD 源同样带「共享」note（提前 return 不漏）");
+    }
+
+    // ---- [21] 判据⑧：独占后端不受影响（不能把正常情况判红）----
+    {
+        std::printf("\n-- [21] 判据⑧ 独占后端不受影响 --\n");
+        const SourceInfo src = pcm_src(44100, 16);
+        DeviceCaps ex = wasapi_caps(kFull);
+        ex.exclusive = true;
+        const PresetSettings s = plan_preset(PresetProfile::BitPerfect, ex, src);
+        const BitPerfectCheck bp = check_bit_perfect(s, ex, src);
+        ck(bp.ok && bp.violations.empty(), "Case 21: 独占后端 + 其余全满足 ⟹ ok=true、无违例",
+           bp.violations.empty() ? std::string() : bp.violations[0]);
+        ck(!has_note(s, "共享"), "Case 21: 独占后端 ⟹ notes 不出现「共享」");
+        // 只翻转 exclusive 一个字段：结论确实是⑧带来的，不是别的字段变了
+        DeviceCaps flip = ex;
+        flip.exclusive = false;
+        const BitPerfectCheck bp2 = check_bit_perfect(s, flip, src);
+        ck(!bp2.ok, "Case 21: 同一份设置只翻转 exclusive ⟹ 立刻判红（判据确由⑧驱动）");
+        ck(!bp2.violations.empty() && bp2.violations.back().find("⑧") != std::string::npos,
+           "Case 21: 翻转后最后一条违例是⑧",
+           bp2.violations.empty() ? std::string() : bp2.violations.back());
+        // ASIO 本身就是独占/直连，判据⑧不该把这类正常后端也判红
+        const DeviceCaps a = asio_caps(kFull, "dsd512");
+        const PresetSettings sa = plan_preset(PresetProfile::BitPerfect, a, src);
+        const BitPerfectCheck bp3 = check_bit_perfect(sa, a, src);
+        ck(a.exclusive && bp3.ok, "Case 21: ASIO 后端 ⟹ exclusive=true 且八条件全过",
+           bp3.violations.empty() ? std::string() : bp3.violations[0]);
     }
 
     if (g_fails == 0) std::printf("\n[ALL PASS] 三档预设决策单测全部通过\n");

@@ -9,7 +9,7 @@
 //   序列化结果里不允许出现 inf/nan（JSON 规范没有它们，客户端解析必崩）。
 //
 // 全部离线：只用本文件自己写出来的 WAV 夹具（+ 文本冒充音频），不依赖 ffmpeg、不读真实曲库、
-// 不打开任何音频设备（铁律 1）。夹具落在当前工作目录的 test_health_robust_tmp\，跑完即删。
+// 不打开任何音频设备（铁律 1）。夹具落在按进程隔离的临时目录，跑完即删。
 #include "analysis/track_health.h"
 #include "analysis/health_stream.h"
 
@@ -58,6 +58,7 @@ static void write_wav(const fsx::path& p, int ch, int rate, int bits, int fmt,
     put32((unsigned)(rate * ch * bytesPer)); put16((unsigned)(ch * bytesPer)); put16((unsigned)bits);
     putS("data"); put32((unsigned)dataBytes);
     std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    if (!f) throw std::runtime_error("cannot create WAV fixture: " + upath(p));
     f.write(h.data(), (std::streamsize)h.size());
     if (withSamples) {
         // 全零（数字静音）：这是最容易把 log10(0) 打成 nan/inf 的输入
@@ -125,7 +126,8 @@ int main() {
 }
 
 static int run_all() {
-    g_dir = fsx::current_path() / "test_health_robust_tmp";
+    // 200 字符文件名测试不应因仓库 checkout 路径较长而在造夹具阶段失败。
+    g_dir = fsx::temp_directory_path() / ("rh" + std::to_string(GetCurrentProcessId()));
     std::error_code ec;
     fsx::remove_all(g_dir, ec);
     fsx::create_directories(g_dir, ec);
@@ -282,7 +284,7 @@ static int run_all() {
         check(js.find("\tfile") == std::string::npos || js.find("\\tfile") != std::string::npos,
               "错误信息里的制表符已转义成 \\t");
         // 反斜杠：Windows 路径天然带 \，必须成对转义（否则 JSON 解析器会吃掉下一个字符）
-        check(js.find("D:\\\\") != std::string::npos || js.find("D:\\\\RTA") != std::string::npos,
+        check(js.find("\\\\") != std::string::npos,
               "路径反斜杠已转义成双反斜杠");
         // 合法但少见的文件名：单引号 / 方括号
         const fsx::path p = g_dir / "a'b[1].wav";

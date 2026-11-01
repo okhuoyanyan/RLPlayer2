@@ -21,6 +21,9 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#ifdef _WIN32
+#include <windows.h>   // MultiByteToWideChar（winsock2.h 通常已带入；显式包含，别依赖包含顺序）
+#endif
 #include "net/upnp_control.h"
 #include <string>
 #include <vector>
@@ -57,6 +60,38 @@ struct UpnpDevice {
 
 namespace upnp_detail {
 inline std::string lower(std::string s) { for (auto& c : s) c = (char)std::tolower((unsigned char)c); return s; }
+
+// ---------------- 供源文件必须用宽字符打开（2026-10-29，投放"绝大多数失败"的真因之一）----------------
+// 现场形态：服务端用 std::fopen(UTF-8 路径) 打开曲目 —— 进程从未 setlocale，UCRT 的 fopen 会按
+// 系统 ANSI 代码页（本机 936/GBK）解释这串 UTF-8 字节，路径里只要有中文/日文就直接返回 NULL。
+// 结果：渲染器的第一发 GET 立刻拿到 404，而 SetAVTransportURI / Play 都是 200 ⟹ 用户只看到
+// "播了两秒自动停/没有声音"，日志里连一行都没有。
+// 本机实测（直接调 ucrtbase.dll / msvcrt.dll，ACP=936）：
+//   fopen(UTF-8 字节)  → NULL      fopen(GBK 字节) → OK      _wfopen(宽字符) → OK
+// 结论：凡是把"用户路径"交给 C 运行时打开的地方，一律走 open_file_utf8()。
+inline std::wstring utf8_to_wide(const std::string& s) {
+#if defined(_WIN32)
+    if (s.empty()) return std::wstring();
+    const int n = ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring w((size_t)n, L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), w.data(), n);
+    return w;
+#else
+    return std::wstring(s.begin(), s.end());
+#endif
+}
+
+inline std::FILE* open_file_utf8(const std::string& path, const wchar_t* wmode, const char* nmode) {
+#if defined(_WIN32)
+    (void)nmode;
+    if (path.empty()) return nullptr;
+    return ::_wfopen(utf8_to_wide(path).c_str(), wmode);
+#else
+    (void)wmode;
+    return std::fopen(path.c_str(), nmode);
+#endif
+}
 inline std::string trim2(const std::string& s) {
     const size_t a = s.find_first_not_of(" \t\r\n");
     if (a == std::string::npos) return "";
@@ -491,6 +526,23 @@ public:
     int64_t total_bytes_served() const { return totalBytesServed_.load(); }
     size_t total_requests_served() const { return totalRequestsServed_.load(); }
 
+    // 2026-10-29：把"渲染器来取流却拿不到数据"的原因留下来。
+    // 旧实现只回 404 + Content-Length: 0，调用方（cast_service）看不到任何原因，
+    // 用户看到的就是"播两秒自动停、没有声音"。
+    int not_found_count() const { return notFoundCount_.load(); }
+    std::string last_error() const { std::lock_guard<std::mutex> lk(errMutex_); return lastError_; }
+    void note_error(const std::string& s) { std::lock_guard<std::mutex> lk(errMutex_); lastError_ = s; }
+
+    // 供源前自检：返回空串 = 这个路径能用宽字符打开；否则返回给用户看的原因。
+    // 为什么要单独有它：等渲染器来取流才发现 404 就晚了（设备已经报错、界面已经"自动暂停"）。
+    static std::string check_file_readable(const std::string& utf8Path) {
+        if (utf8Path.empty()) return "供源文件路径为空";
+        std::FILE* f = upnp_detail::open_file_utf8(utf8Path, L"rb", "rb");
+        if (!f) return "文件打不开（不存在 / 权限不足 / 被独占占用）: " + utf8Path;
+        std::fclose(f);
+        return "";
+    }
+
     std::vector<HttpAccessLog> get_access_logs() const {
         std::lock_guard<std::mutex> lk(logMutex_);
         return accessLogs_;
@@ -584,6 +636,18 @@ private:
             std::istringstream ls(firstLine);
             ls >> method >> path;
         }
+        // 2026-10-29：请求行规范化。部分渲染器发 absolute-URI（GET http://ip:port/stream/x.wav HTTP/1.1），
+        // 还有的会带查询串（?v=2 之类）。旧实现原样拿整串去查表 ⟹ 找不到就 404。
+        {
+            const std::string low = upnp_detail::lower(path);
+            if (low.rfind("http://", 0) == 0 || low.rfind("https://", 0) == 0) {
+                const size_t scheme = low.find("://");
+                const size_t slash = path.find('/', scheme == std::string::npos ? 0 : scheme + 3);
+                path = (slash == std::string::npos) ? "/" : path.substr(slash);
+            }
+            const size_t q = path.find_first_of("?#");
+            if (q != std::string::npos) path = path.substr(0, q);
+        }
 
         // 提取 Range 头
         std::string rangeHeader;
@@ -610,6 +674,9 @@ private:
 
         // 校验 token 与防目录遍历
         if (!found || !validate_stream_token(path, entry.token)) {
+            notFoundCount_++;
+            note_error("渲染器请求了不存在/已失效的流路径: " + path +
+                       (found ? "（token 不匹配）" : "（该路径未注册或会话已结束）"));
             const char* notFoundResp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             sendAll(notFoundResp, std::strlen(notFoundResp));
             record_log(clientIp, clientPort, method, path, rangeHeader, 404, 0);
@@ -620,8 +687,12 @@ private:
         int64_t totalSize = 0;
         FILE* fileHandle = nullptr;
         if (entry.isFile) {
-            fileHandle = std::fopen(entry.filePath.c_str(), "rb");
+            // ★ 2026-10-29 真因修复：原来是 std::fopen(UTF-8 路径) —— 中文/日文目录一律打开失败
+            //   （本机 ACP=936 实测返回 NULL），于是 WAV 直通路径必然 404。改用宽字符打开。
+            fileHandle = upnp_detail::open_file_utf8(entry.filePath, L"rb", "rb");
             if (!fileHandle) {
+                notFoundCount_++;
+                note_error("供源文件打不开（渲染器来取流，我们无法读取）: " + entry.filePath);
                 const char* notFoundResp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                 sendAll(notFoundResp, std::strlen(notFoundResp));
                 record_log(clientIp, clientPort, method, path, rangeHeader, 404, 0);
@@ -690,6 +761,9 @@ private:
 
     std::atomic<int64_t> totalBytesServed_{0};
     std::atomic<size_t>  totalRequestsServed_{0};
+    std::atomic<int>     notFoundCount_{0};
+    mutable std::mutex   errMutex_;
+    std::string          lastError_;
 
     std::vector<HttpAccessLog> accessLogs_;
     std::function<void(const HttpAccessLog&)> accessCallback_;

@@ -12,6 +12,7 @@
 //
 // 类型：PK 峰值 / LS 低架 / HS 高架 / LP 低通 / HP 高通 / BP 带通 / NO 陷波 / AP 全通
 #pragma once
+#include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include "matrix.h"
 #include <string>
 #include <vector>
