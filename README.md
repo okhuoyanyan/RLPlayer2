@@ -1,189 +1,48 @@
-# RLPlayer 3.0.10
+# RLPlayer
 
-> **免费、开源（GPL-3.0）、面向 Windows 的本地高保真播放器。**
-> 升频、滤波、DSD、房间校正、耳机 EQ —— 全链路可调、可测、可自证。
+**简体中文** · [English](README.en.md) · [日本語](README.ja.md) · [Français](README.fr.md) · [Русский](README.ru.md) · [Español](README.es.md) · [العربية](README.ar.md)
 
-![平台](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
-![协议](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
-![版本](https://img.shields.io/badge/version-3.0.10-green)
+**每一环，都为认真听音乐**
 
-## 最新正式版
+高精度升频与滤波，清楚可见的音频链路，持续完善的音乐资料。从数字处理到日常聆听，让声音与体验一起进步。
 
-[下载 3.0.10](https://github.com/okhuoyanyan/RLPlayer2/releases/latest) · [官网](https://rlplayer.rainlain.com)
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20%C2%B7%20macOS%2013%2B-0078D6)
+![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
+![UI](https://img.shields.io/badge/UI%20languages-7-8A2BE2)
 
-- [使用说明书 PDF（25 页）](docs/3.0.10/RLPlayer-3.0.10-使用说明书.pdf) / [可编辑 Word](docs/3.0.10/RLPlayer-3.0.10-使用说明书.docx)
-- [技术白皮书 PDF（13 页）](docs/3.0.10/RLPlayer-3.0.10-技术白皮书.pdf) / [可编辑 Word](docs/3.0.10/RLPlayer-3.0.10-技术白皮书.docx)
+![RLPlayer](https://rlplayer.rainlain.com/assets/img/hero/hero-01-albums.webp)
 
-正式包内置 FFmpeg、GPU 运行时和 WebView2，解压后运行 `RLPlayer.exe`。
-旧版进入 **设置 → 关于与更新 → 检查更新 → 下载更新**；下载完成按提示安装，程序退出后重新打开即完成升级。
-升级保留用户设置、音乐库路径、队列与收藏。3.0.10 修复了旧版启动器跳过六种语言资源的问题，确认升级前按构建绑定的 SHA256 补齐并校验。
-旧 2.0 的文件校验不支持中文安装路径；这类安装请退出播放器，将完整正式包解压覆盖原安装目录（包内不含用户配置）。3.0.10 已修正中文路径校验，后续升级可正常使用该路径。
+## 核心能力
 
-本版集中改进 PCM 同族采样率策略、多相重采样、定点精确累加、双声道调制和异步输出；修复高倍率标准 7 阶调制的数值退化、AHM 偶数电平数量错误，以及 DSD 分块、尾部排空、静音位型和 GPU 缓存等问题。
+- **AMD 与 NVIDIA，让显卡参与音频计算** — 提供 AMD HIP 与 NVIDIA CUDA 双后端，为支持的升频和卷积任务分担计算。界面区分显卡是否可用、本曲是否实际使用加速，处理状态清楚可见。
+- **动态、音质与转码线索，一页看清** — 集中查看响度、动态范围、真峰值、削波和频谱等分析结果。结合截止频率、频谱陡沿与置信度，提示疑似有损转码或带宽受限的线索。
+- **20 段均衡，把声音调成你的偏好** — 每段独立调整频率、增益、Q 值与滤波类型，曲线拖动即时响应。搭配 OPRA 耳机校准预设、自动前级与旁路，让校正和个人口味都能兼顾。
+- **让音箱，更适合你的房间** — 通过测量向导与校正滤波，调整房间和音箱共同造成的频响偏差。支持麦克风校准文件、REW／AutoEq 参数 EQ 文本及 WAV 脉冲响应导入。
+- **从一首歌，读懂更多音乐背景** — 接入 AI 后，辅助检索与整理专辑、歌曲、艺术家和作品资料。结构化展示与本地缓存，让音乐背景更容易查找，也更方便反复阅读。
+- **让曲库有封面，也有故事** — 结合音频内嵌资料、本地图片与在线数据源，补全封面、歌词和歌曲信息。支持滚动歌词与资料整理，让收藏逐渐变得完整、有序。
+- **送到你的数播与音箱** — 向局域网内兼容的 UPnP／DLNA 设备投放音乐，把电脑曲库接进已有系统；macOS 版另支持 AirPlay 投放。
+- **连接 EMBY、Navidrome 与 NAS** — 直接挂载局域网 NAS 与 SMB／NFS 共享，接入 Emby、Navidrome、Plex 等音乐服务器，云端曲库与本地文件一起浏览、播放，不必先下载到本地。
 
-精度与性能数字须结合输入信号、输出率、滤波参数和测量方法阅读，详见新版白皮书。
-设计阻带目标不等于端到端动态范围；目前不宣称全面超越 HQPlayer。
-项目 DoP / ASIO LSB1、MSB1 输出仍是单比特，AHM 硬件多电平输出尚未实现。
+## 下载与文档
 
-开发者需使用支持 C++23 的 Clang、MSVC/Windows SDK、CMake、Ninja、Python 3 及 FFmpeg/FFprobe。
-测试前运行 `python tools/prepare_ci_testdata.py --root .` 生成纯静音测试素材。
-
-以下保留 2.0 时期的产品介绍与历史测试数字；当前行为和测量边界以新版说明书及白皮书为准。
-
----
-
-## 这是什么
-
-一个装在 Windows 上的本地音乐播放器。
-
-它不联网听歌，也不做社交。它只干一件事：**把你已经收藏在硬盘里的音乐，用尽可能高的保真度放出来**，
-并把「为什么这样放」摊开给你看 —— 每一个滤波器都能画出频响曲线，每一项测量都能追溯到实测数据。
-
-如果你只用手机听流媒体，它可能不适合你。
-如果你有一堆 FLAC / DSD / APE，在意升频算法、抖动整形、房间驻波、耳机频响 —— 它是为你做的。
-
----
-
-## 能做什么
-
-### 曲库与资料：它会自己整理，还会告诉你凭什么
-
-- 首次全量扫描 **15000 首约 2.81 秒**（比旧版快 117 倍）
-- 封面自动补全 **177/178（99.44%）**，艺术家头像 **116/127**
-- 同一专辑的多个版本自动归并（**301 张碎卡 → 181 张**）
-- 标签、封面、歌词从 **6 个公开源**补全：QQ 音乐 / 网易云 / iTunes / dizzylab / lrclib / Discogs
-- 歌词三源合并（网易云 → QQ → lrclib），实测命中率 **76.7%**
-- AI 整理资料时**标来源**：哪些是材料里查到的，哪些是模型知识补的，分得清
-
-### 升频与滤波：不是玄学，是一条能画出频响曲线的链
-
-- **79 个**命名滤波器预设（sinc / poly-sinc / closed-form / 切趾 / minringFIR）
-- 20 kHz 通带塌陷修复：**−3.29 dB → 0.00 dB**
-- 阻带（镜像/混叠压制）：**−6.6 dB → −144.6 dB**
-- 44.1k → 384k 时的抽头塌陷修复（**4 → 512 抽头/相**）
-- 完整的抖动（dither）与噪声整形（noise shaping）链，含 LNS15 / 7 阶 SDM
-
-### EQ 与校准：房间、耳机、参数 EQ，一套界面修平
-
-- **20 段**参数 EQ
-- 耳机 EQ 库 **6230 款 / 712 品牌**（来自 OPRA 开源数据库），一键套用
-- 房间校正：**6 种布局**（2.0 ~ 7.1.4）+ 支持导入 REW 测量与脉冲响应 IR
-- 校正集自动挂载（开关、布局匹配、文件可读，三项都满足才应用，否则明确告诉你为什么没应用）
-
-### 格式与效率
-
-- **FLAC / APE / ALAC / OGG / WMA / AAC / WAV / DSF / DFF**
-- DSD 流式解码：大 DSD 首帧 **8.2 s → 651 ms**，峰值内存 **2071 MB → 59 MB**
-- 首屏 300 行渲染 **4.20 ms**
-- ASIO 原生 DSD 直通（真机实测 0 欠载）
-
-### 免费与开源
-
-- **无订阅、无广告、无功能锁**
-- **GPL-3.0 开源**，源码在 GitHub
-- 不可能被厂商下架，也不可能突然改成付费
-
-### GPU 加速（可选，不装也能用）
-
-- AMD：**25 种架构**的 fat binary，内置 HIP 运行时，不需要你装 ROCm
-- NVIDIA：**CUDA 12.9**，覆盖 compute_50 … compute_121 共 **19 档**
-- 没有符合条件的显卡时**自动回退 CPU**，功能不变，只是慢一点
-
----
-
-## 下载与安装
-
-### 系统要求
-
-| 项 | 要求 |
+| | |
 |---|---|
-| 系统 | Windows 10 1809 (x64) 或更新 / Windows 11 |
-| 内存 | 4 GB（大 DSD 库建议 8 GB+） |
-| 硬盘 | 约 400 MB（含内置运行时） |
-| 显卡 | 集显即可；有 AMD/NVIDIA 独显可开启 GPU 加速 |
-
-### 安装
-
-**解压即用，不需要安装任何运行库。**
-
-1. 下载 `RLPlayer-2.0-win64.zip`
-2. 解压到任意目录（**不要放进 Program Files**，那里写入需要管理员权限）
-3. 双击 `RLPlayer.exe`
-4. 首次启动会让你选择音乐文件夹，选好后等它扫完即可
-
-包里已内置：解码器（ffmpeg）、GPU 运行时（HIP / CUDA）、界面运行时（WebView2 固定版）、
-以及全部命令行工具。**不需要另外装 .NET、VC++ 运行库或 WebView2。**
-
-### 卸载
-
-直接删掉整个目录。
-
-所有数据（设置、曲库索引、封面缓存、房间校正集）都在程序目录内，不写注册表、
-不往 `AppData` 里塞东西 —— 这也是为什么建议不要放 Program Files。
-
----
-
-## 关于数据与隐私
-
-**RLPlayer 不收集任何遥测。**
-
-- 曲库扫描、播放、分析全部在本地完成
-- 联网只发生在你**主动**触发的场景：补全标签/封面/歌词、AI 整理资料、检查更新、提交反馈
-- 所有联网请求都可以在设置里逐个关掉
-- 提交反馈时，诊断包会先做**脱敏**（token / 密码 / 路径中的用户名 → `***`），且**不会**上传你的音乐文件
-- 没有账号系统，不需要注册
-
----
-
-## 已知限制（2.0.0）
-
-我们把这些写在最显眼的地方，而不是藏进 FAQ：
-
-1. **CUDA 后端仅做过静态验证**（校验符号、fatbin 架构、PE 结构、以及修复是否真的编进二进制）。
-   我方开发机没有 NVIDIA 显卡，运行时行为由协作者在 RTX 4080 上验证，**我们没有独立复现**。
-2. **版本对比对「音乐素材上的谐波失真」不敏感** —— 一份被加了少量三次谐波染色的文件，
-   可能被判得比原版更好。合成测试信号上正常，音乐素材上有这个盲区。已立项修复。
-3. **ISO / SACD-ISO / DST 尚不支持**。SACD ISO 请先用 `sacd_extract` 转成 DSF/DFF 再放入曲库。
-4. **跨采样率的评分差距仍偏大** —— 96k/24 vs 44.1k/16 的分差已从 18.58 收到 9.28，
-   剩下的部分是 DR 与峰值因子的真实读数差，不是测量伪影。
-
----
+| 官网 | https://rlplayer.rainlain.com |
+| 下载 | https://rlplayer.rainlain.com/download.html |
+| 最新发布 | https://github.com/okhuoyanyan/RLPlayer2/releases/latest |
+| 技术白皮书 | https://rlplayer.rainlain.com/features.html |
+| 使用说明 | https://rlplayer.rainlain.com/manual.html |
+| 实测数据 | https://rlplayer.rainlain.com/measurements.html |
+| 开发与构建 | [DEVELOPING.md](DEVELOPING.md) |
 
 ## 反馈
 
-| 渠道 | 地址 |
-|---|---|
-| **粉丝和反馈 Q 群** | **895816505** |
-| 问题跟踪 | https://github.com/okhuoyanyan/RLPlayer-feedback/issues |
-| 官方主页 | https://rlplayer.rainlain.com （即将上线） |
+https://github.com/okhuoyanyan/RLPlayer-feedback/issues
 
-程序内也有一键反馈：**设置 → 关于与更新 → 意见反馈**，会自动附带脱敏后的诊断信息。
+## 系统要求
 
----
+Windows 10 / 11 x64 · macOS 13+ · 免安装 · GPL-3.0-or-later · 7 种界面语言
 
-## 开发与致谢
+## 许可证
 
-| 角色 | 成员 |
-|---|---|
-| **项目开发者** | **RainLain**、**猫与小行星** |
-| 协助开发者 | 聆听风暴 |
-| 媒体与美术 | Gosed |
-| 测试鸣谢 | Miyu、正在下载99% |
-
-以及所有提交过 issue、帮忙试听、报告过问题的朋友。
-
----
-
-## 协议
-
-**GNU General Public License v3.0 or later**（GPL-3.0-or-later），见 [LICENSE](LICENSE)。
-
-随包分发的第三方组件（FFmpeg / AMD HIP / NVIDIA CUDA / WebView2 / OPRA）
-各自遵循其原始许可，见 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt)。
-
-其中 AMD HIP 与 NVIDIA CUDA 为**厂商专有二进制**，按「可分离第三方组件」处理，
-不在本项目的 GPL 授权范围内。
-
----
-
-*RLPlayer 是一个独立的开源项目，与任何商业播放器厂商无关。*
+GPL-3.0-or-later
