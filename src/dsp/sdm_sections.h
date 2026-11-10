@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include "fp_strict.h"
 #include <array>
 #include <complex>
@@ -7,7 +7,7 @@
 
 namespace rta::dsp {
 // Preserve the Butterworth factors instead of expanding a near-cancelling
-// seventh-degree polynomial. Each section has unit direct feedthrough.
+// fifth/seventh-degree polynomial. Each section has unit direct feedthrough.
 // Consequently NTF(e)-e at the current sample is the sum of the old z1
 // states; it is strictly causal and does not introduce an extra sample delay.
 struct SdmNtfSections {

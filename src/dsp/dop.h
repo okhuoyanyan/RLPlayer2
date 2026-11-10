@@ -80,10 +80,13 @@ inline void dop_pack(const double* const* sdm, int channels, size_t frames,
 // ===========================================================================
 inline bool dop_check_binary(const double* const* sdm, int channels, size_t frames,
                              size_t* badIndex = nullptr, double* badValue = nullptr) {
-    if (!sdm || channels <= 0) return true;
+    // Empty blocks may omit sample pointers, but a stream needs valid channels.
+    if (channels <= 0) return false;
+    if (frames == 0) return true;
+    if (!sdm) return false;
     for (int c = 0; c < channels; ++c) {
         const double* p = sdm[(size_t)c];
-        if (!p) continue;
+        if (!p) return false;
         for (size_t i = 0; i < frames; ++i) {
             const double v = p[i];
             if (v == 1.0 || v == -1.0) continue;
@@ -99,6 +102,15 @@ inline bool dop_check_binary(const double* const* sdm, int channels, size_t fram
 inline bool dop_pack_checked(const double* const* sdm, int channels, size_t frames,
                              std::vector<int32_t>& out, DopPackState& st,
                              std::string* why = nullptr) {
+    // Validate shape before touching pack state or output. A missing buffer is
+    // an execution error, not a successfully validated empty/binary signal.
+    bool invalid = channels <= 0 || (frames > 0 && !sdm);
+    if (!invalid && frames > 0)
+        for (int c = 0; c < channels; ++c) invalid = invalid || !sdm[c];
+    if (invalid) {
+        if (why) *why = "DoP input has invalid channel count or a missing sample buffer";
+        return false;
+    }
     size_t badI = 0;
     double badV = 0.0;
     if (!dop_check_binary(sdm, channels, frames, &badI, &badV)) {
@@ -139,3 +151,4 @@ inline bool dop_unpack(const int32_t* in, int channels, size_t carrierFrames,
 }
 
 } // namespace rta::dsp
+

@@ -1,0 +1,41 @@
+{
+  "retrieved": "2026-11-10",
+  "sources": [
+    {
+      "file": "scarletbook.h",
+      "upstream": "https://raw.githubusercontent.com/sacd-ripper/sacd-ripper/master/libs/libsacd/scarletbook.h",
+      "license": "GPL-2.0-or-later",
+      "sha256": "a18430c0d5b01af702ed15dc631b9e21db13622f8de8292ea334a29bc82e45b6",
+      "pin_error": "HTTP Error 403: rate limit exceeded"
+    },
+    {
+      "file": "scarletbook_read.c",
+      "upstream": "https://raw.githubusercontent.com/sacd-ripper/sacd-ripper/master/libs/libsacd/scarletbook_read.c",
+      "license": "GPL-2.0-or-later",
+      "sha256": "88ed13bce8498845b9c98a03bad8dd8af8fc982218b9a89e706f9e9d14a6a24a",
+      "pin_error": "HTTP Error 403: rate limit exceeded"
+    },
+    {
+      "file": "dstdec-reference.c",
+      "upstream": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/n7.1.1/libavcodec/dstdec.c",
+      "license": "LGPL-2.1-or-later",
+      "sha256": "5df7e20ae139728784b5e8901c0940c3c835c627e429a5870e9f62b14189505d"
+    },
+    {
+      "file": "pcm-dvda-reference.c",
+      "upstream": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/master/libavcodec/pcm-dvda.c",
+      "license": "LGPL-2.1-or-later",
+      "sha256": "1a197f05f9cac6fb26141c4a5128a3625ef39dfc5ed4ae8d0d248ca0152825e0",
+      "pin_error": "HTTP Error 403: rate limit exceeded"
+    },
+    {
+      "file": "dvd_udf-reference.c",
+      "upstream": "https://raw.githubusercontent.com/xbmc/libdvdread/master/src/dvd_udf.c",
+      "license": "GPL-2.0-or-later",
+      "sha256": "593e5e62d5e0349c0c7f16d7f81bca26a2327ef672e7aaba3329a91c42cb6f22",
+      "pin_error": "HTTP Error 403: rate limit exceeded"
+    }
+  ],
+  "restrictions": "No libdstdec MPEG reference implementation files are redistributed or compiled.",
+  "media": "All committed/generated tests are numeric synthetic material; no copyright music."
+}

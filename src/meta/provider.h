@@ -54,6 +54,7 @@
 #include "net/json.h"
 #include "meta/match.h"          // Candidate 的唯一定义(评分与 provider 共用,2026-10-21 统一)
 #include "meta/year.h"           // E-14：年份清洗统一由此头提供
+#include "version.h"
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -186,7 +187,7 @@ struct ProviderDesc {
 // ---------------------------------------------------------------------------
 
 // 如实 UA(lrclib 要求标识客户端;网络纪律「UA 如实」)
-inline const char* pv_user_agent() { return "RLPlayer/1.0 (local music player; metadata provider)"; }
+inline const char* pv_user_agent() { return "RLPlayer/" RLPLAYER_VERSION " (metadata; https://rlplayer.rainlain.com)"; }
 
 // JSON 字符串转义:\ " \n \r \t 与 <0x20 → \u00xx;>=0x80 字节(中文)原样透传。
 // 与 store.h meta_jesc 同风格;本文件独立实现,不拉 store.h(避免带入文件系统依赖)。
@@ -285,7 +286,9 @@ inline rta::net::HttpResponse pv_http_get_retry503(const std::string& url,
                                                    const std::vector<std::string>& headers) {
     rta::net::HttpResponse resp = rta::net::http_get(url, headers, 15000);
     if (resp.status == 503) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        if (!rta::net::http_budget_sleep(std::chrono::milliseconds(1500))) {
+            resp = {}; resp.error = "HTTP_BUDGET_EXCEEDED"; return resp;
+        }
         resp = rta::net::http_get(url, headers, 15000);
     }
     return resp;
@@ -1122,7 +1125,8 @@ inline void dl_gate_reset_for_test() {
 // 但 dizzylab 只有这一条调用路径,且 enrich 侧本来就是串行,阻塞可接受)。
 // 返回 false = 熔断中,调用方直接返回空候选(不重试、不抛)。
 inline bool dl_gate_acquire(std::string& err) {
-    std::lock_guard<std::mutex> lk(dl_gate_mtx());
+    std::unique_lock<std::mutex> lk(dl_gate_mtx(), std::defer_lock);
+    if (!rta::net::http_budget_lock(lk)) { err = "HTTP_BUDGET_EXCEEDED"; return false; }
     DlGate& g = dl_gate();
     const auto now = dl_now();
     if (now < g.coolUntil) {
@@ -1134,20 +1138,24 @@ inline bool dl_gate_acquire(std::string& err) {
     if (g.lastCall.time_since_epoch().count() != 0) {
         const auto wait = std::chrono::milliseconds(kDizzylabMinIntervalMs) - (now - g.lastCall);
         // 若注入了测试时钟，由时钟控制时间推进，不在此做真实线程 sleep
-        if (wait.count() > 0 && !dl_clock_hook()) std::this_thread::sleep_for(wait);
+        if (wait.count() > 0 && !dl_clock_hook() && !rta::net::http_budget_sleep(wait)) {
+            err = "HTTP_BUDGET_EXCEEDED"; return false;
+        }
     }
     g.lastCall = now;
     return true;
 }
 
 inline void dl_gate_success() {
-    std::lock_guard<std::mutex> lk(dl_gate_mtx());
+    std::unique_lock<std::mutex> lk(dl_gate_mtx(), std::defer_lock);
+    if (!rta::net::http_budget_lock(lk)) return;
     dl_gate().fails = 0;
 }
 
 // 记一次失败;达阈值 → 开冷却窗(冷却结束自动恢复,失败计数清零)
 inline void dl_gate_fail() {
-    std::lock_guard<std::mutex> lk(dl_gate_mtx());
+    std::unique_lock<std::mutex> lk(dl_gate_mtx(), std::defer_lock);
+    if (!rta::net::http_budget_lock(lk)) return;
     DlGate& g = dl_gate();
     if (++g.fails >= kDizzylabFailLimit) {
         g.coolUntil = dl_now() +
@@ -1159,11 +1167,13 @@ inline void dl_gate_fail() {
 // 单次 GET(带 UA + 限频 + 熔断记账)。返回空 body 表示失败,err 已写明原因。
 inline std::string dl_http_get(const std::string& url, std::string& err) {
     if (!dl_gate_acquire(err)) return "";
+    const int timeoutMs = rta::net::http_budget_timeout(kDizzylabTimeoutMs);
+    if (rta::net::http_budget_expired() || timeoutMs <= 0) { err = "HTTP_BUDGET_EXCEEDED"; return ""; }
     const auto& hook = dl_transport_hook();
     const rta::net::HttpResponse resp = hook
-        ? hook(url, { std::string("User-Agent: ") + pv_user_agent() }, kDizzylabTimeoutMs)
+        ? hook(url, { std::string("User-Agent: ") + pv_user_agent() }, timeoutMs)
         : rta::net::http_get(
-            url, { std::string("User-Agent: ") + pv_user_agent() }, kDizzylabTimeoutMs);
+            url, { std::string("User-Agent: ") + pv_user_agent() }, timeoutMs);
     if (resp.status == 0) {
         dl_gate_fail();
         err = "请求失败: " + resp.error;
@@ -1566,6 +1576,51 @@ inline bool pv_lrc_is_timed(const std::string& lrc) {
     return false;
 }
 
+// 2026-11-02（用户 261102-01 #2）：源站对"没有填词"的器乐曲会返回一句占位词，
+//   各家措辞不同（「纯音乐，请欣赏」「此歌曲为没有填词的纯音乐，请您欣赏」「暂无歌词」…）。
+//   旧逻辑只按"时间轴行数 1~3"猜，于是把占位词当歌词回给界面 —— 用户看到的就是
+//   一首歌下面孤零零一行「纯音乐，请欣赏」，另一首（别的源给了真歌词）却正常。
+//   判据改成**看内容**：命中任一占位特征且正文很短（< 60 字）才算占位词。
+//   「很短」这个约束是必要的 —— 真歌词里出现"纯音乐"三个字（比如歌名/歌词内容）不能被误杀。
+inline bool pv_lyric_is_placeholder(const std::string& lrc) {
+    if (lrc.empty()) return true;
+    std::string body;                       // 去掉 [mm:ss.xx] 时间标签后的正文
+    body.reserve(lrc.size());
+    for (size_t i = 0; i < lrc.size(); ) {
+        if (lrc[i] == '[') {
+            const size_t e = lrc.find(']', i);
+            if (e != std::string::npos && e > i + 3 &&
+                lrc.substr(i + 1, e - i - 1).find(':') != std::string::npos) {
+                i = e + 1;
+                continue;
+            }
+        }
+        body.push_back(lrc[i]);
+        ++i;
+    }
+    std::string t;                          // 压掉空白/标点，只留汉字与字母数字
+    for (unsigned char c : body) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+        if ((c & 0xC0) == 0x80) { t.push_back((char)c); continue; }   // UTF-8 续字节原样留
+        t.push_back((char)c);
+    }
+    // 长度/行数双闸：占位词永远是"一两行、且很短"。
+    //   单看长度会误杀 —— 实测一段 6 行、共 72 个汉字、内含"纯音乐"三个字的真歌词
+    //   正文只有 216 字节，光靠 240 字节阈值会被判成占位（这一条是单元测试逼出来的）。
+    int lines = 0;
+    for (char c : body) if (c == '\n') ++lines;
+    lines += 1;
+    if (t.size() > 90 || lines > 3) return false;
+    // 直接写 UTF-8 字面量：用 \x 转义时 "\xE9" 后面紧跟 'F' 会被解析成 \xE9F（越界），极容易踩坑。
+    static const char* kMarkers[] = {
+        "纯音乐", "純音樂", "请欣赏", "没有填词", "无填词", "暂无歌词", "没有歌词", "此歌曲",
+        "instrumental", "Instrumental", "INSTRUMENTAL",
+        "インスト", "オフボーカル",
+    };
+    for (const char* m : kMarkers) if (t.find(m) != std::string::npos) return true;
+    return false;
+}
+
 // 时间轴行数(统计用;与 pv_lrc_is_timed 同口径)
 inline int pv_lrc_timed_lines(const std::string& lrc) {
     int n = 0;
@@ -1723,6 +1778,16 @@ inline LyricChainResult lyric_chain(const std::string& title, const std::string&
         st.ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - t0).count();
 
+        // 占位词（「纯音乐，请欣赏」这类）不算命中：它会让界面以为"有歌词"，
+        // 实际只显示一句"请欣赏"。丢掉它，让链路继续问后面的源，全链都只有占位词时
+        // 如实回报"无歌词"，界面才会走自己的空态（2026-11-02 用户 261102-01 #2）。
+        if (!got.lrc.empty() && pv_lyric_is_placeholder(got.lrc)) {
+            st.miss = 1;
+            if (!out.trace.empty()) out.trace += " ";
+            out.trace += id + ":placeholder";
+            out.stats.push_back(st);
+            continue;
+        }
         const bool timed = !got.lrc.empty() && pv_lrc_is_timed(got.lrc);
         const int gotLines = timed ? pv_lrc_timed_lines(got.lrc) : 0;
         if (!got.lrc.empty()) {
@@ -1779,6 +1844,8 @@ inline LyricChainResult lyric_chain(const std::string& title, const std::string&
             out.err += s.id + ": " + s.err;
         }
         if (out.err.empty()) out.err = "各源均无歌词";
+        if (out.trace.find(":placeholder") != std::string::npos && out.err.find("各源均无歌词") != std::string::npos)
+            out.err = "各源只有「纯音乐/暂无歌词」占位词（按无歌词处理）";
     }
     return out;
 }
@@ -1892,6 +1959,11 @@ inline const std::vector<ProviderDesc>& provider_registry() {
         { "discogs", "Discogs",
           pv_caps(ArtCap::Cover, ArtCap::ArtistImage, ArtCap::ArtistBio, ArtCap::ArtistLink,
                   ArtCap::TrackMeta),
+          nullptr, nullptr, nullptr },
+
+        // Official public MusicBrainz release search + Cover Art Archive front.
+        // This is album artwork, not a song/lyrics/artist-image search adapter.
+        { "musicbrainz", "MusicBrainz / Cover Art Archive", pv_caps(ArtCap::Cover),
           nullptr, nullptr, nullptr },
     };
     return reg;

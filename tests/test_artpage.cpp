@@ -537,6 +537,21 @@ static void testBatch() {
 // ===========================================================================
 static void testMultiSource() {
     std::printf("[9] multi-source ladder (cover + artist)\n");
+    {
+        Candidate c; c.album = "Album"; c.artist = "Artist"; c.coverUrl = "https://test/image"; c.albumId = "RELEASE-1";
+        check(art_cover_cand_ok(c, "Album", "Artist"), "release proof: exact album and artist accepted");
+        check(!art_cover_cand_ok(c, "Album", "Other Artist"), "release proof: same album different artist rejected");
+        check(!art_cover_cand_ok(c, "Album", ""), "release proof: absent query artist rejected");
+        c.artist.clear();
+        check(!art_cover_cand_ok(c, "Album", "Artist"), "release proof: absent candidate artist rejected");
+        c.artist = "Artist"; c.album = "Album (Live)";
+        check(!art_cover_cand_ok(c, "Album", "Artist"), "release proof: live album is not studio album");
+        c.album = "Album (Remastered)";
+        check(!art_cover_cand_ok(c, "Album", "Artist"), "release proof: remastered edition cannot impersonate original");
+        c.album.clear(); c.title = "Album";
+        check(!art_cover_cand_ok(c, "Album", "Artist"), "release proof: song title is not album identity");
+        check(!art_cover_cand_ok(c, "", "Artist"), "release proof: absent requested album rejected");
+    }
     const std::string png = makePng(600, 600, 8192);
     ArtworkOpts o;
     o.useCache = false;
@@ -588,6 +603,8 @@ static void testMultiSource() {
         const ArtMultiResult r = art_multi_source_image(false, "专辑A", "艺人A", o);
         check(r.ok, "(a) qq has same-name => hit");
         check(r.source.rfind("qq", 0) == 0, "(a) hit source = qq");
+        check(r.matchedAlbum == "专辑A" && r.matchedArtist == "艺人A" && r.releaseId == "MID1",
+              "(a) album proof carries exact downloaded candidate album artist and ID");
         check(r.stats.triesOf("dizzylab") >= 1, "(a) dizzylab queried");
         check(r.stats.triesOf("netease") == 0, "(a) stops at the first hit (netease not needed)");
         check(r.stats.hitOf("qq") == 1, "(a) qq hit counted");
@@ -614,6 +631,28 @@ static void testMultiSource() {
               r.stats.triesOf("netease") >= 1 && r.stats.triesOf("itunes") >= 1,
               "(c) all four sources queried (incl. itunes)");
         check(r.stats.hitOf("dizzylab") == 0 && r.stats.hitOf("itunes") == 0, "(c) no false hit");
+    }
+    // 错误候选在前，只有后面的匹配发行能够贡献URL及凭证ID。
+    {
+        const std::string response = R"proof({"req_1":{"data":{"body":{"song":{"list":[
+          {"title":"曲","singer":[{"name":"错误艺人"}],"album":{"name":"专辑A","mid":"WRONG-ID"},"mid":"W"},
+          {"title":"曲","singer":[{"name":"艺人A"}],"album":{"name":"专辑A (Live)","mid":"LIVE-ID"},"mid":"L"},
+          {"title":"曲","singer":[],"album":{"name":"专辑A","mid":"MISSING-ARTIST"},"mid":"M"},
+          {"title":"曲","singer":[{"name":"艺人A"}],"album":{"name":"专辑A","mid":"RIGHT-ID"},"mid":"R"}
+        ]}}}}})proof";
+        int imageCalls = 0;
+        set_artwork_http_for_test([&](const ArtHttpRequest& q) {
+            rta::net::HttpResponse r; r.status = 200; r.ok = true;
+            if (q.url.find("musicu.fcg") != std::string::npos) r.body.assign(response.begin(), response.end());
+            else { ++imageCalls; check(q.url.find("RIGHT-ID") != std::string::npos, "wrong releases never downloaded"); r.body.assign(png.begin(), png.end()); }
+            return r;
+        });
+        ArtworkOpts only = o;
+        for (const char* id : {"dizzylab", "netease", "itunes"}) only.srcOn[id] = false;
+        const auto result = art_multi_source_image(false, "专辑A", "艺人A", only);
+        check(result.ok && imageCalls == 1 && result.releaseId == "RIGHT-ID" &&
+              result.matchedAlbum == "专辑A" && result.matchedArtist == "艺人A",
+              "later verified candidate contributes its own release ID only");
     }
     // (d) 头像：QQ 同名 => 命中 qq；netease 也被查过
     {

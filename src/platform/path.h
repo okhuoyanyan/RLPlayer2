@@ -63,6 +63,8 @@ inline std::string lower_extension(const std::string& p) {
 std::string module_dir_utf8();
 // 系统临时目录（UTF-8，【带尾分隔符】，语义与 Win32 GetTempPathW 一致）
 std::string temp_dir_utf8();
+// 系统目录（放 tar.exe / 系统工具）。Windows = GetSystemDirectoryW，无尾分隔符；失败返回空串
+std::string system_dir_utf8();
 // 配置目录（放 *.conf）。Windows 现行规则 = exe 同目录（便携式分发）
 std::string config_dir_utf8();
 // 数据目录（缓存 / meta 库 / 日志）。Windows 现行规则 = exe 同目录

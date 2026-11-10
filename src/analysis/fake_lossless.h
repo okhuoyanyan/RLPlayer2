@@ -42,7 +42,8 @@
 //   - 若实际喂进来的帧数 != begin() 声明的总帧数（截断/读失败），计划就不成立，
 //     planMatched() 返回 false，调用方必须回退整段路径 —— 不要拿它的结果当数。
 #pragma once
-#include "../dsp/fft.h"      // rta::dsp::fft（radix-2，n 须为 2 的幂）/ kPi
+#include "../dsp/fft.h"
+#include "i18n_messages.h"   // 判定说明的多语言文案（2026-11-02）      // rta::dsp::fft（radix-2，n 须为 2 的幂）/ kPi
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -319,63 +320,49 @@ inline void spectrum_from_windows(const LosslessWindowPlan& plan,
     out.fakeVerdict = verdict;
     out.suspected = (verdict == kFakeVerdictLossy);
 
+    // 2026-11-02：说明文案按界面语言出（zh/en/ja/fr/ru/es/ar 七套），表见 i18n_messages.h。
+    //   参数顺序与占位符序列在生成脚本里有校验（同一 kMsgN 七语必须一致）。
     char msg[384];
     if (verdict == kFakeVerdictLossy) {
         if (out.cutoffRatio >= 0.78) {
-            std::snprintf(msg, sizeof(msg),
-                          "%.1f kHz 处存在陡峭截止（下降 %.0f dB，约为奈奎斯特的 %.0f%%）；"
-                          "虽然截止位置属于「母带低通」档，但下降沿 %.0f dB/6 倍频程是编码器级"
-                          "（模拟母带链只有 10~20 dB），判有损源转制",
+            std::snprintf(msg, sizeof(msg), analysis_msg(kMsg0),
                           cutoffHz / 1000.0, edgeDb, out.cutoffRatio * 100.0, edgeDb);
         } else {
-            std::snprintf(msg, sizeof(msg),
-                          "%.1f kHz 处存在陡峭截止（下降 %.0f dB，约为奈奎斯特的 %.0f%%），典型的有损源转制特征",
+            std::snprintf(msg, sizeof(msg), analysis_msg(kMsg1),
                           cutoffHz / 1000.0, edgeDb, out.cutoffRatio * 100.0);
         }
     } else if (verdict == kFakeVerdictBandLimited) {
-        std::snprintf(msg, sizeof(msg),
-                      "有效带宽受限：%.1f kHz 处有陡峭截止（下降 %.0f dB，约为奈奎斯特的 %.0f%%），"
-                      "置信度 %.0f%%%s。母带低通/升频也长这样（此档 78%%~95%%），不据此判假",
+        std::snprintf(msg, sizeof(msg), analysis_msg(kMsg2),
                       cutoffHz / 1000.0, edgeDb, out.cutoffRatio * 100.0, out.confidence * 100.0,
-                      (out.confidence >= 0.9 ? "" : "（各谱窗不一致，证据强度偏低）"));
+                      (out.confidence >= 0.9 ? "" : analysis_msg(kMsg11)));
     } else if (verdict == kFakeVerdictInconclusive) {
         if (windowFill < 0.5) {
-            std::snprintf(msg, sizeof(msg),
-                          "素材过短（谱窗仅 %.0f%% 有实样），不构成判据（需 ≥1.5 s）；"
-                          "检出 %.1f kHz、下降沿 %.0f dB，方向与长片段一致",
+            std::snprintf(msg, sizeof(msg), analysis_msg(kMsg3),
                           windowFill * 100.0, cutoffHz / 1000.0, edgeDb);
         } else {
-            std::snprintf(msg, sizeof(msg),
-                          "置信度未达阈值（%.2f<0.50），检出 %.1f kHz、下降沿 %.0f dB ⟹ 证据不足",
+            std::snprintf(msg, sizeof(msg), analysis_msg(kMsg4),
                           out.confidence, cutoffHz / 1000.0, edgeDb);
         }
     } else if (cutoffHz <= 0.0) {
-        std::snprintf(msg, sizeof(msg), "未检出明显频谱截止");
+        std::snprintf(msg, sizeof(msg), "%s", analysis_msg(kMsg5));
     } else if (cutoffHz < 6000.0) {
-        std::snprintf(msg, sizeof(msg),
-                      "检出 %.1f kHz 附近的谱下降，但低于 6 kHz（纯音/极窄带素材），不构成转码判据",
-                      cutoffHz / 1000.0);
+        std::snprintf(msg, sizeof(msg), analysis_msg(kMsg6), cutoffHz / 1000.0);
     } else if (guardBins < 120) {
-        std::snprintf(msg, sizeof(msg),
-                      "检出 %.1f kHz 附近的谱下降，但该段窄带内能量不足（仅 %d bin，疑似纯音/窄带），不构成判据",
+        std::snprintf(msg, sizeof(msg), analysis_msg(kMsg7),
                       cutoffHz / 1000.0, (int)guardBins);
     } else if (!steep) {
-        std::snprintf(msg, sizeof(msg),
-                      "%.1f kHz 处频谱走低但下降沿缓和（1/6 倍频程约 %.0f dB），更像老录音自然滚降，不判假",
+        std::snprintf(msg, sizeof(msg), analysis_msg(kMsg8),
                       cutoffHz / 1000.0, edgeDb);
     } else if (out.cutoffRatio > 0.95) {
-        std::snprintf(msg, sizeof(msg),
-                      "检出 %.1f kHz 附近的频谱下降（已接近奈奎斯特 %.1f kHz，不判假）",
+        std::snprintf(msg, sizeof(msg), analysis_msg(kMsg9),
                       cutoffHz / 1000.0, out.nyquistHz / 1000.0);
     } else {
-        std::snprintf(msg, sizeof(msg),
-                      "检出 %.1f kHz、下降沿 %.0f dB、置信度 %.0f%% ⟹ 未达判据（需 ≥50%%）",
+        std::snprintf(msg, sizeof(msg), analysis_msg(kMsg10),
                       cutoffHz / 1000.0, edgeDb, out.confidence * 100.0);
     }
     if (shortDiscount) {
         char caveat[128];
-        std::snprintf(caveat, sizeof(caveat),
-                      "；素材偏短（谱窗 %.0f%% 有实样），置信度已按 70%% 折算", windowFill * 100.0);
+        std::snprintf(caveat, sizeof(caveat), analysis_msg(kMsg12), windowFill * 100.0);
         std::strncat(msg, caveat, sizeof(msg) - std::strlen(msg) - 1);
     }
     out.reason = msg;

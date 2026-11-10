@@ -12,7 +12,7 @@
 //   DFF：DSDIFF，大端；FRM8("DSD ") → PROP("SND ") → FS / CHNL / CMPR；DSD 块里的
 //        **Channel Byte 按声道交错**（Clustered Frame = numChannels 个字节，2 声道即
 //        L0,R0,L1,R1…，见 DSDIFF 1.5 §3.3 第 18 页与 §1.2 的「Clustered Frame」定义）；
-//        **位序 MSB-first**（ffmpeg 用 dsd_msbf）。DST 压缩块不支持。
+//        **位序 MSB-first**（ffmpeg 用 dsd_msbf）。DST 压缩块经原生分帧/无损解码后保留原始 DSD 位流。
 //        ★ 2026-10-29（两轮审查 F02）：旧实现按「每声道连续」读/写，而读写共享同一个
 //        错误前提 ⟹ 自写自读的往返测试是假阳性。对标准 DFF，左声道被读成
 //        11 a1 22 b2，而正确值是 11 22 33 44（声道数据被错切成了前后半段）。
@@ -28,6 +28,8 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include "audio/sacd_reader.h"
+#include "audio/dsd_dst_reader.h"
 
 namespace rta::audio {
 
@@ -50,16 +52,15 @@ public:
 // 文案一条一条写全：格式名 + 为什么 + 下一步怎么做。判据见 tests/test_dsd_reader.cpp（[6] 节）
 // 与 tests/test_library.cpp（[6] 节：.iso 入库 + 播放报错）。
 inline std::string msg_dst_unsupported(const std::string& where) {
-    return "DST 压缩的 DSD 暂不支持（这是 SACD 的无损压缩格式）。"
+    return "这个 DST 容器或参数变体暂不支持；SACD ISO 与标准 DST DFF 已支持原生解码。"
            "请先用 sacd_extract / foobar2000 等工具转成 .dsf 或 .dff 再播放。"
            "（位置：" + where + "）";
 }
 inline std::string msg_sacd_iso_unsupported() {
-    return "SACD ISO 镜像暂不支持直接播放。请先用 sacd_extract 转成分轨 .dsf 后入库。";
+    return "SACD ISO 的音轨导航或内容无法解析，请检查镜像是否完整。";
 }
 inline std::string msg_iso_not_audio() {
-    return "这不是音频镜像：这个 .iso 里没有 SACD 目录，看起来是普通数据光盘镜像。"
-           "本播放器只支持 SACD ISO（且需要先用 sacd_extract 转成分轨 .dsf 才能播放）。";
+    return "这不是音频镜像：未找到 SACD Master TOC 或 DVD-Audio IFO 音轨导航。";
 }
 
 enum class DsdBitOrder { MsbFirst, LsbFirst };
@@ -310,6 +311,7 @@ inline DsdStream read_dsf(const std::string& path) {
 
 // ---------------- DFF 读取 ----------------
 inline DsdStream read_dff(const std::string& path) {
+    DstDffReader dst;if(dst.open(path)){DsdStream s;s.rate=dst.rate();s.channels=dst.channels();s.bits=dst.bits();s.container="dff";s.channelIds=dsd_detail::dsf_channel_ids(s.channels);s.data.assign(s.channels,{});std::vector<std::vector<uint8_t>>block;while(dst.read(4704,block))for(int c=0;c<s.channels;++c)s.data[c].insert(s.data[c].end(),block[c].begin(),block[c].end());return s;}
     using namespace dsd_detail;
     const std::vector<uint8_t> f = read_file_bytes(path);
     if (f.size() < 16 || std::memcmp(f.data(), "FRM8", 4) != 0)
@@ -411,6 +413,14 @@ inline DsdStream read_dff(const std::string& path) {
 
 // 按扩展名分派；不认识的抛异常（调用方据此回退 ffmpeg）
 inline DsdStream read_dsd(const std::string& path) {
+    if (sacd_path(path)) {
+        SacdReader reader; reader.open(path); const auto& tr=reader.track();
+        DsdStream s; s.rate=tr.rate; s.channels=tr.channels; s.bits=tr.bits(); s.container="sacd";
+        s.channelIds=dsd_detail::dsf_channel_ids(s.channels); s.data.assign(s.channels,{});
+        std::vector<std::vector<uint8_t>> block;
+        while(reader.read(4704,block))for(int c=0;c<s.channels;++c)s.data[c].insert(s.data[c].end(),block[c].begin(),block[c].end());
+        return s;
+    }
     std::string ext;
     const size_t d = path.find_last_of('.');
     if (d != std::string::npos) {
@@ -438,7 +448,9 @@ struct DsdInfo {
 };
 
 inline DsdInfo probe_dsd(const std::string& path) {
+    if (sacd_path(path)) {const auto tr=sacd_select(path);DsdInfo i;i.rate=tr.rate;i.channels=tr.channels;i.bits=tr.bits();i.container="sacd";return i;}
     using namespace dsd_detail;
+    if(path.size()>=4){auto ext=path.substr(path.size()-4);for(auto&c:ext)c=(char)std::tolower((unsigned char)c);if(ext==".dff"){DstDffReader dst;if(dst.open(path)){DsdInfo i;i.rate=dst.rate();i.channels=dst.channels();i.bits=dst.bits();i.container="dff";return i;}}}
     FILE* fp = dsd_fopen(path, L"rb", "rb");
     if (!fp) throw std::runtime_error("无法打开文件: " + path);
     std::fseek(fp, 0, SEEK_END);

@@ -1,4 +1,4 @@
-RLPlayer @VERSION@ 正式发布版（Full / 自包含）
+﻿RLPlayer @VERSION@ 正式发布版（Full / 自包含）
 ================================================
 
 这是唯一的正式发布版：不再有“最小发布版”。解压后双击 RLPlayer.exe 即可。
@@ -18,7 +18,9 @@ RLPlayer @VERSION@ 正式发布版（Full / 自包含）
   ffprobe.exe           媒体信息探测
   asio_probe.exe        ASIO 驱动预检（避免第三方驱动把播放器带崩）
   README.txt            本文件
+  LICENSE               RLPlayer 源代码许可证原文
   OPRA-NOTICE.txt       耳机 EQ 预设（OPRA）来源与许可说明
+  third-party\ffmpeg\   包内 FFmpeg 对应源码、构建配方、许可与 SHA256 清单
   data\                 OPRA 索引等随包数据
   tools\                命令行工具（见文末）
 
@@ -36,17 +38,20 @@ RLPlayer @VERSION@ 正式发布版（Full / 自包含）
   * AMD：rtagpu.dll 覆盖 gfx803/900/906/908/90a/90c/942、gfx1010~1012、
     gfx1030~1036、gfx1100~1103、gfx1150/1151、gfx1200/1201。
   * NVIDIA：rtagpu_cuda.dll（CUDA 12.x，支持 compute_50…compute_121）。
-  * 运行时会用平凡 kernel 验算“能不能真的执行”；显卡不在列表、驱动太旧
-    或没有对应厂商的卡时，自动退回 CPU，结果一致，不会崩。
+  * 运行时会用平凡 kernel 验算“能不能真的执行”；后端不可用时明确回退 CPU。
+    GPU 开启后，符合条件的定点首级仍可在 CPU 运行，后续浮点级由 GPU 加速。
+    本轮 AMD RX 9070 XT 已实测；NVIDIA 构建与离线门通过，仍待 NVIDIA 真机验证。
   * 仍需要安装显卡驱动（硬件驱动，不能随播放器分发）。
   * 信号链里的绿色节点 = **本次真的由 GPU 计算**；底栏「GPU」徽标也只在真正参与时亮。
     设置里勾了 GPU 但显卡不可用时，会如实显示为未参与。
 
 四、解码与格式
 --------------
-  * WAV / DSF / DFF 原生解码，逐位精确。
+  * WAV / DSF / 未压缩 DFF 由原生读取器处理；满足直通条件时保留源数据。
   * 其它格式走本目录的 ffmpeg.exe（优先同目录，其次 PATH）。
   * DSD 源走原生 DSF/DFF 读取；同速率 + 无处理 + 0 dB 时可开 DirectSDM 直通。
+  * PCM 软件输出上限为 1.536 MHz，DSD 为 DSD1024；实际可选输出取决于设备及驱动。
+    ASIO 原生 DSD 与 DoP 均有输出线路；本轮 DSD1024 为离线验证，不等于 DAC 真机通过。
   * DSD 调制输出会自动保留调制器余量（满幅曲目约 -4 dB），这是为了防止
     1-bit 环路在第一个大动态处失稳；信号链里会显示实际预衰减值。
   * bit-perfect：设置 → 输出 →「切到 bit-perfect 直通」一键把参数切成
@@ -54,13 +59,14 @@ RLPlayer @VERSION@ 正式发布版（Full / 自包含）
 
 五、系统要求
 ------------
-  * Windows 7 SP1 / 8 / 8.1 / 10 / 11，x64。
+  * 本轮运行验收平台：Windows 11 x64。构建保留旧系统兼容门，
+    但不能据此宣称 Windows 7 / 8 / 8.1 / 10 已完成同等真机验收。
   * CPU：SSE4.2 + POPCNT（2009 年后的 x86-64；官方下限 Zen 1 / Intel 6 代）。
     产物不含 AVX-512，不需要 VC++ 运行库（CRT 静态链接）。
-  * 界面：本包已内置 WebView2 固定运行时（\WebView2Runtime），Win10/11 双击即用，
-    不再依赖系统是否装过 WebView2。Win7 请使用 Chrome/Edge 109/新版 Firefox
-    打开界面（内置运行时为当前 Windows 版本，不保证 Win7）。
-  * 内存：DSD256 等大文件按整曲解码，建议 8 GB 以上。
+  * 界面：本包已内置 WebView2 固定运行时（\WebView2Runtime），
+    不再依赖系统是否装过 WebView2。本轮已在 Windows 11 验证，旧系统需单独验证。
+  * DSD 默认按块读取和解码；长滤波器的系数准备仍会占用额外内存。
+    两级转换和缓存会减少重复设计，实际用量随滤波器、采样率与声道数变化。
 
 六、独占缓冲与欠载（1.3.14 起）
 -------------------------------
@@ -98,18 +104,24 @@ RLPlayer @VERSION@ 正式发布版（Full / 自包含）
   * DeepSeek 为可选：在同目录 rlplayer-llm.conf 写入
     base_url=https://api.deepseek.com / api_key=你的key / model=deepseek-chat
     即可启用；不配置也完全可用（规则匹配 + 本地资料）。
-    api_key 只存本地，不会上传、不会打进升级包。
+    api_key 保存在本地，并在请求时用于向你配置的服务商鉴权；
+    诊断与反馈需脱敏，正式发布包不携带开发者或用户的 key。
   * 已知边界：同人/小众曲目在数据源命中率低属正常；补全结果可用
     tools\rtatag.exe 查看与手改（store show / store set）。
 
 九、已知限制（如实）
 --------------------
-  * NAA 已彻底删除：数播的 NAA 只认 HQPlayer 私有握手（EULA 禁止逆向），本机实测 8 种握手变体全部无回应；
-  * WASAPI 输入采集通路未实现（界面已标注）；UPnP 投放已可用。
-  * Native DSD（ASIO DSD 通道类型）未实现；DSD 输出走 DoP。
-  * 7 阶 1-bit 调制器在 DSD64 上不稳定，程序会自动降为 5 阶并说明原因。
+  * 不提供 HQPlayer NAA 兼容线路；远程投放可使用 UPnP/DLNA。
+  * WASAPI 采集与房间校准已有实现；本轮离线逻辑门通过，未新增麦克风真机测量。
+  * ASIO 原生 DSD 需要驱动提供对应通道类型；DoP 同样需要 DAC 支持，不能由 PCM 率推断。
+  * 1-bit 高阶调制器会按稳定性和质量门保护；界面同时显示请求阶数、实际阶数及原因。
+    非 EC 的一位输出会明确拒绝低于 100 kHz 的高级噪声整形截止参数，避免已测出的音频带失真。
+    可恢复默认 0（按 100 kHz 处理）或选择 EC 调制器；不会静默替换已保存的错误设置。
+  * SACD ISO 只做镜像识别，尚不解码；DST 压缩 DFF 不支持，会给出明确诊断。
+  * 280 dB 是指定 FIR 系数配置的数值验收目标，不是所有预设的统一承诺，
+    也不是 DAC 模拟信噪比。Gaussian、运行时舍入与 SDM 噪声按各自证据单独说明。
   * DirectSDM 只在“同速率 + 无 PCM 处理 + 0 dB”时启用，否则回退普通路径。
-  * AI 资料首次生成主要耗时在 LLM（中位约 12 秒），缓存命中 6~7 毫秒。
+  * AI 资料首次生成时间取决于网络、服务商与曲目；生成完成后会缓存，重复查看可直接读取。
 
 十、命令行工具（tools\）
 ------------------------
@@ -122,6 +134,10 @@ RLPlayer @VERSION@ 正式发布版（Full / 自包含）
   dopinfo.exe        检查 DoP 标记是否合法
   wavcmp.exe         逐位比较两个 WAV
   filter_report.exe  滤波器频响/阻带报告
+  dsp_export_pipeline.exe 导出实际准备后的滤波系数与参数
+  dsp_efficiency_benchmark.exe 离线完整帧与校验和性能测量，不打开音频设备
+  rlmultilevel.exe   WAV 流式转真实 6/8 位多电平离线文件（非 DSD/DoP/DAC 协议）
+  review5_multilevel_decode.py 独立校验多电平文件；使用本机 Python 运行
   gpubench_conv.exe  GPU 卷积基准
   wasapi_probe.exe   列出设备独占模式支持的采样率/位深
   wasapi_ex_probe.exe 独占格式阶梯探测（24 紧凑 / float32 / 32int）
@@ -132,7 +148,20 @@ RLPlayer @VERSION@ 正式发布版（Full / 自包含）
 
 十一、第三方组件
 ----------------
-  * ffmpeg / ffprobe：GPLv3，源码与许可见 https://ffmpeg.org/
+  * ffmpeg / ffprobe：本次构建为 GPLv2 或后续版本，见二进制 -L 声明。
+    对应 FFmpeg / zlib 源码、许可和构建配方位于 third-party\ffmpeg\。
   * WebView2Loader.dll：Microsoft WebView2 SDK
   * amdhip64_7.dll：AMD HIP runtime，随 AMD ROCm 分发
   * OPRA 耳机 EQ 预设：见 OPRA-NOTICE.txt
+
+十二、本轮新增功能
+----------------
+  * 侧栏“快速开始”：查看设备能力、预览预设后应用，不自动播放。
+  * UPnP 升频：本机完成生产 DSP 处理后向远端供源；倍率受设备能力与上限约束。
+  * 录音清理：设置中手动启用，默认关闭；会衰减噪声，也可能影响微弱细节。
+    不恢复 CD 已丢失的信息，原音逐位模式会旁路。
+  * SACD raw/DST 与 DVD-Audio LPCM/MLP 镜像支持；ISO9660、常见 UDF 1.02/1.50
+    物理分区可读。不处理加密盘、VAT 分区或不同采样率双组 LPCM。
+  * source/ 内附本次修改的播放器源码 ZIP 与逐文件 SHA256；
+    third-party/audio-images/ 保留音频镜像解析的原始参考、许可与改编源码。
+  * 本包 WebView2 固定运行时已更新，3.2.2 客户端会按现有规则提示下载完整包。

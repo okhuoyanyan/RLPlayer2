@@ -1140,7 +1140,9 @@ inline bool summary_lang_valid(const std::string& lang) {
 // ★ F31：缓存格式/语义版本的**唯一**来源。写入与读取都引用它，
 //   禁止再出现"这里写 7、那里判 3"的两套规则（那正是 F31 的根因）。
 //   每次因为「旧内容可能是错的」而改提示词/清洗规则时，把这里 +1。
-inline constexpr int kSummaryCacheVer = 8;
+// 2026-11-02：v8 → v9 —— 提示词新增「输出语言」指令，旧缓存正文是中文（v8 时代还不按语言生成），
+//   不升版本会把中文继续喂给英文界面。升版本后旧条目按过期重建。
+inline constexpr int kSummaryCacheVer = 10;   // v10：提示词追加"标题/键名也必须用目标语言"
 
 inline fsx::path summary_cache_path(const std::string& baseDir,
                                     const std::string& entity_id,
@@ -2000,6 +2002,11 @@ inline std::vector<LlmMessage> build_track_prompt(const std::string& title,
         "4. 结构：{\"fields\":{...},\"sections\":[{\"heading\":\"简介\",\"paragraphs\":[{\"text\":\"…\"}]}]}\n"
         "   fields 只填有把握的键，键名必须从下面清单里选：\n   " + schema + "\n"
         "5. 叙述（sections）最多两段，简短；不要把字段内容整段复制。\n";
+    // 2026-11-02：字段键名本来只允许从上面这张**中文**清单里选 ⟹ 英文界面里键名仍是中文。
+    //   非中文输出时明确要求把键名译成目标语言（语义不变），改由模型做一次对齐。
+    if (!lang.empty() && lang.rfind("zh", 0) != 0)
+        sys += "6. fields 的键名必须用 OUTPUT LANGUAGE 书写：把上面清单里的中文键名按语义译成目标语言，"
+               "不要直接抄中文键名（否则界面上会出现中文标题）。\n";
     std::ostringstream u;
     u << "歌曲：【" << title << "】";
     if (!artist.empty()) u << "，演唱/艺术家：" << artist;

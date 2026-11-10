@@ -742,8 +742,8 @@ static void unitTests(const fs::path& dir) {
         ck(t.trackNo == 3 && t.year == 2001, "WAV ITRK→track、ICRD→year",
            std::to_string(t.trackNo) + "/" + std::to_string(t.year));
         ck(std::fabs(t.duration - 1.0) < 1e-9, "WAV 时长 = data/blockAlign/sr = 1.000000", std::to_string(t.duration));
-        ck(t.sampleRate == 44100 && t.channels == 2 && t.bits == 0,
-           "WAV 16-bit ⟹ TagInfo.bits=0（ffprobe 的 bits_per_raw_sample 是 N/A）",
+        ck(t.sampleRate == 44100 && t.channels == 2 && t.bits == 16,
+           "WAV 16-bit source precision is 16",
            std::to_string(t.sampleRate) + "/" + std::to_string(t.channels) + "/" + std::to_string(t.bits));
         // 入库口径：lib_probe_one 把 <=0 的位深统一写成 16（与旧 ffprobe 路径逐字一致）
         const LibTrack lt = probeFfprobePathWithNative(p);
@@ -761,7 +761,7 @@ static void unitTests(const fs::path& dir) {
         const fs::path q = dir / "f32.wav";
         writeFile(q, buildWav(f));
         TagInfo t2; std::string why2;
-        ck(probeNative(q, t2, why2) && t2.bits == 0, "WAV float32 ⟹ bits=0（ffprobe 报 N/A，调用方统一写 16）",
+        ck(probeNative(q, t2, why2) && t2.bits == 32, "WAV float32 source precision is 32",
            std::to_string(t2.bits) + " " + why2);
     }
     // ---- WAV：data 声明超长 ⟹ 按实际长度截断（ffmpeg 行为） ----

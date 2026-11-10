@@ -1,8 +1,14 @@
-﻿# verify-stream.ps1 - chunk-invariance gate for the streaming pipeline
+﻿param([string]$BuildDir="")
+# verify-stream.ps1 - chunk-invariance gate for the streaming pipeline
 # Silent: uses --out (offline files) only, never opens an audio device.
 $ErrorActionPreference='Continue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$B = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'build'
+$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $Root 'tools\package_paths.ps1')
+if (-not $BuildDir) { $BuildDir = Join-Path $Root 'build' }
+elseif (-not [IO.Path]::IsPathRooted($BuildDir)) { $BuildDir = Join-Path $Root $BuildDir }
+try { $B = Resolve-ReleaseBuildDirectory -SourceRoot $Root -BuildDir $BuildDir }
+catch { Write-Error $_; exit 2 }
 $play = Join-Path $B 'rtaplay.exe'; $cmp = Join-Path $B 'wavcmp.exe'
 if (-not (Test-Path $play) -or -not (Test-Path $cmp)) { 'missing exes'; exit 2 }
 $td = Join-Path $B 'testdata'; New-Item -ItemType Directory -Force -Path $td | Out-Null

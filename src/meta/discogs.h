@@ -166,6 +166,8 @@ public:
     }
 
     bool acquire(int wait_max_ms = 3500) {
+        wait_max_ms = rta::net::http_budget_timeout(wait_max_ms);
+        if (rta::net::http_budget_expired() || (rta::net::http_budget_active() && wait_max_ms <= 0)) return false;
         const auto start = std::chrono::steady_clock::now();
         while (true) {
             {
@@ -195,7 +197,7 @@ public:
             if (elapsed >= wait_max_ms) {
                 return false;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!rta::net::http_budget_sleep(std::chrono::milliseconds(100))) return false;
         }
     }
 
@@ -1609,8 +1611,12 @@ inline std::string discogs_lookup_genre(const std::string& artist,
     };
 
     rta::net::HttpResponse resp;
+    const int remainingTimeout = rta::net::http_budget_timeout(5000);
+    if (rta::net::http_budget_expired() || remainingTimeout <= 0) {
+        err = "HTTP_BUDGET_EXCEEDED"; return "";
+    }
     if (discogs_transport_hook()) {
-        resp = discogs_transport_hook()(url, headers, 5000);
+        resp = discogs_transport_hook()(url, headers, remainingTimeout);
     } else {
         resp = rta::net::http_get(url, headers, 10000);
     }

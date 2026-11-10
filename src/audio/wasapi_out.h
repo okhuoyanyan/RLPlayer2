@@ -16,8 +16,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <tlhelp32.h>        // 2026-11-02：DEVICE_IN_USE 时统计 RLPlayer 实例数（提示"旧版本还开着"）
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <audiopolicy.h>     // 2026-11-02：IAudioSessionManager2（判断端点是否被别人占用）
 #include <functiondiscoverykeys_devpkey.h>
 #include <cstdio>
 #include <cmath>
@@ -27,6 +29,7 @@
 #include <string>
 #include <vector>
 #include "pcm_dump.h"
+#include "audio_clock.h"
 #include <stdexcept>
 
 namespace rta::audio {
@@ -363,6 +366,69 @@ public:
     // 输入端点（线路输入 / 麦克风 / 回环）
     static std::vector<DeviceInfo> enumerate_capture() { return enumerate(eCapture); }
 
+    // 2026-11-02（用户 261102-01 #1：「连麦时 RLP 把语音应用切了」）：
+    //   独占模式是"抢设备"——一旦拿到，别的程序（会议/语音）的流就被废掉。
+    //   这里先问一句"这个端点上还有没有**别人**的活动会话"，有就别抢，改走共享。
+    //   返回"其他进程的活动会话数"（不含自己；拿不到会话信息时返回 0 = 不阻拦）。
+    static int endpoint_other_active_sessions(const std::string& deviceId) {
+        // 2026-11-02：这里曾在实测里恒返回 0 —— 真因是播放线程**没做过 CoInitializeEx**，
+        //   CoCreateInstance 直接 CO_E_NOTINITIALIZED（与 261028-01 的 ASIO 枚举失败同源）。
+        //   现地补一个 RAII：本线程没初始化就自己初始化，函数结束再撤（已初始化过则不动）。
+        struct CoGuard {
+            bool own = false;
+            CoGuard() {
+                const HRESULT h = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                own = SUCCEEDED(h);
+            }
+            ~CoGuard() { if (own) CoUninitialize(); }
+        } coGuard;
+        IMMDeviceEnumerator* en = nullptr;
+        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                    __uuidof(IMMDeviceEnumerator), (void**)&en)) || !en) return 0;
+        IMMDevice* dev = nullptr;
+        HRESULT hr;
+        if (deviceId.empty()) {
+            hr = en->GetDefaultAudioEndpoint(eRender, eConsole, &dev);
+        } else {
+            const int wlen = MultiByteToWideChar(CP_UTF8, 0, deviceId.c_str(), -1, nullptr, 0);
+            std::wstring wid(wlen > 0 ? (size_t)wlen : 0, L'\0');
+            if (wlen > 1) MultiByteToWideChar(CP_UTF8, 0, deviceId.c_str(), -1, wid.data(), wlen);
+            hr = en->GetDevice(wid.c_str(), &dev);
+        }
+        en->Release();
+        if (FAILED(hr) || !dev) return 0;
+
+        int busy = 0;
+        IAudioSessionManager2* mgr = nullptr;
+        if (SUCCEEDED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**)&mgr)) && mgr) {
+            IAudioSessionEnumerator* sess = nullptr;
+            if (SUCCEEDED(mgr->GetSessionEnumerator(&sess)) && sess) {
+                int cnt = 0;
+                sess->GetCount(&cnt);
+                const DWORD self = GetCurrentProcessId();
+                for (int i = 0; i < cnt; ++i) {
+                    IAudioSessionControl* ctl = nullptr;
+                    if (FAILED(sess->GetSession(i, &ctl)) || !ctl) continue;
+                    AudioSessionState st = AudioSessionStateInactive;
+                    ctl->GetState(&st);
+                    DWORD pid = 0;
+                    IAudioSessionControl2* c2 = nullptr;
+                    if (SUCCEEDED(ctl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&c2)) && c2) {
+                        c2->GetProcessId(&pid);
+                        c2->Release();
+                    }
+                    // pid==0 的系统会话（如"系统声音"）不算：它没有独占诉求
+                    if (st == AudioSessionStateActive && pid != 0 && pid != self) ++busy;
+                    ctl->Release();
+                }
+                sess->Release();
+            }
+            mgr->Release();
+        }
+        dev->Release();
+        return busy;
+    }
+
     // flow = eRender（默认，输出端点）或 eCapture（输入端点）
     static std::vector<DeviceInfo> enumerate(EDataFlow flow = eRender) {
         std::vector<DeviceInfo> out;
@@ -510,6 +576,23 @@ public:
             fmts[nFmt++] = { 4, 32, false, "EXT32/32 int" };
         }
 
+        // 统计本机 RLPlayer.exe 实例数：DEVICE_IN_USE 时用来提示"旧版本还开着"。
+        auto count_player_instances = []() -> int {
+            int n = 0;
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap == INVALID_HANDLE_VALUE) return 0;
+            PROCESSENTRY32W pe{};
+            pe.dwSize = sizeof(pe);
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    // 界面进程与后端进程都要算：独占流在 rtaweb 里，但用户看到的是 RLPlayer
+                    if (_wcsicmp(pe.szExeFile, L"RLPlayer.exe") == 0 ||
+                        _wcsicmp(pe.szExeFile, L"rtaweb.exe") == 0) ++n;
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+            return n;
+        };
         ev_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         REFERENCE_TIME dur = (REFERENCE_TIME)(bufferMs * 10000.0);
         struct Try { REFERENCE_TIME buf; REFERENCE_TIME per; DWORD flags; const char* why; };
@@ -528,22 +611,32 @@ public:
             const char* v = std::getenv("RTA_WASAPI_EVENT");
             return v && v[0] == '1';
         }();
+        // ★ 2026-11-02（用户真机：3.1.9「全部配方 DEVICE_IN_USE，无法播放」）：
+        //   ① 配方顺序把 periodicity=0 排在最前，而本机 TASCAM 对「buffer=dur, per=0」直接回
+        //      DEVICE_IN_USE（wasapi_ex_probe 实测：同格式 per=dur = S_OK，per=0 = 0x8889000A）
+        //      ⟹ 第一条就"看起来被独占"，后面能成功的配方永远轮不到。
+        //   ② 更关键：MSDN 要求 Initialize 失败后 **Release + 重新 Activate** 才能再 Initialize；
+        //      旧实现整轮复用同一个 ac_，第一次失败后所有重试都可能被记成 DEVICE_IN_USE
+        //      （对齐分支的注释早就写过同样的坑，只是没修主循环）。
+        //   ⟹ 现在：period=dur 的组合排前面，且每次尝试都换新 client。
         const Try triesEventFirst[] = {
+            { dur, dur, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=period=xxxms,event" },
             { dur, 0,   AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=xxxms,period=驱动默认,event" },
             { 0,   0,   AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer/period 全默认,event" },
+            { dur, dur, 0,                                 "buffer=period=xxxms,轮询" },
             { dur, 0,   0,                                 "buffer=xxxms,period默认,轮询" },
             { 0,   0,   0,                                 "全默认,轮询" },
-            { dur, dur, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=period=xxxms,event（兜底）" },
         };
         const Try triesPollFirst[] = {
+            { dur, dur, 0,                                 "buffer=period=xxxms,轮询" },
             { dur, 0,   0,                                 "buffer=xxxms,period默认,轮询" },
             { 0,   0,   0,                                 "全默认,轮询" },
+            { dur, dur, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=period=xxxms,event" },
             { dur, 0,   AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=xxxms,period=驱动默认,event" },
             { 0,   0,   AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer/period 全默认,event" },
-            { dur, dur, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=period=xxxms,event（兜底）" },
         };
         const Try* tries = preferEvent ? triesEventFirst : triesPollFirst;
-        const int nTries = 5;
+        const int nTries = 6;
         std::string trialLog;
         hr = E_FAIL;
         const char* fmtUsed = "";
@@ -571,6 +664,19 @@ public:
         for (int ti = 0; ti < nTries; ++ti) {
             const Try& t = tries[ti];
             if (forcePoll && (t.flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK)) continue;   // 只走轮询
+            // 每条配方都用**全新的** IAudioClient（MSDN：Initialize 失败后必须 Release+Activate，
+            // 复用同一个 client 再 Initialize 会拿到 DEVICE_IN_USE / BUFFER_SIZE_ERROR）。
+            if (ti > 0 || fi > 0) {
+                if (ac_) { ac_->Release(); ac_ = nullptr; }
+                const HRESULT hra = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ac_);
+                if (FAILED(hra) || !ac_) {
+                    char b[96];
+                    std::snprintf(b, sizeof(b), "[%s -> Activate 0x%08lX]", t.why, (unsigned long)(unsigned)hra);
+                    trialLog += b;
+                    hr = hra;
+                    continue;
+                }
+            }
             hr = ac_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, t.flags, t.buf, t.per,
                                  (WAVEFORMATEX*)&wfx_, nullptr);
             {
@@ -610,7 +716,24 @@ public:
           if (hr == S_OK) { fmtUsed = F.tag; break; }   // 该格式成功 → 不再试后面的格式
         }
         if (hr != S_OK) {
-            lastErr_ = std::string("Initialize 失败（全部格式×配方）：") + trialLog;
+            // 2026-11-02：把"看起来被独占"与"格式不支持"分开说清。
+            //   现场：用户只看到 15 段 0x8889000A，以为软件坏了；实际这台设备对
+            //   「buffer=dur, per=0」就是回 DEVICE_IN_USE（探测工具同样复现）。
+            const bool anyInUse = trialLog.find("DEVICE_IN_USE") != std::string::npos;
+            std::string hint;
+            if (anyInUse) {
+                // 2026-11-02 用户真机：升级后没关旧版本，两个实例抢独占 ⟹ 新实例 15 段全 DEVICE_IN_USE。
+                // 启动器对"另一版本"是**故意不接管**的（避免拿旧界面骗人），于是两个实例可能同时在跑。
+                const int players = count_player_instances();
+                if (players > 1) {
+                    hint = "。检测到 " + std::to_string(players) +
+                           " 个 RLPlayer 实例在运行 —— 旧版本可能还占着设备，请先退出它";
+                } else {
+                    hint = "。提示：设备若真被独占，请关掉另一个播放器 / 浏览器 / 会议软件；"
+                           "否则请在 设置→输出 换一个端点，或把后端切到「WASAPI 共享」";
+                }
+            }
+            lastErr_ = std::string("Initialize 失败（全部格式×配方）：") + trialLog + hint;
             fillFail(trialLog.c_str());   // HF-01：把请求格式与该位深的实际独占支持列表带出去
             close(); return false;
         }
@@ -879,10 +1002,7 @@ public:
         return (double)(t.QuadPart - qpcStart_) / (double)qpcFreq_;
     }
     bool device_position(unsigned long long& pos) const {
-        if (!clock_) return false;
-        UINT64 p = 0, q = 0;
-        if (FAILED(clock_->GetPosition(&p, &q))) return false;
-        pos = (unsigned long long)p; return true;
+        return clock_position_frames(clock_,rate_,pos);
     }
     uint32_t rate() const { return rate_; }
     int bits() const { return bits_; }

@@ -56,6 +56,7 @@
 #include "dsd_integrator.h"
 #include "kaiser.h"
 #include "modulator.h"
+#include "sdm_output_policy.h"
 #include "parallel.h"
 #include "resampler.h"
 #include <algorithm>
@@ -263,6 +264,7 @@ public:
                                     : std::min(0.0, cfg_.preAttenDb);
         gain_ = std::pow(10.0, gainDb_ / 20.0);
         if (!plan_.needs_dsp()) return;
+        validate_one_bit_sdm_corner(cfg_.modFamily, false, cfg_.modCutoffHz);
         passbandHz_ = conversion_passband(cfg_.conversion);
 
         // ---- 抽取器：源位率 → midRate（每声道一个，状态独立）----

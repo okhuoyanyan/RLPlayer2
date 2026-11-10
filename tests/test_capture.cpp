@@ -1,4 +1,4 @@
-// test_capture.cpp — ROADMAP P4a: WASAPI 采集核心 + 环形缓冲 + 格式转换 + THD+N 离线门禁
+﻿// test_capture.cpp — ROADMAP P4a: WASAPI 采集核心 + 环形缓冲 + 格式转换 + THD+N 离线门禁
 //
 // 验证范围：
 //   §1 无锁 SPSC 环形缓冲：读写顺序、环绕、溢出/下溢计数、水位
@@ -16,6 +16,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -45,6 +46,8 @@ static void ck(bool cond, const char* what, const std::string& detail = "") {
 
 int main() {
     SetConsoleOutputCP(CP_UTF8);
+    const char* noDeviceEnv = std::getenv("RTA_NO_DEVICE");
+    const bool noDevice = noDeviceEnv && std::string(noDeviceEnv) == "1";
     std::printf("=================================================================\n");
     std::printf("== WASAPI 采集核心离线门禁测试 (ROADMAP P4a)                   ==\n");
     std::printf("=================================================================\n");
@@ -366,8 +369,8 @@ int main() {
                "exit=" + std::to_string(pr.exit_code));
         }
 
-        // 4. 设备失败路径：指定不存在的端点
-        {
+        // 4. Device failure requires endpoint enumeration; never enter in offline mode.
+        if (!noDevice) {
             std::string cmd = qExe + " --dev NON_EXISTENT_CAPTURE_DEV_ZZZ_9999 --seconds 0.1";
             auto pr = rta::platform::run_hidden(cmd, true);
             ck(pr.started && pr.exit_code == 3, "CLI 不存在设备退出码为 3 (设备失败)",
@@ -378,6 +381,9 @@ int main() {
     // ---------------- §7 真实设备回环采集 smoke（只读，铁律 1 约束） ----------------
     std::printf("\n-- §7 真实设备回环采集 smoke (只读回环监听，铁律 1 约束) --\n");
     {
+        if (noDevice) {
+            std::printf("UNVERIFIED_DEVICE: real endpoint enumeration/capture disabled by RTA_NO_DEVICE=1; null-source assertions executed\n");
+        } else {
         auto devs = WasapiCapture::enumerate_capture(true);
         std::string lbDevName, lbDevId;
         for (const auto& d : devs) {
@@ -433,6 +439,8 @@ int main() {
             }
         }
     }
+
+    } // explicit real-device branch
 
     std::printf("\n=================================================================\n");
     if (g_fail == 0) {

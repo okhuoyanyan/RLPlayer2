@@ -647,12 +647,74 @@ inline std::string pp_format_block(const std::string& kind_word) {
 //   kind        "专辑" / "歌曲" / "艺术家"
 //   material    已渲染好的材料块（[M1] … 形式）
 //   known_tags  已知标签（pp_signal_tags 或调用方给的元数据）
+
+// 2026-11-02（用户：「AI 资料受提示词影响，必须用对应语言的提示词」）：
+//   简介/资料由 LLM 生成，输出语言由**提示词**决定，翻译字典管不到。这里放一份"当前界面语言"，
+//   并在 system prompt 末尾追加一条**用目标语言写**的强指令（把指令本身写成目标语言，
+//   模型服从度明显高于中文指令里夹一句 Write in English）。
+inline std::string& pp_output_lang() { static std::string v = "zh"; return v; }
+inline void pp_set_output_lang(const std::string& code) {
+    std::string c = code;
+    for (char& ch : c) ch = (char)std::tolower((unsigned char)ch);
+    pp_output_lang() = c.empty() ? std::string("zh") : c;
+}
+// 语言 → 该语言的自称（用于指令文本）
+inline const char* pp_lang_endonym(const std::string& c) {
+    if (c == "en") return "English";
+    if (c == "ja") return "日本語";
+    if (c == "fr") return "français";
+    if (c == "ru") return "русский";
+    if (c == "es") return "español";
+    if (c == "ar") return "العربية";
+    return "";                       // zh / 未知：不加指令
+}
+// 追加到 system prompt 的语言指令（目标语言书写）
+inline std::string pp_language_directive(const std::string& c) {
+    if (c == "en")
+        return "\n\nIMPORTANT OUTPUT LANGUAGE: write every natural-language value (summary text, field values, "
+               "section headings, explanations) in English. Keep proper nouns (artist names, album titles, "
+               "labels, catalogue numbers) in their original language. JSON keys and the given schema stay unchanged. Section headings (sections[].heading) and field keys must also be in English; do not emit Chinese characters anywhere, except inside proper nouns (artist / album / track names).";
+    if (c == "ja")
+        return "\n\n【出力言語の厳守】自然言語の値（概要・各フィールドの値・見出し・説明）はすべて日本語で書くこと。"
+               "固有名詞（人名・曲名・レーベル名・品番）は原語のまま。JSON のキーと指定スキーマは変更しない。見出し（sections[].heading）と fields のキーも日本語にすること。固有名詞（人名・曲名・アルバム名）以外に中国語の文字を出さないこと。";
+    if (c == "fr")
+        return "\n\nLANGUE DE SORTIE : rédigez toutes les valeurs en langage naturel (résumé, champs, titres de "
+               "sections, explications) en français. Conservez les noms propres (artistes, titres d'albums, "
+               "labels) dans leur langue d'origine. Les clés JSON et le schéma restent inchangés. Les titres de sections (sections[].heading) et les clés de champs doivent aussi être en français ; n'utilisez aucun caractère chinois, sauf dans les noms propres.";
+    if (c == "ru")
+        return "\n\nЯЗЫК ВЫВОДА: все значения на естественном языке (описание, поля, заголовки разделов, пояснения) "
+               "пишите по-русски. Имена собственные (исполнители, названия альбомов, лейблы) оставляйте в оригинале. "
+               "Ключи JSON и схема не меняются. Заголовки разделов (sections[].heading) и имена полей тоже должны быть по-русски; никаких китайских иероглифов, кроме имён собственных.";
+    if (c == "es")
+        return "\n\nIDIOMA DE SALIDA: escribe todos los valores en lenguaje natural (resumen, campos, títulos de "
+               "secciones, explicaciones) en español. Mantén los nombres propios (artistas, títulos de álbumes, "
+               "sellos) en su idioma original. Las claves JSON y el esquema no cambian. Los títulos de sección (sections[].heading) y las claves de campo también deben ir en español; no uses caracteres chinos salvo en nombres propios.";
+    if (c == "ar")
+        return "\n\nلغة الإخراج: اكتب جميع القيم النصية (الملخص، الحقول، عناوين الأقسام، الشروحات) بالعربية. "
+               "اترك الأسماء الخاصة (أسماء الفنانين وعناوين الألبومات والشركات) بلغتها الأصلية. "
+               "لا تغيّر مفاتيح JSON أو المخطط المحدد. يجب أن تكون عناوين الأقسام (sections[].heading) وأسماء الحقول بالعربية أيضًا، ولا تستخدم أي حروف صينية خارج الأسماء الخاصة.";
+    return "";
+}
+
+
+// user 提示词的收尾句（与 pp_language_directive 成对使用；中文不需要）
+inline std::string pp_user_language_tail(const std::string& c) {
+    if (c == "en") return " Write every value in English (proper nouns stay original).";
+    if (c == "ja") return " 値はすべて日本語で書くこと（固有名詞は原語のまま）。";
+    if (c == "fr") return " Rédigez toutes les valeurs en français (noms propres inchangés).";
+    if (c == "ru") return " Все значения пишите по-русски (имена собственные — в оригинале).";
+    if (c == "es") return " Escribe todos los valores en español (nombres propios sin traducir).";
+    if (c == "ar") return " اكتب جميع القيم بالعربية (الأسماء الخاصة بلغتها الأصلية).";
+    return "";
+}
+
 inline ProfilePrompt build_profile_prompt(
     const ProfileDecision& dec,
     const std::string& entity,
     const std::string& kind,
     const std::string& material,
-    const std::vector<std::pair<std::string, std::string>>& known_tags = {}) {
+    const std::vector<std::pair<std::string, std::string>>& known_tags = {},
+    const std::string& lang = std::string()) {
     const ProfileSpec& spec = profile_spec(dec.profile);
     const std::string kind_word = pp_kind_word(kind);
 
@@ -785,6 +847,25 @@ inline ProfilePrompt build_profile_prompt(
     }
     user += "\n请按上面的规范输出 JSON：先把所有能确定的标签写进 fields（越多越好），再写解读分节。";
 
+    // 2026-11-02：语言指令追加在 system 末尾（放在 user 里会被材料挤掉注意力）
+    {
+        const std::string L = lang.empty() ? pp_output_lang() : lang;
+        const std::string dir = pp_language_directive(L);
+        if (!dir.empty()) {
+            // 2026-11-02：规则 3 原来写「fields 键名可以自拟（中文优先）」⟹ 英文界面里键名照样是
+            //   「词作 / 作曲 / 版番」这类中文标题（截图实测）。非中文输出时把这条改成本语言优先。
+            //   （有两处：profile 模板与曲目/通用模板，都要换）
+            const std::string zhKeyHint = "（中文优先）";
+            const std::string langHint = std::string("（优先用") + pp_lang_endonym(L) + "）";
+            for (size_t hp = sys.find(zhKeyHint); hp != std::string::npos; hp = sys.find(zhKeyHint, hp + langHint.size()))
+                sys.replace(hp, zhKeyHint.size(), langHint);
+            sys += dir;
+            // user 尾句也要跟着改，否则模型看到「请按上面的规范输出」会默认用中文
+            const std::string en_name = "JSON";
+            (void)en_name;
+            user += pp_user_language_tail(L);
+        }
+    }
     ProfilePrompt out;
     out.system = sys;
     out.user = user;

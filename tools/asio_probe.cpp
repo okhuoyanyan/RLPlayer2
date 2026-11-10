@@ -1,8 +1,8 @@
-// asio_probe.cpp — ASIO 后端的分步验证探针（不发声）
+﻿// asio_probe.cpp — ASIO 后端的分步验证探针（不发声）
 //
 // 为什么要分步：ASIO 是一套固定顺序的虚函数表，一旦顺序错，调用会直接崩。
 // 所以先只走前面几项（创建 / 取名 / 声道 / 缓冲 / 采样率），确认不崩、返回值合理，
-// 再用 --stream 验证 createBuffers + start + 回调。全程送零样本，不产生可听声音。
+// 再用 --stream 验证 createBuffers + start + 回调。PCM 送零样本；DSD 送平衡静音码（不把全零 DSD 当作静音）。
 //
 // 用法：
 //   asio_probe                列出驱动与能力（只读，不创建缓冲）
@@ -11,7 +11,7 @@
 //   asio_probe --stream <n>   对第 n 个驱动做 createBuffers + start + 1 秒静音推送
 //   asio_probe --dsd-create <n|--clsid X> [--rate 2822400] [--ch 2] [--ms 1000]
 //                             真机：切 kASIODSDFormat → 设 DSD 位率 → createBuffers →
-//                             start → 推【全零 DSD 字节】→ stop/dispose → 恢复 PCM。
+//                             start → 推【平衡 DSD 静音码 0x69/0x96】→ stop/dispose → 恢复 PCM。
 //                             每一步都打印原始 ASE 码，绝不只是 OK/FAIL。
 //
 // ⚠️ 判据（铁律 3）：ASIO 的 "DSD 能力" 不是靠猜类型码，而是看三点同时成立：
@@ -46,12 +46,23 @@ static std::string ase(long v) {
     return b;
 }
 
-// ---------------- 回调（探针自己用；回调里把缓冲填零 = 静音） ----------------
+// ---------------- 回调（探针自己用；PCM 填零，DSD 按位序填平衡静音码） ----------------
 static std::atomic<long> g_cbCount{0};
 static std::atomic<unsigned long long> g_firstCb{0}, g_lastCb{0};
 static ASIOBufferInfo* g_bufs = nullptr;
 static long g_ch = 0, g_bufUnits = 0, g_unitBytes = 1;
 
+// Eight chronological bits repeat as 10010110. Reversing the storage bit order
+// changes 0x96(MSB first) to 0x69(LSB first); each byte has four zeros/four ones.
+// Every callback writes complete bytes, so the period stays aligned across
+// odd byte counts, double-buffer switches and repeated callbacks.
+static ASIOSampleType g_probeTypes[32]{};
+static void probe_fill_bytes(void* p, size_t count, ASIOSampleType type) {
+    if (!p || !count) return;
+    const int silence = type == ASIOSTDSDInt8LSB1 ? 0x69
+                      : type == ASIOSTDSDInt8MSB1 ? 0x96 : 0;
+    std::memset(p, silence, count);
+}
 static long g_fillBytes = 0;    // >0 时覆盖"每次回调写多少字节"（诊断用）
 static std::atomic<int> g_cbLog{0};
 static void probe_fill(long idx) {
@@ -63,16 +74,15 @@ static void probe_fill(long idx) {
         if (n <= 3) { printf("     [cb %ld] idx=%ld （nop：不写缓冲）\n", n, idx); fflush(stdout); }
         return;
     }
+    if (idx < 0 || idx > 1 || g_ch <= 0 || g_ch > 32 || g_bufUnits <= 0 || g_unitBytes <= 0) return;
+    const size_t capacity = (size_t)g_bufUnits * (size_t)g_unitBytes;
+    const size_t requested = g_fillBytes > 0 ? (size_t)g_fillBytes : capacity;
+    const size_t nb = requested < capacity ? requested : capacity;
     if (g_cbLog.fetch_add(1) < 3)
-        printf("     [cb %ld] idx=%ld ch=%ld buf0=%p buf1=%p 每声道写 %ld 字节\n",
-               n, idx, g_ch, g_bufs[0].buffers[0], g_bufs[0].buffers[1],
-               g_bufUnits * g_unitBytes);
-    const size_t nb = g_fillBytes > 0 ? (size_t)g_fillBytes
-                                     : (size_t)g_bufUnits * (size_t)g_unitBytes;
-    for (long c = 0; c < g_ch; ++c) {
-        void* p = g_bufs[c].buffers[idx];
-        if (p) std::memset(p, 0, nb);
-    }
+        printf("     [cb %ld] idx=%ld ch=%ld buf0=%p buf1=%p 每声道写 %zu 字节\n",
+               n, idx, g_ch, g_bufs[0].buffers[0], g_bufs[0].buffers[1], nb);
+    for (long c = 0; c < g_ch; ++c)
+        probe_fill_bytes(g_bufs[c].buffers[idx], nb, g_probeTypes[c]);
 }
 static void probe_switch(long idx, ASIOBool) { probe_fill(idx); }
 static ASIOTime* probe_switch_time(ASIOTime* t, long idx, ASIOBool) { probe_fill(idx); return t; }
@@ -122,14 +132,6 @@ static LONG WINAPI probe_veh(EXCEPTION_POINTERS* ep) {
     fputs(b, stdout);
     fflush(stdout);
     return EXCEPTION_CONTINUE_SEARCH;
-}
-
-// 试写 n 字节：AV 就说明这个长度超过驱动实际给我们的缓冲（ASIO 没有 API 能问"缓冲多少字节"）
-static int try_fill_bytes(void* p, size_t n) {
-    ASIO_GUARD_BEGIN
-    std::memset(p, 0, n);
-    return 0;
-    ASIO_GUARD_END(1)
 }
 
 // ---------------- 只读探测 ----------------
@@ -235,7 +237,10 @@ static int dsd_create_test(const AsioDriverEntry& e, const DsdTestOpts& o) {
     printf("    目标：kAsioSetIoFormat(kASIODSDFormat) → 采样率 %.0f Hz → createBuffers → start\n", dsdRate);
     printf("    参数：ch=%d%s buf=%ld(0=驱动 pref) rateFirst=%d outReady=%d nopCb=%d ms=%d\n",
            o.ch, o.allCh ? "(全部)" : "", o.bufBytes, (int)o.rateFirst, (int)o.outReady, (int)o.nopCb, o.ms);
-    printf("    ⚠️ 会打开该驱动并推【全零 DSD 字节】%d ms（全零 = 恒定电平 = 数字静音，不产生可听信号）\n", o.ms);
+    printf("    ⚠️ 会打开该驱动并推【平衡 DSD 静音码 0x69/0x96】%d ms（LSB1=0x69，MSB1=0x96，每 8 bit 正负各半，DC 均值为 0）\n", o.ms);
+    printf("    DSD 的 1-bit 瞬时正负电平不是 PCM 峰值音量；使用周期平衡静音码，不发送全 0/全 1 满幅 DC。\n");
+    if (o.probeBuf) { printf("拒绝 --probe-buf：越界试写不属于安全静音探针\n"); return 2; }
+    if (o.fillBytes < 0) { printf("拒绝负的 --bytes\n"); return 2; }
     printf("    ⚠️ ASIO 独占：运行期间系统其他声音会被该设备接管\n");
 
     wchar_t wc[128] = {0};
@@ -311,7 +316,9 @@ static int dsd_create_test(const AsioDriverEntry& e, const DsdTestOpts& o) {
     int ch = (o.ch > 0 && o.ch <= outCh2) ? o.ch : (int)outCh2;
     if (o.allCh) ch = (int)outCh2;
     const long bufBytes = o.bufBytes > 0 ? o.bufBytes : (pref2 > 0 ? pref2 : (mx2 > 0 ? mx2 : 512));
-    const long writeBytes = bufBytes / 8 > 0 ? bufBytes / 8 : 1;
+    if (bufBytes <= 0 || bufBytes % 8 != 0) { printf("DSD buffer 必须包含完整字节的 1-bit 样本；拒绝不对齐长度\n"); d->Release(); return 2; }
+    const long writeBytes = bufBytes / 8;
+    if (o.fillBytes > writeBytes) { printf("拒绝 --bytes 超过实际 DSD 缓冲字节数 %ld\n",writeBytes); d->Release(); return 2; }
     printf("[8] 采用：%d 声道；getBufferSize 报 %ld（单位=1-bit 样本）⟹ 每回调实际写 %ld 字节/声道"
            "（%.1f ms @ %.0f Hz）\n",
            ch, bufBytes, writeBytes, (double)writeBytes * 8.0 * 1000.0 / dsdRate, dsdRate);
@@ -348,7 +355,8 @@ static int dsd_create_test(const AsioDriverEntry& e, const DsdTestOpts& o) {
         ci.channel = c; ci.isInput = ASIOFalse;
         const ASIOError err = asio_guarded_channel_info(d, &ci);
         if (c == 0) firstType = ci.type;
-        if (!asio_is_dsd_1bit(ci.type)) allDsd = false;
+        g_probeTypes[c] = ci.type;
+        if (err != ASE_OK || !asio_is_dsd_1bit(ci.type) || !bufs[c].buffers[0] || !bufs[c].buffers[1]) allDsd = false;
         if (c < 4 || !asio_is_dsd_1bit(ci.type))
             printf("     ch%-2d getChannelInfo -> err=%ld type=%-2ld %-12s name=\"%s\" active=%ld\n",
                    c, (long)err, (long)ci.type, type_str(ci.type),
@@ -358,38 +366,23 @@ static int dsd_create_test(const AsioDriverEntry& e, const DsdTestOpts& o) {
            allDsd ? "是" : "否", (long)firstType,
            (int)ASIOSTDSDInt8LSB1, (int)ASIOSTDSDInt8MSB1);
 
-    // ---- 到底能写多少字节？ASIO 没有 API 能问，只能实测 ----
-    // 本机 AudioByte 的关键坑：DSD 模式下 getBufferSize 报 32768，但按字节直接写 32768 会 AV。
-    // 先看驱动给的两块内存各自的虚拟内存区域，再逐个长度试写，边界就是真实可写范围。
-    for (int c = 0; c < ch && c < 2; ++c) {
-        for (int b = 0; b < 2; ++b) {
-            void* p = bufs[c].buffers[b];
-            if (!p) { printf("     [内存] ch%d buf%d = null\n", c, b); continue; }
-            MEMORY_BASIC_INFORMATION mbi{};
-            const SIZE_T q = VirtualQuery(p, &mbi, sizeof(mbi));
-            printf("     [内存] ch%d buf%d=%p VirtualQuery=%llu base=%p region=%llu state=0x%lx protect=0x%lx\n",
-                   c, b, p, (unsigned long long)q, mbi.AllocationBase,
-                   (unsigned long long)mbi.RegionSize, (unsigned long)mbi.State, (unsigned long)mbi.Protect);
-        }
-        if (bufs[c].buffers[0] && bufs[c].buffers[1])
-            printf("     [内存] ch%d 两个 double-buffer 相距 %lld 字节\n", c,
-                   (long long)((char*)bufs[c].buffers[1] - (char*)bufs[c].buffers[0]));
+    if (!allDsd) {
+        printf("拒绝开流：声道类型查询失败、不是受支持的 1-bit DSD 或缓冲为空\n");
+        asio_guarded_dispose(d);
+        ASIOIoFormat pf{}; pf.formatType = kASIOPCMFormat;
+        asio_guarded_future(d, kAsioSetIoFormat, &pf);
+        d->Release(); return 3;
     }
-    if (o.probeBuf && bufs[0].buffers[0]) {
-        const size_t cand[] = {1024, 2048, 4096, 8192, 16384, 32768, 65536};
-        printf("     [试写] 从 ch0 buf0 起逐级 memset（AV = 超过驱动实际缓冲）：\n");
-        for (size_t n : cand) {
-            const int bad = try_fill_bytes(bufs[0].buffers[0], n);
-            printf("       %6zu 字节 -> %s\n", n, bad ? "AV（越界）" : "OK");
-            if (bad) break;
-        }
-    }
+    // ASIOStart may consume either buffer before the first callback. Both must
+    // already contain valid silence, including the diagnostic nop callback mode.
+    for (int c=0;c<ch;++c) for (int b=0;b<2;++b)
+        probe_fill_bytes(bufs[c].buffers[b], (size_t)writeBytes, g_probeTypes[c]);
 
-    // 开流 + 推全零 DSD
+    // 开流 + 推平衡 DSD 静音码
     g_cbCount = 0; g_firstCb = 0; g_lastCb = 0;
     g_bufs = o.nopCb ? nullptr : bufs;
-    g_ch = ch; g_bufUnits = bufBytes; g_unitBytes = 1;   // DSD：1 字节 = 8 样本
-    g_fillBytes = o.fillBytes;
+    g_ch = ch; g_bufUnits = writeBytes; g_unitBytes = 1;   // capacity is BYTES, not DSD bits
+    g_fillBytes = o.fillBytes > 0 ? o.fillBytes : writeBytes;
     ASIOSamples s0{}; ASIOTimeStamp t0{};
     const ASIOError sp0 = d->getSamplePosition(&s0, &t0);
     const unsigned long long pos0 = ((unsigned long long)s0.hi << 32) | s0.lo;
@@ -505,6 +498,7 @@ static int check_test(const AsioDriverEntry& e, double rate, int ch) {
 
 static int stream_test(const AsioDriverEntry& e, double rate, int ch, void* hwnd, bool nopCb, int ms) {
     printf("\n=== 推流测试（零样本，%d ms）%s @ %.0f Hz / %d ch ===\n", ms, e.name.c_str(), rate, ch);
+    printf("PCM 静音：所有样本=0，峰值=0（-inf dBFS），不发送测试音。\n");
     AsioDriver drv;
     std::string err;
     // 2026-10-28（261028-01 #2，SMSL DAC）：退出码要能区分「可恢复失败」与「真崩溃」，

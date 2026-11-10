@@ -285,12 +285,19 @@ int main() {
         ck(has_note(diff, "重调制"), "Case 15: note 写明需要重调制");
     }
 
-    // ---- ⑯ DSD 升频：驱动声称 DSD1024 ⟹ 封顶 DSD512 + note ----
+    // ---- ⑯ DSD 升频：驱动声称 DSD1024 ⟹ 目标 DSD1024 + 算力前提 note ----
+    // 2026-11-01：3.0.10 修掉高倍率标准 7 阶的精度退化后，DSD1024 是可交付档位，
+    // 旧的「一律按 DSD512 封顶」是过期限制（它会同时污染能力查询与预设推荐）。
+    // 仍要守住的诚实边界：驱动"声称"支持不等于本机能跑满 ⟹ 必须给算力前提 note。
     {
         const DeviceCaps c = asio_caps(kFull, "dsd1024");
         const PresetSettings s = plan_preset(PresetProfile::Dsd, c, pcm_src(44100, 16));
-        ck(s.dsd == 512, "Case 16: 驱动声称 dsd1024 ⟹ 目标封顶 DSD512", std::to_string(s.dsd));
-        ck(has_note(s, "封顶"), "Case 16: note 写明按 DSD512 封顶");
+        ck(s.dsd == 1024, "Case 16: 驱动声称 dsd1024 ⟹ 目标 DSD1024（不再假封顶 512）", std::to_string(s.dsd));
+        ck(has_note(s, "DSD1024") && has_note(s, "欠载"),
+           "Case 16: note 写明 DSD1024 的算力前提与回退建议");
+        const DeviceCaps c512 = asio_caps(kFull, "dsd512");
+        const PresetSettings s512 = plan_preset(PresetProfile::Dsd, c512, pcm_src(44100, 16));
+        ck(s512.dsd == 512, "Case 16: 设备最高 dsd512 时目标仍是 DSD512", std::to_string(s512.dsd));
     }
 
     // ---- ⑰ bitperfect：独占设备 × 多源矩阵都必须满足八条件（PCM 源） ----
@@ -371,6 +378,26 @@ int main() {
            dsd_level_of_bitrate(3072000) == 64, "Case 18: 位率→档位（44.1k 与 48k 族）");
         ck(preset_dop_max_from_rates(kFull) == "dsd256" && preset_dop_max_from_rates(k96k).empty(),
            "Case 18: DoP 最高档由 PCM 载波率推得（96k 设备没有 DoP）");
+        // 2026-11-01：DSD1024 档位识别与 DoP 载波（44.1k 族 2822400 / 48k 族 2949120）。
+        // 旧实现这两处都只认到 512，导致"设备只支持 1024"被判成 dsd512（能力查询假上限）。
+        ck(dsd_level_of_bitrate(45158400) == 1024 && dsd_level_of_bitrate(49152000) == 1024,
+           "Case 18: 位率→档位 认 DSD1024（44.1k 与 48k 族）");
+        ck(dop_carrier_for_level(1024) == 2822400, "Case 18: DSD1024 的 DoP 载波 = 2822400 Hz");
+        // DoP 载波：44.1k 族 DSD1024 = 45158400/16 = 2822400；48k 族 = 49152000/16 = 3072000
+        ck(preset_dop_max_from_rates({176400u, 2822400u}) == "dsd1024" &&
+           preset_dop_max_from_rates({192000u, 3072000u}) == "dsd1024",
+           "Case 18: DoP 最高档认到 dsd1024（两族载波都认）");
+        // 原生 DSD 能力判定（rtaweb 的探测循环调用的就是这一个纯函数）：
+        // 只给"驱动接受的位率列表"，输出最高档；未知位率忽略；超过上限按上限封顶。
+        ck(dsd_native_level_from_bitrates({}) == 0, "Case 18: 空列表 ⟹ 无原生 DSD");
+        ck(dsd_native_level_from_bitrates({2822400u}) == 64, "Case 18: 只接受 DSD64");
+        ck(dsd_native_level_from_bitrates({2822400u, 22579200u}) == 512, "Case 18: 认到 dsd512");
+        ck(dsd_native_level_from_bitrates({2822400u, 45158400u}) == 1024,
+           "Case 18: 认到 dsd1024（44.1k 族 45158400）");
+        ck(dsd_native_level_from_bitrates({49152000u}) == 1024,
+           "Case 18: 认到 dsd1024（48k 族 49152000）");
+        ck(dsd_native_level_from_bitrates({2822400u, 84672000u}) == 64,
+           "Case 18: 未知超高位率被忽略，不影响已知档位");
     }
 
     // ---- [19] PCM -> DSD 档（2026-10-26，261026-01 #1）----

@@ -12,7 +12,9 @@
 #include "audio/audio_loader.h"
 #include "audio/dsd_reader.h"
 #include "dsp/dop.h"
-#include "dsp/resampler.h"
+#include "engine/pipeline.h"
+#include "audio/cast_upsample_plan.h"
+#include "analysis/health_stream.h"
 #include <string>
 #include <vector>
 #include <thread>
@@ -110,11 +112,15 @@ inline std::string make_cast_temp_wav_path(const char* tag) {
     static std::atomic<uint64_t> s_seq{0};
     auto name = "rtacast_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())
                 + "_" + std::to_string(++s_seq) + "_" + (tag ? tag : "") + ".wav";
-    return (td / name).string();
+    auto u8=(td / name).u8string();return std::string(u8.begin(),u8.end());
 }
 
 struct CastState {
     bool        running = false;
+    bool        naturalEnd = false;
+    bool        cleanupApplied=false;double cleanupMeanReductionDb=0,cleanupModifiedBinFraction=0;
+    double      prepareProgress = 0.0;
+    std::string  prepareNote;
     std::string device;
     std::string sourceFile;
     uint16_t    servePort = 8912;
@@ -151,12 +157,262 @@ struct CastStartParams {
     int         bits = 0;
     double      seconds = 0.0;
     bool        dop = false;
+    bool        upsample = false;
+    bool        forceRate = false;
+    uint32_t    rateCeiling = 192000;
+    std::string requestedRate = "max";
+    bool cleanup=false;double cleanupStrength=.5,cleanupNoiseDb=-101.1;
+    int twoStage=-1;
+    std::string filter = "poly-sinc-tight-lp", filterNx;
+    double      cueStart = -1.0, cueEnd = -1.0;
+    uint64_t    diskReserveBytes = 1048576;
+    uint64_t    maxOutputBytes = 0xFFFFFFFFull - 36; // RIFF/WAVE, not RF64
 };
 
 struct CastStartResult {
     bool ok = false;
     std::string error;
 };
+
+
+// Stream decoder: native WAV keeps integer samples; compressed formats use the
+// bundled decoder's declared PCM format. No complete-track PCM allocation.
+class CastPcmReader {
+public:
+    ~CastPcmReader() { close(); }
+    bool open(const std::string& path, std::atomic<bool>& cancel, const CastStartParams* params=nullptr) {
+        cancel_=&cancel;
+        if(cancel.load())throw std::runtime_error("投放准备已取消");
+        std::string input=path, inputOptions, filter;
+        rta::audio::FfmpegPcmChoice pcm;
+        bool dvdMlp=false;
+        if(rta::audio::lowerExt(path)==".iso") {
+            // Selecting first validates the entire virtual key, including its
+            // media kind. Never strip a suffix and fall back to the first track.
+            const auto track=rta::audio::dvd_audio_select(path);
+            const auto info=rta::audio::dvd_audio_info(path);
+            rate=info.rate;channels=info.channels;bits=info.bits==20?24:info.bits;
+            frames=(uint64_t(track.durationPts)*rate+45000)/90000;
+            if(!track.mlp) {dvd_=std::make_unique<rta::audio::DvdLpcmReader>();dvd_->open(path);return true;}
+            dvdMlp=true;expectedFrames_=frames;
+            // Reject an impossible RIFF budget before extracting a large AOB.
+            const uint64_t limit=params?std::min<uint64_t>(params->maxOutputBytes,0xFFFFFFFFull-36):0xFFFFFFFFull-36;
+            const int minimumBits=params&&params->bits?params->bits:bits;
+            if(minimumBits!=16&&minimumBits!=24&&minimumBits!=32)throw std::runtime_error("投放输出位深仅支持 16/24/32");
+            if(frames>limit/(uint64_t(channels)*(minimumBits/8)))throw std::runtime_error("投放 WAV 超过 RIFF 4GiB 或输出预算上限");
+            const auto skip=rta::audio::dvd_mlp_trim_samples(track.pts,rta::audio::dvd_first_mlp_pes_pts(path,track),rate);
+            // The source is a bounded selected AOB range, not an ISO filename
+            // passed to ffmpeg. PCM goes directly into the cancellable pipe.
+            aobPath_=make_cast_temp_wav_path("mlp-source");
+            std::unique_ptr<FILE,decltype(&fclose)> source(rta::audio::sacd_detail::open(rta::audio::dvd_physical_path(path)),fclose);
+            std::unique_ptr<FILE,decltype(&fclose)> out(upnp_detail::open_file_utf8(aobPath_,L"wb","wb"),fclose);
+            if(!source||!out)throw std::runtime_error("DVD-A MLP: 无法创建选轨临时文件");
+            uint64_t first=uint64_t(track.firstSector)*2048,last=(uint64_t(track.lastSector)+1)*2048,base=0,copied=0;
+            std::array<uint8_t,65536> chunk{};
+            for(const auto& extent:track.aobs) {
+                uint64_t at=std::max(first,base),end=std::min(last,base+extent.bytes);
+                while(at<end) {
+                    if(cancel.load())throw std::runtime_error("投放准备已取消");
+                    size_t n=(size_t)std::min<uint64_t>(chunk.size(),end-at);
+                    std::error_code ec;const auto space=fs::space(fs::u8path(aobPath_).parent_path(),ec);
+                    const auto reserve=params?params->diskReserveBytes:1048576;
+                    if(!ec&&(space.available<n||space.available-n<reserve))throw std::runtime_error("投放准备磁盘空间不足");
+                    if(!rta::audio::iso_extent_at(source.get(),extent,at-base,chunk.data(),n)||fwrite(chunk.data(),1,n,out.get())!=n)throw std::runtime_error("DVD-A MLP: 选轨提取短读写");
+                    at+=n;copied+=n;
+                }
+                base+=extent.bytes;
+            }
+            if(copied!=last-first||fflush(out.get()))throw std::runtime_error("DVD-A MLP: 选轨范围不完整");
+            out.reset();input=aobPath_;inputOptions=" -f mpeg";
+            filter=" -af atrim=start_sample="+std::to_string(skip)+":end_sample="+std::to_string(skip+frames);
+            pcm.codec=bits==16?"pcm_s16le":bits==24?"pcm_s24le":"pcm_s32le";
+        }
+        if (wav_.open(path)) { native_=true; rate=wav_.rate(); bits=wav_.bits(); channels=wav_.channels(); floating=wav_.isFloat(); frames=wav_.totalFrames(); return true; }
+        const auto tool=rta::audio::find_tool("ffmpeg");
+        if(tool.empty()) throw std::runtime_error("投放解码需要包内 ffmpeg.exe");
+        if(!dvdMlp)pcm=rta::audio::probe_ffmpeg_pcm(rta::audio::find_tool("ffprobe"),path);
+        SECURITY_ATTRIBUTES sa{sizeof(sa),nullptr,TRUE}; HANDLE wr=nullptr;
+        if(!CreatePipe(&rd_,&wr,&sa,0)) throw std::runtime_error("投放解码管道创建失败");
+        SetHandleInformation(rd_,HANDLE_FLAG_INHERIT,0);
+        HANDLE nul=CreateFileW(L"NUL",GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,&sa,OPEN_EXISTING,0,nullptr);
+        STARTUPINFOW si{};si.cb=sizeof(si);si.dwFlags=STARTF_USESTDHANDLES;si.hStdOutput=wr;si.hStdError=nul;si.hStdInput=nullptr;
+        auto cmd=L"\""+rta::audio::widen(tool)+L"\" -nostdin -v error"+rta::audio::widen(inputOptions)+L" -i \""+rta::audio::widen(input)+L"\" -map 0:a:0 -vn"+rta::audio::widen(filter)+L" -c:a "+rta::audio::widen(pcm.codec)+L" -f wav pipe:1";
+        PROCESS_INFORMATION pi{};
+        const bool ok=CreateProcessW(nullptr,cmd.data(),nullptr,nullptr,TRUE,CREATE_NO_WINDOW,nullptr,nullptr,&si,&pi)!=0;
+        CloseHandle(wr);CloseHandle(nul);
+        if(!ok) throw std::runtime_error("无法启动投放解码器");
+        process_=pi.hProcess;CloseHandle(pi.hThread);
+        std::vector<uint8_t> h; rta::audio::WavHeaderInfo hi;
+        while(h.size()<(1u<<20)) {
+            uint8_t b; if(!bytes(&b,1)) throw std::runtime_error("投放解码器未输出有效 WAV 头"); h.push_back(b);
+            const int rc=rta::audio::parse_wav_header(h.data(),h.size(),hi);
+            if(rc<0) throw std::runtime_error("投放解码器 WAV 头非法");
+            if(rc>0) {if(dvdMlp&&(hi.rate!=rate||hi.bits!=bits||hi.channels!=channels||hi.isFloat))throw std::runtime_error("DVD-A MLP: 解码格式与音轨头不一致");rate=hi.rate;bits=hi.bits;channels=hi.channels;floating=hi.isFloat;return true;}
+        }
+        throw std::runtime_error("投放解码器 WAV 头超过 1MiB");
+    }
+    size_t read(rta::audio::AudioBuffer& out, size_t count=4096) {
+        if(cancel_&&cancel_->load())throw std::runtime_error("投放准备已取消");
+        if(dvd_) {
+            const size_t n=dvd_->read(pos_,count,out);pos_+=n;
+            // Native DVD unpacking uses a left-aligned int32 buffer. Restore
+            // its exact source precision at this boundary, with no quantizer.
+            if(bits<32)for(auto& v:out.raw)v>>=(32-bits);
+            out.bits=bits;return n;
+        }
+        if(native_) {auto n=wav_.read(pos_,count,out);pos_+=n;return n;}
+        if(expectedFrames_){if(pos_>=expectedFrames_){out.raw.clear();return 0;}count=(size_t)std::min<uint64_t>(count,expectedFrames_-pos_);}
+        const size_t stride=(size_t)channels*(bits/8);std::vector<uint8_t> b(count*stride);
+        const size_t got=bytes(b.data(),b.size());
+        if(got%stride) throw std::runtime_error("投放解码输出截断（不足一帧）");
+        out.rate=rate;out.bits=bits;out.channels=channels;out.isFloat=floating;out.raw.resize(got/(bits/8));
+        for(size_t i=0;i<out.raw.size();++i)out.raw[i]=rta::audio::decode_sample(b.data()+i*(bits/8),bits,floating);
+        if(!got && process_ && WaitForSingleObject(process_,10000)==WAIT_OBJECT_0) { DWORD rc=0;GetExitCodeProcess(process_,&rc);if(rc)throw std::runtime_error("投放解码失败，退出码="+std::to_string((int)rc)); }
+        pos_+=got/stride;
+        if(expectedFrames_&&got<b.size())throw std::runtime_error("DVD-A MLP: 解码在 IFO 轨尾之前截断");
+        return got/stride;
+    }
+    uint32_t rate=0;int bits=0,channels=0;bool floating=false;uint64_t frames=0;
+private:
+    size_t bytes(uint8_t* dst,size_t want) {
+        size_t done=0; auto last=std::chrono::steady_clock::now();
+        while(done<want) {
+            if(cancel_ && cancel_->load())throw std::runtime_error("投放准备已取消");
+            DWORD avail=0;if(!PeekNamedPipe(rd_,nullptr,0,nullptr,&avail,nullptr))break;
+            if(avail) {DWORD n=0;if(!ReadFile(rd_,dst+done,(DWORD)std::min<size_t>(want-done,avail),&n,nullptr)||!n)break;done+=n;last=std::chrono::steady_clock::now();}
+            else {if(WaitForSingleObject(process_,0)==WAIT_OBJECT_0)break;if(std::chrono::steady_clock::now()-last>std::chrono::seconds(30))throw std::runtime_error("投放解码器 30 秒未产生数据");Sleep(2);}
+        }
+        return done;
+    }
+    void close() {if(rd_){CloseHandle(rd_);rd_=nullptr;}if(process_){WaitForSingleObject(process_,10000);CloseHandle(process_);process_=nullptr;}if(!aobPath_.empty()){std::error_code ec;fs::remove(fs::u8path(aobPath_),ec);}}
+    rta::analysis::detail::WavPcmStream wav_;std::unique_ptr<rta::audio::DvdLpcmReader>dvd_;std::string aobPath_;uint64_t expectedFrames_=0;bool native_=false;size_t pos_=0;HANDLE rd_=nullptr,process_=nullptr;std::atomic<bool>* cancel_=nullptr;
+};
+
+// Match an entire renderer tuple. Never combine the rate of one entry with
+// the bit depth/channels of another entry (the old independent-max trap).
+inline UpnpSinkCaps cast_parse_sink_caps(const std::string& sink) {
+    auto caps=parse_sink_caps(sink);size_t pos=0,index=0;
+    while(pos<sink.size() && index<caps.entries.size()) {
+        auto end=sink.find(',',pos);auto token=cast_lower_str(upnp_trim(sink.substr(pos,end==std::string::npos?end:end-pos)));
+        if(!token.empty()) {
+            auto& entry=caps.entries[index++];
+            for(const auto* key:{";bits=",";bitspersample="}) {auto at=token.find(key);if(at!=std::string::npos){int b=atoi(token.c_str()+at+strlen(key));if(b==16||b==24||b==32)entry.bits=b;}}
+        }
+        if(end==std::string::npos)break;pos=end+1;
+    }
+    return caps;
+}
+inline bool cast_tuple_compatible(const UpnpSinkCaps& caps,int bits,int channels) {
+    for(const auto& e:caps.entries)if(e.is_wav() && (!e.bits||e.bits==bits) && (!e.channels||e.channels==channels))return true;
+    return false;
+}
+inline std::vector<uint32_t> cast_compatible_rates(const UpnpSinkCaps& caps,int bits,int channels) {
+    std::vector<uint32_t> rates;
+    for(const auto& e:caps.entries) if(e.is_wav() && e.rate && (!e.bits||e.bits==bits) && (!e.channels||e.channels==channels)) rates.push_back(e.rate);
+    return rates;
+}
+struct CastPreparedPcm { uint32_t rate=0;int bits=0,channels=0;uint64_t frames=0;bool floating=false,changed=false,cleanupApplied=false;double cleanupMeanReductionDb=0,cleanupModifiedBinFraction=0;std::string note; };
+
+// Resolve with the same strict navigation/key parser used by local playback.
+// A foreign or missing selection must fail before any renderer is contacted.
+inline bool cast_is_sacd_image(const std::string& path) {
+    const auto key=rta::audio::image_track_key(path);
+    if(rta::audio::lowerExt(path)!=".iso")return false;
+    if(key.kind=="sacd"){rta::audio::sacd_select(path);return true;}
+    if(key.kind=="dvda"){rta::audio::dvd_audio_select(path);return false;}
+    if(!rta::audio::sacd_tracks(path).empty()){rta::audio::sacd_select(path);return true;}
+    rta::audio::dvd_audio_select(path);return false;
+}
+
+inline CastPreparedPcm cast_prepare_sacd_dop(const CastStartParams& p,const std::string& output,
+        std::atomic<bool>& cancel,std::function<void(double,const std::string&)> progress={}) {
+    if(!p.dop)throw std::runtime_error("SACD DSD 投放必须开启 DoP，拒绝转换 PCM");
+    if(p.cleanup)throw std::runtime_error("DSD DoP 逐位供源不经过 PCM 清理");
+    if(cancel.load())throw std::runtime_error("投放准备已取消");
+    rta::audio::SacdReader reader;reader.open(p.file);
+    const auto& track=reader.track();const uint64_t bytesPerChannel=track.bits()/8;
+    if(track.bits()%16)throw std::runtime_error("SACD: 音轨尾不足一个完整 DoP 帧，拒绝截断");
+    CastPreparedPcm result;result.rate=track.rate/16;result.bits=24;result.channels=track.channels;result.frames=track.bits()/16;
+    result.note="SACD DoP v1.1 分块打包：原始 DSD 位保持不变（未做 PCM 转换）";
+    const uint64_t limit=std::min<uint64_t>(p.maxOutputBytes,0xFFFFFFFFull-36);
+    if(result.frames>limit/(uint64_t(result.channels)*3))throw std::runtime_error("投放 WAV 超过 RIFF 4GiB 或输出预算上限");
+    FILE* f=upnp_detail::open_file_utf8(output,L"wb","wb");if(!f)throw std::runtime_error("投放临时 DoP WAV 无法创建");
+    struct Guard{FILE*f;std::string path;bool ok=false;~Guard(){if(f)fclose(f);if(!ok){std::error_code ec;fs::remove(fs::u8path(path),ec);}}}guard{f,output};
+    const uint64_t dataBytes=result.frames*result.channels*3;
+    std::vector<uint8_t> h;h.insert(h.end(),{'R','I','F','F'});rta::audio::detail::wr32(h,(uint32_t)dataBytes+36);h.insert(h.end(),{'W','A','V','E','f','m','t',' '});rta::audio::detail::wr32(h,16);rta::audio::detail::wr16(h,1);rta::audio::detail::wr16(h,(uint16_t)result.channels);rta::audio::detail::wr32(h,result.rate);rta::audio::detail::wr32(h,result.rate*result.channels*3);rta::audio::detail::wr16(h,(uint16_t)(result.channels*3));rta::audio::detail::wr16(h,24);h.insert(h.end(),{'d','a','t','a'});rta::audio::detail::wr32(h,(uint32_t)dataBytes);
+    if(fwrite(h.data(),1,h.size(),f)!=h.size())throw std::runtime_error("DoP WAV 头写入失败");
+    uint64_t position=0;std::vector<std::vector<uint8_t>> planes;
+    if(progress)progress(0,result.note);
+    while(position<bytesPerChannel) {
+        if(cancel.load())throw std::runtime_error("投放准备已取消");
+        const size_t n=(size_t)std::min<uint64_t>(4096,bytesPerChannel-position);
+        if(reader.read(n,planes)!=n||n%2)throw std::runtime_error("SACD: DoP 音轨短读或半帧");
+        std::vector<uint8_t> block;block.reserve(n/2*result.channels*3);
+        for(size_t i=0;i<n;i+=2)for(int c=0;c<result.channels;++c){block.push_back(planes[c][i+1]);block.push_back(planes[c][i]);block.push_back(((position+i)/2&1)?rta::dsp::DOP_MARKER_B:rta::dsp::DOP_MARKER_A);}
+        std::error_code ec;const auto parent=fs::u8path(output).parent_path();const auto space=fs::space(parent.empty()?fs::current_path():parent,ec);
+        if(!ec&&(space.available<block.size()||space.available-block.size()<p.diskReserveBytes))throw std::runtime_error("投放准备磁盘空间不足");
+        if(fwrite(block.data(),1,block.size(),f)!=block.size())throw std::runtime_error("DoP WAV 写入失败");
+        position+=n;if(progress)progress(double(position)/bytesPerChannel,result.note);
+    }
+    if(cancel.load())throw std::runtime_error("投放准备已取消");
+    if(fflush(f))throw std::runtime_error("DoP WAV 完成写入失败");guard.ok=true;return result;
+}
+
+inline CastPreparedPcm cast_prepare_pcm(const CastStartParams& p,const std::string& output,
+        std::atomic<bool>& cancel,const UpnpSinkCaps& caps,
+        std::function<void(double,const std::string&)> progress) {
+    rta::dsp::DesignCancellationScope cancellation(&cancel);
+    CastPcmReader reader;reader.open(p.file,cancel,&p);
+    CastPreparedPcm result;result.rate=reader.rate;result.bits=p.bits?p.bits:reader.bits;result.channels=reader.channels;
+    if(result.bits!=16 && result.bits!=24 && result.bits!=32)throw std::runtime_error("投放输出位深仅支持 16/24/32");
+    if(caps.ok && !p.bits && !cast_tuple_compatible(caps,result.bits,result.channels)) {
+        for(int candidate:{24,16})if(candidate<=reader.bits && cast_tuple_compatible(caps,candidate,result.channels)){result.bits=candidate;break;}
+    }
+    const auto rates=cast_compatible_rates(caps,result.bits,result.channels);
+    auto decision=rta::audio::decide_cast_target_rate(reader.rate,p.rate?std::to_string(p.rate):p.requestedRate,rates,p.rateCeiling,p.upsample||p.rate>0,p.forceRate);
+    // An explicit incompatible WAV tuple must not become 'undeclared'.
+    if(caps.ok && !cast_tuple_compatible(caps,result.bits,result.channels) && !p.forceRate && decision.upsample) {decision.targetRate=reader.rate;decision.upsample=false;decision.noteZh="渲染器未声明匹配位深/声道的 WAV 升频格式，按源直供";}
+    result.rate=decision.targetRate?decision.targetRate:reader.rate;result.note=decision.noteZh;
+    rta::engine::PipelineConfig cfg;cfg.outRate=result.rate;cfg.outBits=result.bits;cfg.gpuResample=false;cfg.autoTaps=true;
+    cfg.recordingCleanup.enabled=p.cleanup;cfg.recordingCleanup.strength=p.cleanupStrength;cfg.recordingCleanup.noiseFloorDbfs=p.cleanupNoiseDb;
+    if(decision.upsample) {const std::string name=reader.rate>48000&&!p.filterNx.empty()?p.filterNx:p.filter;const auto* fp=rta::dsp::find_preset(name=="auto"?"poly-sinc-tight-lp":name,false);if(!fp)throw std::runtime_error("未知投放滤波器: "+p.filter);rta::engine::apply_filter_preset(cfg,*fp);}
+    rta::engine::apply_resample_purpose(cfg,rta::dsp::ResamplePurpose::Pcm);
+    if(p.twoStage>=0){cfg.twoStage=p.twoStage!=0;cfg.allowAutomaticCascade=false;}
+    result.floating=reader.floating && !decision.upsample && !(p.cleanup&&p.cleanupStrength>0) && (!p.bits||p.bits==reader.bits);
+    result.changed=decision.upsample || result.bits!=reader.bits || (reader.floating&&!result.floating) || (p.cleanup&&p.cleanupStrength>0);
+    if(result.bits<reader.bits || decision.upsample)cfg.shaper=rta::dsp::Shaper::TPDF;
+    rta::engine::Pipeline pipeline(cfg);
+    FILE* f=upnp_detail::open_file_utf8(output,L"wb","wb");if(!f)throw std::runtime_error("投放临时 WAV 无法创建（空间/权限）");
+    struct Guard{FILE* f;std::string path;bool ok=false;~Guard(){if(f)std::fclose(f);if(!ok){std::error_code ec;fs::remove(fs::u8path(path),ec);}}} guard{f,output};
+    uint8_t blank[44]{};if(std::fwrite(blank,1,44,f)!=44)throw std::runtime_error("投放 WAV 头写入失败");
+    uint64_t skipped=0,latency=0,inputFrames=0,dataBytes=0;
+    auto write=[&](const rta::audio::AudioBuffer& a){
+        const size_t skip=(size_t)std::min<uint64_t>(a.frames(),latency-skipped);skipped+=skip;
+        std::vector<uint8_t> b; b.reserve((a.frames()-skip)*(size_t)a.channels*(result.bits/8));
+        for(size_t n=skip;n<a.frames();++n)for(int c=0;c<a.channels;++c){uint32_t v=(uint32_t)a.raw[n*(size_t)a.channels+c];for(int k=0;k<result.bits/8;++k)b.push_back((uint8_t)(v>>(k*8)));}
+        if(dataBytes+b.size()>std::min<uint64_t>(p.maxOutputBytes,0xFFFFFFFFull-36))throw std::runtime_error("投放 WAV 超过 RIFF 4GiB 上限，请降低目标格式或拆分曲目");
+        std::error_code ec;auto space=fs::space(fs::u8path(output).parent_path().empty()?fs::current_path():fs::u8path(output).parent_path(),ec);
+        if(!ec && (space.available<b.size() || space.available-b.size()<p.diskReserveBytes))throw std::runtime_error("投放准备磁盘空间不足（保留 1MiB）");
+        if(std::fwrite(b.data(),1,b.size(),f)!=b.size())throw std::runtime_error("投放 WAV 写入失败（磁盘满/权限）");
+        dataBytes+=b.size();result.frames+=a.frames()-skip;
+    };
+    rta::audio::AudioBuffer block;
+    while(reader.read(block)) {
+        if(cancel.load())throw std::runtime_error("投放准备已取消");
+        auto out=result.floating?block:pipeline.process(block);if(inputFrames==0)latency=(uint64_t)std::ceil(pipeline.algorithmic_latency_out_frames());
+        inputFrames+=block.frames();write(out);
+        if(progress)progress(reader.frames?std::min(.99,(double)inputFrames/reader.frames):0.0,result.note);
+    }
+    if(cancel.load())throw std::runtime_error("投放准备已取消");
+    uint64_t drain=(uint64_t)std::ceil((latency+pipeline.resampler_tail_out_frames()+(pipeline.convolution_tail_out_frames()+pipeline.recording_cleanup_tail_out_frames()))*(double)reader.rate/result.rate)+2;
+    while(drain && latency+pipeline.resampler_tail_out_frames()+(pipeline.convolution_tail_out_frames()+pipeline.recording_cleanup_tail_out_frames())>0) {
+        if(cancel.load())throw std::runtime_error("投放准备已取消");size_t n=(size_t)std::min<uint64_t>(drain,4096);write(pipeline.drain_chunk(n));drain-=n;
+    }
+    std::vector<uint8_t> h;h.insert(h.end(),{'R','I','F','F'});rta::audio::detail::wr32(h,(uint32_t)dataBytes+36);h.insert(h.end(),{'W','A','V','E','f','m','t',' '});rta::audio::detail::wr32(h,16);rta::audio::detail::wr16(h,result.floating?3:1);rta::audio::detail::wr16(h,(uint16_t)result.channels);rta::audio::detail::wr32(h,result.rate);rta::audio::detail::wr32(h,result.rate*result.channels*(result.bits/8));rta::audio::detail::wr16(h,(uint16_t)(result.channels*(result.bits/8)));rta::audio::detail::wr16(h,(uint16_t)result.bits);h.insert(h.end(),{'d','a','t','a'});rta::audio::detail::wr32(h,(uint32_t)dataBytes);
+    if(std::fseek(f,0,SEEK_SET)||std::fwrite(h.data(),1,h.size(),f)!=h.size()||std::fflush(f))throw std::runtime_error("投放 WAV 完成写入失败");
+    if(const auto* observed=pipeline.prepared_recording_cleanup_stats()){result.cleanupApplied=observed->spectralFrames>0;result.cleanupMeanReductionDb=observed->meanReductionDb;result.cleanupModifiedBinFraction=observed->modifiedBinFraction;}
+    guard.ok=true;if(progress)progress(1.0,result.note);return result;
+}
 
 class CastManager {
 public:
@@ -209,18 +465,26 @@ public:
     }
 
     CastStartResult start(const CastStartParams& p) {
+        if (p.cueStart >= 0.0 || p.cueEnd >= 0.0) return {false,"UPnP 暂不支持 CUE 分轨；拒绝播放整个镜像"};
+        if (p.bits != 0 && p.bits != 16 && p.bits != 24 && p.bits != 32) return {false,"投放位深仅支持 16/24/32"};
         if (p.file.empty()) {
             return {false, "未指定音频文件路径"};
         }
 
-        std::string ext = cast_lower_str(rta::audio::lowerExt(p.file));
-        bool isDsd = (ext == ".dsf" || ext == ".dff");
+        std::string ext,physical;bool sacdImage=false;
+        try {
+            physical=rta::audio::image_track_key(p.file).physical;
+            ext=cast_lower_str(rta::audio::lowerExt(p.file));
+            if(ext==".iso")sacdImage=cast_is_sacd_image(p.file);
+        }catch(const std::exception&e){return {false,std::string("音频镜像曲目无效: ")+e.what()};}
+        bool isDsd = (ext == ".dsf" || ext == ".dff" || sacdImage);
+        if(isDsd&&p.cleanup)return {false,"DSD DoP 逐位供源不经过 PCM 清理，请关闭录音清理或切到本地 PCM 输出"};
         if (isDsd && !p.dop) {
             return {false, "源文件为 DSD 格式 (" + p.file + ")。未开启 DoP 模式，为保证音质拒绝转码为 PCM 降质输出（请勾选 DoP）"};
         }
 
         std::error_code ec;
-        if (!fs::exists(fs::u8path(p.file), ec) || ec) {
+        if (!fs::exists(fs::u8path(physical), ec) || ec) {
             return {false, "音频文件不存在: " + p.file};
         }
 
@@ -236,6 +500,8 @@ public:
         stopReq_.store(false);
         pauseReq_.store(false);
         seekReq_.store(-1.0);
+        state_.naturalEnd = false;state_.cleanupApplied=false;state_.cleanupMeanReductionDb=state_.cleanupModifiedBinFraction=0;
+        state_.prepareProgress = 0;state_.prepareNote.clear();
         state_.running = true;
         state_.device = p.dev;
         state_.sourceFile = p.file;
@@ -311,7 +577,7 @@ private:
                     state_.bitPerfectWhy = err;
                 }
                 if (needCleanupTemp && !tempWavPath.empty()) {
-                    std::remove(tempWavPath.c_str());
+                    std::error_code ec;fs::remove(fs::u8path(tempWavPath),ec);
                 }
             }
             log("FAIL " + err);
@@ -392,10 +658,40 @@ private:
             state_.phase = "serving";
         }
 
+        UpnpControlClient client(targetDev.av_transport_url(), targetDev.connection_manager_url());
+        log("DEVICE " + (targetDev.name.empty() ? targetDev.host : targetDev.name) +
+            " model=" + targetDev.model + " av=" + client.av_transport_url() +
+            " cm=" + client.connection_manager_url());
+
+        // 4a) 先问渲染器"你到底收什么"（ConnectionManager.GetProtocolInfo）。
+        //     放在 SetAVTransportURI 之前：① 能在投之前就告诉用户"它不支持这个格式"；
+        //     ② bit-perfect 判定只认这份 Sink，不再拿我们自己发过去的 DIDL 回显当证据。
+        UpnpProtocolInfo proto = client.get_protocol_info();
+        UpnpSinkCaps caps = cast_parse_sink_caps(proto.ok ? proto.sink : std::string());
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            state_.sinkSummary = caps.ok ? caps.summary() : std::string("(GetProtocolInfo 无响应)");
+        }
+        log(std::string("SINK ") + (proto.ok ? "ok" : "FAIL") + " " +
+            (caps.ok ? caps.summary() : std::string("(空)")) +
+            (proto.ok ? "" : (" err=" + proto.error.str())));
+
         // 2) 准备供源音频
         std::string ext = cast_lower_str(rta::audio::lowerExt(p.file));
-        bool isDsd = (ext == ".dsf" || ext == ".dff");
-        if (isDsd) {
+        bool sacdImage=false;
+        try {if(ext==".iso")sacdImage=cast_is_sacd_image(p.file);}
+        catch(const std::exception&e){fail(e.what());return;}
+        bool isDsd = (ext == ".dsf" || ext == ".dff" || sacdImage);
+        if(sacdImage) {
+            try {
+                {std::lock_guard<std::mutex>lk(mtx_);state_.phase="preparing";}
+                tempWavPath=make_cast_temp_wav_path("sacd-dop");needCleanupTemp=true;
+                auto prepared=cast_prepare_sacd_dop(p,tempWavPath,stopReq_,[this](double v,const std::string&note){std::lock_guard<std::mutex>lk(mtx_);state_.prepareProgress=v;state_.prepareNote=note;});
+                wavToServe=tempWavPath;srcFormat.sampleRate=prepared.rate;srcFormat.bits=prepared.bits;srcFormat.channels=prepared.channels;srcFormat.isDsd=true;srcFormat.encoding="DSD over PCM (DoP v1.1)";
+                durationSec=double(prepared.frames)/prepared.rate;softwareWhy=prepared.note;
+                serveFormat="WAV 24bit/"+std::to_string(prepared.rate)+"Hz/"+std::to_string(prepared.channels)+"ch（源 SACD DSD 以 DoP v1.1 打包）";
+            }catch(const std::exception&e){if(stopReq_.load()){std::lock_guard<std::mutex>lk(mtx_);state_.running=false;state_.phase="stopped";return;}fail(std::string("SACD DoP 准备失败: ")+e.what());return;}
+        }else if (isDsd) {
             try {
                 rta::audio::DsdStream dsd = rta::audio::read_dsd(p.file);
                 if (dsd.rate == 0 || dsd.channels == 0 || dsd.data.empty()) {
@@ -445,147 +741,25 @@ private:
                 return;
             }
         } else {
-            if ((ext == ".wav" || ext == ".wave") && p.rate == 0 && p.bits == 0) {
-                // 2026-10-29：.wav 分两类处理。
-                //   A) 渲染器普遍能吃的整型 PCM（16/24-bit、≤2 声道、≤192k）⟹ 源文件**原样**供源：
-                //      字节级一致、零转码、不把整首曲子读进内存（1 小时 24/192 的 WAV 有 4GB，
-                //      旧实现一律整读，会顶到 read_wav 的 4GiB 防御上限直接失败）。
-                //   B) 其余（float32 / 32-bit int / 多声道 / >192k / 头里有超大附属块）⟹ 走
-                //      read_wav → write_wav 规范化成标准 RIFF/WAVE（WAVE_FORMAT_EXTENSIBLE 与
-                //      超大 LIST/id3 附属块会让一部分渲染器直接拒收）。PCM 样本逐位不变，只重写头。
-                //      注意：float32 源规范化后仍是 float32 —— 不偷偷量化成 24-bit，只在 warning 里说清楚。
-                rta::audio::WavHeaderInfo hi;
-                std::string whyNot;
-                if (cast_wav_can_serve_raw(p.file, hi, whyNot)) {
-                    srcFormat.sampleRate = hi.rate;
-                    srcFormat.bits = hi.bits;
-                    srcFormat.channels = hi.channels;
-                    srcFormat.isDsd = false;
-                    srcFormat.encoding = "Linear PCM";
-                    durationSec = (hi.byteRate > 0 && hi.dataDeclaredBytes > 0 && hi.dataDeclaredBytes != 0xFFFFFFFFu)
-                                  ? (double)hi.dataDeclaredBytes / (double)hi.byteRate : 0.0;
-                    wavToServe = p.file;
-                    softwareWhy = "源 WAV 原样供源（未解码、未改写，字节级一致）";
-                } else {
-                    bool normalized = false;
-                    try {
-                        rta::audio::AudioBuffer ab = rta::audio::read_wav(p.file);
-                        srcFormat.sampleRate = ab.rate;
-                        srcFormat.bits = ab.bits;
-                        srcFormat.channels = ab.channels;
-                        srcFormat.isDsd = false;
-                        srcFormat.encoding = ab.isFloat ? "IEEE Float PCM" : "Linear PCM";
-                        durationSec = ab.rate ? (double)ab.frames() / (double)ab.rate : 0.0;
-                        tempWavPath = make_cast_temp_wav_path("wav");
-                        rta::audio::write_wav(tempWavPath, ab);
-                        wavToServe = tempWavPath;
-                        needCleanupTemp = true;
-                        normalized = true;
-                        softwareWhy = "源 WAV 已规范化（" + whyNot + "）：PCM 样本逐位未变，只重写 RIFF 头";
-                        if (ab.isFloat) softwareWhy += "；float32 源仍是 32-bit float（不悄悄量化成 24-bit）";
-                        if (ab.isFloat || (!ab.isFloat && ab.bits != 16 && ab.bits != 24) || ab.channels > 2) {
-                            preWarn = "这个 WAV 的格式不是常见的 16/24-bit PCM 双声道（" + whyNot +
-                                      "）：部分渲染器会拒收，若无声请改用 16/24-bit 的源。";
-                        }
-                    } catch (const std::exception& e) {
-                        // 规范化失败（>4GiB 的整型 WAV / 特殊容器）：退回原样供源 ——
-                        // 供源至少还有机会成功，同时把"渲染器可能不认这个头"讲清楚。
-                        wavToServe = p.file;
-                        softwareWhy = std::string("源 WAV 规范化失败（") + e.what() + "），已原样供源";
-                        preWarn = std::string("这个 WAV 无法规范化（") + e.what() +
-                                  "）：渲染器若无声，多半是不认它的 RIFF 头。";
-                    }
-                    if (!normalized && srcFormat.sampleRate == 0) {
-                        // 连读都读不了：明确失败，不要拿一个空格式去投
-                        fail("源 WAV 无法读取: " + p.file + "（" + whyNot + "）");
-                        return;
-                    }
-                }
+            rta::audio::WavHeaderInfo hi; std::string whyNot;
+            if (!p.upsample && !p.cleanup && p.rate == 0 && p.bits == 0 &&
+                (ext == ".wav" || ext == ".wave") && cast_wav_can_serve_raw(p.file,hi,whyNot)) {
+                srcFormat.sampleRate=hi.rate;srcFormat.bits=hi.bits;srcFormat.channels=hi.channels;
+                srcFormat.encoding="Linear PCM";
+                durationSec=hi.byteRate?(double)hi.dataDeclaredBytes/hi.byteRate:0;
+                softwareWhy="源 WAV 原样供源（未解码、未改写，字节级一致）";
             } else {
                 try {
-                    rta::audio::LoadNote note;
-                    rta::audio::AudioBuffer ab = rta::audio::read_any(p.file, &note);
-
-                    if (p.rate > 0 && p.rate != ab.rate) {
-                        rta::dsp::ResamplerConfig rcfg;
-                        rcfg.inRate = ab.rate;
-                        rcfg.outRate = p.rate;
-                        rcfg.channels = ab.channels;
-                        rta::dsp::PolyphaseResampler resampler(rcfg);
-                        const size_t inFrames = ab.frames();
-                        const size_t maxOut = resampler.maxOutFrames(inFrames);
-                        std::vector<std::vector<double>> inCh(ab.channels, std::vector<double>(inFrames));
-                        std::vector<const double*> inPtrs(ab.channels);
-                        for (int c = 0; c < ab.channels; ++c) {
-                            for (size_t n = 0; n < inFrames; ++n) inCh[c][n] = ab.sample(n, c);
-                            inPtrs[c] = inCh[c].data();
-                        }
-                        std::vector<std::vector<double>> outCh(ab.channels, std::vector<double>(maxOut));
-                        std::vector<double*> outPtrs(ab.channels);
-                        for (int c = 0; c < ab.channels; ++c) outPtrs[c] = outCh[c].data();
-
-                        const size_t outFrames = resampler.process(inPtrs.data(), inFrames, outPtrs.data());
-                        rta::audio::AudioBuffer resBuf;
-                        resBuf.rate = p.rate;
-                        resBuf.channels = ab.channels;
-                        resBuf.bits = (p.bits > 0) ? p.bits : ab.bits;
-                        resBuf.isFloat = false;
-                        resBuf.raw.resize(outFrames * (size_t)ab.channels);
-                        for (size_t n = 0; n < outFrames; ++n) {
-                            for (int c = 0; c < ab.channels; ++c) {
-                                resBuf.setSample(n, c, outCh[c][n]);
-                            }
-                        }
-                        ab = std::move(resBuf);
-                        softwareBitExact = false;
-                        softwareWhy = "已按请求重采样 " + std::to_string(rcfg.inRate) + "Hz → " +
-                                      std::to_string(rcfg.outRate) + "Hz（重采样即不可逆，逐位直通不成立）";
-                    } else if (p.bits > 0 && p.bits != ab.bits) {
-                        // ★ 2026-10-29 真 BUG：旧代码只改 ab.bits 字段、不换算样本值 ⟹
-                        //   16→24bit 之后每个样本被当成 24bit 解读，电平直接掉 48dB（用户听到的是"没有声音"）。
-                        //   这里按满幅重新量化（会引入量化误差，所以 bit-perfect 记 no 并写明原因）。
-                        const int oldBits = ab.bits;
-                        rta::audio::AudioBuffer conv;
-                        conv.rate = ab.rate;
-                        conv.channels = ab.channels;
-                        conv.bits = p.bits;
-                        conv.isFloat = false;
-                        conv.raw.assign(ab.raw.size(), 0);
-                        const size_t convFrames = ab.frames();
-                        for (size_t n = 0; n < convFrames; ++n)
-                            for (int c = 0; c < ab.channels; ++c) conv.setSample(n, c, ab.sample(n, c));
-                        ab = std::move(conv);
-                        softwareBitExact = false;
-                        softwareWhy = "已按请求把位深 " + std::to_string(oldBits) + "bit → " +
-                                      std::to_string(p.bits) + "bit（重新量化）";
-                    }
-
-                    tempWavPath = make_cast_temp_wav_path("pcm");
-                    rta::audio::write_wav(tempWavPath, ab);
-                    wavToServe = tempWavPath;
-                    needCleanupTemp = true;
-
-                    srcFormat.sampleRate = ab.rate;
-                    srcFormat.bits = ab.bits;
-                    srcFormat.channels = ab.channels;
-                    srcFormat.isDsd = false;
-                    srcFormat.encoding = ab.isFloat ? "IEEE Float PCM" : "Linear PCM";
-                    durationSec = ab.rate ? (double)ab.frames() / (double)ab.rate : 0.0;
-                    serveFormat = std::string("WAV ") + std::to_string(ab.bits) + "bit/" +
-                                  std::to_string(ab.rate) + "Hz/" + std::to_string(ab.channels) +
-                                  "ch（源 " + ext + " = " + cast_source_kind(ext) +
-                                  "，MIME " + cast_source_mime(ext) + "，解码后写入 WAV 供源）";
-                    if (ab.isFloat) {
-                        preWarn = "源解码成 32-bit float PCM：不少 DLNA 渲染器只接受 16/24-bit 整型 WAV，"
-                                  "若无声请改用 16/24-bit 的源（本机不做偷偷量化）。";
-                    } else if (ab.channels > 2) {
-                        preWarn = "源是 " + std::to_string(ab.channels) +
-                                  " 声道：多数 DLNA 渲染器只支持 2 声道，可能直接不播。";
-                    }
-                } catch (const std::exception& e) {
-                    fail(std::string("解码/写出临时 WAV 失败: ") + e.what());
-                    return;
-                }
+                    {std::lock_guard<std::mutex> lk(mtx_);state_.phase="preparing";}
+                    tempWavPath=make_cast_temp_wav_path("pcm");needCleanupTemp=true;
+                    const auto prepared=cast_prepare_pcm(p,tempWavPath,stopReq_,caps,[this](double v,const std::string& note){std::lock_guard<std::mutex> lk(mtx_);state_.prepareProgress=v;state_.prepareNote=note;});
+                    wavToServe=tempWavPath;srcFormat.sampleRate=prepared.rate;srcFormat.bits=prepared.bits;
+                    srcFormat.channels=prepared.channels;srcFormat.encoding=prepared.floating?"IEEE Float PCM":"Linear PCM";
+                    durationSec=prepared.rate?(double)prepared.frames/prepared.rate:0;
+                    {std::lock_guard<std::mutex> lk(mtx_);state_.cleanupApplied=prepared.cleanupApplied;state_.cleanupMeanReductionDb=prepared.cleanupMeanReductionDb;state_.cleanupModifiedBinFraction=prepared.cleanupModifiedBinFraction;}
+                    softwareBitExact=!prepared.changed;softwareWhy=prepared.note;
+                    if(!softwareBitExact)softwareWhy+="；生产 Pipeline 已处理，不是逐位直通";
+                } catch(const std::exception& e) {if(stopReq_.load()){std::lock_guard<std::mutex> lk(mtx_);state_.running=false;state_.phase="stopped";return;}fail(std::string("投放准备失败: ")+e.what());return;}
             }
         }
 
@@ -593,7 +767,7 @@ private:
             // 走到这里说明上面三个分支都没有填 serveFormat（.wav 直通分支）
             serveFormat = "WAV " + std::to_string(srcFormat.bits) + "bit/" +
                           std::to_string(srcFormat.sampleRate) + "Hz/" +
-                          std::to_string(srcFormat.channels) + "ch（源 .wav 直通，audio/wav）";
+                          std::to_string(srcFormat.channels) + "ch（audio/wav）";
         }
 
         // 供源文件字节数：res@size 用它；"是否播完"也用它
@@ -629,7 +803,7 @@ private:
             state_.running = false;
             state_.phase = "stopped";
             state_.paused = false;
-            if (needCleanupTemp && !tempWavPath.empty()) std::remove(tempWavPath.c_str());
+            if (needCleanupTemp && !tempWavPath.empty()) fs::remove(fs::u8path(tempWavPath));
             return;
         }
 
@@ -669,7 +843,14 @@ private:
         }
 
         std::string localIp = upnp_local_ip_for(targetDev.host, (uint16_t)targetDev.port);
-        std::string streamPath = server.register_file(wavToServe, "audio/wav");
+        std::string streamPath;
+        try {
+            streamPath = server.register_file(wavToServe, "audio/wav");
+        } catch (const std::exception& e) {
+            server.stop();
+            fail(std::string("Secure stream token generation failed: ") + e.what());
+            return;
+        }
         std::string streamUrl = "http://" + localIp + ":" + std::to_string(server.port()) + streamPath;
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -678,23 +859,6 @@ private:
         log("SERVE url=" + streamUrl + " file=" + wavToServe + " port=" + std::to_string(server.port()));
 
         // 4) UPnP 控制动作 SetAVTransportURI & Play
-        UpnpControlClient client(targetDev.av_transport_url(), targetDev.connection_manager_url());
-        log("DEVICE " + (targetDev.name.empty() ? targetDev.host : targetDev.name) +
-            " model=" + targetDev.model + " av=" + client.av_transport_url() +
-            " cm=" + client.connection_manager_url());
-
-        // 4a) 先问渲染器"你到底收什么"（ConnectionManager.GetProtocolInfo）。
-        //     放在 SetAVTransportURI 之前：① 能在投之前就告诉用户"它不支持这个格式"；
-        //     ② bit-perfect 判定只认这份 Sink，不再拿我们自己发过去的 DIDL 回显当证据。
-        UpnpProtocolInfo proto = client.get_protocol_info();
-        UpnpSinkCaps caps = parse_sink_caps(proto.ok ? proto.sink : std::string());
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            state_.sinkSummary = caps.ok ? caps.summary() : std::string("(GetProtocolInfo 无响应)");
-        }
-        log(std::string("SINK ") + (proto.ok ? "ok" : "FAIL") + " " +
-            (caps.ok ? caps.summary() : std::string("(空)")) +
-            (proto.ok ? "" : (" err=" + proto.error.str())));
 
         if (caps.ok) {
             const auto ans = caps.match_stream(srcFormat.sampleRate, srcFormat.bits, srcFormat.channels);
@@ -755,6 +919,7 @@ private:
         std::string lastUpnpErr;    // 最近一次 SOAP 失败的 UPnPError 原文（收尾时拼进错误里）
         std::string stopReason;     // 退出轮询的原因；空 = 正常结束
         int transportFailStreak = 0;
+        bool naturalEnd = false;
 
         while (!stopReq_.load()) {
             auto now = std::chrono::steady_clock::now();
@@ -797,6 +962,10 @@ private:
             if (!transport.ok && transport.error.has_error()) lastUpnpErr = transport.error.str();
             if (!pos.ok && pos.error.has_error()) lastUpnpErr = pos.error.str();
             transportFailStreak = transport.ok ? 0 : (transportFailStreak + 1);
+            if(transport.ok && !transport.status.empty() && transport.status!="OK") {
+                stopReason="渲染器报告播放错误: "+transport.status;
+                log("TRANSPORT_ERROR "+stopReason);break;
+            }
 
             const bool fetched = server.total_requests_served() > 0;
             const bool playingNow = (transport.state == "PLAYING" || transport.state == "PAUSED_PLAYBACK");
@@ -815,7 +984,7 @@ private:
 
             const int64_t served = server.total_bytes_served();
             const int reqs = (int)server.total_requests_served();
-            const bool complete = (serveBytes > 0 && served + 65536 >= serveBytes);
+            const bool complete = (serveBytes > 0 && served >= serveBytes);
 
             {
                 std::lock_guard<std::mutex> lk(mtx_);
@@ -883,6 +1052,7 @@ private:
                         stopReason = why;
                         log("STOPPED_EARLY " + why);
                     }
+                    naturalEnd=complete && fetched && stopReason.empty();
                     break;
                 }
             }
@@ -908,13 +1078,14 @@ private:
         client.stop();
         server.stop();
         if (needCleanupTemp && !tempWavPath.empty()) {
-            std::remove(tempWavPath.c_str());
+            fs::remove(fs::u8path(tempWavPath));
         }
 
         {
             std::lock_guard<std::mutex> lk(mtx_);
             state_.running = false;
             state_.phase = stopReason.empty() ? "stopped" : "error";
+            state_.naturalEnd = naturalEnd && !stopReq_.load();
             state_.transportState = "STOPPED";
             state_.paused = false;
             if (!stopReason.empty()) {

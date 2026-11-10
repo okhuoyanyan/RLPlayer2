@@ -1,4 +1,4 @@
-// test_entities.cpp — P3 资料层①：实体模型（schema / 归一化 / 显式边 / 落盘）回归
+﻿// test_entities.cpp — P3 资料层①：实体模型（schema / 归一化 / 显式边 / 落盘）回归
 //
 // 判据说明（铁律 3 —— 先说清每个断言凭什么能证明它要证明的事）：
 //   * 【id 复用】不只看「稳定/不重复」，还拿**测试内独立实现的 FNV-1a**与
@@ -27,6 +27,7 @@
 #include "meta/entities.h"
 #include "net/library.h"      // 仅测试用：确认 entity id 与 fnv_hex 同算法同常数
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -89,6 +90,22 @@ static bool has_edge(const EntityGraph& g, const std::string& from, const char* 
 // 「Work→Recording」不是「Recording→Work」—— 只断言正向存在是不够的（漏判反向就可能两边都写）。
 static bool has_reverse(const EntityGraph& g, const std::string& a, const char* rel,
                         const std::string& b) { return has_edge(g, b, rel, a); }
+
+// Real-user-library probes are never part of the default offline regression.
+// An explicit isolated fixture directory is mandatory even when opted in.
+static std::filesystem::path explicit_library_fixture() {
+    const char* enabled = std::getenv("RTA_REAL_LIBRARY_TESTS");
+    const char* path = std::getenv("RTA_TEST_LIBRARY_DIR");
+    if (!enabled || std::string(enabled) != "1") {
+        std::printf("UNVERIFIED_REAL: real-library branch not requested; synthetic assertions still execute\n");
+        return {};
+    }
+    if (!path || !*path || !std::filesystem::u8path(path).is_absolute()) {
+        std::fprintf(stderr, "RTA_REAL_LIBRARY_TESTS=1 requires absolute RTA_TEST_LIBRARY_DIR fixture path\n");
+        std::exit(2);
+    }
+    return std::filesystem::u8path(path);
+}
 
 int main() {
     SetConsoleOutputCP(CP_UTF8);
@@ -547,9 +564,9 @@ int main() {
     // =====================================================================
     std::printf("[9] 真实曲库样本（只读：D:\\RTA-hqplayer\\MUSIC）\n");
     {
-        const fs::path music = fs::path(L"D:\\RTA-hqplayer\\MUSIC");
+        const fs::path music = explicit_library_fixture();
         std::error_code ec;
-        const bool haveMusic = fs::exists(music, ec);
+        const bool haveMusic = !music.empty() && fs::exists(music, ec);
 
         // 样本 A：「专辑 @ 社团」目录名（真实目录）
         const fs::path doujin = music / fs::path(L"专辑-原创&同人");
@@ -954,9 +971,9 @@ int main() {
     // "专辑-单曲收集"。结构判据在真实库上的覆盖率见下面 totalAlbumDirs 的断言。
     std::printf("[12] 分类目录 vs 专辑目录：结构判据（直接有音频 = 专辑；只含子目录 = 分类）\n");
     {
-        const fs::path music = fs::path(L"D:\\RTA-hqplayer\\MUSIC");
+        const fs::path music = explicit_library_fixture();
         std::error_code ec;
-        const bool haveMusic = fs::exists(music, ec);
+        const bool haveMusic = !music.empty() && fs::exists(music, ec);
 
         // 扩展名口径（与 net/library.h lib_is_audio 同一张表；这里只验证比较自身正确）
         ck(entity_audio_ext_ok(".flac") && entity_audio_ext_ok(".FLAC") && entity_audio_ext_ok("wav"),
@@ -1205,8 +1222,8 @@ int main() {
         st.setBaseDir(oldBase);
 
         // 8. MUSIC 只读真实样本核验
-        const fs::path music = fs::path(L"D:\\RTA-hqplayer\\MUSIC");
-        if (fs::exists(music, ec)) {
+        const fs::path music = explicit_library_fixture();
+        if (!music.empty() && fs::exists(music, ec)) {
             size_t validAlbumDirFound = 0, totalAudios = 0;
             for (const auto& de : fs::recursive_directory_iterator(music, ec)) {
                 if (!de.is_regular_file(ec)) continue;

@@ -78,6 +78,23 @@ int main() {
     ck(d.action == CapAction::HardFail && d.userMessage.find("明确指定了 44100") != std::string::npos, "empty capability explicit fails and explains requested rate");
     d=decide_capability_failure(true,44100,{88200,48000,88200},out,44100);
     ck(d.action == CapAction::FallbackRate && out == 88200, "capability fallback same-family");
+    // 2026-11-01：PCM 32x 档（1411200/1536000）—— 旧 UI 与 ASIO 能力查询都止于 768000，
+    // 这条覆盖确保纯决策层对高倍率档位没有任何隐藏上限（上限只应来自设备实际能力）。
+    p = pick_output_rate("1411200", 44100, {44100, 705600, 1411200});
+    ck(p.decided && p.rate == 1411200 && p.note.empty(), "explicit 1411200 accepted when device reports it");
+    p = pick_output_rate("1411200", 44100, {44100, 705600});
+    // 明确选择时 pick 只做"原样保留 + 标注"，硬失败由 decide_capability_failure 负责；
+    // 关键是**绝不悄悄换成别的率**（保真播放器不替用户改主意）。
+    ck(p.decided && p.rate == 1411200 && p.note.empty(),
+       "explicit 1411200 stays unchanged even when device does not report it");
+    p = pick_output_rate("max", 44100, {44100, 352800, 1411200});
+    ck(p.decided && p.rate == 1411200, "max picks 1411200 as highest same-family rate");
+    p = pick_output_rate("max", 48000, {48000, 768000, 1536000});
+    ck(p.decided && p.rate == 1536000, "max picks 1536000 for 48k family");
+    ck(pick_supported_rate(1411200, 44100, {44100, 705600, 1411200}) == 1411200,
+       "pick_supported_rate reaches 1411200 when device reports it");
+    ck(pick_supported_rate(1536000, 48000, {48000, 768000, 1536000}) == 1536000,
+       "pick_supported_rate reaches 1536000 when device reports it");
     std::printf("ratepick: %d checks, %d failures\n",total,fails);
     return fails ? 1 : 0;
 }

@@ -1,7 +1,8 @@
-// test_cast_service.cpp — UPnP 媒体投放后台服务与编排单元测试 (ROADMAP P5b)
+﻿// test_cast_service.cpp — UPnP 媒体投放后台服务与编排单元测试 (ROADMAP P5b)
 #include "net/cast_service.h"
 #include "audio/wav.h"
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -99,8 +100,13 @@ int main() {
     std::printf("\n-- 3. 设备列表查询接口 --\n");
     {
         // forceRescan = false，不触发阻塞式全网扫描
-        auto devs = mgr.get_devices(false);
-        ck(true, "get_devices 接口调用正常且不崩潰");
+        const char* net = std::getenv("RTA_NET_TESTS");
+        if (net && std::string(net) == "1") {
+            auto devs = mgr.get_devices(false);
+            ck(true, "get_devices 接口调用正常且不崩潰");
+        } else {
+            std::printf("UNVERIFIED_REAL: cached-empty get_devices(false) triggers SSDP; RTA_NET_TESTS=1 required for actual LAN discovery\n");
+        }
     }
 
     // ================= 4) 停止与回位 =================

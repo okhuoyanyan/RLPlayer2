@@ -207,6 +207,7 @@ static void theme_flags(bool& dark, bool& blue) {
 static void install_wv_edge_hittest(HWND top);   // 定义在窗口过程之前（WS 边缘命中，见下）
 static void hide_main_window();                 // 261024-05 #1：WM_CLOSE -> 隐藏到托盘（定义在 show_main_window 旁）
 static void open_browser(int port) {
+    if (g_exiting) return;
     wchar_t url[64];
     // 2026-10-27（铁律 11 抓到的真 bug）：原来 Navigate 到固定 URL "http://127.0.0.1:<port>/"。
         // WebView2 复用同一份用户数据目录，对同一个 URL 的导航可能直接命中它自己的缓存/页面恢复，
@@ -464,7 +465,7 @@ static bool spawn_server(int port) {
     return true;
 }
 
-// rtaweb 自己的退出路径：GET /api/quit（见 tools/rtaweb.cpp:6304）把 g_exitReq 置真，
+// rtaweb 自己的退出路径：POST /api/quit 把 g_exitReq 置真（GET 被方法门禁拒绝）。
 // 主循环在 50ms 内醒来 → 播放线程 stop+join、WebUi::stop()，正常返回 0。
 // 用最朴素的阻塞 socket：服务就在本机，1.2s 超时足够，不引第三方 HTTP 客户端。
 static bool http_get_quit(int port) {
@@ -480,10 +481,26 @@ static bool http_get_quit(int port) {
     a.sin_addr.s_addr = inet_addr("127.0.0.1");
     bool ok = false;
     if (::connect(s, (sockaddr*)&a, sizeof(a)) == 0) {
-        const char* req = "GET /api/quit HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
-        if (::send(s, req, (int)strlen(req), 0) > 0) {
+        const char* req = "POST /api/quit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        const int size = (int)strlen(req);
+        int sent = 0;
+        while (sent < size) {
+            const int n = ::send(s, req + sent, size - sent, 0);
+            if (n <= 0) break;
+            sent += n;
+        }
+        if (sent == size) {
+            std::string statusLine;
             char buf[512];
-            ok = ::recv(s, buf, sizeof(buf), 0) > 0;   // 预期 "{\"ok\":true}"
+            while (statusLine.size() < 4096 && statusLine.find("\r\n") == std::string::npos) {
+                const int n = ::recv(s, buf, sizeof(buf), 0);
+                if (n <= 0) break;
+                statusLine.append(buf, (size_t)n);
+            }
+            int status = 0;
+            ok = statusLine.find("\r\n") != std::string::npos &&
+                 sscanf_s(statusLine.c_str(), "HTTP/%*d.%*d %d", &status) == 1 &&
+                 status >= 200 && status < 300;
         }
     }
     ::closesocket(s);
@@ -510,7 +527,7 @@ static bool stop_server_graceful(int port) {
     }
     const DWORD childPid = GetProcessId(g_child);
     const bool sent = http_get_quit(port);
-    logf(L"停服务：已发 GET /api/quit port=%d 送达=%d （pid=%lu，只等它自己退）",
+    logf(L"停服务：已发 POST /api/quit port=%d 接受=%d （pid=%lu，只等它自己退）",
          port, (int)sent, (unsigned long)childPid);
     const DWORD t0 = GetTickCount();
     if (WaitForSingleObject(g_child, 5000) == WAIT_OBJECT_0) {
@@ -739,13 +756,14 @@ static bool wait_first_frame(DWORD capMs) {
     const DWORD t0 = GetTickCount();
     MSG msg;
     for (;;) {
+        if (g_exiting) return false;
         if (g_paintDone) return true;
         const DWORD el = GetTickCount() - t0;
         if ((int)el >= (int)capMs) return false;
         const DWORD left = capMs - el;
         MsgWaitForMultipleObjects(0, nullptr, FALSE, left < 5 ? left : 5, QS_ALLINPUT);
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) return g_paintDone;   // 退出请求：别把消息吞掉
+            if (msg.message == WM_QUIT) { g_exiting = true; PostQuitMessage((int)msg.wParam); return false; }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -1146,6 +1164,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 static bool open_webview_window(int port) {
+    if (g_exiting) return false;
     static const wchar_t* kClass = L"RLPlayerMain";
     // 主题必须在【注册窗口类之前】读出来：类背景刷要直接是主题色（兜底二的最后一层，
     // 任何 DefWindowProc 擦除都只会填主题色，永远不会填系统的白/灰）。
@@ -1293,8 +1312,18 @@ static bool open_webview_window(int port) {
         L"if(++tries<300)setTimeout(send,16);}"
         L"function f(){if(++n>=2){send();}else{requestAnimationFrame(f);}}"
         L"requestAnimationFrame(f);}catch(e){}})();";
-    if (!rta::wv2::create(hwnd, userData, url, &g_wvCtl, &g_wv, err, onMessage, kBandInset, onNav,
-                          std::wstring(kFirstPaintProbe))) {
+    const bool created = rta::wv2::create(hwnd, userData, url, &g_wvCtl, &g_wv, err, onMessage, kBandInset, onNav,
+                          std::wstring(kFirstPaintProbe));
+    if (g_exiting) {
+        logf(L"退出请求：中止 WebView2 初始化，不进入 Edge fallback");
+        if (IsWindow(hwnd)) DestroyWindow(hwnd);
+        // An asynchronous completion may have assigned these after WM_DESTROY.
+        if (g_wvCtl) { g_wvCtl->Close(); g_wvCtl->Release(); g_wvCtl = nullptr; }
+        if (g_wv) { g_wv->Release(); g_wv = nullptr; }
+        g_mainWnd = nullptr;
+        return false;
+    }
+    if (!created) {
         logf(L"WebView2 启动失败（%S），退回 Edge", err.c_str());
         DestroyWindow(hwnd);
         g_mainWnd = nullptr;
@@ -1330,6 +1359,11 @@ static bool open_webview_window(int port) {
     const bool gate = hold_first_frame();
     bool painted = g_paintDone;
     if (!painted && gate) painted = wait_first_frame(first_frame_cap_ms());
+    if (g_exiting) {
+        if (IsWindow(hwnd)) DestroyWindow(hwnd);
+        logf(L"退出请求：首帧门已取消，不显示窗口");
+        return false;
+    }
     const DWORD tWait = GetTickCount() - tWait0;
     g_tShow = GetTickCount();
     ShowWindow(hwnd, SW_SHOW);
@@ -1420,6 +1454,7 @@ static void hide_main_window() {
 // 一圈原生边框 —— 用户报的"四边白框"里，凡是"点托盘打开"的截图都可能来自这条路径。
 // 现在只有 WebView2 窗口真的不存在时才退回 Edge（那是 WebView2 运行库缺失的降级路径）。
 static void show_main_window(int port) {
+    if (g_exiting) return;
     HWND h = g_mainWnd;
     if (h && IsWindow(h)) {
         const bool wasVisible = IsWindowVisible(h) != FALSE;
@@ -1750,10 +1785,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         if (n) logf(L"启动前关掉 %d 个旧窗口", n);
     }
     // 优先用内置 WebView2 窗口（无浏览器外壳、标题栏随主题即时变）；失败才退回 Edge。
-    if (!open_webview_window(g_port)) open_browser(g_port);
-
+    if (!open_webview_window(g_port) && !g_exiting) open_browser(g_port);
+    // A nested initialization pump may already have consumed WM_QUIT. The
+    // explicit exit state, not the continued presence of that message, is final.
+    if (g_exiting) logf(L"退出请求：初始化返回后直接收尾，不进入 GetMessage");
     MSG m;
-    while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+    while (!g_exiting && GetMessageW(&m, nullptr, 0, 0) > 0) {
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }

@@ -1,4 +1,5 @@
-﻿# make_dist.ps1 - build the ONE official release package (Full / self-contained).
+﻿#Requires -PSEdition Desktop
+# make_dist.ps1 - build the ONE official release package (Full / self-contained).
 #
 # Policy since 1.0.2:
 #   * There is no "Lite" package any more. Every release is the official
@@ -22,43 +23,29 @@
 #   显式 -Version 仍然可用，但会与实际产物版本核对，不一致直接失败。
 param(
     [string]$Version = "",
+    [string]$BuildDir = "",
     [switch]$SkipGpuBuild,
-    [string]$DocumentationDir = ""
+    [string]$DocumentationDir = "",
+    [string]$CertificatePythonPath = ""
 )
 
+. (Join-Path $PSScriptRoot 'powershell_module_scope.ps1')
+$releaseModuleState=Enter-HostPowerShellModules
+try {
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $here
-$B = Join-Path $root 'build'
+. (Join-Path $here 'package_paths.ps1')
+. (Join-Path $here 'package_resources.ps1')
+if(-not $BuildDir){$BuildDir=Join-Path $root 'build'}
+$B=Resolve-ReleaseBuildDirectory -SourceRoot $root -BuildDir $BuildDir
 $dist = Join-Path $root 'dist'
 $rocm = 'C:\Program Files\AMD\ROCm\7.2'
 
 function Fail($msg) { Write-Host "FAILED: $msg"; exit 1 }
 
-# Validate every recursive cleanup against its precise parent in this checkout.
-# Junctions/symlinks could redirect a lexically safe path outside the workspace.
-function Get-SafeCleanupDirectory([string]$Target, [string]$Parent) {
-    $rootAbs=(Resolve-Path -LiteralPath $root -ErrorAction Stop).ProviderPath.TrimEnd('\','/')
-    $targetAbs=(Resolve-Path -LiteralPath $Target -ErrorAction Stop).ProviderPath.TrimEnd('\','/')
-    $parentAbs=(Resolve-Path -LiteralPath $Parent -ErrorAction Stop).ProviderPath.TrimEnd('\','/')
-    $buildAbs=[IO.Path]::GetFullPath((Join-Path $rootAbs 'build')).TrimEnd('\','/')
-    $distAbs=[IO.Path]::GetFullPath((Join-Path $rootAbs 'dist')).TrimEnd('\','/')
-    $insideBuild=$parentAbs.Equals($buildAbs,[StringComparison]::OrdinalIgnoreCase) -or $parentAbs.StartsWith($buildAbs + '\',[StringComparison]::OrdinalIgnoreCase)
-    $insideDist=$parentAbs.Equals($distAbs,[StringComparison]::OrdinalIgnoreCase) -or $parentAbs.StartsWith($distAbs + '\',[StringComparison]::OrdinalIgnoreCase)
-    if (-not ($insideBuild -or $insideDist)) { throw "Unsafe cleanup parent outside checkout build/dist: $parentAbs" }
-    if (-not $targetAbs.StartsWith($parentAbs + '\',[StringComparison]::OrdinalIgnoreCase)) {
-        throw "Unsafe recursive cleanup target (must be a strict child): $targetAbs; parent=$parentAbs"
-    }
-    $cursor=$targetAbs
-    while ($cursor.Length -ge $rootAbs.Length) {
-        $entry=Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
-        if (-not $entry.PSIsContainer) { throw "Cleanup target/ancestor is not a directory: $cursor" }
-        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Cleanup refuses reparse point: $cursor" }
-        if ($cursor.Equals($rootAbs,[StringComparison]::OrdinalIgnoreCase)) { break }
-        $cursor=Split-Path -Parent $cursor
-    }
-    return $targetAbs
-}
+# Recursive cleanup is confined to strict children of this admitted build.
+function Get-SafeCleanupDirectory([string]$Target,[string]$Parent){return Resolve-ReleaseCleanupDirectory -BuildDir $B -Target $Target -Parent $Parent}
 
 # ---- 版本号单一来源：src/version.h ----
 $verHeader = Join-Path $root 'src\version.h'
@@ -77,6 +64,17 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
     Write-Host "version: $Version (explicit, matches src/version.h)"
 }
 
+Write-Host '=== audit dependency/configuration gate ==='
+. (Join-Path $here 'get_audit_python_path.ps1')
+$CertificatePythonPath=Resolve-AuditPythonPath -BuildDir $B -Preferred $CertificatePythonPath
+if(-not (Test-Path -LiteralPath (Join-Path $B 'CMakeCache.txt'))){Fail 'A configured build is required before packaging; refusing to guess a compiler/generator'}
+$savedConfigEap=$ErrorActionPreference;$ErrorActionPreference='Continue'
+$configureArgs=@('-S',$root,'-B',$B,('-DRTA_CERTIFICATE_PYTHON_PATH='+$CertificatePythonPath))
+$configOutput=(& cmake @configureArgs 2>&1|Out-String);$configExit=$LASTEXITCODE
+$ErrorActionPreference=$savedConfigEap
+$configOutput|Out-File -LiteralPath (Join-Path $B 'make_dist_configure.log') -Encoding utf8
+if($configExit -ne 0){Write-Host $configOutput;Fail 'Current source/audit dependency configuration failed'}
+
 Write-Host "=== build ==="
 # ★ 2026-10-30（F35 同源问题，出包时踩到）：本脚本 $ErrorActionPreference = Stop，
 #   而 PowerShell 把**原生命令写到 stderr 的任何内容**（包括 ninja 的 warning）
@@ -87,7 +85,7 @@ Write-Host "=== build ==="
 #   再用 $LASTEXITCODE 判定。
 $savedEap = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
-$buildOut = (& cmake --build $B 2>&1 | Out-String)
+$buildOut = (& cmake --build $B --parallel 2 2>&1 | Out-String)
 $buildExit = $LASTEXITCODE
 $ErrorActionPreference = $savedEap
 $buildOut | Out-File -FilePath (Join-Path $B "make_dist_build.log") -Encoding utf8
@@ -99,24 +97,27 @@ if ($buildExit -ne 0) {
 $warnLines = @($buildOut -split [Environment]::NewLine | Where-Object { $_ -match "warning:" })
 if ($warnLines.Count -gt 0) { Write-Host ("build warnings: " + $warnLines.Count + " lines (see build\make_dist_build.log)") }
 
+Write-Host "=== mandatory offline CTest gate ==="
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'run_safe_ctest.ps1') -BuildDir $B -SourceRoot $root -LiteDir (Join-Path $B 'ffmpeg-lite')
+if ($LASTEXITCODE -ne 0) { Fail 'CTest gate failed; refusing to package' }
+
 Write-Host "=== GPU backend ==="
 $gpuDll = Join-Path $B 'rtagpu.dll'
-$gpuSrc = @((Join-Path $root 'src\gpu\gpu_conv_hip.cpp'), (Join-Path $root 'src\gpu\gpu_resample_hip.cpp'))
-$needGpu = $false
 if ($SkipGpuBuild) {
-    if (-not (Test-Path $gpuDll)) { Fail "rtagpu.dll missing and -SkipGpuBuild was used" }
+    if (-not (Test-Path -LiteralPath $gpuDll -PathType Leaf)) { Fail 'rtagpu.dll missing and -SkipGpuBuild was used' }
+    Write-Host 'Explicit -SkipGpuBuild: existing DLL accepted only subject to mandatory staging runtime smoke below.'
 } else {
-    if (-not (Test-Path $gpuDll)) { $needGpu = $true }
-    else {
-        foreach ($s in $gpuSrc) { if ((Get-Item $s).LastWriteTime -gt (Get-Item $gpuDll).LastWriteTime) { $needGpu = $true } }
-    }
-    if ($needGpu) {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'build_gpu.ps1') -Out $gpuDll
-        if ($LASTEXITCODE -ne 0) { Fail "GPU build failed" }
-    } else {
-        Write-Host "rtagpu.dll is up to date"
-    }
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'build_gpu.ps1') -Out $gpuDll
+    if ($LASTEXITCODE -ne 0) { Fail 'GPU build failed' }
 }
+
+# A copied DLL or backdated mtime is never current-source evidence.
+& python (Join-Path $here 'hip_build_provenance.py') verify --source $root --compiler (Join-Path $rocm 'bin\hipcc.bat') --dll $gpuDll --record ($gpuDll+'.provenance.json')
+if($LASTEXITCODE -ne 0){Fail 'HIP source/DLL provenance mismatch; rebuild before packaging'}
+
+# Explicit -SkipGpuBuild still requires a full architecture artifact gate.
+& python (Join-Path $here 'check_hip_artifact.py') $gpuDll --report (Join-Path $B 'dist-hip-artifact.json')
+if ($LASTEXITCODE -ne 0) { Fail 'HIP artifact gate failed; refusing to package' }
 
 $hipDll = Join-Path $rocm 'bin\amdhip64_7.dll'
 if (-not (Test-Path $hipDll)) { Fail "HIP runtime not found: $hipDll" }
@@ -132,16 +133,19 @@ if ($LASTEXITCODE -ne 0) { Fail "compatibility gate failed - refusing to package
 # 缺任何一项就 exit 1 —— 缺件绝不静默出一个"看起来完整"的包（铁律 6）。
 $liteDir = Join-Path $B 'ffmpeg-lite'
 Write-Host "=== ffmpeg 精简版守卫（缺必需解码器即拒绝出包）==="
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'verify_ffmpeg_lite.ps1') -Dir $liteDir
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'verify_ffmpeg_lite.ps1') -Dir $liteDir -BuildDir $B
 if ($LASTEXITCODE -ne 0) { Fail "ffmpeg 精简版守卫未通过 - 拒绝出包（原因见上面的守卫输出）" }
 $ffPath = Join-Path $liteDir 'ffmpeg.exe'
 $fpPath = Join-Path $liteDir 'ffprobe.exe'
 if (-not (Test-Path $ffPath) -or -not (Test-Path $fpPath)) { Fail "精简版产物缺失：$liteDir" }
 
 $name = "RLPlayer-$Version-win64"
-$out = Join-Path $dist $name
+$packageStageRoot=Join-Path $B '_dist_stage'
+Assert-ReleaseNoReparseAncestors $packageStageRoot
+New-Item -ItemType Directory -Force -Path $packageStageRoot|Out-Null
+$out=Join-Path $packageStageRoot $name
 if (Test-Path -LiteralPath $out) {
-    $safeOut=Get-SafeCleanupDirectory $out $dist
+    $safeOut=Get-SafeCleanupDirectory $out $packageStageRoot
     Remove-Item -LiteralPath $safeOut -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $out | Out-Null
@@ -153,23 +157,23 @@ foreach ($f in $main) {
     if (-not (Test-Path $p)) { Fail "missing build artifact: $f" }
     Copy-Item $p $out -Force
 }
-# 2026-10-23：CUDA 后端（rtagpu_cuda.dll）是可选组件 —— 由协作者在 NVIDIA 机器上构建后放到 build\。
-# 有就一起打进包（铁律 6：正式版自包含，NVIDIA 用户不需要自己编）；没有就跳过（兼容门禁标 OPTIONAL）。
+# FULL always contains a current-source CUDA backend; absence is a release failure.
 $cudaDll = Join-Path $B 'rtagpu_cuda.dll'
-if (Test-Path $cudaDll) {
-    Copy-Item $cudaDll $out -Force
-    Write-Host 'bundled rtagpu_cuda.dll (NVIDIA CUDA backend)'
-} else {
-    Write-Host 'rtagpu_cuda.dll not in build\ — CUDA backend stays optional (fallback: dx12/AMD/CPU)'
-}
+if (-not (Test-Path -LiteralPath $cudaDll -PathType Leaf)) { Fail 'FULL package requires rtagpu_cuda.dll; build with tools/build_gpu_cuda.ps1 first' }
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'build_gpu_cuda.ps1') -Out $cudaDll -VerifyOnly
+if ($LASTEXITCODE -ne 0) { Fail 'CUDA content seal/cubins/exports verification failed' }
+Copy-Item -LiteralPath $cudaDll -Destination $out -Force
+Write-Host 'bundled required CUDA backend: offline artifact verified; NVIDIA hardware scope remains explicit'
 
 Copy-Item $hipDll $out -Force
 Copy-Item $ffPath (Join-Path $out 'ffmpeg.exe') -Force
 Copy-Item $fpPath (Join-Path $out 'ffprobe.exe') -Force
+$ffmpegSources=Copy-RequiredFfmpegRedistribution -SourceRoot $root -LiteDir $liteDir -OutputDirectory (Join-Path $out 'third-party\ffmpeg')
+$ffmpegSources|ConvertTo-Json|Out-File -LiteralPath (Join-Path $B 'dist-ffmpeg-redistribution.json') -Encoding utf8
 
 # Fixed WebView2 runtime: copy the whole installed runtime next to the exe.
-# wv2_host.h prefers .WebView2msedgewebview2.exe, so a clean machine / Win7
-# does not depend on a separately installed Evergreen runtime.
+# Bundling removes the Evergreen installation dependency. The vendor runtime
+# retains its own modern Windows requirements; this does not establish Win7 support.
 $wvBase = 'C:/Program Files (x86)/Microsoft/EdgeWebView/Application'
 if (-not (Test-Path $wvBase)) { Fail "WebView2 runtime not installed: $wvBase" }
 $wvVer = Get-ChildItem $wvBase -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'msedgewebview2.exe') } |
@@ -219,14 +223,9 @@ $probeSrc = Join-Path $here 'wasapi_ex_probe.cpp'
 $benchExe = Join-Path $B 'gpubench_conv.exe'
 $benchSrc = Join-Path $here 'gpubench_conv.cpp'
 $clang = 'C:\Program Files\AMD\ROCm\7.2\bin\clang++.exe'
-if (Test-Path $clang) {
-    if ((-not (Test-Path $probeExe)) -or ((Get-Item $probeSrc).LastWriteTime -gt (Get-Item $probeExe).LastWriteTime)) {
-        & $clang -std=c++20 -O2 $probeSrc -o $probeExe -lole32
-    }
-    if ((-not (Test-Path $benchExe)) -or ((Get-Item $benchSrc).LastWriteTime -gt (Get-Item $benchExe).LastWriteTime)) {
-        & $clang -std=c++20 -O2 -I(Join-Path $root 'src') $benchSrc -o $benchExe
-    }
-}
+. (Join-Path $here 'build_required_cli.ps1')
+Build-RequiredCli -Compiler $clang -Source $probeSrc -Output $probeExe -Options @('-std=c++20','-O2','-lole32')
+Build-RequiredCli -Compiler $clang -Source $benchSrc -Output $benchExe -Options @('-std=c++20','-O2',('-I'+(Join-Path $root 'src')))
 
 $tools = @('rtaplay.exe', 'dsdconv.exe', 'make_dsd.exe', 'rtanet_rx.exe', 'dopinfo.exe',
            'wavcmp.exe', 'wasapi_probe.exe', 'upnp_scan.exe',
@@ -234,12 +233,17 @@ $tools = @('rtaplay.exe', 'dsdconv.exe', 'make_dsd.exe', 'rtanet_rx.exe', 'dopin
            'wasapi_ex_probe.exe', 'gpubench_conv.exe',
            'filter_sweep.exe', 'filter_numerical_audit.exe', 'apod_check.exe', 'dsp_measure_dsd.exe', 'dsp_ringing_reference.exe',
            'dsp_pipeline_benchmark.exe', 'dsp_dop_benchmark.exe', 'dsp_sdm_block_benchmark.exe',
-           'dsp_efficiency_benchmark.exe')
+           'dsp_efficiency_benchmark.exe', 'dsp_export_pipeline.exe', 'rlmultilevel.exe')
 foreach ($f in $tools) {
     $p = Join-Path $B $f
     if (Test-Path $p) { Copy-Item $p (Join-Path $out 'tools') -Force }
     else { Fail "required FULL-package tool missing: $f" }
 }
+
+# Ship the independent, standard-library-only multilevel format reader.
+$multilevelReader = Join-Path $here 'review5_multilevel_decode.py'
+if (-not (Test-Path -LiteralPath $multilevelReader -PathType Leaf)) { Fail "required multilevel independent reader missing: $multilevelReader" }
+Copy-Item -LiteralPath $multilevelReader -Destination (Join-Path $out 'tools') -Force
 
 # 2026-10-24：模板改放 tools\（dist\ 被 .gitignore 忽略，模板不进仓库的话别人 clone 后打不了包）；
 # 旧位置 dist\README-template.txt 保留为兜底。
@@ -269,9 +273,24 @@ foreach ($lc in @('en', 'ja', 'fr', 'ru', 'es', 'ar')) {
 }
 Write-Host ("i18n: 6 个语言包已复制到 data\i18n")
 
-$opraNoticeSrc = Join-Path $root 'OPRA-NOTICE.txt'
-if (-not (Test-Path $opraNoticeSrc)) { Fail "OPRA 归属文件缺失: $opraNoticeSrc" }
-Copy-Item $opraNoticeSrc (Join-Path $out 'OPRA-NOTICE.txt') -Force
+$licenseResources=Copy-RequiredReleaseNotices -SourceRoot $root -OutputDirectory $out
+$imageSources=Copy-RequiredAudioImageSources -SourceRoot $root -OutputDirectory (Join-Path $out 'third-party\audio-images')
+$imageSources|ConvertTo-Json|Out-File -LiteralPath (Join-Path $B 'dist-audio-image-sources.json') -Encoding utf8
+
+# Include the exact modified player sources; upstream FFmpeg sources are above.
+$sourceOut=Join-Path $out 'source'
+New-Item -ItemType Directory -Force -Path $sourceOut|Out-Null
+$sourceArchive=Join-Path $sourceOut ('RLPlayer-'+$Version+'-source.zip')
+$sourceArchiveOutput=(& python (Join-Path $here 'make_source_archive.py') --source-root $root --output $sourceArchive 2>&1|Out-String)
+$sourceArchiveExit=$LASTEXITCODE
+$sourceArchiveOutput|Out-File -LiteralPath (Join-Path $B 'dist-source-archive.json') -Encoding utf8
+if($sourceArchiveExit -ne 0){Write-Host $sourceArchiveOutput;Fail 'Required corresponding source snapshot failed'}
+Write-Host 'corresponding player sources and checksums included'
+$licenseResources | ConvertTo-Json | Out-File -LiteralPath (Join-Path $B 'dist-license-resources.json') -Encoding utf8
+
+Write-Host '=== complete staged PE inventory (all application CLI and explicit vendor runtime scope) ==='
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'check_compat.ps1') -Dir $out -Recursive -Report (Join-Path $B 'dist-pe-inventory.json')
+if($LASTEXITCODE -ne 0){Fail 'Recursive packaged PE gate failed'}
 
 Write-Host "=== GPU staging smoke (PATH = System32 only) ==="
 $stage = Join-Path $B '_gpustage_dist'
@@ -306,7 +325,7 @@ if (-not $gpuOk) { Fail "bundled GPU smoke failed/unverified (exit=$gpuExit; req
 #   artistimg/、covercache/、rlplayer-meta/、webview2/ 等运行时状态。
 # 规则：发布包只允许「程序 + 静态资源 + 空数据目录」，任何运行时状态一律不许进包。
 # 做法：先清理，再硬校验 —— 少了这一步，换个人手工往 $out 里拷东西就会再犯。
-$devStateDirs = @('artistimg', 'covercache', 'rlplayer-meta', 'webview2', 'lyricscache', 'roomcorr')
+$devStateDirs = @('artistimg', 'covercache', 'trackcovercache', 'rlplayer-meta', 'webview2', 'lyricscache', 'roomcorr')
 foreach ($d in $devStateDirs) {
     $p = Join-Path $out $d
     if (Test-Path -LiteralPath $p) {
@@ -355,8 +374,15 @@ if (-not [string]::IsNullOrWhiteSpace($DocumentationDir)) {
     }
 }
 
-$zip = Join-Path $dist ($name + '.zip')
-if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+$privateMaterialLog = Join-Path $B 'dist-private-material.json'
+$privateMaterialOutput = (& python (Join-Path $here 'check_private_material.py') $out 2>&1 | Out-String)
+$privateMaterialExit = $LASTEXITCODE
+$privateMaterialOutput | Out-File -LiteralPath $privateMaterialLog -Encoding utf8
+if ($privateMaterialExit -ne 0) { Fail "private key or administration credential material detected in staged package" }
+
+$badLinks=@(Get-ChildItem -LiteralPath $out -Recurse -Force|Where-Object {($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0})
+if($badLinks.Count){Fail 'Staged package contains a reparse point; refusing ZIP/copy traversal'}
+$zip=Join-Path $packageStageRoot ($name+'-'+[guid]::NewGuid().ToString('N')+'.zip')
 # Stream files with explicit UTF-8 entry names and portable '/' separators.
 # Windows tar can emit CP936 names without the ZIP UTF-8 flag, which corrupts
 # Chinese documentation names in standards-compliant readers on other systems.
@@ -380,6 +406,29 @@ try {
     } finally { $archive.Dispose() }
 } finally { $zipStream.Dispose() }
 
+# The old dist is not recursively deleted. Copy to a new named partial path,
+# then promote within the destination volume; preserve previous artifacts.
+Assert-ReleaseNoReparseAncestors $dist
+New-Item -ItemType Directory -Force -Path $dist|Out-Null
+$delivery=Assert-ReleasePublishChild (Join-Path $dist $name) $dist
+$deliveryTemporary=Assert-ReleasePublishChild (Join-Path $dist ($name+'.partial-'+[guid]::NewGuid().ToString('N'))) $dist
+Copy-Item -LiteralPath $out -Destination $deliveryTemporary -Recurse
+if(Test-Path -LiteralPath $delivery){
+ $previous=Assert-ReleasePublishChild (Join-Path $dist ($name+'.previous-'+[guid]::NewGuid().ToString('N'))) $dist
+ Move-Item -LiteralPath $delivery -Destination $previous
+ Write-Host ('Previous unpacked package preserved: '+$previous)
+}
+Move-Item -LiteralPath $deliveryTemporary -Destination $delivery
+$deliveryZip=Assert-ReleasePublishChild (Join-Path $dist ($name+'.zip')) $dist
+$deliveryZipTemporary=Assert-ReleasePublishChild (Join-Path $dist ($name+'.zip.partial-'+[guid]::NewGuid().ToString('N'))) $dist
+Copy-Item -LiteralPath $zip -Destination $deliveryZipTemporary
+if((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $deliveryZipTemporary -Algorithm SHA256).Hash){Fail 'Copied ZIP hash mismatch before publication'}
+if(Test-Path -LiteralPath $deliveryZip){
+ $previousZip=Assert-ReleasePublishChild (Join-Path $dist ($name+'.zip.previous-'+[guid]::NewGuid().ToString('N'))) $dist
+ [IO.File]::Replace($deliveryZipTemporary,$deliveryZip,$previousZip)
+}else{[IO.File]::Move($deliveryZipTemporary,$deliveryZip)}
+$out=$delivery;$zip=$deliveryZip
+
 Write-Host ''
 Get-ChildItem $out | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
 $h = Get-FileHash $zip -Algorithm SHA256
@@ -395,3 +444,4 @@ if (-not (Test-Path $distNotice)) { Fail "包内缺失 OPRA-NOTICE.txt" }
 $distIndexSize = (Get-Item $distIndex).Length
 Write-Host ("OPRA 索引: $distIndex ($distIndexSize 字节, " + [math]::Round($distIndexSize / 1KB, 1) + " KB)")
 Write-Host ("OPRA 归属: $distNotice (已包含)")
+} finally { Exit-HostPowerShellModules $releaseModuleState }

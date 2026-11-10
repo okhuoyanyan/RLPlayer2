@@ -37,7 +37,13 @@ foreach ($a in $archs) { $hipArgs += "--offload-arch=$a" }
 #   加 -ffp-contract=off 后实测 0/1048576、max|Δ|=0。
 $hipArgs += @('-O3', '-march=x86-64-v2', '-ffp-contract=off', '-shared', '-I', (Join-Path $root 'src')) + $src + @('-o', $Out)
 
-$log = Join-Path $root 'build\gpu_build.log'
+$outputDir=Split-Path -Parent ([IO.Path]::GetFullPath($Out))
+New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+$provenance=Join-Path $here 'hip_build_provenance.py'
+$snapshot=Join-Path $outputDir ('hip-inputs-'+[guid]::NewGuid().ToString('N')+'.json')
+& python $provenance snapshot --source $root --compiler $hipcc --snapshot $snapshot
+if($LASTEXITCODE -ne 0){throw 'HIP input snapshot failed'}
+$log = Join-Path $outputDir 'gpu_build.log'
 Write-Host ("building rtagpu.dll for " + $archs.Count + " archs ...")
 # Native compilers write warnings to stderr; PowerShell would treat those as
 # terminating errors under ErrorActionPreference=Stop. Keep going, judge by exit code.
@@ -53,13 +59,13 @@ if ($rc -ne 0) {
 }
 if (-not (Test-Path $Out)) { Write-Host "GPU build produced no output"; exit 1 }
 
-# Verify every requested architecture string really made it into the binary.
-$bytes = [System.IO.File]::ReadAllBytes($Out)
-$text  = [System.Text.Encoding]::ASCII.GetString($bytes)
-$missing = @($archs | Where-Object { $text.IndexOf($_, [System.StringComparison]::Ordinal) -lt 0 })
-if ($missing.Count -gt 0) {
-    Write-Host ("GPU build missing arch code objects: " + ($missing -join ', '))
-    exit 1
-}
-Write-Host ("rtagpu.dll multi-arch OK (" + $archs.Count + " archs): " + [math]::Round((Get-Item $Out).Length / 1KB) + " KB")
+# Validate actual ELF code objects and host exports, never arbitrary strings.
+$checker=Join-Path $here 'check_hip_artifact.py'
+$checkArgs=@($checker,$Out,'--readobj',(Join-Path $rocm 'bin\llvm-readobj.exe'),'--report',(Join-Path $outputDir 'hip-artifact.json'))
+foreach($a in $archs) {$checkArgs+=@('--arch',$a)}
+& python @checkArgs
+if($LASTEXITCODE -ne 0) {throw 'HIP offline code-object gate failed'}
+& python $provenance seal --source $root --compiler $hipcc --snapshot $snapshot --dll $Out --record ($Out+'.provenance.json')
+if($LASTEXITCODE -ne 0){throw 'HIP inputs changed during build; refusing stale artifact'}
+Write-Host ('HIP offline artifact PASS ('+$archs.Count+' archs); GPU hardware execution requires separate staging smoke.')
 exit 0

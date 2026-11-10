@@ -391,7 +391,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::string streamPath = server.register_file(wavToServe, "audio/wav");
+    std::string streamPath;
+    try {
+        streamPath = server.register_file(wavToServe, "audio/wav");
+    } catch (const std::exception& e) {
+        server.stop();
+        std::fprintf(stderr, "Secure stream token generation failed: %s\n", e.what());
+        if (needCleanupTemp) std::remove(tempWavPath.c_str());
+        return 1;
+    }
     std::string streamUrl = "http://" + localIp + ":" + std::to_string(server.port()) + streamPath;
     std::printf("本地 HTTP 供源就绪: %s\n", streamUrl.c_str());
 

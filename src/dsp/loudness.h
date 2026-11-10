@@ -50,55 +50,115 @@ class Loudness {
 public:
     explicit Loudness(const LoudnessConfig& c = {}) : cfg_(c) {}
 
-    void init(double sampleRate) { fs_ = sampleRate > 0 ? sampleRate : 48000.0; dirty_ = true; }
-
-    // 依当前音量算出实际提升量并重建滤波器系数
-    void set_volume_db(double v) {
-        if (std::fabs(v - volDb_) < 1e-9) return;
-        volDb_ = v;
+    void init(double sampleRate) {
+        fs_ = sampleRate > 0 ? sampleRate : 48000.0;
+        rampSamples_ = std::max<size_t>(1, (size_t)std::llround(fs_ * 0.020));
         dirty_ = true;
     }
 
-    // 插值系数：0 = 满提升（音量 <= 下界），1 = 无提升（音量 >= 上界）
-    double scale() const {
-        const double span = cfg_.upperBoundDb - cfg_.lowerBoundDb;
-        if (span <= 1e-12) return 1.0;
-        const double t = (volDb_ - cfg_.lowerBoundDb) / span;
-        return std::clamp(t, 0.0, 1.0);
+    // Called only on the processing thread. Initial setup is immediate; live
+    // changes take 20 ms, preserving the input/output history of both shelves.
+    void set_volume_db(double v) {
+        if (!std::isfinite(v) || std::fabs(v - volDb_) < 1e-9) return;
+        volDb_ = v;
+        if (!processed_) { currentDb_ = v; remaining_ = 0; }
+        else remaining_ = rampSamples_;
+        dirty_ = true;
     }
-    double bass_db()   const { return cfg_.bassMaxDb   * (1.0 - scale()); }
+
+    double scale() const { return scale_for(volDb_); }
+    double bass_db() const { return cfg_.bassMaxDb * (1.0 - scale()); }
     double treble_db() const { return cfg_.trebleMaxDb * (1.0 - scale()); }
+    bool active() const {
+        return remaining_ != 0 || loudness_effect_db(cfg_, currentDb_) > 1e-9 ||
+               bass_.settling() || treble_.settling();
+    }
 
     void prepare() {
         if (!dirty_) return;
-        const double bd = bass_db(), td = treble_db();
-        if (bd > 1e-9) { Biquad q; biquad_design::lowShelf(q, fs_, cfg_.bassFreq, cfg_.bassSlope, bd);  bass_ = q; }
-        else           { bass_ = Biquad{}; }
-        if (td > 1e-9) { Biquad q; biquad_design::highShelf(q, fs_, cfg_.trebleFreq, cfg_.trebleSlope, td); treble_ = q; }
-        else           { treble_ = Biquad{}; }
+        const double k = 1.0 - scale_for(currentDb_);
+        bass_.design(fs_, cfg_.bassFreq, cfg_.bassSlope, cfg_.bassMaxDb * k, false);
+        treble_.design(fs_, cfg_.trebleFreq, cfg_.trebleSlope, cfg_.trebleMaxDb * k, true);
         dirty_ = false;
     }
 
-    // 单声道就地处理
     void process(double* x, size_t n) {
-        prepare();
-        if (bass_db() <= 1e-9 && treble_db() <= 1e-9) {
-            // 无提升时旁路 —— 保证 0 dB 时逐位不变
-            return;
+        for (size_t i = 0; i < n; ++i) {
+            if (remaining_) {
+                currentDb_ += (volDb_ - currentDb_) / (double)remaining_;
+                if (--remaining_ == 0) currentDb_ = volDb_;
+                // Update every 16 frames (plus the final frame), independent
+                // of caller chunking. Direct-form I keeps physical x/y history
+                // when coefficients change, rather than resetting a Biquad.
+                if ((tick_ & 15u) == 0 || remaining_ == 0) dirty_ = true;
+            }
+            prepare();
+            x[i] = treble_.process(bass_.process(x[i]));
+            ++tick_;
         }
-        for (size_t i = 0; i < n; ++i) x[i] = treble_.process(bass_.process(x[i]));
+        if (n) processed_ = true;
     }
 
-    // 清空滤波器状态。注意：Biquad 把系数与延迟状态存在一起，
-    // 直接赋单位滤波器会连【系数】一起清掉 —— 必须置 dirty_ 让 prepare() 重建，
-    // 否则滤波器会被永久旁路（实测：reset 后所有频点增益都变成 0.00 dB）。
-    void reset() { dirty_ = true; bass_ = Biquad{}; treble_ = Biquad{}; }
+    void reset() {
+        bass_.reset(); treble_.reset();
+        currentDb_ = volDb_; remaining_ = 0; tick_ = 0;
+        processed_ = false; dirty_ = true;
+    }
 
 private:
+    // RBJ shelves, same design as matrix.h. Direct-form I makes coefficient
+    // updates safe without clearing the signal history. At exactly 0 dB the
+    // exact identity preserves input bits after existing corrections decay.
+    struct Shelf {
+        double b0=1, b1=0, b2=0, a1=0, a2=0;
+        double x1=0, x2=0, y1=0, y2=0;
+        bool identity = true;
+        void reset() { x1=x2=y1=y2=0; }
+        void design(double fs, double f, double slope, double db, bool high) {
+            identity = db <= 1e-9;
+            const double A=std::pow(10.0, db/40.0);
+            const double w=2.0*kPi*f/fs, cw=std::cos(w), sw=std::sin(w);
+            const double alpha=sw/2.0*std::sqrt((A+1.0/A)*(1.0/slope-1.0)+2.0);
+            const double t=2.0*std::sqrt(A)*alpha;
+            double aa0;
+            if (high) {
+                aa0=(A+1)-(A-1)*cw+t;
+                b0=A*((A+1)+(A-1)*cw+t)/aa0;
+                b1=-2*A*((A-1)+(A+1)*cw)/aa0;
+                b2=A*((A+1)+(A-1)*cw-t)/aa0;
+                a1=2*((A-1)-(A+1)*cw)/aa0;
+                a2=((A+1)-(A-1)*cw-t)/aa0;
+            } else {
+                aa0=(A+1)+(A-1)*cw+t;
+                b0=A*((A+1)-(A-1)*cw+t)/aa0;
+                b1=2*A*((A-1)-(A+1)*cw)/aa0;
+                b2=A*((A+1)-(A-1)*cw-t)/aa0;
+                a1=-2*((A-1)+(A+1)*cw)/aa0;
+                a2=((A+1)+(A-1)*cw-t)/aa0;
+            }
+        }
+        bool settling() const {
+            return identity && (std::fabs(x1-y1) + std::fabs(x2-y2) > 1e-14);
+        }
+        double process(double x) {
+            // A live move to 0 dB must retain the unity filter's poles until
+            // its previous correction has decayed. Immediate identity would
+            // discard that history and create an end-of-ramp click.
+            const double y=(identity && !settling()) ? x : b0*x+b1*x1+b2*x2-a1*y1-a2*y2;
+            x2=x1; x1=x; y2=y1; y1=y;
+            return y;
+        }
+    };
+    double scale_for(double db) const {
+        const double span=cfg_.upperBoundDb-cfg_.lowerBoundDb;
+        if (span <= 1e-12) return 1.0;
+        return std::clamp((db-cfg_.lowerBoundDb)/span, 0.0, 1.0);
+    }
     LoudnessConfig cfg_;
-    double fs_ = 48000.0, volDb_ = 0.0;
-    bool dirty_ = true;
-    Biquad bass_, treble_;
+    double fs_=48000.0, volDb_=0.0, currentDb_=0.0;
+    size_t rampSamples_=960, remaining_=0, tick_=0;
+    bool dirty_=true, processed_=false;
+    Shelf bass_, treble_;
 };
 
 } // namespace rta::dsp

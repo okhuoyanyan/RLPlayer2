@@ -43,10 +43,17 @@ namespace rta::engine {
 // 稳定性都不划算，且吃 CPU）。设备支持更高时按 384000 封顶并在 notes 里说明。
 constexpr uint32_t kPresetRateCap = 384000u;
 
-// DSD 档的位率上限：本项目的调制器/输出链最远只到 DSD512（见 docs/SDM-调制器纪要.md 的
-// SNR 表）。驱动若连 DSD1024 都报"接受"（本机 AudioByte 实测：canSampleRate(45158400)=OK），
-// 只能说明它对采样率不做校验，不能当成真能力 —— 一律按 DSD512 封顶并记 note。
-constexpr int kPresetDsdMaxLevel = 512;
+// DSD 档的位率上限。
+// ★ 2026-11-01（3.0.10 后）：旧值 512 的理由是「本项目调制器只到 DSD512」，而 3.0.10 已经
+//   修掉高倍率标准 7 阶的精度退化（src/dsp/sdm_sections.h：保留因子结构、分段计算，
+//   ≥40 MHz 不再退 5 阶），DSD1024 是**可交付档位**：实测 45.1584 MHz 调制 1.6~1.8× 实时，
+//   端到端（含 44.1k→2.8224 MHz 载波重采样）纯 CPU 0.51×、带 rtagpu.dll 0.80×、
+//   报告口径的 GPU 管线 2.271×。因此能力查询与档位识别必须认到 1024，不能再用 512 假封顶。
+// 仍然保留的两条诚实边界（AGENTS 铁律 4）：
+//   ① 驱动对 canSampleRate(45158400) 报"接受"只说明它不校验采样率，不等于真能稳定输出；
+//      本机没有 DSD1024 设备，**真实输出未验证**。
+//   ② 一键预设推荐到 1024 时必须在 notes 里写明算力前提，不能只给数字。
+constexpr int kPresetDsdMaxLevel = 1024;
 
 enum class PresetProfile {
     BitPerfect,   // 原音直通（PCM 直出 / DSD 直通）
@@ -110,13 +117,25 @@ inline int dsd_level_from_name(const std::string& s) {
 // DSD 位率 → 档位（44.1k 族与 48k 族都认；认不出返回 0）
 inline int dsd_level_of_bitrate(uint32_t bits) {
     if (bits == 0) return 0;
-    for (int m : {64, 128, 256, 512}) {
+    for (int m : {64, 128, 256, 512, 1024}) {
         if (bits == (uint32_t)(44100 * m) || bits == (uint32_t)(48000 * m)) return m;
     }
     return 0;
 }
 
-// DoP 载波 = DSD 位率 / 16（DSD64→176400 / DSD128→352800 / DSD256→705600 / DSD512→1411200）
+// 驱动"接受"的 DSD 位率列表 → 原生 DSD 最高档（纯函数，rtaweb 的探测循环只负责查询与收集）。
+// 这样"能力判定"本身可以离线单测：不必有 DSD1024 设备，也能证明查询口径没有 512 假上限。
+inline int dsd_native_level_from_bitrates(const std::vector<uint32_t>& accepted) {
+    int best = 0;
+    for (uint32_t r : accepted) {
+        const int lvl = dsd_level_of_bitrate(r);
+        if (lvl > best) best = lvl;
+    }
+    return best > kPresetDsdMaxLevel ? kPresetDsdMaxLevel : best;
+}
+
+// DoP 载波 = DSD 位率 / 16（DSD64→176400 / DSD128→352800 / DSD256→705600 / DSD512→1411200 /
+// DSD1024→2822400；48k 族按 48000 基率同式换算）
 inline uint32_t dop_carrier_for_level(int mult) {
     if (mult <= 0) return 0;
     return (uint32_t)(44100 * mult) / 16u;
@@ -129,7 +148,7 @@ struct DeviceCaps {
     std::vector<uint32_t> rates;         // PCM 采样率（升序；空 = 探测为空/未知）
     uint32_t maxRate = 0;                // 设备实际最高档（不封顶；0 = 未知）
     bool dsdNative = false;              // ASIO 2.3 IoFormat DSD 且 DSD 位率被接受
-    std::string dsdNativeMax;            // "dsd64"…"dsd512"；空 = 无原生 DSD
+    std::string dsdNativeMax;            // "dsd64"…"dsd1024"；空 = 无原生 DSD
     bool dop = false;                    // 有 ≥176400 的 24-bit 承载率才可能 DoP
     std::string dopMax;                  // DoP 能承载的最高档
     bool exclusive = false;              // 独占/直连（WASAPI 独占或 ASIO）
@@ -150,7 +169,7 @@ struct SourceInfo {
 // 设置：字段名与 /api/play 的请求键名同义（applied JSON 由 rtaweb 从这里生成）
 struct PresetSettings {
     std::string rate = "src";         // "follow" | "src" | "max" | "384000"（数字串）
-    int dsd = 0;                         // 0 = PCM；64/128/256/512 = DSD 输出档
+    int dsd = 0;                         // 0 = PCM；64/128/256/512/1024 = DSD 输出档
     std::string modFamily;               // "" = 不改（默认 dsd）；dsd 档写 "ec"
     int modOrder = 0;                    // 0 = 不改；dsd 档写 7
     std::string filter;                  // "" = 用默认 Kaiser；升频档写 poly-sinc-tight-lp
@@ -178,7 +197,7 @@ inline uint32_t preset_max_pcm_rate(const std::vector<uint32_t>& rates, uint32_t
 inline std::string preset_dop_max_from_rates(const std::vector<uint32_t>& rates) {
     int best = 0;
     for (uint32_t r : rates) {
-        for (int m : {64, 128, 256, 512}) {
+        for (int m : {64, 128, 256, 512, 1024}) {
             if (r == dop_carrier_for_level(m) && m > best) best = m;
             // 48k 族 DSD 的载波（230400/460800/921600/1843200）也认：源是 48k 族时用得上
             const uint32_t c48 = (uint32_t)(48000 * m) / 16u;
@@ -392,8 +411,15 @@ inline PresetSettings plan_preset(PresetProfile prof, const DeviceCaps& caps, co
                           detail::num(dop_carrier_for_level(capLevel)) + " Hz）");
     }
     if (nativeLvl > kPresetDsdMaxLevel || dopLvl > kPresetDsdMaxLevel) {
-        s.notes.push_back("驱动声称支持高于 DSD512 的位率：本档按 DSD" +
+        s.notes.push_back("驱动声称支持高于 DSD" + detail::numi(kPresetDsdMaxLevel) + " 的位率：本档按 DSD" +
                           detail::numi(kPresetDsdMaxLevel) + " 封顶（不对超规格档位打包票）");
+    }
+    // 推荐到 DSD1024 时必须交代算力前提：能力"支持"不等于本机能稳定跑满。
+    // 数字来自 3.0.10 实测（10 s 双声道 44.1k，poly-sinc-short-lp，--analyze 不发声）：
+    //   调制段 1.6~1.8×；端到端纯 CPU 0.51×、带 rtagpu.dll 0.80×；GPU 管线口径 2.271×。
+    if (capLevel >= 1024) {
+        s.notes.push_back("目标 DSD1024（45.1584 MHz）：该档对算力要求最高，纯 CPU 端到端实测约 0.5~0.8× 实时，"
+                          "GPU 升频可到 2× 左右；若出现欠载请在设置里改回 DSD512");
     }
     if (s.directSdm) {
         s.notes.push_back("源 DSD" + detail::numi(srcLevel) + " 与目标同速率 ⟹ DirectSDM 1-bit 直通（跳过调制）");

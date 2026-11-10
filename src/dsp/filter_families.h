@@ -11,6 +11,7 @@
 //   线性相位原型 H → 实倒谱 c[n] → 折叠（因果部分加倍、反因果置零）→ 指数还原 → IFFT
 //   这是严格的最小相位分解，不是"把脉冲右移"之类的近似。
 #pragma once
+#include <atomic>
 #include "apod_quality.h"
 #include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include "kaiser.h"
@@ -22,6 +23,8 @@
 #include <string>
 #include <algorithm>
 #include <cstddef>
+#include <limits>
+#include <stdexcept>
 
 namespace rta::dsp {
 
@@ -45,9 +48,12 @@ inline const char* phase_name(PhaseKind p) {
 }
 
 // 混合相位的默认比例：0 = 全最小相位，1 = 全线性相位
-inline double& phase_mix_ref() { static double v = 0.5; return v; }
-inline void   set_phase_mix(double v) { phase_mix_ref() = (v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v)); }
-inline double phase_mix() { return phase_mix_ref(); }
+inline std::atomic<double>& phase_mix_ref() { static std::atomic<double> v{0.5}; return v; }
+inline void set_phase_mix(double v) {
+    if (!std::isfinite(v)) return;
+    phase_mix_ref().store(std::clamp(v, 0.0, 1.0), std::memory_order_relaxed);
+}
+inline double phase_mix() { return phase_mix_ref().load(std::memory_order_relaxed); }
 
 // ---------------- 窗函数 ----------------
 
@@ -70,6 +76,10 @@ inline double phase_mix() { return phase_mix_ref(); }
 //   · 铁律 3：没验证过的东西不进产物。所以这里**不留半成品代码**，只留结论。
 
 inline std::vector<double> make_window(WindowKind kind, int n, double attenDb) {
+    check_design_cancel();
+    if (n < 0 || !std::isfinite(attenDb) || attenDb < 0.0 ||
+        kind < WindowKind::Kaiser || kind > WindowKind::Hann)
+        throw std::invalid_argument("Invalid FIR window size, attenuation or kind");
     std::vector<double> w((size_t)n, 1.0);
     if (n <= 1) return w;
     const double m = (double)(n - 1);
@@ -85,6 +95,7 @@ inline std::vector<double> make_window(WindowKind kind, int n, double attenDb) {
             // 故规格把它的天花板定为实测地板 110 dB，并登记「部分预设低于声明值」为已知缺口（§11）。
             const double alpha = 3.0 + 0.011 * std::max(0.0, attenDb - 60.0);
             for (int i = 0; i < n; ++i) {
+                if ((i & 4095) == 0) check_design_cancel();
                 const double r = (2.0 * i - m) / m;
                 w[(size_t)i] = std::exp(-0.5 * (alpha * r) * (alpha * r));
             }
@@ -122,6 +133,7 @@ struct FirSpec {
 };
 
 inline std::vector<double> design_fir(const FirSpec& s) {
+    check_design_cancel();
     // Respect the requested support: even-length Type-II lowpasses are legal.
     // Growing to N+1 then cropping a nonzero endpoint breaks DC and symmetry.
     int n = s.taps; if (n < 3) n = 3;
@@ -132,6 +144,7 @@ inline std::vector<double> design_fir(const FirSpec& s) {
     if (!s.apodizing) {
         const double fc = s.cutoff * 0.5;
         for (int i = 0; i < n; ++i) {
+            if ((i & 4095) == 0) check_design_cancel();
             const double x = (double)i - m;
             const double sc = (x == 0.0) ? 2.0 * fc : std::sin(2.0 * kPi * fc * x) / (kPi * x);
             h[(size_t)i] = sc * w[(size_t)i];
@@ -145,6 +158,7 @@ inline std::vector<double> design_fir(const FirSpec& s) {
         const double fc = 0.5 * (f1 + f2) * 0.5;
         const double df = 0.5 * (f2 - f1) * 0.5;
         for (int i = 0; i < n; ++i) {
+            if ((i & 4095) == 0) check_design_cancel();
             const double x = (double)i - m;
             const double sinc_val = (x == 0.0) ? 2.0 * fc : std::sin(2.0 * kPi * fc * x) / (kPi * x);
             const double denom = 1.0 - 16.0 * df * df * x * x;
@@ -165,11 +179,23 @@ inline std::vector<double> design_fir(const FirSpec& s) {
 // ---------------- 最小相位变换（倒谱法）----------------
 // 输入线性相位 FIR，输出同长度的最小相位 FIR（因果，能量集中在起始处）。
 inline std::vector<double> to_minimum_phase(const std::vector<double>& h, size_t fftOversample = 8, bool enforceReal = false) {
+    check_design_cancel();
     const size_t L = h.size();
+    if (!fftOversample) throw std::invalid_argument("Minimum-phase FFT padding must be positive");
+    if (!L) return {};
+    const size_t maximum = std::vector<cplx>().max_size();
+    if (L > maximum / fftOversample)
+        throw std::length_error("Minimum-phase FFT target exceeds addressable storage");
+    const size_t target = L * fftOversample;
     // ★ 2026-10-31（独立审核 2.4.5）：这里的倍率是**倒谱采样密度**，不是输出支撑长度。
     //   8 倍会让实倒谱的尾部混叠 ⟹ 通带误差最大 0.21 dB（即使线性相位那级是平的）。
     //   级联分支用 32 倍（高斯 64 倍）；单段保持 8 倍（全局改会造成 12~28 dB 的深阻带退化）。
-    size_t N = 1; while (N < L * fftOversample) N <<= 1;
+    size_t N = 1;
+    while (N < target) {
+        if (N > maximum / 2)
+            throw std::length_error("Minimum-phase FFT power-of-two exceeds addressable storage");
+        N <<= 1;
+    }
 
     std::vector<cplx> H(N, cplx(0.0, 0.0));
     for (size_t i = 0; i < L; ++i) H[i] = cplx(h[i], 0.0);
@@ -181,33 +207,38 @@ inline std::vector<double> to_minimum_phase(const std::vector<double>& h, size_t
     double peakMag = 0.0;
     for (size_t k = 0; k < N; ++k) peakMag = std::max(peakMag, std::abs(H[k]));
     const double floorMag = std::max(peakMag * 1e-15, 1e-300);
-    std::vector<cplx> logH(N);
     for (size_t k = 0; k < N; ++k) {
+        if ((k & 4095u) == 0) check_design_cancel();
         const double mag = std::max(std::abs(H[k]), floorMag);
-        logH[k] = cplx(std::log(mag), 0.0);
+        H[k] = cplx(std::log(mag), 0.0);
     }
 
     // 实系数 FIR 要求对数幅度是**偶函数**。深阻带零点附近 FFT 舍入的相对误差很大，
     // 两半独立取对数会凭空造出虚倒谱，破坏重建出的通带（审核实测）。
-    if (enforceReal) for (size_t k = 1; k < N / 2; ++k) logH[N - k] = logH[k];
+    if (enforceReal) for (size_t k = 1; k < N / 2; ++k) H[N - k] = H[k];
 
     // 2) 实倒谱
-    fft(logH, /*inverse=*/true);
+    fft(H, /*inverse=*/true);
 
     // 3) 折叠：n=0 保留；1..N/2-1 加倍；N/2 保留；其余置零
-    std::vector<cplx> c(N, cplx(0.0, 0.0));
-    c[0] = enforceReal ? cplx(logH[0].real(), 0.0) : logH[0];
-    for (size_t n = 1; n < N / 2; ++n) c[n] = enforceReal ? cplx(logH[n].real() * 2.0, 0.0) : logH[n] * 2.0;
-    c[N / 2] = enforceReal ? cplx(logH[N / 2].real(), 0.0) : logH[N / 2];
+    // Each bin is consumed independently. Reuse its storage without changing
+    // a single arithmetic operation, padding factor, or output coefficient.
+    H[0] = enforceReal ? cplx(H[0].real(), 0.0) : H[0];
+    for (size_t n = 1; n < N / 2; ++n) H[n] = enforceReal ? cplx(H[n].real() * 2.0, 0.0) : H[n] * 2.0;
+    H[N / 2] = enforceReal ? cplx(H[N / 2].real(), 0.0) : H[N / 2];
+    std::fill(H.begin() + N / 2 + 1, H.end(), cplx(0.0, 0.0));
 
     // 4) 指数还原 -> 最小相位频谱
-    fft(c);
-    for (auto& v : c) v = std::exp(v);
+    fft(H);
+    for (size_t k = 0; k < H.size(); ++k) {
+        if ((k & 4095u) == 0) check_design_cancel();
+        H[k] = std::exp(H[k]);
+    }
 
     // 5) 回到时域，取前 L 点（因果）
-    fft(c, /*inverse=*/true);
+    fft(H, /*inverse=*/true);
     std::vector<double> out(L);
-    for (size_t i = 0; i < L; ++i) out[i] = c[i].real();
+    for (size_t i = 0; i < L; ++i) out[i] = H[i].real();
 
     // 归一化到单位直流增益
     double sum = 0.0; for (auto v : out) sum += v;
@@ -584,6 +615,16 @@ inline double preset_ceiling_db(WindowKind w) {
 // contentHz  : 该源的真实内容边缘（CD≈20000，96k≈40000）
 // tolHz      : 容差（D-15 定为 1000 Hz；切趾本身要切在内容边缘下方约 1 kHz）
 inline PresetMetrics preset_metrics(const FilterPreset& fp, double fsIn, double contentHz, double tolHz = 1000.0) {
+    if (!std::isfinite(fsIn) || fsIn <= 0.0 || fsIn > double(UINT32_MAX) ||
+        !std::isfinite(contentHz) || contentHz < 0.0 ||
+        !std::isfinite(tolHz) || tolHz < 0.0 ||
+        !std::isfinite(fp.transition) || fp.transition < 0.0 || fp.transition >= 1.0 ||
+        !std::isfinite(fp.attenDb) || fp.attenDb < 0.0 ||
+        fp.taps < 0 || fp.tapsPerInput < 0 ||
+        fp.window < WindowKind::Kaiser || fp.window > WindowKind::Hann ||
+        (fp.apodizing && (!std::isfinite(fp.apodF1) || !std::isfinite(fp.apodF2) ||
+                          fp.apodF1 <= 0.0 || fp.apodF2 <= fp.apodF1 || fp.apodF2 > 1.0)))
+        throw std::invalid_argument("Invalid filter metrics rate, bandwidth or preset parameters");
     PresetMetrics m;
     m.ceilingDb = preset_ceiling_db(fp.window);
     const double half = fsIn * 0.5;
@@ -604,7 +645,10 @@ inline PresetMetrics preset_metrics(const FilterPreset& fp, double fsIn, double 
     } else {
         // Keep the established source-domain budget. LP design margin and
         // full-support phase factors address quality without moving the band edges.
-        m.T = (int)(21.13 * fsIn / m.dfHz + 0.5);
+        const double requestedT = 21.13 * fsIn / m.dfHz + 0.5;
+        if (!std::isfinite(requestedT) || requestedT > double(INT_MAX))
+            throw std::length_error("Filter metrics tap count exceeds supported range");
+        m.T = (int)requestedT;
         // Retained narrow-band budget floor. Resource caps must not reduce it.
         if (m.dfHz < 500.0 && m.T < 2877) m.T = 2877;
     }
@@ -657,6 +701,8 @@ inline double content_hz_for_rate(uint32_t fs) {
 inline int solve_taps_per_phase(WindowKind w, double transition, bool apodizing,
                                 double apodF1, double apodF2, int taps,
                                 int tapsPerInput, double fsIn) {
+    if (!std::isfinite(fsIn) || fsIn <= 0.0 || fsIn > double(UINT32_MAX))
+        throw std::invalid_argument("Filter source rate must be finite and representable");
     if (tapsPerInput > 0 && !apodizing) return tapsPerInput;
     FilterPreset fp{};
     fp.name = "auto"; fp.taps = taps; fp.transition = transition;

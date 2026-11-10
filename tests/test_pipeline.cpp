@@ -189,17 +189,10 @@ static int run_tests() {
 
 
     // ---------------------------------------------------------------
-    // 2026-10-30：bit-perfect 判定必须问「源有多深」，不是「容器有多宽」
-    //
-    // 缺陷（用户实测，同一会话内两种结论并存）：
-    //   16 bit WAV   in=16 out=24@44100 ⟹ bp=yes「源→解码→输出全程逐位一致」
-    //   MP3(float32) in=32 out=24@44100 ⟹ bp=no 「原因未归类」
-    // 真因：willBeBitPerfect/willBeZeroPad 见到 in.isFloat 就 return false，
-    //   而且拿 in.bits(容器=32) 去比 outBits(24)，把「16bit 源装进 float 容器」
-    //   当成了「32→24 位深降低」。
-    //
-    // 判据设计：同一个 16bit 源的两种解码形态（int16 缓冲 / float32 缓冲）必须得到
-    //   同一个结论 —— 这才是「判据问的是源、不是容器」的可证形式。
+    // 2026-11-09: source precision is metadata, not permission to shift raw
+    // float bit patterns. This test must construct real float samples and
+    // compare numeric output, rather than relabel integer raw bits as float.
+    // Only actual integer widening is a zero-pad operation.
     // ---------------------------------------------------------------
     {
         const size_t N = 1024;
@@ -215,12 +208,20 @@ static int run_tests() {
         check(p.willBeZeroPad(i16) && !p.willBeBitPerfect(i16),
               "16bit 源 → 24bit 输出：判为无损展宽（不是逐位同格式）");
 
-        // float32 容器 + 已知源位深 16：与上面的 int16 缓冲**必须同结论**
+        // Construct genuine float PCM from the same normalized samples.
         AudioBuffer f32 = i16;
         f32.isFloat = true;
         f32.bits = 32;
-        check(p.willBeZeroPad(f32) && !p.willBeBitPerfect(f32),
-              "同一份 16bit 源的 float32 容器：结论与 int16 容器一致（旧代码此处一律 false）");
+        for (size_t n = 0; n < N; ++n)
+            for (int ch = 0; ch < 2; ++ch) f32.setSample(n, ch, i16.sample(n, ch));
+        PipelineStats fst;
+        const auto fo = p.process(f32, &fst);
+        bool same = true;
+        for (size_t n = 0; n < N; ++n)
+            for (int ch = 0; ch < 2; ++ch)
+                same = same && fo.sample(n, ch) == i16.sample(n, ch);
+        check(!p.willBeZeroPad(f32) && !p.willBeBitPerfect(f32) && !fst.zeroPad && same,
+              "真实 float32 样本走数值转换，输出逐样本正确且不冒称整数补零");
 
         // 源位深未知 + float ⟹ 不敢承诺（这是唯一该保守的情况）
         PipelineConfig cu = c;

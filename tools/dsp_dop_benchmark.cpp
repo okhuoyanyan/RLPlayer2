@@ -275,7 +275,8 @@ static Trial run(int mode,const std::vector<Block>& blocks,size_t frames,const S
     return result;
 }
 int main(int argc,char**argv)try {
-    double seconds=.25,dither=0.;int pairs=5,order=5;std::string family="dsd";bool verify=false;
+    // Match rtaweb/rtaplay production defaults; overrides are always printed.
+    double seconds=.25,dither=.0005,cutoff=100000.;int pairs=5,order=5;std::string family="dsd";bool verify=false;
     for(int i=1;i<argc;++i) {
         std::string arg=argv[i];
         if(arg=="--verify-only")verify=true;
@@ -284,10 +285,11 @@ int main(int argc,char**argv)try {
         else if(arg=="--order"&&i+1<argc)order=std::stoi(argv[++i]);
         else if(arg=="--family"&&i+1<argc)family=argv[++i];
         else if(arg=="--dither"&&i+1<argc)dither=std::stod(argv[++i]);
+        else if(arg=="--cutoff"&&i+1<argc)cutoff=std::stod(argv[++i]);
         else throw std::runtime_error("invalid argument");
     }
-    if(!(seconds>0&&seconds<=4)||pairs<5||!(pairs&1)||order<1||order>8||!(dither>=0&&dither<=1))
-        throw std::runtime_error("seconds (0,4], odd pairs>=5, order 1..8, dither [0,1] required");
+    if(!(seconds>0&&seconds<=4)||pairs<5||!(pairs&1)||order<1||order>8||!(dither>=0&&dither<=1)||!(cutoff>0&&cutoff<=1000000))
+        throw std::runtime_error("seconds (0,4], odd pairs>=5, order 1..8, dither [0,1], cutoff (0,1000000] Hz required");
     int cpu[4];__cpuid(cpu,(int)0x80000000u);
     if((unsigned)cpu[0]<0x80000001u)throw std::runtime_error("RDTSCP is not supported");
     __cpuid(cpu,(int)0x80000001u);
@@ -295,7 +297,8 @@ int main(int argc,char**argv)try {
     const char* names[]={"legacy_double_checked","fused_scalar","fused_block"};
     for(int ratio:{512,1024}) {
         SdmConfig cfg;cfg.fs=44100.*ratio;cfg.order=order;cfg.family=parse_modulator_family(family);
-        cfg.ditherLsb=dither;cfg.oneBitOutput=true;
+        cfg.ditherLsb=dither;cfg.cutoffHz=cutoff;cfg.oneBitOutput=true;
+        const SdmModulator observed(cfg);
         const size_t frames=verify?65537:(size_t)(cfg.fs*seconds)+7;
         const size_t blockFrames=verify?8191:4096*(size_t)ratio;
         std::vector<Block> blocks;
@@ -311,6 +314,8 @@ int main(int argc,char**argv)try {
         std::cout<<"CONFIG ratio="<<ratio<<" channels=2 frames_per_channel="<<frames
                  <<" blocks="<<blocks.size()<<" block_frames="<<blockFrames<<" family="<<family
                  <<" requested="<<order<<" effective="<<reference.effective<<" dither="<<dither
+                 <<" cutoff_hz="<<cutoff<<" levels="<<observed.levels()<<" sections="<<observed.uses_sections()
+                 <<" stepped_down="<<observed.steppedDown()<<" reason="<<std::quoted(observed.stepDownReason())
                  <<" seed=0x2545F4914F6CDD1D tsc_unit=ticks_not_cpu_cycles"
                  <<" bytes="<<reference.words.size()*4<<" sha256="<<hash<<std::endl;
         auto equal=[&](const Trial&t){return t.words==reference.words&&t.clamp==reference.clamp
@@ -344,3 +349,4 @@ int main(int argc,char**argv)try {
     }
     return 0;
 }catch(const std::exception&e){std::cerr<<"FAIL "<<e.what()<<std::endl;return 1;}
+

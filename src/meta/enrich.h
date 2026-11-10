@@ -18,14 +18,14 @@
 //     「top1 0.32~0.49 + LLM 裁决=-1 仍被写入」(同人曲在网易的大量同社团错曲目诱饵)。
 //   * fieldsFilled 只记「本次真正新写入(合并生效)」的字段:写前快照、写后比对;
 //   * 网络纪律:搜索源之间 sleep ≥300ms;歌词依序 lrclib→netease→qq 取第一个 ok;
-//     封面只在记录缺 coverRelPath 且首选候选有 coverUrl 时下载一次(>2KB 才收);
+//     缺图时逐曲补全；仅可靠同一录音候选可回退下载，失败按曲冷却，完整缓存不广播联网;
 //   * 可离线测试面(铁律 3,不造假联网测试):字段兜底选择/封面扩展名判定/LLM pick 解析/
 //     歌词句柄挑选/查询串拼装都抽成纯函数(enrich_detail),tests/test_enrich.cpp 最小构造覆盖;
-//     编排本体(网络+落盘)由任务 F 的真实网络门禁验证,不做假离线测试。
+//     搜索/HTTP边界可注入可重复数据，编排评分与真实磁盘提交由 test_enrich 回归。
 //
-// ⚠️ 未解决项(铁律 4):provider 各源单次超时 15s(provider.h 实现),极端全超时场景
-//     enrich_track 可能超过 20s(上层 /api/enrich 以同步方式调用时的已知边界);
-//     正常命中场景(任一源活)在数秒内返回。以任务 F 实测时延为回归基线。
+// 网络编排共用绝对时间预算（默认 20s），传至 HTTP 取消、限频等待和重试；
+// 到期停止后续网络但保留已采纳字段。不能取消的本地文件探测/落盘和 OS 回调收尾
+// 不冒充零耗时；具体上界与慢首字节/滴流回归见应用证据。
 //     采纳门槛的回归基线 = P1.5 同批 20 首在空 store 沙箱(p16sandbox)的实跑复验
 //     (build/p16_sample_report.txt,2026-10-22):4 例错配曲目(#1/#6/#7/#10)应显示
 //     「未采纳:…低于门槛」且无落盘记录;LLM 逐次裁决结果本身仍随模型/候选波动。
@@ -59,10 +59,18 @@ struct EnrichOpts {
     // P1.5 注册表化:源开关 id → 开关;未列出的源缺省开(新增数据源零接线)。
     std::map<std::string, bool> srcOn;
     bool llm = true;
+    bool artworkOnly = false; // 可见缺图按需任务，不取歌词/LLM/补写标签
+    int totalBudgetMs = 20000;
     // 2026-10-22 功能4:llm 配置文件路径。空 = 沿用默认相对路径 "rlplayer-llm.conf"
     // (rtatag 这类"以 CWD 为家"的调用方保持旧行为);rtaweb 传 exe 同目录的绝对路径 ——
     // 这样【界面里保存的 key】与【补全时读的 key】永远是同一份文件,不受启动 CWD 影响。
     std::string llmConfPath;
+    // 宿主的用户确认锁：查询前和下载后的提交点均检查。
+    std::function<bool(const std::string&)> allowCoverUpdate;
+    // 宿主持用户选图同一把锁执行提交，封住检查与落盘之间的窗口。
+    std::function<bool(const std::string&, const std::function<void()>&)> withCoverUpdate;
+    // 同一首无图失败后至少等五分钟；force 可显式重试，不影响其它歌曲。
+    int coverRetrySec = 300;
     // 读取开关:map 里没有该源 = 开
     bool enabled(const std::string& id) const {
         const auto it = srcOn.find(id);
@@ -85,6 +93,7 @@ inline EnrichOpts make_enrich_opts(bool qq, bool netease, bool itunes, bool lrcl
 struct EnrichStats {
     bool ok = false;                         // 本次实际补到了内容并过采纳门槛(未采纳/skipped/失败均 false)
     bool skipped = false;                    // 已有完整标签记录且未 force → 未动
+    bool budgetExceeded = false;             // 可重试；已有本地/已采纳结果仍保留
     bool confident = false;                  // match_confident(top1) 的判定(与是否 LLM 裁决无关)
     int nCand = 0;                           // 汇总候选数
     double bestScore = 0;                    // 采用候选的 match 总分
@@ -190,29 +199,72 @@ inline bool enrich_adopt(bool confident, int llmPick, bool llmRan, double topSco
 // 编排本体
 // ---------------------------------------------------------------------------
 
+// 可重复协议替身：只替换搜索边界，评分、图片传输、磁盘提交仍执行生产代码。
+using EnrichSearchHook = std::function<std::vector<Candidate>(const ProviderQuery&)>;
+inline EnrichSearchHook& enrich_search_hook() { static EnrichSearchHook h; return h; }
+inline void set_enrich_search_for_test(EnrichSearchHook h) { enrich_search_hook() = std::move(h); }
+
+// 每首独立的持久重试冷却，不由列表 GET 触发；改变可信查询身份可立即重试。
+inline bool enrich_cover_retry_due(const std::string& file, const std::string& identity,
+                                   long long now, int retrySec) {
+    const auto path = meta_path_of(MetaStore::instance().baseDir()) / "covers" /
+                      (MetaStore::hashOf(file) + ".retry");
+    std::ifstream f(path);
+    long long ts = 0; std::string prior;
+    if (!(f >> ts >> prior)) return true;
+    return prior != art_fnv_hex(identity) || now < ts || now - ts >= retrySec;
+}
+inline void enrich_cover_retry_mark(const std::string& file, const std::string& identity, long long now) {
+    const auto path = meta_path_of(MetaStore::instance().baseDir()) / "covers" /
+                      (MetaStore::hashOf(file) + ".retry");
+    (void)meta_write_atomic(path, std::to_string(now) + " " + art_fnv_hex(identity));
+}
+
 inline EnrichStats enrich_track(const std::string& file, bool force, const EnrichOpts& opts) {
+    rta::net::HttpBudgetScope budget(opts.totalBudgetMs);
     EnrichStats st;
+    struct Flight {
+        std::string key; bool admitted;
+        static std::mutex& mutex() { static std::mutex m; return m; }
+        static std::set<std::string>& active() { static std::set<std::string> s; return s; }
+        explicit Flight(const std::string& f) : key(f) {
+            std::lock_guard<std::mutex> lk(mutex()); admitted = active().insert(key).second;
+        }
+        ~Flight() { if (admitted) { std::lock_guard<std::mutex> lk(mutex()); active().erase(key); } }
+    } flight(file);
+    if (!flight.admitted) { st.skipped = true; st.note = "同一歌曲已有补全在途"; return st; }
     MetaStore& ms = MetaStore::instance();
     const long long now = (long long)std::time(nullptr);
     std::vector<std::string> notes;              // note 碎片,最后拼一句
+    auto recordBudget = [&]() {
+        if (rta::net::http_budget_expired() && !st.budgetExceeded) {
+            st.budgetExceeded = true;
+            notes.push_back("ENRICH_BUDGET_EXCEEDED: 元数据网络整理已达到时间预算，可重试；已有结果不会丢失");
+        }
+    };
 
-    // ---- 1) 已有完整记录且未 force → skipped ----
+    // 已有字段但无图仍可补本曲图片；成功图或失败冷却不重复联网。
     TrackMeta tm;
     const bool had = ms.load(file, tm);
-    if (!had) tm.path = file;                    // 无记录:新建(路径决定 hash)
-    if (had && !force) {
-        const auto itT = tm.fields.find("title");
-        const auto itA = tm.fields.find("artist");
-        const auto itAl = tm.fields.find("album");
-        const std::string t = (itT == tm.fields.end()) ? "" : itT->second.value;
-        const std::string a = (itA == tm.fields.end()) ? "" : itA->second.value;
-        const std::string al = (itAl == tm.fields.end()) ? "" : itAl->second.value;
-        if (!t.empty() && (!a.empty() || !al.empty())) {
-            st.skipped = true;
-            st.note = "已有完整标签记录(title + artist/album 非空),未动(可用 force 强制)";
-            return st;
-        }
+    if (!had) tm.path = file;
+    auto valueOf = [&](const char* key) {
+        const auto it = tm.fields.find(key);
+        return it == tm.fields.end() ? std::string() : it->second.value;
+    };
+    const bool complete = !valueOf("title").empty() &&
+                          (!valueOf("artist").empty() || !valueOf("album").empty());
+    const std::string retryIdentity = valueOf("title") + "\n" + valueOf("artist");
+    const bool coverAllowed = !opts.allowCoverUpdate || opts.allowCoverUpdate(file);
+    if (had && !force && complete && (!tm.coverRelPath.empty() || !coverAllowed ||
+        !enrich_cover_retry_due(file, retryIdentity, now, opts.coverRetrySec))) {
+        st.skipped = true;
+        st.note = "已有完整记录且封面已存在/已锁定/处于失败冷却，未动";
+        return st;
     }
+    if (!force && !enrich_cover_retry_due(file, retryIdentity, now, opts.coverRetrySec)) {
+        st.skipped = true; st.note = "逐曲补全失败冷却中"; return st;
+    }
+    if (tm.coverRelPath.empty() && coverAllowed) enrich_cover_retry_mark(file, retryIdentity, now);
 
     // 写字段并跟踪「合并是否真生效」(写前快照、写后比对;fieldsFilled 去重)
     auto mergeTracked = [&](const char* field, const MetaValue& v) {
@@ -242,19 +294,21 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
         const size_t at = parentName.find(" @ ");
         dirAlbum = parentName.substr(0, at);
         dirCircle = parentName.substr(at + 3);
-        notes.push_back("父目录「" + parentName + "」(同人盘形态,参与扩展查询)");
+        notes.push_back("父目录「" + parentName + "」(同人盘形态,仅作诊断，不参与歌曲查询)");
     }
 
     // ---- 3) 查询侧 ParsedName:标签优先 → 文件名规则 → LLM 兜底 ----
     const std::string stem = meta_string_of(meta_path_of(file).stem());
     LlmConfig cfg;
-    if (opts.llm) cfg = opts.llmConfPath.empty() ? llm_config_load() : llm_config_load(opts.llmConfPath);
-    const bool llmReady = opts.llm && !cfg.apiKey.empty();
+    if (opts.llm && !opts.artworkOnly) cfg = opts.llmConfPath.empty() ? llm_config_load() : llm_config_load(opts.llmConfPath);
+    const bool llmReady = opts.llm && !opts.artworkOnly && !cfg.apiKey.empty();
 
     ParsedName p;
     bool llmParsed = false;                      // 本次 LLM 是否实际参与(解析或裁决,进 note)
-    if (!mi.artist.empty() && !mi.title.empty()) {
-        p = parse_from_tags(mi.artist, mi.title);
+    const std::string queryTitle = !valueOf("title").empty() ? valueOf("title") : mi.title;
+    const std::string queryArtist = !valueOf("artist").empty() ? valueOf("artist") : mi.artist;
+    if (!queryTitle.empty()) {
+        p = parse_from_tags(queryArtist, queryTitle);
     } else {
         p = parse_filename(stem);
         if (p.confidence < 0.8f && llmReady) {
@@ -284,17 +338,19 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
     pq.query   = query;
     pq.title   = p.title;
     pq.artist  = p.artist;
-    pq.album   = !mi.album.empty() ? mi.album : dirAlbum;
-    pq.circle  = dirCircle;
-    pq.dirName = parentName;
+    pq.album   = mi.album; // 真标签可用；父目录仅为展示分组，不能污染歌曲查询。
+    pq.circle.clear();
+    pq.dirName.clear();
 
     std::vector<Candidate> cands;
     std::vector<std::string> srcErrs;
     bool firstCall = true;
     for (const ProviderDesc& pd : provider_registry()) {
+        if (rta::net::http_budget_expired()) break;
+        if (enrich_search_hook()) break;
         if (!pd.canSearch) continue;
         if (!opts.enabled(pd.id)) continue;
-        if (!firstCall) std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        if (!firstCall && !rta::net::http_budget_sleep(std::chrono::milliseconds(300))) break;
         firstCall = false;
         std::string err;
         std::vector<Candidate> got;
@@ -306,7 +362,9 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
         if (!err.empty()) srcErrs.push_back(std::string(pd.id) + ": " + err);
         for (Candidate& c : got) cands.push_back(std::move(c));
     }
+    if (enrich_search_hook()) cands = enrich_search_hook()(pq);
     st.nCand = (int)cands.size();
+    recordBudget();
     if (!srcErrs.empty()) {
         std::string all;
         for (const std::string& e : srcErrs) { if (!all.empty()) all += " | "; all += e; }
@@ -326,7 +384,7 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
     st.bestSource = cands[bestIdx].source;
     int llmPick = -9;                            // LLM 裁决结果;-9 = 裁决未运行/失败(语义见 enrich_adopt)
     bool llmAdjudicated = false;                 // 裁决这一步是否真实运行(与解析是否用 LLM 无关)
-    if (!st.confident && llmReady && sorted.size() >= 2) {
+    if (!st.confident && llmReady && sorted.size() >= 2 && !rta::net::http_budget_expired()) {
         const int nShow = (int)std::min<size_t>(3, sorted.size());
         std::ostringstream pr;
         pr << "你是音乐元数据匹配裁决助手。根据查询信息,从候选中选出正确匹配;都不对选 -1。\n"
@@ -361,6 +419,7 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
 
     // note 汇总(两个出口共用:未采纳→门槛出口直接收尾;采纳→流程尾)
     auto finishNote = [&]() {
+        recordBudget();
         std::ostringstream ns;
         ns << "候选" << st.nCand << ", best=" << st.bestSource << " " << st.bestScore
            << (st.confident ? " confident" : " 非confident")
@@ -386,6 +445,7 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
     const Candidate& best = cands[bestIdx];
     st.ok = true;                                // 过了采纳门槛,后续步骤只增不减
 
+    if (!opts.artworkOnly) {
     // ---- 6) 融合写入:首选候选六键 + genre/year/album 逐字段兜底(只补空) ----
     MetaValue mv; mv.ts = now; mv.confidence = (float)st.bestScore; mv.source = best.source;
     if (!best.title.empty()) { mv.value = best.title;  mergeTracked("title", mv); }
@@ -421,7 +481,7 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
 
     // ---- 6.5) E-5: genre 多源（Discogs styles 接入作为 backfill 来源）----
     // 保持采纳门槛语义不变（在此之前采纳门槛已裁决并过门），保留 iTunes 优先（仅当 genre 仍为空时尝试 Discogs）
-    if (fieldStillEmpty("genre") && opts.enabled("discogs")) {
+    if (fieldStillEmpty("genre") && opts.enabled("discogs") && !rta::net::http_budget_expired()) {
         std::string dErr;
         const std::string alb = !best.album.empty() ? best.album : mi.album;
         const std::string dg = discogs_lookup_genre(p.artist, p.title, alb, dErr);
@@ -436,33 +496,55 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
         }
     }
 
+    } // artworkOnly 不补写任何标签/流派
+
     // ---- 7) 封面:记录缺封面 → 按匹配分**遍历全部候选**的 coverUrl(2026-10-27) ----
     // 老缺陷(261025-02 提出的「封面只问第一首、缓存后永不重试」)：这里原来只取
     // best.coverUrl 一次，首选候选的图 404/超时就等于整首没封面，别的候选(别的源)
     // 明明有图也不用。现在候选 URL 链由 art_cover_urls_by_score 派生(纯函数)，
     // 逐个试到第一张「>2KB 且字节魔数是图片」为止，失败原因逐条进 note。
-    // ⚠️ 边界(铁律 4)：顶层 step 1 的 skipped 早退仍然存在 —— 已经 title+artist 齐全的
-    //    记录不会为了补封面重新联网搜索(那会在每次播放时都发请求)。用户可见的专辑页封面
-    //    走的是 rtaweb 的 /api/lib/cover 链(负缓存 7 天过期 + all=1 强制重试)，
-    //    与本函数的 skipped 语义互不影响。
-    if (tm.coverRelPath.empty()) {
-        const std::vector<std::string> coverUrls = art_cover_urls_by_score(sorted, cands);
+    if (tm.coverRelPath.empty() && coverAllowed && !rta::net::http_budget_expired()) {
+        const std::vector<std::string> coverUrls = art_recording_cover_urls(
+            sorted, cands, p.title, p.artist, p.feat, fileSec, p.version);
         if (!coverUrls.empty()) {
             ArtworkOpts aopts;
             aopts.minBytes = 2049;      // 与旧判据 resp.body.size() > 2048 完全等价
             aopts.downloadMs = 15000;   // 与旧单次 GET 的超时一致
             const CoverFetchResult cf = art_fetch_cover_urls(coverUrls, aopts);
             if (cf.ok) {
-                const std::string rel = ms.saveCover(file, (const unsigned char*)cf.bytes.data(),
-                                                     cf.bytes.size(),
-                                                     enrich_detail::ed_cover_ext(cf.url));
-                if (!rel.empty()) {
-                    tm.coverRelPath = rel;
-                    st.fieldsFilled.push_back("cover");
-                    notes.push_back("封面已缓存(" + rel + ", " + std::to_string(cf.bytes.size()) + "B)");
-                } else {
-                    notes.push_back("封面保存失败");
-                }
+                auto commit = [&]() {
+                    TrackMeta latest;
+                    const bool hasLatest = ms.load(file, latest);
+                    if (hasLatest) {
+                        for (const char* field : {"title", "artist", "album"}) {
+                            const auto current = latest.fields.find(field);
+                            if (current != latest.fields.end() && current->second.source == "user" &&
+                                current->second.value != valueOf(field)) {
+                                notes.push_back("下载期间用户确认字段已变化，旧查询图片未提交");
+                                return;
+                            }
+                        }
+                    }
+                    if (hasLatest && !latest.coverRelPath.empty()) {
+                        tm.coverRelPath = latest.coverRelPath;
+                        notes.push_back("下载期间封面已有更新，保留现有图片");
+                        return;
+                    }
+                    const std::string rel = ms.saveCover(file, (const unsigned char*)cf.bytes.data(),
+                                                         cf.bytes.size(), enrich_detail::ed_cover_ext(cf.url));
+                    if (!rel.empty()) {
+                        tm.coverRelPath = rel;
+                        std::string source;
+                        for (const Candidate& c : cands) if (c.coverUrl == cf.url) { source = c.source; break; }
+                        tm.fields["coverRecording"] = MetaValue{art_fnv_hex(p.artist + "\n" + p.title + "\n" + p.version), source, now, 1.0f};
+                        st.fieldsFilled.push_back("cover");
+                        notes.push_back("封面已缓存(" + rel + ", " + std::to_string(cf.bytes.size()) + "B)");
+                    } else notes.push_back("封面保存失败");
+                };
+                bool allowed = !opts.allowCoverUpdate || opts.allowCoverUpdate(file);
+                if (allowed && opts.withCoverUpdate) allowed = opts.withCoverUpdate(file, commit);
+                else if (allowed) commit();
+                if (!allowed) notes.push_back("用户已锁定封面，后台结果未提交");
             } else {
                 notes.push_back("封面未收(" + enrich_detail::ed_join_notes(cf.tried) + ")");
             }
@@ -470,12 +552,12 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
     }
 
     // ---- 8) 歌词:lyrics 为空时按注册表【逆序】(canLyric 过滤)= lrclib → netease → qq,
-    //         第一个 ok 写入。注册表正向是搜索优先级,逆序恰是 P1 的歌词优先级,顺序不变;
+    //         第一个非占位的 ok 写入。注册表正向是搜索优先级,逆序恰是 P1 的歌词优先级,顺序不变;
     //         源内句柄经 LyricRequest.cands(按分数从高到低)带入,免重复搜索。 ----
     {
         const auto itL = tm.fields.find("lyrics");
         const bool needLyrics = itL == tm.fields.end() || itL->second.value.empty();
-        if (needLyrics) {
+        if (needLyrics && !opts.artworkOnly) {
             LyricRequest lrq;
             lrq.title  = p.title;
             lrq.artist = p.artist;
@@ -490,9 +572,13 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
             // 顺序与改造前逐项相同(lrclib → netease → qq) —— tests/test_metaproviders.cpp 有断言。
             // 以后新增一个带歌词的源，只改 provider_registry() 一处，这里零改动。
             for (const ProviderDesc* pd : art_lyric_sources(opts.srcOn)) {
+                if (rta::net::http_budget_expired()) break;
                 if (!pd->lyric) continue;
                 std::string lerr;
                 LyricResult t = pd->lyric(lrq, lerr);
+                // 与 lyric_chain 一致：源站的「纯音乐/暂无歌词」不是真歌词，
+                // 不能写入 Store 并阻止后续来源补全。空的 ok 同样继续。
+                if (t.ok && pv_lyric_is_placeholder(t.lrc)) continue;
                 if (t.ok) { lr = std::move(t); break; }
                 if (!t.err.empty()) lyrErrs.push_back(t.err);
             }
@@ -511,10 +597,28 @@ inline EnrichStats enrich_track(const std::string& file, bool force, const Enric
     }
 
     // ---- 9) 落盘 + note ----
-    if (!tm.fields.empty() || !tm.coverRelPath.empty()) ms.save(tm);
+    if (!tm.fields.empty() || !tm.coverRelPath.empty()) {
+        TrackMeta latest;
+        if (ms.load(file, latest)) {
+            for (const auto& kv : latest.fields)
+                if (kv.second.source == "user") tm.fields[kv.first] = kv.second;
+            if (!latest.coverRelPath.empty()) tm.coverRelPath = latest.coverRelPath;
+        }
+        ms.save(tm);
+        if (tm.coverRelPath.empty() && coverAllowed)
+            enrich_cover_retry_mark(file, valueOf("title") + "\n" + valueOf("artist"), now);
+    }
 
+    if (opts.artworkOnly) st.ok = !tm.coverRelPath.empty();
     finishNote();
     return st;
+}
+
+inline EnrichStats enrich_track_artwork(const std::string& file, const EnrichOpts& opts) {
+    EnrichOpts artwork = opts;
+    artwork.artworkOnly = true;
+    artwork.llm = false;
+    return enrich_track(file, false, artwork);
 }
 
 } // namespace rta::meta

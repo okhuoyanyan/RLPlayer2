@@ -30,6 +30,11 @@ ProcessResult run_hidden(const std::string& command_line_utf8, bool capture_outp
 // name 不带扩展名（如 "ffmpeg"）。
 std::string find_executable(const char* name);
 
+// 请宿主（托盘启动器）退出。Windows = FindWindow("RLPlayerTray") + PostMessage(WM_COMMAND, 1003)
+// —— 这是"通知它做它本来就会做的事"，**不是**结束进程（铁律 2：绝不 force-kill 进程树）。
+// 返回 false = 没找到窗口（启动器没在跑，或已经退出）。
+bool request_launcher_exit();
+
 } // namespace rta::platform
 
 #if defined(_WIN32)

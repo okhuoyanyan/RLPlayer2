@@ -76,12 +76,6 @@
 //           写的"format 优先、缺失回退 stream"不一致。
 //      修 library.h 会让本条与本文件的合并口径一起失效，必须同步改（并重跑 [5] 的两条判据）。
 #pragma once
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -93,9 +87,8 @@
 #include <fstream>
 #include <string>
 #include <vector>
-#ifdef _WIN32
-#include "platform/windows/win_text.h"   // rta::platform::detail::widen（UTF-8 -> UTF-16，含 windows.h）
-#endif
+#include "platform/env.h"    // get_env_wide（线程安全的 GetEnvironmentVariableW 包装）
+#include "platform/text.h"   // utf8_to_wide / wide_to_utf8_checked
 
 namespace rta::meta::native {
 
@@ -129,22 +122,15 @@ inline SharedStats& stats() { static SharedStats s; return s; }
 // 为什么要有总开关：这是**唯一**会在解析器里"推断"值的地方（推错了会进索引），
 // 用户必须能在不改代码的情况下整体关掉（设置项 RLPLAYER_TAG_GUESS 由 launcher/配置写入环境变量）。
 inline bool guess_enabled() {
-#ifdef _WIN32
-    wchar_t v[64] = {0};
-    const DWORD n = ::GetEnvironmentVariableW(L"RLPLAYER_TAG_GUESS", v, 64);
+    // 平台层：GetEnvironmentVariableW + 64 个 UTF-16 单元的缓冲（与原实现同一缓冲语义）
+    std::wstring v;
+    const unsigned n = rta::platform::get_env_wide("RLPLAYER_TAG_GUESS", 64, v);
     if (n == 0 || n >= 64) return true;
     std::string s;
-    for (DWORD i = 0; i < n; ++i) if (v[i] < 128) s.push_back((char)v[i]);
+    for (unsigned i = 0; i < n; ++i) if (v[i] < 128) s.push_back((char)v[i]);
     for (auto& c : s) c = (char)std::tolower((unsigned char)c);
     if (s == "0" || s == "off" || s == "false" || s == "no") return false;
     return true;
-#else
-    const char* v = std::getenv("RLPLAYER_TAG_GUESS");
-    if (!v) return true;
-    std::string s(v);
-    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
-    return !(s == "0" || s == "off" || s == "false" || s == "no");
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -167,31 +153,18 @@ inline bool guess_enabled() {
 // 实现照抄 enabled()/guess_enabled() 的口径（GetEnvironmentVariableW 而不是 _wgetenv —— 扫描是
 // 多线程，_wgetenv 返回共享缓冲）；新开关复用这一份，避免第三份复制粘贴出偏差。
 inline bool env_switch_off(const char* name) {
-#ifdef _WIN32
-    wchar_t nameW[64] = {0};
-    int nw = 0;
-    for (const char* p = name; *p && nw < 63; ++p) nameW[nw++] = (wchar_t)(unsigned char)*p;
-    wchar_t v[64] = {0};
-    const DWORD got = ::GetEnvironmentVariableW(nameW, v, 64);
+    std::wstring v;
+    const unsigned got = rta::platform::get_env_wide(name, 64, v);
     if (got == 0 || got >= 64) return false;               // 未设置 = 开
-    std::wstring s(v, (size_t)got);
+    // ⚠️ 用 .data() + 长度：std::wstring(v, got) 在 v 也是 std::wstring 时命中"子串构造函数"
+    //    （从下标 got 到结尾），而不是"前 got 个字符"。改这一行会让开关静默失效（实测会红）。
+    std::wstring s(v.data(), (size_t)got);
     for (auto& c : s) c = (wchar_t)::towlower((wint_t)c);
     const size_t a = s.find_first_not_of(L" \t\r\n");
     if (a == std::wstring::npos) return false;             // 全空白 = 当成没设
     const size_t b = s.find_last_not_of(L" \t\r\n");
     s = s.substr(a, b - a + 1);
     return s == L"0" || s == L"off" || s == L"false" || s == L"no";
-#else
-    const char* v = std::getenv(name);
-    if (!v || !*v) return false;
-    std::string s(v);
-    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
-    const size_t a = s.find_first_not_of(" \t\r\n");
-    if (a == std::string::npos) return false;
-    const size_t b = s.find_last_not_of(" \t\r\n");
-    s = s.substr(a, b - a + 1);
-    return s == "0" || s == "off" || s == "false" || s == "no";
-#endif
 }
 inline bool fill_enabled()   { return !env_switch_off("RLPLAYER_TAG_FILL"); }
 inline bool online_enabled() { return !env_switch_off("RLPLAYER_TAG_ONLINE"); }
@@ -241,11 +214,10 @@ inline void set_online_finder(OnlineFinder fn, void* user = nullptr) {
 inline OnlineFinder online_finder() { return detail::online_finder_slot().load(std::memory_order_acquire); }
 
 inline bool enabled() {
-#ifdef _WIN32
-    wchar_t v[64] = {0};
-    const DWORD n = ::GetEnvironmentVariableW(L"RLPLAYER_NATIVE_TAGS", v, 64);
+    std::wstring v;
+    const unsigned n = rta::platform::get_env_wide("RLPLAYER_NATIVE_TAGS", 64, v);
     if (n == 0 || v[0] == L'\0') return true;              // 未设置 = 开
-    std::wstring s(v, (n > 64 ? 64 : (size_t)n));
+    std::wstring s(v.data(), (n > 64 ? 64 : (size_t)n));   // .data()：同上，别用子串构造函数
     std::wstring low;
     for (wchar_t c : s) low.push_back((wchar_t)::towlower((wint_t)c));
     // 去首尾空白（用户可能写 " 0 "）
@@ -254,13 +226,6 @@ inline bool enabled() {
     const size_t b = low.find_last_not_of(L" \t\r\n");
     low = low.substr(a, b - a + 1);
     return !(low == L"0" || low == L"off" || low == L"false" || low == L"no");
-#else
-    const char* v = std::getenv("RLPLAYER_NATIVE_TAGS");
-    if (!v || !*v) return true;
-    std::string s(v);
-    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
-    return !(s == "0" || s == "off" || s == "false" || s == "no");
-#endif
 }
 
 namespace detail {
@@ -315,12 +280,8 @@ inline bool utf16_to_utf8(const unsigned char* p, size_t n, bool big, std::strin
         const uint16_t u = big ? (uint16_t)((p[i] << 8) | p[i + 1]) : (uint16_t)(p[i] | (p[i + 1] << 8));
         w.push_back((wchar_t)u);
     }
-    const int m = ::WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    if (m <= 0) return false;
-    std::string s((size_t)m, '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), m, nullptr, nullptr);
-    *out = std::move(s);
-    return true;
+    // 平台层：CP_UTF8, flags=0, 显式长度；返回 false = 平台转换失败（原实现在 m <= 0 时回退）
+    return rta::platform::wide_to_utf8_checked(w, *out);
 #else
     for (size_t i = 0; i + 1 < n; i += 2) {
         uint32_t u = big ? (uint32_t)((p[i] << 8) | p[i + 1]) : (uint32_t)(p[i] | (p[i + 1] << 8));
@@ -386,11 +347,10 @@ public:
     }
 private:
     static std::filesystem::path make_path(const std::string& utf8) {
-#ifdef _WIN32
-        return std::filesystem::path(rta::platform::detail::widen(utf8));   // 宽字符构造（见 library.h p8 注释）
-#else
-        return std::filesystem::path(std::u8string((const char8_t*)utf8.data(), utf8.size()));
-#endif
+        // 宽字符构造（见 library.h p8 注释）：平台层 utf8_to_wide 用的就是 CP_UTF8/flags 0，
+        // 与迁移前的 platform::detail::widen 同一个 API —— 只差"-1 长度"vs"显式长度"，
+        // 对路径（不含内嵌 NUL）逐字节等价。
+        return std::filesystem::path(rta::platform::utf8_to_wide(utf8));
     }
     mutable std::ifstream f_;
     long long size_ = 0;
@@ -1402,7 +1362,7 @@ inline bool parse_mp3(FileReader& r, TagInfo& t, std::string& why) {
     const long long frameEnd = off + frameLen;
     t.sampleRate = sr;
     t.channels = channels;
-    t.bits = 0;                                   // ffprobe 对 MP3 报 N/A ⟹ 由调用方退化成 16（与旧路径一致）
+    t.bits = 0;                                   // ffprobe 对 MP3 报 N/A ⟹ 未知位深保持 0，不虚构整数源精度
     t.codec = "mp3";
 
     // ---- Xing/Info ----
@@ -1677,7 +1637,7 @@ inline bool parse_wav(FileReader& r, TagInfo& t, std::string& why) {
     //   pcm_s16le → N/A、pcm_u8 → N/A、pcm_f32le/f64le → N/A  ⟹ 旧代码把它们统一写成 16；
     //   pcm_s24le → 24、pcm_s32le → 32。
     // 所以这里只在 24/32 位整数 PCM 时报真值，其余情形报 0，由 lib_probe_one 的 upsell 逻辑写成 16。
-    t.bits = (fmtTag == 1 && (bits == 24 || bits == 32)) ? bits : 0;
+    t.bits = (fmtTag == 1 || fmtTag == 3) ? bits : 0; // Actual source depth; float is not 16-bit PCM.
     if (fmtTag == 3)      t.codec = (bits == 64) ? "pcm_f64le" : "pcm_f32le";
     else if (bits == 8)   t.codec = "pcm_u8";
     else if (bits == 16)  t.codec = "pcm_s16le";
@@ -1739,7 +1699,7 @@ inline bool parse_ogg(FileReader& r, TagInfo& t, std::string& why) {
     if (channels <= 0 || rate == 0) { why = "OGG: Vorbis 识别头参数无效"; return false; }
     t.channels = channels;
     t.sampleRate = (int)rate;
-    t.bits = 0;                                    // ffprobe 对 Vorbis 报 N/A ⟹ 调用方退化成 16
+    t.bits = 0;                                    // ffprobe 对 Vorbis 报 N/A ⟹ 未知位深保持 0
     t.codec = "vorbis";
 
     // ---- 找注释包（第 2 个包；大封面会让它跨很多页）----

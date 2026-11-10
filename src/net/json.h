@@ -152,6 +152,21 @@ private:
                 // 控制字符在 JSON 里必须转义；宽松模式照收（历史行为）
                 if (strict_ && (unsigned char)c < 0x20u)
                     return fail(p_ - 1, "字符串里出现未转义的控制字符");
+                if (strict_ && (unsigned char)c >= 0x80u) {
+                    const unsigned char first = (unsigned char)c;
+                    const size_t count = first >= 0xc2 && first <= 0xdf ? 2 :
+                                         first >= 0xe0 && first <= 0xef ? 3 :
+                                         first >= 0xf0 && first <= 0xf4 ? 4 : 0;
+                    if (!count || count - 1 > s_.size() - p_) return fail(p_ - 1, "非法 UTF-8 字符串");
+                    const unsigned char second = (unsigned char)s_[p_];
+                    if ((first == 0xe0 && second < 0xa0) || (first == 0xed && second >= 0xa0) ||
+                        (first == 0xf0 && second < 0x90) || (first == 0xf4 && second >= 0x90))
+                        return fail(p_ - 1, "非法 UTF-8 码点");
+                    for (size_t n = 0; n < count - 1; ++n)
+                        if (((unsigned char)s_[p_ + n] & 0xc0u) != 0x80u) return fail(p_ + n, "非法 UTF-8 延续字节");
+                    out += c; out.append(s_, p_, count - 1); p_ += count - 1;
+                    continue;
+                }
                 out += c;
                 continue;
             }
@@ -212,6 +227,31 @@ private:
 
     bool number(Json& j) {
         const size_t st = p_;
+        if (strict_) {
+            if (p_ < s_.size() && s_[p_] == '-') ++p_;
+            if (p_ >= s_.size()) return fail(st, "非法数字");
+            if (s_[p_] == '0') ++p_;
+            else {
+                if (s_[p_] < '1' || s_[p_] > '9') return fail(st, "非法数字");
+                while (p_ < s_.size() && s_[p_] >= '0' && s_[p_] <= '9') ++p_;
+            }
+            if (p_ < s_.size() && s_[p_] == '.') {
+                ++p_; const size_t digits = p_;
+                while (p_ < s_.size() && s_[p_] >= '0' && s_[p_] <= '9') ++p_;
+                if (p_ == digits) return fail(st, "小数点后缺少数字");
+            }
+            if (p_ < s_.size() && (s_[p_] == 'e' || s_[p_] == 'E')) {
+                ++p_;
+                if (p_ < s_.size() && (s_[p_] == '+' || s_[p_] == '-')) ++p_;
+                const size_t digits = p_;
+                while (p_ < s_.size() && s_[p_] >= '0' && s_[p_] <= '9') ++p_;
+                if (p_ == digits) return fail(st, "指数后缺少数字");
+            }
+            j.type = Json::Num;
+            j.num = std::strtod(s_.substr(st, p_ - st).c_str(), nullptr);
+            if (!std::isfinite(j.num)) return fail(st, "数字超出有限范围");
+            return true;
+        }
         if (p_ < s_.size() && (s_[p_] == '-' || s_[p_] == '+')) ++p_;
         bool anyDigit = false;
         while (p_ < s_.size() && isdigit((unsigned char)s_[p_])) { ++p_; anyDigit = true; }
@@ -246,6 +286,7 @@ private:
                 if (!eat(':')) { if (strict_) return fail(p_, "对象缺少冒号"); break; }
                 Json v;
                 if (!value(v)) { if (strict_) return false; }
+                if (strict_ && j.obj.find(k) != j.obj.end()) return fail(p_, "对象包含重复键");
                 j.obj[k] = std::move(v);
                 if (eat(',')) continue;
                 if (!eat('}')) { if (strict_) return fail(p_, "对象没有闭合 }（文档被截断）"); }

@@ -27,6 +27,7 @@
 #include <windows.h>
 #include "audio/wav.h"
 #include "audio/dsd_reader.h"
+#include "audio/dvd_audio.h"
 #include "dsp/dsd_integrator.h"
 #include <string>
 #include <vector>
@@ -91,121 +92,38 @@ inline std::wstring widen(const std::string& s) {
 }
 
 inline std::string lowerExt(const std::string& p) {
-    const size_t d = p.find_last_of('.');
+    const std::string physical = sacd_physical_path(p);
+    const size_t d = physical.find_last_of('.');
     if (d == std::string::npos) return "";
-    std::string e = p.substr(d);
+    std::string e = physical.substr(d);
     std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return (char)std::tolower(c); });
     return e;
 }
 
-// ===========================================================================
-// ISO 镜像识别（2026-10-27，用户 261027-01 #3）
-//
-// 为什么需要：`.iso` 以前连「识别」都没有（扩展名白名单里没有它），用户把 SACD ISO 拖进来
-// 只会看到 ffmpeg 的 "Invalid data found when processing input"。真正的解决要写 SACD 解析，
-// 这里只做**识别**这一档：分清「SACD 镜像」与「普通数据盘」，然后给出明确指引。
-//
-// 判据（只用 ISO9660 的结构，不猜内容）：
-//   ① 扇区 16（偏移 32768）起的卷描述符标识必须是 "CD001"，且能找到类型 1（主卷描述符）；
-//   ② 根目录记录（PVD 偏移 156，34 字节）给出根目录起始 LBA 与长度；
-//   ③ 在根目录里找名字含 "SACD" 的目录/文件（SACD 母盘在 ISO9660 里就是一个 SACD/ 目录，
-//      内含 TOC 与 2ch/mch 音轨区）；卷标（PVD 偏移 40，32 字节）也一并看。
-// SACD ISO 有 ISO9660 层，所以这套判据对 sacd_extract 产出的镜像成立；真 UDF-only 镜像会落到
-// 「无法识别」而不是被误判成 SACD —— 宁可说不知道，也不给错指引。
-// ===========================================================================
-enum class IsoKind {
-    NotIso,    // 打不开 / 不是 ISO9660 镜像
-    Sacd,      // 根目录（或卷标）里有 SACD 字样 ⟹ SACD 镜像
-    Data       // 是 ISO9660 镜像，但没有 SACD 目录 ⟹ 普通数据盘
-};
-
-struct IsoInfo {
-    IsoKind kind = IsoKind::NotIso;
-    std::string volumeId;     // PVD 卷标（去掉尾部空格）
-    std::string why;          // 给用户看的判断依据（卷标/根目录命中项/失败原因）
-};
-
-// 只读前 4 个卷描述符扇区；需要时才读根目录扇区。全程只读、无子进程、不开任何设备。
-inline IsoInfo iso_inspect(const std::string& path) {
+// Audio images are recognized by their real navigation structures, never by
+// a volume/directory name. A raw SACD dump need not contain ISO9660 at all.
+enum class IsoKind { NotIso, Sacd, DvdAudio, Data };
+struct IsoInfo { IsoKind kind=IsoKind::NotIso;std::string volumeId,why; };
+inline IsoInfo iso_inspect(const std::string&path){
     IsoInfo out;
-    FILE* f = dsd_detail::dsd_fopen(path, L"rb", "rb");
-    if (!f) { out.why = "打不开文件"; return out; }
-    struct Guard { FILE* f; ~Guard() { if (f) std::fclose(f); } } g{ f };
-
-    // ---- ① 卷描述符：16 号扇区起连续若干张，找到类型 1（主卷描述符）为止 ----
-    uint8_t vd[2048];
-    bool havePvd = false;
-    for (int s = 16; s < 20; ++s) {
-        if (_fseeki64(f, (long long)s * 2048, SEEK_SET) != 0) break;
-        if (std::fread(vd, 1, sizeof(vd), f) != sizeof(vd)) break;
-        if (std::memcmp(vd + 1, "CD001", 5) != 0) break;   // 不是 ISO9660
-        if (vd[0] == 0x01) { havePvd = true; break; }
-        if (vd[0] == 0xFF) break;                          // 终止描述符
-    }
-    if (!havePvd) { out.why = "没有 ISO9660 主卷描述符"; return out; }
-
-    out.volumeId.assign((const char*)vd + 40, 32);
-    while (!out.volumeId.empty() && (out.volumeId.back() == ' ' || out.volumeId.back() == '\0'))
-        out.volumeId.pop_back();
-
-    // ---- ② 根目录记录：PVD 偏移 156 起 34 字节（extent LBA 小端在前 4 字节） ----
-    const uint8_t* rr = vd + 156;
-    const uint32_t rootLba = (uint32_t)rr[2] | ((uint32_t)rr[3] << 8) |
-                             ((uint32_t)rr[4] << 16) | ((uint32_t)rr[5] << 24);
-    const uint32_t rootLen = (uint32_t)rr[10] | ((uint32_t)rr[11] << 8) |
-                             ((uint32_t)rr[12] << 16) | ((uint32_t)rr[13] << 24);
-    out.kind = IsoKind::Data;                              // 到这里已是合法 ISO9660 镜像
-    out.why = "ISO9660 卷标=" + (out.volumeId.empty() ? std::string("(空)") : out.volumeId);
-
-    // ---- ③ 根目录：逐条目录记录找 SACD（大小写不敏感；带 ";1" 版本后缀的也认） ----
-    // 名字长度 0 = 到本扇区末尾（填充），直接跳下一个扇区；长度 < 34 视为坏记录，停。
-    uint8_t dir[2048];
-    std::string hits;
-    const uint32_t maxSectors = rootLen ? (rootLen + 2047u) / 2048u : 1u;
-    for (uint32_t s = 0; s < maxSectors && s < 8; ++s) {
-        if (_fseeki64(f, (long long)(rootLba + s) * 2048, SEEK_SET) != 0) break;
-        if (std::fread(dir, 1, sizeof(dir), f) != sizeof(dir)) break;
-        size_t off = 0;
-        while (off + 33 < sizeof(dir)) {
-            const uint8_t len = dir[off];
-            if (len == 0) break;                       // 本扇区剩余为填充
-            if (len < 34 || off + len > sizeof(dir)) break;
-            const uint8_t nameLen = dir[off + 32];
-            if (nameLen > 0 && (size_t)off + 33 + nameLen <= sizeof(dir)) {
-                const std::string nm((const char*)dir + off + 33, nameLen);
-                std::string up = nm;
-                for (auto& c : up) c = (char)std::toupper((unsigned char)c);
-                if (up.find("SACD") != std::string::npos) {
-                    if (hits.size() < 120) { if (!hits.empty()) hits += " "; hits += nm; }
-                    out.kind = IsoKind::Sacd;
-                }
-            }
-            off += len;
+    try{
+        if(!sacd_tracks(path).empty()){out.kind=IsoKind::Sacd;out.why="Scarlet Book SACDMTOC and validated area track tables";return out;}
+        if(!dvd_audio_tracks(path).empty()){out.kind=IsoKind::DvdAudio;out.why="DVD-Audio AUDIO_TS/ATS IFO track navigation";return out;}
+        std::unique_ptr<FILE,decltype(&fclose)> f(dsd_detail::dsd_fopen(sacd_physical_path(path),L"rb","rb"),fclose);
+        if(!f){out.why="打不开镜像文件";return out;}
+        std::array<uint8_t,2048>vd{};
+        for(int sector=16;sector<32;++sector){if(!sacd_detail::at(f.get(),uint64_t(sector)*2048,vd.data(),2048)||memcmp(vd.data()+1,"CD001",5))break;
+            if(vd[0]==1){out.kind=IsoKind::Data;out.volumeId.assign((const char*)vd.data()+40,32);while(!out.volumeId.empty()&&(out.volumeId.back()==' '||out.volumeId.back()==0))out.volumeId.pop_back();out.why="ISO9660 data volume without supported audio navigation";return out;}
+            if(vd[0]==255)break;
         }
-    }
-    if (out.kind == IsoKind::Sacd) {
-        out.why = "根目录含 " + hits;
-    } else {
-        std::string up = out.volumeId;
-        for (auto& c : up) c = (char)std::toupper((unsigned char)c);
-        if (up.find("SACD") != std::string::npos) {
-            out.kind = IsoKind::Sacd;
-            out.why = "卷标含 SACD（" + out.volumeId + "）";
-        }
-    }
+        out.why="未找到 SACDMTOC 或 DVD-Audio IFO";
+    }catch(const std::exception&e){out.why=e.what();}
     return out;
 }
-
-// 播放/解码入口对 .iso 的统一处理：给出「SACD 需转换」或「这不是音频镜像」，绝不落到 ffmpeg。
-[[noreturn]] inline void throw_for_iso(const std::string& path) {
-    const IsoInfo ii = iso_inspect(path);
-    if (ii.kind == IsoKind::Sacd)
-        throw UnsupportedFormat(msg_sacd_iso_unsupported() + "（文件=" + path + "，" + ii.why + "）");
-    if (ii.kind == IsoKind::Data)
-        throw UnsupportedFormat(msg_iso_not_audio() + "（文件=" + path + "，" + ii.why + "）");
-    throw UnsupportedFormat(
-        "这个 .iso 里没有 ISO9660 文件系统，无法判断是不是 SACD 镜像（" + ii.why + "）。"
-        "如果是 SACD ISO，请先用 sacd_extract 转成分轨 .dsf 后入库。");
+[[noreturn]] inline void throw_for_iso(const std::string&path){
+    auto info=iso_inspect(path);
+    if(info.kind==IsoKind::Data)throw UnsupportedFormat(msg_iso_not_audio()+"（"+info.why+"）");
+    throw UnsupportedFormat("音频镜像无法解析："+info.why+"（文件="+path+"）");
 }
 
 // 播放器所在目录（分发时把 ffmpeg.exe / ffprobe.exe 放在这里就能自带解码器，
@@ -591,6 +509,8 @@ inline bool read_wav_stream_pipe(HANDLE hPipe, HANDLE hProcess, AudioBuffer& ab,
 // 抽取器瞬态因此落在被丢弃的区段里（与整曲缓冲 + seek_reset 的既有行为一致）。
 
 struct DsdFileLayout {
+    bool     isDst = false;
+    bool     isSacd = false;
     bool     isDsf = false;
     uint32_t rate = 0;                 // 1-bit 采样率
     int      channels = 0;
@@ -608,6 +528,8 @@ inline DsdFileLayout probe_dsd_layout(const std::string& path) {
     using namespace dsd_detail;
     const std::string ext = lowerExt(path);
     DsdFileLayout L;
+    if(sacd_path(path)){const auto tr=sacd_select(path);L.isSacd=true;L.rate=tr.rate;L.channels=tr.channels;L.bitsPerChannel=tr.bits();L.bytesPerChannel=(tr.bits()+7)/8;L.dataSize=L.bytesPerChannel*tr.channels;L.container="sacd";L.blockSize=4704;return L;}
+    if(ext==".dff"){DstDffReader dst;if(dst.open(path)){L.isDst=true;L.rate=dst.rate();L.channels=dst.channels();L.bitsPerChannel=dst.bits();L.bytesPerChannel=(dst.bits()+7)/8;L.blockSize=4704;L.dataSize=L.bytesPerChannel*L.channels;L.container="dff";return L;}}
     FILE* f = dsd_fopen(path, L"rb", "rb");
     if (!f) throw std::runtime_error("无法打开文件: " + path);
     struct Guard { FILE* f; ~Guard() { if (f) std::fclose(f); } } g{ f };
@@ -778,6 +700,27 @@ inline DsdFileLayout probe_dsd_layout(const std::string& path) {
 //   DsdPcmStream s; std::string err;
 //   if (!s.open(path, dsd_pcm_settings(), &err)) { /* 回退整曲路径 */ }
 //   AudioBuffer chunk; s.read(0, 4096, chunk);        // 任意位置（顺序读最快）
+
+// Common PCM streaming facade for DVD-Audio. LPCM unpacks sectors directly;
+// MLP uses the bundled lossless decoder with file-backed PCM, bounded RAM.
+class DvdAudioPcmStream {
+ std::unique_ptr<DvdLpcmReader>pcm_;FILE*wav_=nullptr;std::wstring aobPath_,wavPath_;
+ uint32_t rate_=0;int channels_=0;size_t frames_=0;uint64_t data_=0;std::string error_;
+ static std::wstring temporary(){wchar_t dir[MAX_PATH]{},file[MAX_PATH]{};if(!GetTempPathW(MAX_PATH,dir)||!GetTempFileNameW(dir,L"dvd",0,file))throw std::runtime_error("DVD-A: cannot allocate decoder temporary file");return file;}
+public:
+ ~DvdAudioPcmStream(){close();}
+ void close(){pcm_.reset();if(wav_){fclose(wav_);wav_=nullptr;}if(!aobPath_.empty())DeleteFileW(aobPath_.c_str());if(!wavPath_.empty())DeleteFileW(wavPath_.c_str());aobPath_.clear();wavPath_.clear();frames_=0;error_.clear();}
+ bool open(const std::string&p,std::string*err=nullptr){close();try{auto t=dvd_audio_select(p);if(!t.mlp){pcm_=std::make_unique<DvdLpcmReader>();pcm_->open(p);rate_=pcm_->format().rate;channels_=pcm_->format().channels;frames_=size_t(pcm_->frames());return true;}
+  aobPath_=temporary();wavPath_=temporary();FILE*f=_wfopen(aobPath_.c_str(),L"wb");if(!f)throw std::runtime_error("DVD-A: cannot write extracted track");try{dvd_audio_extract(p,t,f);fclose(f);}catch(...){fclose(f);throw;}
+  auto sourceInfo=dvd_audio_info(p);auto firstPts=dvd_first_mlp_pes_pts(p,t);auto skipSamples=dvd_mlp_trim_samples(t.pts,firstPts,sourceInfo.rate);auto trackSamples=(uint64_t(t.durationPts)*sourceInfo.rate+45000)/90000;
+  auto ff=find_tool("ffmpeg");if(ff.empty())throw std::runtime_error("DVD-A MLP: bundled ffmpeg missing");std::string log;
+  auto cmd=L"\""+widen(ff)+L"\" -v error -y -f mpeg -i \""+aobPath_+L"\" -map 0:a:0 -vn -af atrim=start_sample="+std::to_wstring(skipSamples)+L":end_sample="+std::to_wstring(skipSamples+trackSamples)+L" -c:a pcm_s32le -f wav \""+wavPath_+L"\"";
+  if(run_hidden(cmd,&log))throw std::runtime_error("DVD-A MLP decode: "+log);
+  wav_=_wfopen(wavPath_.c_str(),L"rb");if(!wav_)throw std::runtime_error("DVD-A MLP: PCM cache missing");std::vector<uint8_t>head(65536);head.resize(fread(head.data(),1,head.size(),wav_));WavHeaderInfo h;std::string why;if(parse_wav_header(head.data(),head.size(),h,&why)<=0||h.bits!=32||h.isFloat)throw std::runtime_error("DVD-A MLP: invalid PCM cache header "+why);rate_=h.rate;channels_=h.channels;data_=h.headerBytes;frames_=size_t((uint64_t(t.durationPts)*rate_+45000)/90000);auto bytes=sacd_detail::length(wav_);if(bytes<data_+uint64_t(frames_)*channels_*4)throw std::runtime_error("DVD-A MLP: decoded duration shorter than IFO track");return true;
+ }catch(const std::exception&e){std::string why=e.what();close();error_=why;if(err)*err=why;return false;}}
+ bool is_open()const{return bool(pcm_)||wav_;}uint32_t rate()const{return rate_;}int channels()const{return channels_;}size_t totalFrames()const{return frames_;}bool error(std::string*why=nullptr)const{if(why)*why=error_;return !error_.empty();}
+ size_t read(size_t pos,size_t n,AudioBuffer&out){try{if(pcm_)return pcm_->read(pos,n,out);out.rate=rate_;out.channels=channels_;out.bits=32;out.isFloat=false;out.raw.clear();if(!wav_||pos>=frames_)return 0;n=std::min(n,frames_-pos);out.raw.resize(n*channels_);if(!sacd_detail::at(wav_,data_+uint64_t(pos)*channels_*4,out.raw.data(),out.raw.size()*4))throw std::runtime_error("DVD-A MLP: PCM cache short read");return n;}catch(const std::exception&e){error_=e.what();out.raw.clear();return 0;}}
+};
 class DsdPcmStream {
 public:
     DsdPcmStream() = default;
@@ -788,6 +731,10 @@ public:
     bool open(const std::string& path, const DsdPcmSettings& st, std::string* errOut = nullptr) {
         close();
         try {
+            if(lowerExt(path)==".iso" && sacd_tracks(path).empty() && !dvd_audio_tracks(path).empty()){
+                dvd_=std::make_unique<DvdAudioPcmStream>();if(!dvd_->open(path,errOut)){dvd_.reset();return false;}
+                outRate_=dvd_->rate();ch_=dvd_->channels();totalFrames_=dvd_->totalFrames();return true;
+            }
             layout_ = probe_dsd_layout(path);
         } catch (const std::exception& e) {
             if (errOut) *errOut = e.what();
@@ -803,7 +750,9 @@ public:
         dec_.clear();
         for (int c = 0; c < layout_.channels; ++c)
             dec_.push_back(std::make_unique<dsp::DsdDecimator>(cfg_));
-        f_ = dsd_detail::dsd_fopen(path, L"rb", "rb");
+        if(layout_.isDst){try{dst_=std::make_unique<DstDffReader>();dst_->open(path);}catch(const std::exception&e){if(errOut)*errOut=e.what();return false;}}
+        if(layout_.isSacd){try{sacd_=std::make_unique<SacdReader>();sacd_->open(path);}catch(const std::exception&e){if(errOut)*errOut=e.what();return false;}}
+        f_ = dsd_detail::dsd_fopen(sacd_physical_path(path), L"rb", "rb");
         if (!f_) { if (errOut) *errOut = "无法打开文件: " + path; return false; }
         ch_ = layout_.channels;
         M_ = layout_.rate / outRate_;
@@ -818,12 +767,15 @@ public:
 
     void close() {
         if (f_) { std::fclose(f_); f_ = nullptr; }
+        dvd_.reset();
+        dst_.reset();
+        sacd_.reset();
         dec_.clear();
         pending_.clear();
         curBit_ = 0; absFrames_ = 0; totalFrames_ = 0;
         failed_ = false; failWhy_.clear();
     }
-    bool is_open() const { return f_ != nullptr; }
+    bool is_open() const { return f_ != nullptr || bool(dvd_); }
     uint32_t rate() const { return outRate_; }
     int channels() const { return ch_; }
     size_t totalFrames() const { return totalFrames_; }
@@ -837,9 +789,10 @@ public:
     //   旧实现在短读时 std::memset 补零，然后照常返回"读到 declared 帧数"⟹ 截断文件
     //   在流式路径上被当成完整成功（整曲路径会拒绝，两条路给出相反结论）。
     //   现在：短读/seek 失败一律置错误并停止产出，调用方必须查 error()。
-    bool error(std::string* why = nullptr) const { if (why) *why = failWhy_; return failed_; }
+    bool error(std::string* why = nullptr) const { if(dvd_)return dvd_->error(why);if (why) *why = failWhy_; return failed_; }
 
     size_t read(size_t pos, size_t n, AudioBuffer& out) {
+        if(dvd_)return dvd_->read(pos,n,out);
         out.rate = outRate_; out.channels = ch_; out.bits = 32; out.isFloat = false; out.raw.clear();
         if (!f_ || ch_ <= 0 || n == 0 || pos >= totalFrames_) return 0;
         if (failed_) return 0;                       // 已损坏：不再假装能读
@@ -916,7 +869,15 @@ private:
         const uint64_t byteOff = b * blockBytes;
         if (byteOff >= layout_.bytesPerChannel) return false;
         const size_t thisBlock = (size_t)std::min<uint64_t>(blockBytes, layout_.bytesPerChannel - byteOff);
-        if (layout_.isDsf) {
+        if (layout_.isDst) {
+            try{dst_->seek(byteOff);if(dst_->read(thisBlock,bufs_)!=thisBlock){fail("DST: premature track end");return false;}}
+            catch(const std::exception&e){fail(e.what());return false;}
+            for(int c=0;c<ch_;++c)dec_[(size_t)c]->process_bits(bufs_[(size_t)c].data(),thisBlock*8,pending_[(size_t)c]);
+        } else if (layout_.isSacd) {
+            try{sacd_->seek(byteOff);if(sacd_->read(thisBlock,bufs_)!=thisBlock){fail("SACD: premature track end");return false;}}
+            catch(const std::exception&e){fail(e.what());return false;}
+            for(int c=0;c<ch_;++c)dec_[(size_t)c]->process_bits(bufs_[(size_t)c].data(),thisBlock*8,pending_[(size_t)c]);
+        } else if (layout_.isDsf) {
             // ★ 2026-10-29（F16 修正）：必须【先把所有声道的字节都读成功，再喂抽取器】。
             //   旧写法边读边喂：第 0 声道喂完、第 1 声道才失败 ⟹ pending_[0] 比 pending_[1]
             //   多出一块，而 pendCount() 只看 pending_[0] ⟹ read() 里 v[skip+i] 越界
@@ -960,6 +921,9 @@ private:
         return true;
     }
 
+    std::unique_ptr<DstDffReader> dst_;
+    std::unique_ptr<DvdAudioPcmStream> dvd_;
+    std::unique_ptr<SacdReader> sacd_;
     DsdFileLayout layout_;
     FILE* f_ = nullptr;
     uint32_t outRate_ = 0;
@@ -1013,13 +977,15 @@ inline bool dsd_streamable(const std::string& path, double* decodedMb = nullptr,
 // 是否应该对这次播放走流式（只看文件头）：DSD 且解码后超过阈值 且 开关打开。
 inline bool should_stream_decode(const std::string& path, double* decodedMb = nullptr, std::string* why = nullptr) {
     const std::string ext = lowerExt(path);
-    if (ext != ".dsf" && ext != ".dff") { if (why) *why = "非 DSD 文件"; return false; }
+    if(ext==".iso"){try{return !sacd_tracks(path).empty()||!dvd_audio_tracks(path).empty();}catch(const std::exception&e){if(why)*why=e.what();return false;}}
+    if (ext != ".dsf" && ext != ".dff" && ext != ".iso") { if (why) *why = "非 DSD 文件"; return false; }
     const BigFileStreamSettings& s = big_file_stream_settings();
     if (!s.enabled) { if (why) *why = "流式播放已关闭(stream_threshold_mb=0)"; return false; }
     double mb = 0.0;
     std::string whyLocal;
     if (!dsd_streamable(path, &mb, &whyLocal)) { if (why) *why = whyLocal; return false; }
     if (decodedMb) *decodedMb = mb;
+    if (ext == ".iso") return true; // ISO packets are always decoded in bounded chunks.
     if (mb <= s.thresholdMb) { if (why) *why = "解码后 " + std::to_string((long long)mb) + " MB 低于阈值"; return false; }
     return true;
 }
@@ -1407,11 +1373,10 @@ inline AudioBuffer read_via_ffmpeg(const std::string& path, LoadNote* note = nul
 inline AudioBuffer read_any(const std::string& path, LoadNote* note = nullptr) {
     const std::string ext = lowerExt(path);
     const auto t_any_0 = std::chrono::steady_clock::now();
-    // .iso 在**最前面**拦（2026-10-27，261027-01 #3）：ISO 镜像不是 ffmpeg 能碰的容器
-    // （随包 ffmpeg 9.0 没有 sacd/iso9660/udf demuxer），落到下面只会得到
-    // "Invalid data found when processing input" —— 用户会以为文件坏了。
-    // 这里直接给「SACD 需转换 / 这不是音频镜像」的指引。
-    if (ext == ".iso") throw_for_iso(path);
+    // Images use native track navigation; feed ffmpeg only an extracted MLP track, never the ISO container.
+    if (ext == ".iso") { if(iso_inspect(path).kind==IsoKind::Sacd)return read_dsd_native(path,note);
+        if(!dvd_audio_tracks(path).empty()){DvdAudioPcmStream stream;std::string err;if(!stream.open(path,&err))throw std::runtime_error(err);AudioBuffer all,chunk;all.rate=stream.rate();all.channels=stream.channels();all.bits=32;for(size_t pos=0;pos<stream.totalFrames();){size_t n=stream.read(pos,8192,chunk);if(!n){stream.error(&err);throw std::runtime_error(err);}all.raw.insert(all.raw.end(),chunk.raw.begin(),chunk.raw.end());pos+=n;}if(note)note->text="DVD-Audio native navigation / lossless PCM";return all;}
+        throw_for_iso(path); }
     try {
         if (ext == ".wav" || ext == ".wave" || ext.empty()) {
             AudioBuffer b = read_wav(path);
@@ -1476,7 +1441,7 @@ inline AudioBuffer read_any(const std::string& path, LoadNote* note = nullptr) {
             throw UnsupportedFormat(
                 "这个文件 ffmpeg 解不了（它报的原文是 \"Invalid data found when processing input\"，"
                 "含义是容器/编码不可识别，不等于文件损坏）。常见原因是：DST 压缩的 DSD（需先转 .dsf/.dff）、"
-                "SACD ISO 镜像（需先 sacd_extract 分轨）、加密或下载不完整的文件。"
+                "音频镜像导航损坏、加密或下载不完整的文件。"
                 "（文件=" + path + "，阶段=read_any，ffmpeg 原始报错=" + m + "）");
         }
         throw;

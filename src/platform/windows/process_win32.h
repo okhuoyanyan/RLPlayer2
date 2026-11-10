@@ -15,6 +15,10 @@
 
 #include "platform/windows/win_text.h"
 
+// request_launcher_exit 用 FindWindowW/PostMessageW（user32）。
+// 迁移前这条 pragma 写在 net/feedback.h / net/update_apply.h 里；实现收进平台层后跟过来。
+#pragma comment(lib, "user32.lib")
+
 namespace rta::platform {
 
 // 不弹窗地跑一个命令，返回退出码（-1 = 启动失败）+ 合并输出
@@ -58,6 +62,16 @@ inline ProcessResult run_hidden(const std::string& command_line_utf8, bool captu
     ::CloseHandle(pi.hProcess);
     out.exit_code = (int)code;
     return out;
+}
+
+// 语义 = 发一条启动器本来就认的 WM_COMMAND（ID_TRAY_EXIT = 1003，见 tools/launcher.cpp）。
+// 先按"类名 + 任意标题"找，再退到"类名 + 同名标题"（与迁移前 net/update_apply.h 一致）。
+inline bool request_launcher_exit() {
+    HWND h = ::FindWindowW(L"RLPlayerTray", nullptr);
+    if (!h) h = ::FindWindowW(L"RLPlayerTray", L"RLPlayerTray");
+    if (!h) return false;
+    ::PostMessageW(h, WM_COMMAND, (WPARAM)1003, 0);
+    return true;
 }
 
 inline std::string find_executable(const char* name) {

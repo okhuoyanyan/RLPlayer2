@@ -16,11 +16,12 @@
 # Usage:
 #   powershell -File tools\build_gpu_cuda.ps1                     # 全 arch（分发用）
 #   powershell -File tools\build_gpu_cuda.ps1 -Fast               # 只编本机 arch（开发用）
-#   powershell -File tools\build_gpu_cuda.ps1 -Out build\rtagpu_cuda.dll -CudaRoot "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+#   powershell -File tools\build_gpu_cuda.ps1 -Out build\rtagpu_cuda.dll -CudaRoot "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
 param(
   [string]$Out = "",
   [string]$CudaRoot = "",
-  [switch]$Fast
+  [switch]$Fast,
+  [switch]$VerifyOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,6 +51,8 @@ if (-not $cuda) {
   Write-Host "nvcc not found. Install the CUDA Toolkit (winget install Nvidia.CUDA) or pass -CudaRoot."
   exit 2
 }
+$versionText=(& (Join-Path $cuda 'bin\nvcc.exe') --version 2>&1 | Out-String)
+if ($LASTEXITCODE -ne 0 -or $versionText -notmatch 'release 12\.') { throw 'Distribution CUDA backend requires working CUDA 12.x (Maxwell/Pascal/Volta coverage)' }
 $nvcc = Join-Path $cuda 'bin\nvcc.exe'
 $cuobjdump = Join-Path $cuda 'bin\cuobjdump.exe'
 
@@ -94,6 +97,7 @@ $allSms = @(
 )
 $supported = @()
 $listOut = & $nvcc --list-gpu-arch 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { throw 'nvcc --list-gpu-arch failed' }
 foreach ($sm in $allSms) {
   # 注意：nvcc --list-gpu-arch 输出的是 compute_XX（不是 sm_XX）。
   # 两种写法都接受，但必须带边界，否则 sm_50 会撞上 sm_500 这类更长的编号。
@@ -105,6 +109,25 @@ if ($supported.Count -eq 0) {
   exit 1
 }
 Write-Host ("nvcc supports " + $supported.Count + " of " + $allSms.Count + " requested archs: sm_" + ($supported -join ',sm_'))
+
+$dumpbin = Join-Path $ccbin 'dumpbin.exe'
+$provenance = Join-Path $here 'cuda_build_provenance.py'
+$artifactGate = Join-Path $here 'check_cuda_artifact.py'
+$fullArchs = @(50,52,53,60,61,62,70,72,75,80,86,87,89,90,100,101,103,120,121)
+if (-not $Fast) {
+  $notSupported = @($fullArchs | Where-Object { $supported -notcontains $_ })
+  if ($notSupported.Count) { throw ('FULL CUDA 12.9 coverage missing: '+($notSupported -join ',')) }
+  $supported = $fullArchs
+}
+if ($VerifyOnly) {
+  if ($Fast) { throw '-VerifyOnly is a FULL 19-architecture release gate; -Fast is not allowed' }
+  & python $provenance verify --source $root --compiler $nvcc --host-compiler (Join-Path $ccbin 'cl.exe') --dll $Out --record ($Out+'.provenance.json')
+  if ($LASTEXITCODE -ne 0) { throw 'CUDA source/toolchain/DLL provenance failed' }
+  & python $artifactGate $Out --cuobjdump $cuobjdump --dumpbin $dumpbin --report ($Out+'.artifact.json')
+  if ($LASTEXITCODE -ne 0) { throw 'CUDA independent offline artifact gate failed' }
+  Write-Host 'CUDA VerifyOnly PASS_OFFLINE_ONLY; NVIDIA hardware execution remains UNVERIFIED'
+  exit 0
+}
 
 if ($Fast) {
   # 开发用：只编本机卡。判定用 nvidia-smi 的 compute capability 不直接可得，
@@ -142,7 +165,8 @@ $newest = ($archs | Measure-Object -Maximum).Maximum
 $nvArgs += "-gencode=arch=compute_$newest,code=compute_$newest"
 $nvArgs += @('-I', (Join-Path $root 'src'))
 $nvArgs += $srcs
-$nvArgs += @('-o', $Out)
+$temporaryOut = Join-Path $buildDir ('rtagpu_cuda-build-'+[guid]::NewGuid().ToString('N')+'.dll')
+$nvArgs += @('-o', $temporaryOut)
 
 $log = Join-Path $buildDir 'gpu_cuda_build.log'
 $ver = (& $nvcc --version 2>&1 | Out-String)
@@ -156,6 +180,10 @@ if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
 Write-Host ("building rtagpu_cuda.dll for " + ($archs -join ',') + " (arch count " + $archs.Count + ") ...")
 "=== nvcc ===`n$ver`n=== gpu ===`n$drv`n=== ccbin ===`n$ccbin`n=== args ===`n$($nvArgs -join ' ')" | Set-Content -Path $log -Encoding UTF8
 
+$snapshot = Join-Path $buildDir ('cuda-inputs-'+[guid]::NewGuid().ToString('N')+'.json')
+& python $provenance snapshot --source $root --compiler $nvcc --host-compiler (Join-Path $ccbin 'cl.exe') --snapshot $snapshot
+if ($LASTEXITCODE -ne 0) { throw 'CUDA input snapshot failed' }
+
 # nvcc 把 warning 写 stderr；ErrorActionPreference=Stop 会把它当终止错误。按退出码判定。
 $eap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
@@ -167,44 +195,16 @@ if ($rc -ne 0) {
   Get-Content $log -Tail 40 | ForEach-Object { Write-Host $_ }
   exit 1
 }
-if (-not (Test-Path $Out)) { Write-Host "CUDA build produced no output"; exit 1 }
+if (-not (Test-Path -LiteralPath $temporaryOut -PathType Leaf)) { Write-Host "CUDA build produced no output"; exit 1 }
 
-# ---------------- 4. 校验每个请求的 arch 真的进了二进制 ----------------
-# 判据取 cuobjdump 的 ELF 清单（不是搜文件名/字符串）：CUDA 的 fatbin 会把
-# cubin 名字写成 rtagpu_cuda.<n>.sm_89.cubin，但仅凭文件名匹配容易自欺——
-# -lelf 列的是真的被嵌入的 code object。
-$dumpOut = & $cuobjdump -lelf $Out 2>&1 | Out-String
-$missing = @()
-foreach ($sm in $archs) {
-  if ($dumpOut -notmatch ("sm_" + $sm + "(\D|$)")) { $missing += ("sm_" + $sm) }
-}
-if ($missing.Count -gt 0) {
-  Write-Host ("CUDA build missing code objects: " + ($missing -join ', '))
-  Write-Host "cuobjdump -lelf output:"
-  Write-Host $dumpOut
-  exit 1
-}
-
-# 导出符号校验：管线靠这两个名字动态加载，改名字不会报错、只会静默退回 CPU
-$symDump = & $cuobjdump -symbols $Out 2>&1 | Out-String
-$needSyms = @('rta_gpu_available', 'rta_gpu_convolve', 'rta_gpu_resample', 'rta_gpu_resample_invalidate')
-$missingSym = @($needSyms | Where-Object { $symDump -notmatch [regex]::Escape($_) })
-# cuobjdump -symbols 只列 device 符号；host 导出符号用 dumpbin 复核（MSVC 一定在）
-if ($ccbin) {
-  # dumpbin.exe 与 cl.exe 同目录（<VC>\Tools\MSVC\<ver>\bin\Hostx64\x64\）
-  $dumpbin = Join-Path $ccbin 'dumpbin.exe'
-  if (Test-Path $dumpbin) {
-    $exp = & $dumpbin /exports $Out 2>&1 | Out-String
-    $missingSym = @($needSyms | Where-Object { $exp -notmatch [regex]::Escape($_) })
-  } else {
-    Write-Host "warning: dumpbin.exe not found next to cl.exe; export symbols not verified"
-  }
-}
-if ($missingSym.Count -gt 0) {
-  Write-Host ("CUDA build missing exported symbols: " + ($missingSym -join ', '))
-  exit 1
-}
-
-Write-Host ("rtagpu_cuda.dll OK (" + $archs.Count + " archs, +PTX compute_" + $newest + "): " +
-            [math]::Round((Get-Item $Out).Length / 1KB) + " KB -> " + $Out)
+# Independent artifact validation happens before replacing any prior DLL.
+& python $artifactGate $temporaryOut --cuobjdump $cuobjdump --dumpbin $dumpbin --archs ($archs -join ',') --report ($temporaryOut+'.artifact.json')
+if ($LASTEXITCODE -ne 0) { throw 'CUDA offline artifact gate failed; previous DLL preserved' }
+& python $provenance seal --source $root --compiler $nvcc --host-compiler (Join-Path $ccbin 'cl.exe') --dll $temporaryOut --snapshot $snapshot --record ($temporaryOut+'.provenance.json')
+if ($LASTEXITCODE -ne 0) { throw 'CUDA inputs changed during build; previous DLL preserved' }
+Move-Item -LiteralPath $temporaryOut -Destination $Out -Force
+Move-Item -LiteralPath ($temporaryOut+'.provenance.json') -Destination ($Out+'.provenance.json') -Force
+Move-Item -LiteralPath ($temporaryOut+'.artifact.json') -Destination ($Out+'.artifact.json') -Force
+Write-Host "CUDA OFFLINE ARTIFACT CHECK ONLY: NVIDIA kernel execution remains unverified without matching hardware."
+Write-Host ("rtagpu_cuda.dll sealed ("+$archs.Count+" arches): "+$Out)
 exit 0

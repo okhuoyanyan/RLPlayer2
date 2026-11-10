@@ -1,4 +1,4 @@
-// test_dsd_stream_decode.cpp -- DsdPcmStream 与整曲解码的逐位一致性
+﻿// test_dsd_stream_decode.cpp -- DsdPcmStream 与整曲解码的逐位一致性
 //
 // 判据（铁律 3：判据必须能证明要证明的事）：
 //   * 从任意块边界顺序读、以及乱序/回头读，输出 PCM 必须与 read_any()/read_dsd_native()
@@ -23,8 +23,9 @@
 using rta::audio::AudioBuffer;
 namespace fs = std::filesystem;
 
-static int g_fail = 0;
+static int g_fail = 0, g_checks = 0;
 static void ck(bool c, const char* what, const std::string& detail = "") {
+    ++g_checks;
     if (c) std::printf("  [PASS] %s\n", what);
     else { std::printf("  [FAIL] %s  %s\n", what, detail.c_str()); ++g_fail; }
 }
@@ -57,7 +58,7 @@ static void test_pipeline_equivalence(const std::string& f, const AudioBuffer& w
     Pipeline pa(cfg), pb(cfg);
     rta::audio::DsdPcmStream s;
     std::string err;
-    if (!s.open(f, rta::audio::dsd_pcm_settings(), &err)) { std::printf("  [SKIP] stream open: %s\n", err.c_str()); return; }
+    if (!s.open(f, rta::audio::dsd_pcm_settings(), &err)) { ck(false, "pipeline stream must open the supplied/generated fixture", err); return; }
 
     size_t pos = 0, bad = 0, outFrames = 0;
     const size_t kChunk = 4096, ch = (size_t)whole.channels;
@@ -83,13 +84,13 @@ static void test_file(const std::string& f) {
     rta::audio::LoadNote note;
     AudioBuffer whole;
     try { whole = rta::audio::read_any(f, &note); }
-    catch (const std::exception& e) { std::printf("  [SKIP] read_any failed: %s\n", e.what()); return; }
-    if (whole.rate == 0 || whole.frames() == 0) { std::printf("  [SKIP] empty decode\n"); return; }
+    catch (const std::exception& e) { ck(false, "read_any must decode the supplied/generated fixture", e.what()); return; }
+    if (whole.rate == 0 || whole.frames() == 0) { ck(false, "supplied/generated fixture must decode nonempty samples"); return; }
 
     rta::audio::DsdPcmStream s;
     std::string err;
     if (!s.open(f, rta::audio::dsd_pcm_settings(), &err)) {
-        std::printf("  [SKIP] stream open failed: %s\n", err.c_str());
+        ck(false, "stream must open the supplied/generated fixture", err);
         return;
     }
     ck(s.rate() == whole.rate, "流式输出采样率与整曲解码一致",
@@ -143,6 +144,8 @@ static void test_file(const std::string& f) {
         ck(got5 == n5 && same_range(whole, c5, p5, n5), "seek 到 5:00 后读出的数据逐样本一致");
     }
 
+    else { std::printf("UNVERIFIED_REAL five-minute seek requires an explicit file longer than 301 seconds; generated short-fixture seek comparisons executed\n"); }
+
     // 5) 端到端：两条路喂同一管线，输出逐样本相同（只比前 5 秒，CPU 升频太慢）
     test_pipeline_equivalence(f, whole, 5.0);
 }
@@ -157,8 +160,29 @@ int main(int argc, char** argv) {
                                "build/testdata/src64.dsf" })
             if (fs::exists(fs::u8path(f))) files.push_back(f);
     }
-    if (files.empty()) { std::printf("no test files found (run from repo root)\n"); return 0; }
+    fs::path generated;
+    if (files.empty()) {
+        generated = fs::temp_directory_path() / ("rta-stream-dsd-fixture-" + std::to_string(GetCurrentProcessId()) + ".dsf");
+        rta::audio::DsdStream fixture;
+        fixture.rate=2822400; fixture.channels=2; fixture.bits=141120;
+        fixture.data.assign(2,std::vector<uint8_t>((fixture.bits+7)/8));
+        for(int channel=0;channel<2;++channel) {
+            rta::dsp::SdmConfig cfg; cfg.fs=fixture.rate; cfg.order=5;
+            cfg.oneBitOutput=true; cfg.ditherLsb=.0005;
+            rta::dsp::SdmModulator mod(cfg);
+            for(size_t bit=0;bit<fixture.bits;++bit)
+                fixture.setBit(channel,bit,mod.process(.001*std::sin(2*rta::dsp::kPi*(997+channel*211)*bit/fixture.rate))>0);
+        }
+        auto utf8=generated.u8string();
+        const std::string path(reinterpret_cast<const char*>(utf8.data()),utf8.size());
+        rta::audio::write_dsf(path,fixture);
+        if(!fs::exists(generated)) {std::printf("FAIL generated DSF fixture write\n");return 2;}
+        files.push_back(path);
+        std::printf("GENERATED_FIXTURE bits=%zu channels=2 level=-60dBFS; actual decoder/pipeline assertions required\n",size_t(fixture.bits));
+    }
     for (const auto& f : files) test_file(f);
+    ck(g_checks > 0, "at least one actual decoder comparison executed");
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "ALL PASS", g_fail, g_fail == 1 ? "" : "s");
+    if (!generated.empty()) {std::error_code ec;fs::remove(generated,ec);}
     return g_fail ? 1 : 0;
 }

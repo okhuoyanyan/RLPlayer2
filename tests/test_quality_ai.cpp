@@ -505,6 +505,28 @@ int main() {
         check(pr.system.find("📀 专辑基本信息") != std::string::npos &&
               pr.system.find("💿 补充背景与解读") != std::string::npos,
               "system 保留模型自己的分节结构（📀/🎵/💿）");
+
+        // 2026-11-02（用户：AI 资料「有部分中文、部分英文」）：
+        //   ① 非中文输出时 system 必须带对应语言的强指令；
+        //   ② fields 键名规则里的「（中文优先）」必须换成本语言 —— 否则英文界面里键名还是中文标题。
+        {
+            const rta::meta::ProfilePrompt pe =
+                rta::meta::build_profile_prompt(dg, "样本", "专辑", "[M1] 材料", {}, "en");
+            check(pe.system.find("IMPORTANT OUTPUT LANGUAGE") != std::string::npos,
+                  "en：system 含输出语言强指令");
+            check(pe.system.find("（中文优先）") == std::string::npos,
+                  "en：fields 键名规则不再要求中文优先");
+            check(pe.system.find("优先用English") != std::string::npos,
+                  "en：fields 键名规则改为本语言优先");
+            check(pe.user.find("Write every value in English") != std::string::npos,
+                  "en：user 收尾句要求英文");
+            const rta::meta::ProfilePrompt pj =
+                rta::meta::build_profile_prompt(dg, "样本", "专辑", "[M1] 材料", {}, "ja");
+            check(pj.system.find("【出力言語の厳守】") != std::string::npos, "ja：system 含日语指令");
+            const rta::meta::ProfilePrompt pz =
+                rta::meta::build_profile_prompt(dg, "样本", "专辑", "[M1] 材料", {}, "zh");
+            check(pz.system == pr.system, "zh：不追加任何语言指令（与默认完全一致）");
+        }
         check(pr.system.find("键名**自由**") != std::string::npos, "system 允许自由标签（不压成固定 schema）");
         check(pr.user.find("[M1]") != std::string::npos, "user 带材料编号 [M1]");
         printf("\n  ---- 古典模板 system 片段 ----\n%.420s\n", pr.system.c_str());

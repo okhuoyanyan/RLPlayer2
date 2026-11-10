@@ -945,6 +945,12 @@ int main(int argc, char** argv) {
     AudioBuffer out;
     std::vector<std::vector<double>> dsdPlanes;
 
+    // ★ 2026-11-01（P0）：管线准备会抛 std::runtime_error —— 例如某预设在该输出率下
+    //   原型抽头数超出 PolyphaseResampler 的预算（44.1k→384k 的 poly-sinc-xl 需要 3.68M 抽头，
+    //   旧预算 2^21）。以前这里没有 try/catch ⟹ 异常逃出 main ⟹ std::terminate ⟹
+    //   Windows 0xC0000409，看起来像崩溃（实测 exit=-1073740791）。
+    //   现在改成显式失败：打印原因 + 退出码 3，绝不抛到进程边界。
+    try {
     if (chunkFrames == 0 || chunkFrames >= in.frames()) {
         // 整块处理
         out = pl.process(in, &st, dsdMultiple > 0 ? &dsdPlanes : nullptr);
@@ -986,6 +992,12 @@ int main(int argc, char** argv) {
         printf("分块处理: %zu 帧/块, 共 %zu 块, 耗时 %.3f 秒 (%.1fx 实时)\n",
                chunkFrames, (total + chunkFrames - 1) / chunkFrames, el,
                (double)total / (double)in.rate / (el > 0 ? el : 1e-9));
+    }
+    } catch (const std::exception& e) {
+        printf("!! 管线准备失败：%s\n", e.what());
+        printf("   该滤波器在此输出采样率下的原型抽头数超出系数预算。\n");
+        printf("   可改选较短预设、降低输出采样率，或显式提高 maxPrototypeTaps。\n");
+        return 3;
     }
 
     // Offline/export paths retain the complete causal FIR/IR tail. Trim only

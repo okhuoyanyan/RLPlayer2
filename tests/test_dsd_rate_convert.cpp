@@ -1,4 +1,4 @@
-// test_dsd_rate_convert.cpp — DSD→DSD 速率转换（DSD64→128/256…）的判据
+﻿// test_dsd_rate_convert.cpp — DSD→DSD 速率转换（DSD64→128/256…）的判据
 //
 // 每一条都打印实测数字，铁律 3：判据要能证明要证明的事。
 //   1. 速率规划：同族整数倍支持 / 跨族与非整数倍明确拒绝（含原因里的数字）
@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -666,8 +667,15 @@ int main() {
     // ================= 7. 真实 .dsf 端到端 =================
     std::printf("\n=== 7. 真实 .dsf 端到端（流式解码 + 转换 + DoP 合法性）===\n");
     {
-        const char* path = "D:\\RTA-hqplayer\\MUSIC\\银の龙の背に乘って.dsf";
-        if (!std::filesystem::exists(u8path_of(path))) {
+        const char* real = std::getenv("RTA_REAL_LIBRARY_TESTS");
+        const char* requested = std::getenv("RTA_TEST_DSF_FILE");
+        if (real && std::string(real) == "1" && (!requested || !*requested || !std::filesystem::u8path(requested).is_absolute())) {
+            std::fprintf(stderr, "RTA_REAL_LIBRARY_TESTS=1 requires absolute RTA_TEST_DSF_FILE fixture path\n");
+            return 2;
+        }
+        const char* path = real && std::string(real) == "1" ? requested : "";
+        if (!*path || !std::filesystem::exists(u8path_of(path))) {
+            std::printf("UNVERIFIED_REAL: real DSF branch not requested/fixture absent; synthetic conversion assertions execute\n");
             std::printf("  [SKIP] 文件不存在：%s\n", path);
         } else {
             const auto fileMb = (double)std::filesystem::file_size(u8path_of(path)) / (1024.0 * 1024.0);

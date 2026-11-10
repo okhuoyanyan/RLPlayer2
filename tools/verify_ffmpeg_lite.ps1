@@ -11,13 +11,15 @@
 #   ... -SkipMatrix    # 只查二进制与解码器清单（矩阵要另外编，bootstrap 时用）
 param(
     [string]$Dir = "",
+    [string]$BuildDir = "",
     [switch]$SkipMatrix
 )
 
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $here
-if (-not $Dir) { $Dir = Join-Path $root 'build\ffmpeg-lite' }
+if(-not $BuildDir){$BuildDir=Join-Path $root 'build'}
+if(-not $Dir){$Dir=Join-Path $BuildDir 'ffmpeg-lite'}
 
 function Fail($msg) { Write-Host "FAILED: $msg"; exit 1 }
 
@@ -49,20 +51,30 @@ Write-Host ("OK  " + $pOut[0])
 # ---- 2. 解码器白名单 ----
 Write-Host "--- 2/3 必需解码器白名单 ---"
 $decoders = @()
-foreach ($line in @(& $ff -hide_banner -decoders 2>$null)) {
+$coverDecoders = @()
+$savedEap=$ErrorActionPreference;$ErrorActionPreference='Continue'
+$decoderOutput=@(& $ff -hide_banner -decoders 2>&1);$decoderExit=$LASTEXITCODE
+$ErrorActionPreference=$savedEap
+if($decoderExit -ne 0){Fail ('decoder inventory command failed: exit='+$decoderExit)}
+foreach ($line in $decoderOutput) {
     # 只收"像解码器名"的 token：图例行 "A..... = Audio" 会被解析成 "=" 必须滤掉
     if ($line -match '^\s(A[.A-Z]{5})\s+([a-z0-9_.]+)') { $decoders += $matches[2] }
+    if ($line -match '^\s(V[.A-Z]{5})\s+([a-z0-9_.]+)') { $coverDecoders += $matches[2] }
 }
 if ($decoders.Count -lt 150) { Fail "只数出 $($decoders.Count) 个解码器——精简版异常（解析或构建坏了）" }
 $reqFile = Join-Path $here 'ffmpeg_lite_required.txt'
 if (-not (Test-Path $reqFile)) { Fail "缺少白名单 $reqFile" }
 $required = @(Get-Content $reqFile | ForEach-Object { $_.Trim() } |
               Where-Object { $_ -and -not $_.StartsWith('#') })
+if($required.Count -eq 0){Fail 'Required decoder whitelist is empty; zero obligations are not proof'}
 $missing = @($required | Where-Object { $decoders -notcontains $_ })
 if ($missing.Count -gt 0) {
     Fail ("精简版缺必需解码器（" + $missing.Count + " 项）：" + ($missing -join ', '))
 }
 Write-Host ("OK  白名单 " + $required.Count + " 项齐全；解码器共 " + $decoders.Count + " 个")
+foreach ($coverCodec in @('png','mjpeg','bmp','gif')) {
+    if ($coverDecoders -notcontains $coverCodec) { Fail "Missing required cover decoder: $coverCodec" }
+}
 
 # ---- 2b. 编码器白名单（2026-10-23 新增）----
 # 为什么需要：用户反馈「1.3.x 封面不显示」，根因之一是 get_cover 用 -c:v png 转码取图，
@@ -70,47 +82,36 @@ Write-Host ("OK  白名单 " + $required.Count + " 项齐全；解码器共 " + 
 # 第 2 步只校验解码器，这类「用到编码器但被裁掉」的问题完全漏网。现在把编码器也钉住。
 Write-Host "--- 2b/3 必需编码器白名单 ---"
 $encoders = @()
-foreach ($line in @(& $ff -hide_banner -encoders 2>$null)) {
-    if ($line -match '^\s(A[.A-Z]{5})\s+([a-z0-9_.]+)') { $encoders += $matches[2] }
+$savedEap=$ErrorActionPreference;$ErrorActionPreference='Continue'
+$encoderOutput=@(& $ff -hide_banner -encoders 2>&1);$encoderExit=$LASTEXITCODE
+$ErrorActionPreference=$savedEap
+if($encoderExit -ne 0){Fail ('encoder inventory command failed: exit='+$encoderExit)}
+foreach ($line in $encoderOutput) {
+    if ($line -match '^\s([AV][.A-Z]{5})\s+([a-z0-9_.]+)') { $encoders += $matches[2] }
 }
-$requiredEnc = @('pcm_s16le', 'pcm_s24le', 'pcm_s32le', 'pcm_f32le')
+$requiredEnc = @('pcm_s16le', 'pcm_s24le', 'pcm_s32le', 'pcm_f32le', 'png', 'mjpeg')
 $missingEnc = @($requiredEnc | Where-Object { $encoders -notcontains $_ })
 if ($missingEnc.Count -gt 0) { Fail ("精简版缺必需编码器（" + $missingEnc.Count + " 项）：" + ($missingEnc -join ", ")) }
 Write-Host ("OK  编码器白名单 " + $requiredEnc.Count + " 项齐全；编码器共 " + $encoders.Count + " 个")
 
-# 封面抽取必须能工作：用 copy 通道，不依赖 png 编码器。占位 PNG 只有 77 字节，真实封面 >4KB。
-$coverProbe = Join-Path $root 'build\testdata\embedded.flac'
-if (Test-Path $coverProbe) {
-    $img = Join-Path $env:TEMP ('ffcover_' + [guid]::NewGuid().ToString('N') + '.img')
-    & $ff -v error -y -i $coverProbe -map 0:v:0 -c:v copy -f image2 $img 2>$null | Out-Null
-    $sz = if (Test-Path $img) { (Get-Item $img).Length } else { 0 }
-    Remove-Item $img -Force -ErrorAction SilentlyContinue
-    # 判据：get_cover 失败时返回内置 1x1 透明 PNG（77 字节）；成功则是真实图片（小样本也有上千字节）。
-    # 不能要求 >4096 —— testdata\embedded.flac 的封面本身只有 3 KB，那样会误报（已实测踩过）。
-    if ($sz -lt 200) { Fail ("内嵌封面抽取失败（只得到 $sz 字节；占位图是 77）—— 检查 get_cover 的 -c:v copy 通道") }
-    Write-Host ("OK  内嵌封面抽取正常（" + $sz + " 字节）")
-} else {
-    Write-Host "SKIP  缺少 build\testdata\embedded.flac，跳过内嵌封面抽取校验"
-}
+# An inventory entry alone is not proof. This independent, tiny fixture checks
+# actual decode/encode, attached PNG dimensions, metadata remux and bit-exact
+# audio preservation without calling a generator FFmpeg from PATH.
+$python = (Get-Command python -ErrorAction Stop).Source
+& $python -X utf8 (Join-Path $here 'verify_ffmpeg_png.py') --dir $Dir
+if ($LASTEXITCODE -ne 0) { Fail 'Actual PNG encode/decode/attached-art/audio-preservation check failed' }
 
-# ---- 3. 产品解码路径（格式矩阵）----
-Write-Host "--- 3/3 格式矩阵（rta::audio::read_any）---"
-if ($SkipMatrix) {
-    Write-Host "SKIP  -SkipMatrix：矩阵未跑（bootstrap 用；出包流程不许带这个开关）"
-} else {
-    $mtx = Join-Path $root 'build\test_ffmpeg_matrix.exe'
-    if (-not (Test-Path $mtx)) { Fail "缺少 $mtx（先 cmake --build build --target test_ffmpeg_matrix）" }
-    $env:RTA_FFMPEG_LITE_DIR = $Dir
-    try { $mOut = @(& $mtx 2>&1); $mRc = $LASTEXITCODE } finally { Remove-Item Env:\RTA_FFMPEG_LITE_DIR -ErrorAction SilentlyContinue }
-    $mOut | ForEach-Object { Write-Host $_ }
-    if ($mRc -ne 0) { Fail ("格式矩阵未通过（退出码 $mRc）—— 见上面 [FAIL] 行") }
-    # 注意：-like '*[FAIL]*' 里的方括号是【通配符字符类】，会匹配任何含 F/A/I/L 的行
-    # （实测把自己吓红过）。必须用 -match 的正则转义。
-    $failLines = @($mOut | Where-Object { $_ -match '\[FAIL\]' })
-    if ($failLines.Count -gt 0) { Fail "格式矩阵出现 [FAIL] 行" }
-    $sum = @($mOut | Where-Object { $_ -match '\[SUMMARY\]' })
-    if ($sum.Count -eq 0) { Fail "格式矩阵没有输出 [SUMMARY]（没真跑？）" }
+# Cover extraction is exercised by the fresh generated-media matrix below,
+# never an optional pre-existing build/testdata file from another build.
+Write-Host '--- 3/3 private generated-media matrix ---'
+if($SkipMatrix){
+ Write-Host 'UNVERIFIED_MATRIX: tools/codec inventory only; this bootstrap result does not authorize packaging'
+ Write-Host 'PASS_OFFLINE_TOOLS_ONLY (actual format/cover matrix not executed)'
+ exit 0
 }
-
-Write-Host "=== 守卫通过：精简版可用，允许出包 ==="
+. (Join-Path $here 'package_paths.ps1')
+$BuildDir=Resolve-ReleaseBuildDirectory -SourceRoot $root -BuildDir $BuildDir
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'run_safe_ctest.ps1') -BuildDir $BuildDir -SourceRoot $root -LiteDir $Dir -Include '^ffmpeg_matrix$'
+if($LASTEXITCODE -ne 0){Fail 'Actual generated format/cover matrix failed or did not execute'}
+Write-Host 'PASS_PACKAGED_FFMPEG_MATRIX: tools + actual generated media decode/remux/cover; unencodable formats remain explicitly uncovered'
 exit 0

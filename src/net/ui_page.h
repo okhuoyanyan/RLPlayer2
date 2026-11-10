@@ -263,8 +263,9 @@ inline std::string rta_ui_page() {
     // 顶栏与内容同底色、无分隔线：整块界面连成一片（QQ 音乐式一体化）。
     h += ".top{grid-column:1/-1;display:flex;align-items:center;gap:10px;padding:0 10px 0 16px;background:var(--bg);border-bottom:0;position:relative;z-index:9;min-width:0}";
     h += ".hsep{width:1px;height:18px;background:var(--line);margin:0 2px;flex:none}";
-    h += ".ptitle{font-weight:650;font-size:14px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px;flex:none}";
-    h += ".pcnt{font-size:11px;color:var(--mut2);white-space:nowrap;flex:none}";
+    h += ".ptitle{font-weight:650;font-size:14px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px;min-width:0;flex:0 1 auto}";
+    h += ".pcnt{font-size:11px;color:var(--mut2);white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto}";
+    h += "@media(max-width:1100px){.top .pcnt{display:none}.top .ptitle{max-width:180px}}";
     h += ".ptools{display:flex;align-items:center;gap:4px;flex:none}";
     h += ".wctl{display:none;align-items:center;margin-left:2px;margin-right:-10px;flex:none}";
     h += "html.webview2 .wctl{display:flex}";
@@ -465,10 +466,13 @@ inline std::string rta_ui_page() {
     // 又不挤占封面/标题区。每块 = 小标题 + 一句人话结论 + 2×2 指标格（指标名 + 数值 + 单位）。
     // 指标格用 --mut2 小字 + tabular-nums，数值右对齐 ⟹ 三条并排时数字列也能对齐。
     h += ".npanal{display:flex;flex-direction:column;gap:8px;min-width:0}";
-    h += ".npanal-hd{display:flex;align-items:center;gap:8px;min-width:0}";
+    h += ".npanal-hd{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap;row-gap:4px}";
     h += ".npanal-hd .t{font-size:10px;letter-spacing:1.4px;color:var(--mut2);font-weight:700;white-space:nowrap}";
     h += ".npanal-hd .st{font-size:10.5px;color:var(--mut2);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
-    h += ".npanal-hd .sp{flex:1}";
+    h += ".npanal-hd .sp{flex:1 1 0;min-width:0}";
+// 2026-11-02：英文按钮比中文长，原来是 flex 默认允许收缩 ⟹ 文字溢出盒子、两个按钮压在一起（截图实测）。
+//   按钮不收缩，让状态文字收缩。
+h += ".npanal-hd .npanal-btn{flex:0 0 auto}";
     h += ".npanal-btn{font-size:10.5px;padding:2px 9px;border-radius:6px;border:1px solid var(--line);background:transparent;color:var(--mut);cursor:pointer;white-space:nowrap;transition:.13s}";
     h += ".npanal-btn:hover{color:var(--txt);border-color:var(--acc);background:var(--hov)}";
     h += ".npanal-btn.on{color:var(--ok-text);border-color:var(--ok-line);background:var(--ok-bg)}";
@@ -476,14 +480,19 @@ inline std::string rta_ui_page() {
     h += ".npanal-card{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.08);border-radius:11px;padding:6px 10px;min-width:0;display:flex;flex-direction:column;gap:3px}";
     h += ".npanal-card .ct{font-size:10.5px;font-weight:700;letter-spacing:.6px;color:var(--mut);display:flex;align-items:baseline;gap:6px;min-width:0}";
     h += ".npanal-card .ct i{font-style:normal;font-size:9.5px;font-weight:400;color:var(--mut2);letter-spacing:0}";
-    h += ".npanal-verdict{font-size:12.5px;font-weight:650;color:var(--txt);line-height:1.35;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}";
+    // 2026-11-02：英文文案比中文长，原来 nowrap+ellipsis 会把结论吃掉半句 ⟹ 允许折行（最多 3 行）
+h += ".npanal-verdict{font-size:12.5px;font-weight:650;color:var(--txt);line-height:1.35;min-width:0;white-space:normal;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}";
     h += ".npanal-verdict.warn{color:var(--warn)}";
     h += ".npanal-verdict.ok{color:var(--ok-text)}";
     h += ".npanal-verdict.mut{color:var(--mut2);font-weight:500;font-size:11.5px}";
     h += ".npanal-kv{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 10px;font-size:10.5px;line-height:1.45}";
-    h += ".npanal-kv .r{display:flex;align-items:baseline;justify-content:space-between;gap:6px;min-width:0}";
-    h += ".npanal-kv .k{color:var(--mut2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
-    h += ".npanal-kv .v{font-variant-numeric:tabular-nums;font-weight:600;color:var(--txt2);white-space:nowrap}";
+    h += ".npanal-kv .r{display:flex;align-items:baseline;justify-content:space-between;gap:6px;min-width:0;flex-wrap:wrap}";
+// ③ 假无损卡：值最长（"Bandwidth limited (not judged lossy)"）⟹ 这一卡用单列，避免压到右边那一项
+h += "#npAnlFake .npanal-kv{grid-template-columns:minmax(0,1fr)}";
+h += "#npAnlFake .npanal-kv .v{text-align:right}";
+    h += ".npanal-kv .k{color:var(--mut2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;min-width:0}";
+    // 2026-11-02：值允许折行（英文长句原来会压到右边那一列上，实测「Verdict」整格压住「Cutoff」）
+h += ".npanal-kv .v{font-variant-numeric:tabular-nums;font-weight:600;color:var(--txt2);white-space:normal;overflow-wrap:anywhere;text-align:right;flex:0 1 auto;min-width:0}";
     h += ".npanal-kv .v i{font-style:normal;font-weight:400;color:var(--mut2);font-size:9.5px}";
     h += ".npanal-skel{height:9px;border-radius:4px;background:var(--track);animation:npanlpulse 1.2s ease-in-out infinite}";
     h += "@keyframes npanlpulse{0%,100%{opacity:.35}50%{opacity:.85}}";
@@ -507,8 +516,15 @@ inline std::string rta_ui_page() {
     // （实测 1600×950 下 L2 高 1038 px ⟹ 控制条 bottom=1136 > innerHeight 858）。
     // 上限 30vh：L1(210) + 30vh(≈290) + 控制区 仍留在视口内；超出部分在块内滚动。
     // position/z-index：L2 撑高后，右栏「AI 整理」浮卡会盖住表头按钮 —— 分析条自己成一层排在它上面。
-    h += ".npanal{position:relative;z-index:20}";
-    h += ".npanal-det{grid-column:1/-1;display:flex;flex-direction:column;gap:6px;min-width:0;max-height:30vh;overflow-y:auto;overscroll-behavior:contain;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.08);border-radius:11px;padding:8px 10px}";
+    // 2026-11-02：分析条是 sticky + z-index:20，但原来**没有背景色** ⟹ 滚到下面时正文会从条缝里透出来，
+//   截图里「Completed」徽标就压在分析条标题上。给它一个不透明底。
+h += ".npanal{position:relative;z-index:20;background:var(--bg);padding-top:4px;padding-bottom:2px}";
+    // 2026-11-02（阿拉伯语实测）：数值格在 RTL 里会被 bidi 重排（"−0.861" 显示成 "0.861-"）⟹
+//   数字串单独隔离成 LTR，并按左对齐放回单元格。
+h += "html[dir=rtl] .npanal-kv .v,html[dir=rtl] .npanal-det .v{unicode-bidi:isolate;direction:ltr;text-align:left}";
+// 2026-11-02（用户：音频质量「必须全部展开」）：原来这里是 30vh 的内部滚动框，展开后还要再滚一次才对，
+//   而且判定依据那一组会被截在框口。改成随内容展开（整页滚动）。
+h += ".npanal-det{grid-column:1/-1;display:flex;flex-direction:column;gap:6px;min-width:0;max-height:none;overflow:visible;overscroll-behavior:contain;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.08);border-radius:11px;padding:8px 10px}";
     // L2 里一行两格会把"指标名…数值"拉开到 500px，读起来断裂 ⟹ 宽屏四列（窄屏由下面的媒体查询回落两列）
     h += ".npanal-det .npanal-kv{grid-template-columns:repeat(3,minmax(0,1fr))}";
     h += ".npanal-det .dh{font-size:10.5px;font-weight:700;letter-spacing:.6px;color:var(--mut);display:flex;align-items:baseline;gap:6px}";
@@ -560,6 +576,7 @@ inline std::string rta_ui_page() {
     h += ".trow.on{background:var(--acc-weak)}";
     h += ".trow .n{color:var(--mut2);text-align:right;font-variant-numeric:tabular-nums;font-size:11.5px}";
     h += ".trow .tt{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
+    h += ".album-song-title{display:flex;align-items:center;gap:8px}.album-song-art{width:30px;height:30px;flex:none;border-radius:4px;background:var(--bg3);overflow:hidden}.album-song-art img{width:100%;height:100%;object-fit:cover;visibility:hidden}.album-song-label{min-width:0;overflow:hidden;text-overflow:ellipsis}";
     h += ".trow .ar{color:var(--mut2);min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11.5px}";
     // 261027-04 #2：.du 原来**只有 text-align:right**，没有 nowrap/ellipsis ⟹ 长专辑名在窄列里
     // 自动折 2~3 行，把最近播放的行撑成 32/50/68px 各不相同（用户：「每一行的行距不一样」）。
@@ -828,7 +845,10 @@ h += "#npPage .npedge{display:none}";
     //   没设过就退回原来的 clamp()，老用户观感零变化。
     h += ".npline{font-size:var(--ly-size,clamp(13px,1.9vh,17px));line-height:2.05;color:var(--mut);transition:.18s}";
     // 译文行：比正文小一号、更淡；不参与高亮加粗（高亮的是原文那一行）
-    h += ".ly-tr{font-size:.8em;line-height:1.5;color:var(--mut2);margin-top:2px;font-weight:400;transform:none}";
+    // 2026-11-01（用户 261101 #1）：译文必须**自成一行**、比原文小且暗（参考 QQ 音乐）。
+// 旧值 margin-top:2px + 与原文同一 line-height，两行贴得像一行；这里给足行距与缩进，
+// 并显式 display:block + 取消加粗/缩放继承（.npline.on 会 font-weight:650 / scale）。
+h += ".ly-tr{display:block;font-size:.86em;line-height:1.55;color:var(--mut2);opacity:.92;margin-top:6px;font-weight:400;letter-spacing:.01em;transform:none}";
     // 音译行：斜体，进一步弱化，避免和译文抢视线
     h += ".ly-ph{font-size:.76em;line-height:1.45;color:var(--mut2);font-style:italic;margin-top:1px;font-weight:400;transform:none}";
     // 假名注音：行内小字，放在汉字之前（行内注音而不是 ruby，避免逐字对齐把行高撑乱）
@@ -840,6 +860,8 @@ h += "#npPage .npedge{display:none}";
     h += ".ctxmk{display:inline-block;width:14px;opacity:.85}";
     h += ".ctxnote{padding:4px 11px 6px;font-size:10.5px;color:var(--mut2);letter-spacing:.02em}";
     h += ".npline.on{color:var(--txt);font-weight:650;transform:scale(1.03)}";
+// 2026-11-02：只在中文界面出现的内容（如 QQ 群）。语言标记挂在 body 上，切语言即时生效。
+h += "body[data-i18n-lang]:not([data-i18n-lang=zh]) .zh-only{display:none!important}";
     // 行3：控制区（261024-01 #3b ①：音量不再是底部独立一行）——
     //   进度条一行；下面**同一行**放「时间（左）/ 控制键（中）/ 音量（右）」，
     //   三列都居中于同一条竖轴，整页底部只剩这一块控制区。
@@ -1198,6 +1220,25 @@ h += "#npPage .npedge{display:none}";
     // 滚动条
     h += "::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:var(--track);border-radius:5px}";
     h += "::-webkit-scrollbar-track{background:transparent}";
+    h += R"QSCSS(
+.quick-start{max-width:1160px;margin:0 auto;padding:30px 32px 42px;color:var(--txt)}
+.qs-intro,.qs-device,.qs-profile-top,.qs-preview{display:flex;justify-content:space-between;align-items:center;gap:16px}
+.qs-intro{margin-bottom:26px}.qs-eyebrow{font-size:10px;letter-spacing:2.4px;color:var(--mut2);margin-bottom:9px}
+.qs-intro h1{font-size:28px;letter-spacing:-.7px;margin:0 0 8px;font-weight:650}.qs-intro p{color:var(--mut);margin:0;line-height:1.7}
+.qs-device{padding:20px 22px;background:var(--card);border:1px solid var(--line);border-radius:12px}.qs-device>div{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;min-width:0}
+.qs-device strong{font-size:16px;overflow-wrap:anywhere}.qs-label{font-size:12px;color:var(--mut)}.qs-backend{font-size:11px;color:var(--acc-text);background:var(--acc-weak);border-radius:5px;padding:4px 7px}
+.qs-caps{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin:14px 0 20px;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+.qs-cap{display:flex;flex-direction:column;gap:8px;min-width:0;padding:17px 20px;border-right:1px solid var(--line)}.qs-cap:last-child{border:0}.qs-cap>span{font-size:11px;color:var(--mut2);letter-spacing:1px}.qs-cap strong{font-size:14px;font-weight:550;overflow-wrap:anywhere}
+.qs-note{color:var(--mut);font-size:12px;padding:0 2px;line-height:1.7}.quick-start h2{font-size:15px;font-weight:600;margin:28px 0 13px}
+.qs-profiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:13px}.qs-profile{color:var(--txt);text-align:left;border:1px solid var(--line);background:var(--card);border-radius:11px;padding:20px;display:flex;flex-direction:column;gap:13px;cursor:pointer;min-width:0;transition:border-color .15s,background .15s}
+.qs-profile:hover:not(:disabled),.qs-profile[aria-pressed=true]{border-color:var(--acc);background:var(--hov)}.qs-profile:disabled{opacity:.5;cursor:default}.qs-profile-top{flex-wrap:wrap;gap:6px}.qs-profile-top strong{font-size:15px;font-weight:600}.qs-profile>span:not(:first-child){font-size:12px;color:var(--mut);line-height:1.7}
+.qs-recommend{color:var(--acc-text);background:var(--acc-weak);font-size:10px;border-radius:4px;padding:3px 6px}.qs-profile .qs-profile-action{margin-top:auto;color:var(--acc-text);padding-top:8px}
+.qs-preview{margin-top:14px;padding:18px 20px;border:1px solid var(--acc);border-radius:10px;background:var(--card)}.qs-preview[hidden]{display:none}.qs-preview p{color:var(--txt2);font-size:12px;line-height:1.7;margin:8px 0}.qs-preview small{color:var(--mut);font-size:11px}
+.qs-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.qs-action{border:1px solid var(--line);border-radius:9px;background:var(--card);color:var(--txt2);padding:14px;display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;text-align:left;font-size:12px}.qs-action:hover{border-color:var(--acc);color:var(--txt)}.qs-action span{color:var(--mut2)}
+.qs-foot{font-size:11px;color:var(--mut2);line-height:1.7;margin-top:20px}.quick-start button:focus-visible{outline:2px solid var(--acc);outline-offset:3px}
+@media(max-width:1050px){.quick-start{padding:24px 20px}.qs-profiles{grid-template-columns:1fr}.qs-profile{gap:7px;padding:15px 18px}.qs-actions{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:650px){.qs-intro,.qs-device,.qs-preview{align-items:flex-start;flex-direction:column}.qs-caps{grid-template-columns:1fr}.qs-cap{border-right:0;border-bottom:1px solid var(--line)}}
+)QSCSS";
     h += "</style></head><body>";
     h += "<div id=app>";
 
@@ -1222,6 +1263,7 @@ h += "#npPage .npedge{display:none}";
 
     // ---------- 侧栏（只保留真正的入口；播放列表就用播放队列） ----------
     h += "<div class=side>";
+    h += "<button type=button class=nav data-v=station><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><path d='M4 11l8-7 8 7v9H4z'/><path d='M9 20v-7h6v7'/></svg>快速开始</button>";
     h += "<div class='nav on' data-v=albums><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><circle cx='12' cy='12' r='9'/><circle cx='12' cy='12' r='2.5'/></svg>专辑</div>";
     h += "<div class=nav data-v=artists><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8'><circle cx='12' cy='8' r='3.6'/><path d='M4.5 20.5c0-4.1 3.4-6.8 7.5-6.8s7.5 2.7 7.5 6.8'/></svg>艺术家</div>";
     // 2026-10-23 用户 261023-04 #9：「古典作品」不再占左导航（作品/版本推荐入口移到单曲页「作品」tab）。
@@ -1288,7 +1330,11 @@ h += "#npPage .npedge{display:none}";
     // src 与 max 的区别正在这里：src 只要设备支持源率就逐位直通，不支持时由
     // rate_pick.h 的降级逻辑处理（不会去挑 384k），所以 10-22 那个坑不会被重新踩到。
     h += "<select id=sRate><option value=src>源采样率（直通）</option><option value=follow>跟随系统</option><option value=max>自动（按族策略选最高）</option>";
-    for (int r : {44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000}) {
+    // 2026-11-01：旧列表止于 768000，而 DSP 实测到 1411200（32×）与 1536000（32×）都成立
+    // （rtaplay --rate 1411200 --analyze 实跑：4410 帧 → 144496 帧，211 抽头/相位）。列表本身
+    // 不是能力上限，只是可选项；设备不支持时由 rate_pick 的降级逻辑如实报错。
+    for (int r : {44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000,
+                  1411200, 1536000}) {
         h += "<option value=" + std::to_string(r) + ">" + std::to_string(r) + "</option>";
     }
     h += "</select>";
@@ -1343,7 +1389,10 @@ h += "#npPage .npedge{display:none}";
     // 261024-02 #5：投放中的底栏徽标（与单曲页按钮、流媒体页推送区块同源 /api/cast/state）
     h += "<span class=badge id=castBadge style='display:none' title='正在投放'>UPnP</span>";
     h += "<svg width=14 height=14 viewBox='0 0 24 24' fill=none stroke=currentColor stroke-width=2 opacity=.55><path d='M3 10v4h4l5 4V6L7 10H3z'/><path d='M16.5 8.5a5 5 0 010 7'/></svg>";
-    h += "<input id=vol type=range min=-60 max=0 step=0.5 value=0></div></div>";
+    h += "<span id=volumePending style='font-size:11px;color:var(--mut)'>音量尚未读取</span>";
+    h += "<input id=vol type=range min=-120 max=0 step=0.5 value=0 disabled aria-busy=true style='visibility:hidden'></div></div>";
+    h += "<div id=playbackSettingsNotice role=status aria-live=polite style='position:fixed;z-index:200;left:50%;bottom:96px;transform:translateX(-50%);max-width:calc(100% - 32px);padding:12px 16px;border:1px solid var(--line);border-radius:10px;background:var(--phbg);color:var(--txt)'>";
+    h += "<span id=playbackSettingsMsg>正在读取播放设置，完成后请再次点击播放。</span> <button class='btn pri' id=playbackSettingsRetry hidden>重新读取播放设置</button></div>";
     // ---------- 正在播放（点封面/曲名打开） ----------
     // 布局：CSS Grid 四行（2026-10-23 用户 261023-04 #6）——
     //   .nphero 封面+标题区 / .npdata 资料区 / #npLyric 歌词区 / .npctl2 进度控制区。
@@ -1361,7 +1410,11 @@ h += "#npPage .npedge{display:none}";
     h += "<div class=npgrid id=npGrid>";
     // 行1：封面 + 标题区（标题/副题/元数据芯片/EQ 芯片）
     h += "<div class=nphero>";
-    h += "<div class=npcover><img id=npCover alt=''></div>";
+    h += "<div class=npcover style='position:relative'><img id=npCover alt=''>"
+         "<div style='position:absolute;right:8px;bottom:8px;display:flex;gap:4px'>"
+         "<button class=btn id=npSetCover title='仅设置当前歌曲封面，不修改专辑和音乐文件' aria-label='设置歌曲封面' style='padding:4px 7px;font-size:11px'>设置歌曲封面</button>"
+         "<button class=btn id=npResetCover title='恢复自动封面' style='display:none;padding:4px 7px;font-size:11px'>自动</button>"
+         "</div><input type=file id=npCoverFile accept='image/*' style='display:none'></div>";
     h += "<div class=npinfo>";
     h += "<div class=npkind id=npKind>正在播放</div>";
     h += "<div class=nptitleline><div class=nptit id=npTitle>未播放</div>";
@@ -1426,7 +1479,7 @@ h += "#npPage .npedge{display:none}";
     h += "</div>";   // .npkeys —— 音量必须和 npkeys 同级，才是"同一行"
     // 音量并入同一控制行（#3b ①）；滑块本身是 #vol 的镜像（同一个 S.vol 真相源，见 setVol）
     h += "<div class=npvol><svg width='14' height='14' viewBox='0 0 24 24' fill=none stroke='currentColor' stroke-width='2' opacity=.6><path d='M3 10v4h4l5 4V6L7 10H3z'/><path d='M16.5 8.5a5 5 0 010 7'/></svg>";
-    h += "<input id=npVol type=range min=-60 max=0 step=0.5 value=0 title='音量（dB）'>";
+    h += "<input id=npVol type=range min=-120 max=0 step=0.5 value=0 title='音量（dB）'>";
     h += "<span class=vlab id=npVolLab>0.0 dB</span></div>";
     h += "</div>";   // .npctlrow
     h += "</div>";   // .npctl2

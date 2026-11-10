@@ -6,8 +6,9 @@
 //      而语言包是纯数据，放盘上还能让用户自己补词条（缺失的键自动回落中文）。
 //   ② 键 = **中文原文**。界面里本来就有 1 万多个中文字面量，逐处改成 t("key") 等于重写 UI；
 //      用中文原文当键，前端只要在渲染后做一次文本节点替换即可，零侵入。
-//   ③ 系统语言探测走 Win32 `GetUserDefaultUILanguage()`（不是 GetSystemDefaultUILanguage ——
-//      前者是"当前登录用户的界面语言"，用户改了显示语言立刻生效，后者是安装时的系统语言）。
+//   ③ 系统语言探测走平台层 platform::user_ui_language_id()（Windows 实现 =
+//      GetUserDefaultUILanguage，不是 GetSystemDefaultUILanguage —— 前者是"当前登录用户的
+//      界面语言"，用户改了显示语言立刻生效，后者是安装时的系统语言）。
 #pragma once
 #include <string>
 #include <vector>
@@ -17,15 +18,7 @@
 #include "net/json.h"
 #include "platform/path.h"
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
+#include "platform/sysinfo.h"   // user_ui_language_id（Win32 的 GetUserDefaultUILanguage 已在平台层）
 
 namespace rta::net {
 
@@ -79,13 +72,10 @@ inline std::string i18n_from_lang_id(unsigned langid) {
 
 // 系统界面语言（当前登录用户）。取不到时回落 en。
 inline std::string i18n_detect_system() {
-#ifdef _WIN32
-    const LANGID id = ::GetUserDefaultUILanguage();
+    // 平台层：用户界面语言（0 = 取不到，回落英语）
+    const unsigned id = rta::platform::user_ui_language_id();
     if (id == 0) return "en";
-    return i18n_from_lang_id((unsigned)id);
-#else
-    return "en";
-#endif
+    return i18n_from_lang_id(id);
 }
 
 // "auto" / 空 ⟹ 用系统语言；其余必须受支持，否则也回落系统语言。

@@ -15,18 +15,16 @@ production_config(const rta::dsp::FilterPreset &p, unsigned in, unsigned out,
   c.outRate = out;
   c.channels = 1;
   apply_preset(c, p);
-  if (!manual && c.minTapsPerInput == 0)
-    c.minTapsPerInput =
-        solve_taps_per_phase(p.window, p.transition, p.apodizing, p.apodF1,
-                             p.apodF2, p.taps, 0, (double)in);
-  return c;
+  c.allowAutomaticCascade = !manual;
+  c.autoTaps = !manual;
+  return resolve_auto_taps(c);
 }
 
-// Single-stage prototype is in interpolation domain; cascade hook returns
-// process() output impulse.
+// Both hooks export the interpolation-domain prototype before decimation.
 inline double prototype_rate(const rta::dsp::PolyphaseResampler &r, unsigned in,
                              unsigned out) {
-  return r.two_stage() ? (double)out : (double)in * r.upFactor();
+  (void)out;
+  return (double)in * r.upFactor();
 }
 inline double diagnostic_stop_db(const std::vector<double> &h, double first) {
   // Coarse sampling plus local search can miss other narrow peaks.
