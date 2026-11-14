@@ -17,6 +17,7 @@ enum class HostAction {
     Drag,
     Theme,
     OpenUrl,
+    PickMusicFolder,
     Resize        // arg: left/right/top/bottom/topleft/topright/bottomleft/bottomright
 };
 
@@ -57,6 +58,7 @@ inline HostMessage parse_host_message(const std::string& m) {
     if (m == "max") { r.action = HostAction::Maximize; return r; }
     if (m == "close") { r.action = HostAction::Close; return r; }
     if (m == "drag") { r.action = HostAction::Drag; return r; }
+    if (m == "pick-music-folder") { r.action = HostAction::PickMusicFolder; return r; }
     if (m.rfind("theme:", 0) == 0) {
         r.action = HostAction::Theme;
         r.arg = m.substr(6);

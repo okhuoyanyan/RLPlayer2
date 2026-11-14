@@ -1,4 +1,4 @@
-// upnp_control.h — UPnP/DLNA 媒体投放控制面与格式取证（零 windows.h，跨平台）
+// upnp_control.h — UPnP/DLNA 媒体投放控制面与格式取证（Windows 发布平台）
 //
 // 契约要点（ROADMAP P5a）：
 //   1) SOAP 动作：SetAVTransportURI、Play、Pause、Stop、Seek、GetTransportInfo、
@@ -21,6 +21,11 @@
 #include <functional>
 #include <algorithm>
 #include <cstdio>
+#include <stdexcept>
+#ifdef _WIN32
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
+#endif
 
 namespace rta::net {
 
@@ -1124,13 +1129,27 @@ inline bool validate_stream_token(const std::string& requestPath, const std::str
 
 inline std::string generate_random_token(size_t hexLength = 16) {
     static const char hexChars[] = "0123456789abcdef";
-    std::string tok;
-    tok.reserve(hexLength);
-    uint64_t seed = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
-    for (size_t i = 0; i < hexLength; ++i) {
-        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
-        tok += hexChars[(seed >> 32) & 0x0F];
+    std::string tok(hexLength, '0');
+#ifdef _WIN32
+    // Tokens grant access to a local stream. A timestamp-seeded generator can
+    // repeat within one clock tick and is predictable. Use the OS CSPRNG;
+    // failure must abort registration before any stream is published.
+    unsigned char bytes[128];
+    for (size_t offset = 0; offset < hexLength;) {
+        const size_t remaining = hexLength - offset;
+        const ULONG count = (ULONG)std::min(sizeof(bytes), remaining / 2 + remaining % 2);
+        const NTSTATUS status = BCryptGenRandom(nullptr, bytes, count, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (status < 0)
+            throw std::runtime_error("Windows system random source failed; stream token was not generated (status=" +
+                                     std::to_string((long)status) + ")");
+        for (ULONG i = 0; i < count; ++i) {
+            tok[offset++] = hexChars[bytes[i] >> 4];
+            if (offset < hexLength) tok[offset++] = hexChars[bytes[i] & 0x0f];
+        }
     }
+#else
+    if (hexLength) throw std::runtime_error("Secure stream token generation requires Windows system RNG");
+#endif
     return tok;
 }
 

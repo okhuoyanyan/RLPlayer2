@@ -26,12 +26,7 @@
 //   2) 非 Windows 平台没有 CP936 转换表，cue_gbk_to_utf8() 原样返回字节（本仓库只构建 Windows）。
 //   3) 方言指令（CDTEXTFILE / FLAGS / SONGWRITER 之外的自造指令）只记 warning，不解释含义。
 #pragma once
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
+#include "platform/text.h"   // UTF-8/UTF-16/GBK 转换（Win32 的 CP_UTF8 / CP936 调用已在平台层）
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -43,9 +38,6 @@
 #include <iterator>
 #include <string>
 #include <vector>
-#if defined(_WIN32)
-#include <windows.h>
-#endif
 
 namespace rta::meta {
 
@@ -85,47 +77,25 @@ inline bool cue_utf8_valid(const std::string& s) {
     return true;
 }
 
+// UTF-16 -> UTF-8（CP_UTF8, flags=0, 显式长度；空串 -> 空串；失败 -> 空串）
 inline std::string cue_from_wstring(const std::wstring& w) {
-#if defined(_WIN32)
-    if (w.empty()) return std::string();
-    const int n = ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    if (n <= 0) return std::string();
-    std::string s((size_t)n, '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n, nullptr, nullptr);
-    return s;
-#else
-    return std::string(w.begin(), w.end());
-#endif
+    return rta::platform::wide_to_utf8(w);
 }
 
+// UTF-8 -> UTF-16（CP_UTF8, flags=0, 显式长度；空串 -> 空串；失败 -> 空串）
 inline std::wstring cue_widen_utf8(const std::string& s) {
-#if defined(_WIN32)
-    if (s.empty()) return std::wstring();
-    const int n = ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    if (n <= 0) return std::wstring();
-    std::wstring w((size_t)n, L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), w.data(), n);
-    return w;
-#else
-    return std::wstring(s.begin(), s.end());
-#endif
+    return rta::platform::utf8_to_wide(s);
 }
 
 // UTF-8 路径 -> std::filesystem::path（Windows 上必须走宽字符，否则非 ASCII 目录名打不开）
+// 为什么不是 platform::path 的 from_utf8：后者按 u8string 构造（非法 UTF-8 会抛），
+// 这里沿用"MultiByteToWideChar + 宽字符构造"的既有行为（非法序列替换成 U+FFFD，绝不抛）。
 inline fsc::path cue_u8path(const std::string& s) {
-#if defined(_WIN32)
     return fsc::path(cue_widen_utf8(s));
-#else
-    return fsc::path(s);
-#endif
 }
 
 inline std::string cue_path_utf8(const fsc::path& p) {
-#if defined(_WIN32)
     return cue_from_wstring(p.wstring());
-#else
-    return p.string();
-#endif
 }
 
 // UTF-16（记事本「Unicode」/「Unicode big endian」另存的 cue 不少见）→ UTF-8
@@ -142,17 +112,11 @@ inline std::string cue_utf16_to_utf8(const std::string& raw, bool bigEndian) {
 
 // GBK（CP936）→ UTF-8。先严格解（非法序列会失败），再宽松解（坏字节变 U+FFFD，不丢上下文）。
 inline std::string cue_gbk_to_utf8(const std::string& s) {
-#if defined(_WIN32)
-    if (s.empty()) return std::string();
-    int n = ::MultiByteToWideChar(936, MB_ERR_INVALID_CHARS, s.c_str(), (int)s.size(), nullptr, 0);
-    if (n <= 0) n = ::MultiByteToWideChar(936, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    if (n <= 0) return s;                       // 连宽松解码都失败：原样返回，绝不丢字节
-    std::wstring w((size_t)n, L'\0');
-    if (::MultiByteToWideChar(936, 0, s.c_str(), (int)s.size(), w.data(), n) <= 0) return s;
-    return cue_from_wstring(w);
-#else
-    return s;                                   // 非 Windows：没有 CP936 表，原样返回（见文件头未解决项 2）
-#endif
+    std::string out;
+    // 平台层逐步复刻原来的三段调用：严格探测（MB_ERR_INVALID_CHARS）-> 宽松探测 -> 宽松转换。
+    // 返回 false = 连宽松解码都失败 ⟹ 原样返回，绝不丢字节。
+    if (!rta::platform::gbk_to_utf8(s, out)) return s;
+    return out;
 }
 
 // 整份 .cue 文本的编码判定：UTF-16 BOM → UTF-8 BOM → 严格 UTF-8 → GBK

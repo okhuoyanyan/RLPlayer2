@@ -26,12 +26,15 @@
 #include <cctype>
 #include <vector>
 #include <memory>
+#include "net/http_authority.h"
 
 namespace rta::net {
 
 struct HttpRequest {
     std::string method, path, body;
     std::string host;     // Host 头（DNS rebinding 校验用；空 = 客户端没发，按不通过处理）
+    std::string origin;
+    bool originPresent = false;
 };
 
 class WebUi {
@@ -48,8 +51,8 @@ private:
     void loop();
     void handle(SOCKET c);
     static std::string trim(std::string s) {
-        while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ')) s.pop_back();
-        size_t i = 0; while (i < s.size() && s[i] == ' ') ++i;
+        while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
+        size_t i = 0; while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
         return s.substr(i);
     }
     // ★ 2026-10-29（两轮审查 F06）：worker 生命周期必须由 WebUi 自己拥有。
@@ -102,6 +105,7 @@ inline std::string http_status_text(int code) {
         case 400: return "Bad Request";
         case 403: return "Forbidden";
         case 405: return "Method Not Allowed";
+        case 409: return "Conflict";
         case 413: return "Payload Too Large";
         case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
@@ -110,21 +114,27 @@ inline std::string http_status_text(int code) {
 }
 
 // Host 头是否属于本机（allowedHost_ 是逗号分隔的白名单：127.0.0.1,<port>,localhost,<port>,<计算机名>）
-inline bool webui_host_allowed_impl(const std::string& host, const std::string& allowed) {
-    std::string h = host;
-    for (auto& ch : h) ch = (char)std::tolower((unsigned char)ch);
-    // 去掉端口（IPv6 的 [::1]:port 这里不做支持：控制面只绑 IPv4）
-    const size_t colon = h.find(':');
-    if (colon != std::string::npos) h = h.substr(0, colon);
-    if (h.empty()) return false;
+inline bool webui_host_allowed_impl(const std::string& host, const std::string& allowed, unsigned expectedPort = 0) {
+    const auto authority = parse_http_authority(host, expectedPort ? expectedPort : 80);
+    if (!authority.valid || (expectedPort && authority.port != expectedPort)) return false;
     std::istringstream is(allowed);
     std::string tok;
     while (std::getline(is, tok, ',')) {
         std::string t = tok;
         for (auto& ch : t) ch = (char)std::tolower((unsigned char)ch);
-        if (!t.empty() && t == h) return true;
+        if (!t.empty() && t == authority.host) return true;
     }
     return false;
+}
+
+inline bool webui_origin_allowed(const HttpRequest& request, unsigned port) {
+    // Native launchers and scripts need no browser CSRF credential. Browsers
+    // attach Origin to cross-site form/fetch writes; require exact same origin.
+    if (!request.originPresent || request.method == "GET" || request.method == "HEAD" || request.method == "OPTIONS") return true;
+    if (request.origin.rfind("http://", 0) != 0) return false;
+    const auto origin = parse_http_authority(request.origin.substr(7), 80);
+    const auto target = parse_http_authority(request.host, port);
+    return origin.valid && target.valid && origin.host == target.host && origin.port == port;
 }
 
 // handler 想把状态行写成 405/4xx 时调它（默认一律 200）。
@@ -167,8 +177,7 @@ inline bool WebUi::start(uint16_t port, Handler h, bool loopbackOnly) {
     ::getsockname(listen_, (sockaddr*)&got, &gl);
     port_ = ntohs(got.sin_port);
     // Host 白名单（--lan 时的最小防线，见 handle() 的注释）
-    allowedHost_ = "127.0.0.1," + std::to_string((unsigned)port_) +
-                   ",localhost," + std::to_string((unsigned)port_);
+    allowedHost_ = "127.0.0.1,localhost";
     {
         char nb[MAX_COMPUTERNAME_LENGTH + 1] = {0}; DWORD nl = sizeof(nb);
         if (::GetComputerNameA(nb, &nl) && nl > 0) allowedHost_ += std::string(",") + nb;
@@ -295,6 +304,7 @@ inline void WebUi::handle(SOCKET c) {
         std::string body = buf.substr(hdrEnd + sep);
 
         HttpRequest req;
+        bool authorityHeadersBad = false;
         {
             std::istringstream is(head); std::string line;
             std::getline(is, line);
@@ -304,13 +314,21 @@ inline void WebUi::handle(SOCKET c) {
         }
         // ---- Host 头（DNS rebinding 的最小防线）----
         {
-            std::istringstream hs(head); std::string line; bool first = true;
+            std::istringstream hs(head); std::string line; bool first = true, hostSeen = false;
             while (std::getline(hs, line)) {
                 if (first) { first = false; continue; }
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 const size_t colon = line.find(':');
                 if (colon == std::string::npos) continue;
-                if (trim(line.substr(0, colon)) == "Host") { req.host = trim(line.substr(colon + 1)); break; }
+                std::string name = trim(line.substr(0, colon));
+                for (char& ch : name) ch = (char)std::tolower((unsigned char)ch);
+                if (name == "host") {
+                    if (hostSeen) authorityHeadersBad = true;
+                    hostSeen = true; req.host = trim(line.substr(colon + 1));
+                } else if (name == "origin") {
+                    if (req.originPresent) authorityHeadersBad = true;
+                    req.originPresent = true; req.origin = trim(line.substr(colon + 1));
+                }
             }
         }
         // ---- Content-Length：**先判上限再分配** ----
@@ -339,6 +357,17 @@ inline void WebUi::handle(SOCKET c) {
                 if (want > cap) { clBad = true; break; }
             }
         }
+        // The accepted socket's local IPv4 is the actual LAN address being
+        // addressed; admitting that exact address preserves phone/tablet access
+        // without trusting arbitrary private-IP or hostname prefixes.
+        std::string trustedHosts = allowedHost_;
+        if (lan_) {
+            sockaddr_in local{}; int localSize = sizeof(local);
+            if (::getsockname(c, (sockaddr*)&local, &localSize) == 0) {
+                char ip[INET_ADDRSTRLEN] = {};
+                if (::inet_ntop(AF_INET, &local.sin_addr, ip, sizeof(ip))) trustedHosts += std::string(",") + ip;
+            }
+        }
         if (req.method.empty() || req.path.empty()) {
             fail(400, "请求行无法解析");
         } else if (clBad && want > ((req.path.rfind("/api/upload", 0) == 0) ? kMaxUploadBytes : kMaxBodyBytes)) {
@@ -347,12 +376,14 @@ inline void WebUi::handle(SOCKET c) {
                         : "请求体过大（上限 16MB）");
         } else if (clBad) {
             fail(400, "Content-Length 非法");
-        } else if (lan_ && !webui_host_allowed_impl(req.host, allowedHost_)) {
+        } else if (authorityHeadersBad || !webui_host_allowed_impl(req.host, trustedHosts, port_)) {
             // ---- Host 白名单 ----
             // --lan 会把控制面绑到 0.0.0.0 且**没有鉴权**，一个恶意网页可以让受害者浏览器去
             // http://<公网域名指向 127.0.0.1>/api/... 做副作用请求（DNS rebinding）。最小防线：
             // Host 必须是我们自己的名字/地址之一。curl/PowerShell 默认都带 Host，本机 UI 也不受影响。
-            fail(403, "Host 不被允许：--lan 只接受 127.0.0.1 / localhost / 本机名");
+            fail(403, "Host 不被允许或请求头重复");
+        } else if (!webui_origin_allowed(req, port_)) {
+            fail(403, "Origin 不被允许：浏览器写请求必须同源");
         } else {
             while (body.size() < want) {
                 const int r = ::recv(c, tmp, sizeof(tmp), 0);

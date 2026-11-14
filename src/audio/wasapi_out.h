@@ -16,8 +16,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <tlhelp32.h>        // 2026-11-02：DEVICE_IN_USE 时统计 RLPlayer 实例数（提示"旧版本还开着"）
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <audiopolicy.h>     // 2026-11-02：IAudioSessionManager2（判断端点是否被别人占用）
 #include <functiondiscoverykeys_devpkey.h>
 #include <cstdio>
 #include <cmath>
@@ -27,6 +29,7 @@
 #include <string>
 #include <vector>
 #include "pcm_dump.h"
+#include "audio_clock.h"
 #include <stdexcept>
 
 namespace rta::audio {
@@ -142,10 +145,76 @@ inline size_t quantize_period_write(size_t toWrite, size_t per, size_t bufferFra
     return toWrite;
 }
 
+// =====================================================================================
+// 实时节流上限（2026-11-13，ZiSan UAC2 真机：1.536 MHz 独占时 GetCurrentPadding 不节流）
+// =====================================================================================
+// 现场（本机 ZiSan UAC2，WASAPI 独占，源=目标率，不做重采样）：
+//   rate=1411200  8 s 素材 → 8.25 s 播完（0.97×，正常）
+//   rate=768000   8 s 素材 → 8.18 s 播完（0.98×，正常）
+//   rate=1536000  8 s 素材 → **3.23 s 播完（2.47×）**；缓冲 20 ms → 0.45 s（17.9×）
+//                                      缓冲 200 ms → 0.65 s（12.3×）
+//                                      缓冲 500 ms → 8.24 s（0.97×，正常）
+// 判据（铁律 3）：同一段 8 s 音频在 3.2 s 内「播完」在物理上不可能 —— DAC 只能按自己的
+// 时钟消费 rate_ 帧/秒。所以这不是"设备很快"，而是**驱动报告的 padding 没有起节流作用**：
+// write_available 每拍都算得出「缓冲是空的」，于是把整个文件一口气灌进去；播放进度按
+// 写入帧数推进，进度条冲到 100%，听感上是极短的一截 + 大段丢失。
+//
+// 修法：给写入加一道**物理上限** —— 已写帧数不允许超过「设备按自己的时钟最多能消费的帧数
+// + 一个缓冲的余量」。这与驱动是否如实报告 padding 无关，因此对所有后端形态都成立。
+// 5% 容差留给真实时钟偏差（本机实测 devrate 100.1~100.4%），再加一个缓冲的启动余量，
+// 正常设备永远不会被这道闸卡到（它本来就写不这么快）。
+//
+// 抽成纯函数只为可测（铁律 3）：tests/test_pace_guard.cpp 直接喂输入，不需要真设备。
+//   written        本次写入前已写帧数
+//   elapsedSec     本次流从 Start 起的秒数
+//   rate           设备采样率（帧/秒）
+//   bufferFrames   独占缓冲帧数
+// 返回本拍最多还能写多少帧；<0 表示"不限"（参数不足，不做节流）。
+inline long long pace_budget(size_t written, double elapsedSec, uint32_t rate,
+                             size_t bufferFrames, double tolerance = 1.01) {
+    if (rate == 0 || bufferFrames == 0) return -1;
+    if (!(elapsedSec >= 0.0) || elapsedSec > 1.0e7) return -1;   // NaN/离谱值：不节流
+    const double allowed = elapsedSec * (double)rate * tolerance + (double)bufferFrames;
+    if (allowed <= 0.0) return 0;
+    const long long budget = (long long)allowed - (long long)written;
+    return budget > 0 ? budget : 0;
+}
+
+// 设备时钟背压（2026-11-13 ZiSan 1.536 MHz 现场定案）。
+// 现场证据（RLPLAYER_CLK_LOG=1，同一端点、同一 30 s 静音素材）：
+//   1411200 Hz：devpos 每秒 +1411200，backlog（已写−设备已播）**恒为 141312 = 一个缓冲**
+//   1536000 Hz：devpos 每秒 +1536000（设备确实跑在这个率），但 backlog 每秒涨 ~77,000 帧，
+//                8 s 从 0 涨到 791,880；同期 GetCurrentPadding 只报 2 万~10 万 ⟹ **padding 严重偏小**。
+// 结论：设备没错、率没错，是驱动在 1.5M 档把 padding 报小了，我们的写入只受 5% 容差限制，
+// 每秒多写 5%，积压无界增长 ⟹ 跑久了必然在驱动内部溢出丢样（听感=隔一阵「跳」一下）。
+//
+// 所以补一道**以设备时钟为准的背压**：在飞帧数（已写−设备已播）不得超过 k 个缓冲。
+// 取 k=2（而不是 1）是刻意的：正常设备稳态就在 1 个缓冲附近（1411200 实测恒 141312），
+// 留一个缓冲的余量才能既兜住积压增长、又不会把正常播放卡成欠载。
+// 抽成纯函数只为可测（铁律 3）：tests/test_pace_guard.cpp 直接喂输入，不开设备。
+// ★ 额度必须带**时间下限**（2026-11-13 现场第二次踩坑）：
+// 只按「2 个缓冲」封顶时，20 ms 缓冲的额度只有 40 ms，而 IAudioClock 位置在某些驱动上
+// 按周期/百毫秒量化，一次更新就能让 inflight 瞬间超过额度 ⟹ 每拍都判"满了" ⟹ 流被饿死。
+// 实测 1411/20ms 被压到 35.6%（RATECHECK ok=0，devrate=502110），这就是判据本身造成的假故障。
+// 因此额度取 max(k×缓冲, rate×0.25s)：既兜住"每秒多写 5%"的无界增长，
+// 又给时钟量化留足余量（250 ms 远大于任何合理的量化粒度）。
+inline long long clock_room(long long inflight, size_t bufferFrames, uint32_t rate,
+                            int k = 2, double minSec = 0.5) {
+    if (bufferFrames == 0 || k <= 0) return -1;      // 参数不足 ⟹ 不启用
+    long long cap = (long long)bufferFrames * (long long)k;
+    if (rate > 0 && minSec > 0.0) {
+        const long long floorCap = (long long)((double)rate * minSec);
+        if (floorCap > cap) cap = floorCap;
+    }
+    if (inflight >= cap) return 0;                    // 在飞已满 ⟹ 本拍不写，等设备播
+    return cap - inflight;
+}
+
 // 最近一次 write_available 的现场数字（WFAIL 明细用；只读，不改变行为）。
 struct WriteDetail {
     long long pad = -1, room = -1, per = -1, avail = -1, toWrite = -1;
     long long gbHr = -999;   // IAudioRenderClient::GetBuffer 的 HRESULT（-999 = 本次未调用）
+    long long pace = -1;     // pace_budget 给出的本拍上限（-1 = 未启用/不限）
 };
 
 // =====================================================================================
@@ -241,6 +310,7 @@ inline void ex_pack_int32(const ExContainer& c, int channels, int srcBits, doubl
 }
 
 class WasapiOutput {
+    friend struct WasapiOutputTestPeer; // Offline COM adapter; no device enumeration/open.
 public:
     WasapiOutput() {
         HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -291,8 +361,13 @@ public:
             if (dev) {
                 IAudioClient* ac = nullptr;
                 if (SUCCEEDED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ac)) && ac) {
+                    // 2026-11-13（ZiSan UAC2 真机）：旧列表漏了 1411200（44.1k 族 32×）。
+                    // 用户用 HQPlayer 实测这台机器 1411200 / 1536000 都能出声，而我们的探测
+                    // 因为候选表里没有 1411200，永远报“不支持”，随后拒绝播放 —— 这是**查询口径的假上限**，
+                    // 与 ASIO 侧 2026-11-01 补 1411200/1536000 是同一个 bug 的 WASAPI 分支。
                     static const uint32_t cand[] = { 44100, 48000, 88200, 96000, 176400, 192000,
-                                                     352800, 384000, 705600, 768000, 1536000 };
+                                                     352800, 384000, 705600, 768000,
+                                                     1411200, 1536000 };
                     // ★ 2026-10-23 真机 DEBUG（wasapi_ex_probe 实测 TASCAM Portacapture X8）：
                     //   紧凑 24(blockAlign=ch*3) → OK；EXT32/32 float → OK；PCM16/EXT16/EXT32int/EXT32容器24 → UNSUPPORTED
                     // 而 UltraLite-mk5 恰好相反（只认 32 容器 + 24 有效）。**没有一种形态通吃**，
@@ -362,6 +437,69 @@ public:
 
     // 输入端点（线路输入 / 麦克风 / 回环）
     static std::vector<DeviceInfo> enumerate_capture() { return enumerate(eCapture); }
+
+    // 2026-11-02（用户 261102-01 #1：「连麦时 RLP 把语音应用切了」）：
+    //   独占模式是"抢设备"——一旦拿到，别的程序（会议/语音）的流就被废掉。
+    //   这里先问一句"这个端点上还有没有**别人**的活动会话"，有就别抢，改走共享。
+    //   返回"其他进程的活动会话数"（不含自己；拿不到会话信息时返回 0 = 不阻拦）。
+    static int endpoint_other_active_sessions(const std::string& deviceId) {
+        // 2026-11-02：这里曾在实测里恒返回 0 —— 真因是播放线程**没做过 CoInitializeEx**，
+        //   CoCreateInstance 直接 CO_E_NOTINITIALIZED（与 261028-01 的 ASIO 枚举失败同源）。
+        //   现地补一个 RAII：本线程没初始化就自己初始化，函数结束再撤（已初始化过则不动）。
+        struct CoGuard {
+            bool own = false;
+            CoGuard() {
+                const HRESULT h = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                own = SUCCEEDED(h);
+            }
+            ~CoGuard() { if (own) CoUninitialize(); }
+        } coGuard;
+        IMMDeviceEnumerator* en = nullptr;
+        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                    __uuidof(IMMDeviceEnumerator), (void**)&en)) || !en) return 0;
+        IMMDevice* dev = nullptr;
+        HRESULT hr;
+        if (deviceId.empty()) {
+            hr = en->GetDefaultAudioEndpoint(eRender, eConsole, &dev);
+        } else {
+            const int wlen = MultiByteToWideChar(CP_UTF8, 0, deviceId.c_str(), -1, nullptr, 0);
+            std::wstring wid(wlen > 0 ? (size_t)wlen : 0, L'\0');
+            if (wlen > 1) MultiByteToWideChar(CP_UTF8, 0, deviceId.c_str(), -1, wid.data(), wlen);
+            hr = en->GetDevice(wid.c_str(), &dev);
+        }
+        en->Release();
+        if (FAILED(hr) || !dev) return 0;
+
+        int busy = 0;
+        IAudioSessionManager2* mgr = nullptr;
+        if (SUCCEEDED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**)&mgr)) && mgr) {
+            IAudioSessionEnumerator* sess = nullptr;
+            if (SUCCEEDED(mgr->GetSessionEnumerator(&sess)) && sess) {
+                int cnt = 0;
+                sess->GetCount(&cnt);
+                const DWORD self = GetCurrentProcessId();
+                for (int i = 0; i < cnt; ++i) {
+                    IAudioSessionControl* ctl = nullptr;
+                    if (FAILED(sess->GetSession(i, &ctl)) || !ctl) continue;
+                    AudioSessionState st = AudioSessionStateInactive;
+                    ctl->GetState(&st);
+                    DWORD pid = 0;
+                    IAudioSessionControl2* c2 = nullptr;
+                    if (SUCCEEDED(ctl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&c2)) && c2) {
+                        c2->GetProcessId(&pid);
+                        c2->Release();
+                    }
+                    // pid==0 的系统会话（如"系统声音"）不算：它没有独占诉求
+                    if (st == AudioSessionStateActive && pid != 0 && pid != self) ++busy;
+                    ctl->Release();
+                }
+                sess->Release();
+            }
+            mgr->Release();
+        }
+        dev->Release();
+        return busy;
+    }
 
     // flow = eRender（默认，输出端点）或 eCapture（输入端点）
     static std::vector<DeviceInfo> enumerate(EDataFlow flow = eRender) {
@@ -510,6 +648,23 @@ public:
             fmts[nFmt++] = { 4, 32, false, "EXT32/32 int" };
         }
 
+        // 统计本机 RLPlayer.exe 实例数：DEVICE_IN_USE 时用来提示"旧版本还开着"。
+        auto count_player_instances = []() -> int {
+            int n = 0;
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap == INVALID_HANDLE_VALUE) return 0;
+            PROCESSENTRY32W pe{};
+            pe.dwSize = sizeof(pe);
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    // 界面进程与后端进程都要算：独占流在 rtaweb 里，但用户看到的是 RLPlayer
+                    if (_wcsicmp(pe.szExeFile, L"RLPlayer.exe") == 0 ||
+                        _wcsicmp(pe.szExeFile, L"rtaweb.exe") == 0) ++n;
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+            return n;
+        };
         ev_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         REFERENCE_TIME dur = (REFERENCE_TIME)(bufferMs * 10000.0);
         struct Try { REFERENCE_TIME buf; REFERENCE_TIME per; DWORD flags; const char* why; };
@@ -528,22 +683,32 @@ public:
             const char* v = std::getenv("RTA_WASAPI_EVENT");
             return v && v[0] == '1';
         }();
+        // ★ 2026-11-02（用户真机：3.1.9「全部配方 DEVICE_IN_USE，无法播放」）：
+        //   ① 配方顺序把 periodicity=0 排在最前，而本机 TASCAM 对「buffer=dur, per=0」直接回
+        //      DEVICE_IN_USE（wasapi_ex_probe 实测：同格式 per=dur = S_OK，per=0 = 0x8889000A）
+        //      ⟹ 第一条就"看起来被独占"，后面能成功的配方永远轮不到。
+        //   ② 更关键：MSDN 要求 Initialize 失败后 **Release + 重新 Activate** 才能再 Initialize；
+        //      旧实现整轮复用同一个 ac_，第一次失败后所有重试都可能被记成 DEVICE_IN_USE
+        //      （对齐分支的注释早就写过同样的坑，只是没修主循环）。
+        //   ⟹ 现在：period=dur 的组合排前面，且每次尝试都换新 client。
         const Try triesEventFirst[] = {
+            { dur, dur, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=period=xxxms,event" },
             { dur, 0,   AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=xxxms,period=驱动默认,event" },
             { 0,   0,   AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer/period 全默认,event" },
+            { dur, dur, 0,                                 "buffer=period=xxxms,轮询" },
             { dur, 0,   0,                                 "buffer=xxxms,period默认,轮询" },
             { 0,   0,   0,                                 "全默认,轮询" },
-            { dur, dur, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=period=xxxms,event（兜底）" },
         };
         const Try triesPollFirst[] = {
+            { dur, dur, 0,                                 "buffer=period=xxxms,轮询" },
             { dur, 0,   0,                                 "buffer=xxxms,period默认,轮询" },
             { 0,   0,   0,                                 "全默认,轮询" },
+            { dur, dur, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=period=xxxms,event" },
             { dur, 0,   AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=xxxms,period=驱动默认,event" },
             { 0,   0,   AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer/period 全默认,event" },
-            { dur, dur, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, "buffer=period=xxxms,event（兜底）" },
         };
         const Try* tries = preferEvent ? triesEventFirst : triesPollFirst;
-        const int nTries = 5;
+        const int nTries = 6;
         std::string trialLog;
         hr = E_FAIL;
         const char* fmtUsed = "";
@@ -571,6 +736,19 @@ public:
         for (int ti = 0; ti < nTries; ++ti) {
             const Try& t = tries[ti];
             if (forcePoll && (t.flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK)) continue;   // 只走轮询
+            // 每条配方都用**全新的** IAudioClient（MSDN：Initialize 失败后必须 Release+Activate，
+            // 复用同一个 client 再 Initialize 会拿到 DEVICE_IN_USE / BUFFER_SIZE_ERROR）。
+            if (ti > 0 || fi > 0) {
+                if (ac_) { ac_->Release(); ac_ = nullptr; }
+                const HRESULT hra = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ac_);
+                if (FAILED(hra) || !ac_) {
+                    char b[96];
+                    std::snprintf(b, sizeof(b), "[%s -> Activate 0x%08lX]", t.why, (unsigned long)(unsigned)hra);
+                    trialLog += b;
+                    hr = hra;
+                    continue;
+                }
+            }
             hr = ac_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, t.flags, t.buf, t.per,
                                  (WAVEFORMATEX*)&wfx_, nullptr);
             {
@@ -610,7 +788,24 @@ public:
           if (hr == S_OK) { fmtUsed = F.tag; break; }   // 该格式成功 → 不再试后面的格式
         }
         if (hr != S_OK) {
-            lastErr_ = std::string("Initialize 失败（全部格式×配方）：") + trialLog;
+            // 2026-11-02：把"看起来被独占"与"格式不支持"分开说清。
+            //   现场：用户只看到 15 段 0x8889000A，以为软件坏了；实际这台设备对
+            //   「buffer=dur, per=0」就是回 DEVICE_IN_USE（探测工具同样复现）。
+            const bool anyInUse = trialLog.find("DEVICE_IN_USE") != std::string::npos;
+            std::string hint;
+            if (anyInUse) {
+                // 2026-11-02 用户真机：升级后没关旧版本，两个实例抢独占 ⟹ 新实例 15 段全 DEVICE_IN_USE。
+                // 启动器对"另一版本"是**故意不接管**的（避免拿旧界面骗人），于是两个实例可能同时在跑。
+                const int players = count_player_instances();
+                if (players > 1) {
+                    hint = "。检测到 " + std::to_string(players) +
+                           " 个 RLPlayer 实例在运行 —— 旧版本可能还占着设备，请先退出它";
+                } else {
+                    hint = "。提示：设备若真被独占，请关掉另一个播放器 / 浏览器 / 会议软件；"
+                           "否则请在 设置→输出 换一个端点，或把后端切到「WASAPI 共享」";
+                }
+            }
+            lastErr_ = std::string("Initialize 失败（全部格式×配方）：") + trialLog + hint;
             fillFail(trialLog.c_str());   // HF-01：把请求格式与该位深的实际独占支持列表带出去
             close(); return false;
         }
@@ -791,6 +986,22 @@ public:
         if (toWrite == 0 && written_ == 0) toWrite = (size_t)bufferFrames_;
         const size_t room = toWrite;          // 设备侧可用空间（量化之前）
         if (toWrite > availFrames) toWrite = availFrames;
+        // ---- 物理节流上限（2026-11-13 ZiSan 1.536 MHz 现场）：见文件上方 pace_budget 注释 ----
+        long long pace = -1;
+        if (paceGuard_) {
+            pace = pace_budget(written_, elapsed_seconds(), rate_, bufferFrames_);
+            if (pace >= 0 && (long long)toWrite > pace) toWrite = (size_t)pace;
+        }
+        // ---- 设备时钟背压（同上现场定案）：padding 偏小时靠「在飞帧数」兜住积压增长 ----
+        // 只在 IAudioClock 真的能报位置时启用；报不出来就退化成只有上面那道墙钟闸。
+        if (paceGuard_ && clock_) {
+            unsigned long long devPos = 0;
+            if (device_position(devPos)) {
+                const long long inflight = (long long)written_ - (long long)devPos;
+                const long long room2 = clock_room(inflight, bufferFrames_, rate_);
+                if (room2 >= 0 && (long long)toWrite > room2) toWrite = (size_t)room2;
+            }
+        }
         // 独占模式的 GetBuffer 要求周期整数倍；向下取整，宁可少写也不报错。
         size_t per = 0;
         if (period_ > 0 && rate_ > 0)
@@ -803,6 +1014,7 @@ public:
         detail_.per     = (long long)per;
         detail_.avail   = (long long)availFrames;
         detail_.toWrite = (long long)toWrite;
+        detail_.pace    = pace;
         detail_.gbHr    = lastGbHr_;
         // ---- 归因计数（2026-10-22 用户真机反馈 20261022-02）：只观测，不改变行为 ----
         // 判定本体在 ZeroAttrib::classify（见本文件上方）；这里只把三个观测量喂进去。
@@ -874,15 +1086,15 @@ public:
     int  init_recipe_index() const { return initRecipeIndex_; }
     const WriteDetail& last_write_detail() const { return detail_; }
     size_t frames_written() const { return written_; }
+    // 物理节流闸开关（默认开）。只有"用假 COM 在微秒内跑完整段循环"的 mock 单元测试需要关。
+    void set_pace_guard(bool on) { paceGuard_ = on; }
+    bool pace_guard() const { return paceGuard_; }
     double elapsed_seconds() const {
         LARGE_INTEGER t; QueryPerformanceCounter(&t);
         return (double)(t.QuadPart - qpcStart_) / (double)qpcFreq_;
     }
     bool device_position(unsigned long long& pos) const {
-        if (!clock_) return false;
-        UINT64 p = 0, q = 0;
-        if (FAILED(clock_->GetPosition(&p, &q))) return false;
-        pos = (unsigned long long)p; return true;
+        return clock_position_frames(clock_,rate_,pos);
     }
     uint32_t rate() const { return rate_; }
     int bits() const { return bits_; }
@@ -912,6 +1124,10 @@ private:
     }
 
     bool comInit_ = false, running_ = false, realigned_ = false;
+    // 物理节流闸（见 pace_budget）。默认开；仅 mock 驱动的 COM 单元测试会关掉它 ——
+    // 那些测试用假 IAudioClient 在微秒内跑完整段渲染循环，真实时间不前进，
+    // 开着闸会恒判「设备不可能消费这么快」而饿死，测的就不再是暂停/DoP 语义了。
+    bool paceGuard_ = true;
     // 2026-10-23 真机 DEBUG：实际被驱动接受的独占格式（pack 必须按它取样字节数与定标，
     // 否则选到紧凑 24 却按 4 字节写 → 噪声/爆音）。由 open() 的格式阶梯设置。
     // 2026-10-25 P0-A：改为三要素（字节数 / 有效位 / 是否 float）—— 只记字节数与 float

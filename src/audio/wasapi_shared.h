@@ -597,10 +597,7 @@ public:
     size_t buffer_frames() const { return bufferFrames_; }
     size_t frames_written() const { return written_; }
     bool device_position(unsigned long long& pos) const {
-        if (!clock_) return false;
-        UINT64 p = 0, q = 0;
-        if (FAILED(clock_->GetPosition(&p, &q))) return false;
-        pos = (unsigned long long)p; return true;
+        return clock_position_frames(clock_,mixRate_,pos);
     }
     double elapsed_seconds() const {
         LARGE_INTEGER t; QueryPerformanceCounter(&t);

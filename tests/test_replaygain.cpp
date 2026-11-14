@@ -1,4 +1,4 @@
-// test_replaygain.cpp — ReplayGain / Album Gain 离线门禁
+﻿// test_replaygain.cpp — ReplayGain / Album Gain 离线门禁
 //
 // 判据全部可被单独否定（铁律 3）：
 //   [1] 值解析（" dB" 后缀 / 全角减号 / 小数逗号 / dB 写法的 peak / 百分比写法）
@@ -19,6 +19,7 @@
 #include "dsp/volume.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <string>
@@ -317,6 +318,22 @@ static bool mp4_add_freeform(const std::string& inPath, const std::string& outPa
 static bool approx_eq(double a, double b, double eps) { return std::fabs(a - b) <= eps; }
 
 // ===========================================================================
+// Real-user-library probes are never part of the default offline regression.
+// An explicit isolated fixture directory is mandatory even when opted in.
+static std::filesystem::path explicit_library_fixture() {
+    const char* enabled = std::getenv("RTA_REAL_LIBRARY_TESTS");
+    const char* path = std::getenv("RTA_TEST_LIBRARY_DIR");
+    if (!enabled || std::string(enabled) != "1") {
+        std::printf("UNVERIFIED_REAL: real-library branch not requested; synthetic assertions still execute\n");
+        return {};
+    }
+    if (!path || !*path || !std::filesystem::u8path(path).is_absolute()) {
+        std::fprintf(stderr, "RTA_REAL_LIBRARY_TESTS=1 requires absolute RTA_TEST_LIBRARY_DIR fixture path\n");
+        std::exit(2);
+    }
+    return std::filesystem::u8path(path);
+}
+
 int main() {
     const fs::path tmp = fs::temp_directory_path() / "rg_fixture";
     std::error_code ec;
@@ -770,8 +787,8 @@ int main() {
     // ---------------------------------------------------------------- [8]
     std::printf("\n[8] 真实库只读扫描（D:\\RTA-hqplayer\\MUSIC）\n");
     {
-        const fs::path music = fs::u8path("D:\\RTA-hqplayer\\MUSIC");
-        if (!fs::exists(music)) {
+        const fs::path music = explicit_library_fixture();
+        if (music.empty() || !fs::exists(music)) {
             std::printf("  [SKIP] 没有真实库目录\n");
         } else {
             size_t files = 0, tagTrack = 0, tagAlbum = 0, none = 0, both = 0;
@@ -814,9 +831,9 @@ int main() {
     // ---------------------------------------------------------------- [9]
     std::printf("\n[9] 真实库：计算值 vs 标签值（口径对照）\n");
     {
-        const fs::path music = fs::u8path("D:\\RTA-hqplayer\\MUSIC");
+        const fs::path music = explicit_library_fixture();
         std::vector<std::string> tagged;
-        if (fs::exists(music)) {
+        if (!music.empty() && fs::exists(music)) {
             std::error_code e3;
             for (auto it = fs::recursive_directory_iterator(music, e3); it != fs::recursive_directory_iterator(); it.increment(e3)) {
                 if (e3) break;

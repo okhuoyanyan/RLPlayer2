@@ -148,14 +148,33 @@ int main() {
     store_file_tags(flac2.string());
     store_file_tags(flac3.string());
 
-    // 验证 Enrich 编排在已有本地标签场景下的幂等行为
-    const EnrichOpts offOpts = make_enrich_opts(false, false, false, false, false);
+    // 此处验证「完整文本 + 已缓存本曲图片」的幂等，不再把仅文本齐全误作无需补图。
+    // 真PNG由本地ffmpeg离线生成；三个文件各用自身路径保存、读回，不借专辑缓存。
+    const fs_std::path coverFile = rootDir / "fixture-cover.png";
+    run_cmd(L"\"" + rta::audio::widen(ffmpeg) + L"\" -y -v error -f lavfi -i color=c=black:s=32x32 -frames:v 1 \"" + coverFile.wstring() + L"\"");
+    std::ifstream imageFile(coverFile, std::ios::binary);
+    const std::vector<unsigned char> imageBytes((std::istreambuf_iterator<char>(imageFile)), std::istreambuf_iterator<char>());
+    int coverW = 0, coverH = 0;
+    ck(art_image_dims(std::string(imageBytes.begin(), imageBytes.end()), &coverW, &coverH) && coverW == 32 && coverH == 32,
+       "本地离线生成的缓存夹具是真实32x32 PNG");
+    for (const auto& path : {flac1, flac2, flac3}) {
+        TrackMeta cached; MetaStore::instance().load(path.string(), cached);
+        cached.coverRelPath = MetaStore::instance().saveCover(path.string(), imageBytes.data(), imageBytes.size(), "png");
+        MetaStore::instance().save(cached);
+        std::vector<unsigned char> actual; std::string mime;
+        ck(!cached.coverRelPath.empty() && MetaStore::instance().cover(path.string(), actual, mime) && actual == imageBytes && mime == "image/png",
+           "本曲封面已独立保存并逐字节读回: " + path.filename().string());
+    }
+    EnrichOpts offOpts;
+    offOpts.llm = false;
+    // 旧五布尔构造只关闭五个旧源，新注册的dizzylab/discogs仍默认开；离线测试明确关闭全注册表。
+    for (const auto& provider : provider_registry()) offOpts.srcOn[provider.id] = false;
     const auto st1 = enrich_track(flac1.string(), false, offOpts);
     const auto st2 = enrich_track(flac2.string(), false, offOpts);
     const auto st3 = enrich_track(flac3.string(), false, offOpts);
-    ck(st1.skipped, "FLAC 1 已有完整本地标签，enrich 流程正确识别并保留原有字段");
-    ck(st2.skipped, "FLAC 2 已有完整本地标签，enrich 流程正确识别并保留原有字段");
-    ck(st3.skipped, "FLAC 3 已有完整本地标签，enrich 流程正确识别并保留原有字段");
+    ck(st1.skipped, "FLAC 1 已有完整本地标签及本曲封面，enrich 幂等保留原有字段");
+    ck(st2.skipped, "FLAC 2 已有完整本地标签及本曲封面，enrich 幂等保留原有字段");
+    ck(st3.skipped, "FLAC 3 已有完整本地标签及本曲封面，enrich 幂等保留原有字段");
 
     TrackMeta tm1, tm3;
     ck(MetaStore::instance().load(flac1.string(), tm1), "FLAC 1 成功存入并读回 MetaStore");

@@ -38,6 +38,9 @@ $CRLF = [string][char]13 + [string][char]10
 
 $FFmpegVer = '9.0'
 $NasmVer   = '2.16.03'
+$ZlibVer   = '1.3.2'
+$ZlibSha   = 'd7a0654783a4da529d1bb793b7ad9c3318020af77667bcae35f95d0e42a792f3'
+$urlZlib   = "https://zlib.net/zlib-$ZlibVer.tar.xz"
 $urlMsys   = 'https://github.com/msys2/msys2-installer/releases/latest/download/msys2-base-x86_64-latest.tar.xz'
 $urlWinlib = 'https://github.com/brechtsanders/winlibs_mingw/releases/latest/download/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r3.zip'
 $urlNasm   = "https://www.nasm.us/pub/nasm/releasebuilds/$NasmVer/win64/nasm-$NasmVer-win64.zip"
@@ -70,7 +73,7 @@ function Get-File([string]$url, [string]$dest) {
         return
     }
     Write-Host "GET     $url"
-    & curl.exe -L --retry 3 --max-time 3600 -o $dest $url
+    & curl.exe --fail -L --retry 3 --max-time 3600 -o $dest $url
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dest) -or (Get-Item $dest).Length -lt 1024) {
         Fail "下载失败：$url 。可手工下载后放到 $dest 再重跑（离线机器就是这个流程）"
     }
@@ -78,6 +81,18 @@ function Get-File([string]$url, [string]$dest) {
 }
 
 New-Item -ItemType Directory -Force -Path $WorkDir, $OutDir | Out-Null
+$WorkDir = [IO.Path]::GetFullPath($WorkDir)
+$OutDir = [IO.Path]::GetFullPath($OutDir)
+function Remove-WorkDirectory([string]$path) {
+    $resolved = [IO.Path]::GetFullPath($path)
+    if (-not $resolved.StartsWith($WorkDir.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)) {
+        Fail "Cleanup target is outside private WorkDir: $resolved"
+    }
+    if (Test-Path -LiteralPath $resolved) {
+        if ((Get-Item -LiteralPath $resolved).Attributes -band [IO.FileAttributes]::ReparsePoint) { Fail "Refusing reparse cleanup target: $resolved" }
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+    }
+}
 $B = To-Posix $WorkDir
 $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
 $bash = Join-Path $WorkDir 'msys64\usr\bin\bash.exe'
@@ -93,21 +108,37 @@ if (-not (Test-Path $bash)) {
 # 只验证 bash 能起（msys 的 coreutils 要靠 /usr/bin 在 PATH，-c 里跑 uname 不一定行）
 $probe = (& $bash -c 'echo bash-ok' 2>&1) -join ' '
 if ($LASTEXITCODE -ne 0 -or $probe -notmatch 'bash-ok') { Fail "bash 跑不起来：$bash（输出：$probe）" }
+if (-not (Test-Path -LiteralPath (Join-Path $WorkDir 'msys64\usr\bin\make.exe'))) {
+    # MSYS2 base does not include make. Install only inside this private SDK;
+    # prefer the domestic mirror and retain the official fallback.
+    $mirrors = @{
+        'mirrorlist.msys' = @('Server = https://mirrors.ustc.edu.cn/msys2/msys/$arch',
+                              'Server = https://repo.msys2.org/msys/$arch') -join $LF
+        'mirrorlist.mingw' = @('Server = https://mirrors.ustc.edu.cn/msys2/mingw/$repo/',
+                               'Server = https://repo.msys2.org/mingw/$repo/') -join $LF
+    }
+    foreach ($entry in $mirrors.GetEnumerator()) {
+        $mirror = Join-Path $WorkDir ('msys64\etc\pacman.d\' + $entry.Key)
+        [IO.File]::WriteAllText($mirror, $entry.Value+$LF, (New-Object System.Text.UTF8Encoding($false)))
+    }
+    & $bash -lc 'pacman-key --init && pacman-key --populate msys2 && pacman --noconfirm -Sy make'
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $WorkDir 'msys64\usr\bin\make.exe'))) { Fail 'Private MSYS2 make installation failed' }
+}
 
 Step "工具链：winlibs GCC（MinGW-w64 ucrt）"
 if (-not (Test-Path (Join-Path $WorkDir 'mingw64\bin\gcc.exe'))) {
     $zip = Join-Path $WorkDir 'winlibs.zip'
     Get-File $urlWinlib $zip
     $tmp = Join-Path $WorkDir '_unzip_mingw'
-    if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+    Remove-WorkDirectory $tmp
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
     & $tar -xf $zip -C $tmp
     if ($LASTEXITCODE -ne 0) { Fail "winlibs 解压失败" }
     $inner = Get-ChildItem $tmp -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'bin\gcc.exe') } | Select-Object -First 1
     if (-not $inner) { Fail "winlibs 包里没找到 bin\gcc.exe" }
-    if (Test-Path (Join-Path $WorkDir 'mingw64')) { Remove-Item (Join-Path $WorkDir 'mingw64') -Recurse -Force }
+    Remove-WorkDirectory (Join-Path $WorkDir 'mingw64')
     Move-Item $inner.FullName (Join-Path $WorkDir 'mingw64')
-    Remove-Item $tmp -Recurse -Force
+    Remove-WorkDirectory $tmp
 }
 $gccVer = @(& (Join-Path $WorkDir 'mingw64\bin\gcc.exe') --version 2>&1)[0]
 Write-Host "gcc: $gccVer"
@@ -145,6 +176,26 @@ function Run-Bash([string]$name, [string]$body) {
     if ($LASTEXITCODE -ne 0) { Fail "$name 失败（退出码 $LASTEXITCODE，日志见 $WorkDir）" }
 }
 $w = To-Posix $WorkDir
+
+# PNG requires zlib. --disable-autodetect otherwise silently disables PNG even
+# when --enable-decoder=png / --enable-encoder=png are present. Build the pinned
+# static dependency privately, then explicitly require it in configure.
+Step "zlib $ZlibVer static dependency (PNG cover decode/encode)"
+$zArc = Join-Path $WorkDir "zlib-$ZlibVer.tar.xz"
+Get-File $urlZlib $zArc
+if ((Get-FileHash -LiteralPath $zArc -Algorithm SHA256).Hash.ToLowerInvariant() -ne $ZlibSha) { Fail 'zlib source SHA256 mismatch' }
+$zSrc = Join-Path $WorkDir "zlib-$ZlibVer"
+if (-not (Test-Path -LiteralPath (Join-Path $zSrc 'win32\Makefile.gcc'))) {
+    & $tar -xf $zArc -C $WorkDir
+    if ($LASTEXITCODE -ne 0) { Fail 'zlib extraction failed' }
+}
+$zSrcPosix = To-Posix $zSrc
+$zBody = "set -e" + $LF + "cd '$zSrcPosix'" + $LF +
+    "make -f win32/Makefile.gcc -j8 libz.a > ../make_zlib.log 2>&1" + $LF +
+    "mkdir -p '$w/zlib-static/include' '$w/zlib-static/lib'" + $LF +
+    "cp zlib.h zconf.h '$w/zlib-static/include/'" + $LF +
+    "cp libz.a '$w/zlib-static/lib/'" + $LF
+Run-Bash 'zlib.sh' $zBody
 
 if ((Test-Path (Join-Path $WorkDir 'lst_decoders.txt')) -and -not $Force) {
     Write-Host "组件清单已缓存（-Force 可重建）"
@@ -250,12 +301,13 @@ BSF=$(norm ../../lst_bsfs.txt)
   --disable-doc --disable-debug --disable-ffplay --disable-avdevice \
   --enable-ffmpeg --enable-ffprobe --enable-static --disable-shared --enable-gpl \
   --enable-protocol=file,pipe \
-  --enable-decoder="$DEC,mjpeg,png,bmp,gif" \
+  --enable-zlib \
+  --enable-decoder="$DEC,mjpeg,png,bmp,gif,webp" \
   --enable-encoder=pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_u8,png,mjpeg \
   --enable-demuxer="$DEM" --enable-muxer="$MUX" --enable-parser="$PAR" --enable-bsf="$BSF" \
   --enable-filter=aresample,anull,aformat,null,scale,format,channelmap,pan,atrim,asetpts,setpts,fps,trim,copy,apad \
   --enable-swscale --enable-swresample \
-  --extra-cflags="-O2" --extra-ldflags="-static -s" \
+  --extra-cflags="-O2 -I../../zlib-static/include" --extra-ldflags="-L../../zlib-static/lib -static -s" \
   > ../../configure_lite.log 2>&1
 make -j16 > ../../make_lite.log 2>&1
 mkdir -p ../../out
@@ -305,6 +357,9 @@ foreach ($rt in (Get-Content $audioSet)) {
 if ($coverMissing.Count -gt 0) { Fail ("精简版少了音频解码器（与探针全集比对）：" + ($coverMissing -join ', ')) }
 Write-Host ("覆盖率：音频全集 " + (Get-Content $audioSet).Count + " 个，精简版全部包含")
 
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'verify_ffmpeg_lite.ps1') -Dir $OutDir -SkipMatrix
+if ($LASTEXITCODE -ne 0) { Fail 'Packaged FFmpeg codec and actual PNG cover checks failed' }
+
 $ffSha = (Get-FileHash $ff -Algorithm SHA256).Hash
 $fpSha = (Get-FileHash $fp -Algorithm SHA256).Hash
 $manifest = @(
@@ -313,12 +368,16 @@ $manifest = @(
     "ffmpeg_version : $ver",
     "ffmpeg_sha256  : $ffSha",
     "ffprobe_sha256 : $fpSha",
+    "zlib_version   : $ZlibVer",
+    "zlib_source_sha256 : $ZlibSha",
     ("ffmpeg_size   : " + [math]::Round((Get-Item $ff).Length / 1MB, 2) + " MB"),
     ("ffprobe_size  : " + [math]::Round((Get-Item $fp).Length / 1MB, 2) + " MB"),
     ("decoders      : " + $decoders.Count),
     ("required_ok   : " + $required.Count + "/" + $required.Count)
 )
 Set-Content -Path (Join-Path $OutDir 'MANIFEST.txt') -Value $manifest -Encoding UTF8
+& python -X utf8 (Join-Path $here 'write_ffmpeg_build_manifest.py') --work-dir $WorkDir --out-dir $OutDir
+if ($LASTEXITCODE -ne 0) { Fail 'Exact source archive and license bundle failed' }
 
 Write-Host ''
 Write-Host ("产物：" + $OutDir)

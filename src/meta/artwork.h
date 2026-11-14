@@ -91,7 +91,12 @@ inline ArtHttpHook& art_http_hook() {
 inline void set_artwork_http_for_test(ArtHttpHook hook) { art_http_hook() = std::move(hook); }
 
 inline rta::net::HttpResponse art_http(const ArtHttpRequest& q) {
-    if (const auto& h = art_http_hook()) return h(q);
+    ArtHttpRequest bounded = q;
+    bounded.timeoutMs = rta::net::http_budget_timeout(q.timeoutMs);
+    if (rta::net::http_budget_expired() || (rta::net::http_budget_active() && bounded.timeoutMs <= 0)) {
+        rta::net::HttpResponse r; r.error = "HTTP_BUDGET_EXCEEDED"; return r;
+    }
+    if (const auto& h = art_http_hook()) return h(bounded);
     if (q.method == "POST")
         return rta::net::http_post(q.url, q.body, q.headers,
                                    q.contentType.empty() ? "application/json" : q.contentType.c_str(),
@@ -120,6 +125,7 @@ struct ArtworkOpts {
     // 域名兜底(自动化测试用不可达地址验证「断网不崩、不写脏负缓存」)。
     // neteaseHost 与 rtaweb.cpp 既有环境变量 RLPLAYER_ARTISTIMG_HOST 同义。
     std::string neteaseHost, qqHost, dizzylabHost, discogsHost;
+    std::string musicbrainzHost, coverArtHost, qqImageHost, dizzylabImageHost;
 
     bool enabled(const std::string& id) const {
         const auto it = srcOn.find(id);
@@ -607,6 +613,39 @@ inline std::vector<std::string> art_cover_urls_by_score(const std::vector<Scored
     return urls;
 }
 
+// 逐曲图片比普通字段采纳更严格：不能让高分第一名给错曲回退候选背书。
+// 标题核心/艺人/尾部版本必须一致；已知时长差 >3秒也拒绝。无艺人没有
+// 足够的录音身份，宁可留空。专辑和目录分组名不用于歌曲身份。
+inline std::vector<std::string> art_recording_cover_urls(
+        const std::vector<Scored>& ranked, const std::vector<Candidate>& cands,
+        const std::string& title, const std::string& artist, const std::string& feat,
+        int fileSec, const std::string& version = {}) {
+    std::vector<std::string> urls;
+    std::set<std::string> seen;
+    if (match_norm(artist).empty()) return urls;
+    std::string core = title;
+    std::vector<std::string> groups;
+    match_detail::mf_strip_trailing_groups(core, &groups);
+    std::string ver = version;
+    if (ver.empty()) for (const auto& g : groups) { if (!ver.empty()) ver += " / "; ver += g; }
+    if (match_norm(core).empty()) return urls;
+    for (const auto& score : ranked) {
+        if (score.idx >= cands.size()) continue;
+        const Candidate& c = cands[score.idx];
+        if (score.score < 0.80 || c.coverUrl.empty()) continue;
+        std::string ccore = c.title, cver;
+        std::vector<std::string> cg;
+        match_detail::mf_strip_trailing_groups(ccore, &cg);
+        for (const auto& g : cg) { if (!cver.empty()) cver += " / "; cver += g; }
+        if (match_norm(core) != match_norm(ccore) || match_norm(ver) != match_norm(cver)) continue;
+        if (artist_score(artist, feat, c.artist) < 1.0) continue;
+        if (fileSec > 0 && c.durationMs > 0 &&
+            std::llabs((long long)fileSec * 1000 - c.durationMs) > 3000) continue;
+        if (seen.insert(c.coverUrl).second) urls.push_back(c.coverUrl);
+    }
+    return urls;
+}
+
 // 逐 URL 下载封面：第一个「>minBytes 且是图片」的胜出；每个 URL 都留失败原因。
 struct CoverFetchResult {
     bool ok = false;
@@ -814,10 +853,11 @@ inline ArtFetchOut art_download_image(const std::string& url, const std::vector<
     q.method = "GET";
     q.url = url;
     q.headers = headers;
-    q.timeoutMs = std::max(500, std::min(opts.downloadMs, budgetMs));
+    q.timeoutMs = std::min(opts.downloadMs, budgetMs);
+    if (q.timeoutMs <= 0) { out.transient = true; out.reason = "图片下载预算耗尽"; return out; }
     const rta::net::HttpResponse resp = art_http(q);
     if (resp.status != 200) {
-        out.transient = (resp.status == 0 || resp.status >= 500);
+        out.transient = (resp.status == 0 || resp.status == 401 || resp.status == 403 || resp.status == 429 || resp.status >= 500);
         out.reason = "下载 HTTP " + std::to_string(resp.status) +
                      (resp.error.empty() ? "" : (" " + resp.error));
         return out;
@@ -974,14 +1014,15 @@ inline std::chrono::steady_clock::time_point& art_discogs_last() {
 }
 inline void art_discogs_throttle() {
     if (art_http_hook()) return;                  // 离线测试不真睡
-    std::lock_guard<std::mutex> lk(art_discogs_mtx());
+    std::unique_lock<std::mutex> lk(art_discogs_mtx(), std::defer_lock);
+    if (!rta::net::http_budget_lock(lk)) return;
     auto& last = art_discogs_last();
     const auto now = std::chrono::steady_clock::now();
     if (last.time_since_epoch().count() != 0) {
         const auto wait = std::chrono::milliseconds(2500) - (now - last);
-        if (wait.count() > 0) std::this_thread::sleep_for(wait);
+        if (wait.count() > 0 && !rta::net::http_budget_sleep(wait)) return;
     }
-    last = now;
+    last = std::chrono::steady_clock::now();
 }
 
 // Discogs 搜索 + 详情两步的公共实现(头像与简介都用它，避免两套节流/解析)。
@@ -2865,6 +2906,8 @@ inline ArtPageVerdict art_page_gate(const std::string& pageUrl, const std::strin
 struct ArtMultiResult {
     bool ok = false;
     std::string source, url, page, reason;
+    // 仅封面成功时，从实际命中图片所属的核验候选取证；头像路径为空。
+    std::string matchedAlbum, matchedArtist, releaseId;
     std::string bytes;
     int w = 0, h = 0;
     std::vector<ArtSourceTry> tried;      // 逐源留痕（source/ok/reason/ms）
@@ -2882,30 +2925,63 @@ struct ArtMultiResult {
     }
 };
 
+// A changed chain must be allowed to retry misses recorded by older versions.
+inline constexpr int art_cover_chain_revision() { return 2; }
+
+// MusicBrainz's public service requires at most one request per second. Pace
+// actual dispatch, not future reservations: worker wake-up jitter must not turn
+// two reserved slots into a burst. Locking, pacing and transport share a budget.
+inline rta::net::HttpResponse art_musicbrainz_request(int budgetMs,
+        const std::function<rta::net::HttpResponse()>& request) {
+    static std::timed_mutex mutex;
+    static std::chrono::steady_clock::time_point next;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(0,budgetMs));
+    std::unique_lock<std::timed_mutex> lock(mutex,std::defer_lock);
+    rta::net::HttpResponse failed; failed.error = "MusicBrainz 限频等待超出预算";
+    if (budgetMs <= 0 || !lock.try_lock_until(deadline)) return failed;
+    if (next >= deadline) return failed;
+    const auto wait = next - std::chrono::steady_clock::now();
+    if (wait.count() > 0 && !rta::net::http_budget_sleep(wait)) return failed;
+    if (std::chrono::steady_clock::now() >= deadline) return failed;
+    auto result = request();
+    next = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    return result;
+}
+inline bool art_release_mbid(const std::string& id) {
+    if (id.size() != 36) return false;
+    for (size_t n = 0; n < id.size(); ++n) {
+        if (n == 8 || n == 13 || n == 18 || n == 23) { if (id[n] != '-') return false; }
+        else if (!((id[n] >= '0' && id[n] <= '9') || (id[n] >= 'a' && id[n] <= 'f') || (id[n] >= 'A' && id[n] <= 'F'))) return false;
+    }
+    return true;
+}
+inline std::string art_mb_quoted(const std::string& value) {
+    std::string out = "\"";
+    for (char c : value) { if (c == '\\' || c == '"') out += '\\'; out += c; }
+    return out + '"';
+}
+// Explicit transport-fixture roots only. Empty roots preserve official URLs;
+// search paths and generated image paths remain exactly the production paths.
+inline std::string art_cover_host_url(const std::string& url, const std::string& host) {
+    if (host.empty()) return url;
+    const size_t scheme = url.find("://");
+    const size_t path = scheme == std::string::npos ? std::string::npos : url.find('/', scheme + 3);
+    return art_trim_host(host) + (path == std::string::npos ? std::string() : url.substr(path));
+}
+
 // 单个封面源的搜索结果（不下载）。urls 非空 = 有合规候选。
 struct ArtCoverSearch {
     std::vector<std::string> urls;
+    std::map<std::string, Candidate> verifiedByUrl;
     std::string why;
     bool transient = false;
     int cands = 0;          // 该源返回的原始候选条数（调试用）
 };
 
-// 候选封面是否属于这张碟：album 名要同名（简繁折叠），给了 artist 就要求主艺人同名。
-// 判据保守（宁缺毋错）：同名是唯一证据；artist 只要有一边为空就不作为否决项。
+// 可信发行凭证必须同时核对专辑与完整艺人。保留括号里的发行版本，
+// 不拿歌曲标题冒充专辑，不把缺艺人当作同一艺人，不截取主艺人猜合作版。
 inline bool art_cover_cand_ok(const Candidate& c, const std::string& album, const std::string& artist) {
-    if (c.coverUrl.empty()) return false;
-    const std::string nm = c.album.empty() ? c.title : c.album;
-    if (!album.empty() && !art_name_same_loose(nm, album)) return false;
-    if (!artist.empty()) {
-        const std::string wa = art_primary_artist(artist);
-        const std::string ga = art_primary_artist(c.artist);
-        const std::string want = wa.empty() ? art_trim_name(artist) : wa;
-        const std::string got  = ga.empty() ? art_trim_name(c.artist) : ga;
-        if (!got.empty() && !want.empty() && !art_name_same_loose(got, want) &&
-            !art_name_same_loose(c.artist, artist))
-            return false;
-    }
-    return true;
+    return !c.coverUrl.empty() && art_name_equal(c.album, album) && art_name_equal(c.artist, artist);
 }
 
 // 按注册表 Cover 顺序取候选：dizzylab → qq → netease → itunes。
@@ -2914,7 +2990,20 @@ inline ArtCoverSearch art_cover_search_source(const std::string& src, const std:
                                               const std::string& album, const std::string& artist,
                                               const ArtworkOpts& opts, int budgetMs) {
     ArtCoverSearch out;
-    const int to = std::max(600, std::min(opts.perSourceMs, budgetMs));
+    if (art_trim_name(album).empty() || art_trim_name(artist).empty()) { out.why = "缺少可信专辑名或完整艺人"; return out; }
+    const int to = std::min(opts.perSourceMs, budgetMs);
+    const std::string host = src == "qq" ? opts.qqHost : src == "netease" ? opts.neteaseHost :
+        src == "dizzylab" ? opts.dizzylabHost : src == "discogs" ? opts.discogsHost :
+        src == "musicbrainz" ? opts.musicbrainzHost : std::string();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(0, budgetMs));
+    auto fetch = [&](ArtHttpRequest request) {
+        if (src == "discogs") art_discogs_throttle();
+        const int left = (int)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        request.timeoutMs = std::min(to, left);
+        request.url = art_cover_host_url(request.url, host);
+        if (request.timeoutMs <= 0) { rta::net::HttpResponse r; r.error = "封面搜索预算耗尽"; return r; }
+        return art_http(request);
+    };
     ArtHttpRequest q;
     q.timeoutMs = to;
     std::string err;
@@ -2925,7 +3014,7 @@ inline ArtCoverSearch art_cover_search_source(const std::string& src, const std:
         q.method = "GET";
         q.url = dizzylab_build_search_url(query);
         q.headers = { std::string("User-Agent: ") + pv_user_agent() };
-        const rta::net::HttpResponse r = art_http(q);
+        const rta::net::HttpResponse r = fetch(q);
         if (r.status == 0) { dl_gate_fail(); out.why = "搜索请求失败: " + r.error; out.transient = true; return out; }
         if (r.status != 200) {
             dl_gate_fail();
@@ -2942,7 +3031,7 @@ inline ArtCoverSearch art_cover_search_source(const std::string& src, const std:
         q.body = qq_build_search_body(query);
         q.contentType = "application/json";
         q.headers = { "Referer: https://y.qq.com/", "User-Agent: Mozilla/5.0" };
-        const rta::net::HttpResponse r = art_http(q);
+        const rta::net::HttpResponse r = fetch(q);
         if (r.status == 0) { out.why = "搜索请求失败: " + r.error; out.transient = true; return out; }
         if (r.status != 200) {
             out.why = "搜索 HTTP " + std::to_string(r.status);
@@ -2957,7 +3046,7 @@ inline ArtCoverSearch art_cover_search_source(const std::string& src, const std:
         q.body = netease_build_search_body(query);
         q.contentType = "application/x-www-form-urlencoded";
         q.headers = { "User-Agent: Mozilla/5.0", "Referer: https://music.163.com/" };
-        const rta::net::HttpResponse r = art_http(q);
+        const rta::net::HttpResponse r = fetch(q);
         if (r.status == 0) { out.why = "搜索请求失败: " + r.error; out.transient = true; return out; }
         if (r.status != 200) {
             out.why = "搜索 HTTP " + std::to_string(r.status);
@@ -2966,11 +3055,44 @@ inline ArtCoverSearch art_cover_search_source(const std::string& src, const std:
         }
         cands = parse_netease_search(std::string(r.body.begin(), r.body.end()), err);
         if (!err.empty()) { out.why = err; return out; }
+        // Current public song-search responses can identify the correct album
+        // but omit picUrl. Resolve that known ID, never construct an image URL
+        // from picId or let a different album/artist lend it a picture.
+        std::set<std::string> visited;
+        std::map<std::string,std::string> verifiedImages;
+        for (auto& c : cands) {
+            if (!c.coverUrl.empty() || !art_name_equal(c.album, album) || !art_name_equal(c.artist, artist) ||
+                c.albumId.empty() || c.albumId.find_first_not_of("0123456789") != std::string::npos) continue;
+            const auto cached = verifiedImages.find(c.albumId);
+            if (cached != verifiedImages.end()) { c.coverUrl = cached->second; continue; }
+            if (!visited.insert(c.albumId).second) continue;
+            ArtHttpRequest detail = q; detail.method = "GET"; detail.body.clear(); detail.contentType.clear();
+            detail.url = "https://music.163.com/api/album/" + c.albumId;
+            const auto dr = fetch(detail);
+            if (dr.status != 200) {
+                out.why = "网易专辑详情 HTTP " + std::to_string(dr.status);
+                if (!dr.error.empty()) out.why += ": " + dr.error;
+                out.transient = out.transient || dr.status == 0 || dr.status == 401 || dr.status == 403 || dr.status == 429 || dr.status >= 500;
+                continue;
+            }
+            const auto payload = rta::net::json_parse(std::string(dr.body.begin(), dr.body.end()));
+            const auto& release = payload["album"];
+            if (payload["code"].n() != 200 || release.type != rta::net::Json::Obj) {
+                out.why = "网易专辑详情响应无有效 code/album"; out.transient = true; continue;
+            }
+            const auto& credits = release["artists"];
+            const std::string completeArtist = credits.type == rta::net::Json::Arr && credits.size() > 0
+                ? pv_join_names(credits) : release["artist"]["name"].s();
+            if (release["id"].s() != c.albumId || !art_name_equal(release["name"].s(), album) ||
+                !art_name_equal(completeArtist, artist)) { out.why = "网易专辑详情发行身份不一致"; continue; }
+            c.coverUrl = release["picUrl"].s();
+            if (!c.coverUrl.empty()) verifiedImages.emplace(c.albumId, c.coverUrl);
+        }
     } else if (src == "itunes") {
         q.method = "GET";
         q.url = itunes_build_search_url(query);
         q.headers = { std::string("User-Agent: ") + pv_user_agent() };
-        const rta::net::HttpResponse r = art_http(q);
+        const rta::net::HttpResponse r = fetch(q);
         if (r.status == 0) { out.why = "搜索请求失败: " + r.error; out.transient = true; return out; }
         if (r.status != 200) {
             out.why = "搜索 HTTP " + std::to_string(r.status);
@@ -2979,19 +3101,93 @@ inline ArtCoverSearch art_cover_search_source(const std::string& src, const std:
         }
         cands = parse_itunes_search(std::string(r.body.begin(), r.body.end()), err);
         if (!err.empty()) { out.why = err; return out; }
+    } else if (src == "musicbrainz") {
+        q.method = "GET";
+        q.url = "https://musicbrainz.org/ws/2/release/?query=" +
+                percent_enc_utf8("release:" + art_mb_quoted(album) + " AND artist:" + art_mb_quoted(artist)) + "&fmt=json&limit=5";
+        q.headers = {std::string("User-Agent: ") + pv_user_agent(), "Accept: application/json"};
+        const auto r = art_musicbrainz_request(budgetMs,[&] { return fetch(q); });
+        if (r.status != 200) {
+            out.why = "MusicBrainz 搜索 HTTP " + std::to_string(r.status);
+            if (!r.error.empty()) out.why += ": " + r.error;
+            out.transient = r.status == 0 || r.status == 401 || r.status == 403 || r.status == 429 || r.status >= 500;
+            return out;
+        }
+        const auto result = rta::net::json_parse(std::string(r.body.begin(), r.body.end()));
+        if (result["releases"].type != rta::net::Json::Arr) { out.why = "MusicBrainz 响应缺少 releases"; return out; }
+        for (const auto& release : result["releases"].arr) {
+            Candidate c; c.source = "musicbrainz"; c.albumId = release["id"].s(); c.album = release["title"].s();
+            if (!art_release_mbid(c.albumId)) continue;
+            if (release["artist-credit"].type == rta::net::Json::Arr) for (const auto& credit : release["artist-credit"].arr) {
+                const std::string name = credit["name"].s().empty() ? credit["artist"]["name"].s() : credit["name"].s();
+                c.artist += name + credit["joinphrase"].s();
+            }
+            c.coverUrl = art_cover_host_url("https://coverartarchive.org/release/" + c.albumId + "/front-1200", opts.coverArtHost);
+            cands.push_back(std::move(c));
+        }
+    } else if (src == "discogs") {
+        if ((long long)std::time(nullptr) < art_discogs_cool_until().load()) { out.why = "Discogs 429 冷却中"; out.transient = true; return out; }
+        q.method = "GET";
+        q.url = "https://api.discogs.com/database/search?release_title=" + percent_enc_utf8(album) +
+                "&artist=" + percent_enc_utf8(artist) + "&type=release&per_page=3";
+        q.headers = {std::string("User-Agent: ") + pv_user_agent()};
+        const auto r = fetch(q);
+        if (r.status != 200) {
+            out.why = "搜索 HTTP " + std::to_string(r.status);
+            if (!r.error.empty()) out.why += ": " + r.error;
+            if (r.status == 429) art_discogs_cool_until().store((long long)std::time(nullptr) + 300);
+            if (r.status == 401 || r.status == 403) out.why += " (Discogs 认证/访问被拒)";
+            out.transient = r.status == 0 || r.status == 401 || r.status == 403 || r.status == 429 || r.status >= 500;
+            return out;
+        }
+        const auto result = rta::net::json_parse(std::string(r.body.begin(), r.body.end()));
+        if (result["results"].type != rta::net::Json::Arr) { out.why = "搜索响应缺少 results"; return out; }
+        for (const auto& item : result["results"].arr) {
+            const std::string id = item["id"].s();
+            if (id.empty() || id.find_first_not_of("0123456789") != std::string::npos) continue;
+            ArtHttpRequest detail = q;
+            detail.url = "https://api.discogs.com/releases/" + id;
+            const auto dr = fetch(detail);
+            if (dr.status != 200) {
+                out.why = "发行详情 HTTP " + std::to_string(dr.status);
+                if (!dr.error.empty()) out.why += ": " + dr.error;
+                if (dr.status == 429) art_discogs_cool_until().store((long long)std::time(nullptr) + 300);
+                out.transient = out.transient || dr.status == 0 || dr.status == 401 || dr.status == 403 || dr.status == 429 || dr.status >= 500;
+                continue;
+            }
+            const auto release = rta::net::json_parse(std::string(dr.body.begin(), dr.body.end()));
+            if (release["id"].s() != id) { out.why = "发行详情 ID 与搜索结果不一致"; continue; }
+            Candidate c; c.source = "discogs"; c.albumId = id; c.album = release["title"].s();
+            const auto& credits = release["artists"];
+            if (credits.type == rta::net::Json::Arr) for (size_t n = 0; n < credits.size(); ++n) {
+                const auto& credit = credits.at(n);
+                c.artist += credit["name"].s();
+                if (n + 1 < credits.size()) c.artist += credit["join"].s().empty() ? " / " : " " + credit["join"].s() + " ";
+            }
+            if (release["images"].type == rta::net::Json::Arr) for (const auto& im : release["images"].arr) {
+                if (c.coverUrl.empty() || im["type"].s() == "primary") c.coverUrl = im["uri"].s();
+                if (im["type"].s() == "primary" && !c.coverUrl.empty()) break;
+            }
+            cands.push_back(std::move(c));
+        }
     } else {
         out.why = "未知源 " + src;
         return out;
     }
     out.cands = (int)cands.size();
-    for (const Candidate& c : cands) {
+    for (Candidate c : cands) {
         if (out.urls.size() >= 3) break;
+        if (src == "qq") c.coverUrl = art_cover_host_url(c.coverUrl, opts.qqImageHost.empty() ? opts.qqHost : opts.qqImageHost);
+        if (src == "dizzylab") c.coverUrl = art_cover_host_url(c.coverUrl, opts.dizzylabImageHost.empty() ? opts.dizzylabHost : opts.dizzylabImageHost);
         if (!art_cover_cand_ok(c, album, artist)) continue;
         bool dup = false;
         for (const std::string& u : out.urls) if (u == c.coverUrl) { dup = true; break; }
-        if (!dup) out.urls.push_back(c.coverUrl);
+        if (!dup) {
+            out.urls.push_back(c.coverUrl);
+            out.verifiedByUrl.emplace(c.coverUrl, c);
+        }
     }
-    if (out.urls.empty())
+    if (out.urls.empty() && out.why.empty())
         out.why = "无同名候选(" + std::to_string(cands.size()) + " 条)";
     return out;
 }
@@ -3019,7 +3215,9 @@ inline ArtMultiResult art_multi_source_image(bool isArtist, const std::string& r
     ArtMultiResult res;
     const std::string name = art_trim_name(rawName);
     if (name.empty()) { res.reason = "空名字"; return res; }
+    if (!isArtist && art_trim_name(rawArtist).empty()) { res.reason = "缺少可信发行艺人"; return res; }
     int remaining = opts.totalBudgetMs > 0 ? opts.totalBudgetMs : 15000;
+    rta::net::HttpBudgetScope totalBudget(remaining);
     std::vector<std::string> variants = art_name_variants(name);
     if (variants.empty()) variants.push_back(name);
     if (variants.size() > 2) variants.resize(2);        // 每源最多两遍：别把预算烧在写法上
@@ -3088,13 +3286,12 @@ inline ArtMultiResult art_multi_source_image(bool isArtist, const std::string& r
         return res;
     }
     // 封面
-    static const char* kC[] = { "dizzylab", "qq", "netease", "itunes" };
     const std::string artist = art_trim_name(rawArtist);
-    for (const char* sid : kC) {
-        if (!opts.enabled(sid)) continue;
+    for (const ProviderDesc* provider : art_cover_sources(opts.srcOn)) {
+        const char* sid = provider->id;
         for (const std::string& v : variants) {
             if (remaining <= 600) return budget_out(sid);
-            const std::string query = (artist.empty() || artist == name) ? v : (v + " " + artist);
+            const std::string query = (std::string(sid) == "dizzylab" || artist.empty() || artist == name) ? v : (v + " " + artist);
             const auto t0 = std::chrono::steady_clock::now();
             const ArtCoverSearch cs = art_cover_search_source(sid, query, name, artist, opts, remaining);
             const int ms0 = took(t0);
@@ -3112,8 +3309,12 @@ inline ArtMultiResult art_multi_source_image(bool isArtist, const std::string& r
                     std::vector<std::string> hdr = { std::string("User-Agent: ") + pv_user_agent() };
                     const std::string ref = art_source_referer(sid);
                     if (!ref.empty()) hdr.push_back(ref);
+                    const auto downloadStart = std::chrono::steady_clock::now();
                     const ArtFetchOut dl = art_download_image(u, hdr, opts, remaining);
-                    remaining -= std::min(remaining, opts.downloadMs);
+                    t.transient = t.transient || dl.transient;
+                    const int downloadElapsed = took(downloadStart);
+                    remaining -= downloadElapsed;
+                    t.ms += downloadElapsed;
                     if (dl.ok) {
                         t.ok = true;
                         t.url = u;
@@ -3125,6 +3326,14 @@ inline ArtMultiResult art_multi_source_image(bool isArtist, const std::string& r
                         res.bytes = dl.bytes;
                         res.url = u;
                         res.source = std::string(sid) + (v == name ? std::string() : ("@" + v));
+                        const auto proof = cs.verifiedByUrl.find(u);
+                        if (proof == cs.verifiedByUrl.end() || !art_cover_cand_ok(proof->second, name, artist)) {
+                            res.ok = false; res.bytes.clear(); res.reason = "缺少图片对应发行凭证";
+                            return res;
+                        }
+                        res.matchedAlbum = proof->second.album;
+                        res.matchedArtist = proof->second.artist;
+                        res.releaseId = proof->second.albumId;
                         return res;
                     }
                     res.stats.rej(sid);

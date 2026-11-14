@@ -26,6 +26,7 @@
 #include "net/feedback.h"          // 一键反馈（261027-01 #1）：诊断快照 + 用户手打文字 → 一个 JSON → 上传仓库
 #include "net/update.h"             // 在线更新（261027-02 #5）：清单检查 / 增量计划 / 下载 / 校验
 #include "net/update_apply.h"       // 替换与回滚台账（真正换文件在启动器启动那一刻做）
+#include "net/profile_artwork_migration.h" // Missing artwork/user metadata from explicit sibling release profiles.
 #include "net/i18n.h"               // 界面多语言（261029-03）：语种表 / 系统语言探测 / 语言包加载
 #include "meta/lyrics_ai.h"         // 歌词 AI（261029-03 #4/#5）：翻译 / 音译 / 假名 / 繁体 + 缓存
 #include "analysis/track_health.h"  // 曲目体检（含 quality 19 项）：/api/health 的数据源
@@ -43,6 +44,7 @@ extern "C" __declspec(dllimport) unsigned int __stdcall timeEndPeriod(unsigned i
 #include <avrt.h>
 #pragma comment(lib, "avrt.lib")
 #include "engine/pipeline.h"
+#include "dsp/design_control.h"
 #include "engine/preset_profiles.h"   // 三档官方推荐预设的纯决策层（2026-10-25；离线单测 tests/test_preset_profiles.cpp）
 #include "audio/wav.h"
 #include "audio/audio_loader.h"
@@ -53,6 +55,7 @@ extern "C" __declspec(dllimport) unsigned int __stdcall timeEndPeriod(unsigned i
 #include "audio/cda_mci.h"
 #include "audio/wasapi_capture.h"  // WASAPI 采集核心 (ROADMAP P4b)
 #include "audio/render_loop.h"     // 渲染主循环(含 RENDERFAIL 遥测;测试与 rtaweb 共用同一份)
+#include "analysis/waveform.h"
 #include "audio/buffer_policy.h"   // C1 独占缓冲策略(尊重设置/学习缓存/L1 预检;测试与生产同一份)
 #include "audio/rate_pick.h"       // 输出采样率选择的纯逻辑(可离线单测;2026-10-22 第二首按 44100 开流事故)
 #include "audio/asio_out.h"
@@ -76,6 +79,7 @@ using rta::render::SinkOpenOpts;
 #include "dsp/opra.h"
 #include "dsp/dop.h"
 #include "dsp/modulator.h"
+#include "dsp/sdm_output_policy.h"
 #include "dsp/dop_stream.h"
 #include "dsp/dop_async.h"
 #include "dsp_ringing_reference.h"
@@ -95,6 +99,7 @@ using rta::render::SinkOpenOpts;
 #include <atomic>
 #include <mutex>
 #include <algorithm>
+#include <charconv>
 #include <filesystem>
 #include <chrono>
 #include <random>
@@ -165,6 +170,7 @@ static std::string ringing_json(const char* name, double fs) {
 
 struct PlayParams {
     std::string file;
+    size_t queueIndex = std::string::npos;  // Optional hint for repeated identical queue entries.
     std::string filter;      // 1x（44.1/48k）用；空 = 默认 Kaiser
     std::string filterNx;    // Nx（>=88.2k）用；空则沿用 filter
     std::string shaper = "none";
@@ -172,6 +178,8 @@ struct PlayParams {
     std::string rateFamilyPolicy = "prefer";
     double volume = 0.0;
     bool   gpu = false;
+    bool cleanup = false, cleanupAuto = true;
+    double cleanupStrength = .5, cleanupNoiseDb = -101.1;
     bool   loudness = false;
     bool   isp = true;         // 过采样峰值保护
     // 两段式升频：三态（★ 2026-10-29 两轮审查 F23）
@@ -202,6 +210,8 @@ struct PlayParams {
     std::string sdmFilter;            // SDM（DSD 输出）用的 1x 滤波器；空 = 沿用 filter
     std::string sdmFilterNx;          // SDM 用的 Nx 滤波器；空 = 沿用 filterNx
     std::string backend = "wasapi";   // wasapi | wasapi-shared | asio | upnp | null（naa 已于 261024-05 删除）
+    bool upnpUpsample = false, upnpForceRate = false;
+    uint32_t upnpRateCeiling = 192000;
     std::string upnpDev;              // UPnP/DLNA 渲染器（设备描述 URL；后端 = upnp 时使用）
     int    outChannels = 0;           // 0 = 跟随源
     double trim[8] = {0,0,0,0,0,0,0,0};   // 每声道增益 dB
@@ -250,12 +260,42 @@ struct PlayParams {
     // 给了 cueStart 却读不了/越界 ⟹ **明确报错**，绝不静默从头播（那样用户只会以为 cue 没生效）。
     double cueStart = -1.0;
     double cueEnd   = -1.0;
+    // Workbench-only first-track restart. Never accepted by the ordinary play form.
+    double workbenchResume = -1.0;
+    bool workbenchPaused = false;
+    bool workbenchStrict = false;
     std::string remoteId;        // 远程曲目 id（Subsonic）
     std::string remoteSuffix;    // 远程文件后缀，决定缓存文件名
     std::string remoteTitle;
 };
 
 // ---------------- 播放状态 ----------------
+struct CleanupAutoSnapshot {
+    rta::dsp::RecordingCleanupAutoState state=rta::dsp::RecordingCleanupAutoState::Manual;
+    bool valid=false,appliedValid=false,frozen=false;
+    double estimated=-144,applied=-144,coverage=0;
+    size_t learningFrames=0,rejectedMusicFrames=0;
+};
+template<class T> static CleanupAutoSnapshot cleanup_auto_snapshot(const T& s,bool active) {
+    CleanupAutoSnapshot v;v.state=s.cleanupAutoState;v.valid=s.cleanupAutoEstimateValid;
+    v.estimated=s.cleanupEstimatedNoiseFloorDbfs;v.applied=s.cleanupAppliedNoiseFloorDbfs;
+    v.appliedValid=active&&(v.state==rta::dsp::RecordingCleanupAutoState::Manual||v.valid);
+    v.coverage=s.cleanupAutoEvidenceCoverage;v.learningFrames=s.cleanupAutoLearningFrames;
+    v.rejectedMusicFrames=s.cleanupAutoRejectedMusicFrames;v.frozen=s.cleanupAutoFrozenForDrain;
+    return v;
+}
+static void append_cleanup_auto_json(std::ostringstream& j,const CleanupAutoSnapshot& v) {
+    j << ",\"cleanupAutoState\":\"" << rta::dsp::recording_cleanup_auto_state_name(v.state) << "\""
+      << ",\"cleanupAutoEstimateValid\":" << (v.valid?"true":"false")
+      << ",\"cleanupEstimatedNoiseFloorDbfs\":";
+    if(v.valid)j<<v.estimated;else j<<"null";
+    j << ",\"cleanupAppliedNoiseFloorDbfs\":";
+    if(v.appliedValid)j<<v.applied;else j<<"null";
+    j << ",\"cleanupAutoEvidenceCoverage\":" << v.coverage
+      << ",\"cleanupAutoLearningFrames\":" << v.learningFrames
+      << ",\"cleanupAutoRejectedMusicFrames\":" << v.rejectedMusicFrames
+      << ",\"cleanupAutoFrozenForDrain\":" << (v.frozen?"true":"false");
+}
 struct PlayerState {
     std::mutex  mtx;
     std::thread th;
@@ -264,6 +304,10 @@ struct PlayerState {
     std::atomic<bool> pauseReq{false};   // HTTP 线程置位，播放线程响应
     std::atomic<bool> paused{false};     // 实际是否处于暂停
     std::atomic<bool> playing{false};
+    std::atomic<bool> workbenchReady{false};
+    // Protected by mtx, together with the volume handed to a raw 1-bit owner.
+    // Set before preparation so a late slider request cannot be silently lost.
+    bool rawVolumeLocked = false;
     std::atomic<size_t> played{0};
     std::atomic<size_t> total{0};
     // ★ 2026-10-29（音质准则 → F17 尾部策略）：本次播放"源内容之外"多放的滤波器尾部帧数
@@ -271,9 +315,16 @@ struct PlayerState {
     //   这个字段让 END 日志如实交代"实际多放了 N 帧"，判据不与事实脱节（铁律 3）。
     std::atomic<size_t> tailOut{0};
     std::string current;
+    double activeCueStart=-1,activeCueEnd=-1; // Same mtx/identity as current.
+    size_t activeQueueIndex=std::string::npos;
     std::string error;
     std::string info;
     std::string signal;       // 本次播放的信号链快照（JSON），供界面画"每一环"
+    std::atomic<bool> cleanupObserved{false}, cleanupUsed{false};
+    std::atomic<double> cleanupMeanDb{0.}, cleanupModifiedFraction{0.};
+    // One coherent estimate snapshot; copy under lock, format JSON after release.
+    std::mutex cleanupAutoMutex;
+    CleanupAutoSnapshot cleanupAuto;
     std::atomic<bool> resamplerObserved{false}, twoStageObserved{false};
     std::atomic<size_t> resamplerCoefficientCount{0};
     std::atomic<int> resamplerStage1T{0}, resamplerStage2T{0};
@@ -352,9 +403,13 @@ struct PlayerState {
         stop.store(true);
         if (th.joinable()) th.join();
         stop.store(false);
+        std::lock_guard<std::mutex> lock(mtx);
+        rawVolumeLocked = false;
     }
 };
 static PlayerState g_ps;
+static rta::audio::PlaybackSegmentState g_segment;
+namespace workbench { inline bool sync_saved_locked(); inline bool sync_peq_locked(); }
 
 // 写"输出格式自证"字段（唯一入口：字段成组更新，且必须持 ps.mtx ——
 // /api/status 的读线程也在同一把锁下取值。调用点不得已经持有 ps.mtx，否则死锁）。
@@ -371,10 +426,23 @@ static void set_dsd_out_state(const char* mode, int level, uint32_t bitRate,
 
 // 20 段参数均衡 PEQ（261024-02 #6）：全局单例。播放线程处理音频，HTTP 线程改参数（热更新）。
 static std::shared_ptr<rta::dsp::PeqEngine> g_peq;
+static void peq_load_current();
+static bool peq_save_current(const rta::dsp::PeqSettings&);
 static std::atomic<bool> g_exitReq{false};
 // 2026-10-25：退出中标志。后台 detached 任务看到它就尽量提前收尾（目前只用于文档与诊断，
 // 真正防崩溃靠 main 末尾的 detach + _Exit，见那里的注释）。
 static std::atomic<bool> g_shutdown{false};
+// One owned background design. Its cancellation flag remains alive until join.
+static std::atomic_bool g_filterPrewarmCancel{false};
+static std::thread g_filterPrewarmThread;
+static std::mutex g_filterPrewarmMutex;
+static void filter_prewarm_cancel() {
+    g_filterPrewarmCancel.store(true, std::memory_order_relaxed);
+}
+static void filter_prewarm_join() {
+    std::lock_guard<std::mutex> lock(g_filterPrewarmMutex);
+    if (g_filterPrewarmThread.joinable()) g_filterPrewarmThread.join();
+}
 // 播放线程诊断计数（出问题时第一手证据，比猜快得多）
 static std::atomic<long long> g_dbgW0{0}, g_dbgPulls{0}, g_dbgWf{0}, g_dbgWr{0}, g_dbgPer{0};
 // C2 遥测（2026-10-24 N300 欠载）：dry/dryms/ev/evint/prod 由 render_loop 计数并导出，
@@ -400,6 +468,22 @@ static void dlog(const std::string& s) {
     g_log.push_back(s);
 }
 static PlayParams  g_params;      // 最近一次播放参数，跳曲时沿用
+static bool g_paramsInitialized = false; // Protected by g_ps.sessionMx, like g_params.
+static uint64_t g_workbenchSerial = 1; // Protected by sessionMx.
+static bool raw_dsd_pending(const PlayParams&);
+
+// Only an accepted explicit play establishes the session's output parameters.
+// Seed live volume once, after the old owner has stopped; later tracks must not
+// overwrite a volume request that arrived while they were decoding/preparing.
+static void establish_session_params_locked(const PlayParams& p) {
+    g_params = p;
+    g_paramsInitialized = true;
+    ++g_workbenchSerial;
+    std::lock_guard<std::mutex> lock(g_ps.mtx);
+    g_ps.volDb.store(p.volume);
+    g_ps.rawVolumeLocked = raw_dsd_pending(p);
+    if (g_ps.rawVolumeLocked) g_ps.startDb.store(0.0);
+}
 
 // ---------------- 进程内存遥测（2026-10-25 大 DSD 文件"卡死"取证） ----------------
 // 为什么必须自己量：外部按秒采样会漏掉解码阶段的瞬时峰值（整曲解成 double 平面只在几秒内存在），
@@ -549,6 +633,8 @@ static std::string utf8_sanitize(const std::string& s) {
 // 本想用 null 后端，结果一首曲子以 0 dB 播到了用户的录音接口上）。
 static std::string path_in_exe_dir(const char* name);   // 定义在后面（见文件中部）
 static std::string saved_backend_setting() {
+    std::lock_guard<std::recursive_mutex> settingsReadLock(
+        rta::meta::meta_file_mutex(fs::u8path(path_in_exe_dir("rlplayer-settings.conf"))));
     std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
     std::string line;
     while (std::getline(f, line)) {
@@ -563,13 +649,23 @@ static std::string saved_backend_setting() {
 
 // 同上的 vol 版：不带 volume= 时用已保存的音量；连保存的都没有则按铁律 1 取 -60 dB（不可闻）。
 static double saved_volume_setting() {
+    std::lock_guard<std::recursive_mutex> settingsReadLock(
+        rta::meta::meta_file_mutex(fs::u8path(path_in_exe_dir("rlplayer-settings.conf"))));
     std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
     std::string line;
     while (std::getline(f, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.rfind("volume=", 0) == 0) {
             const std::string v = line.substr(7);
-            if (!v.empty()) { try { return std::stod(v); } catch (...) { break; } }
+            if (!v.empty()) {
+                try {
+                    size_t consumed = 0;
+                    const double db = std::stod(v, &consumed);
+                    if (consumed == v.size() && std::isfinite(db) && db >= -120.0 && db <= 20.0)
+                        return db;
+                } catch (...) { }
+                break; // Invalid persisted volume must never become full-scale output.
+            }
         }
     }
     return -60.0;
@@ -577,6 +673,8 @@ static double saved_volume_setting() {
 
 // 同上的 roomcorrauto 版（B3）。缺键 = 老配置 ⟹ 默认「开」（与 GET /api/settings 的 injectKv 一致）。
 static bool saved_roomcorr_auto() {
+    std::lock_guard<std::recursive_mutex> settingsReadLock(
+        rta::meta::meta_file_mutex(fs::u8path(path_in_exe_dir("rlplayer-settings.conf"))));
     std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
     std::string line;
     while (std::getline(f, line)) {
@@ -590,6 +688,8 @@ static bool saved_roomcorr_auto() {
 }
 
 static std::string saved_rate_family_policy() {
+    std::lock_guard<std::recursive_mutex> settingsReadLock(
+        rta::meta::meta_file_mutex(fs::u8path(path_in_exe_dir("rlplayer-settings.conf"))));
     std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
     std::string line;
     while (std::getline(f, line)) {
@@ -618,7 +718,13 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "shaper")   p.shaper = v;
         else if (k == "rate")     p.rate = v;
         else if (k == "rateFamilyPolicy") { p.rateFamilyPolicy = v; sawRateFamilyPolicy = true; }
-        else if (k == "volume")   { p.volume = atof(v.c_str()); sawVolume = true; }
+        else if (k == "volume")   {
+            // 2026-11-12：音量上限放到 +20 dB；与 /api/volume 同一套严格解析，拒绝 NaN / 半截数字。
+            double vv = 0.0; size_t used = 0;
+            try { vv = std::stod(v, &used); } catch (...) { vv = 0.0; used = 0; }
+            if (used == v.size() && std::isfinite(vv)) p.volume = std::clamp(vv, -120.0, 20.0);
+            sawVolume = true;
+        }
         else if (k == "gpu")      p.gpu = (v == "1");
         else if (k == "isp")      p.isp = (v == "1");
         else if (k == "twostage") p.twoStage = (v == "1" || v == "true") ? 1
@@ -635,6 +741,10 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "dsdconv")  p.dsdConv = v;
         else if (k == "dsd2stage") p.dsd2Stage = (v == "1" || v == "true");
         else if (k == "loudness") p.loudness = (v == "1");
+        else if(k=="cleanup")p.cleanup=(v=="1"||v=="true");
+        else if(k=="cleanup_auto")p.cleanupAuto=(v=="1"||v=="true");
+        else if(k=="cleanup_strength"){double x=atof(v.c_str());p.cleanupStrength=rta::audio::audio_finite(x)?std::clamp(x,0.,1.):.5;}
+        else if(k=="cleanup_noise_db"){double x=atof(v.c_str());p.cleanupNoiseDb=rta::audio::audio_finite(x)?std::clamp(x,-120.,-60.):-101.1;}
         else if (k == "rgmode")   p.rgMode = v;
         else if (k == "rgclip")   p.rgClip = (v == "1" || v == "true");
         else if (k == "buffer")   p.bufferMs = std::max(10, atoi(v.c_str()));
@@ -657,6 +767,9 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "backend") { p.backend = v; sawBackend = true; }
         // naahost：NAA 已删除，老配置里的这一行忽略（不报错，避免用户配置迁移失败）
         else if (k == "upnpdev")  p.upnpDev = v;
+        else if (k == "upnpUpsample") p.upnpUpsample = (v=="1"||v=="true");
+        else if (k == "upnpForceRate") p.upnpForceRate = (v=="1"||v=="true");
+        else if (k == "upnpRateCeiling") p.upnpRateCeiling = (uint32_t)std::clamp(atoi(v.c_str()),44100,768000);
         else if (k == "channels") p.outChannels = atoi(v.c_str());
         else if (k == "trim") {
             std::istringstream ts(v);
@@ -672,6 +785,12 @@ static PlayParams parseForm(const std::string& body) {
         // CUE 分轨区间（秒，浮点）。不带 cue_start ⟹ 整首（cueStart 保持 -1）。
         else if (k == "cue_start") p.cueStart = atof(v.c_str());
         else if (k == "cue_end")   p.cueEnd   = atof(v.c_str());
+        else if (k == "queueIndex") {
+            size_t index = 0;
+            const auto parsed = std::from_chars(v.data(), v.data() + v.size(), index);
+            if (parsed.ec == std::errc{} && parsed.ptr == v.data() + v.size())
+                p.queueIndex = index;
+        }
         else if (k == "rid")     p.remoteId = v;
         else if (k == "rsuffix") p.remoteSuffix = v;
         else if (k == "rtitle")  p.remoteTitle = v;
@@ -716,6 +835,32 @@ static SinkOpenOpts sink_opts(const PlayParams& p) {
 
 // 播放器 exe 目录下的文件路径（定义在本文件后面；WasapiSink 的学习缓存要用，先声明）。
 static std::string path_in_exe_dir(const char* name);
+
+static void play_log(const std::string& s);   // 前向声明：下面的 CLK 诊断要用（定义在文件后段）
+
+// 2026-11-13（反馈 FB-20261113-A916DFDBD3「CD无法拖入播放」）：
+// 拖入一个文件夹时浏览器会把 desktop.ini / 封面 jpg / 说明 txt 一起传上来，旧实现不筛选，
+// 于是 desktop.ini 被当成曲目入队，播放时才由 ffmpeg 报"Invalid data found" ——
+// 用户看到的是「CD 拖不进去」。这里统一一份判定，三处（目录展开 / 单文件入队 / 上传）共用，
+// 免得各处列表各自漂移（原来就有两份不一致的列表）。
+static bool rta_is_playable_ext(std::string ext) {
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    static const char* kExt[] = {
+        ".wav", ".wave", ".flac", ".alac", ".m4a", ".mp3", ".aac", ".ogg", ".opus",
+        ".wma", ".ape", ".wv", ".aif", ".aiff", ".aifc", ".caf", ".mka",
+        ".dsf", ".dff", ".cue", ".iso"
+    };
+    for (const char* e : kExt) if (ext == e) return true;
+    return false;
+}
+static std::string rta_ext_of(const std::string& path) {
+    const size_t dot = path.find_last_of('.');
+    const size_t sep = path.find_last_of("\\/");
+    if (dot == std::string::npos) return std::string();
+    if (sep != std::string::npos && dot < sep) return std::string();
+    return path.substr(dot);
+}
 
 class WasapiSink : public OutSink {
 public:
@@ -777,9 +922,33 @@ public:
     bool wait_event(int ms) override { return ao_.wait_event(ms); }
     long long last_pad() const override { return ao_.last_pad(); }
     size_t write_one_period(const int32_t* pcm, size_t frames) override { return ao_.write_one_period(pcm, frames); }
-    size_t write_available(const int32_t* pcm, size_t frames) override { return ao_.write_available(pcm, frames); }
+    size_t write_available(const int32_t* pcm, size_t frames) override {
+        const size_t got = ao_.write_available(pcm, frames);
+        // 2026-11-13 诊断（RLPLAYER_CLK_LOG=1）：把「设备时钟位置 vs 已写帧数」按秒打出来。
+        // 用来分清两种完全不同的成因：驱动不报 padding 但设备照常消费（只是缺节流信号），
+        // 还是设备根本没跑到标称率（能力问题）。前者 backlog 有界，后者 backlog 单调增长。
+        if (clkLog_) {
+            const double el = ao_.elapsed_seconds();
+            if (el - lastClkLog_ >= 1.0) {
+                lastClkLog_ = el;
+                unsigned long long pos = 0;
+                const bool ok = ao_.device_position(pos);
+                std::ostringstream s;
+                s.setf(std::ios::fixed); s.precision(3);
+                s << "CLK t=" << el
+                  << " pad=" << ao_.last_pad()
+                  << " written=" << (long long)ao_.frames_written()
+                  << " devpos=" << (ok ? (long long)pos : -1LL)
+                  << " backlog=" << (ok ? ((long long)ao_.frames_written() - (long long)pos) : -1LL)
+                  << " rate=" << ao_.rate();
+                play_log(s.str());
+            }
+        }
+        return got;
+    }
     void pause() override { ao_.pause(); }
     void resume() override { ao_.resume(); }
+    bool keep_clock_on_pause() const override { return true; }
     void close() override { ao_.close(); }
     const std::string& last_error() const override { return err_.empty() ? ao_.last_error() : err_; }
     long long last_gb_hr() const override { return ao_.last_gb_hr(); }
@@ -854,6 +1023,9 @@ public:
 private:
     WasapiOutput ao_;
     bool ok_ = false;
+    // CLK 诊断（RLPLAYER_CLK_LOG=1 才开）：每秒一行「设备时钟 vs 已写帧数」。
+    bool clkLog_ = (std::getenv("RLPLAYER_CLK_LOG") != nullptr);
+    double lastClkLog_ = -1.0;
     bool opened_ = false;
     OpenFail fail_;
     OpenFail failRequested_;   // 按【用户请求值】打开那一次的失败归因（降级重试会覆盖 fail_）
@@ -911,6 +1083,7 @@ public:
     double out_peak() const override { return so_.out_peak(); }
     void pause() override { so_.pause(); }
     void resume() override { so_.resume(); }
+    bool keep_clock_on_pause() const override { return true; }
     void close() override { so_.close(); }
     const std::string& last_error() const override { return err_.empty() ? so_.last_error() : err_; }
     long long last_gb_hr() const override { return so_.last_gb_hr(); }
@@ -978,6 +1151,19 @@ static std::vector<std::string> artistimg_parse_names(const std::string& raw);  
 
 static void play_log(const std::string& s);              // 定义在后面
 static void play_log_rotate();
+// 自动化测试固定设置 RTA_NET_TESTS=0。SSDP 发现与 UPnP 投放供源会绑定 0.0.0.0，
+// 每复制一份 rtaweb.exe 都会触发 Windows 防火墙弹窗，严重打断桌面操作。
+// 该开关只影响测试进程；正常启动不设置，行为不变。
+static bool rta_net_tests_disabled() {
+    const char* v = std::getenv("RTA_NET_TESTS");
+    return v && std::string(v) == "0";
+}
+// 测试模式仍允许 127.0.0.1/localhost 的本地渲染器：它只绑回环，不会触发防火墙。
+static bool cast_dev_is_loopback(const std::string& dev) {
+    return dev.find("127.0.0.1") != std::string::npos ||
+           dev.find("localhost") != std::string::npos ||
+           dev.find("[::1]") != std::string::npos;
+}
 
 // E-11: 记录上一次播放以 END pos=0 error="" 结束的状态，供下一次 START 显式归因 PLAY_ABORT
 struct LastPlayEnd {
@@ -1256,6 +1442,38 @@ private:
     std::string err_;
 };
 
+
+// 2026-11-02（用户反馈：板载声卡没开独占 ⟹ 永远不是 bit-perfect，但软件不提示）：
+//   共享 WASAPI 的采样要过 Windows 混音器（我们的 SharedSink 也没有 RAW 模式），
+//   **管线再干净也不可能逐位**。之前 bpState 只看 DSP 链、不看输出模式 ⟹ 共享下照样显示
+//   「bit-perfect」。这里单独记一个"当前输出是不是共享"，供结论/原因/底栏一致使用。
+static std::atomic<bool> g_outShared{false};
+
+// 2026-11-02：多语言验收通道的状态（只在 RLPLAYER_QA=1 时被页面轮询）
+static std::atomic<int> g_qa_step{-1};
+static std::atomic<int> g_qa_done{-1};
+static std::mutex g_qa_mu;
+static std::string g_qa_cmd;
+
+// 2026-11-02（261102-01 #1）：开播前看一眼端点上有无**别人**的活动会话。
+//
+//   ★ 当天两次改口径，最终以用户 2026-11-02 14:xx 的原话为准：
+//     「不自动降级，我们的目标是高音质播放，应该是别的给我们让路，
+//       而不是我们给别的软件让路。」
+//   ⟹ 本函数**只记录、不改行为**：仍然请求独占（Windows 会挤掉共享客户端，
+//     对方要么静音要么自己重开），绝不自作主张降成共享。
+//     想主动让路的人可以在 设置→输出 手动选「WASAPI 共享」，那是他自己的选择。
+//   ⟹ 这行日志的价值在于：用户报「我的通话断了 / 这首没有 bit-perfect 徽标」时，
+//     能直接看出当时设备上还有几个别的程序在放音。
+//   历史备注：3.1.11 曾在这里自动降级成共享（EXCL_SKIP），3.1.12 按上面那句话撤销。
+static void note_endpoint_busy(const PlayParams& p) {
+    if (p.backend != "wasapi") return;
+    const int busy = rta::audio::WasapiOutput::endpoint_other_active_sessions(p.device);
+    play_log("EXCLBUSY n=" + std::to_string(busy) + " backend=" + p.backend +
+             " dev=" + (p.device.empty() ? std::string("(默认)") : p.device) +
+             (busy > 0 ? " 仍独占（高音质优先，其他程序让路）" : ""));
+}
+
 static std::unique_ptr<OutSink> make_sink(const PlayParams& p) {
     // 守门（261024-01 #9）：backend=upnp 由 /api/play 直接转交投放会话，本地播放线程根本不该启动。
     // 万一将来有别的路径漏过来，也绝不能落到默认的 WasapiSink —— 那会真的接管本机声卡。
@@ -1264,7 +1482,10 @@ static std::unique_ptr<OutSink> make_sink(const PlayParams& p) {
     // 261024-05：backend=naa 已删除。老配置文件里残留的 naa 落到这里 —— 明确报错，不静默换后端。
     if (p.backend == "naa")            return nullptr;
     if (p.backend == "asio")           return std::make_unique<AsioSink>();   // 见 audio/asio_out.h
-    if (p.backend == "wasapi-shared")  return std::make_unique<WasapiSharedSink>();
+    if (p.backend == "wasapi-shared") {
+        g_outShared.store(true);       // 显式选了共享
+        return std::make_unique<WasapiSharedSink>();
+    }
     return std::make_unique<WasapiSink>();
 }
 
@@ -1288,6 +1509,8 @@ static bool upnp_is_dsd_file(const std::string& file) {
 // 把一条曲目交给投放会话。切歌 / 重播都走这里：先停旧会话再起新会话
 //（CastManager 同一时刻只允许一条会话）。失败原因原样返回，界面直接显示，不假装成功。
 static bool upnp_start_track(const PlayParams& p, const std::string& file, std::string& err) {
+    if (rta_net_tests_disabled() && !cast_dev_is_loopback(p.upnpDev)) {err="测试模式已禁用非回环网络投放（RTA_NET_TESTS=0）";return false;}
+    if (p.cueStart >= 0.0 || p.cueEnd >= 0.0) {err="UPnP 暂不支持 CUE 分轨；拒绝播放整个镜像";return false;}
     if (p.upnpDev.empty()) {
         err = "未选择 UPnP / DLNA 渲染器：设置 → 输出 → 目标渲染器（点「重新发现」刷新列表）";
         return false;
@@ -1297,6 +1520,12 @@ static bool upnp_start_track(const PlayParams& p, const std::string& file, std::
     cp.dev = p.upnpDev;
     cp.file = file;
     cp.port = 8912;
+    cp.cueStart=p.cueStart;cp.cueEnd=p.cueEnd;
+    cp.upsample=p.upnpUpsample;cp.forceRate=p.upnpForceRate;cp.rateCeiling=p.upnpRateCeiling;
+    cp.requestedRate=p.rate.empty()?"max":p.rate;
+    cp.cleanup=p.cleanup;cp.cleanupAuto=p.cleanupAuto;cp.cleanupStrength=p.cleanupStrength;cp.cleanupNoiseDb=p.cleanupNoiseDb;
+    cp.filter=(p.filter.empty()||p.filter=="auto")?"poly-sinc-tight-lp":p.filter;cp.filterNx=p.filterNx;cp.twoStage=p.twoStage;
+    if(p.upnpUpsample)cp.bits=p.bits;
     // DSD 源必须 DoP 打包（cast_service 对未开 DoP 的 DSD 会明确拒绝 —— 铁律 3：不悄悄转码降质）
     cp.dop = upnp_is_dsd_file(file) || p.dsd >= 64;
     rta::net::CastManager::instance().stop();
@@ -1391,7 +1620,40 @@ static std::string naa_discover_json(bool force) {
 // 本函数只做参数校验：不打开设备、不读音频数据（只看扩展名），因此 /api/play 可以在
 // HTTP 线程里同步返回明确原因（tests/native_dsd_api_check.ps1 的 4 条断言就是冲它来的）。
 // 返回 true = 可以走原生 DSD；false = why 里写明缺哪一条（必须原样报给用户）。
-static bool native_dsd_precheck(const PlayParams& p, std::string& why) {
+static bool raw_peq_requested(const rta::dsp::PeqSettings& s) {
+    if (s.bypass) return false;
+    if (std::fabs(s.preampDb) > 1e-9) return true;
+    for (const auto& band : s.bands)
+        if (band.enabled && std::fabs(band.gainDb) > 1e-9) return true;
+    return false;
+}
+
+static std::vector<std::string> raw_dsd_processing(const PlayParams& p,
+                                                  const rta::dsp::PeqSettings* proposedPeq = nullptr) {
+    std::vector<std::string> proc;
+    if (!p.eqFile.empty()) proc.push_back("EQ");
+    if (!p.convIr.empty()) proc.push_back("IR 卷积");
+    if (proposedPeq ? raw_peq_requested(*proposedPeq) : g_peq && raw_peq_requested(g_peq->settings()))
+        proc.push_back("20 段 PEQ");
+    if (p.rgMode != "off" && !p.rgMode.empty()) proc.push_back("ReplayGain");
+    if (p.roomCorrAuto) proc.push_back("自动房间校正");
+    if (p.isp) proc.push_back("峰值保护");
+    if (p.loudness) proc.push_back("等响度补偿");
+    if (p.cleanup) proc.push_back("录音噪声清理");
+    for (int i = 0; i < 8; ++i) {
+        if (p.trim[i] != 0.0) { proc.push_back("每声道增益"); break; }
+    }
+    return proc;
+}
+
+static std::string raw_dsd_processing_text(const std::vector<std::string>& proc) {
+    std::string text;
+    for (const auto& part : proc) { if (!text.empty()) text += "、"; text += part; }
+    return text;
+}
+
+static bool native_dsd_precheck(const PlayParams& p, std::string& why,
+                               const rta::dsp::PeqSettings* proposedPeq = nullptr) {
     const std::string be = p.backend.empty() ? std::string("wasapi") : p.backend;
     if (be != "asio") {
         why = "Native DSD 只能走 ASIO 后端（ASIO 2.3 的 IoFormat 原生 DSD 通道）：当前后端是「" + be +
@@ -1405,7 +1667,7 @@ static bool native_dsd_precheck(const PlayParams& p, std::string& why) {
               "」。PCM 源没有 1-bit 码流可直通 —— 想输出 DSD 请用 DoP（它会先调制）。";
         return false;
     }
-    if (std::fabs(p.volume) > 1e-9) {
+    if (p.volume != 0.0) {
         char b[200];
         std::snprintf(b, sizeof(b),
             "Native DSD 要求音量 0 dB（逐位直通，整条 PCM 链都被跳过）：当前音量 %.1f dB。"
@@ -1413,22 +1675,9 @@ static bool native_dsd_precheck(const PlayParams& p, std::string& why) {
         why = b;
         return false;
     }
-    std::vector<std::string> proc;
-    if (!p.eqFile.empty())  proc.push_back("EQ");
-    if (!p.convIr.empty())  proc.push_back("IR 卷积");
-    if (p.loudness)         proc.push_back("等响度补偿");
-    for (int i = 0; i < 8; ++i) {
-        if (std::fabs(p.trim[i]) > 1e-9) {
-            char b[96];
-            std::snprintf(b, sizeof(b), "每声道增益(ch%d %.1f dB)", i + 1, p.trim[i]);
-            proc.push_back(b);
-            break;
-        }
-    }
+    const auto proc = raw_dsd_processing(p, proposedPeq);
     if (!proc.empty()) {
-        std::string list;
-        for (size_t i = 0; i < proc.size(); ++i) { if (i) list += "、"; list += proc[i]; }
-        why = "Native DSD 不做任何 PCM 处理（1-bit 流不经过 DSP 链）：请清空 " + list + "，或改用 DoP。";
+        why = "Native DSD 不做任何 PCM 处理（1-bit 流不经过 DSP 链）：请关闭 " + raw_dsd_processing_text(proc) + "，或改用 DoP。";
         return false;
     }
     // 升频 / 变速：2026-10-27 起 **DSD→DSD 速率转换已落地**（pipeline.h 的 dsd_rate_branch /
@@ -1475,12 +1724,40 @@ static bool direct_sdm_eligible(const PlayParams& p, const DsdInfo& info, std::s
     if (p.dsd < 64) { why = "输出不是 DSD：把 SDM 页的比特率选成 DSD64/128/256（DoP）"; return false; }
     const uint32_t base = (info.rate % 48000u == 0) ? 48000u : 44100u;
     const uint32_t target = rta::dsp::dsd_rate(p.dsd, base);
-    bool anyProc = !p.eqFile.empty() || !p.convIr.empty() || p.loudness;
-    for (int i = 0; i < 8; ++i) if (p.trim[i] != 0.0) anyProc = true;
+    const auto proc = raw_dsd_processing(p);
+    bool anyProc = !proc.empty();
     if (p.outChannels > 0 && p.outChannels != info.channels) anyProc = true;   // 声道数变化也是处理
     const auto d = rta::dsp::direct_sdm_decision(info.rate, target, anyProc, p.volume != 0.0);
     why = d.reason;
+    if (!proc.empty()) why += "：" + raw_dsd_processing_text(proc);
     return d.enabled;
+}
+
+static bool raw_dsd_pending(const PlayParams& p) {
+    if (p.backend == "upnp" || p.backend == "wasapi-shared") return false;
+    if (p.volume != 0.0 || !raw_dsd_processing(p).empty()) return false;
+    const auto ext = rta::audio::lowerExt(p.file);
+    return (ext == ".dsf" || ext == ".dff") && (p.dsdNative || (p.directSdm && p.dsd >= 64));
+}
+
+// Lock order for HTTP owners is sessionMx -> mtx. The playback thread only
+// takes mtx: apply/stop may hold sessionMx while waiting for that thread.
+static bool claim_raw_dsd_volume(PlayParams& p, const DsdInfo* info, std::string& why) {
+    std::lock_guard<std::mutex> lock(g_ps.mtx);
+    p.volume = g_ps.volDb.load();
+    const bool accepted = p.dsdNative ? native_dsd_precheck(p, why)
+                                     : info && direct_sdm_eligible(p, *info, why);
+    g_ps.rawVolumeLocked = accepted;
+    if (accepted) g_ps.startDb.store(0.0);
+    return accepted;
+}
+
+// Caller holds mtx. Sharing this check with the actual API also makes both
+// startup orderings testable without constructing a sink or ASIO driver.
+static bool write_live_volume_locked(double db) {
+    if (g_ps.playing.load() && g_ps.rawVolumeLocked && db != 0.0) return false;
+    g_ps.volDb.store(db);
+    return true;
 }
 
 // 直接播放 DSD 源：1-bit 流按 16 位整数倍切片 → DoP 24-bit 载波 → 输出后端。
@@ -1600,10 +1877,11 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
 
         ps.outRate = carrier;
         ps.outBits = 24;
+        set_dsd_out_state("dop", (srcRate % 48000u == 0) ? (int)(srcRate / 48000u) : (int)(srcRate / 44100u),
+                          srcRate, std::string(), 0, opts.fallbackNote);
         ps.total.store(frameCount);   // CUE 分轨：本区间的 DoP 帧数（不是整轨）
         ps.played.store(0);
         ps.startDb.store(0.0);
-        ps.volDb.store(0.0);
         ps.gpu = false;
         ps.gpuConvUsed.store(false);   // 直通路径不会有卷积，显式归零（#8）
 
@@ -1639,6 +1917,7 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
                 << ",\"dsd\":" << p.dsd
                 << ",\"dsdRate\":" << srcRate
                 << ",\"modOrder\":0"
+                << ",\"modOrderRequested\":0"
                 << ",\"ispPeak\":0,\"ispOver\":0,\"preAtten\":0"
                 << ",\"atten\":0,\"conv\":false,\"irGpu\":false"
                 << ",\"gpuVendor\":\"\",\"gpuStatus\":\"\""
@@ -1697,7 +1976,17 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
         const size_t period = sink->buffer_frames() ? sink->buffer_frames() : 4096;
         std::vector<int32_t> pend;
         size_t pendFrames = 0, posFrames = frameBase, played = 0;
+        if (p.workbenchResume >= 0.0) {
+            const size_t rel = std::min(frameCount, (size_t)(p.workbenchResume * carrier));
+            posFrames += rel; played = rel; ps.played.store(rel);
+            ps.pauseReq.store(p.workbenchPaused);
+            ps.seekReq.store(-1.0);
+            ps.workbenchReady.store(true);
+        }
         bool pausedNow = false, eos = false;
+        bool dopNextMarkerA=true, segmentEnded=false;
+        std::vector<int32_t> pausePcm;
+        auto pauseWriteProgress=std::chrono::steady_clock::now();
         int  timeouts = 0;
         auto lastLog = std::chrono::steady_clock::now();
         rta::dsp::DopPackState packSt;      // 标记相位跨块保持；跳转时也不重置（避免出现 A,A）
@@ -1736,12 +2025,34 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
         };
 
         while (!ps.stop.load()) {
-            if (ps.pauseReq.load() != pausedNow) {
-                pausedNow = ps.pauseReq.load();
-                if (pausedNow) { sink->pause(); ps.paused.store(true); }
-                else { sink->resume(); ps.paused.store(false); timeouts = 0; }
+            const bool wantPause=ps.pauseReq.load();
+            if (wantPause != pausedNow) {
+                pausedNow = wantPause;
+                if (pausedNow) {
+                    if(!sink->keep_clock_on_pause())sink->pause();
+                    ps.paused.store(true);pauseWriteProgress=std::chrono::steady_clock::now();
+                }else {
+                    if(!sink->keep_clock_on_pause())sink->resume();
+                    ps.paused.store(false); timeouts = 0;lastLog=std::chrono::steady_clock::now();
+                    if(segmentEnded){const auto s=g_segment.for_track(file,p.cueStart,p.cueEnd,p.queueIndex);if(s.enabled&&frameCount)ps.seekReq.store(s.start*carrier/(double)frameCount);segmentEnded=false;}
+                }
+                play_log(std::string(pausedNow?"PAUSE":"RESUME")+" strategy="+
+                    (sink->keep_clock_on_pause()?"clock-silence":"backend")+" raw_dop=1 content_frame="+std::to_string(played));
             }
-            if (pausedNow) { Sleep(30); continue; }
+            if (pausedNow) {
+                if(!sink->keep_clock_on_pause()){Sleep(30);continue;}
+                rta::render::pause_silence(pausePcm,period,ch,true,dopNextMarkerA);
+                const size_t w=sink->write_available(pausePcm.data(),period);
+                if(w){if(w&1u)dopNextMarkerA=!dopNextMarkerA;pauseWriteProgress=std::chrono::steady_clock::now();}
+                else {
+                    if(std::chrono::steady_clock::now()-pauseWriteProgress>std::chrono::seconds(2)){
+                        std::lock_guard<std::mutex> lock(ps.mtx);
+                        ps.error="PAUSE_WRITE_FAILED 暂停期间DoP输出流持续2秒不接受合法静音；已停止";break;
+                    }
+                    sink->wait_event(5);
+                }
+                continue;
+            }
 
             const double sk = ps.seekReq.exchange(-1.0);
             if (sk >= 0.0) {
@@ -1751,6 +2062,14 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
                 pend.clear(); pendFrames = 0; eos = false; timeouts = 0;
                 played = rel;
                 ps.played.store(played);
+                continue;
+            }
+
+            const auto segment=g_segment.for_track(file,p.cueStart,p.cueEnd,p.queueIndex);
+            const size_t segmentEnd=segment.enabled?std::min(frameCount,segment.end_frame(carrier)):frameCount;
+            if(segment.enabled&&played>=segmentEnd){
+                if(segment.repeat)ps.seekReq.store(segment.start*carrier/(double)frameCount);
+                else{segmentEnded=true;ps.pauseReq.store(true);}
                 continue;
             }
 
@@ -1790,8 +2109,11 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
                 }
             }
             sink->wait_event(20);
-            const size_t w = sink->write_available(pend.data(), pendFrames);
+            rta::render::dop_rephase(pend,ch,dopNextMarkerA);
+            const size_t permitted=segment.enabled?std::min(pendFrames,segmentEnd-played):pendFrames;
+            const size_t w = sink->write_available(pend.data(), permitted);
             if (w > 0) {
+                if(w&1u)dopNextMarkerA=!dopNextMarkerA;
                 pend.erase(pend.begin(), pend.begin() + (long long)(w * (size_t)ch));
                 pendFrames -= w;
                 played += w;
@@ -1914,6 +2236,9 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
                     convCfg.modOrder = p.modOrder > 0 ? p.modOrder : 5;
                     convCfg.modDitherLsb = p.modDither >= 0.0 ? p.modDither : 0.0005;
                     convCfg.modCutoffHz = p.modCutoff > 0.0 ? p.modCutoff * 1000.0 : 100000.0;
+                    // Reject a known-distorting setting before conversion and
+                    // before the native-device/fallback branch can open a sink.
+                    rta::dsp::validate_one_bit_sdm_corner(convCfg.modFamily, false, convCfg.modCutoffHz);
                     convCfg.modOobGainDb = p.oobGain;
                     convCfg.modAhmBits = p.ahmBits;
                     eng::DsdRateBranchResult cr = eng::dsd_rate_convert(src, want0, convCfg, conv);
@@ -1991,6 +2316,11 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
         // 失败回落：把已读好的 1-bit 流直接交给 DoP 路径（不重复读盘），原因写进信号链。
         auto dop_fallback = [&](const std::string& reason, const std::string& devName) -> bool {
             drv.close();
+            if (p.workbenchStrict) {
+                std::lock_guard<std::mutex> lock(ps.mtx);
+                ps.error = "工作台原生DSD切换失败：" + reason;
+                return false;
+            }
             play_log("NATIVE_DSD_FALLBACK reason=" + reason);
             dlog("NATIVE_DSD_FALLBACK " + reason);
             DirectDsdOpts o;
@@ -2119,7 +2449,6 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
         ps.total.store(bitsCount);   // 无 cue = bitsTotal（与旧实现逐位一致）；cue = 本区间样点数
         ps.played.store(0);
         ps.startDb.store(0.0);
-        ps.volDb.store(0.0);
         ps.gpu = false;
         ps.gpuConvUsed.store(false);   // 直通路径没有卷积，显式归零
 
@@ -2129,6 +2458,11 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
         std::vector<uint8_t> inter((size_t)period * (size_t)ch);
         std::vector<uint8_t> zeros((size_t)period * (size_t)ch, 0x69);
         size_t cursor = byteBegin, pushed = 0, padPushed = 0;   // CUE：从本轨起点开始
+        if (p.workbenchResume >= 0.0) {
+            cursor += std::min(byteEnd - byteBegin, (size_t)(p.workbenchResume * srcRate / 8.0));
+            ps.pauseReq.store(p.workbenchPaused);
+            ps.seekReq.store(-1.0);
+        }
         auto fill = [&](size_t n) {
             for (size_t i = 0; i < n; ++i) {
                 const size_t b = cursor + i;
@@ -2137,6 +2471,12 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
             }
         };
         while (cursor < byteEnd && drv.free_frames() >= (size_t)period) {
+            if (p.workbenchResume >= 0.0 && p.workbenchPaused) {
+                const size_t w = drv.push_dsd(zeros.data(), (size_t)period);
+                if (!w) break;
+                padPushed += w;
+                continue;
+            }
             const size_t n = std::min<size_t>((size_t)period, byteEnd - cursor);
             fill(n);
             const size_t w = drv.push_dsd(inter.data(), n);
@@ -2192,6 +2532,7 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
                 << ",\"dsd\":0"                       // 0 = 不经过调制/DoP（UI 据此不画那两环）
                 << ",\"dsdRate\":" << srcRate
                 << ",\"modOrder\":" << convertedModOrder
+                << ",\"modOrderRequested\":" << (convertedModOrder > 0 ? (p.modOrder > 0 ? p.modOrder : 5) : 0)
                 << ",\"ispPeak\":0,\"ispOver\":0,\"preAtten\":0"
                 << ",\"atten\":0,\"conv\":false,\"irGpu\":false"
                 << ",\"gpuVendor\":\"\",\"gpuStatus\":\"\""
@@ -2225,15 +2566,18 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
                                         : "Native DSD：1-bit 流直送 ASIO（不经 PCM / DoP 封装），逐位一致";
         }
 
-        bool pausedNow = false;
+        bool pausedNow = false, segmentEnded=false;
+        if (p.workbenchResume >= 0.0) ps.workbenchReady.store(true);
         auto lastProgress = std::chrono::steady_clock::now();
         auto lastLog = std::chrono::steady_clock::now();
         const auto tPlay0 = std::chrono::steady_clock::now();
 
-        while (!ps.stop.load() && cursor < byteEnd) {
-            if (ps.pauseReq.load() != pausedNow) {
-                pausedNow = ps.pauseReq.load();
+        while (!ps.stop.load()) {
+            const bool wantPause=ps.pauseReq.load();
+            if (wantPause != pausedNow) {
+                pausedNow = wantPause;
                 ps.paused.store(pausedNow);
+                if(!pausedNow&&segmentEnded){const auto s=g_segment.for_track(file,p.cueStart,p.cueEnd,p.queueIndex);if(s.enabled&&byteEnd>byteBegin)ps.seekReq.store(s.start*(srcRate/8.0)/(double)(byteEnd-byteBegin));segmentEnded=false;}
             }
             if (pausedNow) {
                 // 暂停时不写数据会让驱动反复欠载，把"0 欠载"的证据变脏。
@@ -2265,9 +2609,17 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
                 lastProgress = std::chrono::steady_clock::now();
                 continue;
             }
+            const auto segment=g_segment.for_track(file,p.cueStart,p.cueEnd,p.queueIndex);
+            const size_t segmentEnd=segment.enabled?byteBegin+std::min(byteEnd-byteBegin,segment.end_frame(srcRate/8.0)):byteEnd;
+            if(segment.enabled&&cursor>=segmentEnd){
+                if(segment.repeat)ps.seekReq.store(segment.start*(srcRate/8.0)/(double)(byteEnd-byteBegin));
+                else{segmentEnded=true;ps.pauseReq.store(true);}
+                continue;
+            }
+            if(cursor>=byteEnd)break;
             bool progressed = false;
-            while (cursor < byteEnd && drv.free_frames() >= (size_t)period) {
-                const size_t n = std::min<size_t>((size_t)period, byteEnd - cursor);
+            while (cursor < segmentEnd && drv.free_frames() >= (size_t)period) {
+                const size_t n = std::min<size_t>((size_t)period, segmentEnd - cursor);
                 fill(n);
                 const size_t w = drv.push_dsd(inter.data(), n);
                 if (!w) break;
@@ -2405,6 +2757,8 @@ struct PlaySource {
 
 // 读 rlplayer-settings.conf 的单键（缺失返回 def）
 static std::string conf_get(const std::string& key, const std::string& def = std::string()) {
+    std::lock_guard<std::recursive_mutex> settingsReadLock(
+        rta::meta::meta_file_mutex(fs::u8path(path_in_exe_dir("rlplayer-settings.conf"))));
     std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
     if (!f) return def;
     std::string line;
@@ -2556,8 +2910,10 @@ static bool preset_probe_asio_driver(const rta::audio::AsioDriverEntry& e,
     }
     c.channels = (int)outCh;
     // PCM：canSampleRate 是**查询**（不 setSampleRate，不会改变设备状态）
+    // 2026-11-01：补 1411200 / 1536000（PCM 32× 档）。旧列表止于 768000，导致"能力查询"把
+    // 真正支持 1.4M/1.5M 的设备报成 768k —— 这是查询口径的假上限，不是 DSP 的上限。
     static const double kPcmRates[] = {44100, 48000, 88200, 96000, 176400, 192000,
-                                       352800, 384000, 705600, 768000};
+                                       352800, 384000, 705600, 768000, 1411200, 1536000};
     for (double r : kPcmRates)
         if (preset_asio_can_sample_rate(d, r) == ASE_OK) c.rates.push_back((uint32_t)r);
     c.maxRate = c.rates.empty() ? 0u : c.rates.back();
@@ -2574,13 +2930,18 @@ static bool preset_probe_asio_driver(const rta::audio::AsioDriverEntry& e,
                           (fmt.formatType == rta::audio::kASIODSDFormat);
     int dsdLevel = 0;
     if (canDoDsd) {
-        // DSD64/128/256/512 的位率逐档问 canSampleRate（同样是查询）
-        static const double kDsdRates[] = {2822400, 5644800, 11289600, 22579200};
+        // DSD64/128/256/512/1024 的位率逐档问 canSampleRate（同样是查询）。
+        // 2026-11-01：补 1024 档（44.1k 族 45158400 / 48k 族 49152000）—— 旧列表只到 DSD512，
+        // 于是"设备只支持 1024"的情形会被判成 max=dsd512，进而让预设推荐与界面全部偏保守。
+        static const double kDsdRates[] = {2822400, 5644800, 11289600, 22579200, 45158400, 49152000};
+        // 查询与判定分离：这里只负责"问驱动"，判定交给纯函数（可离线单测，见
+        // tests/test_preset_profiles.cpp 的 dsd_native_level_from_bitrates 用例）。
+        std::vector<uint32_t> dsdAccepted;
         for (double r : kDsdRates) {
             if (preset_asio_can_sample_rate(d, r) != ASE_OK) continue;
-            const int lvl = rta::engine::dsd_level_of_bitrate((uint32_t)r);
-            if (lvl > dsdLevel) dsdLevel = lvl;
+            dsdAccepted.push_back((uint32_t)r);
         }
+        dsdLevel = rta::engine::dsd_native_level_from_bitrates(dsdAccepted);
         if (dsdLevel > 0) {
             c.dsdNative = true;
             c.dsdNativeMax = rta::engine::dsd_level_name(dsdLevel);
@@ -2600,17 +2961,24 @@ static bool preset_probe_asio_driver(const rta::audio::AsioDriverEntry& e,
 // 探测当前设置下的输出设备能力（只读）。
 // backend=asio ⟹ 问 ASIO 驱动；其余（wasapi / wasapi-shared / null / upnp / 空）
 // ⟹ 问 WASAPI 默认（或已选）端点的独占能力，且 dsdNative 恒为 false（WASAPI 没有 1-bit 通道）。
-static rta::engine::DeviceCaps preset_probe_caps() {
+static rta::engine::DeviceCaps preset_probe_caps(const PlayParams* requested = nullptr) {
     using rta::engine::DeviceCaps;
     DeviceCaps c;
-    const std::string savedBackend = conf_get("backend", "");
-    int ch = std::atoi(conf_get("channels", "0").c_str());
+    const std::string savedBackend = requested ? requested->backend : conf_get("backend", "");
+    int ch = requested ? requested->outChannels : std::atoi(conf_get("channels", "0").c_str());
     if (ch <= 0) ch = 2;
-    int bits = std::atoi(conf_get("bits", "0").c_str());
+    int bits = requested ? requested->bits : std::atoi(conf_get("bits", "0").c_str());
     if (bits <= 0) bits = 24;
     c.channels = ch;
     c.bits = bits;
-    const std::string devId = conf_get("device", "");
+    const std::string devId = requested ? requested->device : conf_get("device", "");
+    if (requested && savedBackend == "null") {
+        c.backend = "null"; c.deviceName = "Null 输出（不出声）";
+        c.rates = {44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000};
+        c.maxRate = c.rates.back(); c.dop = true; c.dopMax = "dsd256";
+        c.probeNote = "离线 Null 输出，无物理设备能力声明";
+        return c;
+    }
 
     if (savedBackend == "asio") {
         const auto list = rta::audio::asio_enum_drivers();
@@ -2767,7 +3135,10 @@ static rta::engine::SourceInfo preset_source_info(const std::map<std::string, st
         std::lock_guard<std::mutex> lk(g_ps.mtx);
         file = g_ps.current;
     }
-    if (file.empty()) file = g_params.file;
+    if (file.empty()) {
+        std::lock_guard<std::mutex> sessionLock(g_ps.sessionMx);
+        file = g_params.file;
+    }
     if (!file.empty()) {
         const std::string ext = rta::audio::lowerExt(file);
         if (ext == ".dsf" || ext == ".dff") {
@@ -2808,6 +3179,7 @@ static rta::engine::SourceInfo preset_source_info(const std::map<std::string, st
 //（2026-10-23 的真实事故，见 /api/settings 处的注释）。
 static bool preset_write_conf(const std::map<std::string, std::string>& kv, std::string& err) {
     const std::string sp = path_in_exe_dir("rlplayer-settings.conf");
+    std::lock_guard<std::recursive_mutex> settingsFileLock(rta::meta::meta_file_mutex(fs::u8path(sp)));
     std::map<std::string, std::string> merged;
     std::vector<std::string> order;
     {
@@ -2896,6 +3268,18 @@ static std::string preset_apply_json(const std::string& path) {
     std::string srcNote;
     const SourceInfo src = preset_source_info(q, srcNote);
     PresetSettings s = plan_preset(prof, caps, src);
+    const bool keepVolume = q.count("keep_volume") && q.at("keep_volume") == "1";
+    const bool stoppedOnly = q.count("require_stopped") && q.at("require_stopped") == "1";
+    std::unique_lock<std::mutex> session(g_ps.sessionMx);
+    if (stoppedOnly) {
+        if (g_ps.playing.load() || g_ps.paused.load() || g_upnpPlayer.load()) {
+            rta::net::webui_set_status(409);
+            return "{\"ok\":false,\"error\":\"请先停止播放，再应用播放方式\"}";
+        }
+    }
+    if (keepVolume) s.volumeDb = saved_volume_setting();
+    const auto preserve=q.find("preserve_processing");
+    if(prof!=PresetProfile::BitPerfect && preserve!=q.end() && preserve->second=="1")s.clearEqIr=false;
     // ★ 2026-10-30：把「八条件自检」的结论**接进响应**。
     //   在此之前 check_bit_perfect() 全仓只有单测在调（rtaweb 只调 plan_preset）⟹
     //   第⑧条「必须独占/直连」永远到不了界面，用户点了原音直通仍然以为能逐位。
@@ -2903,7 +3287,7 @@ static std::string preset_apply_json(const std::string& path) {
 
     // ---- 落盘（键名与 /api/play 的请求键名一致）----
     std::map<std::string, std::string> kv;
-    kv["volume"]   = "0";                        // 官方推荐链路：0 dB（预衰减交给 DSP 的余量逻辑）
+    if (!keepVolume) kv["volume"] = "0";
     kv["rate"]     = s.rate;
     kv["shaper"]   = s.shaper;
     kv["filter"]   = s.filter;
@@ -2935,10 +3319,20 @@ static std::string preset_apply_json(const std::string& path) {
         // 升频/DSD 档保留 ISP —— 它挡的是过采样峰值削波，与"清空 EQ/IR"是两件事。
         kv["isp"]        = (prof == PresetProfile::BitPerfect) ? "0" : "1";
     }
+    if(prof==PresetProfile::BitPerfect) {
+        kv["roomcorrauto"]="0";kv["cleanup"]="0";kv["upnpUpsample"]="0";kv["upnpForceRate"]="0";kv["rgmode"]="off";
+        if(!g_peq)peq_load_current();
+        auto peq=g_peq->settings();peq.bypass=true;
+        if(!peq_save_current(peq)) {rta::net::webui_set_status(400);return "{\"ok\":false,\"error\":\"无法保存 PEQ 旁路；预设未应用\"}";}
+        g_peq->set_settings(peq);
+    }
     std::string werr;
     if (!preset_write_conf(kv, werr)) {
         rta::net::webui_set_status(400);
         return std::string("{\"ok\":false,\"error\":\"写入设置失败：") + jesc(werr) + "\"}";
+    }
+    if(!workbench::sync_saved_locked()||!workbench::sync_peq_locked()){
+        rta::net::webui_set_status(500);return "{\"ok\":false,\"error\":\"设置已应用，但当前配置组保存失败\"}";
     }
 
     // ---- 说明（决策 notes + 落盘事实）----
@@ -2949,6 +3343,8 @@ static std::string preset_apply_json(const std::string& path) {
         notes.push_back("minTapsPerInput=" + std::to_string(s.minTapsPerInput) +
                         " 由 poly-sinc-tight-lp 预设自带（手动 taps 覆盖已清 0，避免被当成总抽头预算）");
     }
+    if(!s.clearEqIr)notes.push_back("已保留用户 EQ、IR 校正、PEQ 与声道增益");
+    if(prof==PresetProfile::BitPerfect)notes.push_back("已旁路 PEQ，并关闭自动房间校正、录音清理、ReplayGain 与 UPnP 升频");
     if (s.clearEqIr) notes.push_back("已清空 EQ/IR/等响度/每声道增益" +
                                      std::string(prof == PresetProfile::BitPerfect
                                                  ? "，并关闭 ISP 预衰减" : ""));
@@ -2980,7 +3376,7 @@ static std::string preset_apply_json(const std::string& path) {
              " dsd=" + std::to_string(s.dsd) +
              " modfamily=" + (s.modFamily.empty() ? std::string("-") : s.modFamily) +
              " modorder=" + std::to_string(s.modOrder) +
-             " shaper=" + s.shaper + " volume=0 directsdm=" + std::to_string(s.directSdm) +
+             " shaper=" + s.shaper + " volume=" + std::to_string(s.volumeDb) + " directsdm=" + std::to_string(s.directSdm) +
              " src=" + (src.isDsd ? "dsd" : "pcm") + "/" +
              std::to_string((unsigned long long)src.srcRate) +
              " notes=" + std::to_string(notes.size()));
@@ -2989,12 +3385,14 @@ static std::string preset_apply_json(const std::string& path) {
     j << "{\"ok\":true,\"profile\":\"" << preset_profile_name(prof) << "\",\"applied\":{"
       << "\"rate\":\"" << jesc(s.rate) << "\""
       << ",\"filter\":\"" << jesc(s.filter) << "\""
+      << ",\"clearProcessing\":" << (s.clearEqIr?"true":"false")
+      << ",\"filterNx\":\"\",\"twostage\":\"" << (prof==PresetProfile::BitPerfect?conf_get("twostage","auto"):"auto") << "\""
       << ",\"minTapsPerInput\":" << s.minTapsPerInput
       << ",\"dsd\":\"" << s.dsd << "\""
       << ",\"modfamily\":\"" << jesc(s.modFamily) << "\""
       << ",\"modorder\":" << s.modOrder
       << ",\"shaper\":\"" << jesc(s.shaper) << "\""
-      << ",\"volume\":" << (long long)std::llround(s.volumeDb)
+      << ",\"volume\":" << s.volumeDb
       << ",\"directsdm\":" << s.directSdm
       // 封装（用户 261025-02 #5）：preset 不改它，但必须让前端能直接显示"这次到底走原生还是 DoP"
       << ",\"packing\":\"" << packing << "\""
@@ -3105,9 +3503,56 @@ struct RoomCorrAuto {
     int ch = 0;                  // 校正集声道数
     int taps = 0;
     uint32_t fs = 0;             // 校正集的采样率（≠ 工程采样率时已重采样）
-    double subDelaySamples = 0.0, subGainDb = 0.0;   // 主/超低对齐（只上报，不改音频，见下）
+    double subDelaySamples = 0.0, subGainDb = 0.0;   // 主/超低对齐，已经按当前源采样率换算并应用
     std::vector<std::vector<double>> irs;   // 每声道 FIR（已重采样到 inRate）
 };
+// Positive measured lag means the subwoofer arrives late. Delay all mains,
+// never the already-late LFE. Prefixing IRs includes alignment in drain/tails.
+static void roomcorr_apply_alignment(rta::engine::PipelineConfig& cfg,const RoomCorrAuto& rc) {
+    const auto layouts=rta::dsp::room_layouts();
+    for(const auto& layout:layouts) if(rc.layout==layout.name && layout.sub) {
+        if(cfg.channel.size()<(size_t)layout.chCount)return;
+        const double delay=rc.subDelaySamples;
+        const size_t n=(size_t)std::llround(std::abs(delay));
+        for(int c=0;c<layout.chCount;++c) {
+            const bool sub=std::string(layout.chName[c])=="LFE";
+            auto& ch=cfg.channel[(size_t)c];
+            if(sub)ch.gainDb+=rc.subGainDb;
+            if(n && ((delay>0 && !sub)||(delay<0 && sub)))ch.ir.insert(ch.ir.begin(),n,0.0);
+        }
+        return;
+    }
+}
+static void apply_channel_trims(rta::engine::PipelineConfig& cfg,int channels,const double* trim) {
+    int need=0;for(int c=0;c<channels && c<8;++c)if(trim[c]!=0.0)need=c+1;
+    if((int)cfg.channel.size()<need)cfg.channel.resize((size_t)need);
+    for(int c=0;c<need;++c)cfg.channel[(size_t)c].gainDb+=trim[c];
+}
+static bool roomcorr_ir_valid(const std::vector<double>& ir) {
+    if (ir.empty() || ir.size() > rta::dsp::ir_detail::kMaxSamples) return false;
+    for (double v : ir) if (!rta::audio::audio_finite(v)) return false;
+    return true;
+}
+// Manual WAVs and generated correction JSON share the same coefficient guard.
+// A mono WAV broadcasts; a multichannel WAV must match the output exactly.
+static std::vector<std::vector<double>> roomcorr_manual_prepare(const std::string& file,
+                                                               int channels, uint32_t rate) {
+    const rta::audio::AudioBuffer irb = rta::audio::read_wav(file);
+    if (channels < 1 || channels > 64 || irb.rate < 8000 || irb.rate > 1536000 ||
+        (irb.channels != 1 && irb.channels != channels) || irb.frames() == 0 ||
+        irb.frames() > rta::dsp::ir_detail::kMaxSamples)
+        throw std::runtime_error("Invalid manual IR shape or sample rate");
+    std::vector<std::vector<double>> prepared((size_t)channels);
+    for (int c = 0; c < channels; ++c) {
+        auto& ir = prepared[(size_t)c];
+        ir.resize(irb.frames());
+        for (size_t n = 0; n < ir.size(); ++n) ir[n] = irb.sample(n, irb.channels == 1 ? 0 : c);
+        if (!roomcorr_ir_valid(ir)) throw std::runtime_error("Invalid manual IR coefficients");
+        if (irb.rate != rate) ir = rta::dsp::ir_resample(ir, irb.rate, rate);
+        if (!roomcorr_ir_valid(ir)) throw std::runtime_error("Invalid resampled manual IR");
+    }
+    return prepared;
+}
 // 定义在文件后部（roomcorr_* 一整套工具函数旁边）；此处只做前置声明。
 static RoomCorrAuto roomcorr_auto_prepare(int outCh, uint32_t inRate, bool settingOn,
                                           bool manualIrEmpty, bool useGpu);
@@ -3119,9 +3564,11 @@ static RoomCorrAuto roomcorr_auto_prepare(int outCh, uint32_t inRate, bool setti
 // sharedFallback（可选出参）：独占流 RENDERFAIL（设备持续不接受数据）且允许回退时置 true，
 // 由 play_one 包装层决定是否以 wasapi-shared 重开整条播放；extraNote：回退重入时追加到
 // note/ps.info/信号链的说明（"独占流无响应,已回退 WASAPI 共享"）。
-static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuffer& buf,
+static bool play_one_impl(const std::string& file, const PlayParams& requested, AudioBuffer& buf,
                           bool* sharedFallback, const std::string& extraNote) {
     auto& ps = g_ps;
+    PlayParams p = requested;
+    p.file = file;
     play_log_rotate();
     g_dbgPeak.store(0.0);
     g_dbgClip.store(0);
@@ -3134,7 +3581,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
     // 本身就是一条会被误判成"成功"的假链路。
     if (p.dsdNative) {
         std::string why;
-        if (!native_dsd_precheck(p, why)) {
+        if (!claim_raw_dsd_volume(p, nullptr, why)) {
             play_log("PLAY_REJECT dsdnative=1 " + why);
             dlog(std::string("PLAY_REJECT dsdnative=1 ") + why);
             std::lock_guard<std::mutex> lk(ps.mtx);
@@ -3153,7 +3600,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             try {
                 const DsdInfo info = probe_dsd(file);
                 std::string why;
-                if (direct_sdm_eligible(p, info, why)) return play_one_direct(file, p);
+                if (claim_raw_dsd_volume(p, &info, why)) return play_one_direct(file, p);
                 directNote = "DirectSDM 未启用：" + why;
             } catch (const std::exception& e) {
                 directNote = std::string("DirectSDM 判定失败（回退普通路径）：") + e.what();
@@ -3161,6 +3608,10 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         } else {
             directNote = "DirectSDM 只对 DSD 源（.dsf / .dff）有效，本文件按普通路径播放";
         }
+    }
+    {
+        std::lock_guard<std::mutex> lock(ps.mtx);
+        ps.rawVolumeLocked = false;
     }
     // 系统级时序调优：MMCSS Pro Audio + CPU 亲和 + 定时器 1ms
     RtTune rt = rta::audio::apply_playback_tuning();
@@ -3358,6 +3809,11 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             if (!p.device.empty()) {
                 const FormatProbe ep = WasapiOutput::probe_formats(p.device);
                 if (!ep.endpointAlive) {
+                    if (p.workbenchStrict) {
+                        std::lock_guard<std::mutex> lock(ps.mtx);
+                        ps.error = "工作台所选输出设备已失效，切换中止";
+                        return false;
+                    }
                     const std::string shown = ep.friendlyName.empty()
                         ? p.device : (ep.friendlyName + " / " + p.device);
                     std::string defName = "默认端点";
@@ -3376,7 +3832,10 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         rta::dsp::GpuBridge::instance().reload();
         dlog("stage gpu-ok");
 
-        eng::PipelineConfig cfg;      // 先声明：下面的 ReplayGain 判定要写 cfg.replayGainDb
+        eng::PipelineConfig cfg;
+        cfg.recordingCleanup.enabled=p.cleanup;cfg.recordingCleanup.strength=p.cleanupStrength;cfg.recordingCleanup.noiseFloorDbfs=p.cleanupNoiseDb;
+        cfg.recordingCleanup.noiseMode=p.cleanupAuto?rta::dsp::RecordingCleanupNoiseMode::Auto:rta::dsp::RecordingCleanupNoiseMode::Manual;
+        // 先声明：下面的 ReplayGain 判定要写 cfg.replayGainDb
 
         // ---------------- ReplayGain（261027-01 #2；判据见 dsp/replaygain.h 文件头）----------------
         // 这里只做「读标签 → 判定 → 写一个数」，不做任何音频运算：
@@ -3602,6 +4061,11 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         uint32_t deviceRate = cfg.outRate;            // 设备真正打开的采样率
         uint32_t dsdRate = 0;
         if (dop) {
+            // Old profiles and direct API calls can bypass the settings form.
+            // Check before capability probes/opening any output endpoint.
+            rta::dsp::validate_one_bit_sdm_corner(
+                rta::dsp::parse_modulator_family(p.modFamily), false,
+                p.modCutoff > 0.0 ? p.modCutoff * 1000.0 : 100000.0);
             const uint32_t base = (in.rate % 48000u == 0) ? 48000u : 44100u;
             dsdRate    = rta::dsp::dsd_rate(p.dsd, base);
             deviceRate = dsdRate / 16u;               // DoP 载波
@@ -3610,10 +4074,10 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             cfg.shaper  = rta::dsp::Shaper::None;     // 抖动交给调制器之后的 1-bit 量化
             // 自证（261025-02 #2）：**PCM 源同样走这里** —— dsd>=64 就是"要 DSD 输出"，
             // 与源是 PCM 还是 DSD 无关（PCM 源由 SdmModulator 调制出 1-bit 再装箱）。
-            // 这里先把"请求值"写出去；真正的生效阶数由生产者在 stable_sdm_order 之后覆盖。
+            // 模块构造前实际阶数尚未确认；请求值保留在 signal 快照中，不能冒充实际值。
             set_dsd_out_state("dop", p.dsd, dsdRate,
                               p.modFamily.empty() ? std::string("dsd") : p.modFamily,
-                              p.modOrder > 0 ? p.modOrder : 5, directNote);
+                              0, directNote);
         }
 
         // 设备能力检查（仅 WASAPI）。HF-01/02/04 接线（2026-10-22）：
@@ -3875,6 +4339,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         rta::engine::apply_resample_purpose(cfg, dop ? rta::dsp::ResamplePurpose::Dsd
                                                     : rta::dsp::ResamplePurpose::Pcm);
         if (p.twoStage >= 0) {
+            cfg.allowAutomaticCascade = false; // Explicit on/off outranks automatic planning.
             const bool want = (p.twoStage != 0);
             if (want != cfg.twoStage) {
                 play_log(std::string("TWOSTAGE 显式请求覆盖预设 twoStage=") +
@@ -3928,27 +4393,20 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         bool convLoaded = false;
         if (!p.convIr.empty()) {
             try {
-                AudioBuffer irb = read_wav(p.convIr);
-                if (!irb.raw.empty()) {
-                    const size_t maxCh = (size_t)std::max(in.channels, 2);
-                    cfg.channel.resize(maxCh);
-                    // 261024-05（A2）：IR 采样率与音源不同时必须**先重采样**。
-                    // 为什么是 in.rate：信号链里卷积(4)在重采样(5)之前，卷积器看到的是源采样率。
-                    // 以前这里原样铺开 —— 44.1k 量的房间响应用在 96k 工程上，时间基准会被拉长
-                    // 2.18 倍（1 秒的响应当成 0.46 秒），听感是"房间变小/低频不对"。
-                    const bool needRate = (irb.rate != 0 && irb.rate != in.rate);
-                    for (size_t c = 0; c < maxCh; ++c) {
-                        auto& dst = cfg.channel[c];
-                        const int srcCh = (irb.channels > 1) ? (int)(c % (size_t)irb.channels) : 0;
-                        std::vector<double> ir(irb.frames(), 0.0);
-                        for (size_t n = 0; n < irb.frames(); ++n) ir[n] = irb.sample(n, srcCh);
-                        if (needRate) ir = rta::dsp::ir_resample(ir, irb.rate, in.rate);
-                        dst.ir = std::move(ir);
-                        dst.useGpu = p.convGpu;
-                    }
-                    convLoaded = true;
+                const int irOutCh = pEff.outChannels > 0 ? pEff.outChannels : in.channels;
+                auto prepared = roomcorr_manual_prepare(p.convIr, irOutCh, in.rate);
+                cfg.channel.resize(prepared.size());
+                for (size_t c = 0; c < prepared.size(); ++c) {
+                    cfg.channel[c].ir = std::move(prepared[c]);
+                    cfg.channel[c].useGpu = p.convGpu;
                 }
-            } catch (...) { /* IR 读失败就当没配 */ }
+                convLoaded = true;
+            } catch (const std::exception& e) {
+                play_log("MANUAL_IR_INVALID file=" + p.convIr + " reason=" + e.what());
+                std::lock_guard<std::mutex> lk(ps.mtx);
+                ps.error = "Manual FIR is invalid; playback was not started.";
+                return false;
+            }
         }
 
         // ---------------- 流式渲染 ----------------
@@ -3966,15 +4424,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         // 共享后端：pEff.outChannels 已被强制为系统混音声道数（见上方共享归一块）。
         const int      outCh    = (pEff.outChannels > 0) ? pEff.outChannels : in.channels;
         if (outCh != in.channels) cfg.outChannels = outCh;
-        {
-            // 每声道增益：左右平衡 / 多声道校正
-            int need = 0;
-            for (int c = 0; c < outCh && c < 8; ++c) if (p.trim[c] != 0.0) need = c + 1;
-            if (need > 0) {
-                if ((int)cfg.channel.size() < need) cfg.channel.resize((size_t)need);
-                for (int c = 0; c < need; ++c) cfg.channel[(size_t)c].gainDb = p.trim[c];
-            }
-        }
+        apply_channel_trims(cfg,outCh,p.trim);
         // ---- 房间校正自动应用（B3，2026-10-27）----
         // 位置讲究：必须在 outCh 定下来之后（布局=输出声道数），且在 Pipeline 构造之前
         // （生产者线程 3892 行才把 cfg 拿去建管线）。手动 IR 已在上面按 WAV 铺进 cfg.channel，
@@ -3988,6 +4438,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 cfg.channel[c].ir = rcAuto.irs[c];
                 cfg.channel[c].useGpu = p.convGpu;
             }
+            roomcorr_apply_alignment(cfg,rcAuto);
             // 校正集声道数 < 输出声道数：多出来的声道**不校正**，但必须写清（半套校正比不校更误导）
             if (rcAuto.irs.size() < (size_t)outCh && rcAuto.why.empty())
                 rcAuto.why = "校正集只有 " + std::to_string(rcAuto.irs.size()) + " 声道，当前输出 " +
@@ -4059,6 +4510,10 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         // 结论与原因**只在这里算一次**：信号链 JSON 与 /api/status 的 ps.bpState/bpWhy
         // 都引用它，两处口径不可能再漂移（这正是 F21 要修的东西）。
         const std::string bpState = [&]() -> std::string {
+            // 2026-11-02：共享输出**永远**不是 bit-perfect（系统混音器 + 无 RAW 模式）。
+            //   结论必须排在其它规则之前，否则管线干净就会被误判成 "yes"。
+            const bool sharedOut = g_outShared.load();
+            if (sharedOut) return "no";
             if (p.directSdm && directNote.empty()) return "direct";
             if (dop) return "no";                 // DoP 载波必然经过调制，不是 PCM 直通
             // ★ 2026-10-30：第四态 lossy —— 链路逐位，但源本身有损（mp3/aac/…）。
@@ -4068,6 +4523,22 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             return "no";
         }();
         const std::string bpWhy = [&]() -> std::string {
+            // 共享模式：原因必须写清楚"为什么、怎么修"，否则用户只会觉得"调了也没用"
+            const std::string sharedWhy =
+                "WASAPI 共享输出：采样要经 Windows 混音器（本程序也没有 RAW 模式），"
+                "所以无论音量/EQ/升频怎么设都不可能 bit-perfect。"
+                "要 bit-perfect 请在 设置→输出 把后端改成「WASAPI（独占 · 事件驱动）」";
+            if (g_outShared.load()) {
+                if (p.directSdm && directNote.empty()) return sharedWhy;
+                std::vector<std::string> why;
+                why.push_back(sharedWhy);
+                // 继续把管线侧的原因也列出来（音量/EQ/升频…），两件事都要说清
+                if (outRate != in.rate) why.push_back("重采样 " + std::to_string(in.rate) + "→" + std::to_string(outRate) + " Hz");
+                if (cfg.volumeEnabled && std::fabs(cfg.volumeDb) > 1e-9) why.push_back("音量 " + std::to_string((int)std::lround(cfg.volumeDb)) + " dB");
+                if (cfg.peq && (cfg.peq->has_effect() || cfg.peq->transitioning())) why.push_back("PEQ");
+                std::string s; for (size_t i = 0; i < why.size(); ++i) { if (i) s += "、"; s += why[i]; }
+                return s;
+            }
             if (p.directSdm && directNote.empty()) return "DirectSDM：1-bit 直通，跳过 PCM 与调制";
             std::vector<std::string> why;
             if (outRate != in.rate) why.push_back("重采样 " + std::to_string(in.rate) + "→" + std::to_string(outRate) + " Hz");
@@ -4097,6 +4568,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 if (g) why.push_back("声道增益");
                 if (dl) why.push_back("声道延迟");
             }
+            if (cfg.recordingCleanup.enabled && cfg.recordingCleanup.strength>0)why.push_back("录音噪声清理");
             if (eqLoaded) why.push_back("EQ");
             if (convLoaded) why.push_back("IR 卷积");
             if (rcAuto.applied) why.push_back("房间校正（" + rcAuto.file + "）");
@@ -4171,6 +4643,10 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                                   : (cfg.filterPhase == rta::dsp::PhaseKind::Intermediate ? "混合相位" : "线性相位")) << "\""
                 << ",\"shaper\":\"" << jesc(p.shaper == "auto" ? std::string(rta::dsp::shaper_name(cfg.shaper))
                                                           : (p.shaper.empty() ? std::string("none") : p.shaper)) << "\""
+                << ",\"cleanupRequested\":" << (p.cleanup?"true":"false")
+                << ",\"cleanupAuto\":" << (p.cleanupAuto?"true":"false")
+                << ",\"cleanupStrength\":" << p.cleanupStrength
+                << ",\"cleanupNoiseDb\":" << p.cleanupNoiseDb
                 << ",\"loudness\":" << (p.loudness ? "true" : "false")
                 << ",\"volume\":" << p.volume
                 << ",\"buffer\":" << p.bufferMs
@@ -4181,6 +4657,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 << ",\"dsdRate\":" << (dop ? dsdRate : 0)
                 << ",\"modFamily\":\"" << jesc(p.modFamily.empty() ? std::string("dsd") : p.modFamily) << "\""
                  << ",\"modOrder\":" << (dop ? (p.modOrder > 0 ? p.modOrder : 5) : 0)
+                << ",\"modOrderRequested\":" << (dop ? (p.modOrder > 0 ? p.modOrder : 5) : 0)
+                << ",\"carrier\":" << (dop ? deviceRate : 0)
                 << ",\"ispPeak\":" << ispPeak
                 << ",\"ispOver\":" << ispOver
                 // ispScan: full（整曲扫描）/ partial（流式文件只扫开头 isp_prescan_sec 秒）/ off
@@ -4192,7 +4670,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 << ",\"modHeadroom\":" << modHeadroomDb
                 << ",\"preAtten\":" << preAtten
                 << ",\"atten\":" << cfg.attenDb
-                << ",\"conv\":" << (convLoaded ? "true" : "false")
+                << ",\"conv\":" << ((convLoaded || rcAuto.applied) ? "true" : "false")
                 // ---- 房间校正自动应用（B3，2026-10-27）----
                 // 一个对象说清四件事：**开了没 / 用了没 / 用的哪个文件 / 为什么没用**。
                 // 只给一个 bool 是不够的：用户最需要知道的是"为什么我测了却没生效"，
@@ -4203,7 +4681,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                 //   manual   用户手动配了 IR，自动校正让位
                 //   file     文件名（不含目录）；layout 校正集自己的布局；want 当前输出对应的布局
                 //   taps/fs/ch 校正集参数（fs ≠ 源采样率时已重采样到源率）
-                //   subDelay/subGain 主/超低对齐量（⚠️ 只上报，尚未接进播放链，见 roomcorr_auto_prepare）
+                //   subDelay/subGain 主/超低对齐量（已应用，正值延迟主声道，负值延迟LFE）
                 << ",\"roomCorr\":{\"enabled\":" << (rcAuto.enabled ? "true" : "false")
                 << ",\"applied\":" << (rcAuto.applied ? "true" : "false")
                 << ",\"mismatch\":" << (rcAuto.mismatch ? "true" : "false")
@@ -4256,6 +4734,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             dlog("stage playlog-ok");
             meta_on_play(file);   // 播放触发元数据补全(设置可关;inFlight 去重,后台线程)
             std::lock_guard<std::mutex> lk(ps.mtx);
+            ps.cleanupObserved.store(false);ps.cleanupUsed.store(false);ps.cleanupMeanDb.store(0);ps.cleanupModifiedFraction.store(0);
+            {std::lock_guard<std::mutex> lock(ps.cleanupAutoMutex);ps.cleanupAuto={};}
             ps.resamplerObserved.store(false); ps.twoStageObserved.store(false);
             ps.gpuResamplerStageMask.store(0); ps.gpuCompactResamplerStageMask.store(0); ps.gpuAllResamplerStages.store(false);
             ps.resamplerCoefficientCount.store(0);
@@ -4275,9 +4755,9 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         }
         ps.startDb.store(p.volume);
         dlog("stage sig-ok");
-        // ★ 必须无条件重置：旧代码只在 p.volume != 0 时写 volDb，导致上一曲
-        //   拖过音量后，下一曲的实时增益 = 旧 volDb - 新 startDb（凭空多减几十 dB）。
-        ps.volDb.store(p.volume);
+        // Live volume belongs to the session, not this track's preparation.
+        // startDb is the pipeline baseline; the renderer applies live-startDb.
+        // Resetting live here would undo a slider change during preparation.
 
         std::thread prod([&]() {
             const size_t kChunk = 4096;
@@ -4394,7 +4874,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                     std::chrono::steady_clock::now() - begin).count();
                 return enqueue(std::move(o));
             };
-            try {
+            for (;;) {
+              try {
                 for (;;) {
                     if (RQ.abort.load()) break;
                     const auto [sf, requestedEpoch] = RQ.consume_seek();
@@ -4452,6 +4933,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                     //   render_loop 对 DoP 会跳过 sink 层增益（那会改坏 DoP marker），
                     //   所以这条是 DSD 播放中拖动音量的唯一生效路径。
                     if (dop) pl->set_volume_db(ps.volDb.load());
+                    else pl->set_loudness_volume_db(ps.volDb.load());
                     eng::PipelineStats pst;
                     std::vector<std::vector<double>> dsdPlanes;
                     AudioBuffer o = pl->process(c, &pst, dop ? &dsdPlanes : nullptr);
@@ -4473,7 +4955,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                         //   总时长仍等于源时长，且末尾内容不丢。
                         const double latF = pl->algorithmic_latency_out_frames();
                         drainLeft = (size_t)(latF + 0.5);
-                        tailOut = (size_t)(pl->convolution_tail_out_frames() + 0.5);
+                        tailOut = (size_t)std::ceil(pl->convolution_tail_out_frames()+pl->recording_cleanup_tail_out_frames());
                         resamplerTail = (size_t)std::ceil(pl->resampler_tail_out_frames());
                         ps.tailOut.store(tailOut);
                         if (drainLeft > 0) {
@@ -4486,6 +4968,10 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
                                      " 帧（输出域）将完整放出（IR 抽头 " +
                                      std::to_string(pst.maxIrLength) + "）：不截断混响衰减 file=" + file);
                     }
+                    ps.cleanupObserved.store(true);ps.cleanupUsed.store(pst.usedRecordingCleanup);
+                    ps.cleanupMeanDb.store(pst.cleanupMeanReductionDb);ps.cleanupModifiedFraction.store(pst.cleanupModifiedBinFraction);
+                    {const auto snap=cleanup_auto_snapshot(pst,pst.usedRecordingCleanup);
+                     std::lock_guard<std::mutex> lock(ps.cleanupAutoMutex);ps.cleanupAuto=snap;}
                     if (pst.usedGpuConvolution) ps.gpuConvUsed.store(true);
                     // Post-process facts: capability alone cannot reveal failed/partial dispatch.
                     RQ.gpu.store(pst.usedGpuResample);
@@ -4548,8 +5034,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
             } catch (...) {
                 std::lock_guard<std::mutex> lk(RQ.mtx); RQ.err = "未知异常"; RQ.error = true;
             }
-            { std::lock_guard<std::mutex> lk(RQ.mtx); RQ.done = true; }
-            RQ.cv.notify_all();
+              if(!RQ.wait_after_eof(myEpoch))break;
+            }
         });
 
         // 必须等第一块数据就绪再开流。实测踩到的坑：WASAPI 独占事件驱动在 Start 之后
@@ -4576,6 +5062,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         }
 
         // 输出后端：WASAPI 独占 / 共享 / ASIO / NAA / Null，由 make_sink 决定（pEff：可能已回退默认端点）
+        // 261102-01 #1（终稿）：只记日志，**不降级** —— 高音质优先，别的程序给我们让路。
+        note_endpoint_busy(pEff);
         auto sink = make_sink(pEff);
         if (!sink->open(sink_opts(pEff), deviceRate, outCh, outBits)) {
             RQ.abort.store(true); RQ.cv.notify_all(); prod.join();
@@ -4632,6 +5120,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         rl.seekReq = &ps.seekReq; rl.played = &ps.played;
         rl.volDb = &ps.volDb; rl.startDb = &ps.startDb; rl.dbgPad = &ps.dbgPad; rl.gpuOut = &ps.gpu;
         rl.rq = &RQ;
+        rl.segment=[file,cs=p.cueStart,ce=p.cueEnd,index=p.queueIndex](){return g_segment.for_track(file,cs,ce,index);};
         rl.deviceRate = deviceRate; rl.outBits = outBits; rl.outCh = outCh;
         // inFrames/totalOut 必须是**本区间**的：render_loop 的 seek 用 inFrames 算 seekFrame，
         // 用 totalOut 换算 played 比例 —— 这两个数一旦还是整轨的，跳转就会落到文件别处。
@@ -4655,6 +5144,18 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
         rl.fallbackEligible = (sharedFallback != nullptr) && !dop &&
                               (p.backend.empty() || p.backend == "wasapi");
         rl.dop = dop;
+        if (p.workbenchResume >= 0.0) {
+            // The renderer consumes this request before its first write. Its
+            // seek epoch discards every primed block from the previous position.
+            const double duration = (double)totalOut / deviceRate;
+            const double fraction = duration > 0.0 ? p.workbenchResume / duration : 0.0;
+            ps.seekReq.store(std::clamp(fraction, 0.0, 1.0));
+            ps.played.store((size_t)(std::clamp(fraction, 0.0, 1.0) * totalOut));
+            ps.pauseReq.store(p.workbenchPaused);
+            play_log("WORKBENCH_RESUME seconds=" + std::to_string(p.workbenchResume) +
+                     " paused=" + (p.workbenchPaused ? "1" : "0") + " beforeFirstWrite=1");
+            ps.workbenchReady.store(true);
+        }
         rta::render::render_loop(*sink, rl);
 
         RQ.abort.store(true); RQ.cv.notify_all();
@@ -4698,15 +5199,20 @@ static bool play_one_impl(const std::string& file, const PlayParams& p, AudioBuf
 // 以 wasapi-shared 重开整条 play_one（设备率取系统混音率、shaper=None、note 明示
 // 已回退非 bit-perfect）；共享也失败才最终报错。DoP/DSD 不回退（impl 已把关）。
 static bool play_one(const std::string& file, const PlayParams& p, AudioBuffer& buf) {
+    filter_prewarm_cancel(); // Foreground preparation takes priority, including queue transitions.
+    // 每首歌开始时重置"是否共享输出"：用户的设置可能刚改过（独占↔共享），
+    // 而 FALLBACK_SHARED 之后这个标志会变 true —— 不能跨曲沿用上一首的结论。
+    g_outShared.store(p.backend == "wasapi-shared");
     auto& ps = g_ps;
     bool sharedFallback = false;
     const bool ok = play_one_impl(file, p, buf, &sharedFallback, std::string());
-    if (ok || !sharedFallback) return ok;
+    if (ok || !sharedFallback || p.workbenchStrict) return ok;
     if (ps.stop.load()) return false;   // 用户已停止：不要再重开一遍
 
     PlayParams p2 = p;
     p2.backend = "wasapi-shared";
     p2.shaper = "none";                 // 共享模式不追求 bit-perfect，关掉抖动整形
+    g_outShared.store(true);   // 独占失败回退共享 ⟹ 之后不可能 bit-perfect，结论/原因要跟着变
     play_log("FALLBACK_SHARED 独占流无响应,回退 WASAPI 共享(非 bit-perfect) file=" + file);
     { std::lock_guard<std::mutex> lk(ps.mtx); ps.error.clear(); }
     ps.played.store(0);
@@ -4849,6 +5355,7 @@ static constexpr int    kArtistImgTotalBudgetMs = 12000;          // 单个艺�
 static constexpr int    kArtistImgSearchMs   = 3000;              // 搜索单跳上限
 static constexpr int    kArtistImgDownloadMs = 3000;              // 下载单跳上限
 static constexpr size_t kArtistImgMinBytes   = 1024;              // 小于它当「没有头像」
+static constexpr size_t kArtistImgMaxBytes   = 12u * 1024u * 1024u; // 接收/落盘/供图共用上限
 static constexpr long long kArtistImgNegSec  = 7LL * 24 * 3600;   // 负缓存有效期：7 天
 // 2026-10-27（261027-03 #7）：2 → 6。原来的理由「再大也过不了单线程 accept」已过期 ——
 // WebUi 现在是 6 个 worker 并发（webui.h: kMaxWorkers=6）。实测（用户库 127 位艺术家、
@@ -4980,7 +5487,8 @@ static std::string artist_avatar_cached(const std::string& name, bool* from_cach
     if (from_cache) *from_cache = false;
     if (name.empty()) return std::string();
     std::string bytes;
-    if (artistimg_read_file(artistimg_paths(name).jpg, bytes, 8u * 1024u * 1024u)) {
+    if (artistimg_read_file(artistimg_paths(name).jpg, bytes, kArtistImgMaxBytes) &&
+        rta::meta::art_image_magic(bytes)) {
         if (from_cache) *from_cache = true;
         return bytes;
     }
@@ -4999,6 +5507,46 @@ enum class ArtistImgOutcome { Ok, Miss, Fail };
 // 为什么需要这个参数：dizzylab 的限频是**全局串行**的（provider.h 的 dl_gate_acquire 持锁 sleep
 // 1 s），而它排头像链第一位 ⟹ 6 个后台 worker 全被这一把锁串成 1 个/秒。
 // 实测口径：246 位艺人仅 dizzylab 一步就要约 246 s（4 分钟），这就是用户说的「头像抓取非常慢」。
+struct MetaSettings {
+    bool on = true;                          // metaon 总开关
+    bool llm = true;                         // metallm
+    bool summary = false;                    // metasummary 默认 0（成本策略：显式开启）
+    std::map<std::string, bool> srcOn;       // 注册表 id → 开关(缺省 true)
+};
+static bool meta_bool_val(const std::string& v) {
+    return v == "1" || v == "true" || v == "on";
+}
+static MetaSettings meta_settings_load() {
+    MetaSettings ms;
+    std::map<std::string, std::string> legacy;      // 旧键 metaqq/... 的值(迁移读取用)
+    std::lock_guard<std::recursive_mutex> settingsReadLock(
+        rta::meta::meta_file_mutex(fs::u8path(path_in_exe_dir("rlplayer-settings.conf"))));
+    std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t e = line.find('=');
+        if (e == std::string::npos) continue;
+        const std::string k = line.substr(0, e);
+        const std::string v = line.substr(e + 1);
+        if      (k == "metaon")      ms.on      = meta_bool_val(v);
+        else if (k == "metallm")     ms.llm     = meta_bool_val(v);
+        else if (k == "metasummary") ms.summary = meta_bool_val(v);
+        else if (k.rfind("metasrc_", 0) == 0) ms.srcOn[k.substr(8)] = meta_bool_val(v);
+        else if (k == "metaqq")      legacy["qq"]      = v;
+        else if (k == "metanetease") legacy["netease"] = v;
+        else if (k == "metaitunes")  legacy["itunes"]  = v;
+        else if (k == "metalrclib")  legacy["lrclib"]  = v;
+    }
+    // 补全:注册表逐源,新键未写且旧键存在 → 迁移;两者都没有 → 缺省开
+    for (const rta::meta::ProviderDesc& pd : rta::meta::provider_registry()) {
+        if (ms.srcOn.count(pd.id) != 0) continue;
+        const auto it = legacy.find(pd.id);
+        ms.srcOn[pd.id] = (it == legacy.end()) ? true : meta_bool_val(it->second);
+    }
+    return ms;
+}
+
 static ArtistImgOutcome artist_avatar_fetch(const std::string& name, std::string* detail,
                                             long long* bytesOut, bool allowDz) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -5007,7 +5555,10 @@ static ArtistImgOutcome artist_avatar_fetch(const std::string& name, std::string
                    std::chrono::steady_clock::now() - t0).count();
     };
 
+    const MetaSettings settings=meta_settings_load();
+    if(!settings.on){if(detail)*detail="metadata_disabled";return ArtistImgOutcome::Fail;}
     rta::meta::ArtworkOpts o;
+    o.srcOn=settings.srcOn;
     o.cacheDir      = path_in_exe_dir("artistimg");
     o.useCache      = true;
     o.negTtlSec     = kArtistImgNegSec;        // 7 天（与旧版同口径）
@@ -5015,6 +5566,7 @@ static ArtistImgOutcome artist_avatar_fetch(const std::string& name, std::string
     o.perSourceMs   = kArtistImgSearchMs;
     o.downloadMs    = kArtistImgDownloadMs;
     o.minBytes      = kArtistImgMinBytes;
+    o.maxBytes      = kArtistImgMaxBytes;
     // 每轮 dizzylab 预算（见函数头注释）。关掉它只是本轮不试这一源，不写任何负缓存。
     if (!allowDz) o.srcOn["dizzylab"] = false;
     // 环境变量 RLPLAYER_ARTISTIMG_HOST（网易云）与 _QQ/_DZ/_DC 由 artwork.h 自己读，
@@ -5099,7 +5651,7 @@ static void artistimg_bg_worker(std::shared_ptr<ArtistImgBg> bg) {
             play_log("ARTISTIMG bg miss name=" + nm + " " + detail);
             {   // 261027-04 #9：脚本源确认没有 ⟹ 记进 API 兜底名单
                 std::lock_guard<std::mutex> lk(bg->missedMtx);
-                if (bg->missed.size() < kApiAutoMax) bg->missed.push_back(nm);
+                bg->missed.push_back(nm);
             }
             break;
         default:
@@ -5107,7 +5659,7 @@ static void artistimg_bg_worker(std::shared_ptr<ArtistImgBg> bg) {
             play_log("ARTISTIMG bg fail name=" + nm + " " + detail);
             {   // 瞬态失败同样进兜底名单：这一轮确实没拿到图（网络恢复后 API 也能补）
                 std::lock_guard<std::mutex> lk(bg->missedMtx);
-                if (bg->missed.size() < kApiAutoMax) bg->missed.push_back(nm);
+                bg->missed.push_back(nm);
             }
             break;
         }
@@ -5274,6 +5826,37 @@ static std::vector<std::string> artistimg_parse_names(const std::string& raw) {
 // 分别指到别处（自动化测试用不可达地址验证「断网不崩、不写脏缓存」）。
 // 单张专辑预算 18 s：三源链最坏情况 = 网易 2 跳(6s) + QQ 1 跳(3s) + DizzyLab 1 跳(3s) + 3 次下载(9s)。
 // 实测正常情况一张 0.3~1.5 s（三源都 miss 才是这个量级），断网时各跳立刻 connection refused，不占预算。
+// 2026-11-01（紧急 FB）：封面抽取限流。
+//   真机诊断包的 COVERGET 原文：单张内嵌封面 ms=594 / 2279 / 3075 —— 抽取是"打开音频文件 +
+//   解析容器 + 取出 APIC"，不是纯内存操作。而浏览器对同一个 origin 只有 6 条连接：
+//   6 张慢封面就把连接池占满，同一时刻发出的 /api/lib/albums、/api/lib/artists 全排在图片后面
+//   ⟹ 前端 8 s 超时 ⟹ 用户在"滚到没封面的地方"之后看到整站"加载失败"（服务进程其实是活的）。
+//   对策：请求线程里最多 2 个并发抽取，抢不到许可就最多等 120 ms，然后**立刻 404**（前端露首字母），
+//   由后台预热线程把图补进缓存，前端下一次轮询会把它们顶上来。
+//   —— 不许把"服务器其实没死"表达成"网络异常"。
+static std::atomic<int> g_coverExtract{0};
+struct CoverExtractGate {
+    bool held = false;
+    CoverExtractGate() {
+        int cur = g_coverExtract.load(std::memory_order_relaxed);
+        while (cur < 2) {
+            if (g_coverExtract.compare_exchange_weak(cur, cur + 1)) { held = true; return; }
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t0).count() < 120) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(8));
+            int c = g_coverExtract.load(std::memory_order_relaxed);
+            while (c < 2) {
+                if (g_coverExtract.compare_exchange_weak(c, c + 1)) { held = true; return; }
+            }
+        }
+    }
+    ~CoverExtractGate() { if (held) g_coverExtract.fetch_sub(1); }
+    CoverExtractGate(const CoverExtractGate&) = delete;
+    CoverExtractGate& operator=(const CoverExtractGate&) = delete;
+};
+
 static constexpr int    kCoverBudgetMs      = 18000;            // 单张专辑总预算（三源链硬上限）
 static constexpr int    kCoverSearchMs      = 3000;             // 搜索单跳上限（每源）
 static constexpr int    kCoverDownloadMs    = 3000;             // 下载单跳上限
@@ -5311,52 +5894,170 @@ static std::string cover_key_slug(const std::string& key) {
 
 static CoverPaths cover_paths(const std::string& key) {
     CoverPaths p;
-    p.dir  = cover_cache_dir();
-    const std::string leaf = cover_key_slug(key);
+    const bool track=key.rfind("track:",0)==0;
+    p.dir=track?path_in_exe_dir("trackcovercache"):cover_cache_dir();
+    const std::string leaf=cover_key_slug(track?key.substr(6):key);
     p.jpg  = p.dir + "\\" + leaf + ".jpg";
     p.none = p.dir + "\\" + leaf + ".none";
     return p;
 }
 
-// 请求线程专用：正缓存存在且非空？（只 stat，不读内容 —— 列表端点每张专辑会调一次）
-static bool cover_has_disk(const std::string& key) {
-    if (key.empty()) return false;
-    std::error_code ec;
-    const auto sz = fs::file_size(fs::u8path(cover_paths(key).jpg), ec);
-    return !ec && sz > 0 && (unsigned long long)sz <= kCoverMaxBytes;
-}
+static bool cover_looks_like_image(const std::vector<unsigned char>& b);
 
-// 请求线程专用：读正缓存字节（≤ 8 MB）。
-// 按文件头给 Content-Type（用户手动设置的封面可能是 PNG/WEBP）
+// A cache image and its origin are one committed record: immutable SHA-named
+// bytes first, then atomically replace the bounded source manifest. Old .jpg
+// files are never overwritten/deleted. A malformed present manifest fails closed.
+static std::mutex& cover_cache_mutex() { static std::mutex m; return m; }
+static bool cover_read_bounded(const std::string& path, size_t maximum, std::vector<unsigned char>& out) {
+    out.clear(); std::error_code ec;
+    const auto n=fs::file_size(fs::u8path(path),ec);
+    if(ec || n==0 || n>maximum) return false;
+    std::ifstream f(fs::u8path(path),std::ios::binary);
+    if(!f)return false;
+    out.resize((size_t)n); f.read(reinterpret_cast<char*>(out.data()),(std::streamsize)n);
+    if(!f || (size_t)f.gcount()!=(size_t)n){out.clear();return false;} return true;
+}
 static const char* cover_mime_of(const std::vector<unsigned char>& b) {
-    if (b.size() >= 8 && b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G') return "image/png";
-    if (b.size() >= 3 && b[0] == 0xFF && b[1] == 0xD8) return "image/jpeg";
-    if (b.size() >= 12 && b[0] == 'R' && b[1] == 'I' && b[8] == 'W' && b[9] == 'E') return "image/webp";
-    if (b.size() >= 4 && b[0] == 'G' && b[1] == 'I' && b[2] == 'F') return "image/gif";
+    if(b.size()>=8 && b[0]==0x89 && b[1]=='P' && b[2]=='N' && b[3]=='G')return "image/png";
+    if(b.size()>=3 && b[0]==0xff && b[1]==0xd8)return "image/jpeg";
+    if(b.size()>=12 && b[0]=='R' && b[1]=='I' && b[8]=='W' && b[9]=='E')return "image/webp";
+    if(b.size()>=4 && b[0]=='G' && b[1]=='I' && b[2]=='F')return "image/gif";
     return "image/jpeg";
 }
-
-static bool cover_read_cached(const std::string& key, std::vector<unsigned char>& out) {
-    if (key.empty()) return false;
-    const std::string p = cover_paths(key).jpg;
-    std::error_code ec;
-    const auto sz = fs::file_size(fs::u8path(p), ec);
-    if (ec || sz == 0 || (unsigned long long)sz > kCoverMaxBytes) return false;
-    std::ifstream f(fs::u8path(p), std::ios::binary);
-    if (!f) return false;
-    out.resize((size_t)sz);
-    f.read(reinterpret_cast<char*>(out.data()), (std::streamsize)sz);
-    if (!f || (size_t)f.gcount() != (size_t)sz) { out.clear(); return false; }
+static bool cover_image_present(const std::vector<unsigned char>& b) {
+    return b.size()>128 && b.size()<=kCoverMaxBytes && cover_looks_like_image(b);
+}
+struct CoverCacheRecord {std::string path,source,hash;uintmax_t bytes=0;};
+// Shared bounded provenance validation. The caller holds cover_cache_mutex.
+// A present invalid/locked record never falls through to an older .jpg.
+static bool cover_cache_record(const std::string& key,CoverCacheRecord& out){
+    out={};if(key.empty())return false;
+    const auto paths=cover_paths(key);const std::string manifest=paths.jpg+".source.json";
+    std::error_code ec;const bool declared=fs::exists(fs::u8path(manifest),ec);if(ec)return false;
+    if(declared){
+        std::vector<unsigned char> raw;if(!cover_read_bounded(manifest,8192,raw))return false;
+        rta::net::Json j;std::string error;
+        if(!rta::net::json_parse_strict(std::string(raw.begin(),raw.end()),j,&error)||j.type!=rta::net::Json::Obj)return false;
+        const std::string origin=j["source"].s(),hash=j["sha256"].s();
+        if(j["version"].n()==1&&j["key"].s()==key&&origin=="reset"&&key.rfind("track:",0)==0){out.source="reset";return false;}
+        const bool verifiedOnline=origin=="online"&&j["version"].n()==2&&!j["albumName"].s().empty()&&!j["albumArtist"].s().empty()&&j["matchUrl"].s().rfind("http",0)==0&&!j["matchProvider"].s().empty();
+        if((j["version"].n()!=1&&!verifiedOnline)||j["key"].s()!=key||(origin!="manual"&&origin!="online"&&origin!="extracted")||(origin=="online"&&!verifiedOnline)||
+           hash.size()!=64||!std::all_of(hash.begin(),hash.end(),[](char c){return(c>='0'&&c<='9')||(c>='a'&&c<='f');}))return false;
+        if(verifiedOnline){rta::net::LibAlbumIdentity identity{};if(!Library::instance().albumIdentity(key,identity)||identity.name!=j["albumName"].s()||identity.artist!=j["albumArtist"].s())return false;}
+        const std::string leaf=cover_key_slug(key.rfind("track:",0)==0?key.substr(6):key)+"."+hash+".blob";
+        if(j["blob"].s()!=leaf)return false;
+        out.path=paths.dir+"\\"+leaf;out.source=origin;out.hash=hash;
+        out.bytes=fs::file_size(fs::u8path(out.path),ec);
+        if(ec||out.bytes<=128||out.bytes>kCoverMaxBytes||j["bytes"].n()!=(double)out.bytes){out={};return false;}
+    }else{
+        out.path=paths.jpg;out.source="legacy";out.bytes=fs::file_size(fs::u8path(out.path),ec);
+        if(ec||out.bytes<=128||out.bytes>kCoverMaxBytes){out={};return false;}
+    }
     return true;
+}
+// Lists need a source hint, not the image payload. Read only bounded metadata
+// and 16 bytes through ReadFile (no filebuf prefetch), retaining full digest
+// verification exclusively in metadata/image resolution below.
+static bool cover_probe_cached(const std::string& key,std::string& source){
+    source.clear();if(key.empty())return false;std::lock_guard<std::mutex> lock(cover_cache_mutex());
+    // Cache only the already-validated image header, never the source record.
+    // Every list still observes record presence and image size/write/creation
+    // changes. Typed manifests are read/parsed afresh, including sharing denial.
+    static std::map<std::string,WIN32_FILE_ATTRIBUTE_DATA> headers;
+    auto same=[](const WIN32_FILE_ATTRIBUTE_DATA&a,const WIN32_FILE_ATTRIBUTE_DATA&b){
+        return a.dwFileAttributes==b.dwFileAttributes&&a.nFileSizeHigh==b.nFileSizeHigh&&a.nFileSizeLow==b.nFileSizeLow&&
+            a.ftCreationTime.dwLowDateTime==b.ftCreationTime.dwLowDateTime&&a.ftCreationTime.dwHighDateTime==b.ftCreationTime.dwHighDateTime&&
+            a.ftLastWriteTime.dwLowDateTime==b.ftLastWriteTime.dwLowDateTime&&a.ftLastWriteTime.dwHighDateTime==b.ftLastWriteTime.dwHighDateTime;
+    };
+    const auto paths=cover_paths(key);WIN32_FILE_ATTRIBUTE_DATA recordAttributes{};
+    if(!GetFileAttributesExW(widen(paths.jpg+".source.json").c_str(),GetFileExInfoStandard,&recordAttributes)){
+        const DWORD error=GetLastError();if(error!=ERROR_FILE_NOT_FOUND&&error!=ERROR_PATH_NOT_FOUND)return false;
+        auto prior=headers.find(paths.jpg);WIN32_FILE_ATTRIBUTE_DATA imageAttributes{};
+        if(prior!=headers.end()&&GetFileAttributesExW(widen(paths.jpg).c_str(),GetFileExInfoStandard,&imageAttributes)&&same(prior->second,imageAttributes)){
+            source="legacy";return true;
+        }
+    }
+    CoverCacheRecord record;if(!cover_cache_record(key,record))return false;
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    if(!GetFileAttributesExW(widen(record.path).c_str(),GetFileExInfoStandard,&attributes)||(attributes.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY))return false;
+    auto prior=headers.find(record.path);
+    if(prior!=headers.end()&&same(prior->second,attributes)){source=record.source;return true;}
+    HANDLE h=CreateFileW(widen(record.path).c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(h==INVALID_HANDLE_VALUE)return false;
+    LARGE_INTEGER size{};std::vector<unsigned char> head(16);DWORD n=0;
+    const bool ok=GetFileSizeEx(h,&size)&&size.QuadPart==(LONGLONG)record.bytes&&ReadFile(h,head.data(),(DWORD)head.size(),&n,nullptr)&&n==head.size();
+    CloseHandle(h);if(!ok||!cover_looks_like_image(head))return false;
+    if(headers.size()>=32768)headers.clear();headers[record.path]=attributes;
+    source=record.source;return true;
+}
+static bool cover_read_cached(const std::string& key,std::vector<unsigned char>& out,std::string* source=nullptr){
+    out.clear();if(source)source->clear();std::lock_guard<std::mutex> lock(cover_cache_mutex());
+    CoverCacheRecord record;
+    if(!cover_cache_record(key,record)){if(source)*source=record.source;return false;}
+    if(!cover_read_bounded(record.path,(size_t)kCoverMaxBytes,out)||out.size()!=record.bytes||!cover_image_present(out)||
+       (!record.hash.empty()&&rta::update::sha256_hex(out.data(),out.size())!=record.hash)){out.clear();return false;}
+    if(source)*source=record.source;return true;
+}
+static bool cover_has_disk(const std::string& key) {
+    std::vector<unsigned char> b;std::string source;return cover_read_cached(key,b,&source) && (source=="manual" || source=="online");
+}
+static bool cover_write_atomic_file(const std::string& path,const void* data,size_t size) {
+    static std::atomic<unsigned long long> serial{0};
+    const std::string temp=path+".tmp-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(serial.fetch_add(1));
+    HANDLE h=CreateFileW(widen(temp).c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(h==INVALID_HANDLE_VALUE)return false;
+    bool ok=true;size_t offset=0;
+    while(offset<size){DWORD n=0,want=(DWORD)std::min<size_t>(size-offset,1u<<20);if(!WriteFile(h,(const unsigned char*)data+offset,want,&n,nullptr)||n!=want){ok=false;break;}offset+=n;}
+    if(ok)ok=FlushFileBuffers(h)!=0;CloseHandle(h);
+    if(ok)ok=MoveFileExW(widen(temp).c_str(),widen(path).c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
+    if(!ok)DeleteFileW(widen(temp).c_str());return ok;
+}
+static bool cover_write_cached(const std::string& key,const std::vector<unsigned char>& b,const std::string& source="extracted",const std::string& evidenceUrl={},const std::string& evidenceProvider={},const std::string& expectedAlbum={},const std::string& expectedArtist={}) {
+    if(key.empty() || !cover_image_present(b) || (source!="manual"&&source!="online"&&source!="extracted"))return false;
+    rta::net::LibAlbumIdentity identity{};
+    const bool track=key.rfind("track:",0)==0;
+    if(track){if(source!="manual" || key.size()!=22 || !std::all_of(key.begin()+6,key.end(),[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');}))return false;}
+    else if(!Library::instance().albumIdentity(key,identity) || (source=="online"&&(!identity.onlineCoverEligible||identity.name.empty()||identity.artist.empty()||evidenceUrl.rfind("http",0)!=0||evidenceProvider.empty())))return false;
+    if(source=="online" && ((!expectedAlbum.empty()&&identity.name!=expectedAlbum)||(!expectedArtist.empty()&&identity.artist!=expectedArtist)))return false;
+    std::lock_guard<std::mutex> lock(cover_cache_mutex());
+    const auto paths=cover_paths(key);std::error_code ec;fs::create_directories(fs::u8path(paths.dir),ec);if(ec)return false;
+    // Re-check priority at the commit point, after any background download.
+    // Queue-time checks cannot protect a manual choice made while IO is pending.
+    if(source!="manual"){
+        std::vector<unsigned char> record;
+        if(cover_read_bounded(paths.jpg+".source.json",8192,record)){
+            rta::net::Json current;std::string error;
+            if(rta::net::json_parse_strict(std::string(record.begin(),record.end()),current,&error) &&
+               current["version"].n()==1 && current["key"].s()==key && current["source"].s()=="manual")return false;
+        }
+    }
+
+    const std::string hash=rta::update::sha256_hex(b.data(),b.size()),leaf=cover_key_slug(track?key.substr(6):key)+"."+hash+".blob",blob=paths.dir+"\\"+leaf;
+    // Retained historical managed blobs have a finite per-key disk budget. A
+    // rejected update preserves the previous pointer and all legacy user files.
+    uintmax_t used=0;const std::string prefix=cover_key_slug(track?key.substr(6):key)+".";
+    for(fs::directory_iterator it(fs::u8path(paths.dir),ec),last;!ec && it!=last;it.increment(ec)){
+        const std::string name=pathToUtf8(it->path().filename());
+        if(name.rfind(prefix,0)==0 && name.size()==prefix.size()+64+5 && name.ends_with(".blob")){const auto n=it->file_size(ec);if(ec)return false;if(n>128ull*1024*1024-used)return false;used+=n;}
+    }
+    if(ec)return false;
+    std::vector<unsigned char> existing;const bool haveBlob=cover_read_bounded(blob,(size_t)kCoverMaxBytes,existing)&&existing==b;
+    if(!haveBlob && (used>128ull*1024*1024-b.size() || !cover_write_atomic_file(blob,b.data(),b.size())))return false;
+    const std::string proof=source=="online"?",\"albumName\":\""+jesc(identity.name)+"\",\"albumArtist\":\""+jesc(identity.artist)+"\",\"matchUrl\":\""+jesc(evidenceUrl)+"\",\"matchProvider\":\""+jesc(evidenceProvider)+"\"":std::string();
+    const std::string manifest="{\"version\":"+std::string(source=="online"?"2":"1")+",\"key\":\""+jesc(key)+"\",\"source\":\""+source+"\",\"blob\":\""+leaf+"\",\"sha256\":\""+hash+"\",\"bytes\":"+std::to_string(b.size())+proof+"}";
+    if(!cover_write_atomic_file(paths.jpg+".source.json",manifest.data(),manifest.size()))return false;
+    fs::remove(fs::u8path(paths.none),ec);return true;
 }
 
 // 负缓存是否还在有效期内（存在且 mtime ≤ 7 天）
 static bool cover_neg_fresh(const std::string& key) {
-    if (key.empty()) return false;
-    const std::string p = cover_paths(key).none;
-    std::error_code ec;
-    if (!fs::exists(fs::u8path(p), ec)) return false;
-    return !artistimg_file_older_than(p, kCoverNegSec);
+    if(key.empty())return false;
+    const std::string p=cover_paths(key).none;
+    std::vector<unsigned char> bytes;
+    if(!cover_read_bounded(p,4096,bytes))return false;
+    const auto j=rta::net::json_parse(std::string(bytes.begin(),bytes.end()));
+    return j["coverChainRevision"].n()==rta::meta::art_cover_chain_revision() &&
+           !artistimg_file_older_than(p,kCoverNegSec);
 }
 
 static std::string cover_env_base(const char* name) {
@@ -5551,20 +6252,20 @@ static std::string cover_pick_pic(const std::string& js, const std::string& want
         // Beats-》Dice 只有 0.52，但它确实是同一张碟。所以包含关系单独放行 —— 只是仍要艺术家佐证。
         const bool contained = (want.size() >= 4 && cover_vec_has(nm, want)) ||
                                (nm.size() >= 4 && cover_vec_has(want, nm));
-        if (d < 0.72 && !contained) continue;
+        if (!rta::meta::art_name_equal(wantName,a["name"].s())) continue;
         bool artistOk = false;
         if (who.size() >= 2) {
             const rta::net::Json& arr = a["artists"];
             for (size_t k = 0; k < arr.size() && !artistOk; ++k) {
                 const std::vector<uint32_t> ca = cover_name_key(arr.at(k)["name"].s());
-                if (ca.size() >= 2 && (cover_vec_has(who, ca) || cover_vec_has(ca, who))) artistOk = true;
+                if (!wantArtist.empty() && rta::meta::art_name_equal(wantArtist,arr.at(k)["name"].s())) artistOk = true;
             }
             if (!artistOk) {
                 const std::vector<uint32_t> ca = cover_name_key(a["artist"]["name"].s());
-                if (ca.size() >= 2 && (cover_vec_has(who, ca) || cover_vec_has(ca, who))) artistOk = true;
+                if (!wantArtist.empty() && rta::meta::art_name_equal(wantArtist,a["artist"]["name"].s())) artistOk = true;
             }
         }
-        if (d < 0.90 && !artistOk) continue;          // 只是"有点像"或"名字被加了前后缀"：必须有艺术家佐证
+        if (d < 0.999 || !artistOk) continue;          // 只是"有点像"或"名字被加了前后缀"：必须有艺术家佐证
         if (d > bestScore) { best = pic; bestName = a["name"].s(); bestScore = d; if (d >= 0.999) break; }
     }
     if (diceOut) *diceOut = best.empty() ? seenDice : bestScore;
@@ -5644,12 +6345,12 @@ static bool cover_name_verdict(const std::string& wantName, const std::string& w
     if (who.size() >= 2) {
         for (const auto& a : candArtists) {
             const std::vector<uint32_t> ca = cover_name_key(a);
-            if (ca.size() >= 2 && (cover_vec_has(who, ca) || cover_vec_has(ca, who))) { artistOut = true; break; }
+            if (!wantArtist.empty() && rta::meta::art_name_equal(wantArtist,a)) { artistOut = true; break; }
         }
     }
     if (want.empty()) { why = "no_name"; return false; }
-    if (diceOut < 0.72) { why = "name_mismatch"; return false; }
-    if (diceOut < 0.90 && !artistOut) { why = "artist_mismatch"; return false; }
+    if (!rta::meta::art_name_equal(wantName,candName)) { why = "name_mismatch"; return false; }
+    if (!artistOut) { why = "artist_mismatch"; return false; }
     why = artistOut ? "name+artist" : "name";
     return true;
 }
@@ -5934,7 +6635,8 @@ enum class CoverOutcome { Hit, Miss, Fail };
 //   Hit = 拿到并写盘；Miss = 图床明确回错（非图片/太小/4xx）；Fail = 网络层失败（瞬态，不写负缓存）。
 static CoverOutcome cover_download_store(const CoverPaths& pp, const std::string& url,
                                          const std::vector<std::string>& hdr, int toMs,
-                                         std::string& err, long long* bytesOut) {
+                                         std::string& err, long long* bytesOut,bool verifiedRelease=false,const std::string& provider={}) {
+    if(!verifiedRelease||provider.empty()){err="unverified release candidate";return CoverOutcome::Miss;}
     auto ir = rta::net::http_get(url, hdr, toMs);
     if (ir.ok && ir.status == 200 && ir.body.size() > kCoverSoftMaxBytes) {
         err = "图片过大 " + std::to_string(ir.body.size()) + "B（上限 " + std::to_string(kCoverSoftMaxBytes) + "）";
@@ -5951,24 +6653,8 @@ static CoverOutcome cover_download_store(const CoverPaths& pp, const std::string
         err = "download HTTP " + std::to_string(ir.status) + " " + ir.error;
         return CoverOutcome::Miss;
     }
-    std::error_code ec;
-    fs::create_directories(fs::u8path(pp.dir), ec);
-    // 先写 .part 再原子改名：读侧永远看不到半张图
-    const std::string tmp = pp.jpg + ".part";
-    {
-        std::ofstream f(fs::u8path(tmp), std::ios::binary | std::ios::trunc);
-        if (!f) throw std::runtime_error("无法写入 covercache（目录/权限？）");
-        f.write(reinterpret_cast<const char*>(ir.body.data()), (std::streamsize)ir.body.size());
-        f.flush();
-        if (!f) throw std::runtime_error("covercache 写入失败（磁盘满？）");
-    }
-    if (!MoveFileExW(widen(tmp).c_str(), widen(pp.jpg).c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        std::error_code em;
-        fs::rename(fs::u8path(tmp), fs::u8path(pp.jpg), em);
-        fs::remove(fs::u8path(tmp), em);
-    }
-    std::error_code el;
-    fs::remove(fs::u8path(pp.none), el);     // 有图了，旧负缓存作废
+    const std::string key=pathToUtf8(fs::u8path(pp.jpg).stem());
+    if(!cover_write_cached(key,ir.body,"online",url,provider)){err="cover provenance commit failed";return CoverOutcome::Fail;}
     if (bytesOut) *bytesOut = (long long)ir.body.size();
     return CoverOutcome::Hit;
 }
@@ -5983,375 +6669,59 @@ static std::string cover_dice_str(double d) {
 // 后台专用：真正去网上取一张封面并落盘（图源链 网易 → QQ → DizzyLab，见上「图源链」注释）。
 // 前一个源 miss 才走下一个；命中即落盘并打 COVSRC 日志。
 // 返回：Hit = 有源拿到并写盘；Miss = **所有**源都明确说没有（写 .none）；Fail = 至少一个源瞬态失败（不写）。
+static rta::meta::ArtworkOpts cover_source_options(const MetaSettings& settings) {
+    rta::meta::ArtworkOpts o;o.useCache=false;o.srcOn=settings.srcOn;
+    o.totalBudgetMs=20000;o.perSourceMs=3500;o.downloadMs=3000;
+    o.minBytes=kCoverMinBytes;o.maxBytes=kCoverMaxBytes;
+    o.neteaseHost=cover_env_base("RLPLAYER_COVER_HOST");
+    o.qqHost=cover_env_base("RLPLAYER_COVER_HOST_QQ");
+    o.dizzylabHost=cover_env_base("RLPLAYER_COVER_HOST_DIZZY");
+    o.discogsHost=cover_env_base("RLPLAYER_COVER_HOST_DISCOGS");
+    o.qqImageHost=cover_env_base("RLPLAYER_COVER_IMG_QQ");
+    o.dizzylabImageHost=cover_env_base("RLPLAYER_COVER_IMG_DIZZY");
+    return o;
+}
+
+// Public providers are the primary, complete chain. Paid search is a separate
+// gated phase; a provider miss can never implicitly read credentials here.
 static CoverOutcome cover_fetch(const CoverJob& job, CoverTermCache& tc,
                                 std::string* detail, long long* bytesOut) {
-    const auto t0 = std::chrono::steady_clock::now();
-    auto elapsed_ms = [&]() {
-        return (int)std::chrono::duration_cast<std::chrono::milliseconds>(
-                   std::chrono::steady_clock::now() - t0).count();
-    };
-    const CoverPaths pp = cover_paths(job.key);
-    std::string err, trace;
-    bool transient = false;      // 任一源瞬态失败（超时/断网/异常页）⟹ 不写 7 天负缓存
-
-    // 每个源的判定都留一句人话，拼进 COVERBG miss 的 detail（报告要能逐张解释为什么没补上）
-    auto note = [&](const std::string& s) { if (!trace.empty()) trace += ';'; trace += s; };
-    // 网易的拒绝原因：Dice 只有数字，原因由阈值反推（<0.72 = 名字不符，否则 = 艺术家佐证缺失）
-    auto netease_why = [](double d) {
-        if (d <= 0.0) return std::string("no_result");
-        return d < 0.72 ? std::string("name_mismatch") : std::string("artist_mismatch");
-    };
-
+    (void)tc;if(bytesOut)*bytesOut=0;
+    const MetaSettings settings=meta_settings_load();
+    if(!settings.on){if(detail)*detail="metadata_disabled";return CoverOutcome::Fail;}
+    const auto opts=cover_source_options(settings);
+    if(rta::meta::art_cover_sources(opts.srcOn).empty()){
+        if(detail)*detail="all_cover_sources_disabled";return CoverOutcome::Fail;
+    }
+    rta::net::LibAlbumIdentity identity;
+    if(!Library::instance().albumIdentity(job.key,identity) || !identity.onlineCoverEligible ||
+       identity.name!=job.name || identity.artist!=job.artist){
+        if(detail)*detail="album_identity_changed_or_untrusted";return CoverOutcome::Fail;
+    }
     try {
-        // ---------- ① 网易云音乐（type=10 专辑搜索）：原逻辑原样保留（两跳搜索 + 词缓存）----------
-        std::string pic, cand;
-        double dice = 0.0;
-        {
-            struct Try { std::string term, note; };
-            std::vector<Try> tries;
-            if (!job.term.empty()) tries.push_back({job.term, "album+artist"});
-            if (!job.name.empty() && job.name != job.term) tries.push_back({job.name, "album"});
-            const std::string surl = cover_env_host() + "/api/search/get";
-            const std::vector<std::string> hdr = {
-                "User-Agent: Mozilla/5.0",
-                "Referer: https://music.163.com/",
-            };
-            if (tries.empty()) err = "搜索词为空（专辑名与艺术家都没有）";
-            for (const auto& at : tries) {
-                const int remain = kCoverBudgetMs - elapsed_ms();
-                if (remain <= 0) { err = "预算耗尽（搜索前）"; transient = true; break; }
-                bool have = false;
-                std::string cached;
-                {
-                    std::lock_guard<std::mutex> lk(tc.mtx);
-                    auto it = tc.pic.find(at.term);
-                    if (it != tc.pic.end()) { cached = it->second; have = true; }
-                }
-                if (have) {
-                    if (!cached.empty()) { pic = cached; break; }
-                    err = "search(" + at.note + ") 无 picUrl";
-                    continue;
-                }
-                const int to = remain < kCoverSearchMs ? remain : kCoverSearchMs;
-                const std::string body = "s=" + artistimg_pct(at.term) + "&type=10&limit=5&offset=0";
-                auto sr = rta::net::http_post(surl, body, hdr, "application/x-www-form-urlencoded", to);
-                if (sr.ok && sr.status == 200) {
-                    const std::string js(sr.body.begin(), sr.body.end());
-                    double gotDice = 0.0;
-                    std::string gotName;
-                    const std::string got = cover_pick_pic(js, job.name, job.artist, &gotDice, &gotName);
-                    {
-                        std::lock_guard<std::mutex> lk(tc.mtx);
-                        if (tc.pic.size() < 8192) tc.pic[at.term] = got;
-                    }
-                    if (!got.empty()) { pic = got; dice = gotDice; cand = gotName; break; }
-                    if (gotDice > dice) { dice = gotDice; cand = gotName; }
-                    err = "search(" + at.note + ") 无 picUrl";
-                    if (remain < kCoverSearchMs) transient = true;   // 预算被压到很短时的超时不作数
-                } else {
-                    err = "search(" + at.note + ") HTTP " + std::to_string(sr.status) + " " + sr.error;
-                    transient = (sr.status == 0);
-                    if (transient) break;      // 断网/超时：第二跳也一定失败，别再浪费一个超时
-                }
-            }
+        const auto result=rta::meta::art_multi_source_image(false,job.name,job.artist,opts);
+        if(detail)*detail=result.summary();
+        if(result.ok){
+            rta::net::LibAlbumIdentity current;
+            if(!Library::instance().albumIdentity(job.key,current) || !current.onlineCoverEligible ||
+               current.name!=job.name || current.artist!=job.artist ||
+               !rta::meta::art_name_equal(job.name,result.matchedAlbum) ||
+               !rta::meta::art_name_equal(job.artist,result.matchedArtist))return CoverOutcome::Fail;
+            const std::vector<unsigned char> bytes(result.bytes.begin(),result.bytes.end());
+            if(!cover_looks_like_image(bytes) || !cover_write_cached(job.key,bytes,"online",result.url,result.source,job.name,job.artist))return CoverOutcome::Fail;
+            if(bytesOut)*bytesOut=(long long)bytes.size();
+            play_log("COVSRC key="+job.key+" src="+result.source+" bytes="+std::to_string(bytes.size()));
+            return CoverOutcome::Hit;
         }
-        if (!pic.empty()) {
-            const int remain = kCoverBudgetMs - elapsed_ms();
-            if (remain <= 0) { err = "预算耗尽（下载前）"; transient = true; note("netease budget_exhausted"); }
-            else {
-                const int to = remain < kCoverDownloadMs ? remain : kCoverDownloadMs;
-                std::string derr;
-                long long got = 0;
-                const CoverOutcome oc = cover_download_store(
-                    pp, pic, {"User-Agent: Mozilla/5.0", "Referer: https://music.163.com/"}, to, derr, &got);
-                if (oc == CoverOutcome::Hit) {
-                    play_log("COVSRC src=netease name=" + job.name + " bytes=" + std::to_string(got) +
-                             " dice=" + cover_dice_str(dice) + " cand=" + cand + " url=" + pic);
-                    if (detail) *detail = pic;
-                    if (bytesOut) *bytesOut = got;
-                    return CoverOutcome::Hit;
-                }
-                if (oc == CoverOutcome::Fail) transient = true;
-                play_log("COVSRC src=netease name=" + job.name + " bytes=0 miss why=download " +
-                         derr + " url=" + pic);
-                note("netease dl_fail(" + derr + ")");
-            }
-        } else {
-            // 网络失败与"服务器说没有"必须分开写：前者 transient（不写负缓存），后者才是定论
-            note(!err.empty() ? ("netease " + err)
-                              : ("netease " + (dice > 0.0 ? ("why=" + netease_why(dice) + " dice=" + cover_dice_str(dice))
-                                                          : std::string("no_result"))));
-        }
-
-        // ---------- ② QQ 音乐（2026-10-26 新增：同人碟覆盖优于网易）----------
-        {
-            const int remain = kCoverBudgetMs - elapsed_ms();
-            if (remain <= 400) { transient = true; note("qq budget_exhausted"); }
-            else {
-                const int hop = remain < kCoverSearchMs ? remain : kCoverSearchMs;
-                const CoverSrcResult q = cover_try_qq(job, tc, hop);
-                if (q.transient) transient = true;
-                if (q.pick.found) {
-                    const int remain2 = kCoverBudgetMs - elapsed_ms();
-                    const int to = remain2 < kCoverDownloadMs ? (remain2 > 0 ? remain2 : 1) : kCoverDownloadMs;
-                    std::string derr;
-                    long long got = 0;
-                    const CoverOutcome oc = cover_download_store(
-                        pp, q.pick.url, {"User-Agent: Mozilla/5.0", "Referer: https://y.qq.com/"}, to, derr, &got);
-                    if (oc == CoverOutcome::Hit) {
-                        play_log("COVSRC src=qq name=" + job.name + " mid=" + q.pick.mid + " bytes=" +
-                                 std::to_string(got) + " dice=" + cover_dice_str(q.pick.dice) +
-                                 " cand=" + q.pick.cand);
-                        if (detail) *detail = q.pick.url;
-                        if (bytesOut) *bytesOut = got;
-                        return CoverOutcome::Hit;
-                    }
-                    if (oc == CoverOutcome::Fail) transient = true;
-                    play_log("COVSRC src=qq name=" + job.name + " mid=" + q.pick.mid +
-                             " bytes=0 miss why=download " + derr);
-                    note("qq dl_fail(" + derr + ")");
-                } else {
-                    if (q.pick.dice > 0.0)
-                        play_log("COVSRC src=qq name=" + job.name + " why=" + q.pick.why +
-                                 " dice=" + cover_dice_str(q.pick.dice) + " cand=" + q.pick.cand);
-                    note(q.transient ? ("qq fail(" + q.err + ")")
-                                     : ("qq " + (q.pick.dice > 0.0 ? ("why=" + q.pick.why + " dice=" + cover_dice_str(q.pick.dice))
-                                                                   : std::string("no_result"))));
-                }
-            }
-        }
-
-        // ---------- ③ DizzyLab（同人第一手目录；网页搜索页 + catalog 拼封面）----------
-        {
-            const int remain = kCoverBudgetMs - elapsed_ms();
-            if (remain <= 400) { transient = true; note("dizzylab budget_exhausted"); }
-            else {
-                const int hop = remain < kCoverSearchMs ? remain : kCoverSearchMs;
-                const CoverSrcResult d = cover_try_dizzy(job, tc, hop);
-                if (d.transient) transient = true;
-                if (d.pick.found) {
-                    const int remain2 = kCoverBudgetMs - elapsed_ms();
-                    const int to = remain2 < kCoverDownloadMs ? (remain2 > 0 ? remain2 : 1) : kCoverDownloadMs;
-                    std::string derr;
-                    long long got = 0;
-                    const CoverOutcome oc = cover_download_store(
-                        pp, d.pick.url, {"User-Agent: Mozilla/5.0", "Referer: https://www.dizzylab.net/"}, to, derr, &got);
-                    if (oc == CoverOutcome::Hit) {
-                        play_log("COVSRC src=dizzylab name=" + job.name + " mid=" + d.pick.mid + " bytes=" +
-                                 std::to_string(got) + " dice=" + cover_dice_str(d.pick.dice) +
-                                 " cand=" + d.pick.cand);
-                        if (detail) *detail = d.pick.url;
-                        if (bytesOut) *bytesOut = got;
-                        return CoverOutcome::Hit;
-                    }
-                    if (oc == CoverOutcome::Fail) transient = true;
-                    play_log("COVSRC src=dizzylab name=" + job.name + " mid=" + d.pick.mid +
-                             " bytes=0 miss why=download " + derr);
-                    note("dizzylab dl_fail(" + derr + ")");
-                } else {
-                    if (d.pick.dice > 0.0)
-                        play_log("COVSRC src=dizzylab name=" + job.name + " why=" + d.pick.why +
-                                 " dice=" + cover_dice_str(d.pick.dice) + " cand=" + d.pick.cand);
-                    note(d.transient ? ("dizzylab fail(" + d.err + ")")
-                                     : ("dizzylab " + (d.pick.dice > 0.0 ? ("why=" + d.pick.why + " dice=" + cover_dice_str(d.pick.dice))
-                                                                         : std::string("no_result"))));
-                }
-            }
-        }
-
-        // ---------- ④ DeepSeek 联网检索 + og:image（2026-10-26 新增，261026-06）----------
-        // 为什么需要这一段：QQ 搜索接口会间歇性返回 HTTP 500（本机实测），网易对同人碟召回差，
-        // DizzyLab 只覆盖自己站内的碟。而 llm.h 里早就有 ds_search（联网检索），这一轮才用上 ——
-        // 搜索结果页的 og:image 直接就是专辑封面，不用猜任何 token 或 catalog 号。
-        // 实测：「盈月纪年2」经豆瓣音乐页 og:image 拿到 540x405 JPEG（45191 B，肉眼确认是真封面）。
-        // 注意：不要用 ds_fetch —— 它返回的是剥掉图片的 Markdown（实测 2271B 里 0 个图片 URL）。
-        // ---------- ③b 豆瓣音乐（2026-10-26 261026-06：不需要 API key，稳定带 og:image）----------
-        // 实测：GET https://music.douban.com/subject_search?search_text=<专辑名>
-        //   → 页面里有 /subject/<id> → GET /subject/<id>/ → <meta property="og:image"> 就是封面。
-        // 这条路比"让模型挑页面"可靠得多（模型搜索结果每次不同，常给出无 og:image 的论坛帖）。
-        {
-            const int remain = kCoverBudgetMs - elapsed_ms();
-            if (remain > 800) {
-                const int hop_q = remain < kCoverSearchMs ? remain : kCoverSearchMs;
-                const std::string du = "https://music.douban.com/subject_search?search_text=" + artistimg_pct(job.name);
-                auto dr = rta::net::http_get(du,
-                    {"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36", "Referer: https://music.douban.com/"}, hop_q);
-                if (dr.ok && dr.status == 200) {
-                    const std::string dh(dr.body.begin(), dr.body.end());
-                    std::string sid;
-                    {
-                        size_t at = dh.find("music.douban.com/subject/");
-                        if (at != std::string::npos) {
-                            size_t p2 = at + std::strlen("music.douban.com/subject/");
-                            size_t e2 = p2;
-                            while (e2 < dh.size() && dh[e2] >= '0' && dh[e2] <= '9') ++e2;
-                            if (e2 > p2) sid = dh.substr(p2, e2 - p2);
-                        }
-                    }
-                    if (!sid.empty()) {
-                        const std::string su = "https://music.douban.com/subject/" + sid + "/";
-                        auto sr2 = rta::net::http_get(su,
-                            {"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                             "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36", "Referer: https://music.douban.com/"}, hop_q);
-                        if (sr2.ok && sr2.status == 200) {
-                            const std::string sh(sr2.body.begin(), sr2.body.end());
-                            std::string img;
-                            size_t at2 = sh.find("og:image");
-                            if (at2 != std::string::npos) {
-                                const size_t cs2 = sh.find("content=\"", at2);
-                                const size_t ce2 = (cs2 == std::string::npos) ? std::string::npos : sh.find('"', cs2 + 9);
-                                if (cs2 != std::string::npos && ce2 != std::string::npos) {
-                                    const std::string v = sh.substr(cs2 + 9, ce2 - cs2 - 9);
-                                    if (v.rfind("http", 0) == 0) img = v;
-                                }
-                            }
-                            if (!img.empty()) {
-                                std::string derr2;
-                                long long got2 = 0;
-                                const int remainD2 = kCoverBudgetMs - elapsed_ms();
-                                const int to2 = remainD2 < kCoverDownloadMs ? (remainD2 > 0 ? remainD2 : 1) : kCoverDownloadMs;
-                                const CoverOutcome oc2 = cover_download_store(pp, img,
-                                    {"User-Agent: Mozilla/5.0", "Referer: " + su}, to2, derr2, &got2);
-                                if (oc2 == CoverOutcome::Hit) {
-                                    play_log("COVSRC src=douban name=" + job.name + " id=" + sid +
-                                             " bytes=" + std::to_string(got2) + " img=" + img);
-                                    if (detail) *detail = img;
-                                    if (bytesOut) *bytesOut = got2;
-                                    return CoverOutcome::Hit;
-                                }
-                                if (oc2 == CoverOutcome::Fail) transient = true;
-                            } else {
-                                note("douban no_og id=" + sid);
-                            }
-                        }
-                    } else {
-                        note("douban no_result");
-                    }
-                } else if (dr.status == 0) {
-                    transient = true;
-                    note("douban fail");
-                }
-            }
-        }
-
-        // ---------- ④ DeepSeek 联网检索 + og:image（兜底）----------
-        {
-            const int remain = kCoverBudgetMs - elapsed_ms();
-            if (remain > 800) {
-                const rta::meta::LlmConfig lcfg = apifill_llm_cfg();   // 含 KEY.txt 回退（见其实现）
-                if (lcfg.apiKey.empty()) {
-                    note("ds-web no_key");
-                } else {
-                    const int hop = remain < 6000 ? remain : 6000;
-                    // 2026-10-26 (261026-06): 查询词与策略。
-                    // 实测：(a) 加"封面"会得到一堆论坛帖（无 og:image）；(b) 只用"专辑"时结果**每次不同**，
-                    // 有时豆瓣页在第 3 位、有时整页都是论坛 ⟹ 单次搜索不可靠。
-                    // 所以先做一次**限定站内**的搜索（site: 语法被 DeepSeek 检索接受），
-                    // 失败再把不带限定的结果作为补充。两条结果合并后再按站点分档排序。
-                    rta::meta::DsSearchReply sr = rta::meta::ds_search(
-                        lcfg, job.name + " 专辑 site:music.douban.com", 5);
-                    if (!sr.ok || sr.hits.empty()) {
-                        sr = rta::meta::ds_search(lcfg, job.name + " 专辑", 6);
-                    }
-                    if (!sr.ok) {
-                        note("ds-web fail(" + sr.error + ")");
-                    } else {
-                        // 2026-10-26 (261026-06): 分三档排序。实测只有豆瓣 subject 页稳定带 og:image，
-                        // 百科/THBWiki 多数**没有** og:image，论坛/视频/直播一律没有。
-                        // 之前把百科和豆瓣同级，5 次配额被百科耗光 ⟹ 盈月纪年2 明明有豆瓣页却抓不到。
-                        std::vector<std::string> ordered;
-                        for (int pass = 0; pass < 3; ++pass) {
-                            for (const auto& h : sr.hits) {
-                                if (h.url.rfind("http", 0) != 0) continue;
-                                int tier = 2;
-                                if (h.url.find("douban.com/subject") != std::string::npos ||
-                                    h.url.find("musicbrainz.org/release") != std::string::npos ||
-                                    h.url.find("discogs.com/") != std::string::npos ||
-                                    h.url.find("dizzylab.net/d/") != std::string::npos) tier = 0;   // 实测带 og:image
-                                else if (h.url.find("baike.baidu.com/item") != std::string::npos ||
-                                         h.url.find("thwiki.cc") != std::string::npos) tier = 1;
-                                if (tier == pass) ordered.push_back(h.url);
-                            }
-                        }
-                        int tried = 0;
-                        for (size_t i = 0; i < ordered.size() && tried < 5; ++i) {
-                            const std::string pageUrl = ordered[i];
-                            if (kCoverBudgetMs - elapsed_ms() <= 400) break;
-                            if (kCoverBudgetMs - elapsed_ms() <= 400) break;
-                            ++tried;
-                            auto pr = rta::net::http_get(pageUrl,
-                                {"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                                 "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}, hop);
-                            if (!pr.ok || pr.status != 200) continue;
-                            const std::string html(pr.body.begin(), pr.body.end());
-                            std::string img;
-                            {
-                                size_t at = html.find("og:image");
-                                for (int guard = 0; guard < 3 && at != std::string::npos && img.empty(); ++guard) {
-                                    const size_t cs = html.find("content=\"", at);
-                                    if (cs == std::string::npos) break;
-                                    const size_t ce = html.find('"', cs + 9);
-                                    if (ce == std::string::npos) break;
-                                    const std::string v = html.substr(cs + 9, ce - cs - 9);
-                                    if (v.rfind("http", 0) == 0) img = v;
-                                    at = html.find("og:image", at + 8);
-                                }
-                            }
-                            play_log("DSWEB page=" + pageUrl + " htmlLen=" + std::to_string(html.size()) +
-                                     " ogImage=[" + img + "]");
-                            if (img.empty()) continue;
-                            const bool looksImg = img.find(".jpg") != std::string::npos ||
-                                                  img.find(".jpeg") != std::string::npos ||
-                                                  img.find(".png") != std::string::npos ||
-                                                  img.find(".webp") != std::string::npos ||
-                                                  img.find("doubanio.com") != std::string::npos ||
-                                                  img.find("bcebos.com") != std::string::npos;
-                            if (!looksImg) continue;
-                            const int remainD = kCoverBudgetMs - elapsed_ms();
-                            const int to = remainD < kCoverDownloadMs ? (remainD > 0 ? remainD : 1) : kCoverDownloadMs;
-                            std::string derr;
-                            long long got = 0;
-                            const CoverOutcome oc = cover_download_store(pp, img,
-                                {"User-Agent: Mozilla/5.0", "Referer: " + pageUrl}, to, derr, &got);
-                            if (oc == CoverOutcome::Hit) {
-                                play_log("COVSRC src=ds-web name=" + job.name + " bytes=" + std::to_string(got) +
-                                         " page=" + pageUrl + " img=" + img);
-                                if (detail) *detail = img;
-                                if (bytesOut) *bytesOut = got;
-                                return CoverOutcome::Hit;
-                            }
-                            if (oc == CoverOutcome::Fail) transient = true;
-                        }
-                        note("ds-web tried=" + std::to_string(tried));
-                    }
-                }
-            }
-        }
-    } catch (const std::exception& e) {
-        err = std::string("exception: ") + e.what();
-        transient = true;
-    } catch (...) {
-        err = "exception: unknown";
-        transient = true;
-    }
-
-    if (!transient) {
-        try {
-            std::error_code ec;
-            fs::create_directories(fs::u8path(pp.dir), ec);
-            std::ofstream f(fs::u8path(pp.none), std::ios::binary | std::ios::trunc);
-        } catch (...) {}
-    }
-    if (detail) {
-        // err 是网易那一跳的原始错误串，trace 里已经带了同一句（note("netease " + err)）⟹ 去重，
-        // 否则断网日志会变成 "search(…) HTTP 0 …; netease search(…) HTTP 0 …" 两句一样的。
-        std::string d = trace;
-        if (!err.empty() && trace.find(err) == std::string::npos) d = err + "; " + trace;
-        if (d.empty()) d = err;
-        *detail = d + (transient ? " [transient]" : "") + " ms=" + std::to_string(elapsed_ms());
-    }
-    return transient ? CoverOutcome::Fail : CoverOutcome::Miss;
+        bool transient=result.tried.empty();
+        for(const auto& trial:result.tried)transient=transient||trial.transient;
+        if(transient)return CoverOutcome::Fail;
+        const auto paths=cover_paths(job.key);std::error_code ec;fs::create_directories(fs::u8path(paths.dir),ec);
+        const std::string json="{\"coverChainRevision\":"+std::to_string(rta::meta::art_cover_chain_revision())+"}";
+        if(ec || !cover_write_atomic_file(paths.none,json.data(),json.size()))return CoverOutcome::Fail;
+        return CoverOutcome::Miss;
+    }catch(const std::exception& e){if(detail)*detail=e.what();return CoverOutcome::Fail;}
+    catch(...){if(detail)*detail="provider_exception";return CoverOutcome::Fail;}
 }
 
 // 一轮预热的共享状态：jobs 是**深拷贝**的名单（线程绝不回头读 Library 单例），
@@ -6412,6 +6782,7 @@ static void cover_bg_worker(std::shared_ptr<CoverBg> bg) {
 
 // 起一轮预热。返回 true = 已排队；false = 上一轮还在跑 / 名单为空（都不排队）。
 static bool cover_bg_start(std::vector<CoverJob> jobs) {
+    if(!meta_settings_load().on)return false;
     if (jobs.empty()) return false;
     size_t expect = 0;
     if (!g_cover_active.compare_exchange_strong(expect, 1)) return false;
@@ -6466,17 +6837,153 @@ static std::vector<CoverJob> cover_build_queue(const std::vector<std::string>& o
     return out;
 }
 
-// 列表端点用：一张专辑的封面来源。只信专辑表里算好的来源 + 一次 stat，绝不触发 ffmpeg。
-// 2026-10-27（用户 2.0 发包前 BUG「专辑名对、封面严重错误」）：来源从 2 态扩成 3 态 ——
-//   embed = 曲目**内嵌**封面（APIC/PICTURE/covr，永远首选，天然按「文件 → 专辑」绑定）
-//   dir   = 同目录 cover/folder/front，**仅当该目录只对应这一张专辑**（多碟装的 CD1/CD2 仍算一目录）
-//   net   = 磁盘上的在线抓取缓存；none = 都没有（前端露首字母占位，而不是显示别人的图）
-// cv 的语义不变（"有图可显示" = embed/dir/net 任一），只是 dir 不再冒充 embed。
-static const char* cover_src_of(const rta::net::LibAlbum& a) {
-    if (a.coverSrc == rta::net::kCoverEmbedded) return "embed";
-    if (a.coverSrc == rta::net::kCoverDirFile)  return "dir";
-    if (cover_has_disk(a.key)) return "net";
+// Query boundaries are split before percent decoding: encoded %26 belongs to
+// the file name, while &_cov / &v are independent cache-buster parameters.
+static std::string cover_query_value(const std::string& path,const std::string& name) {
+    const auto q=path.find('?');if(q==std::string::npos)return {};
+    size_t at=q+1;
+    while(at<path.size()){
+        const auto end=path.find('&',at);const auto part=path.substr(at,end==std::string::npos?end:end-at);
+        const auto eq=part.find('=');if(eq!=std::string::npos && urlDecode(part.substr(0,eq))==name)return urlDecode(part.substr(eq+1));
+        if(end==std::string::npos)break;at=end+1;
+    }return {};
+}
+static std::string cover_url_escape(const std::string& s){
+    static const char* hex="0123456789ABCDEF";std::string out;
+    for(unsigned char c:s){if((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='-'||c=='_'||c=='.'||c=='~')out+=(char)c;else{out+='%';out+=hex[c>>4];out+=hex[c&15];}}return out;
+}
+struct CoverResolution {std::vector<unsigned char> bytes;std::string mime="image/png",source="none",hash;};
+static rta::net::artwork_migration::HistoryAlbumBinding cover_history_binding(const rta::net::LibAlbum& album) {
+    rta::net::LibAlbum current;std::vector<rta::net::LibTrack> tracks;
+    if(!Library::instance().albumTracksSnapshot(album.key,current,tracks))return {};
+    rta::net::artwork_migration::HistoryAlbumBinding binding{current.key,current.legacyKey,current.name,current.artist,rta::net::lib_album_identity_source_name(current.identitySource)};
+    std::vector<rta::net::artwork_migration::HistoryMember> members;members.reserve(tracks.size());
+    for(const auto& t:tracks)members.push_back({t.path,t.cuePath,t.cueNo,t.cueOff,t.cueLen});
+    binding.memberCount=members.size();binding.membersSha256=rta::net::artwork_migration::history_members_sha256(members);
+    return binding;
+}
+static const char* cover_model_local_source(const rta::net::LibAlbum& album) {
+    if(album.coverSrc==rta::net::kCoverEmbedded)return "embed";
+    if(album.coverSrc==rta::net::kCoverDirFile)return "dir";
     return "none";
+}
+// Sole read-only policy for metadata, track images and album images. Never
+// downloads, migrates legacy files or publishes cache/provenance on a GET.
+static CoverResolution resolve_cover(const std::string& file,const std::string& albumKey={}) {
+    CoverResolution r;auto& lib=Library::instance();rta::net::LibAlbumIdentity id{};
+    const bool inLibrary=!file.empty()?lib.trackAlbumIdentity(file,id):lib.albumIdentity(albumKey,id);
+    auto accept=[&](std::vector<unsigned char>& b,const std::string& mime,const std::string& source){
+        if(!cover_image_present(b))return false;r.bytes.swap(b);r.mime=mime.empty()?cover_mime_of(r.bytes):mime;r.source=source;r.hash=rta::update::sha256_hex(r.bytes.data(),r.bytes.size());return true;
+    };
+    if(!file.empty()){
+        const std::string key="track:"+rta::meta::MetaStore::hashOf(rta::net::lib_path_key(file));
+        std::vector<unsigned char> b;std::string source;
+        if(cover_read_cached(key,b,&source) && accept(b,{},"track_manual"))return r;
+        std::error_code ec;const bool declared=fs::exists(fs::u8path(cover_paths(key).jpg+".source.json"),ec);
+        if((declared||ec) && source!="reset")return r;
+    }
+    // Song-owned artwork is independent of album artwork. A user changing
+    // an album must not replace an embedded picture or this exact track's cache.
+    if(!file.empty()){
+        std::vector<unsigned char> own;std::string ownMime;
+        if(rta::net::lib_has_embedded_cover(file)){
+            own=rta::net::lib_cover_embedded_bytes(file,ownMime);
+            if(accept(own,ownMime,"embed"))return r;
+        }
+        if(rta::meta::MetaStore::instance().cover(file,own,ownMime)){
+            rta::meta::TrackMeta tm;std::string source="metastore";
+            if(rta::meta::MetaStore::instance().load(file,tm)){
+                const auto evidence=tm.fields.find("coverRecording");
+                if(evidence!=tm.fields.end()&&!evidence->second.value.empty()&&!evidence->second.source.empty())source="track_online";
+            }
+            if(accept(own,ownMime,source))return r;
+        }
+    }
+    std::vector<unsigned char> cached;std::string origin;
+    const bool haveCache=inLibrary && cover_read_cached(id.key,cached,&origin);
+    // A user assignment is explicitly to this exact browsing key, even when
+    // that key is a folder group rather than a verified release album.
+    if(haveCache && origin=="manual" && accept(cached,{},"manual"))return r;
+    // Library already established ownership (embedded or a directory belonging
+    // to this album). Reuse that exact model/extraction path, never another
+    // member's MetaStore picture or an unrelated mixed-directory cover.
+    if(inLibrary) {
+        rta::net::LibAlbum album;
+        if(lib.album(id.key,album)) {
+            const char* source=cover_model_local_source(album);
+            const bool mayInherit=file.empty() || album.coverSrc==rta::net::kCoverDirFile || album.onlineCoverEligible;
+            if(mayInherit && std::strcmp(source,"none")!=0 && lib.albumCoverCacheState(id.key)!=rta::net::LibCoverCacheState::Missing) {
+                std::vector<unsigned char> local;std::string mime;
+                if(lib.albumCoverCached(id.key,local,mime) && accept(local,mime,source))return r;
+                CoverExtractGate gate;
+                if(!gate.held){coverwarm_bg_start();return r;}
+                if(lib.albumCover(id.key,local,mime) && accept(local,mime,source))return r;
+            }
+        }
+    }
+    // A successful album-query record is itself the release-level artwork
+    // evidence. Tags/folder membership, member art and old untyped/extracted
+    // caches are never evidence that a group is a matched release.
+    if(inLibrary && id.onlineCoverEligible && haveCache && origin=="online" && accept(cached,{},"online"))return r;
+    if(inLibrary) {
+        rta::net::LibAlbum album;std::vector<unsigned char> history;std::string mime;
+        rta::net::artwork_migration::HistoryInfo info;
+        if(lib.album(id.key,album) && rta::net::artwork_migration::read_history(path_in_exe_dir(""),cover_history_binding(album),history,mime,&info) &&
+           (file.empty() || info.source!="historical_group") && accept(history,mime,info.source))return r;
+    }
+    if(!inLibrary && !file.empty()){
+        std::string mime;auto local=rta::audio::get_cover(file,mime);
+        if(accept(local,mime,"dir"))return r;
+    }
+    return r;
+}
+static const char* cover_src_of(const rta::net::LibAlbum& a) {
+    // Same ownership policy as resolve_cover, with bounded cache metadata IO.
+    std::string source;
+    const bool cached=cover_probe_cached(a.key,source);
+    if(cached && source=="manual")return "manual";
+    const char* local=cover_model_local_source(a);
+    if(std::strcmp(local,"none")!=0) {
+        std::vector<unsigned char> prefix;size_t bytes=0;
+        const auto state=Library::instance().albumCoverCacheState(a.key,&prefix,&bytes);
+        if(state==rta::net::LibCoverCacheState::Unknown ||
+           (state==rta::net::LibCoverCacheState::Present && bytes>128 && bytes<=kCoverMaxBytes && cover_looks_like_image(prefix)))return local;
+    }
+    if(cached && a.onlineCoverEligible && source=="online")return "net";
+    rta::net::artwork_migration::HistoryInfo history;
+    if(rta::net::artwork_migration::probe_history(path_in_exe_dir(""),cover_history_binding(a),&history))return history.source=="historical_group"?"historical_group":"history";
+    return "none";
+}
+
+// Writes are explicit startup/scan-completion phases. Picture/list GETs above
+// only read validated history records; they never migrate, fetch or publish.
+static void artwork_profile_migrate_startup() {
+    try {
+        const auto report=rta::net::artwork_migration::migrate_profile_artwork(path_in_exe_dir(""),RLPLAYER_VERSION);
+        play_log("ARTWORK_PROFILE profiles="+std::to_string(report.profiles)+" typed="+std::to_string(report.typedRecords)+" meta="+std::to_string(report.metaRecords)+" rejected="+std::to_string(report.rejected)+" failed="+std::to_string(report.failed));
+    }catch(const std::exception& e){play_log(std::string("ARTWORK_PROFILE retry-next-start reason=")+e.what());}
+}
+static void artwork_history_import_now() {
+    try {
+        std::vector<rta::net::artwork_migration::HistoryAlbumBinding> bindings;
+        for(const auto& album:Library::instance().albums())bindings.push_back(cover_history_binding(album));
+        const auto report=rta::net::artwork_migration::import_legacy_history(path_in_exe_dir(""),bindings,RLPLAYER_VERSION);
+        play_log("ARTWORK_HISTORY profiles="+std::to_string(report.profiles)+" imported="+std::to_string(report.historyRecords)+" rejected="+std::to_string(report.rejected)+" failed="+std::to_string(report.failed));
+    }catch(const std::exception& e){play_log(std::string("ARTWORK_HISTORY retry-next-start reason=")+e.what());}
+}
+static std::atomic<bool> g_artworkHistoryImportActive{false},g_artworkHistoryImportRequested{false};
+static void artwork_history_import_after_scan() {
+    g_artworkHistoryImportRequested.store(true);
+    bool expected=false;if(!g_artworkHistoryImportActive.compare_exchange_strong(expected,true))return;
+    std::thread([] {
+        do {
+            g_artworkHistoryImportRequested.store(false);
+            while(!g_shutdown.load() && Library::instance().scanning())std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            if(!g_shutdown.load())artwork_history_import_now();
+        }while(!g_shutdown.load() && g_artworkHistoryImportRequested.exchange(false));
+        g_artworkHistoryImportActive.store(false);
+        if(!g_shutdown.load() && g_artworkHistoryImportRequested.load())artwork_history_import_after_scan();
+    }).detach();
 }
 
 // ---------------- API 补图：用已配置的 DeepSeek key 补「脚本抓不到」的图（2026-10-26）----------------
@@ -6804,6 +7311,7 @@ static std::string apifill_page_images(const ApiJob& job, const std::vector<std:
 static ApiFillOutcome apifill_download_store(const ApiJob& job, const std::string& url,
                                             const std::string& referer, long long* bytesOut,
                                             std::string* whyOut, int budgetLeft) {
+    if(!job.isArtist){if(whyOut)*whyOut="release_evidence_required";return ApiFillOutcome::Rejected;}
     if (budgetLeft < 300) { if (whyOut) *whyOut = "budget_before_download"; return ApiFillOutcome::Rejected; }
     const int dlTo = budgetLeft < kApiFillDownloadMs ? budgetLeft : kApiFillDownloadMs;
     std::vector<std::string> hdr = { "User-Agent: Mozilla/5.0" };
@@ -6836,7 +7344,7 @@ static ApiFillOutcome apifill_download_store(const ApiJob& job, const std::strin
         wpath = cp.jpg; wnone = cp.none;
     }
     std::string werr;
-    if (!apifill_write_blob(wpath, wnone, ir.body, werr)) {
+    if (!(job.isArtist?apifill_write_blob(wpath,wnone,ir.body,werr):cover_write_cached(job.key,ir.body,"online"))) {
         if (whyOut) *whyOut = "write:" + werr;
         return ApiFillOutcome::Rejected;
     }
@@ -6875,6 +7383,9 @@ static rta::meta::ArtLedger apifill_ledger_load(std::string* pathOut = nullptr) 
     if (!f) return {};
     const std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     rta::meta::ArtLedger lg = rta::meta::art_ledger_parse(all);
+    const auto document=rta::net::json_parse(all);
+    if(document["coverChainRevision"].n()!=rta::meta::art_cover_chain_revision())
+        for(auto it=lg.m.begin();it!=lg.m.end();)if(it->second.outcome=="miss")it=lg.m.erase(it);else ++it;
     if (lg.dropped > 0)
         play_log("APIBATCH ledger dropped=" + std::to_string(lg.dropped) + " path=" + p);
     return lg;
@@ -6883,7 +7394,8 @@ static rta::meta::ArtLedger apifill_ledger_load(std::string* pathOut = nullptr) 
 // 账本写：tmp + 原子改名（读侧永远看不到半截账本）。**调用方持 ledgerMtx**。
 static void apifill_ledger_save_locked(const rta::meta::ArtLedger& lg) {
     const std::string p = apifill_ledger_path();
-    const std::string js = rta::meta::art_ledger_render(lg);
+    std::string js = rta::meta::art_ledger_render(lg);
+    js.insert(1,"\"coverChainRevision\":"+std::to_string(rta::meta::art_cover_chain_revision())+",");
     const std::string tmp = p + ".part";
     try {
         std::ofstream f(fs::u8path(tmp), std::ios::binary | std::ios::trunc);
@@ -6906,7 +7418,7 @@ static void apifill_ledger_save_locked(const rta::meta::ArtLedger& lg) {
 // 尺寸/长宽比这两道要在落盘前统一补齐（五道闸对所有来源一视同仁）。
 static ApiFillOutcome apifill_store_bytes(const ApiJob& job, const std::string& bytes,
                                           const std::string& url, std::string* whyOut,
-                                          long long* bytesOut) {
+                                          long long* bytesOut,const std::string& verifiedProvider={}) {
     std::string gw;
     int w = 0, h = 0;
     if (!rta::meta::art_image_ok(bytes, kApiFillMinBytes, kApiFillMinSide, &gw, &w, &h)) {
@@ -6929,7 +7441,7 @@ static ApiFillOutcome apifill_store_bytes(const ApiJob& job, const std::string& 
     }
     std::string werr;
     const std::vector<unsigned char> body(bytes.begin(), bytes.end());
-    if (!apifill_write_blob(wpath, wnone, body, werr)) {
+    if (!(job.isArtist?apifill_write_blob(wpath,wnone,body,werr):cover_write_cached(job.key,body,"online",url,verifiedProvider,job.name,job.artist))) {
         if (whyOut) *whyOut = "write:" + werr;
         return ApiFillOutcome::Fail;
     }
@@ -6943,12 +7455,15 @@ struct ApiItemState {
     std::vector<std::string> pages;    // 模型给的候选页
     std::vector<std::string> images;   // 模型给的图片直链（兼容通道）
     std::string why;                   // 走到这一步还缺图的原因（逐项留痕）
+    bool sourceTransient=false;
 };
 
 struct ApiFillBg {
     std::vector<ApiJob> jobs;
     rta::meta::LlmConfig cfg;
     bool artist = false;
+    bool runSources = true, allowPaid = false, primaryArtistDone=false;
+    MetaSettings settings;
     std::atomic<size_t> next{0};
     std::atomic<int> done{0}, hit{0}, rej{0}, fail{0};
     std::atomic<int> llmReq{0}, batches{0}, resumeSkip{0};   // 判据 #2 / #6 的硬证据
@@ -7056,15 +7571,18 @@ static void apibatch_phase_sources(std::shared_ptr<ApiFillBg> bg) {
         o.perSourceMs  = 3500;
         o.downloadMs   = 3000;
         o.minBytes     = kApiFillMinBytes;
-        // 设置页勾掉的源不许被补图偷偷用（metasrc_<id>，与 enrich 那条链同一份 conf）。
-        for (const char* sid : { "dizzylab", "qq", "netease", "itunes", "discogs", "bgm", "anilist", "apple" })
-            o.srcOn[sid] = conf_get(std::string("metasrc_") + sid, "1") != "0";
+        if(!bg->settings.on)return;
+        o.srcOn=bg->settings.srcOn;
+        if(bg->primaryArtistDone)for(const char* id:{"qq","netease","dizzylab","discogs"})o.srcOn[id]=false;
+        if(!job.isArtist)o=cover_source_options(bg->settings);
         const rta::meta::ArtMultiResult mr =
             rta::meta::art_multi_source_image(job.isArtist, job.name, job.artist, o);
         apibatch_merge_stats(*bg, mr.stats);
         if (!mr.ok) {
             // 阶梯没拿到：把逐源原因留给第二/三段（日志里能看出"问过谁、各说了什么"）
             bg->st[i].why = "src:" + mr.reason;
+            bg->st[i].sourceTransient=mr.tried.empty();
+            for(const auto& attempt:mr.tried)bg->st[i].sourceTransient=bg->st[i].sourceTransient||attempt.transient;
             continue;
         }
         // 跨对象重复图闸（仅头像）：同一份字节被**另一个人**用过 ⟹ 平台占位图，不落盘。
@@ -7090,7 +7608,7 @@ static void apibatch_phase_sources(std::shared_ptr<ApiFillBg> bg) {
         }
         std::string why;
         long long got = 0;
-        const ApiFillOutcome oc = apifill_store_bytes(job, mr.bytes, mr.url, &why, &got);
+        const ApiFillOutcome oc = apifill_store_bytes(job, mr.bytes, mr.url, &why, &got,(!job.isArtist && rta::meta::art_name_equal(job.name,mr.matchedAlbum) && rta::meta::art_name_equal(job.artist,mr.matchedArtist))?mr.source:std::string());
         if (oc == ApiFillOutcome::Hit) {
             bg->hit.fetch_add(1);
             bg->done.fetch_add(1);
@@ -7110,10 +7628,19 @@ static void apibatch_phase_sources(std::shared_ptr<ApiFillBg> bg) {
 
 // ---- ② 模型批处理：**每 20 项一次请求** ----
 static void apibatch_phase_llm(std::shared_ptr<ApiFillBg> bg) {
+    // User switches are live permissions for every new paid request. An
+    // already in-flight call may finish; it cannot authorize the next one.
+    auto paid_allowed=[&] {
+        const MetaSettings live=meta_settings_load();std::string capError;
+        return bg->allowPaid && live.on && live.llm && !g_shutdown.load() && !bg->fatal.load() &&
+               rta::meta::llm_check_cap(bg->cfg,{},&capError);
+    };
+    if(!paid_allowed())return;
     std::vector<size_t> need;
     need.reserve(bg->jobs.size());
     for (size_t i = 0; i < bg->jobs.size(); ++i)
         if (!bg->resolved[i]) need.push_back(i);
+    if(bg->primaryArtistDone && need.size()>kApiAutoMax)need.resize(kApiAutoMax);
     if (need.empty()) {
         play_log("APIBATCH llm skip why=nothing_left");
         return;
@@ -7160,6 +7687,7 @@ static void apibatch_phase_llm(std::shared_ptr<ApiFillBg> bg) {
         //   工具调用本身也是「模型没有浏览能力」这个根因的正解：让它真的去搜，而不是猜。
         const std::string toolsJson = rta::meta::llm_web_tools_json();
         std::vector<rta::meta::LlmMessage> conv = msgs;
+        if(!paid_allowed())return;
         rta::meta::LlmReply rep =
             rta::meta::llm_chat(c, conv, kApiBatchMaxTokens, 0.0f, /*jsonObject=*/true, toolsJson);
         int toolRounds = 0;
@@ -7171,12 +7699,14 @@ static void apibatch_phase_llm(std::shared_ptr<ApiFillBg> bg) {
             conv.push_back(asst);
             for (const auto& tc : rep.toolCalls) {
                 bool tok = false;
+                if(!paid_allowed())return;
                 const std::string out = rta::meta::llm_execute_web_tool(
                     c, tc.name, tc.arguments, kApiFillToolHopMs, &tok);
                 conv.push_back(rta::meta::llm_tool_result_message(tc.id, out));
                 bg->llmReq.fetch_add(1);
             }
             ++toolRounds;
+            if(!paid_allowed())return;
             rep = rta::meta::llm_chat(c, conv, kApiBatchMaxTokens, 0.0f, /*jsonObject=*/true, toolsJson);
         }
         // 2026-10-29：工具轮用完时模型可能仍想继续调工具（此时 content 为空 ⟹ 解析出 ok=0 why=empty）。
@@ -7190,7 +7720,8 @@ static void apibatch_phase_llm(std::shared_ptr<ApiFillBg> bg) {
             if (!rep.toolCalls.empty()) {
                 for (const auto& tc : rep.toolCalls) {
                     bool tok = false;
-                    const std::string out = rta::meta::llm_execute_web_tool(
+                    if(!paid_allowed())return;
+                const std::string out = rta::meta::llm_execute_web_tool(
                         c, tc.name, tc.arguments, kApiFillToolHopMs, &tok);
                     conv.push_back(rta::meta::llm_tool_result_message(tc.id, out));
                     bg->llmReq.fetch_add(1);
@@ -7200,6 +7731,7 @@ static void apibatch_phase_llm(std::shared_ptr<ApiFillBg> bg) {
             hint.role = "user";
             hint.content = "现在不再调用工具，请只输出 JSON。若仍无可用图片页，对应项的 pages 给空数组。";
             conv.push_back(hint);
+            if(!paid_allowed())return;
             rep = rta::meta::llm_chat(c, conv, kApiBatchMaxTokens, 0.0f, /*jsonObject=*/true);
         }
         const int ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -7298,12 +7830,16 @@ static void apibatch_phase_pages(std::shared_ptr<ApiFillBg> bg) {
 
 // 起一轮批量补图。true = 已排队；false = 上一轮还在跑 / 名单为空 / 账本说全做完了。
 // 断点续跑就在这里生效：先把账本里"已处理"的项剔掉，**只把剩下的放进队列**。
-static bool api_bg_start(std::vector<ApiJob> jobs, bool artist, const rta::meta::LlmConfig& cfg) {
+static bool api_bg_start(std::vector<ApiJob> jobs, bool artist, const rta::meta::LlmConfig& cfg, bool runSources=true, bool primaryArtistDone=false) {
+    const MetaSettings settings=meta_settings_load();
+    if(!settings.on)return false;
     if (jobs.empty()) return false;
     std::atomic<size_t>& act = artist ? g_api_artist_active : g_api_cover_active;
     size_t expect = 0;
     if (!act.compare_exchange_strong(expect, 1)) return false;
     auto bg = std::make_shared<ApiFillBg>();
+    bg->settings=settings;bg->runSources=runSources;bg->primaryArtistDone=primaryArtistDone;
+    std::string capError;bg->allowPaid=settings.llm&&!cfg.apiKey.empty()&&rta::meta::llm_check_cap(cfg,{},&capError);
     std::string lp;
     bg->ledger = apifill_ledger_load(&lp);
     bg->ledgerPath = lp;
@@ -7313,7 +7849,10 @@ static bool api_bg_start(std::vector<ApiJob> jobs, bool artist, const rta::meta:
     size_t skipped = 0;
     for (ApiJob& j : jobs) {
         const std::string k = j.isArtist ? j.name : j.key;
-        if (!rta::meta::art_ledger_need(bg->ledger, j.isArtist, k, now)) { ++skipped; continue; }
+        const auto entry=bg->ledger.m.find(rta::meta::art_ledger_key(j.isArtist,k));
+        const bool artifact=j.isArtist?artistimg_has_cache(j.name):cover_has_disk(j.key);
+        if (!rta::meta::art_ledger_need(bg->ledger, j.isArtist, k, now) &&
+            (entry==bg->ledger.m.end()||entry->second.outcome!="hit"||artifact)) { ++skipped; continue; }
         keep.push_back(std::move(j));
     }
     bg->resumeSkip.store((int)skipped);
@@ -7347,7 +7886,7 @@ static bool api_bg_start(std::vector<ApiJob> jobs, bool artist, const rta::meta:
         {
             std::vector<std::thread> ws;
             ws.reserve((size_t)kApiFillConcurrency);
-            for (int k = 0; k < kApiFillConcurrency; ++k)
+            if(bg->runSources)for (int k = 0; k < kApiFillConcurrency; ++k)
                 ws.emplace_back([bg]() { apibatch_phase_sources(bg); });
             for (auto& t : ws) if (t.joinable()) t.join();
         }
@@ -7356,14 +7895,22 @@ static bool api_bg_start(std::vector<ApiJob> jobs, bool artist, const rta::meta:
                      std::to_string(bg->hit.load()) + " stats=" +
                      ([&] { std::lock_guard<std::mutex> lk(bg->statMtx); return bg->stats.line(); }()));
         // ② 模型批处理（单线程：批与批之间串行，保证"每批 1 次请求"可数）
-        if (!g_shutdown.load() && !bg->fatal.load()) apibatch_phase_llm(bg);
+        const MetaSettings paidEntry=meta_settings_load();
+        bg->allowPaid=bg->allowPaid&&paidEntry.on&&paidEntry.llm;
+        if (bg->allowPaid && !g_shutdown.load() && !bg->fatal.load()) apibatch_phase_llm(bg);
         // ③ 抓页 + 下载 + 五道闸 + 落盘
         bg->next.store(0);
         {
             std::vector<std::thread> ws;
             ws.reserve((size_t)kApiFillConcurrency);
-            for (int k = 0; k < kApiFillConcurrency; ++k)
+            const MetaSettings paidExit=meta_settings_load();
+            bg->allowPaid=bg->allowPaid&&paidExit.on&&paidExit.llm;
+            if(bg->allowPaid)for (int k = 0; k < kApiFillConcurrency; ++k)
                 ws.emplace_back([bg]() { apibatch_phase_pages(bg); });
+            if(!bg->allowPaid)for(size_t i=0;i<bg->jobs.size();++i)if(!bg->resolved[i]){
+                bg->done.fetch_add(1);bg->rej.fetch_add(1);
+                if(bg->runSources && !bg->st[i].sourceTransient)apibatch_mark(bg,bg->jobs[i],"miss","");
+            }
             for (auto& t : ws) if (t.joinable()) t.join();
         }
         bg->running.store(false);
@@ -7453,37 +8000,26 @@ static std::atomic<bool> g_api_auto_cover_once{false};
 static std::atomic<bool> g_api_auto_artist_once{false};
 
 static void api_auto_fill_after_script(std::vector<ApiMissItem> items, bool artist) {
-    const char* tag = artist ? "APIART" : "APICOV";
-    if (items.empty()) return;
-    if (g_shutdown.load()) return;                       // 退出中：不再开工
-    std::atomic<bool>& once = artist ? g_api_auto_artist_once : g_api_auto_cover_once;
-    if (once.exchange(true)) { play_log(std::string(tag) + " auto skip why=already_ran_once"); return; }
-    const rta::meta::LlmConfig cfg = apifill_llm_cfg();
-    if (cfg.apiKey.empty()) { play_log(std::string(tag) + " auto skip why=no_key"); return; }
-    if (items.size() > kApiAutoMax) items.resize(kApiAutoMax);
-    // 去重（同一键/同名只问一次）：封面按 key，艺术家按 name。
-    std::vector<ApiJob> jobs;
-    std::set<std::string> seen;
-    jobs.reserve(items.size());
-    for (auto& it : items) {
-        const std::string dedupKey = artist ? it.name : it.key;
-        if (dedupKey.empty() || !seen.insert(dedupKey).second) continue;
-        ApiJob j;
-        j.isArtist = artist;
-        j.key      = artist ? std::string() : it.key;
-        j.name     = it.name;
-        j.artist   = artist ? std::string() : it.artist;
-        // items（曲名/专辑名清单）刻意留空：补图只读一份拷贝，不回头取 Library（后台线程不碰单例）。
-        jobs.push_back(std::move(j));
+    const char* tag=artist?"APIART":"APICOV";
+    if(items.empty()||g_shutdown.load())return;
+    const MetaSettings settings=meta_settings_load();if(!settings.on)return;
+    rta::meta::LlmConfig cfg;
+    // The existing on/llm/key/cap settings authorize paid fallback. Only that
+    // phase is once per process and capped40, never the public artist sources.
+    if(settings.llm){
+        std::atomic<bool>& once=artist?g_api_auto_artist_once:g_api_auto_cover_once;
+        if(!once.exchange(true))cfg=apifill_llm_cfg();
     }
-    const size_t n = jobs.size();
-    if (n == 0) { play_log(std::string(tag) + " auto skip why=no_candidate"); return; }
-    const size_t candidates = items.size();
-    const bool started = api_bg_start(std::move(jobs), artist, cfg);
-    play_log(std::string(tag) + " auto start n=" + std::to_string(started ? n : 0) +
-             " candidates=" + std::to_string(candidates) +
-             " source=script_miss model=" + cfg.model +
-             " key=" + rta::meta::llm_mask_key(cfg.apiKey));
+    if(!artist && cfg.apiKey.empty()){play_log(std::string(tag)+" auto skip why=paid_disabled_or_no_key");return;}
+    if(!artist && items.size()>kApiAutoMax)items.resize(kApiAutoMax);
+    std::vector<ApiJob> jobs;std::set<std::string> seen;
+    for(const auto& item:items){
+        const std::string key=artist?item.name:item.key;if(key.empty()||!seen.insert(key).second)continue;
+        ApiJob job;job.isArtist=artist;job.key=artist?std::string():item.key;job.name=item.name;job.artist=artist?std::string():item.artist;jobs.push_back(std::move(job));
+    }
+    const size_t total=jobs.size();
+    const bool started=api_bg_start(std::move(jobs),artist,cfg,artist,artist);
+    play_log(std::string(tag)+" auto start n="+std::to_string(started?total:0)+" public_extensions="+(artist?"1":"0")+" paid="+(!cfg.apiKey.empty()?"1":"0"));
 }
 
 
@@ -7556,6 +8092,13 @@ static void peq_load_current() {
         rta::dsp::PeqSettings parsed;
         std::string err;
         if (rta::dsp::peq_from_text(text, parsed, &err)) s = parsed;
+    }
+    // 2026-11-12：旧版默认写出的平直 PEQ 是 bypass=0（界面勾着「启用」但什么都不做）。
+    // 用户要求「默认不启动均衡」⟹ 读到全平直且无前级的 Flat 时按关闭处理。
+    if (!s.bypass && s.preampDb == 0.0 && s.presetName == "Flat") {
+        bool flat = true;
+        for (const auto& b : s.bands) if (std::fabs(b.gainDb) > 1e-9) { flat = false; break; }
+        if (flat) s.bypass = true;
     }
     g_peq->set_settings(s);
 }
@@ -7698,6 +8241,8 @@ struct MonitorSavedSettings {
 static MonitorSavedSettings monitor_saved_settings() {
     MonitorSavedSettings s;
     s.volumeDb = saved_volume_setting();   // 同一个读取器，保证与播放口径一致
+    std::lock_guard<std::recursive_mutex> settingsReadLock(
+        rta::meta::meta_file_mutex(fs::u8path(path_in_exe_dir("rlplayer-settings.conf"))));
     std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
     std::string line;
     while (std::getline(f, line)) {
@@ -8028,48 +8573,25 @@ static void play_log_rotate() {
 // 读侧:旧键 metaqq/metanetease/metaitunes/metalrclib 若存在则迁移读取(只读不写,
 // 写侧只写新键);metaon 总开关、metallm 不变。每次现读文件 —— 设置改完立即生效。
 // POST 白名单见 /api/settings。
-struct MetaSettings {
-    bool on = true;                          // metaon 总开关
-    bool llm = true;                         // metallm
-    bool summary = false;                    // metasummary 默认 0（成本策略：显式开启）
-    std::map<std::string, bool> srcOn;       // 注册表 id → 开关(缺省 true)
-};
-static bool meta_bool_val(const std::string& v) {
-    return v == "1" || v == "true" || v == "on";
+// Manual track commits and background image saves share this commit mutex.
+static bool track_cover_auto_allowed_locked(const std::string& file){
+    const std::string key="track:"+rta::meta::MetaStore::hashOf(rta::net::lib_path_key(file));
+    CoverCacheRecord record;const bool valid=cover_cache_record(key,record);
+    if(valid)return record.source!="manual";
+    if(record.source=="reset")return true;
+    std::error_code ec;const bool declared=fs::exists(fs::u8path(cover_paths(key).jpg+".source.json"),ec);
+    return !declared&&!ec;
 }
-static MetaSettings meta_settings_load() {
-    MetaSettings ms;
-    std::map<std::string, std::string> legacy;      // 旧键 metaqq/... 的值(迁移读取用)
-    std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
-    std::string line;
-    while (std::getline(f, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        const size_t e = line.find('=');
-        if (e == std::string::npos) continue;
-        const std::string k = line.substr(0, e);
-        const std::string v = line.substr(e + 1);
-        if      (k == "metaon")      ms.on      = meta_bool_val(v);
-        else if (k == "metallm")     ms.llm     = meta_bool_val(v);
-        else if (k == "metasummary") ms.summary = meta_bool_val(v);
-        else if (k.rfind("metasrc_", 0) == 0) ms.srcOn[k.substr(8)] = meta_bool_val(v);
-        else if (k == "metaqq")      legacy["qq"]      = v;
-        else if (k == "metanetease") legacy["netease"] = v;
-        else if (k == "metaitunes")  legacy["itunes"]  = v;
-        else if (k == "metalrclib")  legacy["lrclib"]  = v;
-    }
-    // 补全:注册表逐源,新键未写且旧键存在 → 迁移;两者都没有 → 缺省开
-    for (const rta::meta::ProviderDesc& pd : rta::meta::provider_registry()) {
-        if (ms.srcOn.count(pd.id) != 0) continue;
-        const auto it = legacy.find(pd.id);
-        ms.srcOn[pd.id] = (it == legacy.end()) ? true : meta_bool_val(it->second);
-    }
-    return ms;
+static void meta_attach_cover_guard(rta::meta::EnrichOpts& o){
+    o.allowCoverUpdate=[](const std::string& file){std::lock_guard<std::mutex> lock(cover_cache_mutex());return track_cover_auto_allowed_locked(file);};
+    o.withCoverUpdate=[](const std::string& file,const std::function<void()>& action){std::lock_guard<std::mutex> lock(cover_cache_mutex());if(!track_cover_auto_allowed_locked(file))return false;action();return true;};
 }
 static rta::meta::EnrichOpts meta_opts_from_settings() {
     const MetaSettings ms = meta_settings_load();
     rta::meta::EnrichOpts o;
     o.srcOn = ms.srcOn;
     o.llm = ms.llm;
+    meta_attach_cover_guard(o);
     // 功能4：llm 配置固定读 exe 同目录（界面 /api/llm 写的就是这一份）
     o.llmConfPath = path_in_exe_dir("rlplayer-llm.conf");
     return o;
@@ -8093,6 +8615,7 @@ static void meta_on_play(const std::string& file) {
     std::thread([file, ms] {
         rta::meta::EnrichOpts o;
         o.srcOn = ms.srcOn; o.llm = ms.llm;
+        meta_attach_cover_guard(o);
         o.llmConfPath = path_in_exe_dir("rlplayer-llm.conf");
         rta::meta::enrich_track(file, false, o);
         { std::lock_guard<std::mutex> lk(s_metaMx); s_inFlight.erase(file); }
@@ -8349,6 +8872,8 @@ static WbJob g_wb;
 // 之后每次整库写回都算数"。设置页的开关不归本工作包改(ui_script/settings 端点另有归属),
 // 所以这里直读同一个 conf 文件,键名照既有 metasrc_* 风格起名。
 static bool wb_cover_default() {
+    std::lock_guard<std::recursive_mutex> settingsReadLock(
+        rta::meta::meta_file_mutex(fs::u8path(path_in_exe_dir("rlplayer-settings.conf"))));
     std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
     std::string line;
     while (std::getline(f, line)) {
@@ -8574,7 +9099,7 @@ static void recent_add(const std::string& file, const std::string& title,
 static QItem item_from_line(const std::string& rest);   // 定义在后面（与具名保存队列共用同一套解析）
 
 // 原子写：先写 <文件>.tmp，再 rename 覆盖正式文件。
-// rename 失败（目标被占用 / 跨卷）才退回整份重写 —— 宁可这一次非原子，也不让队列丢掉。
+// rename 失败必须保留正式文件并报错；不能 trunc 旧文件，否则失败会清空用户队列。
 static bool queue_write_file(const std::string& dst, const std::vector<QItem>& items,
                              size_t index, int repeat, bool shuffle) {
     const std::string tmp = dst + ".tmp";
@@ -8602,9 +9127,9 @@ static bool queue_write_file(const std::string& dst, const std::vector<QItem>& i
     std::error_code ec;
     fs::rename(fs::u8path(tmp), fs::u8path(dst), ec);
     if (!ec) return true;
-    fs::remove(fs::u8path(tmp), ec);
-    std::ofstream f(fs::u8path(dst), std::ios::binary | std::ios::trunc);
-    return (bool)f;
+    std::error_code cleanupError;
+    fs::remove(fs::u8path(tmp), cleanupError);
+    return false;
 }
 
 // 读一个队列文件；解析规则与旧格式**逐字节兼容**（item=<路径>[TAB cs TAB ce]）。
@@ -8692,7 +9217,9 @@ static void queue_load() {
     size_t index = 0;
     int repeat = 0;
     bool shuffle = false;
-    bool got = queue_read_file(path, items, index, repeat, shuffle) && !items.empty();
+    // A valid empty queue is a saved user decision, not a missing installation
+    // profile. Importing a sibling here would resurrect a queue after Clear.
+    bool got = queue_read_file(path, items, index, repeat, shuffle);
     std::string from = path;
     if (!got) {
         const std::string sib = queue_find_sibling(path);
@@ -8871,7 +9398,7 @@ struct PreSlot {
 };
 static PreSlot g_pre;
 
-static void prefetch_start(const std::string& path) {
+static void prefetch_start(const std::string& path, const PlayParams& params) {
     if (path.empty() || g_pre.busy.load()) return;
     // 大文件不预解码（2026-10-25）：这类文件在播放时走流式，预先把整曲塞进内存正好是
     // 要修的那个病（517 MB + 1 GB 峰值）。判据与播放路径同一个函数，不会出现两套口径。
@@ -8890,9 +9417,9 @@ static void prefetch_start(const std::string& path) {
     g_pre.busy.store(true);
     g_pre.path = path;
     { std::lock_guard<std::mutex> lk(g_pre.mtx); g_pre.buf = AudioBuffer{}; }
-    g_pre.th = std::thread([path]() {
+    g_pre.th = std::thread([path, params]() {
         try {
-            apply_dsd_src_settings(g_params);      // 预解码也按当前设置（否则会解码出另一套滤波器）
+            apply_dsd_src_settings(params); // Immutable session snapshot; no racing global read.
             AudioBuffer b = read_any(path, nullptr);
             std::lock_guard<std::mutex> lk(g_pre.mtx);
             if (g_pre.path == path) g_pre.buf = std::move(b);
@@ -8911,8 +9438,42 @@ static AudioBuffer prefetch_take(const std::string& path) {
     return AudioBuffer{};
 }
 
+// UPnP queue owner: wait for an explicit natural-end verdict. A user stop,
+// decoder/SOAP failure or seconds limit never advances to another track.
+static void upnp_queue_thread(PlayParams p,size_t index,bool alreadyStarted=false) {
+    auto& ps=g_ps;
+    try {
+        for(;;) {
+            if(ps.stop.load())break;
+            QItem cur;
+            {std::lock_guard<std::mutex> lk(g_q.mtx);if(index>=g_q.items.size())break;cur=g_q.items[index];g_q.index=index;}
+            if(!alreadyStarted) {
+                p.volume=ps.volDb.load();
+                p.cueStart=cur.cs;p.cueEnd=cur.ce;std::string err;
+                if(!upnp_start_track(p,cur.path,err)){upnp_mark_player_state(cur.path,false,err);break;}
+                upnp_mark_player_state(cur.path,true,"");
+            }
+            alreadyStarted=false;g_upnpPlayer.store(true);ps.playing.store(true);queue_save();
+            rta::net::CastState st;
+            do {if(ps.stop.load())break;Sleep(50);st=rta::net::CastManager::instance().get_state();}while(st.running);
+            if(ps.stop.load())break;
+            if(!st.naturalEnd || !st.error.empty()){if(!st.error.empty()){std::lock_guard<std::mutex> lk(ps.mtx);ps.error=st.error;}break;}
+            {std::lock_guard<std::mutex> lk(g_q.mtx);
+                if(g_q.items.empty())break;
+                if(g_q.repeat==2)continue;
+                if(index+1<g_q.items.size()){++index;continue;}
+                if(g_q.repeat==1||g_q.repeat==3){index=0;continue;}
+                break;
+            }
+        }
+    }catch(const std::exception& e){std::lock_guard<std::mutex> lk(ps.mtx);ps.error=std::string("UPnP 队列失败: ")+e.what();}
+    if(ps.stop.load())rta::net::CastManager::instance().stop();
+    g_upnpPlayer.store(false);ps.playing.store(false);ps.paused.store(false);
+}
+
 // ---- 队列播放线程：自动播下一首，并在播当前曲时预解码下一曲 ----
 static void queue_thread(PlayParams p, size_t start) {
+    if(p.backend=="upnp"){upnp_queue_thread(p,start);return;}
     // ★ 2026-10-24 现场定案：同一台 DC-Elite 用 QQ 音乐独占完全正常，而 RLPlayer 有
     // 持续「啵」+ 随机闪断；全项目此前没有任何线程优先级代码（avrt 链接了却从未调用）。
     // 独占模式下的渲染线程必须进 MMCSS「Pro Audio」并提到 TIME_CRITICAL，否则被普通
@@ -8932,6 +9493,11 @@ static void queue_thread(PlayParams p, size_t start) {
     }
     auto& ps = g_ps;
     size_t idx = start;
+    // ★ 2026-11-01（播放线程硬化）：整段队列循环包一层异常边界。
+    //   单曲内部的 play_one 已有自己的 catch（超预算等可继续下一首的失败走那里）；
+    //   这里的边界兜的是**循环本身**的意外（队列读写、预解码、日志、路径处理）。
+    //   没有它的话，任何一处抛出都会逃出 std::thread ⟹ std::terminate ⟹ 进程消失。
+    try {
     for (;;) {
         if (ps.stop.load()) break;
 
@@ -8950,19 +9516,42 @@ static void queue_thread(PlayParams p, size_t start) {
             if (idx + 1 < g_q.items.size()) nextPath = g_q.items[idx + 1].path;
         }
 
-        { std::lock_guard<std::mutex> lk(ps.mtx); ps.current = cur.path; ps.error.clear(); }
+        { std::lock_guard<std::mutex> lk(ps.mtx); ps.current = cur.path; ps.error.clear();
+          ps.activeCueStart=cur.cs;ps.activeCueEnd=cur.ce;ps.activeQueueIndex=idx; }
         ps.played.store(0);
         ps.total.store(0);
 
-        if (!nextPath.empty()) prefetch_start(nextPath);   // 后台预解码下一曲
+        if (!nextPath.empty()) prefetch_start(nextPath, p);   // 后台预解码下一曲
 
         AudioBuffer buf = prefetch_take(cur.path);
         // ★ 本曲的播放区间**只来自队列项**：绝不沿用上一曲的 cueStart/cueEnd。
         //   （p 是"最近一次播放参数"，同专辑内切到非 cue 曲目时必须归零，否则会少播一段。）
         PlayParams pit = p;
+        pit.file = cur.path;
+        pit.queueIndex=idx;
+        {
+            std::lock_guard<std::mutex> lock(ps.mtx);
+            pit.volume = ps.volDb.load(); // Queue handoff and live volume share one short lock.
+            ps.rawVolumeLocked = raw_dsd_pending(pit);
+            if (ps.rawVolumeLocked) ps.startDb.store(0.0);
+        }
         pit.cueStart = cur.cs;
         pit.cueEnd   = cur.ce;
-        const bool done = play_one(cur.path, pit, buf);
+        // ★ 2026-11-01（P0）：play_one 会走到 Pipeline::prepare_stream，而后者在
+        //   「某预设在该输出率下的原型抽头数超预算」时抛 std::runtime_error
+        //   （resampler.h 的 maxPrototypeTaps）。以前这里没有 try/catch ⟹ 异常逃出播放线程
+        //   ⟹ std::terminate ⟹ 进程 0xC0000409。CLI 已实测复现（poly-sinc-xl @384k）。
+        //   这里兜住并转成可见错误：/api/status 的 error 会带出原因，播放线程继续正常工作。
+        bool done = false;
+        try {
+            done = play_one(cur.path, pit, buf);
+        } catch (const std::exception& e) {
+            play_log(std::string("PLAY_EXCEPTION ") + e.what() + " file=" + cur.path);
+            std::lock_guard<std::mutex> lk(ps.mtx);
+            ps.error = std::string("管线准备失败：") + e.what();
+        }
+        p.workbenchResume = -1.0;
+        p.workbenchPaused = false;
         const double endPos = (ps.outRate > 0 ? (double)ps.played.load() / (double)ps.outRate : 0.0);
         const size_t endPlayed = ps.played.load();
         std::string endErr = ps.error;
@@ -8995,12 +9584,29 @@ static void queue_thread(PlayParams p, size_t start) {
         if (ps.stop.load() || !done) break;
 
         std::lock_guard<std::mutex> lk(g_q.mtx);
+        // 2026-11-12：随机重排只改了 g_q.index，推进用的局部 idx 还是旧坐标 ⟹
+        // 播放中切随机后会重播当前曲/跳歌。推进前先按“当前曲目项”重新定位。
+        idx = queue_reindex_locked(cur);
+        if (idx >= g_q.items.size()) { if (g_q.repeat == 1 || g_q.repeat == 3) idx = 0; else break; }
         if (g_q.repeat == 2) continue;                     // 单曲循环
         if (idx + 1 < g_q.items.size()) { idx += 1; continue; }
         if (g_q.repeat == 1 || g_q.repeat == 3) { idx = 0; continue; }   // 列表循环 / 随机
         break;
     }
-    ps.playing = false;
+    } catch (const std::exception& e) {
+        play_log(std::string("QUEUE_EXCEPTION what=") + e.what() + " (队列循环已中止，进程继续运行)");
+        std::lock_guard<std::mutex> lk(ps.mtx);
+        ps.error = std::string("播放线程异常：") + e.what();
+    } catch (...) {
+        play_log("QUEUE_EXCEPTION what=<non-std> (队列循环已中止，进程继续运行)");
+        std::lock_guard<std::mutex> lk(ps.mtx);
+        ps.error = "播放线程异常（未知类型）";
+    }
+    {
+        std::lock_guard<std::mutex> lock(ps.mtx);
+        ps.playing = false;
+        ps.rawVolumeLocked = false;
+    }
 }
 
 // ---------------- HTTP 处理 ----------------
@@ -9774,59 +10380,105 @@ inline size_t skip_ws(const std::string& t, size_t p) {
     while (p < t.size() && (t[p] == ' ' || t[p] == '\t' || t[p] == '\r' || t[p] == '\n')) ++p;
     return p;
 }
-// key 要带引号（例如 "\"fs\""）；先找 key，再跳过 : 与空白，然后 strtod。
-inline bool num(const std::string& t, const char* key, double& v) {
-    const size_t k = t.find(key);
-    if (k == std::string::npos) return false;
-    size_t p = skip_ws(t, k + std::strlen(key));
-    if (p < t.size() && t[p] == ':') p = skip_ws(t, p + 1);
-    if (p >= t.size()) return false;
-    char* end = nullptr;
-    const double x = std::strtod(t.c_str() + p, &end);
-    if (!end || end == t.c_str() + p) return false;
-    v = x;
-    return true;
-}
-inline bool str(const std::string& t, const char* key, std::string& out) {
-    const size_t k = t.find(key);
-    if (k == std::string::npos) return false;
-    size_t p = skip_ws(t, k + std::strlen(key));
-    if (p < t.size() && t[p] == ':') p = skip_ws(t, p + 1);
-    if (p >= t.size() || t[p] != '"') return false;
-    ++p;
-    out.clear();
-    while (p < t.size() && t[p] != '"') {
-        if (t[p] == '\\' && p + 1 < t.size()) ++p;
-        out += t[p++];
-    }
-    return true;
-}
-// "channels":[ {"name":…,"ir":[…]} , … ] —— 逐个 "ir" 数组取数
-inline void irs(const std::string& t, std::vector<std::vector<double>>& out) {
-    size_t p = t.find("\"channels\"");
-    if (p == std::string::npos) return;
-    for (;;) {
-        const size_t ir = t.find("\"ir\"", p);
-        if (ir == std::string::npos) return;
-        size_t q = t.find('[', ir);
-        if (q == std::string::npos) return;
-        ++q;
-        std::vector<double> one;
-        while (q < t.size()) {
-            q = skip_ws(t, q);
-            if (q >= t.size()) break;
-            if (t[q] == ']') { ++q; break; }
-            if (t[q] == ',') { ++q; continue; }
-            char* end = nullptr;
-            const double v = std::strtod(t.c_str() + q, &end);
-            if (!end || end == t.c_str() + q) break;      // 非法数字 ⟹ 本声道到此为止
-            one.push_back(v);
-            q = (size_t)(end - t.c_str());
+// Keep coefficients as doubles, not a Json node per tap. The remaining small
+// document is validated in strict mode, including complete input/duplicate keys.
+inline bool document(const std::string& t, rta::net::Json& meta,
+                     std::vector<std::vector<double>>& irs) {
+    std::string metadataText;
+    metadataText.reserve(std::min<size_t>(t.size(), 65536));
+    int depth = 0;
+    for (size_t p = 0; p < t.size();) {
+        if (t[p] != '"') {
+            if (t[p] == '{' || t[p] == '[') { if (++depth > 32) return false; }
+            if (t[p] == '}' || t[p] == ']') { if (--depth < 0) return false; }
+            metadataText += t[p++];
+        } else {
+            const size_t begin = p++;
+            bool closed = false;
+            while (p < t.size()) {
+                if (t[p] == '\\') { p += 2; continue; }
+                if (t[p++] == '"') { closed = true; break; }
+            }
+            if (!closed || p > t.size()) return false;
+            rta::net::Json token;
+            if (!rta::net::json_parse_strict(t.substr(begin, p - begin), token)) return false;
+            metadataText.append(t, begin, p - begin);
+            const size_t colon = skip_ws(t, p);
+            if (token.str != "ir" || colon >= t.size() || t[colon] != ':') continue;
+            const size_t open = skip_ws(t, colon + 1);
+            if (open >= t.size() || t[open] != '[' || irs.size() >= 12) return false;
+            size_t q = skip_ws(t, open + 1);
+            std::vector<double> values;
+            if (q >= t.size() || t[q] == ']') return false;
+            for (;;) {
+                const size_t start = q;
+                // Delimiters remain unconsumed so missing/doubled commas reject.
+                while (q < t.size() && t[q] != ',' && t[q] != ']' &&
+                       t[q] != ' ' && t[q] != '\t' && t[q] != '\r' && t[q] != '\n') ++q;
+                if (q == start || q - start > 128) return false;
+                rta::net::Json number;
+                if (!rta::net::json_parse_strict(t.substr(start, q - start), number) ||
+                    number.type != rta::net::Json::Num || !rta::audio::audio_finite(number.num)) return false;
+                values.push_back(number.num);
+                if (values.size() > rta::dsp::ir_detail::kMaxSamples) return false;
+                q = skip_ws(t, q);
+                if (q >= t.size()) return false;
+                if (t[q] == ']') { ++q; break; }
+                if (t[q] != ',') return false;
+                q = skip_ws(t, q + 1);
+            }
+            irs.push_back(std::move(values));
+            metadataText.append(t, p, open - p);
+            // Array index binds this exact channel to its coefficient vector.
+            metadataText += std::to_string(irs.size() - 1);
+            p = q;
         }
-        if (!one.empty()) out.push_back(std::move(one));
-        else return;                                      // 空数组 ⟹ 不再往后找（结构已不符预期）
-        p = q;
+        // Metadata itself is small in the export format. Reject pathological
+        // documents before building a large recursive Json tree.
+        if (metadataText.size() > (1u << 20)) return false;
     }
+    return depth == 0 && rta::net::json_parse_strict(metadataText, meta) && meta.type == rta::net::Json::Obj;
+}
+inline bool integer(const rta::net::Json& j, double lo, double hi) {
+    return j.type == rta::net::Json::Num && rta::audio::audio_finite(j.num) &&
+           j.num >= lo && j.num <= hi && std::floor(j.num) == j.num;
+}
+inline bool decode(const std::string& text, const rta::dsp::RoomLayout& layout,
+                   RoomCorrAuto& result) {
+    using rta::net::Json;
+    Json meta;
+    std::vector<std::vector<double>> irs;
+    if (!document(text, meta, irs) || meta["layout"].type != Json::Str ||
+        meta["layout"].str != layout.name || !integer(meta["fs"],8000,1536000) ||
+        !integer(meta["taps"],1,(double)rta::dsp::ir_detail::kMaxSamples)) return false;
+    if (meta.has("version") && !integer(meta["version"],1,1)) return false;
+    if (meta["channels"].type != Json::Arr || meta["channels"].arr.size() != (size_t)layout.chCount ||
+        irs.size() != (size_t)layout.chCount) return false;
+    if (meta.has("chNames") && (meta["chNames"].type != Json::Arr ||
+                               meta["chNames"].arr.size() != (size_t)layout.chCount)) return false;
+    for (int c=0;c<layout.chCount;++c) {
+        const auto& channel=meta["channels"].arr[(size_t)c];
+        if (channel.type != Json::Obj || channel["name"].type != Json::Str ||
+            channel["name"].str != layout.chName[c] || !integer(channel["ir"],c,c) ||
+            irs[(size_t)c].size() != (size_t)meta["taps"].num || !roomcorr_ir_valid(irs[(size_t)c])) return false;
+        if (channel.has("valid") && (channel["valid"].type != Json::Bool || !channel["valid"].b)) return false;
+        if (meta.has("chNames") && (meta["chNames"].arr[(size_t)c].type != Json::Str ||
+                                    meta["chNames"].arr[(size_t)c].str != layout.chName[c])) return false;
+    }
+    double delay=0,gain=0;
+    if (meta.has("subDelaySamples")) {
+        if (meta["subDelaySamples"].type != Json::Num || !rta::audio::audio_finite(meta["subDelaySamples"].num)) return false;
+        delay=meta["subDelaySamples"].num;
+        if(std::abs(delay)>meta["fs"].num*2.0)return false;
+    }
+    if (meta.has("subGainDb")) {
+        if (meta["subGainDb"].type != Json::Num || !rta::audio::audio_finite(meta["subGainDb"].num)) return false;
+        gain=meta["subGainDb"].num;
+        if(std::abs(gain)>60.0)return false;
+    }
+    result.layout=layout.name;result.fs=(uint32_t)meta["fs"].num;result.taps=(int)meta["taps"].num;
+    result.subDelaySamples=delay;result.subGainDb=gain;result.irs=std::move(irs);
+    return true;
 }
 }   // namespace roomcorr_auto_detail
 
@@ -9893,17 +10545,9 @@ static RoomCorrAuto roomcorr_auto_prepare(int outCh, uint32_t inRate, bool setti
         r.why = "校正集读取失败：correction-" + chosen + ".json";
         return r;
     }
-    using namespace roomcorr_auto_detail;
-    double fsv = 0.0, tapsv = 0.0, sd = 0.0, sg = 0.0;
-    str(text, "\"layout\"", r.layout);
-    if (r.layout.empty()) r.layout = chosen;
-    if (num(text, "\"fs\"", fsv)) r.fs = (uint32_t)std::lround(std::max(0.0, fsv));
-    if (num(text, "\"taps\"", tapsv)) r.taps = (int)std::lround(std::max(0.0, tapsv));
-    if (num(text, "\"subDelaySamples\"", sd)) r.subDelaySamples = sd;
-    if (num(text, "\"subGainDb\"", sg)) r.subGainDb = sg;
-    irs(text, r.irs);
-    if (r.irs.empty()) {
-        r.why = "校正集里没有可用的 FIR：correction-" + chosen + ".json";
+    const auto* chosenLayout=roomcorr_find_layout(chosen);
+    if (!chosenLayout || !roomcorr_auto_detail::decode(text,*chosenLayout,r)) {
+        r.why = "校正集无效（需完整 JSON、匹配布局/声道和有限 FIR）：correction-" + chosen + ".json";
         return r;
     }
     r.ch = (int)r.irs.size();
@@ -9911,15 +10555,21 @@ static RoomCorrAuto roomcorr_auto_prepare(int outCh, uint32_t inRate, bool setti
     // 采样率不同必须先重采样：卷积(4) 在重采样(5) 之前，卷积器看到的是【源采样率】。
     // 同规则见上方手动 IR 分支（261024-05 A2 的既有结论）。
     if (r.fs != 0 && inRate != 0 && r.fs != inRate) {
-        for (auto& ir : r.irs) ir = rta::dsp::ir_resample(ir, r.fs, inRate);
+        for (auto& ir : r.irs) {
+            ir = rta::dsp::ir_resample(ir, r.fs, inRate);
+            if (!roomcorr_ir_valid(ir)) {
+                r.irs.clear();r.why="校正集重采样后 FIR 无效：correction-"+chosen+".json";
+                return r;
+            }
+        }
+        r.subDelaySamples*=(double)inRate/r.fs;
+        r.fs=inRate;r.taps=(int)r.irs[0].size();
         r.why.clear();
     }
     r.file = "correction-" + chosen + ".json";
     r.wantLayout = chosen;
     r.applied = true;
-    // subDelay/subGain 只上报不改音频：sub_alignment 的 delaySamples 符号语义
-    // （"超低晚到"该补在哪一路）在 C1 里没有定论，按错误方向改会比不改更糟。
-    // ⚠️ 未解决项（铁律 4）：主/超低对齐尚未接进播放链，当前以"不应用"作为回归基线。
+    // Alignment is applied at the same point as these FIRs in play_one.
     return r;
 }
 
@@ -10369,12 +11019,13 @@ static bool is_side_effect_path(const std::string& p) {
         // 261027-02 #4：队列排序会重写 items 顺序并落盘（恢复默认顺序同理）⟹ 纯副作用，只接受 POST
         "/api/qorder", "/api/qsort",
         // 三档预设的 apply 会写 rlplayer-settings.conf（副作用）；caps 是只读查询，不进这张表
-        "/api/preset/apply",
+        "/api/preset/apply", "/api/workbench/apply", "/api/workbench/profile",
+        "/api/workbench/eqpresets", "/api/workbench/loop",
         // 艺术家头像预热：会落盘缓存 + 打网络（副作用端点，只接受 POST；GET 端点是 /api/artist/image）
         "/api/artist/prefetch",
         // 专辑封面预热（2026-10-26）：会落盘 covercache + 打网络。
         // 只读端点是 /api/lib/cover（单张）与 /api/lib/cover/progress（进度）。
-        "/api/lib/cover/prefetch", "/api/lib/cover/set",
+        "/api/lib/cover/prefetch", "/api/lib/cover/set", "/api/cover/set", "/api/cover/reset", "/api/cover/lookup",
         // API 补封面（2026-10-26）：会让 DeepSeek 出 URL、下载、落盘 covercache —— 纯副作用。
         // 两种拼写都收（前端 JS 历史上 camelCase/kebab 混用，这里不做风格警察）。
         "/api/lib/cover/apiFill", "/api/lib/cover/apifill",
@@ -10390,12 +11041,15 @@ static bool is_side_effect_path(const std::string& p) {
         // 版本对比（B3）：会把 N 个文件各解码一遍（秒级 CPU）⟹ 只接受 POST，
         // 否则一个 <img src=".../api/compare?files=..."> 就能让服务端反复满载。
         "/api/compare",
-        // 一键反馈（261027-01 #1）：会打网络 + 往仓库写文件 ⟹ 纯副作用，只接受 POST
-        //（否则一个 <img src=".../api/feedback?title=..."> 就能替用户提交反馈）
+        // 反馈与手动外链上报都有网络副作用，只接受 POST。
         "/api/feedback",
-        // 在线更新（261027-02 #5）：下载会打网络+落盘；apply 会让程序重启；skip 会写 conf。
-        // 只读端点是 /api/update/check、/api/update/progress、/api/update/state（不进这张表）。
-        "/api/update/download", "/api/update/apply", "/api/update/skip",
+        // 只读端点是 /api/update/check、/api/update/progress、/api/update/state、/api/feedback/status。
+        "/api/update/download", "/api/update/apply", "/api/update/skip", "/api/update/manual",
+        // 多语言覆盖率采集（2026-11-01，仅 RLPLAYER_I18N_DEBUG=1 时生效）：POST 一条待译清单，
+        // 后端只写日志。放在这里是为了让「GET 不该有副作用」的门禁保持完整（不走 GET 绕过）。
+        "/api/i18n/miss",
+        // 多语言验收测试通道（2026-11-02，仅 RLPLAYER_QA=1）：会写 qa_text.log、推进步骤
+        "/api/qa/cmd", "/api/qa/done", "/api/qa/text",
     };
     for (const char* k : kNeedPost) {
         const size_t n = std::strlen(k);
@@ -10432,11 +11086,13 @@ static bool is_side_effect_exempt(const std::string& p) {
         "/api/artist/image",
         // /api/miccal：GET = 读 conf 里的 miccal 并解析出状态（只读，不写任何东西）。
         "/api/miccal",
+        "/api/feedback/status",
     };
     // ★ 例外中的例外（2026-10-26）：白名单是按**前缀**放的，而 "/api/lib/cover" 下面还有
     //   /api/lib/cover/prefetch —— 它会落盘 covercache 并打网络，绝不能因为前缀相同而放行 GET。
     //   （一个 <img src=.../api/lib/cover/prefetch> 就能让整库去联网，正是这张表当年要防的事。）
     if (p.rfind("/api/lib/cover/prefetch", 0) == 0) return false;
+    if (p.rfind("/api/lib/cover/set", 0) == 0) return false;
     // 同理：/api/lib/cover/apiFill 也会联网 + 落盘（一个 <img src> 就能让整库去问 LLM，最贵的那种）。
     if (p.rfind("/api/lib/cover/apiFill", 0) == 0) return false;
     if (p.rfind("/api/lib/cover/apifill", 0) == 0) return false;
@@ -10447,8 +11103,44 @@ static bool is_side_effect_exempt(const std::string& p) {
     return false;
 }
 
+static std::string cleanup_input_error(const rta::net::HttpRequest& rq) {
+    if(rq.path.rfind("/api/settings",0)!=0 && rq.path.rfind("/api/play",0)!=0 && rq.path.rfind("/api/cast/start",0)!=0)return {};
+    std::map<std::string,std::string> values;
+    if(!rq.body.empty() && rq.body.front()=='{') {
+        const auto j=rta::net::json_parse(rq.body);
+        for(const auto* key:{"cleanup_strength","cleanup_noise_db"})if(j.has(key)){
+            if(j[key].type!=rta::net::Json::Num)return "录音清理参数必须是有限数字";
+            values[key]=std::to_string(j[key].num);
+        }
+        for(const auto* key:{"cleanup_auto","quickstart"})if(j.has(key)){
+            const auto& value=j[key];
+            if(value.type==rta::net::Json::Bool)values[key]=value.b?"1":"0";
+            else if(value.type==rta::net::Json::Num && (value.num==0 || value.num==1))values[key]=value.num==1?"1":"0";
+            else if(value.type==rta::net::Json::Str)values[key]=value.str;
+            else return "cleanup_auto and quickstart must be 0 or 1";
+        }
+    }else{
+        std::istringstream is(rq.body);std::string token;
+        while(std::getline(is,token,'&')){const auto at=token.find('=');if(at!=std::string::npos)values[urlDecode(token.substr(0,at))]=urlDecode(token.substr(at+1));}
+    }
+    for(const auto& spec:std::vector<std::pair<std::string,std::pair<double,double>>>{{"cleanup_strength",{0,1}},{"cleanup_noise_db",{-120,-60}}}) {
+        const auto it=values.find(spec.first);if(it==values.end())continue;
+        char* end=nullptr;const double value=strtod(it->second.c_str(),&end);
+        if(it->second.empty()||end==it->second.c_str()||*end||!rta::audio::audio_finite(value)||value<spec.second.first||value>spec.second.second)
+            return spec.first=="cleanup_strength"?"清理强度必须是 0～1 的有限数字":"噪声底必须是 -120～-60 dBFS 的有限数字";
+    }
+    for(const auto* key:{"cleanup_auto","quickstart"}){
+        const auto it=values.find(key);if(it==values.end())continue;
+        if(it->second!="0" && it->second!="1" && it->second!="true" && it->second!="false")return "cleanup_auto and quickstart must be 0 or 1";
+    }
+    return {};
+}
+#include "net/workbench_config.h"
+
 static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct) {
     auto& ps = g_ps;
+    const auto processingError=cleanup_input_error(rq);
+    if(!processingError.empty()){ct="application/json; charset=utf-8";rta::net::webui_set_status(400);return "{\"ok\":false,\"error\":\""+jesc(processingError)+"\"}";}
 
     // ---- 副作用端点强制 POST（见上方注释）----
     // ★ GET 副作用判定不是"查表就完"，还要看参数：
@@ -10468,6 +11160,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     };
     auto getReadOnlyOk = [&](const std::string& p) {
         if (hasSideEffectQuery(p)) return false;
+        if(p=="/api/workbench/profiles"||p=="/api/workbench/eqpresets"||p=="/api/workbench/loop")return true;
         if (p.rfind("/api/writeback", 0) == 0) return p.rfind("/api/writeback/status", 0) != 0;  // 预览端点
         if (p.rfind("/api/settings", 0) == 0) return true;
         if (p.rfind("/api/peq", 0) == 0) return p.rfind("/api/peq/preset", 0) != 0;
@@ -10483,6 +11176,54 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                " 不支持，" + rq.path.substr(0, rq.path.find('?')) + " 只接受 POST\"}";
     }
 
+    if (rq.path == "/api/workbench/state") {
+        ct = "application/json; charset=utf-8";
+        if (rq.method != "GET") return workbench::error(405, "工作台状态只接受GET");
+        std::lock_guard<std::mutex> session(ps.sessionMx);
+        return workbench::state_locked();
+    }
+    if (rq.path == "/api/workbench/apply") {
+        ct = "application/json; charset=utf-8";
+        return workbench::apply(rq.body);
+    }
+    if (rq.path == "/api/workbench/profiles") {
+        ct="application/json; charset=utf-8";
+        if(rq.method!="GET")return workbench::error(405,"配置组列表只接受GET");
+        std::lock_guard<std::mutex> session(ps.sessionMx);
+        return workbench::profiles_json_locked();
+    }
+    if (rq.path == "/api/workbench/profile") {
+        ct="application/json; charset=utf-8";
+        if(rq.method!="POST")return workbench::error(405,"配置组修改只接受POST");
+        return workbench::profile_request(rq.body);
+    }
+    if (rq.path == "/api/workbench/eqpresets") {
+        ct="application/json; charset=utf-8";
+        if(rq.method=="POST")return workbench::eqpresets_request(rq.body);
+        if(rq.method!="GET")return workbench::error(405,"均衡方案只接受GET或POST");
+        std::lock_guard<std::mutex> session(ps.sessionMx);
+        return workbench::eqpresets_json_locked();
+    }
+    if (rq.path == "/api/workbench/loop") {
+        ct="application/json; charset=utf-8";
+        if(rq.method=="POST")return workbench::loop_request(rq.body);
+        if(rq.method!="GET")return workbench::error(405,"片段只接受GET或POST");
+        std::lock_guard<std::mutex> session(ps.sessionMx);
+        return "{\"ok\":true,\"loop\":"+workbench::loop_json_locked()+'}';
+    }
+    if(rq.path=="/api/waveform"||rq.path.rfind("/api/waveform?",0)==0){
+        ct="application/json; charset=utf-8";
+        if(rq.method!="GET")return workbench::error(405,"波形只接受GET");
+        workbench::Values f;std::string why;const auto query=rq.path.find('?');
+        if(query==std::string::npos||!workbench::request_values(rq.path.substr(query+1),f,why)||f["file"].empty())return workbench::error(400,why.empty()?"缺少波形文件":why);
+        if(f.count("fresh")&&f["fresh"]!="0"&&f["fresh"]!="1")return workbench::error(400,"fresh必须为0或1");
+        double start=0,length=0;
+        if((f.count("clip_start")&&(!parse_num_strict(f["clip_start"],start)||!rta::audio::audio_finite(start)||start<0))||
+           (f.count("clip_length")&&(!parse_num_strict(f["clip_length"],length)||!rta::audio::audio_finite(length)||length<0)))return workbench::error(400,"波形区间必须为非负有限秒数");
+        {std::lock_guard<std::mutex> session(ps.sessionMx);const auto current=workbench::snapshot_locked();
+            if(!f.count("clip_start")&&!f.count("clip_length")&&current.file==f["file"]&&current.params.cueStart>=0){start=current.params.cueStart;if(current.params.cueEnd>start)length=current.params.cueEnd-start;}}
+        return rta::analysis::waveform_request_json(f["file"],path_in_exe_dir("waveformcache"),start,length,f["fresh"]=="1");
+    }
     if (rq.path.rfind("/favicon", 0) == 0) {
         ct = "image/png";
         return std::string(reinterpret_cast<const char*>(rta::net::kAppIconPng), rta::net::kAppIconPngSize);
@@ -10497,6 +11238,84 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // 返回 {"ok":true,"lang":"<实际生效>","setting":"<conf 里的值>","rtl":bool,"map":{...}}。
     //   · lang 取"实际生效"而不是请求值：包不存在时返回 zh，前端就知道界面仍是中文；
     //   · setting 原样回传（可能是 "auto"），前端用它同步下拉框。
+
+    // ---------------- 多语言验收测试通道（RLPLAYER_QA=1 才启用） ----------------
+    // 为什么存在：合成鼠标进不到 WebView2 子窗口（261024-04 #1），而"音频分析全部展开、
+    // AI 抽屉逐屏滚动"必须由页面自己动。页面每 500 ms 拉一次 /api/qa/cmd，执行后
+    // 把两个面板的 innerText POST 回来并 ack —— 截图给人看，文本给机器查残留。
+    if (rq.path.rfind("/api/qa/", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        const char* qav = std::getenv("RLPLAYER_QA");
+        if (!(qav && qav[0] && std::string(qav) != std::string("0")))
+            return std::string("{\"ok\":false,\"error\":\"qa disabled\"}");
+        auto qarg = [&](const char* name) -> std::string {
+            const std::string key = std::string(name) + "=";
+            size_t p = rq.path.find(key);
+            std::string v = rq.path;
+            if (p != std::string::npos) { v = rq.path.substr(p + key.size()); }
+            else {
+                size_t b = rq.body.find(key);
+                if (b == std::string::npos) return std::string();
+                v = rq.body.substr(b + key.size());
+            }
+            const size_t amp = v.find('&');
+            if (amp != std::string::npos) v.resize(amp);
+            return urlDecode(v);
+        };
+        // 轮询走 /api/qa/next（GET，不进 kNeedPost）；下发走 /api/qa/cmd（POST）。
+        // 早先两者共用一个路径，结果 GET 被副作用门禁判 405 ⟹ 页面拿不到 step，整场静默。
+        if (rq.path.rfind("/api/qa/next", 0) == 0 || rq.path.rfind("/api/qa/cmd", 0) == 0) {
+            if (rq.method == "POST") {
+                const std::string stepS = qarg("step");
+                const std::string cmd = qarg("cmd");
+                {
+                    std::lock_guard<std::mutex> lk(g_qa_mu);
+                    g_qa_cmd = cmd;
+                }
+                g_qa_step.store(stepS.empty() ? -1 : std::atoi(stepS.c_str()));
+                return std::string("{\"ok\":true}");
+            }
+            std::string cur;
+            {
+                std::lock_guard<std::mutex> lk(g_qa_mu);
+                cur = g_qa_cmd;
+            }
+            return std::string("{\"step\":") + std::to_string(g_qa_step.load()) +
+                   ",\"cmd\":\"" + jesc(cur) + "\"}";
+        }
+        if (rq.path.rfind("/api/qa/done", 0) == 0) {
+            const std::string stepS = qarg("step");
+            g_qa_done.store(stepS.empty() ? -1 : std::atoi(stepS.c_str()));
+            return std::string("{\"ok\":true}");
+        }
+        if (rq.path.rfind("/api/qa/state", 0) == 0) {
+            return std::string("{\"step\":") + std::to_string(g_qa_step.load()) +
+                   ",\"done\":" + std::to_string(g_qa_done.load()) + "}";
+        }
+        if (rq.path.rfind("/api/qa/text", 0) == 0) {
+            const std::string stepS = qarg("step");
+            const std::string path = path_in_exe_dir("qa_text.log");
+            std::ofstream f(fs::u8path(path), std::ios::app | std::ios::binary);
+            if (f) {
+                f << "=== step " << (stepS.empty() ? "?" : stepS) << " ===\n";
+                f << rq.body << "\n";
+            }
+            return std::string("{\"ok\":true,\"bytes\":") + std::to_string(rq.body.size()) + "}";
+        }
+        return std::string("{\"ok\":false,\"error\":\"unknown qa endpoint\"}");
+    }
+
+    // 2026-11-01：多语言覆盖率**运行时采集**入口（只在 RLPLAYER_I18N_DEBUG=1 时页面会调）。
+    //   页面把「渲染后仍然是中文、且语言包里没有」的文本节点 POST 上来，这里写进播放日志，
+    //   我用它逐页生成待翻译清单 —— 比静态扫源码准得多（能拿到拼接后的真实字符串）。
+    if (rq.path.rfind("/api/i18n/miss", 0) == 0) {
+        const char* dbg = std::getenv("RLPLAYER_I18N_DEBUG");
+        if (dbg && dbg[0] && std::string(dbg) != "0") {
+            play_log("I18N_MISS " + rq.body);
+        }
+        return "{\"ok\":true}";
+    }
+
     if (rq.path.rfind("/api/i18n", 0) == 0) {
         ct = "application/json; charset=utf-8";
         std::string want;
@@ -11054,10 +11873,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
         const std::vector<std::string> names = artistimg_parse_names(raw);
         const bool explicitList = !names.empty();
-        const rta::meta::LlmConfig cfg = apifill_llm_cfg();
-        if (cfg.apiKey.empty())
-            return std::string("{\"ok\":false,\"error\":\"未配置 DeepSeek api_key"
-                               "（rlplayer-llm.conf 的 api_key，或 exe/上级目录的 KEY.txt 都没有）\"}");
+        const MetaSettings settings=meta_settings_load();
+        if(!settings.on)return "{\"ok\":false,\"error\":\"元数据补全已关闭\"}";
+        const rta::meta::LlmConfig cfg=settings.llm?apifill_llm_cfg():rta::meta::LlmConfig{};
         const auto t0 = std::chrono::steady_clock::now();
         auto jobs = apifill_build_artist_queue(names);          // 只读库 + stat，零网络
         const size_t total = jobs.size();
@@ -11134,6 +11952,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             play_log(lg);
             dlog(lg);
             lib.startScan(full);
+            artwork_history_import_after_scan();
             return "{\"ok\":true}";
         }
         // ---- 清理（261025-01 一.3：删掉的文件的记录必须能清掉）----
@@ -11223,9 +12042,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                   << ",\"sr\":" << sr << ",\"bits\":" << bits
                   // 2026-10-26：cv 的语义 = **有图可显示**（内嵌/同目录 或 网图缓存），
                   // 不然前端只判 cv 会把 46 张网图吞掉（实测 AFTER 仍是 118/181）。
-                  << ",\"cv\":" << ((a.hasCover || csrc == "net") ? "true" : "false")
-                  << ",\"cvSrc\":\"" << csrc << "\"";
-                if (csrc == "net") j << ",\"cvUrl\":\"/api/lib/cover?k=" << a.key << "\"";
+                  << ",\"cv\":" << ((csrc != "none") ? "true" : "false")
+                  << ",\"cvSrc\":\"" << csrc << "\""
+                  << ",\"albumIdentitySource\":\"" << rta::net::lib_album_identity_source_name(a.identitySource) << "\""
+                  << ",\"identitySource\":\"" << rta::net::lib_album_identity_source_name(a.identitySource) << "\""
+                  << ",\"onlineCoverEligible\":" << (a.onlineCoverEligible?"true":"false");
+                if (csrc != "none") j << ",\"cvUrl\":\"/api/lib/cover?k=" << a.key << "\"";
                 j << "}";
             }
             j << "]}";
@@ -11234,7 +12056,18 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         if (rq.path.rfind("/api/lib/album", 0) == 0) {
             std::string key;
             const size_t p = rq.path.find("?k=");
-            if (p != std::string::npos) key = urlDecode(rq.path.substr(p + 3));
+            // ★ 2026-11-02（用户反馈「封面有时刷得出来有时候刷不出来」的真因之一）：
+            //   前端为绕缓存会给图片加 &_cov=<时间戳>（预取完成后重指）与 &_r=<时间戳>（失败重试）；
+            //   旧代码把 "?k=" 之后**整段**当键 ⟹ 键带上 "&_cov=…&_r=…" ⟹ 查库必失败 ⟹ 404，
+            //   表现就是"第一次能显示，刷新/重试一次后永远消失"。这里按参数边界截断。
+            if (p != std::string::npos) {
+                std::string kv = rq.path.substr(p + 3);
+                const size_t amp = kv.find('&');
+                if (amp != std::string::npos) kv.resize(amp);
+                const size_t hash = kv.find('#');
+                if (hash != std::string::npos) kv.resize(hash);
+                key = urlDecode(kv);
+            }
             rta::net::LibAlbum a;
             if (!lib.album(key, a)) return "{\"ok\":false,\"error\":\"专辑不存在\"}";
             std::ostringstream j;
@@ -11243,9 +12076,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             j << "{\"ok\":true,\"k\":\"" << a.key << "\",\"name\":\"" << jesc(a.name)
               << "\",\"artist\":\"" << jesc(a.artist) << "\",\"year\":" << a.year
               << ",\"dur\":" << a.duration
-              << ",\"cv\":" << ((a.hasCover || csrc == "net") ? "true" : "false")
-              << ",\"cvSrc\":\"" << csrc << "\"";
-            if (csrc == "net") j << ",\"cvUrl\":\"/api/lib/cover?k=" << a.key << "\"";
+              << ",\"cv\":" << ((csrc != "none") ? "true" : "false")
+              << ",\"cvSrc\":\"" << csrc << "\""
+                  << ",\"albumIdentitySource\":\"" << rta::net::lib_album_identity_source_name(a.identitySource) << "\""
+                  << ",\"identitySource\":\"" << rta::net::lib_album_identity_source_name(a.identitySource) << "\""
+                  << ",\"onlineCoverEligible\":" << (a.onlineCoverEligible?"true":"false");
+            if (csrc != "none") j << ",\"cvUrl\":\"/api/lib/cover?k=" << a.key << "\"";
             j << ",\"tracks\":[";
             for (size_t i = 0; i < a.idx.size(); ++i) {
                 rta::net::LibTrack t;
@@ -11427,35 +12263,17 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         // 程序再怎么抓也抓不到 —— 这类只能由用户挑一张图。落盘到 covercache（**不改动音乐文件**）。
         // 契约：POST /api/lib/cover/set?k=<专辑键>，body = 图片原始字节（jpg/png/webp/gif），≤24 MB。
         if (rq.path.rfind("/api/lib/cover/set", 0) == 0) {
-            std::string key;
-            const size_t qp = rq.path.find("?k=");
-            if (qp != std::string::npos) key = urlDecode(rq.path.substr(qp + 3));
-            std::string kk;
-            for (char c : key) if (std::isxdigit((unsigned char)c)) kk.push_back((char)std::tolower((unsigned char)c));
-            // 专辑键必须是平台生成的 16 位十六进制（fnv_hex 的长度）：这样什么都没有的垃圾输入
-            // （例如 k=..\..\windows\win.ini 里恰好含 hex 字符 "d"）不会莫名其妙写出一张 d.jpg。
-            if (kk.size() != 16) return "{\"ok\":false,\"error\":\"专辑键非法（应为 16 位十六进制）\"}";
+            const std::string key=cover_query_value(rq.path,"k");
+            std::string kk=key;
+            if(kk.size()!=16 || !std::all_of(kk.begin(),kk.end(),[](unsigned char c){return std::isxdigit(c)!=0;}))return "{\"ok\":false,\"error\":\"专辑键非法\"}";
+            std::transform(kk.begin(),kk.end(),kk.begin(),[](unsigned char c){return (char)std::tolower(c);});
+            rta::net::LibAlbumIdentity identity{};
+            if(!Library::instance().albumIdentity(kk,identity))return "{\"ok\":false,\"error\":\"专辑键不存在\"}";
             if (rq.body.size() < 1024) return "{\"ok\":false,\"error\":\"图片太小（<1KB）\"}";
             if (rq.body.size() > 24u * 1024u * 1024u) return "{\"ok\":false,\"error\":\"图片超过 24MB\"}";
             const std::vector<unsigned char> body(rq.body.begin(), rq.body.end());
             if (!cover_looks_like_image(body)) return "{\"ok\":false,\"error\":\"不是可识别的图片（jpg/png/webp/gif）\"}";
-            const CoverPaths pp = cover_paths(kk);
-            std::error_code ec;
-            fs::create_directories(fs::u8path(pp.dir), ec);
-            const std::string tmp = pp.jpg + ".part";
-            {
-                std::ofstream f(fs::u8path(tmp), std::ios::binary | std::ios::trunc);
-                if (!f) return "{\"ok\":false,\"error\":\"无法写入 covercache\"}";
-                f.write(rq.body.data(), (std::streamsize)rq.body.size());
-                f.flush();
-                if (!f) return "{\"ok\":false,\"error\":\"写入失败（磁盘满？）\"}";
-            }
-            std::error_code em;
-            if (!MoveFileExW(widen(tmp).c_str(), widen(pp.jpg).c_str(), MOVEFILE_REPLACE_EXISTING)) {
-                fs::rename(fs::u8path(tmp), fs::u8path(pp.jpg), em);
-                if (em) { fs::remove(fs::u8path(tmp), em); return "{\"ok\":false,\"error\":\"改名失败\"}"; }
-            }
-            fs::remove(fs::u8path(pp.none), em);
+            if(!cover_write_cached(kk,body,"manual"))return "{\"ok\":false,\"error\":\"封面及来源提交失败；原封面保留\"}";
             play_log("COVERSET k=" + kk + " bytes=" + std::to_string((long long)rq.body.size()));
             return std::string("{\"ok\":true,\"k\":\"") + kk + "\",\"bytes\":" + std::to_string((long long)rq.body.size()) + "}";
         }
@@ -11494,10 +12312,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 }
                 flush();
             }
-            const rta::meta::LlmConfig cfg = apifill_llm_cfg();
-            if (cfg.apiKey.empty())
-                return std::string("{\"ok\":false,\"error\":\"未配置 DeepSeek api_key"
-                                   "（rlplayer-llm.conf 的 api_key，或 exe/上级目录的 KEY.txt 都没有）\"}");
+            const MetaSettings settings=meta_settings_load();
+            if(!settings.on)return "{\"ok\":false,\"error\":\"元数据补全已关闭\"}";
+            const rta::meta::LlmConfig cfg=settings.llm?apifill_llm_cfg():rta::meta::LlmConfig{};
             const auto t0 = std::chrono::steady_clock::now();
             auto jobs = apifill_build_cover_queue(keys);       // 只读库 + stat，零网络
             const size_t total = jobs.size();
@@ -11520,54 +12337,24 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         if (rq.path.rfind("/api/lib/cover", 0) == 0) {
             std::string key;
             const size_t p = rq.path.find("?k=");
-            if (p != std::string::npos) key = urlDecode(rq.path.substr(p + 3));
+            // ★ 2026-11-02（用户反馈「封面有时刷得出来有时候刷不出来」的真因之一）：
+            //   前端为绕缓存会给图片加 &_cov=<时间戳>（预取完成后重指）与 &_r=<时间戳>（失败重试）；
+            //   旧代码把 "?k=" 之后**整段**当键 ⟹ 键带上 "&_cov=…&_r=…" ⟹ 查库必失败 ⟹ 404，
+            //   表现就是"第一次能显示，刷新/重试一次后永远消失"。这里按参数边界截断。
+            if (p != std::string::npos) {
+                std::string kv = rq.path.substr(p + 3);
+                const size_t amp = kv.find('&');
+                if (amp != std::string::npos) kv.resize(amp);
+                const size_t hash = kv.find('#');
+                if (hash != std::string::npos) kv.resize(hash);
+                key = urlDecode(kv);
+            }
             const auto t0 = std::chrono::steady_clock::now();
             std::vector<unsigned char> bytes;
             std::string mime = "image/jpeg";
             const char* src = "none";
-            // ① 库里自己的图（内嵌 or 一目录一专辑的目录封面，来源见 LibAlbum::coverSrc）。
-            //    ★ 只有 hasCover=1 才去问 —— hasCover / coverSrc 是整理专辑表时算好的，
-            //      且语义已收紧（2026-10-27）：**没有属于本专辑的图时 hasCover=false**，
-            //      所以"一目录多专辑"里那 9 张会走到 ②/③ 去要网图，而**不会**再拿同目录那张。
-            //      对 hasCover=0 的专辑调 albumCover() 会为每张专辑起 3 次 ffmpeg（~200 ms/张），
-            //      187 张就把单线程 accept 堵死 30+ 秒 —— 这正是"封面页卡死"的老病根。
-            bool hasCv = false;
-            int cvSrc = rta::net::kCoverNone;
-            rta::net::LibAlbum a;
-            if (!key.empty() && lib.album(key, a)) { hasCv = a.hasCover; cvSrc = a.coverSrc; }
-            if (hasCv && lib.albumCover(key, bytes, mime) && !bytes.empty()) {
-                src = (cvSrc == rta::net::kCoverDirFile) ? "dir" : "embed";
-            } else {
-                // ② 磁盘正缓存（网图）
-                bytes.clear();
-                mime = "image/jpeg";
-                if (cover_read_cached(key, bytes)) { src = "net"; mime = cover_mime_of(bytes); }
-                // 2026-10-26 (261026-05): album key formula changed. If the new key has no
-                // cached cover, look up the LEGACY key and migrate the file in place, so users
-                // who already downloaded covers do not lose them after upgrading.
-                if (src == std::string("none")) {
-                    rta::net::LibAlbum la;
-                    if (lib.album(key, la) && !la.legacyKey.empty() && la.legacyKey != key) {
-                        std::vector<unsigned char> lbytes;
-                        if (cover_read_cached(la.legacyKey, lbytes)) {
-                            const CoverPaths pn = cover_paths(key);
-                            std::error_code ec2;
-                            fs::create_directories(fs::u8path(pn.dir), ec2);
-                            const std::string tmp = pn.jpg + ".part";
-                            {
-                                std::ofstream wf(fs::u8path(tmp), std::ios::binary | std::ios::trunc);
-                                if (wf) { wf.write(reinterpret_cast<const char*>(lbytes.data()), (std::streamsize)lbytes.size()); }
-                            }
-                            if (!MoveFileExW(widen(tmp).c_str(), widen(pn.jpg).c_str(), MOVEFILE_REPLACE_EXISTING)) {
-                                std::error_code em; fs::rename(fs::u8path(tmp), fs::u8path(pn.jpg), em); fs::remove(fs::u8path(tmp), em);
-                            }
-                            fs::remove(fs::u8path(pn.none), ec2);
-                            bytes.swap(lbytes); src = "net"; mime = cover_mime_of(bytes);
-                            play_log("COVSRC legacy-migrate k=" + key + " from=" + la.legacyKey + " bytes=" + std::to_string((unsigned long long)bytes.size()));
-                        }
-                    }
-                }
-            }
+            const CoverResolution resolved=resolve_cover({},key);
+            bytes=resolved.bytes;mime=resolved.mime;src=resolved.source.c_str();
             const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - t0).count();
             // 日志节流：专辑页一次渲染就会打 296 次这个端点，且响应头是 Cache-Control: no-store
@@ -11630,14 +12417,14 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             }
             // ★ F05：整段会话切换在 sessionMx 下完成（不允许与另一个 play/stop 交错）
             std::lock_guard<std::mutex> lkSession(ps.sessionMx);
+            ps.session_stop_join_locked();
+            establish_session_params_locked(p);
             {
                 std::lock_guard<std::mutex> lk(g_q.mtx);
                 g_q.items = items;
                 g_q.index = start;
             }
             queue_save();
-            g_params = p;
-            ps.session_stop_join_locked();
             { std::lock_guard<std::mutex> lk(ps.mtx); ps.error.clear(); ps.current = items[start].path; }
             ps.played.store(0);
             ps.total.store(0);
@@ -11649,7 +12436,18 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         if (rq.path.rfind("/api/lib/enqueue", 0) == 0) {
             std::string key;
             const size_t p = rq.path.find("?k=");
-            if (p != std::string::npos) key = urlDecode(rq.path.substr(p + 3));
+            // ★ 2026-11-02（用户反馈「封面有时刷得出来有时候刷不出来」的真因之一）：
+            //   前端为绕缓存会给图片加 &_cov=<时间戳>（预取完成后重指）与 &_r=<时间戳>（失败重试）；
+            //   旧代码把 "?k=" 之后**整段**当键 ⟹ 键带上 "&_cov=…&_r=…" ⟹ 查库必失败 ⟹ 404，
+            //   表现就是"第一次能显示，刷新/重试一次后永远消失"。这里按参数边界截断。
+            if (p != std::string::npos) {
+                std::string kv = rq.path.substr(p + 3);
+                const size_t amp = kv.find('&');
+                if (amp != std::string::npos) kv.resize(amp);
+                const size_t hash = kv.find('#');
+                if (hash != std::string::npos) kv.resize(hash);
+                key = urlDecode(kv);
+            }
             rta::net::LibAlbum a;
             if (!lib.album(key, a)) return "{\"ok\":false,\"error\":\"专辑不存在\"}";
             size_t cnt = 0;
@@ -11681,8 +12479,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             return lyr_stats_json(reset);
         }
         std::string file;
-        const size_t q = rq.path.find("?file=");
-        if (q != std::string::npos) file = urlDecode(rq.path.substr(q + 6));
+        file=cover_query_value(rq.path,"file");
         if (file.empty()) return "{\"ok\":false,\"error\":\"未指定文件\"}";
         if (!valid_utf8(file)) return utf8_path_reject(file);   // F1：本端点下方就是 fs::u8path
         std::string text, src;
@@ -11923,6 +12720,56 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             }
             j << "]}";
             return j.str();
+        }
+        if (rq.path.rfind("/api/sq/create", 0) == 0) {
+            const std::string name = sqName(sqp("name"));
+            if (name.empty()) return "{\"ok\":false,\"error\":\"缺少歌单名字\"}";
+            bool dup = false, saved = false;
+            {
+                std::lock_guard<std::mutex> lk(g_sqMu);
+                for (const auto& q : g_sqList) if (q.name == name) { dup = true; break; }
+                if (!dup) { g_sqList.push_back(SavedQueue{name, {}}); saved = sq_save_locked(); }
+            }
+            if (dup) return "{\"ok\":false,\"error\":\"同名歌单已存在\"}";
+            return std::string("{\"ok\":") + (saved ? "true" : "false") + ",\"name\":\"" + jesc(name) + "\",\"count\":0" + (saved ? "" : ",\"error\":\"写入磁盘失败\"") + "}";
+        }
+        if (rq.path.rfind("/api/sq/add", 0) == 0) {
+            const std::string name = sqName(sqp("name"));
+            const std::string file = sqp("file");
+            if (name.empty() || file.empty()) return "{\"ok\":false,\"error\":\"缺少 name 或 file 参数\"}";
+            if (!valid_utf8(file)) return "{\"ok\":false,\"error\":\"文件路径不是合法 UTF-8\"}";
+            const std::string csS = sqp("cue_start"), ceS = sqp("cue_end");
+            double cs = -1.0, ce = -1.0;
+            if (!csS.empty()) cs = atof(csS.c_str());
+            if (!ceS.empty()) ce = atof(ceS.c_str());
+            if (cs >= 0.0 && (!std::isfinite(cs) || !std::isfinite(ce) || ce <= cs)) return "{\"ok\":false,\"error\":\"CUE 区间无效\"}";
+            size_t count = 0; bool saved = false;
+            {
+                std::lock_guard<std::mutex> lk(g_sqMu);
+                auto it = std::find_if(g_sqList.begin(), g_sqList.end(), [&](const SavedQueue& q){ return q.name == name; });
+                if (it == g_sqList.end()) { g_sqList.push_back(SavedQueue{name, {}}); it = g_sqList.end() - 1; }
+                it->items.push_back(QItem(file, cs, ce));
+                count = it->items.size();
+                saved = sq_save_locked();
+            }
+            return std::string("{\"ok\":") + (saved ? "true" : "false") + ",\"name\":\"" + jesc(name) + "\",\"count\":" + std::to_string(count) + (saved ? "" : ",\"error\":\"写入磁盘失败\"") + "}";
+        }
+        if (rq.path.rfind("/api/sq/remove", 0) == 0) {
+            const std::string name = sqName(sqp("name"));
+            const std::string idxS = sqp("i");
+            if (name.empty() || idxS.empty()) return "{\"ok\":false,\"error\":\"缺少 name 或 i 参数\"}";
+            const int idx = atoi(idxS.c_str());
+            bool found = false, saved = false; size_t count = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_sqMu);
+                for (auto& q : g_sqList) if (q.name == name) {
+                    found = true;
+                    if (idx >= 0 && (size_t)idx < q.items.size()) { q.items.erase(q.items.begin() + idx); saved = sq_save_locked(); }
+                    count = q.items.size(); break;
+                }
+            }
+            if (!found) return "{\"ok\":false,\"error\":\"歌单不存在\"}";
+            return std::string("{\"ok\":") + (saved ? "true" : "false") + ",\"name\":\"" + jesc(name) + "\",\"count\":" + std::to_string(count) + "}";
         }
         if (rq.path.rfind("/api/sq/save", 0) == 0) {
             const std::string name = sqName(sqp("name"));
@@ -12357,14 +13204,13 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                             "s > 文件时长 " + std::to_string(mi.duration) + "s") + "\"}";
             play_log("PLAY_CUE cue=" + cue_range_text(p.cueStart, p.cueEnd) + " file=" + p.file);
         }
-        g_params = p;
-
         // ★ F05：会话串行所有者 —— 从这里到"起新线程"整段在 sessionMx 下完成。
         //   旧代码的两个并发 /api/play 会同时通过 joinIfDone() 再依次给同一个 joinable
         //   thread 赋值 ⟹ std::terminate（0xC0000409）。
         std::unique_lock<std::mutex> lkSession(ps.sessionMx);
         // 先停掉上一次
         ps.session_stop_join_locked();
+        establish_session_params_locked(p);
         // 一条会话原则（261024-01 #9）：开始新的本地播放时，停掉可能还在跑的投放会话，
         // 避免本机声卡与网络渲染器同时出声（两套控制互相打架）。
         g_upnpPlayer.store(false);
@@ -12375,6 +13221,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             ps.error.clear();
             ps.current = p.file;
         }
+        size_t startIndex;
         {
             std::lock_guard<std::mutex> lk(g_q.mtx);
             // 如果点的文件已在队列里，就把指针移到它；否则**追加到末尾再播**。
@@ -12385,14 +13232,20 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             //   只要在曲目页点了另外一首就**整列消失**（实测 15 → 1，见 build-q11/shots/baseline-08）。
             //   队列是用户的劳动成果，"播一首"绝不该销毁它 ⟹ 改成追加到末尾（与「加入队列」同义）。
             const QItem want(p.file, p.cueStart, p.cueEnd);
-            bool found = false;
-            for (size_t i = 0; i < g_q.items.size(); ++i)
-                if (g_q.items[i].same(want)) { g_q.index = i; found = true; break; }
-            if (!found) {
-                g_q.items.push_back(want);
-                g_q.index = g_q.items.size() - 1;
-                g_q.sortBase.clear();     // 队列结构变了 ⟹ 排序撤销点作废（与 /api/add 一致）
+            if (p.queueIndex < g_q.items.size() && g_q.items[p.queueIndex].same(want)) {
+                startIndex = p.queueIndex;
+            } else {
+                const auto match = std::find_if(g_q.items.begin(), g_q.items.end(),
+                    [&](const QItem& item) { return item.same(want); });
+                startIndex = static_cast<size_t>(match - g_q.items.begin());
+                if (match == g_q.items.end()) {
+                    g_q.items.push_back(want);
+                    // 2026-11-12：随机态下新增曲目也要进快照，否则关掉随机时这首会消失。
+                    if (g_q.shuffle && !g_q.base.empty()) g_q.base.push_back(want);
+                    g_q.sortBase.clear();
+                }
             }
+            g_q.index = startIndex;
         }
         // 261027-02 #4：index 变了就落盘 —— 旧实现 /api/play 只改内存 index 不写文件，
         // 重启后 index 会退回上一次"队列结构变化"时的位置（用户感受是"重启后指针乱跳"）。
@@ -12414,15 +13267,16 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             ps.outRate = 0;
             ps.outBits = 0;
             ps.playing.store(true);
+            ps.th=std::thread(upnp_queue_thread,p,startIndex,true);
             return "{\"ok\":true,\"upnp\":true}";
         }
         ps.playing.store(true);
-        const size_t st0 = g_q.index;
-        ps.th = std::thread(queue_thread, p, st0);
+        ps.th = std::thread(queue_thread, p, startIndex);
         return "{\"ok\":true}";
     }
 
     if (rq.path.rfind("/api/qdel", 0) == 0) {
+        std::lock_guard<std::mutex> session(ps.sessionMx);
         ct = "application/json; charset=utf-8";
         size_t idx = 0;
         const size_t q = rq.path.find("?i=");
@@ -12451,6 +13305,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return "{\"ok\":true,\"count\":" + std::to_string(cnt) + "}";
     }
     if (rq.path.rfind("/api/qmove", 0) == 0) {
+        std::lock_guard<std::mutex> session(ps.sessionMx);
         ct = "application/json; charset=utf-8";
         size_t from = 0, to = 0;
         { const size_t q = rq.path.find("?from="); if (q != std::string::npos) from = (size_t)atoi(rq.path.c_str() + q + 6); }
@@ -12487,6 +13342,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     //   ③ **落回后端 items**：排序不只是前端显示顺序（拖拽排序本来就改后端），
     //      两套顺序并存必然出现"看到的和播放的不一致"。
     if (rq.path.rfind("/api/qsort", 0) == 0) {
+        std::lock_guard<std::mutex> session(ps.sessionMx);
         ct = "application/json; charset=utf-8";
         std::string by = "default";
         { const size_t q = rq.path.find("?by="); if (q != std::string::npos) by = urlDecode(rq.path.substr(q + 4)); }
@@ -12512,6 +13368,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                ",\"index\":" + std::to_string(newIndex) + "}";
     }
     if (rq.path.rfind("/api/qorder", 0) == 0) {
+        std::lock_guard<std::mutex> session(ps.sessionMx);
         ct = "application/json; charset=utf-8";
         std::string files;
         {
@@ -12578,6 +13435,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
 
     if (rq.path.rfind("/api/add", 0) == 0) {
+        std::lock_guard<std::mutex> session(ps.sessionMx);
         ct = "application/json; charset=utf-8";
         PlayParams p = parseForm(rq.body);   // 非 const：远程曲目会把 p.file 换成缓存路径
         // 远程曲目：先把原始文件完整下载到缓存，再走与本地完全相同的解码与 DSP 路径
@@ -12607,6 +13465,16 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                     if (ok) { addList.push_back(pathToUtf8(it->path())); ++guard; }
                 }
             } else {
+                // 2026-11-13 反馈 FB-20261113-A916DFDBD3：单文件也要判扩展名。
+                // 旧实现无条件入队 ⟹ desktop.ini / 封面 jpg 会进队列，播到它才报
+                // "ffmpeg 解不了"，用户根本看不出是哪一步错了。
+                if (!rta_is_playable_ext(rta_ext_of(p.file))) {
+                    std::ostringstream jb;
+                    jb << "{\"ok\":false,\"error\":\"不是可播放的音频文件："
+                       << jesc(pathToUtf8(fs::u8path(p.file).filename()))
+                       << "（支持 wav / flac / mp3 / m4a / ape / wv / dsf / dff / cue / iso 等）\"}";
+                    return jb.str();
+                }
                 addList.push_back(p.file);
             }
         }
@@ -12894,7 +13762,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     }
     // ---------------- 单曲元数据补全(同步;按设置组装 EnrichOpts) ----------------
     // /api/enrich?file=...&force=1 → enrich_track 结果 JSON。正常命中数秒返回;
-    // 全源超时的最坏情形可能超 20s(enrich.h 头注「未解决项」如实记录)。
+    // 网络链共用20s绝对预算；到期停止并保留已有结果，明确返回budgetExceeded。
     if (rq.path.rfind("/api/enrich", 0) == 0) {
         ct = "application/json; charset=utf-8";
         std::string file;
@@ -12914,10 +13782,13 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
         if (file.empty()) return "{\"ok\":false,\"error\":\"未指定文件\"}";
         if (!valid_utf8(file)) return utf8_path_reject(file);   // F1：enrich_track 内部走 u8string→fs::path
+        if(!meta_settings_load().on)return "{\"ok\":true,\"skipped\":true,\"note\":\"metadata_disabled\"}";
         const rta::meta::EnrichStats st = rta::meta::enrich_track(file, force, meta_opts_from_settings());
         std::ostringstream j;
         j << "{\"ok\":" << (st.ok ? "true" : "false")
           << ",\"skipped\":" << (st.skipped ? "true" : "false")
+          << ",\"budgetExceeded\":" << (st.budgetExceeded ? "true" : "false")
+          << ",\"errorCode\":\"" << (st.budgetExceeded ? "ENRICH_BUDGET_EXCEEDED" : "") << "\""
           << ",\"nCand\":" << st.nCand
           << ",\"bestScore\":" << st.bestScore
           << ",\"bestSource\":\"" << jesc(st.bestSource) << "\""
@@ -12934,46 +13805,26 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     if (rq.path.rfind("/api/meta", 0) == 0) {
         ct = "application/json; charset=utf-8";
         std::string file;
-        const size_t q = rq.path.find("?file=");
-        if (q != std::string::npos) file = urlDecode(rq.path.substr(q + 6));
+        file=cover_query_value(rq.path,"file");
         if (file.empty()) return "{\"ok\":false,\"error\":\"未指定文件\"}";
         if (!valid_utf8(file)) return utf8_path_reject(file);   // F1：probe_media/get_cover 内部有 u8path
         const MediaInfo mi = probe_media(file);
-        // 只探测有没有封面（不把图片塞进 JSON）。
-        // ★ 2026-10-27（第三轮）：hasCover 也必须按**专辑封面来源**判 —— 这是同一个 BUG 的第四条路径
-        //   （用户 2.0 发包前：「专辑名对、封面严重错误」）。老口径 get_cover(file) 第 1 步就是
-        //   "同目录 cover.jpg 优先" ⟹ 一目录多专辑时会把**别人那张图**算成这一首有图（hasCover=true），
-        //   底栏于是去请求 /api/cover（按新逻辑返回空）→ 空白格子：图不再是别人的，但
-        //   "有没有图"这个语义仍然是错的。
-        //   库内文件问 Library::trackCover（与专辑页、单曲页**同一份**来源判断）；库外保持旧行为。
-        bool hasCover = false;
-        {
-            std::vector<unsigned char> cb;
-            std::string cm;
-            if (!rta::net::Library::instance().trackCover(file, cb, cm)) {
-                cb = get_cover(file, cm);      // 库外（拖进来的临时文件 / 还没扫进库）：旧行为
-            }
-            hasCover = cb.size() > 128;
-        }
+        const CoverResolution resolvedCover=resolve_cover(file);
+        const bool hasCover=!resolvedCover.bytes.empty();
+        rta::net::LibAlbumIdentity albumIdentity{};
+        const bool haveAlbumIdentity=Library::instance().trackAlbumIdentity(file,albumIdentity);
+        const std::string folderName=pathToUtf8(fs::u8path(file).parent_path().filename());
+        const std::string identitySource=haveAlbumIdentity?rta::net::lib_album_identity_source_name(albumIdentity.source):"legacy_unknown";
         // MetaStore 补全结果覆盖输出(P1):记录里值非空才覆盖;albumArtist/year/lyrics 是新增键
         rta::meta::TrackMeta tm;
         const bool haveMeta = rta::meta::MetaStore::instance().load(file, tm);
+        if (haveMeta) rta::meta::refresh_embedded_wav_text(file, tm);
         std::string fTitle = mi.title, fArtist = mi.artist, fAlbum = mi.album, fGenre = mi.genre;
-        // 2026-10-28（用户真机：「单曲的 AI 搜索仍然没加入专辑名」——查下来**不是搜索词代码没改**，
-        //   而是这里没兜底）：
-        //   本库大量同人碟是**无标签 WAV**。实测 02. 19：30.wav 连 RIFF 的 LIST/INFO 块都没有，
-        //   probe_media 返回空 ⟹ fAlbum 为空 ⟹ 前端 npDataTargets 的 m.album 为空 ⟹
-        //   npSummUrl 拼不出 &album= ⟹ 后端 opts.album 为空 ⟹ 搜索词退化成
-        //     "19：30 歌曲 作词 作曲 编曲 发行"
-        //   实测这种查询的 rerank 最高只有 0.26，拿回来的是吉他谱/K歌app/DJ粤语版 —— 全是垃圾。
-        //   而**库里本来就能从目录名算出专辑名**（albumVecLocked → lib_dir_album_for，
-        //   已经拆过「专辑 @ 社团」）。这里把同一条兜底接到 /api/meta 上，
-        //   保证「专辑页显示的专辑名」「单曲页副标题」「AI 搜索用的专辑名」是**同一个值**。
-        if (fAlbum.empty()) {
-            const rta::net::LibDirAlbum da = rta::net::lib_dir_album_for(file);
-            if (da.fromDir && !da.album.empty()) fAlbum = da.album;
-        }
+        // A directory browsing label is not release metadata and must never
+        // become an AI album query merely because a folder happens to have a name.
+        if(haveAlbumIdentity){if(albumIdentity.onlineCoverEligible){if(fAlbum.empty())fAlbum=albumIdentity.name;}else fAlbum.clear();}
         std::string fAlbumArtist, fYear, fLyrics;
+        std::string fDate=mi.date,fTrack=mi.track,fDisc;
         std::map<std::string, std::string> metaSrc;     // 字段 → MetaValue.source(溯源表)
         auto metaOverride = [&](const char* key, std::string& dst) {
             if (!haveMeta) return;
@@ -12985,11 +13836,16 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         };
         metaOverride("title", fTitle);
         metaOverride("artist", fArtist);
-        metaOverride("album", fAlbum);
+        if(!haveAlbumIdentity || albumIdentity.onlineCoverEligible)metaOverride("album",fAlbum);
+        else if(haveMeta){const auto it=tm.fields.find("album");if(it!=tm.fields.end()&&it->second.source=="user")metaOverride("album",fAlbum);}
         metaOverride("albumArtist", fAlbumArtist);
         metaOverride("year", fYear);
         metaOverride("genre", fGenre);
         metaOverride("lyrics", fLyrics);
+        // User-confirmed numbering/date retains its full original string (2/2,
+        // 1/11, ISO date), rather than truncating to an integer or year.
+        auto userOverride=[&](const char* key,std::string& dst){if(!haveMeta)return;const auto it=tm.fields.find(key);if(it!=tm.fields.end()&&it->second.source=="user")metaOverride(key,dst);};
+        userOverride("date",fDate);userOverride("trackNo",fTrack);userOverride("discNo",fDisc);
 
         // 简介可用性标志（2026-10-23 用户 261023-03 #2/#3/#5）
         // 单曲播放整页据此决定：是否显示简介板块、是否显示「正在整理资料…」加载行。
@@ -13049,13 +13905,18 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
           << ",\"year\":\"" << jesc(fYear) << "\""
           << ",\"genre\":\"" << jesc(fGenre) << "\""
           << ",\"lyrics\":\"" << jesc(fLyrics) << "\""
-          << ",\"date\":\"" << jesc(mi.date) << "\""
-          << ",\"track\":\"" << jesc(mi.track) << "\""
+          << ",\"date\":\"" << jesc(fDate) << "\""
+          << ",\"track\":\"" << jesc(fTrack) << "\""
+          << ",\"disc\":\"" << jesc(fDisc) << "\""
           << ",\"codec\":\"" << jesc(mi.codec) << "\""
           << ",\"sampleRate\":" << mi.sampleRate
           << ",\"channels\":" << mi.channels
           << ",\"bits\":" << mi.bits
           << ",\"hasCover\":" << (hasCover ? "true" : "false")
+          << ",\"coverSource\":\"" << jesc(resolvedCover.source) << "\""
+          << ",\"coverUrl\":\"" << (hasCover?jesc("/api/cover?file="+cover_url_escape(file)+"&v="+resolvedCover.hash):std::string()) << "\""
+          << ",\"albumIdentitySource\":\"" << jesc(identitySource) << "\""
+          << ",\"folderName\":\"" << jesc(folderName) << "\""
           << ",\"meta\":{\"enriched\":" << (meta_enriched(tm) ? "true" : "false")   // F2：真被在线补过才算
           << ",\"sources\":{";
         {
@@ -13460,52 +14321,87 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return rta::meta::work_versions_to_json(wr);
     }
 
+    if(rq.path=="/api/cover/lookup" || rq.path.rfind("/api/cover/lookup?",0)==0){
+        ct="application/json; charset=utf-8";
+        const std::string file=cover_query_value(rq.path,"file");
+        rta::net::LibAlbumIdentity identity{};std::error_code ec;
+        if(file.empty() || !valid_utf8(file) || !Library::instance().trackAlbumIdentity(file,identity) ||
+           !fs::is_regular_file(fs::u8path(file),ec) || ec || !rta::net::lib_is_audio(fs::u8path(file)))
+            return "{\"ok\":false,\"hasCover\":false,\"error\":\"只能查询曲库中实际存在的音频文件封面\"}";
+        const auto resolved=resolve_cover(file);
+        auto reply=[&](bool pending,bool busy=false,bool disabled=false){
+            const std::string url=resolved.bytes.empty()?std::string():"/api/cover?file="+cover_url_escape(file)+"&v="+resolved.hash;
+            return "{\"ok\":true,\"hasCover\":"+std::string(resolved.bytes.empty()?"false":"true")+",\"coverSource\":\""+resolved.source+"\",\"coverUrl\":\""+jesc(url)+"\",\"pending\":"+(pending?"true":"false")+",\"busy\":"+(busy?"true":"false")+",\"disabled\":"+(disabled?"true":"false")+",\"retryAfterMs\":500}";
+        };
+        if(!resolved.bytes.empty())return reply(false);
+        const MetaSettings settings=meta_settings_load();bool sourceEnabled=false;
+        for(const auto& provider:rta::meta::provider_registry()){
+            const auto enabled=settings.srcOn.find(provider.id);
+            if(provider.canSearch && rta::meta::pv_has_cap(provider.caps,rta::meta::ArtCap::Cover) && (enabled==settings.srcOn.end()||enabled->second))sourceEnabled=true;
+        }
+        if(!settings.on||!sourceEnabled)return reply(false,false,true);
+        // HTTP requests only enqueue/poll: two global workers bound all tabs.
+        // Exact-path dedupe and ten-minute misses prevent endless retry traffic.
+        static std::mutex lookupMx;
+        static std::set<std::string> lookupActive;
+        static std::map<std::string,std::chrono::steady_clock::time_point> lookupMiss;
+        const std::string pathKey=rta::net::lib_path_key(file);
+        std::lock_guard<std::mutex> guard(lookupMx);
+        if(lookupActive.count(pathKey))return reply(true);
+        const auto missed=lookupMiss.find(pathKey);
+        if(missed!=lookupMiss.end()&&std::chrono::steady_clock::now()-missed->second<std::chrono::minutes(10))return reply(false);
+        if(lookupActive.size()>=2)return reply(true,true);
+        lookupActive.insert(pathKey);
+        std::thread([file,pathKey]{
+            bool missing=true;
+            try{
+                if(!g_shutdown.load()&&meta_settings_load().on){
+                    auto opts=meta_opts_from_settings();opts.llm=false;
+                    rta::meta::enrich_track_artwork(file,opts);
+                }
+                missing=resolve_cover(file).bytes.empty();
+            }catch(...){play_log("TRACKCOVER lookup failed file="+file);}
+            std::lock_guard<std::mutex> done(lookupMx);lookupActive.erase(pathKey);
+            if(missing){if(lookupMiss.size()>=8192)lookupMiss.erase(lookupMiss.begin());lookupMiss[pathKey]=std::chrono::steady_clock::now();}
+            else lookupMiss.erase(pathKey);
+        }).detach();
+        return reply(true);
+    }
+    if(rq.path.rfind("/api/cover/set",0)==0 || rq.path.rfind("/api/cover/reset",0)==0){
+        ct="application/json; charset=utf-8";
+        const std::string file=cover_query_value(rq.path,"file");
+        rta::net::LibAlbumIdentity identity{};std::error_code ec;
+        if(file.empty() || !valid_utf8(file) || !Library::instance().trackAlbumIdentity(file,identity) ||
+           !fs::is_regular_file(fs::u8path(file),ec) || ec || !rta::net::lib_is_audio(fs::u8path(file)))
+            return "{\"ok\":false,\"error\":\"只能为曲库中实际存在的音频文件设置封面\"}";
+        const std::string key="track:"+rta::meta::MetaStore::hashOf(rta::net::lib_path_key(file));
+        bool ok=false;
+        if(rq.path.rfind("/api/cover/reset",0)==0){
+            std::lock_guard<std::mutex> lock(cover_cache_mutex());const auto paths=cover_paths(key);
+            fs::create_directories(fs::u8path(paths.dir),ec);
+            const std::string manifest="{\"version\":1,\"key\":\""+key+"\",\"source\":\"reset\"}";
+            ok=!ec && cover_write_atomic_file(paths.jpg+".source.json",manifest.data(),manifest.size());
+        }else{
+            const std::vector<unsigned char> b(rq.body.begin(),rq.body.end());
+            if(b.size()<1024 || !cover_image_present(b))return "{\"ok\":false,\"error\":\"封面须为1KB至24MB的可识别图片\"}";
+            ok=cover_write_cached(key,b,"manual");
+        }
+        if(!ok)return "{\"ok\":false,\"error\":\"封面及来源提交失败；原记录保留\"}";
+        const auto resolved=resolve_cover(file);
+        const std::string url=resolved.bytes.empty()?std::string():"/api/cover?file="+cover_url_escape(file)+"&v="+resolved.hash;
+        return "{\"ok\":true,\"hasCover\":"+std::string(resolved.bytes.empty()?"false":"true")+",\"coverSource\":\""+resolved.source+"\",\"coverUrl\":\""+jesc(url)+"\"}";
+    }
     if (rq.path.rfind("/api/cover", 0) == 0) {
         std::string file;
-        const size_t q = rq.path.find("?file=");
-        if (q != std::string::npos) file = urlDecode(rq.path.substr(q + 6));
+        file=cover_query_value(rq.path,"file");
         if (!file.empty() && !valid_utf8(file)) {   // F1：get_cover/MetaStore 内部消费路径
             ct = "application/json; charset=utf-8";
             return utf8_path_reject(file);
         }
-        std::string mime = "image/png";
-        std::vector<unsigned char> bytes;
-        // 2026-10-27（用户 2.0 发包前 BUG「专辑名对、封面严重错误」的**第三条**路径）：
-        //   老实现直接 get_cover(file)，而它第 1 步是"同目录 cover.jpg 优先" ⟹ 一目录多专辑时
-        //   底栏/单曲页会把别人那张图发给这一首（与 /api/lib/cover 同源，只是入口不同）。
-        //   现在：**库内文件**先问 Library（按它所属专辑的 coverSrc 取图，与专辑页完全同一份判据）；
-        //         **库外文件**（拖进来的临时文件/还没扫进库）保持旧行为，由 get_cover 决定。
-        if (!file.empty()) {
-            if (!rta::net::Library::instance().trackCover(file, bytes, mime))
-                bytes = rta::audio::get_cover(file, mime);
-            // 2026-10-28（用户「所有曲目都没封面」的第二个真因）：
-            //   trackCover 返回空 = 本专辑没有**属于自己**的图（一目录多专辑且该曲无内嵌）。
-            //   此时专辑页（/api/lib/cover?k=）会去查 covercache 的网图，而这里**原来不查**
-            //   ⟹ 在线补图之后，专辑页有图、单曲页与底栏仍空白，同一张专辑两个入口两套结果。
-            //   现在按「该文件所属专辑的键」查一次网图正缓存，与专辑页走同一份数据。
-            if (bytes.size() <= 128) {
-                std::string akey;
-                if (rta::net::Library::instance().trackAlbumKey(file, akey) && !akey.empty()) {
-                    std::vector<unsigned char> nb;
-                    if (cover_read_cached(akey, nb) && nb.size() > 128) {
-                        bytes.swap(nb);
-                        mime = cover_mime_of(bytes);
-                    }
-                }
-            }
-        }
-        // 内嵌/本地图片读取失败(≤128B = get_cover 的占位 PNG，或本专辑没有属于自己的图)
-        // → MetaStore 缓存封面兜底
-        if (file.empty() || bytes.size() <= 128) {
-            std::vector<unsigned char> mb;
-            std::string mm;
-            if (!file.empty() && rta::meta::MetaStore::instance().cover(file, mb, mm) && !mb.empty()) {
-                bytes = std::move(mb);
-                mime = mm;
-            }
-        }
-        ct = mime;
-        return std::string(bytes.begin(), bytes.end());
+        const CoverResolution resolved=resolve_cover(file);
+        ct=resolved.mime;
+        if(resolved.bytes.empty())rta::net::webui_set_status(404);
+        return std::string(resolved.bytes.begin(),resolved.bytes.end());
     }
 
     // ---------------- 播放模式（四态；用户 261026-08 #2）----------------
@@ -13514,6 +14410,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // 一个端点写一个字段（g_q.repeat），图标与行为不可能再分叉 —— 这就是本项需求的核心。
     // 不带 mode 时只回报当前状态（只读语义，给自检/脚本用）。
     if (rq.path.rfind("/api/playmode", 0) == 0) {
+        std::lock_guard<std::mutex> session(ps.sessionMx);
         ct = "application/json; charset=utf-8";
         int mode = -1;
         auto gv = [&](const char* key) -> int {
@@ -13557,6 +14454,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     //   on=1 → 模式 3（随机）；on=0 → 从随机退回模式 1（列表循环）。
     //   不再允许"随机 + 单曲"这种第五、第六种组合（那正是两处真相打架的来源）。
     if (rq.path.rfind("/api/shuffle", 0) == 0) {
+        std::lock_guard<std::mutex> session(ps.sessionMx);
         ct = "application/json; charset=utf-8";
         int on = 1;
         const size_t q = rq.path.find("?on=");
@@ -13581,6 +14479,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     if (rq.path.rfind("/api/queue/set", 0) == 0) {
         ct = "application/json; charset=utf-8";
         std::string files;
+        bool stoppedOnly = false;
         {
             std::istringstream is(rq.body);
             std::string tok;
@@ -13588,6 +14487,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 const size_t e = tok.find('=');
                 if (e == std::string::npos) continue;
                 if (urlDecode(tok.substr(0, e)) == "files") files = urlDecode(tok.substr(e + 1));
+                if (tok == "require_stopped=1") stoppedOnly = true;
             }
         }
         std::vector<QItem> items;
@@ -13603,6 +14503,13 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         if (items.empty()) return "{\"ok\":false,\"error\":\"曲目列表为空\"}";
         for (const auto& it : items)
             if (!valid_utf8(it.path)) return utf8_path_reject(it.path);   // F1
+        std::unique_lock<std::mutex> session(ps.sessionMx);
+        if (stoppedOnly) {
+            if (ps.playing.load() || ps.paused.load() || g_upnpPlayer.load()) {
+                rta::net::webui_set_status(409);
+                return "{\"ok\":false,\"error\":\"请先停止播放，再替换队列。\"}";
+            }
+        }
         size_t cnt = 0;
         {
             std::lock_guard<std::mutex> lk(g_q.mtx);
@@ -13720,6 +14627,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             std::lock_guard<std::mutex> lk(g_q.mtx);
             g_q.items.clear();
             g_q.index = 0;
+            g_q.base.clear();       // 2026-11-12：随机快照也要清 —— 否则清空后再关随机会把旧曲目整体复活
             g_q.sortBase.clear();   // 队列空了，排序撤销点也作废
         }
         queue_save();
@@ -13729,6 +14637,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // /api/repeat：老入口，参数名沿用 rate=（= 模式号），语义与 /api/playmode 完全一致。
     // 现在允许 rate=0..3（3 = 随机），并把 shuffle 一起收敛（唯一真相源 = g_q.repeat）。
     if (rq.path.rfind("/api/repeat", 0) == 0) {
+        std::lock_guard<std::mutex> session(ps.sessionMx);
         ct = "application/json; charset=utf-8";
         PlayParams p = parseForm(rq.body);
         int mode = atoi(p.rate.c_str());
@@ -13757,9 +14666,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         //   旧代码只做了 stop+join，随后无锁地给 th 赋值：另一个并发 play/skip 会在这中间
         //   插入并再次赋值 ⟹ std::terminate。
         std::unique_lock<std::mutex> lkSession(ps.sessionMx);
+        if (!g_paramsInitialized)
+            return "{\"ok\":false,\"needsInitialPlay\":true,\"error\":\"请先选择曲目播放，以建立输出设备和音量参数\"}";
         ps.session_stop_join_locked();
 
         PlayParams p = g_params;
+        p.volume = ps.volDb.load();
         size_t target = 0;
         bool ok = false;
         {
@@ -13789,6 +14701,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             {
                 std::lock_guard<std::mutex> lk(g_q.mtx);
                 targetFile = g_q.items[target].path;
+                p.cueStart=g_q.items[target].cs;p.cueEnd=g_q.items[target].ce;
             }
             std::string err;
             if (!upnp_start_track(p, targetFile, err)) {
@@ -13802,6 +14715,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             ps.outRate = 0;
             ps.outBits = 0;
             ps.playing.store(true);
+            ps.th=std::thread(upnp_queue_thread,p,target,true);
             return "{\"ok\":true,\"index\":" + std::to_string(target) + ",\"upnp\":true}";
         }
         ps.playing.store(true);
@@ -13813,6 +14727,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     if (rq.path.rfind("/api/cast", 0) == 0) {
         ct = "application/json; charset=utf-8";
         if (rq.path.rfind("/api/cast/devices", 0) == 0) {
+            if (rta_net_tests_disabled()) return "{\"ok\":true,\"n\":0,\"devices\":[],\"disabled\":true}";
             bool forceRescan = (rq.path.find("scan=1") != std::string::npos || rq.path.find("rescan=1") != std::string::npos);
             auto devs = rta::net::CastManager::instance().get_devices(forceRescan);
             std::ostringstream j;
@@ -13843,6 +14758,13 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
               << ",\"sourceFile\":\"" << jesc(st.sourceFile) << "\""
               << ",\"servePort\":" << st.servePort
               << ",\"phase\":\"" << jesc(st.phase) << "\""
+              << ",\"cleanupApplied\":" << (st.cleanupApplied?"true":"false")
+              << ",\"cleanupMeanReductionDb\":" << st.cleanupMeanReductionDb
+              << ",\"cleanupModifiedBinFraction\":" << st.cleanupModifiedBinFraction;
+            append_cleanup_auto_json(j,cleanup_auto_snapshot(st,st.cleanupApplied));
+            j << ",\"prepareProgress\":" << st.prepareProgress
+              << ",\"prepareNote\":\"" << jesc(st.prepareNote) << "\""
+              << ",\"naturalEnd\":" << (st.naturalEnd?"true":"false")
               << ",\"positionSec\":" << st.positionSec
               << ",\"transportState\":\"" << jesc(st.transportState) << "\""
               << ",\"servedBytes\":" << st.servedBytes
@@ -13866,6 +14788,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             return j.str();
         }
         if (rq.path.rfind("/api/cast/start", 0) == 0) {
+            if (rta_net_tests_disabled() && rq.body.find("127.0.0.1") == std::string::npos && rq.body.find("localhost") == std::string::npos)
+                return "{\"ok\":false,\"error\":\"测试模式已禁用非回环网络投放（RTA_NET_TESTS=0）\"}";
             if (rq.method != "POST") return "{\"ok\":false,\"error\":\"Method Not Allowed\"}";
             rta::net::CastStartParams p;
             if (!rq.body.empty() && rq.body.front() == '{') {
@@ -13873,7 +14797,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 if (j.has("dev")) p.dev = j["dev"].s();
                 if (j.has("file")) p.file = j["file"].s();
                 if (j.has("port")) p.port = (uint16_t)j["port"].n();
-                if (j.has("rate")) p.rate = (uint32_t)j["rate"].n();
+                if (j.has("rate")) {if(j["rate"].type==rta::net::Json::Str)p.requestedRate=j["rate"].s();else p.rate=(uint32_t)j["rate"].n();}
+                if(j.has("upsample"))p.upsample=j["upsample"].type==rta::net::Json::Bool?j["upsample"].b:j["upsample"].n()!=0;
+                if(j.has("forceRate"))p.forceRate=j["forceRate"].type==rta::net::Json::Bool?j["forceRate"].b:j["forceRate"].n()!=0;
+                if(j.has("rateCeiling"))p.rateCeiling=(uint32_t)std::clamp(j["rateCeiling"].n(),44100.,768000.);
+                if(j.has("filter"))p.filter=j["filter"].s();
+                if(j.has("cue_start"))p.cueStart=j["cue_start"].n();if(j.has("cue_end"))p.cueEnd=j["cue_end"].n();
                 if (j.has("bits")) p.bits = (int)j["bits"].n();
                 if (j.has("seconds")) p.seconds = j["seconds"].n();
                 if (j.has("dop")) p.dop = (j["dop"].type == rta::net::Json::Bool) ? j["dop"].b : (j["dop"].n() != 0.0);
@@ -13888,7 +14817,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                     if (k == "dev") p.dev = v;
                     else if (k == "file") p.file = v;
                     else if (k == "port") p.port = (uint16_t)std::atoi(v.c_str());
-                    else if (k == "rate") p.rate = (uint32_t)std::strtoul(v.c_str(), nullptr, 10);
+                    else if (k == "rate") {uint32_t num=0;if(rta::audio::cast_plan_detail::parse_rate(v,num))p.rate=num;else p.requestedRate=v;}
+                    else if(k=="upsample")p.upsample=(v=="1"||v=="true");
+                    else if(k=="forceRate")p.forceRate=(v=="1"||v=="true");
+                    else if(k=="rateCeiling")p.rateCeiling=(uint32_t)std::clamp(atoi(v.c_str()),44100,768000);
+                    else if(k=="filter")p.filter=v;
+                    else if(k=="cue_start")p.cueStart=atof(v.c_str());else if(k=="cue_end")p.cueEnd=atof(v.c_str());
                     else if (k == "bits") p.bits = std::atoi(v.c_str());
                     else if (k == "seconds") p.seconds = std::atof(v.c_str());
                     else if (k == "dop") p.dop = (v == "1" || v == "true");
@@ -13925,6 +14859,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
 
     if (rq.path.rfind("/api/upnp", 0) == 0) {
         ct = "application/json; charset=utf-8";
+        if (rta_net_tests_disabled()) return "{\"ok\":true,\"n\":0,\"devices\":[],\"disabled\":true}";
         // 2026-10-23（用户 261023-04 #11）：多网卡逐卡发 M-SEARCH + 诊断信息，
         // 并且在 JSON 里把"为什么没搜到"如实说出来（组播被代理/防火墙/AP 隔离拦截是最常见原因）。
         rta::net::UpnpDiscoverDiag diag;
@@ -14020,7 +14955,22 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // POST /api/peq/preset     → action=save|load|delete|reset & name=...
     if (rq.path.rfind("/api/peq", 0) == 0) {
         ct = "application/json; charset=utf-8";
+        std::lock_guard<std::mutex> session(ps.sessionMx);
         if (!g_peq) peq_load_current();
+        auto setLivePeq = [&](const rta::dsp::PeqSettings& settings) {
+            std::lock_guard<std::mutex> lock(ps.mtx);
+            if (ps.playing.load() && ps.rawVolumeLocked && raw_peq_requested(settings)) return false;
+            g_peq->set_settings(settings);
+            return true;
+        };
+        auto rawPeqError = [&]() {
+            rta::net::webui_set_status(409);
+            return std::string("{\"ok\":false,\"error\":\"原始 DSD 码流不经过 PEQ；请在数字音乐台切换到处理模式后再启用均衡。\"}");
+        };
+        auto peqChanged=[&](){
+            if(!workbench::sync_peq_locked())return workbench::error(500,"均衡已应用，但当前配置组保存失败");
+            return peq_state_json(true);
+        };
 
         if (rq.path.rfind("/api/peq/preset", 0) == 0) {
             std::map<std::string, std::string> f;
@@ -14035,9 +14985,10 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             const std::string name   = f.count("name") ? f["name"] : "";
             if (action == "reset") {
                 rta::dsp::PeqSettings s = rta::dsp::peq_flat_settings();
-                g_peq->set_settings(s);
+                s.bypass = true;   // 2026-11-12：复原 = 平直且关闭均衡
+                if (!setLivePeq(s)) return rawPeqError();
                 peq_save_current(s);
-                return peq_state_json(true);
+                return peqChanged();
             }
             if (action == "save") {
                 if (name.empty()) return "{\"ok\":false,\"error\":\"缺少预设名\"}";
@@ -14048,9 +14999,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 peq_load_presets_file(user);
                 user[name] = s;
                 if (!peq_save_presets_file(user)) return "{\"ok\":false,\"error\":\"写预设文件失败\"}";
-                g_peq->set_settings(s);
+                if (!setLivePeq(s)) return rawPeqError();
                 peq_save_current(s);
-                return peq_state_json(true);
+                return peqChanged();
             }
             if (action == "load") {
                 rta::dsp::PeqSettings s;
@@ -14064,9 +15015,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                     if (it != user.end()) { s = it->second; s.presetName = name; ok = true; }
                 }
                 if (!ok) return "{\"ok\":false,\"error\":\"没有这个预设\"}";
-                g_peq->set_settings(s);
+                if (!setLivePeq(s)) return rawPeqError();
                 peq_save_current(s);
-                return peq_state_json(true);
+                return peqChanged();
             }
             if (action == "delete") {
                 std::map<std::string, rta::dsp::PeqSettings> user;
@@ -14097,9 +15048,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                     return "{\"ok\":false,\"error\":\"bands 参数格式不对（应为 序号,类型,频率,增益,Q;...）\"}";
                 s.bands = bands;
             }
-            g_peq->set_settings(s);
+            if (!setLivePeq(s)) return rawPeqError();
             if (!peq_save_current(s)) return "{\"ok\":false,\"error\":\"写 rlplayer-peq.txt 失败\"}";
-            return peq_state_json(true);
+            return peqChanged();
         }
         return peq_state_json(true);
     }
@@ -14159,6 +15110,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         rta::dsp::OpraService::instance().init(path_in_exe_dir("data\\opra_index.json"), path_in_exe_dir(""));
         std::string productId;
         bool forceRefresh = false;
+        bool fullBands = false;
         const size_t qpos = rq.path.find('?');
         if (qpos != std::string::npos) {
             std::istringstream qs(rq.path.substr(qpos + 1));
@@ -14170,6 +15122,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 const std::string v = urlDecode(tok.substr(eq + 1));
                 if (k == "productId" || k == "id") productId = v;
                 else if (k == "refresh") forceRefresh = (v == "1" || v == "true");
+                else if (k == "full") fullBands = (v == "1" || v == "true");
             }
         }
         if (productId.empty()) {
@@ -14196,8 +15149,19 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
               << ",\"details\":\"" << jesc(p.details) << "\""
               << ",\"link\":\"" << jesc(p.link) << "\""
               << ",\"gainDb\":" << p.gainDb
-              << ",\"bandsCount\":" << p.bands.size()
-              << "}";
+              << ",\"bandsCount\":" << p.bands.size();
+            if (fullBands) {
+                // 2026-11-12：试听需要完整频段，但不能先写进 16 个存储位。
+                j << ",\"bands\":[";
+                for (size_t bi = 0; bi < p.bands.size(); ++bi) {
+                    const auto& b = p.bands[bi];
+                    if (bi) j << ",";
+                    j << "{\"type\":\"" << jesc(b.type) << "\",\"frequency\":" << b.frequency
+                      << ",\"gain\":" << b.gainDb << ",\"q\":" << b.q << "}";
+                }
+                j << "]";
+            }
+            j << "}";
         }
         j << "]}";
         return j.str();
@@ -14237,9 +15201,15 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // ---------------- 播放设置持久化 ----------------
     // 没有这个，用户每次重启都要重新选滤波器/抖动/缓冲 —— 日常用起来很烦。
     if (rq.path.rfind("/api/settings", 0) == 0) {
+        std::lock_guard<std::mutex> session(ps.sessionMx);
         ct = "application/json; charset=utf-8";
         const std::string sp = path_in_exe_dir("rlplayer-settings.conf");
+        // Protect the entire read/merge/replace transaction, including GET.
+        // Locking only the writer still loses simultaneous partial POSTs.
+        std::unique_lock<std::recursive_mutex> settingsLock(
+            rta::meta::meta_file_mutex(fs::u8path(sp)));
         if (rq.method == "POST") {
+            filter_prewarm_cancel(); // Never finish warming an obsolete settings snapshot.
             // 2026-10-23（真实事故后加固）：旧实现 std::ios::trunc + 只写本次提交的键 ——
             // 任何「只提交部分键」的客户端都会把其余设置整份清空。
             // 事故复现：测试脚本只 POST eq=… 一个键 → backend/volume 等被抹掉 → 重启后回落
@@ -14274,7 +15244,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                                            "device", "bits", "taps", "atten", "transition", "phase",
                                            "modfamily", "oobgain", "ahmbits", "modcut", "moddith", "ir", "irgpu", "ramp", "theme", "eq",
                                            "gpuvendor", "dsdnative", "directsdm", "dsdkind", "dsdconv", "dsd2stage",
-                                           "backend", "upnpdev", "channels", "trim",
+                                           "cleanup", "cleanup_auto", "cleanup_strength", "cleanup_noise_db", "quickstart", "backend", "upnpdev", "upnpUpsample", "upnpForceRate", "upnpRateCeiling", "channels", "trim",
                                            "inbackend", "indev", "inoffset", "inbuf", "inmon",
                                            "inseconds", "inout",
                                            "sdmfilt", "sdmfiltnx", "streamdecode",
@@ -14316,6 +15286,13 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 }
                 std::string clean;
                 for (char ch : v) if (ch != 10 && ch != 13) clean += ch;
+                if(k=="quickstart" || k=="cleanup_auto"){
+                    if(clean!="0" && clean!="1" && clean!="true" && clean!="false"){
+                        rta::net::webui_set_status(400);
+                        return "{\"ok\":false,\"error\":\"quickstart and cleanup_auto must be 0 or 1\"}";
+                    }
+                    clean=(clean=="1"||clean=="true")?"1":"0";
+                }
                 if (k == "scanThreads" || k == "scanthreads") {
                     const int st = atoi(clean.c_str());
                     if (st > 0) Library::instance().setScanThreads((size_t)st);
@@ -14327,14 +15304,24 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 merged[k] = clean;
             }
             // 整体写回（合并后的全量键；顺序保持首次出现次序，便于人工排查）
-            std::ofstream f(sp, std::ios::trunc);
-            if (!f) return "{\"ok\":false,\"error\":\"写入失败\"}";
+            std::ostringstream settingsBytes;
             for (const auto& kk : order) {
                 const auto itv = merged.find(kk);
                 if (itv == merged.end()) continue;
-                f << kk << "=" << itv->second << (char)10;
+                settingsBytes << kk << "=" << itv->second << (char)10;
             }
-            if (!f.good()) return "{\"ok\":false,\"error\":\"写入未完成\"}";
+            if (!rta::meta::meta_write_atomic(fs::u8path(sp), settingsBytes.str()))
+                return "{\"ok\":false,\"error\":\"写入失败\"}";
+            // sessionMx still owns the committed settings and profile update.
+            // Readers may take file mutex under ps.mtx, so release file mutex
+            // before the workbench callback can acquire the live-state lock.
+            settingsLock.unlock();
+            if(!workbench::sync_saved_locked())return workbench::error(500,"设置已保存，但当前配置组保存失败");
+            // 2026-11-02：界面语言变了 ⟹ AI 资料/简介的输出语言也要跟着变（提示词里那条指令）。
+            rta::meta::pp_set_output_lang(
+                rta::net::i18n_resolve(merged.count("uilang") ? merged["uilang"] : std::string("auto")));
+            rta::analysis::analysis_set_lang(
+                rta::net::i18n_resolve(merged.count("uilang") ? merged["uilang"] : std::string("auto")));
             return "{\"ok\":true,\"merged\":true}";
         }
         std::ifstream f(sp);
@@ -14372,6 +15359,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         // 2026-10-30（用户 261029-03）：界面语言缺省「跟随系统」（老配置没有这个键）
         injectKv("uilang", "auto");
         injectKv("rateFamilyPolicy", "prefer");
+        injectKv("cleanup", "0");injectKv("cleanup_strength", "0.5");injectKv("cleanup_noise_db", "-101.1");
+        injectKv("cleanup_auto", "1");injectKv("quickstart", "1");
+        injectKv("upnpUpsample", "0");injectKv("upnpForceRate", "0");injectKv("upnpRateCeiling", "192000");
         injectKv("autoanl", "1");
         // 2026-10-28：模块总开关缺省「开」（老配置里没有这个键，不能让升级用户突然丢功能）
         injectKv("anlmaster", "1");
@@ -14605,6 +15595,16 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
         if (safe.empty()) safe = "upload.bin";
         if (!valid_utf8(safe)) return utf8_path_reject(name);   // F1：下方 fs::u8path(full) 消费
+        // 2026-11-13 反馈 FB-20261113-A916DFDBD3：上传侧也要挡非音频。
+        // 拖文件夹时浏览器会把 desktop.ini / 封面图一起 POST 上来，旧实现照单全收、
+        // 落盘、入队，最后在播放阶段报 ffmpeg 错误 —— 用户只看到"拖进去就失败"。
+        // 在入口就拒掉，既省一次几十 MB 的落盘，也让前端能直接告诉用户跳过了什么。
+        if (!rta_is_playable_ext(rta_ext_of(safe))) {
+            std::ostringstream jb;
+            jb << "{\"ok\":false,\"skipped\":true,\"error\":\"不是可播放的音频文件："
+               << jesc(safe) << "\"}";
+            return jb.str();
+        }
         std::error_code ec;
         const std::string dir = path_in_exe_dir("uploads");
         fs::create_directories(fs::u8path(dir), ec);
@@ -15182,6 +16182,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         {
             std::ostringstream st2;
             st2 << "# RLPlayer 设置摘要（仅白名单键，不含 api key / 路径以外的敏感项）\n";
+            std::lock_guard<std::recursive_mutex> settingsReadLock(
+                rta::meta::meta_file_mutex(fs::u8path(path_in_exe_dir("rlplayer-settings.conf"))));
             std::ifstream f(fs::u8path(path_in_exe_dir("rlplayer-settings.conf")));
             std::string line;
             static const char* kAllow[] = {"rate", "rateFamilyPolicy", "filter", "filterNx", "shaper", "dsd", "modorder",
@@ -15303,6 +16305,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         j << "],\"probeAge\":" << probeAgeMax;
         // 设置摘要：只取六个白名单键（不回显 ir/eq 等文件路径内容）
         {
+            std::lock_guard<std::recursive_mutex> settingsReadLock(
+                rta::meta::meta_file_mutex(fs::u8path(path_in_exe_dir("rlplayer-settings.conf"))));
             std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
             std::string line, backend = "wasapi", rate, bits, filter, shaper, metaon = "1";
             while (std::getline(f, line)) {
@@ -15359,12 +16363,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         return j.str();
     }
 
-    // ---------------- 一键反馈（261027-01 #1；实现见 src/net/feedback.h）----------------
-    // 语义：POST 一段用户手打文字（type/title/body/steps）+ 我们自动采集的现场快照
-    //       → 打包成一个 JSON 上传到仓库 feedback/（无凭据时降级落 exe 同目录 feedback-outbox\
-    //       并把绝对路径回给界面，界面要显示它）。
-    // 为什么必须只接受 POST：本端点会打网络 + 往仓库写文件，GET 能触发的端点等于把
-    // 「谁都能替用户提交反馈」写进 URL（已进 kNeedPost，非 POST 在上游就 405）。
+    // 反馈在后台上传到 rlplayer.rainlain.com；失败时保留本地 outbox。
     if (rq.path.rfind("/api/feedback", 0) == 0) {
         ct = "application/json; charset=utf-8";
         rta::feedback::LiveState lv;
@@ -15383,6 +16382,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         // settings：把 conf 原样给出去（feedback.h 会解析→逐字段脱敏→重新序列化，
         // token/api_key 一类键进不了 payload）。读不到就只有空对象，不影响提交。
         {
+            std::lock_guard<std::recursive_mutex> settingsReadLock(
+                rta::meta::meta_file_mutex(fs::u8path(path_in_exe_dir("rlplayer-settings.conf"))));
             std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
             std::ostringstream sj;
             sj << "{";
@@ -15407,11 +16408,36 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         //   外层会先命中；所以这里必须在 return web_handler 之前分流（就是这个位置），
         //   不能指望另开一个外层 if —— 那会被上面的前缀匹配吃掉（/api/asio 吞
         //   /api/asiodevices 就是同一个坑，见 13410 行的记录）。
+        if (rq.path.rfind("/api/feedback/status", 0) == 0) {
+            std::string job;
+            const size_t q = rq.path.find('?');
+            if (q != std::string::npos) {
+                const std::string qs = rq.path.substr(q + 1);
+                size_t p = 0;
+                while (p <= qs.size()) {
+                    const size_t e = qs.find('&', p);
+                    const std::string kv = qs.substr(p, e == std::string::npos ? e : e - p);
+                    const size_t eq = kv.find('=');
+                    if (eq != std::string::npos && kv.substr(0, eq) == "job") {
+                        job = urlDecode(kv.substr(eq + 1));
+                        break;
+                    }
+                    if (e == std::string::npos) break;
+                    p = e + 1;
+                }
+            }
+            return rta::feedback::web_submit_status(job);
+        }
         if (rq.path.rfind("/api/feedback/preview", 0) == 0) {
             ct = "application/json; charset=utf-8";
             return rta::feedback::preview_handler(rq.body, lv);
         }
-        return rta::feedback::web_handler(rq.body, lv);
+        const std::string started = rta::feedback::web_submit_start(rq.body, lv);
+        rta::net::Json accepted;
+        const bool ok = rta::net::json_parse_strict(started, accepted) &&
+                        accepted["accepted"].type == rta::net::Json::Bool && accepted["accepted"].b;
+        rta::net::webui_set_status(ok ? 202 : 400);
+        return started;
     }
 
     // ---------------- 分析计数器（261027-04 #4）----------------
@@ -15783,8 +16809,9 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         if (orderPos != std::string::npos) {
             const size_t begin = orderPos + orderKey.size();
             const size_t end = s.find_first_not_of("0123456789", begin);
-            if (end != std::string::npos && end > begin)
+            if (end != std::string::npos && end > begin) {
                 s.replace(begin, end - begin, std::to_string(ps.outModOrder));
+            }
         }
         if (!s.empty() && s.back() == '}') {
             s.pop_back();
@@ -15799,6 +16826,13 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                     << ",\"gpuCompactResampleStageMask\":" << ps.gpuCompactResamplerStageMask.load()
                     << ",\"gpuAllResampleStagesUsed\":" << (ps.gpuAllResamplerStages.load() ? "true" : "false");
             }
+            dyn << ",\"cleanupObserved\":" << (ps.cleanupObserved.load()?"true":"false")
+                << ",\"cleanupApplied\":" << (ps.cleanupUsed.load()?"true":"false")
+                << ",\"cleanupMeanReductionDb\":" << ps.cleanupMeanDb.load()
+                << ",\"cleanupModifiedBinFraction\":" << ps.cleanupModifiedFraction.load();
+            CleanupAutoSnapshot cleanupAuto;
+            {std::lock_guard<std::mutex> lock(ps.cleanupAutoMutex);cleanupAuto=ps.cleanupAuto;}
+            append_cleanup_auto_json(dyn,cleanupAuto);
             dyn << ",\"modFallback\":\"" << jesc(ps.outFallbackWhy) << "\""
                 << ",\"dspBlockMs\":" << avgDspBlockMs
                 << ",\"dspTotalMs\":" << totalDspMs
@@ -15820,6 +16854,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
 
     if (rq.path.rfind("/api/rescan", 0) == 0) {
         Library::instance().startScan(true);
+        artwork_history_import_after_scan();
         return "{\"ok\":true}";
     }
 
@@ -15865,6 +16900,14 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         }
         rta::update::set_skip_version(ver);
         return std::string("{\"ok\":true,\"skipVersion\":\"") + jesc(rta::update::skip_version()) + "\"}";
+    }
+    if (rq.path.rfind("/api/update/manual", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        const auto j = rta::net::json_parse(rq.body);
+        const std::string target = j["target"].s();
+        if (target != "baidu" && target != "github") return "{\"ok\":false,\"error\":\"invalid manual target\"}";
+        rta::update::report_external_click_async(target);
+        return std::string("{\"ok\":true,\"accepted\":true,\"target\":\"") + target + "\"}";
     }
     if (rq.path.rfind("/api/update/apply", 0) == 0) {
         // 只做三件事：校验暂存 → 写台账 → 让程序退出重启。
@@ -15937,18 +16980,27 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     if (rq.path.rfind("/api/volume", 0) == 0) {
         ct = "application/json; charset=utf-8";
         const size_t q = rq.path.find("?db=");
+        if (q == std::string::npos) {
+            rta::net::webui_set_status(400);
+            return "{\"ok\":false,\"error\":\"缺少 db 参数：必须明确提供 -120..+20 dB 音量\"}";
+        }
         double db = 0.0;
         if (q != std::string::npos) {
             // ★ F34：非法数字必须明确失败、且**不改状态**（旧实现会把 NaN 存进去）
             const std::string raw = urlDecode(rq.path.substr(q + 4));
             if (!parse_num_strict(raw, db)) {
                 rta::net::webui_set_status(400);
-                return "{\"ok\":false,\"error\":\"db 参数非法：必须是有限数字（范围 -120..0 dB）\"}";
+                return "{\"ok\":false,\"error\":\"db 参数非法：必须是有限数字（范围 -120..+20 dB）\"}";
             }
-            if (db > 0.0) db = 0.0;
+            if (db > 20.0) db = 20.0;
             if (db < -120.0) db = -120.0;
         }
-        ps.volDb.store(db);
+        std::lock_guard<std::mutex> sessionLock(ps.sessionMx);
+        std::lock_guard<std::mutex> volumeLock(ps.mtx);
+        if (!write_live_volume_locked(db)) {
+            rta::net::webui_set_status(409);
+            return "{\"ok\":false,\"error\":\"原始 DSD 码流不支持软件音量；请使用设备音量，或切换到支持音量处理的 DoP。\",\"volumeWritable\":false,\"rawVolumeLocked\":true,\"db\":0}";
+        }
         char nb[32];
         std::snprintf(nb, sizeof(nb), "%.6f", db);      // 保证是合法 JSON 数字
         return std::string("{\"ok\":true,\"db\":") + nb + "}";
@@ -16028,7 +17080,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         bool castMode = false;
         if (g_upnpPlayer.load()) {
             castSt = rta::net::CastManager::instance().get_state();
-            if (castSt.running) {
+            if (castSt.running || ps.playing.load()) {
                 castMode = true;
             } else {
                 // 投放自然结束（渲染器播完 / 出错被停）：播放器回到停止态并清掉投放标志
@@ -16101,11 +17153,20 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
           << ",\"cdRawMode\":\"" << jesc(cdRawMode) << "\""
           << ",\"cdRawPos\":\"" << jesc(cdRawPos) << "\""
           << ",\"current\":\"" << jesc(curStat) << "\""
+          << ",\"cueStart\":" << ((castMode||cdMode)?-1:ps.activeCueStart)
+          << ",\"cueEnd\":" << ((castMode||cdMode)?-1:ps.activeCueEnd)
+          << ",\"queueIndex\":" << ((castMode||cdMode||ps.activeQueueIndex==std::string::npos)?-1LL:(long long)ps.activeQueueIndex)
           << ",\"error\":\"" << jesc(errStat) << "\""
           << ",\"info\":\"" << jesc(ps.info) << "\""
           << ",\"paused\":" << (pausedStat ? "true" : "false")
+          << ",\"rawVolumeLocked\":" << (playingStat && ps.rawVolumeLocked ? "true" : "false")
+          << ",\"volumeWritable\":" << (playingStat && ps.rawVolumeLocked ? "false" : "true")
           << ",\"pos\":" << pos
           << ",\"dur\":" << dur
+          // 2026-11-02：共享输出（含独占失败回退）—— 界面据此给一次性提示，
+          // 并让底栏「bit-perfect」结论与原因跟实际输出模式一致。
+          << ",\"outShared\":" << (g_outShared.load() ? "true" : "false")
+          << ",\"qa\":" << ([&]{ const char* v = std::getenv("RLPLAYER_QA"); return (v && v[0] && std::string(v) != "0"); }() ? "true" : "false")
           << ",\"outRate\":" << rateStat
           << ",\"outBits\":" << bitsStat
           // ReplayGain（261027-01 #2）：rg = 模式（off/track/album），rgDb = 本次实际乘的 dB，
@@ -16160,8 +17221,22 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             const rta::meta::LlmConfig cfg = rta::meta::llm_config_load(llm_conf_path());   // exe 同目录，不随 cwd 漂移
             hasKeyStat = !cfg.apiKey.empty();
         }
+        // 2026-11-01：**测试钩子**（只在设了环境变量时生效，产品行为不变）。
+        //   为什么要它：这台机器上合成鼠标进不到 WebView2 子窗口，而「多语言要逐页截图验收」
+        //   必须能直达设置页的某个页签 / 单曲页 / 文件夹页。用法：
+        //     set RLPLAYER_START_VIEW=settings:eq   或 tracks / folders / favs / queue / remote
+        static const std::string startViewEnv = [] {
+            const char* v = std::getenv("RLPLAYER_START_VIEW");
+            return std::string(v ? v : "");
+        }();
+        static const bool i18nDebugEnv = [] {
+            const char* v = std::getenv("RLPLAYER_I18N_DEBUG");   // 测试钩子：未翻译文本上报
+            return v && v[0] && std::string(v) != "0";
+        }();
         j << ",\"hasLlmKey\":" << (hasKeyStat ? "true" : "false")
           << ",\"summaryEnabled\":" << (msStat.summary ? "true" : "false")
+          << ",\"startView\":\"" << jesc(startViewEnv) << "\""
+          << ",\"i18nDebug\":" << (i18nDebugEnv ? "true" : "false")
           << "}";
         return j.str();
     }
@@ -16245,9 +17320,12 @@ static std::string page() {
             "Hann",
             "Other",
         };
+        // 2026-11-01：服务端拼出来的文案要跟界面语言一致（否则英文界面里会有中文碎片）
+        const bool ui_zh = (rta::net::i18n_resolve(conf_get("uilang", "auto")) == "zh");
         std::string out;
         // L1 层：自动（推荐）。文本是文本节点 ⟹ 可以进 i18n 字典（与 optgroup 标签不同）。
-        out += "<option value=\"auto\">自动（推荐）</option>";
+        out += ui_zh ? "<option value=\"auto\">自动（推荐）</option>"
+                     : "<option value=\"auto\">Auto (recommended)</option>";
         std::string curFamily;
         // 按家族顺序输出：外层遍历家族，内层遍历该家族的预设
         for (const char* fam : kFamilyOrder) {
@@ -16259,7 +17337,9 @@ static std::string page() {
             if (!opened) { out += std::string("<optgroup label=\"") + fam + "\">"; opened = true; }
             char num[80];
             const auto* rr = ringing_reference(fp.name, fsIn);
-            if (rr) std::snprintf(num, sizeof(num), "  %d dB · 前包络 %.2f ms",
+            // 2026-11-01：这里的文案是**服务端拼**的，进不了 i18n 字典 ⟹ 按当前界面语言直接出。
+            if (rr) std::snprintf(num, sizeof(num),
+                                  ui_zh ? "  %d dB · 前包络 %.2f ms" : "  %d dB · pre-ring %.2f ms",
                                   (int)(m.ceilingDb + 0.5), rr->pre60Ms);
             else std::snprintf(num, sizeof(num), "  %d dB", (int)(m.ceilingDb + 0.5));
             // 规格 §6.5 展示规则：振铃分档加警告符（不删、不隐藏、不排序，只标）
@@ -16289,8 +17369,17 @@ static std::string page() {
     const std::string fo1x = build_filter_opts(44100.0, 20000.0);   // 1x：CD 规格
     const std::string foNx = build_filter_opts(96000.0, 40000.0);   // Nx：高码率
     (void)fo;
+    // 3.3.9：量化整形的选项标签与其它下拉统一（旧版把 auto/none 直接写成英文，
+    // 与旁边“自动（推荐）”混排，看起来像没配置）。value 仍是后端认的字符串。
+    const bool shaperZh = (rta::net::i18n_resolve(conf_get("uilang", "auto")) == "zh");
+    auto shaper_label = [&](const char* s) -> std::string {
+        const std::string k(s);
+        if (k == "auto")  return shaperZh ? "自动（推荐）" : "Auto (recommended)";
+        if (k == "none")  return shaperZh ? "无（逐位）" : "None (bit-perfect)";
+        return k;
+    };
     for (const char* s : {"auto", "none", "NS1", "NS4", "NS5", "NS9", "LNS15", "RPDF", "TPDF", "Gauss1", "Shaped"}) {
-        so += std::string("<option value=\"") + s + "\">" + s + "</option>";
+        so += std::string("<option value=\"") + s + "\">" + shaper_label(s) + "</option>";
     }
     // 占位符要【全部】替换：FILTER_OPTS 同时被 1x 和 Nx 两个下拉使用，
     // 之前只 replace 第一处，Nx 那个下拉于是留着字面量、一个选项都没有，
@@ -16311,6 +17400,109 @@ static std::string page() {
     return h;
 }
 
+// ---- 滤波器预热（2026-11-01）--------------------------------------------------
+// 背景：mp/ip 的相位变换在 44.1→384k 要 4~9 秒（倒谱级联，线性相位只要 0.2~0.5 s），
+// 用户第一次播放该组合时表现为"点了播放没反应"。原型磁盘缓存（src/dsp/filter_cache.h）
+// 让第二次以后只要 0.1~0.2 s，但第一次仍要设计。
+//
+// 启动时只为恢复队列当前曲的已知源率预热一次；未知源率不预测两族。
+// 使用当前设置的数值输出率 + 具体预设名，以及播放路径的那几个函数
+// （apply_preset → solve_taps_per_phase → PolyphaseResampler），不碰设备、不出声；
+// 自定义参数不完整时跳过，缓存禁用/不可写/超预算时零设计；前台/改设置/退出取消。
+//
+// 只处理"不升频就没有设计负担"的情形：rate 不是数值（src / max / follow）直接跳过。
+static uint32_t filter_prewarm_source_rate() {
+    std::string file;
+    {
+        std::lock_guard<std::mutex> lock(g_q.mtx);
+        if (g_q.items.empty() || g_q.index >= g_q.items.size()) return 0;
+        file = g_q.items[g_q.index].path;
+    }
+    // Use already loaded metadata only; do not open a device, probe a remote
+    // URL, or decode an entire file merely to speculate about a future play.
+    auto& library = Library::instance();
+    for (size_t i = 0; i < library.trackCount(); ++i) {
+        rta::net::LibTrack track;
+        if (library.trackAt(i, track) && track.path == file)
+            return track.sampleRate > 0 ? (uint32_t)track.sampleRate : 0;
+    }
+    return 0;
+}
+static void filter_prewarm_bg() {
+    if (!rta::dsp::filter_cache::enabled()) {
+        play_log("FILTER_PREWARM skip reason=cache-disabled"); return;
+    }
+    if (g_shutdown.load() || g_exitReq.load() || g_ps.playing.load()) return;
+    const std::string rateStr = conf_get("rate", "src");
+    uint32_t outRate = 0;
+    try {
+        size_t used = 0;
+        const unsigned long long rate = std::stoull(rateStr, &used);
+        if (used != rateStr.size() || rate > UINT32_MAX || rateStr.find_first_not_of("0123456789") != std::string::npos) return;
+        outRate = (uint32_t)rate;
+    } catch (...) { return; }
+    if (outRate < 88200) return;
+    const uint32_t inRate = filter_prewarm_source_rate();
+    if (!inRate || outRate <= inRate) {
+        play_log("FILTER_PREWARM skip reason=no-known-upsampling-source"); return;
+    }
+    const std::string name = conf_get("filter", "");
+    if (name.empty() || name == "auto") return;
+    const auto* fp = rta::dsp::find_preset(name, false);
+    if (!fp) return;
+    const std::string twoStageSetting = conf_get("twostage", "auto");
+    const int twoStage = (twoStageSetting == "1" || twoStageSetting == "true") ? 1 :
+                         ((twoStageSetting == "0" || twoStageSetting == "false") ? 0 : -1);
+    // Custom design overrides need an exact playback config, not a guessed
+    // preset cache key. Skip until that path supplies a full prepared snapshot.
+    if (conf_get("taps", "0") != "0" || conf_get("phase", "").size() ||
+        conf_get("atten", "0") != "0" || conf_get("transition", "0") != "0") {
+        play_log("FILTER_PREWARM skip reason=custom-design"); return;
+    }
+    std::lock_guard<std::mutex> lock(g_filterPrewarmMutex);
+    if (g_filterPrewarmThread.joinable()) return;
+    g_filterPrewarmCancel.store(false);
+    g_filterPrewarmThread = std::thread([name, outRate, inRate, twoStage] {
+            const auto t0 = std::chrono::steady_clock::now();
+            try {
+                rta::dsp::DesignCancellationScope cancellation(&g_filterPrewarmCancel);
+                rta::dsp::check_design_cancel();
+                rta::dsp::ResamplerConfig rc;
+                rc.inRate = inRate; rc.outRate = outRate; rc.channels = 2;
+                rta::dsp::apply_preset(rc, *rta::dsp::find_preset(name, false));
+                rc.allowAutomaticCascade = (twoStage < 0);
+                if (twoStage >= 0) rc.twoStage = twoStage != 0;
+                // Exact tap/stage decisions come from the same pure planner as
+                // playback. Never estimate an un-split rational prototype here.
+                rc.autoTaps = true;
+                const auto plan = rta::dsp::plan_resampler(rc);
+                if (!plan.stageCount || !plan.cachePayloadBytes) {
+                    play_log("FILTER_PREWARM skip reason=no-cacheable-stages"); return;
+                }
+                if (plan.designPeakBytes > 256ull * 1024 * 1024) {
+                    play_log("FILTER_PREWARM skip reason=workspace-budget estimate=" + std::to_string(plan.designPeakBytes)); return;
+                }
+                const auto probe = rta::dsp::filter_cache::can_store(plan.cachePayloadBytes, {}, &g_filterPrewarmCancel);
+                if (probe != rta::dsp::filter_cache::ProbeStatus::Ready) {
+                    play_log("FILTER_PREWARM skip reason=cache-admission code=" + std::to_string((int)probe)); return;
+                }
+                rta::dsp::check_design_cancel();
+                rta::dsp::PolyphaseResampler r(rc);
+                const double ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0).count();
+                play_log("FILTER_PREWARM ok preset=" + name + " in=" + std::to_string(inRate) +
+                         " out=" + std::to_string(outRate) + " T=" + std::to_string(r.tapsPerPhase()) +
+                         " stages=" + std::to_string(plan.stageCount) + " cache_bytes=" + std::to_string(plan.cachePayloadBytes) +
+                         " ms=" + std::to_string((long long)ms));
+            } catch (const rta::dsp::DesignCancelled&) {
+                play_log("FILTER_PREWARM cancelled");
+            } catch (const std::exception& e) {
+                play_log("FILTER_PREWARM skip preset=" + name + " in=" + std::to_string(inRate) +
+                         " out=" + std::to_string(outRate) + " why=" + e.what());
+            }
+    });
+}
+
 int main(int argc, char** argv) {
     // 2026-10-29（261029-01 #9 连带）：把投放链路日志接进播放日志。
     // 此前投放一行日志都没有，投流失败时日志里查不到任何痕迹，运维上等于瞎。
@@ -16326,6 +17518,9 @@ int main(int argc, char** argv) {
         else if (k == "--lan") lan = true;
     }
     g_uiPort = port;
+    // 测试模式强制回环：即使某个测试误传 --lan，也绝不把控制面绑到 0.0.0.0，
+    // 避免每份临时 rtaweb.exe 都触发 Windows 防火墙弹窗。
+    if (lan && rta_net_tests_disabled()) { lan = false; play_log("TEST_MODE_FORCE_LOOPBACK"); }
     g_lanOn  = lan;
     // 2026-10-23：把端口写进环境，供 Library 选择实例私有的库配置/索引文件名
     //（非 8899 实例用 .p<port> 后缀，避免自检沙箱与用户实例互相覆盖库根）。
@@ -16338,25 +17533,12 @@ int main(int argc, char** argv) {
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     timeBeginPeriod(1);
 
+    // 2026-11-02：AI 资料输出语言 = 界面语言（提示词里追加对应语言指令，字典管不到 LLM）
+    rta::meta::pp_set_output_lang(rta::net::i18n_resolve(conf_get("uilang", "auto")));
+    // 2026-11-02：假无损/带宽判定的说明文字也按界面语言出（后端拼的句子，词典管不到）
+    rta::analysis::analysis_set_lang(rta::net::i18n_resolve(conf_get("uilang", "auto")));
     queue_load();                             // 恢复上次的播放列表
-    Library::instance().load();               // 载入音乐库索引
-    // 261027-05 A2：历史上落盘的平台默认头像先清掉（判据见 artwork.h 9.3b），
-    // 否则"曾经补错过"的艺人会一直被那张占位图占着，闸再也管不到它。
-    if (const int purged = artistimg_purge_defaults(); purged > 0)
-        printf("[artistimg] purged %d platform default avatar(s)\n", purged);
-    // 2026-10-24（用户 261024-01 #5）：流媒体服务器配置必须开机载入。
-    // 旧版从未调用过 SourceManager::load() —— 填过的服务器重启后就"消失"，只能重填。
-    SourceManager::instance().load(path_in_exe_dir("rlplayer-sources.conf"));
-    // 可选后备代理(P1.5):rlplayer-llm.conf 里 proxy=http://127.0.0.1:7897(可省)。
-    // 非空则本进程全部 http_get/http_post 走它(HTTPS 由 WinHTTP 走 CONNECT 隧道);
-    // 没有该行 = 直连,现状行为不变(本机 MusicBrainz 已可直连,代理只是后备)。
-    {
-        const std::string proxy = llm_conf_proxy_line();
-        if (!proxy.empty()) {
-            rta::net::set_http_proxy(proxy);
-            printf("HTTP 代理: %s(来自 rlplayer-llm.conf 的 proxy= 行)\n", proxy.c_str());
-        }
-    }
+    artwork_profile_migrate_startup();        // Positive/user data must exist before MetaStore/Library.load.
     // MetaBase 存放 exe 同目录 rlplayer-meta/(与播放日志/设置同位置约定);
     // 播放触发补全与 /api/enrich、/api/meta、/api/cover、/api/lyrics 都走这个单例
     //
@@ -16378,10 +17560,34 @@ int main(int argc, char** argv) {
         rta::meta::MetaStore::instance().setBaseDir(metaBase);
         rta::meta::EntityStore::instance().setBaseDir(metaBase);
     }
+    Library::instance().load();               // 载入音乐库索引
+    artwork_history_import_now();             // Exact tagged/user-assigned bindings; history stays separately typed.
+    filter_prewarm_bg();                      // 只预热已知队列源；前台/改设置/退出可取消
+    // 261027-05 A2：历史上落盘的平台默认头像先清掉（判据见 artwork.h 9.3b），
+    // 否则"曾经补错过"的艺人会一直被那张占位图占着，闸再也管不到它。
+    if (const int purged = artistimg_purge_defaults(); purged > 0)
+        printf("[artistimg] purged %d platform default avatar(s)\n", purged);
+    // 2026-10-24（用户 261024-01 #5）：流媒体服务器配置必须开机载入。
+    // 旧版从未调用过 SourceManager::load() —— 填过的服务器重启后就"消失"，只能重填。
+    SourceManager::instance().load(path_in_exe_dir("rlplayer-sources.conf"));
+    // 可选后备代理(P1.5):rlplayer-llm.conf 里 proxy=http://127.0.0.1:7897(可省)。
+    // 非空则本进程全部 http_get/http_post 走它(HTTPS 由 WinHTTP 走 CONNECT 隧道);
+    // 没有该行 = 直连,现状行为不变(本机 MusicBrainz 已可直连,代理只是后备)。
+    {
+        const std::string proxy = llm_conf_proxy_line();
+        if (!proxy.empty()) {
+            rta::net::set_http_proxy(proxy);
+            printf("HTTP 代理: %s(来自 rlplayer-llm.conf 的 proxy= 行)\n", proxy.c_str());
+        }
+    }
     rta::dsp::OpraService::instance().init(path_in_exe_dir("data\\opra_index.json"), path_in_exe_dir(""));
     // 20 段参数均衡 PEQ（261024-02 #6）：开机载入用户当前设置；文件不存在 = Flat（20 段 0dB）
     peq_load_current();
+    {std::lock_guard<std::mutex> session(g_ps.sessionMx);
+        if(!workbench::ensure_profiles_locked())play_log("WORKBENCH_PROFILES_ERROR "+workbench::g_profiles.loadError);}
     {
+        std::lock_guard<std::recursive_mutex> settingsReadLock(
+            rta::meta::meta_file_mutex(fs::u8path(path_in_exe_dir("rlplayer-settings.conf"))));
         std::ifstream f(path_in_exe_dir("rlplayer-settings.conf"));
         std::string line;
         while (std::getline(f, line)) {
@@ -16408,6 +17614,7 @@ int main(int argc, char** argv) {
         play_log(std::string("LIBSCAN auto-upgrade reason=") +
                  (Library::instance().trackCount() == 0 ? "empty" : "index_v<5"));
         Library::instance().startScan();
+        artwork_history_import_after_scan();
     }
     // 261027-02 #5：在线更新收尾 —— 确认「上一轮换文件成功」（台账 applied 且版本对上 ⟹ done，清 staging），
     // 并把「上一轮下完但还没装」的暂存恢复出来（用户重启后 UI 仍能显示「立即更新并重启」）。
@@ -16460,6 +17667,8 @@ int main(int argc, char** argv) {
         play_log(o.str());
     }
     g_shutdown = true;                     // 让后台活儿看到"要退了"，别再碰全局
+    filter_prewarm_cancel();
+    filter_prewarm_join();                 // 先收回设计线程，再释放任何日志/配置状态
     // 这两个 std::thread 成员如果还 joinable，就会在静态析构时触发 std::terminate
     // （MSVC 把它报成 0xC0000409 / __fastfail —— 与本崩溃码完全吻合）。
     // 它们可能正在解码/扫描（几十秒），所以**不 join**（会卡退出），改成 detach：

@@ -12,7 +12,9 @@
 #include <array>
 #include "gpu_pref.h"
 #include "filter_design.h"
+#include "coefficient_precision.h"
 #include "filter_families.h"
+#include "filter_cache.h"
 #include "linear_quality.h"
 #include "fixed_resampler_simd.h"
 #include "fixed_conv.h"   // D-11：定点卷积（精确累加）
@@ -25,6 +27,7 @@
 #include <algorithm>
 #include <memory>
 #include <limits>
+#include <climits>
 #include <stdexcept>
 #include <string>
 
@@ -55,10 +58,22 @@ struct ResamplerConfig {
     double apodF1      = 0.0;   // 滚降起始相对输入 Nyquist 比例（例如 18.4k / 22.05k）
     double apodF2      = 0.0;   // 滚降终止相对输入 Nyquist 比例（例如 21.8k / 22.05k）
 
-    // Cascaded integer interpolation: stage one sets the source band;
+    // Cascaded interpolation: stage one sets the source band;
     // stage two removes its images at a higher rate. Throughput is measured,
     // not inferred from tap counts alone.
     bool twoStage   = false;
+    // Production autoTaps may choose a rational cascade. Explicit user "off"
+    // disables this separately; raw/reference resamplers remain opt-in.
+    bool allowAutomaticCascade = false;
+    // Resolve source filter support against both rate clocks. Raw/reference
+    // configurations keep their explicit tap counts unless this is requested.
+    bool autoTaps = false;
+    // Selected by the automatic planner when downsampling needs a lower
+    // coefficient-rounding floor. Raw gain is rounded only once in this path.
+    bool highPrecisionDesign = false;
+    // -1 takes one global snapshot at the outer preparation boundary. Child
+    // stages, cache keys and design then use that same frozen phase mix.
+    double designPhaseMix = -1.0;
     int  stage2Taps = 64;      // 第二级每相位抽头数（过渡带很宽，不需要长）
 
     // ---- 每输入样本内核长度（tapsPerInput）----
@@ -81,7 +96,16 @@ struct ResamplerConfig {
     //   审核用 T=1600 + 2,097,152 点实测五率（88200/192000/352800/384000/705600）：
     //     通带边缘 −0.000000820 dB、抽样最差阻带 −283.9 ~ −284.7 dB、**T 恒定**。
     //   T=2877 + 4M 也可行（−289 dB），但运算与内存更高。
-    int maxPrototypeTaps = 1 << 21;
+    // 原型抽头预算（T × L 个 double）。超过即**显式失败**，绝不偷偷降质量。
+    // 2026-11-01：旧值 2^21（16 MB）把 21 个预设在 44.1→384k、4 个在 44.1→96k 直接挡死，
+    // 而且失败是抛异常 ⟹ CLI/播放线程未捕获 ⟹ std::terminate ⟹ 0xC0000409（真崩溃，已复现）。
+    // 实测（本机，--analyze，10 s 素材）：
+    //   poly-sinc-xl          @44.1→384k  T=2877 L=1280 → 3.68M 抽头，准备 0.44 s，峰值 167 MB
+    //   poly-sinc-gauss-xl    @44.1→96k   T=32767 L=320 → 10.49M 抽头，准备 0.87 s，峰值 301 MB
+    //   sinc-MGa              @44.1→384k  T=32767 L=1280 → 41.9M 抽头，准备 1.98 s，峰值 1,044 MB
+    // 取 2^24（16.8M 抽头 ≈ 134 MB 系数表）：覆盖前两类，
+    // 只把 sinc-MGa@384k 这类 40M 级（1 GB 峰值）继续挡在门外并给出可读错误。
+    int maxPrototypeTaps = 1 << 24;
     // ★ 2026-10-30（261030-01 D-11）：精确定点卷积路径。
     //   仅在「源为整数 PCM ≤24 bit 且无任何增益处理」时由调用方置 true ——
     //   那种情况下输入样本恰好是 k/2^23，转 int24 无损；整数累加零舍入，系数量化及最终 double 转换仍有误差。
@@ -121,72 +145,176 @@ inline void apply_resample_purpose(ResamplerConfig& cfg, ResamplePurpose purpose
     if (purpose == ResamplePurpose::Dsd) cfg.twoStage = true;
 }
 
+
+// Pure preparation plan: playback, prewarm admission and diagnostics share the
+// exact stage/tap decisions. It allocates no coefficient/FFT buffers and never
+// weakens a filter to satisfy a resource budget.
+struct ResamplerStagePlan {
+    ResamplerConfig config;
+    int L=1, M=1, T=0;
+    uint64_t coefficientCount=0;
+};
+struct ResamplerPlan {
+    std::array<ResamplerStagePlan,2> stages;
+    size_t stageCount=0;
+    int L=1,M=1;
+    uint64_t coefficientCount=0,cachePayloadBytes=0,designPeakBytes=0;
+};
+inline void validate_resampler_config(const ResamplerConfig& c) {
+    if(!c.inRate||!c.outRate) throw std::invalid_argument("Resampler sample rates must be positive: inRate="+
+        std::to_string(c.inRate)+" outRate="+std::to_string(c.outRate));
+    if(c.channels<1||c.channels>64) throw std::invalid_argument("Resampler supports 1 to 64 channels");
+    if(c.totalTaps<1||c.stage2Taps<1||c.minTapsPerInput<0||c.maxPrototypeTaps<0)
+        throw std::invalid_argument("Resampler tap counts and budgets are invalid");
+    if(!std::isfinite(c.transition)||c.transition<0.0||c.transition>=1.0)
+        throw std::invalid_argument("Resampler transition must be finite and in [0,1)");
+    if(!std::isfinite(c.attenDb)||c.attenDb<0.0||c.attenDb>1000.0)
+        throw std::invalid_argument("Resampler attenuation must be finite and in [0,1000] dB");
+    if(int(c.window)<0||int(c.window)>int(WindowKind::Hann)||int(c.phase)<0||int(c.phase)>int(PhaseKind::Intermediate))
+        throw std::invalid_argument("Unknown resampler window or phase");
+    if(!std::isfinite(c.designPhaseMix)||(c.designPhaseMix!=-1.0&&(c.designPhaseMix<0.0||c.designPhaseMix>1.0)))
+        throw std::invalid_argument("Invalid resampler phase mix");
+    if(!std::isfinite(c.apodF1)||!std::isfinite(c.apodF2)||
+       (c.apodizing&&!(c.apodF1>=0.0&&c.apodF1<c.apodF2&&c.apodF2<=1.0)))
+        throw std::invalid_argument("Invalid resampler apodization edges");
+    const auto g=std::gcd(c.inRate,c.outRate);
+    if(c.inRate/g>uint32_t(INT_MAX)||c.outRate/g>uint32_t(INT_MAX))
+        throw std::length_error("Reduced resampler ratio exceeds the supported integer range");
+}
+inline int resampler_tap_product(int t,int l) {
+    if(t<1||l<1||int64_t(t)*l>INT_MAX) throw std::length_error("Resampler coefficient count overflow");
+    return t*l;
+}
+inline ResamplerConfig resolve_auto_taps(const ResamplerConfig& requested) {
+    validate_resampler_config(requested);
+    ResamplerConfig c=requested;
+    if(c.designPhaseMix<0.0)c.designPhaseMix=phase_mix();
+    if(!c.autoTaps)return c;
+    c.autoTaps=false; // Resolving a returned configuration again is a no-op.
+    if(c.inRate==c.outRate)return c;
+    if(c.transition==0.0&&!c.apodizing&&c.minTapsPerInput==0)
+        throw std::invalid_argument("Automatic tap design requires a positive transition");
+    const uint32_t bandRate=std::min(c.inRate,c.outRate);
+    int sourceT=c.minTapsPerInput>0?c.minTapsPerInput:
+        solve_taps_per_phase(c.window,c.transition,c.apodizing,
+            c.apodF1,c.apodF2,c.totalTaps,0,double(bandRate));
+    if(c.outRate<c.inRate&&c.phase==PhaseKind::Linear&&!c.apodizing&&
+       (c.window==WindowKind::Kaiser||(c.window==WindowKind::BlackmanHarris&&c.attenDb>100.0))) {
+        // Every decimation branch can contribute coherently. Reserve the
+        // triangle-sum margin at design time; a single-FIR stop band alone
+        // does not certify the complete rate-conversion chain.
+        const double oldAttenuation=c.attenDb;
+        const auto m=c.inRate/std::gcd(c.inRate,c.outRate);
+        c.attenDb=std::ceil(oldAttenuation+20.0*std::log10(double(m))+6.0);
+        const int nominal=solve_taps_per_phase(c.window,c.transition,false,0,0,c.totalTaps,0,double(bandRate));
+        const double required=std::ceil(double(nominal)*(c.attenDb-8.0)/std::max(1.0,oldAttenuation-8.0));
+        if(!std::isfinite(required)||required>INT_MAX)
+            throw std::length_error("Automatic alias rejection requires too many taps");
+        sourceT=std::max(sourceT,int(required));
+        c.highPrecisionDesign=true;
+    }
+    // Prototype length follows max(L,M), not L alone. At downsampling the
+    // antialias transition is set by the slower output clock. Rounding upward
+    // preserves the budget; integer upsampling remains bit-for-bit unchanged.
+    const uint64_t count=(uint64_t(sourceT)*std::max(c.inRate,c.outRate)+c.outRate-1)/c.outRate;
+    if(count>uint64_t(INT_MAX))throw std::length_error("Automatic source support exceeds the tap integer range");
+    c.minTapsPerInput=int(count);
+    return c;
+}
+inline ResamplerStagePlan plan_resampler_stage(const ResamplerConfig& c) {
+    validate_resampler_config(c);
+    ResamplerStagePlan p;p.config=c;
+    const auto g=std::gcd(c.inRate,c.outRate);p.L=int(c.outRate/g);p.M=int(c.inRate/g);
+    int t=c.totalTaps/p.L;
+    if(c.minTapsPerInput>0) t=c.minTapsPerInput;
+    else if(c.transition>0.0) {
+        const double low=21.13/c.transition+0.5,high=2.0*21.13/c.transition+0.5;
+        if(!std::isfinite(high)||high>INT_MAX) throw std::length_error("Transition requires an unrepresentable tap count");
+        const int tMin=std::max(4,int(low)),tMax=std::max(tMin,int(high));
+        if(c.phase==PhaseKind::Linear&&t>tMax)t=tMax;
+        if(c.applyTapFloor&&t<tMin)t=tMin;
+    }
+    p.T=std::max(4,t);p.coefficientCount=uint64_t(resampler_tap_product(p.T,p.L));
+    if(c.maxPrototypeTaps>0&&p.coefficientCount>uint64_t(c.maxPrototypeTaps))
+        throw std::runtime_error("Requested FIR exceeds the coefficient budget; quality was not reduced. inRate="+
+            std::to_string(c.inRate)+" outRate="+std::to_string(c.outRate)+" L="+std::to_string(p.L)+
+            " M="+std::to_string(p.M)+" T="+std::to_string(p.T)+" taps="+std::to_string(p.coefficientCount)+
+            " budget="+std::to_string(c.maxPrototypeTaps)+". Use a cascade or explicitly change the filter configuration.");
+    return p;
+}
+inline ResamplerPlan plan_resampler(const ResamplerConfig& requested) {
+    const auto cfg=resolve_auto_taps(requested);
+    ResamplerPlan p;const auto g=std::gcd(cfg.inRate,cfg.outRate);
+    p.L=int(cfg.outRate/g);p.M=int(cfg.inRate/g);
+    if(p.L==1&&p.M==1)return p;
+    const bool rational=p.M!=1&&uint64_t(cfg.outRate)>=uint64_t(cfg.inRate)*2;
+    int f=1;
+    if((cfg.twoStage||(cfg.allowAutomaticCascade&&rational))&&((p.M==1&&p.L>=8)||rational))
+        for(int candidate:{4,3,2})if(p.L%candidate==0&&p.L/candidate>=(rational?1:2)){f=candidate;break;}
+    if(f>1) {
+        const uint64_t mid=uint64_t(cfg.inRate)*f;
+        if(mid>UINT32_MAX)throw std::length_error("Cascade intermediate sample rate overflow");
+        const int t1=cfg.minTapsPerInput>0?cfg.minTapsPerInput:std::max(4,cfg.totalTaps/p.L);
+        ResamplerConfig a=cfg,b=cfg;
+        a.twoStage=b.twoStage=false;a.allowAutomaticCascade=b.allowAutomaticCascade=false;
+        a.applyTapFloor=b.applyTapFloor=true;
+        a.outRate=uint32_t(mid);a.totalTaps=resampler_tap_product(t1,f);
+        b.inRate=uint32_t(mid);b.minTapsPerInput=cfg.stage2Taps;b.useFixed=false;b.transition=.30;
+        const int l2=p.L/f;
+        if(rational) {
+            b.window=WindowKind::Kaiser;b.apodizing=false;b.apodF1=b.apodF2=0.0;
+            b.attenDb=std::max(286.0,cfg.attenDb+6.0);
+            const double width=.5*b.transition/double(std::max(l2,p.M));
+            const int prototype=kaiser_taps_for(b.attenDb,width);
+            const double count=std::ceil(1.2*double(prototype)/double(l2));
+            if(count>INT_MAX)throw std::length_error("Cascade transition requires too many taps");
+            b.minTapsPerInput=std::max(cfg.stage2Taps,int(count));
+        }
+        b.totalTaps=resampler_tap_product(b.minTapsPerInput,l2);
+        p.stages[0]=plan_resampler_stage(a);p.stages[1]=plan_resampler_stage(b);p.stageCount=2;
+    }else {p.stages[0]=plan_resampler_stage(cfg);p.stageCount=1;}
+    auto pow2=[](uint64_t n){uint64_t v=1;while(v<n){if(v>UINT64_MAX/2)throw std::length_error("FFT size overflow");v*=2;}return v;};
+    uint64_t maxScratch=0,history=0;
+    for(size_t i=0;i<p.stageCount;++i){
+        const auto& stage=p.stages[i];const uint64_t n=stage.coefficientCount;
+        p.coefficientCount+=n;
+        if(n>=filter_cache::kMinTapsToCache)p.cachePayloadBytes+=n*sizeof(double);
+        history+=uint64_t(stage.T)*uint64_t(cfg.channels)*16;
+        if(stage.config.phase!=PhaseKind::Linear){
+            // Mirror the actual factor supports, not full-N times maximum
+            // padding. MP uses two half-support factors; IP allocates LP/MP
+            // order using the frozen mix. Sum workspaces conservatively even
+            // though cepstrum and DD convolution do not peak simultaneously.
+            const bool factored=n>=5&&(n>=2048||stage.config.attenDb>=250.0);
+            uint64_t mpSupport=factored?2*((n-1)/4)+1:n;
+            if(factored&&stage.config.phase==PhaseKind::Intermediate&&stage.config.designPhaseMix>0.0&&stage.config.designPhaseMix<1.0){
+                const int order=2*((int(n)-1)/2);
+                const int lpOrder=std::clamp(2*int(std::round(stage.config.designPhaseMix*order*.5)),2,order-2);
+                mpSupport=uint64_t(order-lpOrder+1);
+            }
+            const uint64_t padding=factored?(stage.config.window==WindowKind::Gaussian?64:32):8;
+            const uint64_t cepstrum=(stage.config.phase==PhaseKind::Intermediate&&stage.config.designPhaseMix>=1.0)?0:pow2(mpSupport*padding)*32;
+            maxScratch=std::max(maxScratch,cepstrum+pow2(n*2)*96);
+        }
+    }
+    p.designPeakBytes=p.coefficientCount*128+history+maxScratch+512*1024;
+    return p;
+}
+
 class PolyphaseResampler {
 public:
-    explicit PolyphaseResampler(const ResamplerConfig& cfg) : cfg_(cfg) {
-        // HF-03 构造防御：采样率为 0 时 gcd(0,x)=x 会算出 M_=0（或 L_=0）的退化参数，
-        // 随后 maxOutFrames 出 inf/巨值，转 size_t 触发裸的 "vector too long"（2.log 症状之一）。
-        // 在入口直接拒绝，错误带两率值。
-        if (cfg.inRate == 0 || cfg.outRate == 0)
-            throw std::runtime_error("重采样器构造失败: 采样率必须>0 (inRate=" + std::to_string(cfg.inRate) +
-                                     ", outRate=" + std::to_string(cfg.outRate) + ")");
-        uint32_t g = std::gcd(cfg.inRate, cfg.outRate);
-        L_ = (int)(cfg.outRate / g);          // 上采样因子（每输入样本产生 L 个相位）
-        M_ = (int)(cfg.inRate  / g);          // 下采样因子
-        ch_ = cfg.channels > 0 ? cfg.channels : 2;
-
-        // 0 值路径已被上面挡住；这里再防 (int) 截断/溢出导致的非正退化值
-        if (L_ <= 0 || M_ <= 0)
-            throw std::runtime_error("重采样器构造失败: L/M 计算退化 (inRate=" + std::to_string(cfg.inRate) +
-                                     ", outRate=" + std::to_string(cfg.outRate) +
-                                     ", L=" + std::to_string(L_) + ", M=" + std::to_string(M_) + ")");
-
-        if (L_ == 1 && M_ == 1) { passthrough_ = true; return; }
-
-        // ---- 两段式：只在"纯升频且倍数够大"时启用 ----
-        if (cfg.twoStage && M_ == 1 && L_ >= 8) {
-            int F = 1;
-            for (int f : { 4, 3, 2 }) if (L_ % f == 0 && L_ / f >= 2) { F = f; break; }
-            if (F > 1) {
-                // HF-03：两级倍数同样防 0/溢出（中间速率 = inRate*F 必须>0 且未回绕）
-                const uint32_t mid = cfg.inRate * (uint32_t)F;
-                if (mid == 0 || mid / (uint32_t)F != cfg.inRate)
-                    throw std::runtime_error("重采样器构造失败: 两段式倍率计算溢出/退化 (inRate=" +
-                                             std::to_string(cfg.inRate) + ", outRate=" +
-                                             std::to_string(cfg.outRate) + ", F=" + std::to_string(F) + ")");
-                // A source-domain tap count belongs to the first stage only.
-                // The wide-band second stage has a separate explicit budget.
-                const int T1 = (cfg.minTapsPerInput > 0) ? cfg.minTapsPerInput
-                                                        : std::max(4, cfg.totalTaps / L_);
-                ResamplerConfig c1 = cfg;
-                c1.twoStage   = false;
-                // c1 也要吃下限：否则单级（有下限）与两段式（无）会不一致。
-                c1.applyTapFloor = true;
-                c1.inRate     = cfg.inRate;
-                c1.outRate    = cfg.inRate * (uint32_t)F;
-                c1.totalTaps  = T1 * F;
-                ResamplerConfig c2 = cfg;
-                c2.twoStage   = false;
-                c2.applyTapFloor = true;
-                c2.inRate     = cfg.inRate * (uint32_t)F;
-                c2.outRate    = cfg.outRate;
-                c2.totalTaps  = cfg.stage2Taps * (L_ / F);
-                // Stage two receives the already filtered floating-point output.
-                // Reusing the input tap floor ignores stage2Taps, and reusing
-                // useFixed quantizes that intermediate signal back to int24.
-                c2.minTapsPerInput = cfg.stage2Taps;
-                c2.useFixed = false;
-                // 第二级的过渡带可以很宽：第一级输出在 22.05 kHz 以上已经是 -180 dB，
-                // 所以第二级只要在"图像出现处"之前进入阻带即可。
-                c2.transition = 0.30;
-                stage1_ = std::make_unique<PolyphaseResampler>(c1);
-                stage2_ = std::make_unique<PolyphaseResampler>(c2);
-                tmp_.clear();
-                tmpP_.assign((size_t)ch_, nullptr);
-                return;
-            }
+    explicit PolyphaseResampler(const ResamplerConfig& requested) : cfg_(resolve_auto_taps(requested)) {
+        check_design_cancel();
+        const ResamplerConfig& cfg=cfg_;
+        const auto plan=plan_resampler(cfg);
+        L_=plan.L;M_=plan.M;ch_=cfg.channels;
+        if(plan.stageCount==0){passthrough_=true;return;}
+        if(plan.stageCount==2){
+            stage1_=std::make_unique<PolyphaseResampler>(plan.stages[0].config);
+            stage2_=std::make_unique<PolyphaseResampler>(plan.stages[1].config);
+            tmpP_.assign(size_t(ch_),nullptr);
+            return;
         }
-
         // 内插域中：输入 Nyquist 位于 1/L，输出 Nyquist 位于 1/M，取较小者
         const double idealCutoff = std::min(1.0 / (double)L_, 1.0 / (double)M_);
         // 【261030-01 规格 §4.5 修正】截止点（−6 dB 点）必须放在**过渡带中点**，不是通带边缘。
@@ -201,32 +329,57 @@ public:
         //   不是回归。tests/test_filters 的容差基线随之更新。
         const double cutoff = idealCutoff * (1.0 - cfg.transition * 0.5);
 
-        // 原型长度取 L 的整数倍
-        int total = cfg.totalTaps;
-        T_ = total / L_;                       // 每相位抽头数
-        // Historical budget mode; production auto mode supplies an explicit T
-        // below. Do not infer an arithmetic precision ceiling from this heuristic.
-        if (cfg.transition > 0.0 && cfg.transition < 1.0) {
-            int tMin  = (int)(21.13 / cfg.transition + 0.5);      // 下限：过渡带至少要够
-            int tMax  = (int)(2.0 * 21.13 / cfg.transition + 0.5); // 上限：留 2 倍余量
-            if (tMin < 4) tMin = 4;
-            if (tMax < tMin) tMax = tMin;
-            if (cfg.phase == PhaseKind::Linear && T_ > tMax) T_ = tMax;
-            if (cfg.applyTapFloor && T_ < tMin) T_ = tMin;
-        }
-        if (cfg.minTapsPerInput > 0) {
-            // 内核长度模式：抽头预算与 L 解耦（默认关闭时这一支永不执行 ⟹ 逐位不变）
-            T_ = cfg.minTapsPerInput;
-        }
-        if (T_ < 4) { T_ = 4; }
-        if ((long long)T_ * L_ > std::numeric_limits<int>::max())
-            throw std::runtime_error("Requested FIR length exceeds the supported integer range");
-        if (cfg.maxPrototypeTaps > 0 && (long long)T_ * L_ > cfg.maxPrototypeTaps)
-            throw std::runtime_error("Requested FIR exceeds the coefficient budget; quality was not reduced. Use a cascade or explicitly raise maxPrototypeTaps.");
-        total = T_ * L_;
+        T_=plan.stages[0].T;
+        const int total=int(plan.stages[0].coefficientCount);
+        const bool rawPrecise=cfg.highPrecisionDesign&&cfg.phase==PhaseKind::Linear&&!cfg.apodizing&&
+            (cfg.window==WindowKind::Kaiser||(cfg.window==WindowKind::BlackmanHarris&&cfg.attenDb>100.0));
 
         std::vector<double> proto;
-        if (cfg.window == WindowKind::Kaiser && cfg.phase == PhaseKind::Linear && !cfg.apodizing) {
+        // ★ 2026-11-01：大原型走磁盘缓存（见 filter_cache.h）。
+        //   mp/ip 的相位变换代价随原型长度线性增长：44.1→384k 的 long-mp / long-ip 冷启动
+        //   实测 8.54 / 8.56 s（线性相位同尺寸只要 0.2~0.5 s）。缓存只是把**同一批系数**
+        //   存下来，命中与未命中必须逐位相同（tests/test_filter_cache.cpp 断言）。
+        bool protoCached = false;
+        std::string cacheKey;
+        filter_cache::LoadStatus cacheLoad = filter_cache::LoadStatus::Disabled;
+        filter_cache::StoreStatus cacheStore = filter_cache::StoreStatus::SkippedSize;
+        bool designLockUnavailable = false;
+        const double designPhaseMix = cfg.designPhaseMix; // same snapshot for both stages, key AND design
+        if (filter_cache::enabled() && (long long)total >= (long long)filter_cache::kMinTapsToCache) {
+            const std::string sig = filter_cache::signature(
+                {(double)total, (double)L_, (double)T_, cutoff, cfg.transition,
+                 (double)cfg.attenDb, (double)(int)cfg.window, (double)(int)cfg.phase,
+                 cfg.apodizing ? 1.0 : 0.0, cfg.apodF1, cfg.apodF2, designPhaseMix},
+                (cfg.phase == PhaseKind::Linear) ? (rawPrecise?"lp-dd-raw":"lp") : "phased");
+            cacheKey = filter_cache::key(sig);
+            cacheLoad = filter_cache::load_checked(cacheKey, proto, (size_t)total);
+            if (cacheLoad == filter_cache::LoadStatus::Hit) protoCached = true;
+            else proto.clear();
+        }
+        if (!protoCached) {
+        // 同一原型可能被两个线程同时需要（启动预热 + 用户点播放）：只让一个真正设计，
+        // 另一个在锁上等它把缓存写好再读，避免 9 秒的设计跑两遍。
+        std::unique_ptr<filter_cache::DesignLock> processDesignLock;
+        if (!cacheKey.empty()) {
+            // A cancellable OS lock also coordinates other application
+            // processes; a plain blocking std::mutex cannot cancel prewarm.
+            processDesignLock = std::make_unique<filter_cache::DesignLock>(
+                cacheKey, 30000, design_cancel_flag);
+            check_design_cancel();
+            designLockUnavailable = !bool(*processDesignLock);
+            const auto secondLoad = filter_cache::load_checked(cacheKey, proto, (size_t)total);
+            // Retain the first failure for diagnosis; a later hit still takes
+            // precedence because it explains the coefficients actually used.
+            if (secondLoad == filter_cache::LoadStatus::Hit || cacheLoad == filter_cache::LoadStatus::NotFound)
+                cacheLoad = secondLoad;
+            if (secondLoad == filter_cache::LoadStatus::Hit) protoCached = true;
+            else proto.clear();
+        }
+        if (!protoCached) {
+        if(rawPrecise) {
+            proto=coefficient_precision::lowpass(total,cutoff,
+                kaiser_beta_for_attenuation(cfg.attenDb),double(L_));
+        } else if (cfg.window == WindowKind::Kaiser && cfg.phase == PhaseKind::Linear && !cfg.apodizing) {
             // 原有路径：参数化 Kaiser sinc（保持逐位不变）
             LowpassSpec spec;
             spec.taps    = total;
@@ -260,15 +413,43 @@ public:
                                   ? cutoff * (1.0 - t) / (1.0 - t * 0.5) : 0.0;
             proto = design_phased_fir(fs.taps, fs.cutoff, fs.attenDb, fs.window,
                                       fs.apodizing, fs.apodF1, fs.apodF2,
-                                      cfg.phase, phase_mix(), passEdge);
+                                      cfg.phase, designPhaseMix, passEdge);
             if ((int)proto.size() != total) proto.resize((size_t)total, 0.0);
+        }
+        check_design_cancel();
+        if (!cacheKey.empty()) cacheStore = filter_cache::store_checked(cacheKey, proto);
+        }   // if (!protoCached) 内层：真正设计
+        }   // if (!protoCached) 外层：允许持锁等待者命中缓存
+        if (!cacheKey.empty()) {
+            const auto loadName = [](filter_cache::LoadStatus s) {
+                using S = filter_cache::LoadStatus;
+                switch(s) {
+                    case S::Hit:return "hit";case S::Disabled:return "disabled";
+                    case S::NotFound:return "not_found";case S::Invalid:return "invalid";
+                    case S::IoError:return "io_error";case S::Busy:return "busy";
+                }
+                return "unknown";
+            };
+            const auto storeName = [](filter_cache::StoreStatus s) {
+                using S = filter_cache::StoreStatus;
+                switch(s) {
+                    case S::Stored:return "stored";case S::Disabled:return "disabled";
+                    case S::SkippedSize:return "skipped_size";case S::Invalid:return "invalid";
+                    case S::Full:return "full";case S::IoError:return "io_error";
+                    case S::Busy:return "busy";case S::Cancelled:return "cancelled";
+                }
+                return "unknown";
+            };
+            std::fprintf(stderr,"FILTER_CACHE key=%s taps=%d load=%s store=%s design_lock=%s\n",
+                cacheKey.c_str(),total,loadName(cacheLoad),protoCached?"not_attempted":storeName(cacheStore),
+                protoCached?"not_needed":(designLockUnavailable?"unavailable":"acquired"));
         }
 
         // 关键：有理 L/M 转换中，"内插 -> 滤波 -> 抽取"要求原型在内插域的直流增益为 L，
         // 否则输出会被整体衰减 L 倍（L=1280 时正好 -62.1 dB，实测确认过这个陷阱）。
         // Total prototype gain is L; individual phase sums may contain finite interpolation error.
         const double phaseGain = (double)L_;
-        for (auto& v : proto) v *= phaseGain;
+        if(!rawPrecise)for (auto& v : proto) v *= phaseGain;
 
         // 相位主序布局：phases_[p][u] = h[p + u*L]，提升缓存友好度
         // D-11：定点路径的系数表（kFixedCoeffBits 位量化）。仅 useFixed 时构建。
@@ -282,20 +463,23 @@ public:
                 for (int u = 0; u < T_; ++u)
                     phasesFixed_[(size_t)p][(size_t)u] = flat[(size_t)(p + u * L_)];
         }
-        phases_.assign((size_t)L_, std::vector<double>((size_t)T_));
+        // ★ 2026-11-01（独立复核 ③）：只保留**一份**连续相位表。
+        //   旧实现 phases_[L][T] 与 phases_flat_[L*T] 内容相同、只是容器不同，
+        //   41.9M 抽头时两份各 320 MiB：构造期 proto + 两份表 ≈ 960 MiB，
+        //   构造完成后仍常驻 640 MiB（复核实测 968.8 / 648.1 MiB）。
+        //   现在直接按相位主序写进唯一一份表，CPU 用指针访问、GPU 直接用同一块，
+        //   随后把原型释放掉。**系数与累加顺序完全不变**（tests/test_resampler* 逐位基线）。
+        phases_flat_.assign((size_t)L_ * (size_t)T_, 0.0);
         for (int p = 0; p < L_; ++p)
             for (int u = 0; u < T_; ++u)
-                phases_[(size_t)p][(size_t)u] = proto[(size_t)(p + u * L_)];
+                phases_flat_[(size_t)p * (size_t)T_ + (size_t)u] = proto[(size_t)(p + u * L_)];
+        std::vector<double>().swap(proto);   // 原型已经重排进相位表，尽早释放
 
         // 2026-10-30 试过「反向相位表 + 正序内积」以利向量化 —— A/B 实测无收益
         // （DSD1024 5.75x vs 5.82x，在噪声内），因为 DSD 高倍率的耗时实际由 GPU kernel 决定。
         // 已回退，不留无用复杂度。
 
-        // GPU 需要连续的 [L][T] 相位表
-        phases_flat_.resize((size_t)L_ * (size_t)T_);
-        for (int pp = 0; pp < L_; ++pp)
-            std::copy(phases_[(size_t)pp].begin(), phases_[(size_t)pp].end(),
-                      phases_flat_.begin() + (ptrdiff_t)((size_t)pp * (size_t)T_));
+        // GPU 与 CPU 共用同一份连续相位表（不再另建副本）
         if (gpu_invalidate_) gpu_invalidate_();   // 换了滤波器 -> 显存里的相位表作废
         hist_.assign((size_t)ch_, std::vector<double>());
         for (auto& hh : hist_) hh.reserve((size_t)T_ * 2);
@@ -321,6 +505,11 @@ public:
             // CPU instance leaves the live stream and GPU cache untouched.
             ResamplerConfig mono = cfg_; mono.channels = 1;
             PolyphaseResampler probe(mono);
+            // Return the equivalent prototype at inRate*L, before decimation.
+            // Changing M after construction preserves the actual coefficients;
+            // redesigning at another rate would measure a different filter.
+            probe.M_ = 1;
+            probe.stage2_->M_ = 1;
             const size_t frames = (size_t)std::ceil(tailInputSamples()) + 1;
             std::vector<double> impulse(frames, 0.0);
             impulse[0] = 1.0;
@@ -334,7 +523,7 @@ public:
         out.assign((size_t)T_ * (size_t)L_, 0.0);
         for (int p = 0; p < L_; ++p)
             for (int u = 0; u < T_; ++u)
-                out[(size_t)(p + u * L_)] = phases_[(size_t)p][(size_t)u];
+                out[(size_t)(p + u * L_)] = phases_flat_[(size_t)p * (size_t)T_ + (size_t)u];
     }
 
     // 是否用 GPU 做多相相乘加（需要 rtagpu.dll；不可用则自动回退 CPU）
@@ -409,6 +598,8 @@ public:
         // ---- 两段式：第一级 -> 中间缓冲 -> 第二级 ----
         if (stage1_) {
             const size_t cap = stage1_->maxOutFrames(inFrames);
+            if (cap > tmp_.max_size() / size_t(ch_))
+                throw std::length_error("Cascade intermediate block exceeds addressable storage");
             if (tmp_.size() < cap * (size_t)ch_) {
                 tmp_.assign(cap * (size_t)ch_, 0.0);
                 for (int c = 0; c < ch_; ++c) tmpP_[(size_t)c] = tmp_.data() + (size_t)c * cap;
@@ -640,7 +831,7 @@ public:
             if (simd && phases_tap_major_.empty()) {
                 phases_tap_major_.resize((size_t)T_ * (size_t)L_);
                 for(int u=0;u<T_;++u) for(int p=0;p<L_;++p)
-                    phases_tap_major_[(size_t)u*L_+p]=phases_[(size_t)p][(size_t)u];
+                    phases_tap_major_[(size_t)u*L_+p]=phases_flat_[(size_t)p*(size_t)T_+(size_t)u];
             }
             auto range = [&](size_t begin,size_t end) {
             size_t simdOutputs=0;
@@ -663,7 +854,7 @@ public:
 #endif
                 for (int c = 0; c < ch_; ++c) {
                     const auto& hh = hist_[(size_t)c];
-                    const auto& ph = phases_[(size_t)p];
+                    const double* ph = phases_flat_.data() + (size_t)p * (size_t)T_;
                     double acc = 0.0;
                     for (int u = 0; u < uEnd; ++u) acc += ph[(size_t)u] * hh[base - (size_t)u];
                     out[c][n] = acc;
@@ -685,9 +876,10 @@ public:
                         if(base>=size_t(T_-1) && remaining>=4) {
                             const size_t width=remaining>=16 ? 16 : remaining>=8 ? 8 : 4;
                             for(int c=0;c<ch_;++c) {
-                                if(width==16)resampler_temporal_group<4>(phases_[p].data(),hist_[c].data(),base,T_,size_t(M_),out[c]+n,size_t(L_));
-                                else if(width==8)resampler_temporal_group<2>(phases_[p].data(),hist_[c].data(),base,T_,size_t(M_),out[c]+n,size_t(L_));
-                                else resampler_temporal_group<1>(phases_[p].data(),hist_[c].data(),base,T_,size_t(M_),out[c]+n,size_t(L_));
+                                const double* ph = phases_flat_.data() + (size_t)p * (size_t)T_;
+                                if(width==16)resampler_temporal_group<4>(ph,hist_[c].data(),base,T_,size_t(M_),out[c]+n,size_t(L_));
+                                else if(width==8)resampler_temporal_group<2>(ph,hist_[c].data(),base,T_,size_t(M_),out[c]+n,size_t(L_));
+                                else resampler_temporal_group<1>(ph,hist_[c].data(),base,T_,size_t(M_),out[c]+n,size_t(L_));
                             }
                             count+=width*size_t(ch_);n+=width*size_t(L_);continue;
                         }
@@ -695,7 +887,8 @@ public:
                         const int endTap=std::min<size_t>(base+1,size_t(T_));
                         for(int c=0;c<ch_;++c) {
                             double acc=0;
-                            for(int u=0;u<endTap;++u)acc+=phases_[p][u]*hist_[c][base-size_t(u)];
+                            const double* ph = phases_flat_.data() + (size_t)p * (size_t)T_;
+                            for(int u=0;u<endTap;++u)acc+=ph[u]*hist_[c][base-size_t(u)];
                             out[c][n]=acc;
                         }
                         n+=size_t(L_);
@@ -751,7 +944,19 @@ public:
     size_t maxOutFrames(size_t inFrames) const {
         if (stage1_) return stage2_->maxOutFrames(stage1_->maxOutFrames(inFrames));
         if (passthrough_) return inFrames;
-        return (size_t)(((double)inFrames * (double)L_) / (double)M_) + (size_t)L_ + 8;
+        // A buffer bound must not lose integer bits through binary64 or wrap
+        // on huge caller-supplied counts. The remainder product fits uint64:
+        // both rational factors were checked against INT_MAX by the planner.
+        const size_t limit = (std::numeric_limits<size_t>::max)();
+        const size_t quotient = inFrames / size_t(M_);
+        const size_t remainder = inFrames % size_t(M_);
+        if (quotient > limit / size_t(L_))
+            throw std::length_error("Resampler output capacity overflow");
+        const size_t whole = quotient * size_t(L_);
+        const size_t extra = size_t(uint64_t(remainder) * uint64_t(L_) / uint64_t(M_)) + size_t(L_) + 8;
+        if (whole > limit - extra)
+            throw std::length_error("Resampler output capacity overflow");
+        return whole + extra;
     }
 
     void reset() {
@@ -820,7 +1025,8 @@ private:
     std::vector<double>  tmp_;
     std::vector<double*> tmpP_;
 
-    std::vector<std::vector<double>> phases_;
+    // 相位表只有一份（连续 [L][T]，CPU 用指针、GPU 直接用同一块）：
+    //   2026-11-01 起删掉了旧的 vector<vector> 副本，见构造函数里的说明。
     std::vector<std::vector<double>> hist_;
     // D-11 定点路径：kFixedCoeffBits 位量化系数（phasesFixed_[p][u]）与本块的 int24 历史副本
     std::vector<std::vector<int64_t>> phasesFixed_;

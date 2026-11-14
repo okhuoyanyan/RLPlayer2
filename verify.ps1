@@ -1,4 +1,4 @@
-﻿param([switch]$NoUi)
+﻿param([switch]$NoUi,[string]$FfmpegDir="",[string]$LiteDir="",[string]$CertificatePythonPath="",[string]$BuildDir="")
 # verify.ps1 - RLPlayer quick self-check (no audio device is opened)
 # NOTE: keep this file UTF-8 WITH BOM. PowerShell 5.1 reads a BOM-less UTF-8 file as GBK
 #       and fails to parse the Chinese comments ("Missing type name after '['").
@@ -6,7 +6,11 @@ $ErrorActionPreference='Continue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $env:Path = 'C:\Program Files\AMD\ROCm\7.2\bin;' + $env:Path
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$B = Join-Path $Root 'build'
+. (Join-Path $Root 'tools\package_paths.ps1')
+if (-not $BuildDir) { $BuildDir = Join-Path $Root 'build' }
+elseif (-not [IO.Path]::IsPathRooted($BuildDir)) { $BuildDir = Join-Path $Root $BuildDir }
+try { $B = Resolve-ReleaseBuildDirectory -SourceRoot $Root -BuildDir $BuildDir }
+catch { Write-Error $_; exit 2 }
 $RunDir = Join-Path $B ('verify-run-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 $rows = @()
@@ -68,8 +72,10 @@ Write-Host '=== RLPlayer self-check (silent: no audio device opened) ==='
 #   build/ 里的旧产物；② 构建是否成功靠正则匹配输出里的 "error:" 文本，
 #   "命令非 0 退出但没有 error: 关键字"（链接器/资源编译器/工具缺失/磁盘满）会被判 PASS。
 #   现在：先存输出（诊断用）再判 $LASTEXITCODE；配置失败直接 FAIL 且不再构建。
+. (Join-Path $Root 'tools\get_audit_python_path.ps1')
+try {$CertificatePythonPath=Resolve-AuditPythonPath -BuildDir $B -Preferred $CertificatePythonPath} catch {Write-Error $_; exit 1}
 $cfgLog = Join-Path $B 'configure.log'
-$cfgOut = (cmake -G Ninja -S $Root -B $B -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER='C:/Program Files/AMD/ROCm/7.2/bin/clang++.exe' 2>&1 | Out-String)
+$cfgOut = (cmake -G Ninja -S $Root -B $B -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER='C:/Program Files/AMD/ROCm/7.2/bin/clang++.exe' ('-DRTA_CERTIFICATE_PYTHON_PATH='+$CertificatePythonPath) 2>&1 | Out-String)
 $cfgExit = $LASTEXITCODE
 New-Item -ItemType Directory -Force -Path $B | Out-Null
 $cfgOut | Out-File -FilePath $cfgLog -Encoding utf8
@@ -77,7 +83,7 @@ $cfgTail = ((($cfgOut -split ([char]10)) | Where-Object { $_.Trim() -ne '' } | S
 Step 'CMake configure' ($cfgExit -eq 0) ('exit=' + $cfgExit + ' ' + $cfgTail)
 $bo = ''
 if ($cfgExit -eq 0) {
-  $bo = (cmake --build $B 2>&1 | Out-String)
+  $bo = (cmake --build $B --parallel 2 2>&1 | Out-String)
   $bExit = $LASTEXITCODE
 } else {
   $bExit = -1
@@ -92,17 +98,21 @@ Step 'CMake build' ($bExit -eq 0) ('exit=' + $bExit + ', ' + $errs.ToString() + 
 # ★ 2026-10-29（两轮审查 F36）：零测试 / 全部被过滤不许冒充通过。
 #   --no-tests=error：一个用例都没跑（构建目录空、-E/-R 过滤掉全部）直接判失败。
 $oldNoDevice = $env:RTA_NO_DEVICE
+$oldNetTests=$env:RTA_NET_TESTS
+$oldPythonOptimize=$env:PYTHONOPTIMIZE
 try {
   $env:RTA_NO_DEVICE='1'
+  $env:RTA_NET_TESTS='0'
+  $env:PYTHONOPTIMIZE=''
   Push-Location $RunDir
-  try { $ct = (ctest --test-dir $B --no-tests=error --output-on-failure 2>&1 | Out-String); $ctExit=$LASTEXITCODE }
+  try { $ct = (& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'tools\run_safe_ctest.ps1') -BuildDir $B -SourceRoot $Root -FfmpegDir $FfmpegDir -LiteDir $LiteDir 2>&1 | Out-String); $ctExit=$LASTEXITCODE }
   finally { Pop-Location }
-} finally { $env:RTA_NO_DEVICE=$oldNoDevice }
+} finally { $env:RTA_NO_DEVICE=$oldNoDevice; $env:RTA_NET_TESTS=$oldNetTests; $env:PYTHONOPTIMIZE=$oldPythonOptimize }
 $ct | Out-File -FilePath (Join-Path $B 'ctest.log') -Encoding utf8
 $sum = ((($ct -split ([char]10)) | Select-String 'tests passed' | Select-Object -First 1) -join ' ').Trim()
 if (-not $sum) { $sum = 'exit=' + $ctExit }
 $ntest = 0
-if ($sum -match 'out of (\d+)') { $ntest = [int]$Matches[1] }
+if ($ct -match 'executed=(\d+)') { $ntest = [int]$Matches[1] }
 Step ('Test suite (' + $ntest + ')') (($ctExit -eq 0) -and ($ntest -gt 0)) ($sum + ' (要求 exit=0 且用例数>0)')
 
 Push-Location $RunDir
@@ -289,8 +299,8 @@ if (Test-Path $cc) {
   $co = (& powershell -NoProfile -ExecutionPolicy Bypass -File $cc -Dir $B 2>&1 | Out-String)
   $ccExit = $LASTEXITCODE
   $cl = ((($co -split ([char]10)) | Select-String 'FAIL count' | Select-Object -First 1) -join ' ').Trim()
-  Step 'Distribution compatibility' ($ccExit -eq 0) $cl
-} else { Step 'Distribution compatibility' $false 'check_compat.ps1 missing' }
+  Step 'Distribution PE static screen' ($ccExit -eq 0) $cl
+} else { Step 'Distribution PE static screen' $false 'check_compat.ps1 missing' }
 
 } finally { Pop-Location }
 

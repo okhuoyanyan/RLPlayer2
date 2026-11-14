@@ -15,6 +15,7 @@
 //   * 任何失败都要在 error 里留下非空、可读的中文原因（不许静默返回空 body）
 #pragma once
 #include <cstddef>
+#include <chrono>
 #include <cstdio>
 #include <functional>
 #include <string>
@@ -29,6 +30,9 @@ struct HttpRequest {
     std::string body;                              // 仅 POST
     std::string contentType = "application/json";  // 仅 POST，作为 Content-Type 头
     int timeoutMs = 20000;
+    // Optional absolute deadline. Windows uses cancellable async IO internally,
+    // while this public call still returns synchronously after cleanup.
+    std::chrono::steady_clock::time_point deadline{};
     std::string proxy;                             // 空 = 直连；"host:port" 或 "http://host:port"
     // 261024-05：流式接收钩子 —— 每从 socket 读到一段原始字节（chunked 已由平台解开）就调一次。
     // 为什么挂在 HttpRequest 上而不是新加一个函数：平台层只该有一份读循环，
@@ -39,6 +43,9 @@ struct HttpRequest {
     // 为什么需要它：更新包 372 MB，边下边写盘已经拿到了全部字节；再往 vector 里攒一份
     // 会额外占用 372 MB 峰值（重新分配时接近 1 GB），对正在播歌的进程是没必要的风险。
     bool discardBody = false;
+    // Signed update endpoints reject redirects so an allowed origin cannot
+    // redirect an automatic download to an unapproved host.
+    bool allowRedirects = true;
 };
 
 struct HttpResult {
@@ -47,10 +54,43 @@ struct HttpResult {
     std::string contentType;
     std::string error;
     std::vector<unsigned char> body;
+    // Bounded response metadata needed by resumable/rate-limited clients.
+    std::string etag;                 // <= 1024 UTF-8 bytes
+    std::string retryAfter;           // <= 128 UTF-8 bytes
+    std::string contentRange;         // <= 256 UTF-8 bytes
+    long long contentLength = -1;     // -1 = absent/invalid; 64-bit value otherwise
     size_t size() const { return body.size(); }
 };
 
 HttpResult http_request(const HttpRequest& req);
+
+// ---------------- 上传通道（PUT / POST）：GitHub Contents API 用 ----------------
+// 为什么不并进 HttpRequest：
+//   ① 方法名必须**任意**（/contents 只接受 PUT），而 HttpRequest 的契约只有 GET/POST；
+//   ② 代理是**三态**：0=跟随系统代理（WinHTTP AUTOMATIC_PROXY）、1=直连、2=具名，
+//      而 HttpRequest.proxy 只有"空/非空"两态；
+//   ③ 失败原因要"平台错误码 -> 人话"的映射（现场排查全靠它，文案不许只说失败）。
+// 这些全是传输层语义（TLS / 代理 / 超时 / 平台错误码），所以收在平台层，而不是让
+// net/ 里再抄一份 WinHTTP —— 上一版 net/feedback.h 就是那么抄的（261027-01）。
+struct HttpUploadRequest {
+    std::string method;                 // "PUT" / "POST"
+    std::string url;                    // http(s)://host[:port]/path
+    std::vector<std::string> headers;   // 每项形如 "名: 值"
+    std::string body;
+    int timeoutMs = 20000;
+    int proxyMode = 0;                  // 0=系统代理 1=直连 2=具名代理
+    std::string proxy;                  // proxyMode==2 时有效（"host:port"）
+    std::string userAgent = "RLPlayer/1.0";
+};
+
+struct HttpUploadResult {
+    bool ok = false;                    // 2xx
+    int status = 0;
+    std::string error;                  // 人话（非 2xx 且无其它错误时是 "HTTP <码>"）
+    std::string body;                   // 原样响应体（非 2xx 也给）
+};
+
+HttpUploadResult http_upload(const HttpUploadRequest& req);
 
 // ---------------- 纯函数（跨平台，可离线测）----------------
 

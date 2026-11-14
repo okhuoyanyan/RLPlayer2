@@ -20,6 +20,8 @@ foreach(lang ar en es fr ja ru)
   file(SHA256 "${asset}" digest)
   string(APPEND RLPLAYER_UPDATE_ASSET_ENTRIES "    {\"data/i18n/${lang}.json\", \"${digest}\"},\n")
 endforeach()
+
+
 configure_file(src/net/update_assets_hashes.h.in generated/net/update_assets_hashes.h @ONLY)
 
 
@@ -108,29 +110,35 @@ add_executable(httptest tools/httptest.cpp)
 target_include_directories(httptest PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(httptest PRIVATE winhttp ws2_32)
 
-# ---------------- 一键反馈自检（诊断打包 + GitHub 上传，用户 261027-01 #1）----------------
-# 与 rtaweb 共用 src/net/feedback.h —— 判据必须跑同一份代码。
-# psapi/user32：进程内存与显卡名；winhttp：GitHub Contents API 的 PUT。
+# ---------------- 一键反馈自检（诊断打包 + 自有服务器上传）----------------
 add_executable(feedback_probe tools/feedback_probe.cpp)
 target_include_directories(feedback_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(feedback_probe PRIVATE winhttp psapi user32 shell32)
+target_link_libraries(feedback_probe PRIVATE winhttp psapi user32 shell32 bcrypt)
 
-# ---------------- 在线更新自检 / 演练（用户 261027-02 #5）----------------
-# 与 rtaweb 共用 src/net/update.h（检查/下载/校验/解压）与 src/net/update_apply.h（保护清单/
-# 脚本生成/回滚台账）—— 单测必须跑同一份代码，不许另写一份"测试专用"实现。
-# winhttp：GitHub release API 与资产下载；ws2_32：演练用的假启动器（只回 /api/ping）。
+# ---------------- 在线更新自检 / 演练 ----------------
 add_executable(update_probe tools/update_probe.cpp)
 target_include_directories(update_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(update_probe PRIVATE winhttp ws2_32)
+target_link_libraries(update_probe PRIVATE winhttp ws2_32 bcrypt)
 add_test(NAME update_selftest COMMAND update_probe --selftest)
 add_executable(test_update_assets tests/test_update_assets.cpp)
 target_include_directories(test_update_assets PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(test_update_assets PRIVATE winhttp ws2_32)
+target_link_libraries(test_update_assets PRIVATE winhttp ws2_32 bcrypt)
 target_compile_definitions(test_update_assets PRIVATE UPDATE_ASSET_SOURCE="${CMAKE_SOURCE_DIR}")
 add_test(NAME update_assets COMMAND test_update_assets)
 add_executable(test_update_unicode tests/test_update_unicode.cpp)
 target_include_directories(test_update_unicode PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_update_unicode PRIVATE winhttp ws2_32 bcrypt)
 add_test(NAME update_unicode COMMAND test_update_unicode)
+add_executable(test_update_signature tests/test_update_signature.cpp)
+target_include_directories(test_update_signature PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_update_signature PRIVATE winhttp ws2_32 bcrypt)
+target_compile_definitions(test_update_signature PRIVATE RLPLAYER_UPDATE_SIGNATURE_TEST_MAIN)
+add_test(NAME update_signature COMMAND test_update_signature)
+add_executable(test_update_protocol tests/test_update_protocol.cpp)
+target_include_directories(test_update_protocol PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_update_protocol PRIVATE winhttp ws2_32 bcrypt)
+target_compile_definitions(test_update_protocol PRIVATE RLPLAYER_UPDATE_PROTOCOL_TEST_MAIN)
+add_test(NAME update_protocol COMMAND test_update_protocol)
 
 target_include_directories(update_probe PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_include_directories(test_update_assets PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -140,9 +148,8 @@ target_include_directories(test_update_assets PRIVATE "${CMAKE_CURRENT_BINARY_DI
 add_executable(rta_launcher WIN32 tools/launcher.cpp)
 set_target_properties(rta_launcher PROPERTIES OUTPUT_NAME "RLPlayer")
 # ole32/uuid/mmdevapi:启动横幅只读枚举输出端点(wasapi_out.h);dbghelp:崩溃转储(crash_dump.h)
-# winhttp：261027-02 #5 起启动器要 include src/net/update_apply.h（→ net/update.h → platform/http.h），
-# 在线更新的"落地"就发生在启动器 main() 开头（此刻 rtaweb 还没起来，文件都不被占用）。
-target_link_libraries(rta_launcher PRIVATE ws2_32 shell32 user32 ole32 uuid mmdevapi dbghelp winhttp)
+# 更新落地发生在启动器 main() 开头，rtaweb 尚未启动、文件未被占用。
+target_link_libraries(rta_launcher PRIVATE ws2_32 shell32 user32 ole32 uuid mmdevapi dbghelp winhttp bcrypt)
 target_include_directories(rta_launcher PRIVATE ${CMAKE_SOURCE_DIR}/src "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_compile_definitions(rta_launcher PRIVATE UNICODE _UNICODE)
 # 内置 WebView2：官方 SDK 头文件（third_party/webview2/include），运行时用同目录的 WebView2Loader.dll
@@ -213,7 +220,7 @@ target_link_libraries(aidecode PRIVATE rtadsp)
 # dbghelp:崩溃转储(crash_dump.h,SetUnhandledExceptionFilter + MiniDumpWriteDump)
 add_executable(rtaweb tools/rtaweb.cpp)
 # iphlpapi: /api/naa/discover 通过 tools/naa_discover.h 枚举本机网卡（自动选网段）
-target_link_libraries(rtaweb PRIVATE rtadsp ws2_32 winmm avrt dbghelp iphlpapi)
+target_link_libraries(rtaweb PRIVATE rtadsp ws2_32 winmm avrt dbghelp iphlpapi winhttp bcrypt)
 
 # ---------------- NAA 端点发现（2026-10-24 用户要求彻底删除）----------------
 # 为什么删：数播的 NAA 只认 HQPlayer 私有握手（服务端先发 16 字节挑战，客户端要用未公开
@@ -254,6 +261,14 @@ enable_testing()
 add_executable(test_host_msg tests/test_host_msg.cpp)
 target_link_libraries(test_host_msg PRIVATE rtadsp)
 add_test(NAME host_msg COMMAND test_host_msg)
+
+# 261031：平台层自身的契约测试（text/env/fs/sysinfo/time/http）。
+# 判据不是"能编译"，而是"与迁移前的 Win32 调用逐项等价"：显式长度语义、env 的三种返回、
+# DeleteFileW/CopyFileW/MoveFileExW 的返回值语义、时区算式、GetTickCount64 同一时基、PUT 通道。
+# ws2_32：第 5 组用本机回环服务器验证 http_upload 真的发 PUT（不联网）。
+add_executable(test_platform tests/test_platform.cpp)
+target_link_libraries(test_platform PRIVATE rtadsp ws2_32)
+add_test(NAME platform COMMAND test_platform)
 
 add_executable(test_resampler tests/test_resampler.cpp)
 target_link_libraries(test_resampler PRIVATE rtadsp)
@@ -374,6 +389,29 @@ add_test(NAME two_stage COMMAND test_two_stage)
 add_executable(test_isp tests/test_isp.cpp)
 target_link_libraries(test_isp PRIVATE rtadsp)
 add_test(NAME isp COMMAND test_isp)
+
+add_executable(test_ui_page_rates tests/test_ui_page_rates.cpp)
+target_include_directories(test_ui_page_rates PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME ui_page_rates COMMAND test_ui_page_rates)
+
+add_executable(test_lyrics_echo tests/test_lyrics_echo.cpp)
+target_include_directories(test_lyrics_echo PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME lyrics_echo COMMAND test_lyrics_echo)
+
+# 2026-11-02（261102-01 #2）：源站占位词（「纯音乐，请欣赏」）被当成歌词显示
+add_executable(test_lyric_placeholder tests/test_lyric_placeholder.cpp)
+target_include_directories(test_lyric_placeholder PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME lyric_placeholder COMMAND test_lyric_placeholder)
+
+add_executable(test_dsd1024_offline tests/test_dsd1024_offline.cpp)
+target_include_directories(test_dsd1024_offline PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_dsd1024_offline PRIVATE rtadsp)
+add_test(NAME dsd1024_offline COMMAND test_dsd1024_offline)
+
+add_executable(test_filter_cache tests/test_filter_cache.cpp)
+target_include_directories(test_filter_cache PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_filter_cache PRIVATE rtadsp)
+add_test(NAME filter_cache COMMAND test_filter_cache)
 
 add_executable(test_library tests/test_library.cpp)
 target_include_directories(test_library PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -1189,3 +1227,407 @@ if(RTA_GPU_MULTIPHASE_CACHE_TEST)
   add_custom_target(gpu_multiphase_cache_prepare ALL DEPENDS "${cache_test}")
   add_test(NAME gpu_multiphase_cache_real COMMAND "${cache_test}")
 endif()
+
+# Round 4 independent measurement gates and source/toolchain-bound filter cache.
+file(GLOB_RECURSE RTA_FILTER_CACHE_INPUTS CONFIGURE_DEPENDS
+     "${CMAKE_SOURCE_DIR}/src/dsp/*.h" "${CMAKE_SOURCE_DIR}/src/dsp/*.hpp"
+     "${CMAKE_SOURCE_DIR}/src/dsp/*.inl")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${RTA_FILTER_CACHE_INPUTS} "${CMAKE_SOURCE_DIR}/tools/review4_cache_fingerprint.py"
+    "${CMAKE_CXX_COMPILER}")
+get_directory_property(RTA_DIRECTORY_COMPILE_OPTIONS COMPILE_OPTIONS)
+string(REPLACE ";" " " RTA_DIRECTORY_COMPILE_OPTIONS "${RTA_DIRECTORY_COMPILE_OPTIONS}")
+string(TOUPPER "${CMAKE_BUILD_TYPE}" RTA_BUILD_CONFIG)
+set(RTA_FILTER_FINGERPRINT_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${RTA_BUILD_CONFIG}} ${RTA_DIRECTORY_COMPILE_OPTIONS} config=${CMAKE_BUILD_TYPE} arch=${RTA_ARCH} fp=${RTA_FP_CONTRACT} crt=${CMAKE_MSVC_RUNTIME_LIBRARY} system=${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR} compiler=${CMAKE_CXX_COMPILER_ID}/${CMAKE_CXX_COMPILER_VERSION}")
+set(RTA_FILTER_RUNTIME_BINDING_DEFAULT OFF)
+if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)
+    set(RTA_FILTER_RUNTIME_BINDING_DEFAULT ON)
+endif()
+option(RTA_FILTER_CACHE_BIND_RUNTIME "Bind Windows Clang static runtime archives to the cache key" ${RTA_FILTER_RUNTIME_BINDING_DEFAULT})
+set(RTA_FILTER_RUNTIME_ARGS)
+if(RTA_FILTER_CACHE_BIND_RUNTIME)
+    list(APPEND RTA_FILTER_RUNTIME_ARGS --auto-runtime-libs
+        "--runtime-probe-arg=-march=${RTA_ARCH}" --runtime-probe-arg=-D_MT
+        --runtime-probe-arg=-Xclang --runtime-probe-arg=--dependent-lib=libcmt)
+else()
+    message(WARNING "Filter cache runtime is UNBOUND on this toolchain; runtime identity is not certified")
+endif()
+set(RTA_FILTER_FINGERPRINT_COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/review4_cache_fingerprint.py"
+    --source "${CMAKE_SOURCE_DIR}" --compiler "${CMAKE_CXX_COMPILER}"
+    "--flags=${RTA_FILTER_FINGERPRINT_FLAGS}"
+    ${RTA_FILTER_RUNTIME_ARGS}
+    --output "${CMAKE_BINARY_DIR}/generated/dsp/filter_build_fingerprint.h")
+execute_process(COMMAND ${RTA_FILTER_FINGERPRINT_COMMAND}
+    RESULT_VARIABLE RTA_CACHE_FINGERPRINT_EXIT OUTPUT_VARIABLE RTA_CACHE_FINGERPRINT_RESULT)
+if(NOT RTA_CACHE_FINGERPRINT_EXIT EQUAL 0)
+    message(FATAL_ERROR "Filter cache build fingerprint generation failed")
+endif()
+file(READ "${CMAKE_BINARY_DIR}/generated/dsp/filter_build_fingerprint.json" RTA_FILTER_FINGERPRINT_JSON)
+string(JSON RTA_RUNTIME_COUNT LENGTH "${RTA_FILTER_FINGERPRINT_JSON}" linked_runtime_artifacts)
+if(RTA_RUNTIME_COUNT GREATER 0)
+    math(EXPR RTA_RUNTIME_LAST "${RTA_RUNTIME_COUNT} - 1")
+    foreach(i RANGE 0 ${RTA_RUNTIME_LAST})
+        string(JSON RTA_RUNTIME_PATH MEMBER "${RTA_FILTER_FINGERPRINT_JSON}" linked_runtime_artifacts ${i})
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${RTA_RUNTIME_PATH}")
+    endforeach()
+endif()
+# Re-run at every build as well: a changed driver environment can select a new
+# SDK without touching the previously discovered archives. Unchanged content
+# preserves the generated header timestamp and does not force recompilation.
+add_custom_target(review4_cache_fingerprint_refresh
+    COMMAND ${RTA_FILTER_FINGERPRINT_COMMAND}
+    BYPRODUCTS "${CMAKE_BINARY_DIR}/generated/dsp/filter_build_fingerprint.h"
+               "${CMAKE_BINARY_DIR}/generated/dsp/filter_build_fingerprint.json"
+    VERBATIM)
+include_directories("${CMAKE_BINARY_DIR}/generated")
+add_executable(test_review4_measurement tests/test_review4_measurement.cpp)
+target_link_libraries(test_review4_measurement PRIVATE rtadsp)
+add_test(NAME review4_reference_contract COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_SOURCE_DIR}/tests/test_review4_reference.py" --exe $<TARGET_FILE:test_review4_measurement>)
+add_executable(test_review4_cache tests/test_review4_cache.cpp)
+target_link_libraries(test_review4_cache PRIVATE rtadsp psapi)
+target_compile_definitions(test_review4_cache PRIVATE REVIEW4_FIXED _CRT_SECURE_NO_WARNINGS)
+add_test(NAME review4_cache_contract COMMAND test_review4_cache)
+add_executable(test_review4_dsd_contract tests/test_review4_dsd_contract.cpp)
+target_link_libraries(test_review4_dsd_contract PRIVATE rtadsp)
+add_test(NAME review4_dsd_contract COMMAND test_review4_dsd_contract)
+get_property(RTA_REVIEW4_TARGETS DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(target IN LISTS RTA_REVIEW4_TARGETS)
+    if(NOT target STREQUAL "review4_cache_fingerprint_refresh")
+        add_dependencies(${target} review4_cache_fingerprint_refresh)
+    endif()
+endforeach()
+
+# Independently replayed application persistence and asynchronous-state regressions.
+find_program(RLPLAYER_NODE_EXECUTABLE node REQUIRED)
+add_test(NAME app_lyrics_state COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_lyrics_state.js")
+add_test(NAME app_settings_state COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_settings_state.js")
+add_test(NAME app_i18n_dynamic COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_i18n_dynamic.js")
+add_test(NAME app_queue_persistence COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_queue_persistence.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME app_settings_persistence COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_settings_persistence.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME app_prewarm COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_prewarm.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME app_launcher_quit COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_launcher_quit.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME app_upnp_token COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_upnp_token.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME app_http_security COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_http_security.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME app_design_cancel COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_design_cancel.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME app_playback_errors COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_playback_errors.js")
+add_test(NAME app_playback_error_contract COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_playback_error_contract.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME app_enrich_lyrics COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_enrich_lyrics.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME app_credit_roles COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_credit_roles.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME app_cue_entities COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_cue_entities.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME app_local_album COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_local_album.js")
+add_test(NAME app_feedback_recovery COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_feedback_recovery.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME app_feedback_ui COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_feedback_ui.js")
+add_test(NAME private_material_gate COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_private_material.py")
+add_test(NAME rlplayer_server COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_rlplayer_server.py")
+add_test(NAME rlplayer_publish COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_rlplayer_publish.py")
+add_test(NAME app_artist_cache COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_artist_cache.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME release_gate_regression COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_SOURCE_DIR}/tools/test_release_gates.ps1")
+add_test(NAME asio_probe_fill COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_asio_probe_fill.py" --compiler "${CMAKE_CXX_COMPILER}")
+add_test(NAME safe_manifest_controls COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/test_safe_manifest.py")
+add_test(NAME hip_provenance_controls COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/test_hip_provenance.py")
+add_test(NAME cuda_release_controls COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/test_cuda_release_gate.py")
+add_executable(test_cache_transactions tests/test_cache_transactions.cpp)
+target_link_libraries(test_cache_transactions PRIVATE rtadsp)
+target_compile_definitions(test_cache_transactions PRIVATE RTA_FILTER_CACHE_TESTING)
+add_test(NAME cache_transactions COMMAND test_cache_transactions)
+add_executable(test_phase_memory_contract tests/test_phase_memory_contract.cpp)
+target_link_libraries(test_phase_memory_contract PRIVATE rtadsp)
+add_test(NAME phase_memory_contract COMMAND test_phase_memory_contract)
+add_executable(test_rational_cascade tests/test_rational_cascade.cpp)
+target_link_libraries(test_rational_cascade PRIVATE rtadsp)
+add_test(NAME rational_cascade COMMAND test_rational_cascade)
+add_executable(test_resampler_plan tests/test_resampler_plan.cpp)
+target_link_libraries(test_resampler_plan PRIVATE rtadsp)
+target_compile_definitions(test_resampler_plan PRIVATE RTA_PLAN_CHECKS)
+add_test(NAME resampler_plan COMMAND test_resampler_plan)
+add_executable(test_pipeline_downsample tests/test_pipeline_downsample.cpp)
+target_link_libraries(test_pipeline_downsample PRIVATE rtadsp)
+add_test(NAME pipeline_downsample COMMAND test_pipeline_downsample)
+add_executable(test_design_cancel tests/test_design_cancel.cpp)
+target_link_libraries(test_design_cancel PRIVATE rtadsp)
+add_test(NAME design_cancel COMMAND test_design_cancel)
+set_tests_properties(design_cancel PROPERTIES ENVIRONMENT "RLPLAYER_FILTER_CACHE=0")
+add_executable(dsp_export_pipeline tools/dsp_export_pipeline.cpp)
+target_link_libraries(dsp_export_pipeline PRIVATE rtadsp)
+foreach(target test_cache_transactions test_phase_memory_contract test_rational_cascade test_resampler_plan test_pipeline_downsample test_design_cancel dsp_export_pipeline)
+    add_dependencies(${target} review4_cache_fingerprint_refresh)
+endforeach()
+
+# Independent arbitrary-precision test oracle. This Python dependency is only
+# needed to build/test the source tree; playback has no Python or Flint runtime.
+set(RTA_CERTIFICATE_PYTHON_PATH "" CACHE PATH "Private directory containing audit Python dependencies")
+execute_process(COMMAND "${Python3_EXECUTABLE}" -c
+    "import sys; sys.path.insert(0,sys.argv[1]); import flint; print(flint.__version__)"
+    "${RTA_CERTIFICATE_PYTHON_PATH}"
+    RESULT_VARIABLE RTA_FLINT_EXIT OUTPUT_VARIABLE RTA_FLINT_VERSION ERROR_VARIABLE RTA_FLINT_ERROR)
+if(NOT RTA_FLINT_EXIT EQUAL 0)
+    message(FATAL_ERROR "Independent certificate dependency missing. Install tools/requirements-audit.txt into a private directory and configure -DRTA_CERTIFICATE_PYTHON_PATH=<directory>. ${RTA_FLINT_ERROR}")
+endif()
+foreach(kind spectral cascade single_rate)
+    add_test(NAME review5_${kind}_certificate COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_SOURCE_DIR}/tests/test_review5_${kind}_certificate.py"
+        --flint-path "${RTA_CERTIFICATE_PYTHON_PATH}"
+        --evidence "${CMAKE_BINARY_DIR}/review5-tests/${kind}")
+endforeach()
+add_executable(review5_precision_design tools/review5_precision_design.cpp)
+target_link_libraries(review5_precision_design PRIVATE rtadsp)
+add_dependencies(review5_precision_design review4_cache_fingerprint_refresh)
+add_test(NAME review5_precision_design COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_SOURCE_DIR}/tests/test_review5_precision_design.py"
+    --exe $<TARGET_FILE:review5_precision_design>
+    --flint-path "${RTA_CERTIFICATE_PYTHON_PATH}"
+    --evidence "${CMAKE_BINARY_DIR}/review5-tests/precision")
+add_executable(test_multilevel_sdm_paths tests/test_multilevel_sdm_paths.cpp)
+target_link_libraries(test_multilevel_sdm_paths PRIVATE rtadsp)
+add_dependencies(test_multilevel_sdm_paths review4_cache_fingerprint_refresh)
+add_test(NAME multilevel_sdm_paths COMMAND test_multilevel_sdm_paths)
+add_executable(test_sdm_config_validation tests/test_sdm_config_validation.cpp)
+target_link_libraries(test_sdm_config_validation PRIVATE rtadsp)
+add_dependencies(test_sdm_config_validation review4_cache_fingerprint_refresh)
+add_test(NAME sdm_config_validation COMMAND test_sdm_config_validation)
+add_test(NAME audio_clock_units COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_audio_clock_units.py" "${CMAKE_CXX_COMPILER}")
+add_executable(rlmultilevel tools/rlmultilevel.cpp)
+target_link_libraries(rlmultilevel PRIVATE rtadsp shell32)
+add_dependencies(rlmultilevel review4_cache_fingerprint_refresh)
+add_executable(test_multilevel_file tests/test_multilevel_file.cpp)
+target_link_libraries(test_multilevel_file PRIVATE rtadsp)
+add_dependencies(test_multilevel_file review4_cache_fingerprint_refresh)
+add_test(NAME multilevel_format COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_multilevel_format.py" --writer $<TARGET_FILE:test_multilevel_file>)
+add_test(NAME multilevel_cli COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_multilevel_cli.py" --exe $<TARGET_FILE:rlmultilevel>)
+add_executable(test_multilevel_wav_stream tests/test_multilevel_wav_stream.cpp)
+target_include_directories(test_multilevel_wav_stream PRIVATE "${CMAKE_SOURCE_DIR}/src")
+add_test(NAME multilevel_wav_stream COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_multilevel_wav_stream.py" --reader $<TARGET_FILE:test_multilevel_wav_stream>)
+add_executable(test_gpu_pipeline_real tests/test_gpu_pipeline_real.cpp)
+target_link_libraries(test_gpu_pipeline_real PRIVATE rtadsp)
+add_dependencies(test_gpu_pipeline_real review4_cache_fingerprint_refresh)
+add_test(NAME gpu_pipeline_real COMMAND test_gpu_pipeline_real)
+add_executable(test_filter_input_validation tests/test_filter_input_validation.cpp)
+target_link_libraries(test_filter_input_validation PRIVATE rtadsp)
+target_compile_definitions(test_filter_input_validation PRIVATE RTA_VALIDATION_OVERFLOW_CHECK=1)
+add_dependencies(test_filter_input_validation review4_cache_fingerprint_refresh)
+add_test(NAME filter_input_validation COMMAND test_filter_input_validation)
+add_executable(test_cache_observability tests/test_cache_observability.cpp)
+target_link_libraries(test_cache_observability PRIVATE rtadsp)
+add_dependencies(test_cache_observability review4_cache_fingerprint_refresh)
+add_test(NAME cache_observability COMMAND test_cache_observability)
+add_executable(test_resampler_capacity tests/test_resampler_capacity.cpp)
+target_link_libraries(test_resampler_capacity PRIVATE rtadsp)
+add_dependencies(test_resampler_capacity review4_cache_fingerprint_refresh)
+add_test(NAME resampler_capacity COMMAND test_resampler_capacity)
+add_test(NAME app_enrich_budget COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_enrich_budget.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME app_enrich_budget_ui COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_enrich_budget_ui.js")
+add_test(NAME app_sdm_status COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_sdm_status.js")
+add_test(NAME app_sdm_signal_contract COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_sdm_signal_contract.py" "${CMAKE_CXX_COMPILER}")
+
+add_test(NAME app_writeback_transaction COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_writeback_transaction.py" "${CMAKE_CXX_COMPILER}")
+
+add_test(NAME app_roomcorr_auto COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_roomcorr_auto.py" "${CMAKE_CXX_COMPILER}")
+
+add_test(NAME app_manual_ir COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_manual_ir.py" "${CMAKE_CXX_COMPILER}")
+
+add_test(NAME app_writeback_cover_real COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_writeback_cover_real.py" "${CMAKE_CXX_COMPILER}" "ffmpeg.exe" "ffmpeg-lite/ffmpeg.exe" "ffmpeg-lite/ffprobe.exe")
+
+add_test(NAME update_failure_process COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_update_failure_process.py" "$<TARGET_FILE:update_probe>")
+add_test(NAME update_intent_recovery COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_update_intent_recovery.py" --probe "$<TARGET_FILE:update_probe>")
+add_test(NAME update_delete_locked COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_update_delete_locked.py" --probe "$<TARGET_FILE:update_probe>" --compiler "${CMAKE_CXX_COMPILER}")
+
+add_test(NAME launcher_startup_exit COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_launcher_startup_exit.py" "${CMAKE_CXX_COMPILER}")
+
+add_test(NAME app_update_recovery COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_update_recovery.js")
+add_test(NAME app_update_manual COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_update_manual.js")
+
+add_test(NAME app_playback_caption COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_playback_caption.js")
+
+add_test(NAME app_sdm_corner COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_sdm_corner.js")
+
+add_executable(test_sdm_output_policy tests/test_sdm_output_policy.cpp)
+target_link_libraries(test_sdm_output_policy PRIVATE rtadsp)
+add_test(NAME sdm_output_policy COMMAND test_sdm_output_policy)
+
+# Cover/album identity contract: all fixtures and caches stay in private test directories.
+add_executable(test_album_cover_identity tests/test_album_cover_identity.cpp tests/test_wav_japanese_metadata.cpp)
+target_include_directories(test_album_cover_identity PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_album_cover_identity PRIVATE winhttp ws2_32)
+add_test(NAME album_cover_identity COMMAND test_album_cover_identity "ffmpeg.exe")
+add_test(NAME wav_japanese_metadata COMMAND test_album_cover_identity --japanese)
+add_test(NAME track_cover_ui COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_track_cover_ui.js")
+add_test(NAME track_cover_resolution COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_track_cover_resolution.py"
+  --compiler "${CMAKE_CXX_COMPILER}"
+  --exe "$<TARGET_FILE:rtaweb>" --ffmpeg "ffmpeg.exe" --product-ffmpeg "ffmpeg-lite/ffmpeg.exe"
+  --ffprobe "ffmpeg-lite/ffprobe.exe" --evidence-dir "track-cover-evidence")
+
+# 3.3 correctness and format acceptance: safe runner stages each executable/profile.
+add_executable(test_audio_integrity_round tests/test_audio_integrity_round.cpp)
+target_link_libraries(test_audio_integrity_round PRIVATE rtadsp)
+add_dependencies(test_audio_integrity_round review4_cache_fingerprint_refresh)
+add_test(NAME audio_integrity_round COMMAND test_audio_integrity_round)
+
+add_executable(test_cast_stream_prepare tests/test_cast_stream_prepare.cpp)
+target_link_libraries(test_cast_stream_prepare PRIVATE rtadsp winhttp ws2_32)
+add_dependencies(test_cast_stream_prepare review4_cache_fingerprint_refresh)
+add_test(NAME cast_stream_prepare COMMAND test_cast_stream_prepare)
+
+add_executable(test_sacd_iso tests/test_sacd_iso.cpp)
+target_link_libraries(test_sacd_iso PRIVATE rtadsp)
+add_test(NAME sacd_iso COMMAND test_sacd_iso)
+
+add_test(NAME app_dsp_alignment COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_dsp_alignment.py" "${CMAKE_CXX_COMPILER}")
+add_test(NAME app_upnp_queue COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_upnp_queue.py" "$<TARGET_FILE:rtaweb>")
+set_tests_properties(app_upnp_queue PROPERTIES RUN_SERIAL TRUE)
+add_test(NAME quick_start COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_quick_start.js")
+
+add_executable(test_recording_cleanup tests/test_recording_cleanup.cpp)
+target_link_libraries(test_recording_cleanup PRIVATE rtadsp)
+add_dependencies(test_recording_cleanup review4_cache_fingerprint_refresh)
+add_test(NAME recording_cleanup COMMAND test_recording_cleanup)
+add_test(NAME recording_cleanup_oracle COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_recording_cleanup_oracle_run.py" "$<TARGET_FILE:test_recording_cleanup>")
+
+add_executable(test_dst_codec tests/test_dst_codec.cpp)
+target_link_libraries(test_dst_codec PRIVATE rtadsp)
+add_test(NAME dst_codec COMMAND test_dst_codec)
+add_executable(test_udf_navigation tests/test_udf_navigation.cpp)
+target_link_libraries(test_udf_navigation PRIVATE rtadsp)
+add_test(NAME udf_navigation COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_udf_navigation_fixture.py" "$<TARGET_FILE:test_udf_navigation>")
+add_executable(test_dvd_audio tests/test_dvd_audio.cpp)
+target_link_libraries(test_dvd_audio PRIVATE rtadsp winhttp ws2_32)
+add_executable(test_image_library tests/test_image_library.cpp)
+target_link_libraries(test_image_library PRIVATE rtadsp winhttp ws2_32)
+add_executable(test_source_depth_migration tests/test_source_depth_migration.cpp)
+target_link_libraries(test_source_depth_migration PRIVATE rtadsp winhttp ws2_32)
+add_test(NAME source_depth_migration COMMAND test_source_depth_migration)
+add_test(NAME iso_end_to_end COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_iso_end_to_end.py"
+  --exe "$<TARGET_FILE:rtaweb>" --sacd "$<TARGET_FILE:test_sacd_iso>"
+  --dvd "$<TARGET_FILE:test_dvd_audio>" --library "$<TARGET_FILE:test_image_library>"
+  --encoder "ffmpeg.exe" --decoder "ffmpeg-lite/ffmpeg.exe" --probe "ffmpeg-lite/ffprobe.exe")
+set_tests_properties(iso_end_to_end PROPERTIES RUN_SERIAL TRUE TIMEOUT 240)
+add_test(NAME app_preset_processing COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_preset_processing.py" "$<TARGET_FILE:rtaweb>")
+add_test(NAME ui_processing COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_ui_processing.js" "$<TARGET_FILE:rtaweb>")
+set_tests_properties(ui_processing PROPERTIES RUN_SERIAL TRUE TIMEOUT 240)
+add_executable(test_cast_iso tests/test_cast_iso.cpp)
+target_link_libraries(test_cast_iso PRIVATE rtadsp winhttp ws2_32)
+add_test(NAME iso_upnp COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_iso_upnp.py"
+  --exe "$<TARGET_FILE:rtaweb>" --sacd "$<TARGET_FILE:test_sacd_iso>" --cast "$<TARGET_FILE:test_cast_iso>"
+  --encoder "ffmpeg.exe" --decoder "ffmpeg-lite/ffmpeg.exe" --probe "ffmpeg-lite/ffprobe.exe")
+set_tests_properties(iso_upnp PROPERTIES RUN_SERIAL TRUE TIMEOUT 300)
+add_test(NAME startup_queue COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_startup_queue.py"
+  --exe "$<TARGET_FILE:rtaweb>")
+set_tests_properties(startup_queue PROPERTIES RUN_SERIAL TRUE TIMEOUT 180)
+
+# 3.3.1 artwork regression: private profiles, local HTTP and actual decoded pixels.
+add_executable(test_profile_artwork_migration tests/test_profile_artwork_migration.cpp)
+target_include_directories(test_profile_artwork_migration PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_profile_artwork_migration PRIVATE bcrypt)
+add_test(NAME profile_artwork_migration COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_profile_artwork_migration.py"
+  --probe "$<TARGET_FILE:test_profile_artwork_migration>" --evidence-dir "profile-artwork-evidence")
+set_tests_properties(profile_artwork_migration PROPERTIES TIMEOUT 180)
+add_test(NAME cover_local_resolution COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_cover_local_resolution.py"
+  --exe "$<TARGET_FILE:rtaweb>" --encoder "ffmpeg.exe"
+  --decoder "ffmpeg-lite/ffmpeg.exe" --probe "ffmpeg-lite/ffprobe.exe"
+  --compiler "${CMAKE_CXX_COMPILER}" --evidence-dir "cover-local-evidence")
+set_tests_properties(cover_local_resolution PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE)
+add_test(NAME cover_refresh_ui COMMAND "${RLPLAYER_NODE_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_cover_refresh_ui.js"
+  --source "${CMAKE_SOURCE_DIR}" --work-root "cover-refresh-evidence" --cxx "${CMAKE_CXX_COMPILER}")
+set_tests_properties(cover_refresh_ui PROPERTIES TIMEOUT 240)
+
+add_executable(test_cover_sources tests/test_cover_sources.cpp)
+target_include_directories(test_cover_sources PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_cover_sources PRIVATE winhttp)
+add_test(NAME cover_sources COMMAND test_cover_sources)
+set_tests_properties(cover_sources PROPERTIES TIMEOUT 120)
+
+add_test(NAME cover_source_controller COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_cover_source_controller.py"
+  --exe "$<TARGET_FILE:rtaweb>" --encoder "ffmpeg.exe"
+  --decoder "ffmpeg-lite/ffmpeg.exe" --probe "ffmpeg-lite/ffprobe.exe"
+  --evidence-dir "cover-source-controller-evidence")
+set_tests_properties(cover_source_controller PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE)
+
+# 3.3.2 preferences, conservative cleanup learning and failed-check throttling.
+add_test(NAME ui_preferences_backend COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_ui_preferences_backend.py")
+set_tests_properties(ui_preferences_backend PROPERTIES TIMEOUT 180)
+add_test(NAME quickstart_preference COMMAND "${RLPLAYER_NODE_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_quickstart_preference.js"
+  --work-root "quickstart-preference-evidence")
+set_tests_properties(quickstart_preference PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE)
+add_test(NAME cleanup_auto_ui COMMAND "${RLPLAYER_NODE_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_cleanup_auto_ui.js" --work-root "cleanup-auto-ui-evidence")
+set_tests_properties(cleanup_auto_ui PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+add_test(NAME listening_modes_ui COMMAND "${RLPLAYER_NODE_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_listening_modes.js" --work-root "listening-modes-evidence")
+set_tests_properties(listening_modes_ui PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+add_test(NAME transport_usability_ui COMMAND "${RLPLAYER_NODE_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_transport_usability.js" --work-root "transport-usability-evidence")
+set_tests_properties(transport_usability_ui PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+add_executable(test_recording_cleanup_auto tests/test_recording_cleanup_auto.cpp)
+target_link_libraries(test_recording_cleanup_auto PRIVATE rtadsp)
+add_dependencies(test_recording_cleanup_auto review4_cache_fingerprint_refresh)
+add_test(NAME recording_cleanup_auto COMMAND test_recording_cleanup_auto)
+set_tests_properties(recording_cleanup_auto PROPERTIES TIMEOUT 180)
+add_test(NAME recording_cleanup_auto_oracle COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_recording_cleanup_auto_oracle.py"
+  "$<TARGET_FILE:test_recording_cleanup_auto>" --work-dir "cleanup-auto-oracle-evidence")
+set_tests_properties(recording_cleanup_auto_oracle PROPERTIES TIMEOUT 180)
+add_test(NAME update_check_retry COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_update_check_retry.py" --exe "$<TARGET_FILE:rtaweb>")
+set_tests_properties(update_check_retry PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+add_test(NAME rlplayer_shared_quota COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+  -s "${CMAKE_SOURCE_DIR}/tests" -p test_shared_monthly_quota.py -v)
+set_tests_properties(rlplayer_shared_quota PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+
+# Unified listening controls and session-preserving digital comparison.
+add_test(NAME workbench_switch COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_workbench_switch.py" "$<TARGET_FILE:rtaweb>"
+  --make-dsd "$<TARGET_FILE:make_dsd>" --compiler "${CMAKE_CXX_COMPILER}" --evidence "workbench-evidence")
+set_tests_properties(workbench_switch PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE)
+add_test(NAME workbench_profiles_ui COMMAND "${RLPLAYER_NODE_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_workbench_profiles_ui.js")
+set_tests_properties(workbench_profiles_ui PROPERTIES TIMEOUT 60)
+add_test(NAME digital_console335 COMMAND "${RLPLAYER_NODE_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_digital_console335.js" --source "${CMAKE_SOURCE_DIR}"
+  --work-root "console-evidence")
+set_tests_properties(digital_console335 PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+add_test(NAME workspace335_integration COMMAND "${RLPLAYER_NODE_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_workspace335_integration.js" --source "${CMAKE_SOURCE_DIR}"
+  --work-root "workspace-evidence")
+set_tests_properties(workspace335_integration PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+
+# 3.3.6: real production WASAPI packing and pause/resume continuity.
+if(WIN32)
+  add_executable(test_pause_resume336 tests/test_pause_resume336.cpp)
+  target_include_directories(test_pause_resume336 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(test_pause_resume336 PRIVATE ole32 uuid mmdevapi)
+  add_test(NAME pause_resume336 COMMAND test_pause_resume336)
+  set_tests_properties(pause_resume336 PROPERTIES TIMEOUT 120)
+  # 3.3.10: physical pace guard (ZiSan 1.536 MHz exclusive: GetCurrentPadding does not throttle)
+  add_executable(test_pace_guard tests/test_pace_guard.cpp)
+  target_include_directories(test_pace_guard PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(test_pace_guard PRIVATE ole32 uuid mmdevapi)
+  add_test(NAME pace_guard COMMAND test_pace_guard)
+  set_tests_properties(pace_guard PROPERTIES TIMEOUT 60)
+  add_executable(test_library_sources336 tests/test_library_sources336.cpp)
+  target_link_libraries(test_library_sources336 PRIVATE rtadsp winhttp ole32 uuid)
+  add_test(NAME library_sources336 COMMAND test_library_sources336)
+  set_tests_properties(library_sources336 PROPERTIES TIMEOUT 120)
+  add_executable(test_waveform336 tests/test_waveform336.cpp)
+  target_link_libraries(test_waveform336 PRIVATE rtadsp)
+  add_test(NAME waveform336 COMMAND test_waveform336
+    "${CMAKE_CURRENT_BINARY_DIR}/waveform336-evidence"
+    "${CMAKE_SOURCE_DIR}/tests/fixtures/waveform336.flac")
+  set_tests_properties(waveform336 PROPERTIES TIMEOUT 180)
+endif()
+add_test(NAME controls336 COMMAND "${RLPLAYER_NODE_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_controls336.js" --source "${CMAKE_SOURCE_DIR}"
+  --work-root "controls336-evidence")
+set_tests_properties(controls336 PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+add_test(NAME workbench_profiles336 COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_profiles336.py" "$<TARGET_FILE:rtaweb>")
+set_tests_properties(workbench_profiles336 PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE)
+add_test(NAME profiles_migration336 COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_profiles_migration336.py"
+  --build "${CMAKE_CURRENT_BINARY_DIR}" --evidence-dir "profiles-migration336-evidence")
+set_tests_properties(profiles_migration336 PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)

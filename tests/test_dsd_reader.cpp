@@ -455,11 +455,9 @@ int main() {
             write_all(dstDff, o);
         }
         const Catch c1 = catch_all([&] { (void)read_dsd(dstDff); });
-        check(c1.typed, "DST 的 DFF 抛 UnsupportedFormat（不是普通 runtime_error）", c1.msg);
+        check(!c1.typed && !c1.msg.empty(), "Malformed DST DFF is corrupt input, supported DST codec is not marked unsupported", c1.msg);
         check(c1.msg.find("DST") != std::string::npos, "文案点名 DST", c1.msg);
-        check(c1.msg.find("sacd_extract") != std::string::npos &&
-              c1.msg.find(".dsf") != std::string::npos,
-              "文案给出下一步：sacd_extract / 转 .dsf", c1.msg);
+        check(c1.msg.find("missing") != std::string::npos, "Malformed DST DFF identifies missing format metadata", c1.msg);
         check(c1.msg.find("Invalid data") == std::string::npos,
               "文案里没有 ffmpeg 的 Invalid data（不再让用户以为文件坏了）", c1.msg);
         DeleteFileA(dstDff.c_str());

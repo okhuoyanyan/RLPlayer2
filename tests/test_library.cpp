@@ -184,6 +184,28 @@ int main() {
     // 否则会读写真实 exe 目录里的 rlplayer-library.conf / index.tsv，污染用户库并让断言全错。
     _putenv_s("RLPLAYER_LIBRARY_DIR", tmp.string().c_str());
 
+    // A v4 cv=1 hint alone is not image evidence. Use two real, silent FLACs
+    // owning a mathematically generated JPEG so the local-art policy below is
+    // proved by the returned original bytes, independently of online identity.
+    const fs::path v4OwnDir=tmp/"v4-own-embedded";
+    const fs::path v4OwnJpeg=tmp/"v4-original.jpg";
+    const fs::path v4OwnFirst=v4OwnDir/"01.flac",v4OwnSecond=v4OwnDir/"02.flac";
+    fs::create_directories(v4OwnDir,ec);
+    const std::string v4Ffmpeg=rta::audio::find_tool("ffmpeg");
+    if(!v4Ffmpeg.empty()){
+        const std::wstring command=L"\""+rta::audio::widen(v4Ffmpeg)+L"\"";
+        rta::audio::run_hidden(command+L" -v error -y -f lavfi -i \"testsrc2=s=320x320:d=1\" -frames:v 1 -c:v mjpeg -q:v 2 \""+v4OwnJpeg.wstring()+L"\"",nullptr);
+        rta::audio::run_hidden(command+L" -v error -y -f lavfi -i \"anullsrc=r=44100:cl=stereo\" -i \""+v4OwnJpeg.wstring()+L"\" -map 0:a -map 1:v -c:a flac -c:v copy -disposition:v attached_pic -t 1 \""+v4OwnFirst.wstring()+L"\"",nullptr);
+        fs::copy_file(v4OwnFirst,v4OwnSecond,fs::copy_options::overwrite_existing,ec);
+    }
+    auto v4Utf8=[](const fs::path& p){const auto u=p.u8string();return std::string(reinterpret_cast<const char*>(u.data()),u.size());};
+    std::ifstream v4PictureFile(v4OwnJpeg,std::ios::binary);
+    const std::vector<unsigned char> v4OriginalPicture((std::istreambuf_iterator<char>(v4PictureFile)),{});
+    std::string v4OwnMime;
+    ck(v4OriginalPicture.size()>1024 && fs::is_regular_file(v4OwnSecond,ec) &&
+       rta::net::lib_cover_embedded_bytes(v4Utf8(v4OwnFirst),v4OwnMime)==v4OriginalPicture,
+       "旧 v4 本地图夹具：真实静音 FLAC 内嵌原始合成 JPEG（不凭 cv 标记）");
+
     // 构造索引：2 张专辑 + 1 个没有专辑标签的目录级条目
     // 字段顺序必须与 library.h 的 load() 一致
     {
@@ -202,8 +224,8 @@ int main() {
               << "\t" << trk << "\t" << disc << "\t" << yr << "\t" << sr << "\t" << bits
               << "\t" << ch << "\t" << dur << "\t" << cov << "\tRock" << "\t\t0\t0\t0\n";
         };
-        row("D:\\Music\\Beatles\\Abbey Road\\02.flac", "Abbey Road", "The Beatles", "The Beatles", "Something", 2, 1, 1969, 44100, 16, 2, 182.0, 1);
-        row("D:\\Music\\Beatles\\Abbey Road\\01.flac", "Abbey Road", "The Beatles", "The Beatles", "Come Together", 1, 1, 1969, 44100, 16, 2, 259.0, 1);
+        row(v4Utf8(v4OwnSecond), "Abbey Road", "The Beatles", "The Beatles", "Something", 2, 1, 1969, 44100, 16, 2, 182.0, 1);
+        row(v4Utf8(v4OwnFirst), "Abbey Road", "The Beatles", "The Beatles", "Come Together", 1, 1, 1969, 44100, 16, 2, 259.0, 1);
         // 同专辑名、不同专辑艺术家 -> 必须分成两张，不能合并
         row("D:\\Music\\Other\\Abbey Road\\01.flac", "Abbey Road", "Someone Else", "Someone Else", "Track A", 1, 1, 2001, 96000, 24, 2, 100.0, 0);
         // 多碟：第 2 碟应排在第 1 碟之后
@@ -236,7 +258,12 @@ int main() {
         ck(t0.title == "Come Together", "曲名解析正确", t0.title);
         ck(t0.sampleRate == 44100 && t0.bits == 16 && t0.channels == 2, "流参数解析正确");
     }
-    ck(ab.hasCover, "专辑封面标记透传（02/01 有封面）");
+    ck(ab.hasCover && ab.coverSrc==rta::net::kCoverEmbedded &&
+       ab.identitySource==rta::net::LibAlbumIdentitySource::LegacyUnknown && !ab.onlineCoverEligible,
+       "旧 v4 未知发行来源保留自己内嵌图，但不提升在线发行资格");
+    std::vector<unsigned char> v4AlbumPicture;std::string v4AlbumMime;
+    ck(lib.albumCover(ab.key,v4AlbumPicture,v4AlbumMime) && v4AlbumPicture==v4OriginalPicture,
+       "旧 v4 专辑图与真实 FLAC 自有合成 JPEG 原字节相同");
 
     // 多碟排序
     for (auto& a : albums) if (a.name == "Live Box") {
@@ -330,6 +357,8 @@ int main() {
     lib.load();                            // 无索引 → 曲目清空，根目录来自 conf
     ck(lib.roots().size() == 1, "扫描夹具：库根 = 1", std::to_string(lib.roots().size()));
     ck(lib.trackCount() == 0, "扫描夹具：起点曲目数 0");
+    _putenv_s("RLPLAYER_TAG_GUESS", "1");
+    _putenv_s("RLPLAYER_TAG_FILL", "1");
     lib.startScan(true);                   // 全量扫描（真实入口 /api/lib/scan?full=1 走的同一函数）
     lib.joinScan();
     ck(!lib.scanning(), "扫描结束 scanning=false");
@@ -389,28 +418,32 @@ int main() {
             } else line += idxText[i];
         }
     }
-    // 判据（铁律 3）：不是"表头里出现了 cue"，而是**前 16 列与 v3 逐字相同**（老读取路径只看前 16 列，
-    // 列序一动就串列）+ 末尾恰好追加 4 列。两条都写死，改任何一列都会红。
+    // 3.3.3 按位置读取前 22 列。3.3.4 只在末尾追加来源核对标记。
     const std::string kV3Head = "#path\tmtime\tsize\talbum\talbumArtist\tartist\ttitle\ttrack\tdisc\tyear\tsr\tbits\tch\tdur\thasCover\tgenre";
-    ck(header == kV3Head + "\tcue\tcueN\tcueOff\tcueLen",
-       "索引表头 = 前 16 列逐字不变 + 末尾追加 cue/cueN/cueOff/cueLen（v4）", header);
+    const std::string legacyV6Head = kV3Head + "\tcue\tcueN\tcueOff\tcueLen\talbumSource\tcodec";
+    const std::string currentHead = legacyV6Head + "\twavTextChecked";
+    ck(header == currentHead, "前 22 列名称和位置与 3.3.3 相同，第 23 列为 wavTextChecked", header);
     ck(header.rfind(kV3Head, 0) == 0 && header.size() > kV3Head.size(),
        "前 16 列表头与 v3 逐字相同（老索引/老读取路径不会串列）");
     ck(rows.size() == 8, "索引 8 行", std::to_string(rows.size()));
-    bool all20 = true;
-    for (auto& r : rows) if (r.size() != 20) all20 = false;
-    ck(all20, "每行 20 列（前 16 列原样 + 末尾 4 列 cue 字段）");
+    const bool currentWidth = std::all_of(rows.begin(), rows.end(), [](const auto& r) { return r.size() == 23; });
+    ck(currentWidth, "每行恰好 23 列");
+    ck(rows.size() == 8 && currentWidth && std::all_of(rows.begin(), rows.end(), [](const auto& r) {
+        return r[20] == "directory_inferred" && r[22] == "1";
+    }), "目录推导的 8 条记录保留第 21 列来源，启用标签核对后的新扫描在第 23 列记 1");
     std::map<std::string, std::pair<std::string, int>> boxRows;
     for (auto& r : rows)
-        if (r.size() == 20 && r[0].find("BoxSetAlbum") != std::string::npos)
+        if (r.size() >= 22 && r[0].find("BoxSetAlbum") != std::string::npos)
             boxRows[fs::path(r[0]).filename().string()] = { r[3], atoi(r[8].c_str()) };
     ck(boxRows.size() == 4, "TSV 里盒装 4 行", std::to_string(boxRows.size()));
-    bool tsvAlb = true, tsvDisc = true;
+    bool tsvAlb = boxRows.size() == 4, tsvDisc = boxRows.size() == 4;
+    const std::map<std::string, int> expectedDiscs{{"01-Track1.flac", 1}, {"02-Track2.flac", 1},
+                                                   {"01-Track3.flac", 2}, {"02-Track4.flac", 2}};
     std::string tsvDetail;
     for (auto& kv : boxRows) {
-        const int want = (kv.first == "01-Track1.flac" || kv.first == "02-Track2.flac") ? 1 : 2;
+        const auto want = expectedDiscs.find(kv.first);
         if (kv.second.first != "BoxSetAlbum") tsvAlb = false;
-        if (kv.second.second != want) tsvDisc = false;
+        if (want == expectedDiscs.end() || kv.second.second != want->second) tsvDisc = false;
         tsvDetail += kv.first + "=" + kv.second.first + "/" + std::to_string(kv.second.second) + " ";
     }
     ck(tsvAlb, "TSV album 列 = BoxSetAlbum（4 行）", tsvDetail);
@@ -455,23 +488,35 @@ int main() {
     // ---- [3] 老索引自愈：album 空 / disc 0 的旧记录在**增量**扫描里被补上 ----
     {
         std::string patched;
+        size_t oldRows = 0;
         {
             std::string line;
             for (size_t i = 0; i <= idxText.size(); ++i) {
                 if (i == idxText.size() || idxText[i] == '\n') {
                     if (!line.empty() && line[0] != '#') {
                         auto f = splitTsv(line);
-                        if (f.size() == 20) { f[3] = ""; f[8] = "0"; }   // 模拟老索引：album 空、disc 0
+                        if (f.size() == 23) {
+                            f.pop_back();  // 3.3.3 写入的索引没有 wavTextChecked
+                            f[3].clear(); f[8] = "0";
+                            ++oldRows;
+                        }
                         for (size_t k = 0; k < f.size(); ++k) { if (k) patched += '\t'; patched += f[k]; }
                         patched += '\n';
-                    } else if (!line.empty()) { patched += line; patched += '\n'; }
+                    } else if (!line.empty()) { patched += line == currentHead ? legacyV6Head : line; patched += '\n'; }
                     line.clear();
                 } else line += idxText[i];
             }
         }
+        ck(oldRows == 8 && patched.find("wavTextChecked") == std::string::npos,
+           "老版本夹具实际写入 8 条 22 列记录及原表头", std::to_string(oldRows));
         { std::ofstream f(idxFile, std::ios::binary | std::ios::trunc); f << patched; }
         lib.load();
-        ck(lib.trackCount() == 8, "老格式索引仍能读（列数/顺序未变）");
+        size_t pending = 0;
+        for (size_t i = 0; i < lib.trackCount(); ++i) {
+            rta::net::LibTrack old;
+            if (lib.trackAt(i, old) && old.album.empty() && old.discNo == 0 && !old.wavTextChecked) ++pending;
+        }
+        ck(lib.trackCount() == 8 && pending == 8, "新版本读取 22 列旧格式，缺失的第 23 列按未核对读取");
         lib.startScan(false);                // 增量：mtime+size 未变 → 走缓存分支
         lib.joinScan();
         ck(lib.lastScanProbed() == 0, "增量扫描 0 次 ffprobe（旧记录被复用）", std::to_string(lib.lastScanProbed()));
@@ -483,8 +528,8 @@ int main() {
         }
         ck(healed == 4, "老索引经增量扫描自愈：4 首盒装曲目重新拿到 album/disc", std::to_string(healed));
         const std::string idx2 = readAll(idxFile);
-        ck(idx2.find("BoxSetAlbum") != std::string::npos && idx2.find("#libIndexV\t5") != std::string::npos,
-           "自愈结果已重新落盘（版本头是 v4）");
+        ck(idx2.find("BoxSetAlbum") != std::string::npos && idx2.find("#libIndexV\t6") != std::string::npos,
+           "自愈结果已重新落盘（版本头是 v6）");
     }
 
 
@@ -768,7 +813,7 @@ int main() {
             readIdx(libA, idxA);
             ck(!idxA.empty(), "v4 索引已落盘");
             const std::string textA = readAll(idxA);
-            ck(textA.find("#libIndexV\t5") != std::string::npos, "落盘版本头 = #libIndexV 5（2026-10-26 升版：标签修复 + 专辑归并）");
+            ck(textA.find("#libIndexV\t6") != std::string::npos, "落盘版本头 = #libIndexV 6（尾列保存专辑身份来源）");
             std::string headA;
             std::vector<std::vector<std::string>> rowsA;
             {
@@ -781,22 +826,21 @@ int main() {
                     } else line += textA[i];
                 }
             }
-            const std::string kV3Head =
-                "#path\tmtime\tsize\talbum\talbumArtist\tartist\ttitle\ttrack\tdisc\tyear\tsr\tbits\tch\tdur\thasCover\tgenre";
-            ck(headA == kV3Head + "\tcue\tcueN\tcueOff\tcueLen",
-               "表头 = v3 的 16 列逐字不变 + 末尾 4 列 cue/cueN/cueOff/cueLen", headA);
+            ck(headA == currentHead, "CUE 索引严格保留原 22 列，在尾部追加 wavTextChecked", headA);
             ck(rowsA.size() == 3, "索引 3 行（3 条虚拟曲目，没有整轨那一行）", std::to_string(rowsA.size()));
-            bool rows20 = rowsA.size() == 3;
-            for (auto& r : rowsA) if (r.size() != 20) rows20 = false;
-            ck(rows20, "每行 20 列");
-            bool cueCols = rowsA.size() == 3;
+            const bool cueWidth = rowsA.size() == 3 && std::all_of(rowsA.begin(), rowsA.end(), [](const auto& r) { return r.size() == 23; });
+            ck(cueWidth, "3 条虚拟曲目每行恰好 23 列");
+            ck(cueWidth && std::all_of(rowsA.begin(), rowsA.end(), [](const auto& r) {
+                return r[20] == "tagged" && r[21] == "pcm_s16le" && r[22] == "1";
+            }), "CUE 虚拟曲目保存专辑来源与物理文件的 codec / 核对标记");
+            bool cueCols = cueWidth;
             for (size_t i = 0; cueCols && i < rowsA.size(); ++i) {
                 if (rowsA[i][16] != cueU8) cueCols = false;
                 if (atoi(rowsA[i][17].c_str()) != (int)i + 1) cueCols = false;
                 if (_strtoi64(rowsA[i][18].c_str(), nullptr, 10) != (long long)i * 4 * SEC) cueCols = false;
-                if (_strtoi64(rowsA[i][19].c_str(), nullptr, 10) <= 0) cueCols = false;
+                if (_strtoi64(rowsA[i][19].c_str(), nullptr, 10) != (long long)(i == 2 ? 2 : 4) * SEC) cueCols = false;
             }
-            ck(cueCols, "落盘 cue 列 = 绝对路径 / cueN=1,2,3 / cueOff=0,176400,352800 / cueLen>0");
+            ck(cueCols, "落盘 cue 列 = 绝对路径 / cueN=1,2,3 / cueOff=0,176400,352800 / cueLen=176400,176400,88200");
 
             // ---- 重启回读：cue 字段必须真的从索引里回来 ----
             lib.load();
@@ -1029,7 +1073,7 @@ int main() {
         ck(lib.needsConvertCount() == 2, "两首都标着「需转换」（needsConvertCount=2）",
            std::to_string(lib.needsConvertCount()));
         const std::string sSacd = p2u(isoSacd), sData = p2u(isoData);
-        ck(lib.isoKindOf(sSacd) == "sacd", "根目录含 SACD/ ⟹ isoKindOf = sacd", lib.isoKindOf(sSacd));
+        ck(lib.isoKindOf(sSacd) == "data", "SACD directory without Master TOC is only data", lib.isoKindOf(sSacd));
         ck(lib.isoKindOf(sData) == "data", "没有 SACD 目录 ⟹ isoKindOf = data", lib.isoKindOf(sData));
 
         bool flags5 = lib.trackCount() == 2;
@@ -1041,7 +1085,7 @@ int main() {
             codecs += t.codec + " | ";
         }
         ck(flags5, "入库记录：needsConvert=true、sr=0、dur=0（不当可播音轨）", codecs);
-        ck(codecs.find("SACD ISO") != std::string::npos && codecs.find("数据盘") != std::string::npos,
+        ck(codecs.find("数据盘") != std::string::npos,
            "codec 字段带出「SACD ISO（需转换）」/「ISO 数据盘（非音频镜像）」", codecs);
         ck(lib.scanMsg().find("需转换") != std::string::npos,
            "扫描消息里如实报「N 个 ISO 镜像需转换」", lib.scanMsg());
@@ -1056,10 +1100,8 @@ int main() {
             try { (void)rta::audio::read_any(sData, nullptr); }
             catch (const rta::audio::UnsupportedFormat& e) { t2 = true; m2 = e.what(); }
             catch (const std::exception& e) { m2 = e.what(); }
-            ck(t1 && m1.find("SACD ISO") != std::string::npos &&
-               m1.find("sacd_extract") != std::string::npos,
-               "播 SACD ISO ⟹ 「SACD ISO 镜像暂不支持直接播放…请先用 sacd_extract 转成分轨 .dsf」(UnsupportedFormat)",
-               m1);
+            ck(t1 && m1.find("不是音频镜像") != std::string::npos,
+               "ISO9660 SACD directory without Master TOC is rejected as non-audio",m1);
             ck(t2 && m2.find("不是音频镜像") != std::string::npos,
                "播普通数据盘 ISO ⟹ 「这不是音频镜像…」（不是 SACD 提示，也不是 Invalid data）", m2);
             ck(m1.find("Invalid data") == std::string::npos && m2.find("Invalid data") == std::string::npos,
@@ -1077,10 +1119,10 @@ int main() {
             // 索引没有 codec 列 ⟹ 重启后 trackAt 会用路径补一条内存标签，UI 的「需转换」才不会消失
             std::string lb;
             for (size_t i = 0; i < lib.trackCount(); ++i) lb += trackOf6(i).codec + " | ";
-            ck(lb.find("需转换") != std::string::npos,
-               "重启后 /api/lib/album 的 codec 字段仍有「需转换」（trackAt 按扩展名补，纯内存）", lb);
+            ck(lb.find("ISO 数据盘") != std::string::npos,
+               "Reload retains non-audio image classification in codec column", lb);
         }
-        ck(lib.isoKindOf(sSacd) == "sacd", "重启后 isoKindOf 仍答 sacd（读镜像头，随时可问）");
+        ck(lib.isoKindOf(sSacd) == "data", "Restart preserves structural rejection of fake SACD");
         fs::remove_all(tmp7, ec);
     }
 
@@ -1149,14 +1191,14 @@ int main() {
         fs::create_directories(libH, ec);
         {
             std::ofstream f(libH / U("rlplayer-index.tsv"), std::ios::binary);
-            f << "#libIndexV\t5\n";
+            f << "#libIndexV\t6\n";
             f << "#path\tmtime\tsize\talbum\talbumArtist\tartist\ttitle\ttrack\tdisc\tyear\tsr\tbits\tch\tdur\thasCover\tgenre"
-                 "\tcue\tcueN\tcueOff\tcueLen\n";
+                 "\tcue\tcueN\tcueOff\tcueLen\talbumSource\n";
             auto row = [&](const fs::path& p, const char* alb, const char* aa, const char* art,
                            const char* ttl, int trk, int disc, int cov) {
                 f << p2u(p) << "\t111\t222\t" << alb << "\t" << aa << "\t" << art << "\t" << ttl
                   << "\t" << trk << "\t" << disc << "\t0\t44100\t16\t2\t60.0\t" << cov
-                  << "\tRock\t\t0\t0\t0\n";
+                  << "\tRock\t\t0\t0\t0\ttagged\n";
             };
             // ① 一目录多专辑（BUG 现场的最小复现）：hasCover=1 是因为**目录里有封面文件**
             row(dirMix / U("01.flac"), "混装甲", "甲", "甲", "t1", 1, 1, 1);
@@ -1330,12 +1372,12 @@ int main() {
         fs::create_directories(libJ, ec);
         {
             std::ofstream f(libJ / U("rlplayer-index.tsv"), std::ios::binary);
-            f << "#libIndexV\t5\n";
+            f << "#libIndexV\t6\n";
             f << "#path\tmtime\tsize\talbum\talbumArtist\tartist\ttitle\ttrack\tdisc\tyear\tsr\tbits\tch\tdur\thasCover\tgenre"
-                 "\tcue\tcueN\tcueOff\tcueLen\n";
+                 "\tcue\tcueN\tcueOff\tcueLen\talbumSource\n";
             auto row = [&](const fs::path& p, const char* alb, const char* ttl, int trk, int cov) {
                 f << p2u(p) << "\t111\t222\t" << alb << "\t" << alb << "\t" << alb << "\t" << ttl
-                  << "\t" << trk << "\t1\t0\t44100\t16\t2\t60.0\t" << cov << "\tRock\t\t0\t0\t0\n";
+                  << "\t" << trk << "\t1\t0\t44100\t16\t2\t60.0\t" << cov << "\tRock\t\t0\t0\t0\ttagged\n";
             };
             if (ffOk) { row(flacEmb, "甲", "a1", 1, 1); row(flacNoPic, "甲", "a2", 2, 1); }
             row(dirMix / U("幽灵.flac"), "乙", "b1", 1, 1);          // 不存在 + hasCover=1（只有目录文件）

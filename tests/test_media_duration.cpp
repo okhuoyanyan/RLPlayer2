@@ -469,7 +469,7 @@ int main() {
             remove_file(tamperedDsf);
         }
 
-        // 7.3 DFF 篡改 header DSD chunk 大小对照测试
+        // 7.3 DFF extent boundaries: malformed declaration versus physically complete control
         std::printf("  7.3 DFF 篡改 header DSD chunk 大小对照\n");
         {
             const std::string origDff = temp_file("rta_dur_orig.dff");
@@ -502,17 +502,50 @@ int main() {
                     std::printf("    | 口径        | 篡改前（705600 字节）| 篡改后（1411200 字节）| 结论                     |\n");
                     std::printf("    | ffprobe     | %15.6f s | %16.6f s | 恒 1.000s（看文件长度）  |\n",
                                 ffOrig, ffTampered);
-                    std::printf("    | probe_media | %15.6f s | %16.6f s | 跟随 header chunk 大小  |\n",
+                    std::printf("    | probe_media | %15.6f s | %16.6f s | 损坏时回退实际长度     |\n",
                                 miOrig.duration, miTampered.duration);
 
-                    ck(std::fabs(miTampered.duration - 2.0) < 0.005,
-                       "probe_media(tampered DFF)：duration 严格跟随 header chunk 大小 2.000s",
-                       "duration=" + std::to_string(miTampered.duration));
-                    ck(std::fabs(ffTampered - 1.0) < 0.01,
-                       "对照：ffprobe 对篡改后 DFF 仍报 1.000s",
-                       "ffTampered=" + std::to_string(ffTampered));
-                    ck(rta::audio::media_duration_sec(miTampered.duration) == 2,
-                       "篡改后 fileSec = 2");
+                    // Independent physical oracle: the mutation changed no payload bytes and no
+                    // FRM8 container length. A declared child extent outside its parent is corrupt,
+                    // not a second second of audio. Keep metadata's tolerant ffprobe fallback,
+                    // while requiring both native playback/probe paths to reject the corrupt extent.
+                    auto big64 = [](const std::vector<uint8_t>& v,size_t at){uint64_t n=0;for(size_t i=0;i<8;++i)n=(n<<8)|v[at+i];return n;};
+                    const uint64_t physicalPayload=bytes.size()-dsdChunkOff-12;
+                    const double physicalSeconds=double(physicalPayload/2*8)/2822400.0;
+                    ck(physicalPayload==705600 && big64(bytes,4)+12==bytes.size(),
+                       "Independent DFF oracle: FRM8 exactly spans file, only 705600 physical DSD bytes remain");
+                    ck(big64(bytes,dsdChunkOff+4)==1411200 && dsdChunkOff+12+1411200>bytes.size(),
+                       "Mutated DSD child extent exceeds both FRM8 parent and physical EOF");
+                    std::printf("    physical_file=%zu DSD_offset=%zu physical_payload=%llu declared_payload=%llu physical_seconds=%.6f\n",
+                                bytes.size(),dsdChunkOff,(unsigned long long)physicalPayload,
+                                (unsigned long long)big64(bytes,dsdChunkOff+4),physicalSeconds);
+                    bool nativeRejected=false;std::string nativeWhy;
+                    try{(void)rta::audio::probe_dsd(tamperedDff);}catch(const std::exception&e){nativeRejected=true;nativeWhy=e.what();}
+                    ck(nativeRejected && nativeWhy.find("exceeds FRM8")!=std::string::npos,
+                       "Native DFF probe explicitly rejects child extent outside FRM8",nativeWhy);
+                    rta::audio::DsdPcmStream nativeStream;std::string streamWhy;
+                    ck(!nativeStream.open(tamperedDff,rta::audio::dsd_pcm_settings(),&streamWhy),
+                       "Native DFF playback stream rejects truncated/overstated audio",streamWhy);
+                    ck(std::fabs(miTampered.duration-physicalSeconds)<0.005,
+                       "Tolerant metadata fallback reports physical audio duration instead of invented bytes",
+                       "duration="+std::to_string(miTampered.duration)+" physical="+std::to_string(physicalSeconds));
+                    ck(std::fabs(ffTampered-physicalSeconds)<0.01,
+                       "Independent ffprobe fallback agrees with physical-byte oracle");
+                    ck(rta::audio::media_duration_sec(miTampered.duration)==1,
+                       "Corrupt declaration cannot manufacture a second second for fileSec matching");
+                    // Positive control: supply the missing real audio bytes AND repair the parent
+                    // extent. A genuine two-second file must remain valid and report two seconds.
+                    std::vector<uint8_t> complete=bytes;complete.resize(dsdChunkOff+12+(size_t)newSz,0x55);
+                    const uint64_t completeForm=complete.size()-12;
+                    for(int j=0;j<8;++j)complete[4+j]=(uint8_t)(completeForm>>(8*(7-j)));
+                    const std::string completeDff=temp_file("rta_dur_complete_2s.dff");
+                    ck(write_bytes(completeDff,complete),"Write physically complete two-second DFF control");
+                    const auto completeInfo=rta::audio::probe_dsd(completeDff);
+                    ck(std::fabs(completeInfo.seconds()-2.0)<0.000001 && completeInfo.bits==5644800,
+                       "Native DFF accepts genuine two-second payload with repaired parent extent");
+                    ck(std::fabs(probe_media(completeDff).duration-2.0)<0.005,
+                       "Metadata still reports two seconds when actual two-second audio exists");
+                    remove_file(completeDff);
                 }
             }
             remove_file(origDff);

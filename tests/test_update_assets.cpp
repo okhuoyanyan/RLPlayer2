@@ -35,5 +35,36 @@ int main(){try{
  confirm_on_startup();require(read_pending().phase=="applied","symlink target rejected");require(!path_exists(asset(outside,"en")),"symlink cannot write outside");
  RemoveDirectoryW(rta::platform::from_utf8(link).c_str());rmtree(outside);
  st=prepare();auto original=read_pending();original.staging=root+"-untrusted";write_pending(original);confirm_on_startup();require(read_pending().phase=="done","ignore untrusted pending staging path");
+
+ // A distribution must never install or roll back per-track manual artwork.
+ st=prepare();const std::string cacheDir=join_path(root,"trackcovercache");ensure_dir(cacheDir);ensure_dir(join_path(st,"trackcovercache"));
+ const std::string manifestRel=R"(trackcovercache\0123456789abcdef.jpg.source.json)",blobRel=R"(trackcovercache\0123456789abcdef.sha.blob)",newRel=R"(trackcovercache\new.blob)";
+ write_text_file(join_path(root,manifestRel),"user-manual-source");write_text_file(join_path(root,blobRel),"user-manual-image");write_text_file(join_path(root,"app.bin"),"old-app");
+ const std::vector<std::string> planned={"app.bin",manifestRel,blobRel,newRel};std::string marker;
+ for(const auto& rel:planned){write_text_file(join_path(st,rel),"package-content");marker+="file="+rel+"\t15\n";}
+ write_text_file(staging_marker_path(st),marker);auto plan=read_pending();plan.phase="ready";plan.files=planned;write_pending(plan);apply_pending_on_startup();
+ require(read_pending().phase=="applied"&&read_text_file(join_path(root,"app.bin"))=="package-content","actual install replaces application file");
+ require(read_text_file(join_path(root,manifestRel))=="user-manual-source"&&read_text_file(join_path(root,blobRel))=="user-manual-image","actual install preserves track manual manifest and image bytes");
+ require(!path_exists(join_path(root,newRel)),"package cannot add files inside track artwork state");
+ auto installed=read_pending();require(installed.applied.size()==1&&installed.applied[0]=="app.bin","protected track artwork is absent from install rollback ledger");
+ rollback_pending("private artwork preservation regression");require(read_pending().phase=="rolled_back"&&read_text_file(join_path(root,"app.bin"))=="old-app","normal rollback restores application file");
+ require(read_text_file(join_path(root,manifestRel))=="user-manual-source"&&read_text_file(join_path(root,blobRel))=="user-manual-image","normal rollback leaves track artwork unchanged");
+ require(is_protected_rel("TRACKCOVERCACHE/nested/image.blob")&&is_protected_rel("trackcovercache"),"track cache protection is recursive and case/slash independent");
+ require(!is_protected_rel("trackcovercache-other/file.bin"),"protection requires a complete directory component");
+ auto forged=read_pending();forged.phase="applied";forged.applied={manifestRel};forged.added={blobRel};ensure_dir(join_path(backup_dir(forged.version),"trackcovercache"));write_text_file(join_path(backup_dir(forged.version),manifestRel),"wrong-backup-source");write_pending(forged);rollback_pending("untrusted artwork ledger");
+ require(read_pending().phase=="rollback_failed","rollback refuses a ledger that names protected artwork");
+ require(read_text_file(join_path(root,manifestRel))=="user-manual-source"&&read_text_file(join_path(root,blobRel))=="user-manual-image","forged rollback cannot replace or delete user track artwork");
+ // Execute the exact production packaging cleanup block in a confined fake stage.
+ const std::string build=join_path(root,"package-build"),out=join_path(build,"stage");ensure_dir(join_path(out,"trackcovercache"));write_text_file(join_path(out,"trackcovercache/user.blob"),"developer-cache");write_text_file(join_path(out,"program.bin"),"keep-program");write_text_file(join_path(build,"outside-sentinel"),"keep-outside");
+ const std::string script=join_path(root,"test-package-cleanup.ps1");
+ auto psquote=[](std::string x){size_t at=0;while((at=x.find('\'',at))!=std::string::npos){x.insert(at,"'");at+=2;}return "'"+x+"'";};
+ const std::string tools=join_path(UPDATE_ASSET_SOURCE,"tools"),make=join_path(tools,"make_dist.ps1");
+ std::string ps="$ErrorActionPreference='Stop'\n. "+psquote(join_path(tools,"package_paths.ps1"))+"\n$B="+psquote(build)+"\n$out="+psquote(out)+"\nfunction Get-SafeCleanupDirectory([string]$Target,[string]$Parent){return Resolve-ReleaseCleanupDirectory -BuildDir $B -Target $Target -Parent $Parent}\n";
+ ps+="$source=[IO.File]::ReadAllText("+psquote(make)+")\n$first=$source.IndexOf('$devStateDirs =');$last=$source.IndexOf('$devStateGlobs =',$first);if($first -lt 0 -or $last -le $first){throw 'production cleanup block missing'}\n& ([scriptblock]::Create($source.Substring($first,$last-$first)))\n";
+ write_text_file(script,ps);const auto cleanup=rta::platform::run_hidden("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -NonInteractive -File \""+script+"\"",true);
+ require(cleanup.started&&cleanup.exit_code==0,"production packaging cleanup executes successfully in private stage");
+ require(!path_exists(join_path(out,"trackcovercache")),"distribution cleanup excludes developer track artwork cache");
+ require(read_text_file(join_path(out,"program.bin"))=="keep-program"&&read_text_file(join_path(build,"outside-sentinel"))=="keep-outside","packaging cleanup preserves program files and out-of-stage sentinel");
+
  rmtree(root);_putenv_s("RLPLAYER_UPDATE_DIR","");std::cout<<"PASS "<<checks<<" / FAIL 0\n";return 0;
 }catch(const std::exception& e){std::cerr<<"FAIL: "<<e.what()<<" after "<<checks<<" checks\n";return 1;}}

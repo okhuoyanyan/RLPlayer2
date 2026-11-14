@@ -29,6 +29,7 @@
 #include <vector>
 #include "wav.h"        // rta::audio::AudioBuffer
 #include "dsp/dop.h"    // ★ F18：DoP 补齐必须用合法 marker（0x05/0xFA），不能补 PCM 零
+#include "playback_segment.h"
 
 namespace rta::render {
 
@@ -61,6 +62,10 @@ struct OutSink {
     virtual double out_peak() const { return 0.0; }
     virtual void   pause() {}
     virtual void   resume() {}
+    // USB WASAPI drivers can lose their packet/clock state across Stop/Start.
+    // These sinks stay started and receive digital silence while the content
+    // cursor is frozen. Stop/close still releases the device normally.
+    virtual bool   keep_clock_on_pause() const { return false; }
     virtual void   close() {}
     virtual const std::string& last_error() const = 0;
     // RENDERFAIL 遥测：最近一次 GetBuffer 的 HRESULT（-999 = 从未调过）。
@@ -129,6 +134,7 @@ struct RenderQ {
             std::lock_guard<std::mutex> lock(mtx);
             requestedEpoch=epoch.fetch_add(1)+1;
             seekFrame.store(frame);
+            done=false; // A new epoch has not reached EOF, even if the old one did.
         }
         cv.notify_all();
         return requestedEpoch;
@@ -136,6 +142,17 @@ struct RenderQ {
     std::pair<long long,uint64_t> consume_seek() {
         std::lock_guard<std::mutex> lock(mtx);
         return {seekFrame.exchange(-1),epoch.load()};
+    }
+    // EOF belongs to an epoch, not to the lifetime of the decoder thread.
+    // A short file can be fully produced before the first seek/loop request.
+    // Keep that owner available until the renderer explicitly aborts it.
+    bool wait_after_eof(uint64_t finishedEpoch) {
+        std::unique_lock<std::mutex> lock(mtx);
+        if(!error&&epoch.load()!=finishedEpoch&&seekFrame.load()>=0){done=false;return true;}
+        done=true;cv.notify_all();
+        cv.wait(lock,[&]{return abort.load()||error||seekFrame.load()>=0;});
+        if(abort.load()||error)return false;
+        done=false;return true;
     }
 };
 
@@ -156,6 +173,7 @@ struct RenderHost {
 
     // ---- 队列 ----
     RenderQ* rq = nullptr;
+    std::function<rta::audio::PlaybackSegment()> segment;
 
     // ---- 本次播放的形状（原 play_one 局部量）----
     uint32_t deviceRate = 0;
@@ -284,6 +302,23 @@ inline double render_now_sec() {
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
+inline void dop_rephase(std::vector<int32_t>& pcm, int channels, bool nextA) {
+    for (size_t i=0; i<pcm.size()/(size_t)channels; ++i) {
+        const uint32_t marker=(nextA?rta::dsp::DOP_MARKER_A:rta::dsp::DOP_MARKER_B)<<16;
+        for(int c=0;c<channels;++c){
+            uint32_t v=marker|(uint32_t(pcm[i*(size_t)channels+c])&0xffffu);
+            if(v&0x800000u)v|=0xff000000u;
+            pcm[i*(size_t)channels+c]=(int32_t)v;
+        }
+        nextA=!nextA;
+    }
+}
+
+inline void pause_silence(std::vector<int32_t>& pcm, size_t frames, int channels, bool dop, bool nextA) {
+    pcm.assign(frames*(size_t)channels,dop?0x6969:0);
+    if(dop)dop_rephase(pcm,channels,nextA);
+}
+
 // ---------------- 渲染主循环 ----------------
 // 从队列取块 → 20ms 轮询设备水位 → 补满设备缓冲。行为与抽出前逐行一致。
 inline void render_loop(OutSink& sink, RenderHost& h) {
@@ -343,6 +378,9 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
     // Seek may discard an odd number of already-packed frames from pend/RQ.q.
     // Keep this phase across seek; zero/failed writes never advance it.
     bool dopNextMarkerA = true;
+    std::vector<int32_t> pausePcm;
+    double pauseWriteFailedAt=-1.0;
+    bool segmentEnded=false;
 
     // ---- 开播自检 / 超时熔断状态（2026-10-24 N300 96k 掉 USB）----
     // 全部是本地量：不分配、不加锁、不改变写入调度；只在判罚时提前 break。
@@ -436,12 +474,20 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
     };
 
     while (!h.stop->load()) {
-        // 响应暂停：Stop 设备（合法路径），恢复时 Start
-        if (h.pauseReq->load() != pausedNow) {
-            pausedNow = h.pauseReq->load();
-            if (pausedNow) { sink.pause(); h.paused->store(true); }
+        // Read the request once: rapid opposing HTTP requests must not make
+        // the branch decide with one value and execute with another.
+        const bool wantPause=h.pauseReq->load();
+        if (wantPause != pausedNow) {
+            pausedNow = wantPause;
+            if (pausedNow) {
+                if(!sink.keep_clock_on_pause())sink.pause();
+                pauseWriteFailedAt=-1.0;h.paused->store(true);
+            }
             else {
-                sink.resume(); h.paused->store(false); timeouts = 0;
+                if(!sink.keep_clock_on_pause())sink.resume();
+                // Silence has advanced DoP marker phase, but never its payload.
+                if(h.dop&&sink.keep_clock_on_pause())dop_rephase(pend,h.outCh,dopNextMarkerA);
+                h.paused->store(false); timeouts = 0;
                 // 暂停期间设备不消耗数据，必须把吞吐窗口清零重来，否则恢复瞬间
                 // 会被判成「设备不接受数据」（假的 STARVING）。
                 winStart = nowSec(); lastTick = winStart;
@@ -449,9 +495,36 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                 // 暂停期间设备不消费：实测速率窗口与超时串都必须重开，否则恢复瞬间
                 // 会把「暂停那段时间」算成设备跑不动（假的 RATE_TOO_SLOW）。
                 rateArmed = false; rateDone = false; rateSupplyLimited = false; hangN = 0;
+                lastIterT=nowSec();flushDry(lastIterT);lastLogT=lastIterT;
+                if(segmentEnded&&h.segment){const auto s=h.segment();if(s.enabled&&h.totalOut)h.seekReq->store(s.start*h.deviceRate/(double)h.totalOut);segmentEnded=false;}
             }
+            if(h.log)h.log(std::string(pausedNow?"PAUSE":"RESUME")+
+                " strategy="+(sink.keep_clock_on_pause()?"clock-silence":"backend")+
+                " content_frame="+std::to_string(played));
         }
-        if (pausedNow) { Sleep(30); continue; }
+        if (pausedNow) {
+            if(!sink.keep_clock_on_pause()){Sleep(30);continue;}
+            pause_silence(pausePcm,period,h.outCh,h.dop,dopNextMarkerA);
+            const size_t w=sink.write_available(pausePcm.data(),period);
+            if(w){
+                writtenTotal+=w;
+                if(h.dop&&(w&1u))dopNextMarkerA=!dopNextMarkerA;
+                pauseWriteFailedAt=-1.0;
+            }else{
+                const double t=nowSec();
+                if(pauseWriteFailedAt<0)pauseWriteFailedAt=t;
+                if(t-pauseWriteFailedAt>2.0){
+                    h.renderFail=true;
+                    h.failMsg="PAUSE_WRITE_FAILED 暂停期间输出流持续2秒不接受数字静音；已停止，设备可能已断开";
+                    if(h.log)h.log(h.failMsg);
+                    break;
+                }
+                const auto per=sink.device_period_frames();
+                const int ms=per>0&&h.deviceRate?std::max(1,std::min(20,(int)(500.0*per/h.deviceRate))):5;
+                sink.wait_event(ms);
+            }
+            continue;
+        }
 
         // 响应跳转：Reset 清空设备缓冲，让生产者从新位置重建管线
         const double sk = h.seekReq->exchange(-1.0);
@@ -473,6 +546,13 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
             continue;
         }
         if (RQ.gpu.load() && !*h.gpuOut) *h.gpuOut = true;
+        const auto segment=h.segment?h.segment():rta::audio::PlaybackSegment{};
+        const size_t segmentEnd=segment.enabled?std::min(h.totalOut,segment.end_frame(h.deviceRate)):h.totalOut;
+        if(segment.enabled&&played>=segmentEnd){
+            if(segment.repeat)h.seekReq->store(segment.start*h.deviceRate/(double)h.totalOut);
+            else {segmentEnded=true;h.pauseReq->store(true);}
+            continue;
+        }
 
         // 实时音量：只把「当前请求 - 起播时已应用的」这个差值交给设备层，
         // 差值为 0 时完全走原路径（逐位不变）。
@@ -598,7 +678,8 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
         // 新时序下一轮最多调用两次，若仍按轮计，zp（按调用）会大于 w0，M4 的
         // 「zp+zs+zo == w0」就不成立（真机现场 19925 vs 9693 就是这么来的）。
         auto attemptWrite = [&]() -> size_t {
-            const size_t got = sink.write_available(pend.data(), pendFrames);
+            const size_t permitted=segment.enabled?std::min(pendFrames,segmentEnd-played):pendFrames;
+            const size_t got = sink.write_available(pend.data(), permitted);
             if (got > 0) h.dbgWr->fetch_add(1); else h.dbgW0->fetch_add(1);
             return got;
         };

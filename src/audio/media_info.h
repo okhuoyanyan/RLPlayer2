@@ -15,6 +15,7 @@
 #include "audio/audio_loader.h"
 #include "audio/dsd_reader.h"
 #include "net/json.h"
+#include "meta/tags_native.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -273,6 +274,7 @@ inline MediaInfo probe_media(const std::string& file) {
         L"-of json \"" + widen(file) + L"\"";
     if (run_hidden(cmd, &out) == 0 && !out.empty()) {
         mi = probe_parse_json(out, dsdHeaderOk, mi);
+        rta::meta::native::recover_wav_text(file, mi.title, mi.artist, mi.album, mi.genre, true);
     }
     if (mi.bits <= 0) mi.bits = dsdHeaderOk ? 1 : 16;
     return mi;

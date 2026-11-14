@@ -14,6 +14,8 @@
 #pragma once
 // （原 WIN32_LEAN_AND_MEAN / NOMINMAX 前导已删：include 链下方的平台头自己会在 windows.h
 //   之前定义它们，行为不变；留着只会让"这个头依赖 Windows"看起来像真的。）
+#include "platform/fs.h"        // remove_file（本文件唯一的平台操作：删临时封面）
+#include "platform/path.h"
 #include "audio/audio_loader.h"
 #include "audio/media_info.h"
 #include "net/scan_pool.h"
@@ -61,9 +63,34 @@ inline std::string lib_ext_lc(const std::string& p) {
     return e;
 }
 
-// 「镜像」类文件：能识别、能入库，但**不能直接播**（2026-10-27，用户 261027-01 #3）。
-// 目前只有 .iso（SACD 镜像）。判据只看扩展名 —— 与 LibTrack::needsConvert() 同一口径。
+// Physical ISO candidates are enumerated into playable #sacd / #dvda tracks.
+// A remaining physical placeholder has no valid audio navigation and needs conversion/repair.
 inline bool lib_is_iso_path(const std::string& p) { return lib_ext_lc(p) == ".iso"; }
+
+enum class LibAlbumIdentitySource { Tagged, UserAssigned, DirectoryInferred, LegacyUnknown };
+inline const char* lib_album_identity_source_name(LibAlbumIdentitySource s) {
+    switch (s) {
+    case LibAlbumIdentitySource::Tagged: return "tagged";
+    case LibAlbumIdentitySource::UserAssigned: return "user_assigned";
+    case LibAlbumIdentitySource::DirectoryInferred: return "directory_inferred";
+    default: return "legacy_unknown";
+    }
+}
+inline bool lib_album_identity_trusted(LibAlbumIdentitySource s) {
+    return s == LibAlbumIdentitySource::Tagged || s == LibAlbumIdentitySource::UserAssigned;
+}
+inline LibAlbumIdentitySource lib_album_identity_source_parse(const std::string& s) {
+    if (s == "tagged") return LibAlbumIdentitySource::Tagged;
+    if (s == "user_assigned") return LibAlbumIdentitySource::UserAssigned;
+    if (s == "directory_inferred") return LibAlbumIdentitySource::DirectoryInferred;
+    return LibAlbumIdentitySource::LegacyUnknown;
+}
+struct LibAlbumIdentity {
+    std::string key, legacyKey, name, artist;
+    LibAlbumIdentitySource source = LibAlbumIdentitySource::LegacyUnknown;
+    bool onlineCoverEligible = false;
+    int dirAlbums = 1;
+};
 
 struct LibTrack {
     std::string path;         // 绝对路径（UTF-8）
@@ -74,10 +101,12 @@ struct LibTrack {
     long long mtime = 0, size = 0;
     int    hasCover = 0;
     // 来源标记（2026-10-25）：album / discNo 是不是「目录结构判据回填」的（= 该字段没有真实标签）。
-    // 不落盘、也不占索引列（列数/顺序必须与老索引一致）：落盘值本身就是「真实标签优先」的结果，
-    // 读回后不需要再判来源。只用于①防止覆盖真实标签 ②测试/调试能量出「这值从哪来」。
+    // v6 尾列持久化 albumIdentitySource；旧列顺序不变。目录显示名不是发行信息，
+    // 不能在重载后被误当真实标签用于在线匹配。albumFromDir 保留给旧调用方。
+    LibAlbumIdentitySource albumIdentitySource = LibAlbumIdentitySource::Tagged;
     bool   albumFromDir = false;
     bool   discFromDir  = false;
+    bool   wavTextChecked = false;  // per-file migration; offline roots retain their pending rows
 
     // ---- CUE 整轨分轨（2026-10-25 第二里程碑）----
     // 一张 .cue 把「一个整轨音频文件」切成 N 首：**path 仍然是物理音频路径**（播放器照旧能播，
@@ -97,8 +126,87 @@ struct LibTrack {
     // 为什么不落盘一个 bool：它完全由路径扩展名决定，这里现算 ⟹ 旧索引（v4/v5 没有这一列）
     // 读回来也是对的，不必升 #libIndexV 让用户整份重扫（升版本的代价见 load() 的注释）。
     // 「SACD 还是普通数据盘」需要读镜像才知道，由 Library::isoKindOf() 现问（见那里的说明）。
-    bool needsConvert() const { return lib_is_iso_path(path); }
+    bool needsConvert() const { return lib_is_iso_path(path); } // Enumerated virtual tracks are directly playable.
 };
+
+// Read only the sparse MetaStore entries at load/scan boundaries. Queries never
+// stat or parse per-track JSON. source=user is MetaStore's existing locked value.
+inline void lib_apply_user_metadata(std::vector<LibTrack>& tracks) {
+    auto& store = rta::meta::MetaStore::instance();
+    // Enumerate sparse records once, but open only hashes belonging to this
+    // library snapshot. CUE segments share one physical file and one read.
+    std::unordered_map<std::string, std::vector<size_t>> wanted;
+    for (size_t i = 0; i < tracks.size(); ++i)
+        wanted[rta::meta::MetaStore::hashOf(tracks[i].path)].push_back(i);
+    std::error_code ec;
+    const auto dir = rta::meta::meta_path_of(store.baseDir()) / "tracks";
+    for (fsx::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        // u8string never converts an arbitrary filename through the Windows
+        // local code page. Unknown/Unicode names are ignored before opening.
+        const auto filename = rta::meta::meta_string_of(it->path().filename());
+        if (filename.size() != 21 || filename.compare(16, 5, ".json") != 0) continue;
+        const auto hit = wanted.find(filename.substr(0, 16));
+        if (hit == wanted.end()) continue;
+        std::ifstream f(it->path(), std::ios::binary);
+        std::string bytes((std::istreambuf_iterator<char>(f)), {});
+        rta::net::Json j;
+        if (!rta::net::json_parse_strict(bytes, j) || j.type != rta::net::Json::Obj ||
+            j["fields"].type != rta::net::Json::Obj) continue;
+        const auto path = j["path"].s();
+        // Check the stored path as well as its hash (including collision safety).
+        for (size_t index : hit->second) {
+            auto& t = tracks[index];
+            if (path != t.path) continue;
+            const auto& fields = j["fields"];
+            auto str = [&](const char* key, std::string& out) {
+                const auto& value = fields[key];
+                if (value["source"].s() != "user") return false;
+                const auto text = value["value"].s();
+                if (text.empty()) return false;
+                out = text; return true;
+            };
+            auto number = [&](const char* key, int& out, bool ordinal = false) {
+                std::string value;
+                if (!str(key, value)) return false;
+                auto integer = [](const std::string& text, int& parsed, bool positive) {
+                    if (text.empty() || text.size() > 10) return false;
+                    int n = 0;
+                    for (unsigned char c : text) {
+                        if (c < '0' || c > '9') return false;
+                        const int digit = c - '0';
+                        if (n > (2147483647 - digit) / 10) return false;
+                        n = n * 10 + digit;
+                    }
+                    if (positive && n == 0) return false;
+                    parsed = n; return true;
+                };
+                const auto slash = value.find('/');
+                int n = 0;
+                if (slash == std::string::npos) {
+                    if (!integer(value, n, ordinal)) return false;
+                } else {
+                    if (!ordinal || value.find('/', slash + 1) != std::string::npos) return false;
+                    int total = 0;
+                    if (!integer(value.substr(0, slash), n, true) ||
+                        !integer(value.substr(slash + 1), total, true) || n > total) return false;
+                }
+                out = n; return true;
+            };
+            if (str("album", t.album)) {
+                t.albumFromDir = false;
+                t.albumIdentitySource = LibAlbumIdentitySource::UserAssigned;
+            }
+            str("albumArtist", t.albumArtist);number("year", t.year);
+            // A physical-file override cannot identify an individual CUE segment.
+            if (!t.isCueTrack()) {
+                str("artist", t.artist);str("title", t.title);
+                number("trackNo", t.trackNo, true);
+                if (number("discNo", t.discNo, true)) t.discFromDir = false;
+            }
+        }
+    }
+
+}
 
 // 专辑封面的**来源**（2026-10-27，用户 2.0 发包前 BUG：「专辑名对、封面严重错误」）。
 // 顺序有意义：数值越大越优先（见 albumVecLocked 里的 src > a.coverSrc）。
@@ -106,6 +214,7 @@ struct LibTrack {
 //   kCoverDirFile  同目录 cover/folder/front —— **仅当该目录（CD1/Disc 2 归一后）只对应一张专辑**
 //   kCoverEmbedded 曲目内嵌（APIC/PICTURE/covr）—— 永远首选（天然按"文件 → 专辑"绑定）
 enum LibCoverSrc { kCoverNone = 0, kCoverDirFile = 1, kCoverEmbedded = 2 };
+enum class LibCoverCacheState { Unknown, Present, Missing };
 
 struct LibAlbum {
     std::string key;          // 十六进制哈希（URL 用）
@@ -123,6 +232,8 @@ struct LibAlbum {
     // Old formula: (albumArtist|artist) + 0x1f + album. Kept so covercache entries
     // written by older versions are still found after upgrading.
     std::string legacyKey;
+    LibAlbumIdentitySource identitySource = LibAlbumIdentitySource::LegacyUnknown;
+    bool onlineCoverEligible = false;
     std::vector<size_t> idx;  // tracks_ 下标，已按 disc/track 排序
 };
 
@@ -249,7 +360,7 @@ public:
     int lastScanProbed() const { return lastScanProbed_.load(); }
     int lastScanCached() const { return lastScanCached_.load(); }
     // 2026-10-26：索引是否需要重新解析标签（v5 之前写的索引）。启动时用它决定要不要自动扫一次。
-    bool indexNeedsRetag() const { return idxHasHeader && !idxIsV5; }
+    bool indexNeedsRetag() const { return idxHasHeader && (!idxIsV6 || idxHasUnknownSource || !idxHasSourceDepth || idxHasUnverifiedWav); }
 
     // ---- 查询 ----
     std::vector<LibAlbum> albums() const {
@@ -260,6 +371,16 @@ public:
         std::lock_guard<std::mutex> lk(mtx_);
         const auto& v = albumVecLocked();
         for (auto& a : v) if (a.key == key) { out = a; return true; }
+        return false;
+    }
+    // Keep album identity and its path/CUE membership in one in-memory snapshot.
+    bool albumTracksSnapshot(const std::string& key,LibAlbum& out,std::vector<LibTrack>& members) const {
+        std::lock_guard<std::mutex> lk(mtx_);members.clear();
+        for(const auto& album:albumVecLocked())if(album.key==key){
+            out=album;members.reserve(album.idx.size());
+            for(size_t ix:album.idx){if(ix>=tracks_.size()){members.clear();return false;}members.push_back(tracks_[ix]);}
+            return true;
+        }
         return false;
     }
     bool trackAt(size_t i, LibTrack& out) const {
@@ -277,6 +398,30 @@ public:
 
     // 某专辑的封面（字节 + mime），失败返回空
     bool albumCover(const std::string& key, std::vector<unsigned char>& bytes, std::string& mime);
+    // 只查内存里已经抽好的封面（命中就 memcpy，零磁盘/零解析）。
+    // 2026-11-01（紧急 FB）：请求线程的抽取限流器只该挡"真的要抽"的请求，
+    // 已经缓存的图必须照样 1 ms 返回，不能被限流器误伤成 404。
+    bool albumCoverCached(const std::string& key, std::vector<unsigned char>& bytes, std::string& mime) const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = coverCache_.find(key);
+        if (it == coverCache_.end() || it->second.first.empty()) return false;
+        bytes = it->second.first;
+        mime = it->second.second;
+        return true;
+    }
+    // Metadata-only snapshot: list endpoints must not copy full image payloads
+    // or perform extraction while deciding cv/cvSrc. A known negative prevents
+    // stale index flags from promising a picture that failed local validation.
+    LibCoverCacheState albumCoverCacheState(const std::string& key,
+            std::vector<unsigned char>* prefix=nullptr,size_t* bytes=nullptr) const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if(prefix)prefix->clear();if(bytes)*bytes=0;
+        const auto it=coverCache_.find(key);
+        if(it==coverCache_.end())return LibCoverCacheState::Unknown;
+        if(bytes)*bytes=it->second.first.size();
+        if(prefix)prefix->assign(it->second.first.begin(),it->second.first.begin()+std::min<size_t>(16,it->second.first.size()));
+        return it->second.first.empty()?LibCoverCacheState::Missing:LibCoverCacheState::Present;
+    }
 
     // 单文件封面（GET /api/cover?file= 用）——**库内文件**按"它所属专辑的封面来源"取图。
     //   返回 true  ⟹ bytes/mime 已定（bytes 可能为空 = 本专辑确实没有属于自己的图，调用方显示占位）；
@@ -286,6 +431,8 @@ public:
     // 一目录多专辑时它会把别人的图发给这一首 —— 与 /api/lib/cover 完全同源的那个 BUG
     // （2026-10-27「专辑名对、封面严重错误」，见 lib_has_cover_file 上方的现场记录）。
     bool trackCover(const std::string& path, std::vector<unsigned char>& bytes, std::string& mime) const;
+    bool trackAlbumIdentity(const std::string& path, LibAlbumIdentity& out) const;
+    bool albumIdentity(const std::string& key, LibAlbumIdentity& out) const;
 
     // 2026-10-28（用户「所有曲目都没封面」的**第二个**真因）：
     // 曲目 → 它所属专辑的键（就是 /api/lib/cover?k= 用的那个 key）。
@@ -329,6 +476,7 @@ public:
     std::string isoKindOf(const std::string& path) const {
         const rta::audio::IsoInfo ii = rta::audio::iso_inspect(path);
         if (ii.kind == rta::audio::IsoKind::Sacd) return "sacd";
+        if (ii.kind == rta::audio::IsoKind::DvdAudio) return "dvda";
         if (ii.kind == rta::audio::IsoKind::Data) return "data";
         return "unknown";
     }
@@ -363,6 +511,10 @@ private:
     mutable bool confMigrated_ = false;
     // 2026-10-26：索引版本标记。idxIsV5=false 且确有版本头 ⟹ 旧索引，标签必须重探（否则修复永远不生效）。
     bool idxIsV5 = false;
+    bool idxHasSourceDepth = false;
+    bool idxHasUnverifiedWav = false;
+    bool idxIsV6 = false;
+    bool idxHasUnknownSource = false;
     bool idxIsV4 = false;
     bool idxHasHeader = false;
     mutable std::string confMigratedFrom_;
@@ -551,7 +703,8 @@ inline std::vector<unsigned char> lib_cover_embedded_bytes(const std::string& fi
         std::ifstream f(fsx::u8path(tmp), std::ios::binary);
         if (f) bytes.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
     }
-    DeleteFileW(rta::audio::widen(tmp).c_str());
+    // 迁移前的 DeleteFileW(widen(tmp)) —— 同一语义（文件不存在返回 false，返回值历来忽略）
+    rta::platform::remove_file(rta::platform::from_utf8(tmp));
     if (bytes.size() <= 64) { bytes.clear(); return bytes; }      // 空/占位：当作没有
     // -c:v copy 下扩展名不可信，按文件头判真实 mime（与 media_info.h 同一口径）
     if (bytes.size() > 8 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47) outMime = "image/png";
@@ -709,6 +862,7 @@ inline std::vector<LibTrack> lib_cue_expand(const rta::meta::CueSheet& sh,
             }
             t.artist      = ct.performer.empty() ? albArtist : ct.performer;
             t.album       = sh.albumTitle.empty() ? ct.albumTitle : sh.albumTitle;
+            if (!t.album.empty()) { t.albumIdentitySource = LibAlbumIdentitySource::Tagged; t.albumFromDir = false; }
             t.albumArtist = albArtist;
             t.genre       = sh.genre;
             t.year        = year;
@@ -812,24 +966,19 @@ inline void lib_fill_album_disc_from_dir(LibTrack& t, LibDirAlbumMemo* memo = nu
     if (!t.album.empty() && t.discNo > 0) return;          // 两样都有真实标签 → 连目录都不用看
     const std::string pdir = u8s(p8(t.path).parent_path().u8string());
     const LibDirAlbum da = memo ? memo->get(pdir, t.path) : lib_dir_album_for(t.path);
-    if (t.album.empty() && !da.album.empty()) { t.album = da.album; t.albumFromDir = true; }
+    if (t.album.empty() && !da.album.empty()) { t.album = da.album; t.albumFromDir = true; t.albumIdentitySource = LibAlbumIdentitySource::DirectoryInferred; }
     if (t.discNo <= 0 && da.disc > 0)         { t.discNo = da.disc; t.discFromDir = true; }
 }
 
-// .iso 入库探测（2026-10-27，用户 261027-01 #3）
-//
-// **不进 ffprobe**：随包 ffmpeg 9.0 没有 iso9660/udf/sacd demuxer，跑一次只会失败并拖慢扫描。
-// 只读镜像的 ISO9660 结构（rta::audio::iso_inspect，两次小读）：
-//   * 根目录或卷标里有 SACD ⟹ codec = "SACD ISO（需转换）"；
-//   * 是 ISO9660 但没有 SACD 目录 ⟹ "ISO 数据盘（非音频镜像）"；
-//   * 连 ISO9660 都没有 ⟹ "ISO 未知镜像"。
-// 流参数（sr/bits/ch/dur）一律留 0：**不许给"看起来有效"的值**，否则 UI 会把它当可播曲目，
-// 用户点了才吃一条错误（那就是本轮要消灭的体验）。
+// Probe a physical image placeholder without ffprobe; successful navigation is
+// expanded into precise virtual tracks by scan finalization. Invalid images keep
+// unknown stream fields and never masquerade as playable audio.
 inline LibTrack lib_probe_iso(const std::string& file) {
     LibTrack t;
     t.path = file;
     const rta::audio::IsoInfo ii = rta::audio::iso_inspect(file);
-    if (ii.kind == rta::audio::IsoKind::Sacd)       t.codec = "SACD ISO（需转换）";
+    if (ii.kind == rta::audio::IsoKind::Sacd)       t.codec = "SACD ISO";
+    else if (ii.kind == rta::audio::IsoKind::DvdAudio) t.codec = "DVD-Audio ISO";
     else if (ii.kind == rta::audio::IsoKind::Data)  t.codec = "ISO 数据盘（非音频镜像）";
     else                                            t.codec = "ISO 未知镜像";
     // 封面：与普通曲目同一口径（同目录独立封面文件；ISO 没有内嵌封面可读）
@@ -837,10 +986,34 @@ inline LibTrack lib_probe_iso(const std::string& file) {
     return t;
 }
 
+
+// Technical-field migration only: never replace a cached track's editorial tags,
+// album ownership or identity source merely because source precision was fixed.
+inline void lib_migrate_source_depth(LibTrack&t,const std::string&ffprobe){
+ const auto ext=lib_ext_lc(t.path);
+ if(ext==".mp3"||ext==".opus"||ext==".aac"){t.bits=0;if(t.codec.empty())t.codec=ext.substr(1);return;}
+ if(ext==".flac"&&t.bits>0){if(t.codec.empty())t.codec="flac";return;}
+ if(ffprobe.empty())return;std::string out;
+ const auto cmd=L"\""+rta::audio::widen(ffprobe)+L"\" -v error -select_streams a:0 -show_entries stream=codec_name,bits_per_raw_sample,bits_per_sample -of default=nw=1 \""+rta::audio::widen(t.path)+L"\"";
+ if(rta::audio::run_hidden(cmd,&out))return;std::istringstream is(out);std::string line,codec;int bits=0;
+ while(std::getline(is,line)){if(!line.empty()&&line.back()=='\r')line.pop_back();auto at=line.find('=');if(at==std::string::npos)continue;auto key=line.substr(0,at),value=line.substr(at+1);if(key=="codec_name")codec=value;else if(key=="bits_per_raw_sample"||key=="bits_per_sample")bits=std::max(bits,atoi(value.c_str()));}
+ if(!codec.empty()){t.bits=bits;t.codec=codec;}
+}
+
+inline bool lib_needs_wav_text_check(const LibTrack& t) {
+    if (t.wavTextChecked || t.isCueTrack() || !rta::meta::native::guess_enabled() || !rta::meta::native::fill_enabled()) return false;
+    const auto ext = lib_ext_lc(t.path);
+    using rta::meta::native::wav_text_suspect;
+    return (ext == ".wav" || ext == ".wave") &&
+           (wav_text_suspect(t.title) || wav_text_suspect(t.artist) || wav_text_suspect(t.genre) ||
+            (t.albumIdentitySource == LibAlbumIdentitySource::Tagged && wav_text_suspect(t.album)));
+}
+
 // 一次 ffprobe 取全部信息（比 media_info.h 的两次调用快一倍）
 inline LibTrack lib_probe_one(const std::string& file, const std::string& ffprobePath = "") {
     LibTrack t;
     t.path = file;
+    t.wavTextChecked = rta::meta::native::guess_enabled() && rta::meta::native::fill_enabled();
     // ===================== 原生标签快速通道（调度层，2026-10-25） =====================
     // 261025-01 一.1/一.8：首次全量扫描 45.9 首/s（3000 首 65.4 s），瓶颈是**每个文件起一次 ffprobe 进程**。
     // src/meta/tags_native.h 就地解析 FLAC/WAV/MP3/OGG 的头部与标签块，语义与下面 ffprobe 分支逐字段对齐
@@ -877,10 +1050,8 @@ inline LibTrack lib_probe_one(const std::string& file, const std::string& ffprob
             t.trackNo = ni.trackNo; t.discNo = ni.discNo; t.year = ni.year;
             t.sampleRate = ni.sampleRate; t.channels = ni.channels;
             t.bits = ni.bits; t.duration = ni.duration; t.codec = ni.codec;
-            // 与下面 ffprobe 分支的老口径逐条对齐：
-            //   * ffprobe 的 bits_per_raw_sample 对 16-bit WAV / MP3 / OGG 是 N/A ⟹ 旧代码统一写成 16；
-            //     FLAC/WAV-24bit 则报真值（24）。这里同样是「<=0 就 16」。
-            if (t.bits <= 0) t.bits = 16;
+            // Preserve actual source precision; lossy/unknown depth remains zero.
+            if (t.bits < 0) t.bits = 0; // Lossy codecs have no integer source bit depth.
             // 同目录独立封面（只 stat）与内嵌封面任一成立即算有封面 —— 与下面同一行逻辑。
             t.hasCover = ni.hasCover ? 1 : 0;
             if (!t.hasCover && lib_has_cover_file(t.path)) t.hasCover = 1;
@@ -907,7 +1078,7 @@ inline LibTrack lib_probe_one(const std::string& file, const std::string& ffprob
     // 另测：mp3(ID3) / wav(INFO) / m4a 的标签都在 format_tags，行为不变。
     const std::wstring cmd =
         L"\"" + rta::audio::widen(ffprobe) + L"\" -v error"
-        L" -show_entries stream=codec_type,codec_name,sample_rate,channels,bits_per_raw_sample"
+        L" -show_entries stream=codec_type,codec_name,sample_rate,channels,bits_per_raw_sample,bits_per_sample"
         L":stream_tags=title,artist,album,album_artist,date,genre,track,disc"
         L":format=duration:format_tags=title,artist,album,album_artist,date,genre,track,disc,tracktotal"
         L" -of default=nw=0 \"" + rta::audio::widen(file) + L"\"";
@@ -954,18 +1125,19 @@ inline LibTrack lib_probe_one(const std::string& file, const std::string& ffprob
                 // （实测：24-bit FLAC + mjpeg 封面 → t.bits 被写成 8）。所以这里只在「当前流是音频」时采信。
                 else if (k == "sample_rate")  { if (curIsAudio) t.sampleRate = atoi(v.c_str()); }
                 else if (k == "channels")     { if (curIsAudio) t.channels = atoi(v.c_str()); }
-                else if (k == "bits_per_raw_sample") { if (curIsAudio) t.bits = atoi(v.c_str()); }
+                else if (k == "bits_per_raw_sample" || k == "bits_per_sample") { if (curIsAudio && atoi(v.c_str())>0) t.bits = std::max(t.bits,atoi(v.c_str())); }
                 else if (k == "duration")     t.duration = atof(v.c_str());
             }
             line.clear();
         } else if (line.size() < 8192) line += out[i];
     }
+    rta::meta::native::recover_wav_text(file, title, artist, album, genre, true);
     t.title = title; t.artist = artist; t.album = album;
     t.albumArtist = aartist; t.genre = genre;
     t.trackNo = atoi(track.c_str());
     t.discNo  = atoi(disc.c_str());
     t.year    = atoi(date.c_str());
-    if (t.bits <= 0) t.bits = (t.codec == "flac" || t.codec == "alac") ? 16 : 16;
+    if (t.bits < 0) t.bits = 0;
     // 封面存在性（2026-10-23 修：此前 hasCover 恒 0，UI 因此不请求封面 → 「封面全部不显示」）
     // 只 stat 同目录 cover/folder/front（与 get_cover 的查找顺序一致），不启动 ffmpeg，扫描开销可忽略。
     // 内嵌封面无法靠 stat 判断，这里只保证「有独立封面文件」的专辑能显示；没有独立文件的专辑
@@ -1090,7 +1262,12 @@ inline void Library::writeFile(const std::string& p, const std::string& s) {
 
 inline void Library::load() {
     {
-        std::string conf = readFile(confPath());
+        const std::string configurationPath = confPath();
+        std::error_code configurationError;
+        const bool explicitlyConfigured = fsx::is_regular_file(p8(configurationPath), configurationError);
+        const bool isolatedLibrary = !lib_env_utf8(L"RLPLAYER_LIBRARY_DIR", "RLPLAYER_LIBRARY_DIR").empty()
+            || lib_env_utf8(L"RLPLAYER_ISOLATE", "RLPLAYER_ISOLATE") == "1";
+        std::string conf = readFile(configurationPath);
         if (conf.size() >= 3 && (unsigned char)conf[0] == 0xEF && (unsigned char)conf[1] == 0xBB && (unsigned char)conf[2] == 0xBF)
             conf = conf.substr(3);
         std::lock_guard<std::mutex> lk(mtx_);
@@ -1103,7 +1280,7 @@ inline void Library::load() {
                 line.clear();
             } else line += conf[i];
         }
-        if (roots_.empty()) {
+        if (roots_.empty() && !explicitlyConfigured && !isolatedLibrary) {
             // ★ 2026-10-26（261026-04 真机根因之四）：升级迁移。
             // 新版本解压到新目录后没有 conf，旧版本目录里却有用户的库根 ——
             // 若不做迁移，用户升级后看到的是"空库/4 张"，会觉得新版本什么都没了。
@@ -1170,7 +1347,7 @@ inline void Library::load() {
                 }
             }
         }
-        if (roots_.empty()) {
+        if (roots_.empty() && !explicitlyConfigured && !isolatedLibrary) {
             // 首次运行：探一遍常见位置，别一打开就是空的（HQPlayer 被诟病的就是这个）
             std::vector<std::string> cands;
             const std::string up = lib_env_utf8(L"USERPROFILE", "USERPROFILE");   // 同上：不能只信 getenv（中文用户名）
@@ -1214,15 +1391,19 @@ inline void Library::load() {
         // v5 = 2026-10-26：标签占位修复 + 专辑归并口径。**低版本索引不再整份丢弃**，
         //      而是「读路径/mtime/size，但标签必须重探」（见 startScan 里的 forceRetag）。
         //      为什么不丢弃：整份丢弃会让「用户的库结构」也一起没了（真机踩到：升级后曲库变空/只剩 4 首）。
+        idxHasSourceDepth = idx.find("#sourceDepthV\t1") != std::string::npos;
+        idxIsV6 = (idx.find("#libIndexV\t6") != std::string::npos);
         idxIsV5 = (idx.find("#libIndexV\t5") != std::string::npos);
         idxHasHeader = (idx.find("#libIndexV\t") != std::string::npos);
         idxIsV4 = (idx.find("#libIndexV\t4") != std::string::npos);
         // v3 及更早：**整份丢弃**（沿用既有铁律）。
         // 为什么 v3 不能像 v4 那样"只重探标签"：v3 里存在 40 分钟的"整轨曲目"记录，
         // 一旦被复用，CUE 分轨永远不生效（测试 [v3 索引被整份丢弃] 就是守这条）。
-        if (!idx.empty() && !idxIsV5 && !idxIsV4) idx.clear();
+        if (!idx.empty() && !idxIsV6 && !idxIsV5 && !idxIsV4) idx.clear();
     }
     std::vector<LibTrack> loaded;
+    idxHasUnknownSource = false;
+    idxHasUnverifiedWav = false;
     if (!idx.empty()) {
         std::string line;
         for (size_t i = 0; i <= idx.size(); ++i) {
@@ -1239,6 +1420,10 @@ inline void Library::load() {
                         t.mtime       = _strtoi64(f[1].c_str(), nullptr, 10);
                         t.size        = _strtoi64(f[2].c_str(), nullptr, 10);
                         t.album       = f[3];
+                        t.albumIdentitySource = (idxIsV6 && f.size() >= 21)
+                            ? lib_album_identity_source_parse(f[20]) : LibAlbumIdentitySource::LegacyUnknown;
+                        t.albumFromDir = t.albumIdentitySource == LibAlbumIdentitySource::DirectoryInferred;
+                        if (t.albumIdentitySource == LibAlbumIdentitySource::LegacyUnknown) idxHasUnknownSource = true;
                         t.albumArtist = f[4];
                         t.artist      = f[5];
                         t.title       = f[6];
@@ -1249,8 +1434,15 @@ inline void Library::load() {
                         t.bits        = atoi(f[11].c_str());
                         t.channels    = atoi(f[12].c_str());
                         t.duration    = atof(f[13].c_str());
+                        // The index is a cache, not trusted numeric input. NaN
+                        // poisons album sums and serializes as invalid JSON;
+                        // seconds beyond the downstream int range are unusable.
+                        if (!std::isfinite(t.duration) || t.duration < 0.0 || t.duration > 2147483647.0)
+                            t.duration = 0.0;
                         t.hasCover    = atoi(f[14].c_str());
                         t.genre       = f[15];
+                        if(f.size()>=22)t.codec=f[21];
+                        if(f.size()>=23)t.wavTextChecked=f[22]=="1";
                         // v4 追加列（v3 只有 16 列；前 16 列的读取路径与 v3 逐字相同）
                         if (f.size() >= 20) {
                             t.cuePath = f[16];
@@ -1258,13 +1450,19 @@ inline void Library::load() {
                             t.cueOff  = _strtoi64(f[18].c_str(), nullptr, 10);
                             t.cueLen  = _strtoi64(f[19].c_str(), nullptr, 10);
                         }
-                        if (!t.path.empty()) loaded.push_back(t);
+                        // Do not defer malformed cached paths to p8()/filesystem
+                        // in album grouping. Preserve all other usable records.
+                        if (!t.path.empty() && t.path.find('\0') == std::string::npos && lib_valid_utf8(t.path)) {
+                            if (lib_needs_wav_text_check(t)) idxHasUnverifiedWav = true;
+                            loaded.push_back(t);
+                        }
                     }
                 }
                 line.clear();
             } else line += idx[i];
         }
     }
+    lib_apply_user_metadata(loaded);
     {
         std::lock_guard<std::mutex> lk(mtx_);
         tracks_.swap(loaded);
@@ -1317,9 +1515,9 @@ inline std::string Library::indexTextLocked() const {
     // v3 = 2026-10-23 起「音频流字段不再被封面流覆盖」(24-bit 不再变 8)
     // v4 = 2026-10-25 起 CUE 虚拟分轨：**前 16 列逐字不变**，末尾追加 cue / cueN / cueOff / cueLen。
     //      为什么追加而不是插列：老读取路径（含用户手里 v3 索引）只看前 16 列，列序不动才不会串列。
-    s += "#libIndexV\t5\n";
+    s += "#libIndexV\t6\n#sourceDepthV\t1\n";
     s += "#path\tmtime\tsize\talbum\talbumArtist\tartist\ttitle\ttrack\tdisc\tyear\tsr\tbits\tch\tdur\thasCover\tgenre"
-         "\tcue\tcueN\tcueOff\tcueLen\n";
+         "\tcue\tcueN\tcueOff\tcueLen\talbumSource\tcodec\twavTextChecked\n";
     char buf[256];
     for (auto& t : tracks_) {
         s += lib_clean_field(t.path); s += '\t';
@@ -1333,8 +1531,9 @@ inline std::string Library::indexTextLocked() const {
         s += buf;
         s += lib_clean_field(t.genre);     s += '\t';
         s += lib_clean_field(t.cuePath);   s += '\t';
-        std::snprintf(buf, sizeof(buf), "%d\t%lld\t%lld\n", t.cueNo, t.cueOff, t.cueLen);
+        std::snprintf(buf, sizeof(buf), "%d\t%lld\t%lld\t%s\t", t.cueNo, t.cueOff, t.cueLen, lib_album_identity_source_name(t.albumIdentitySource));
         s += buf;
+        s += lib_clean_field(t.codec); s += t.wavTextChecked ? "\t1\n" : "\t0\n";
     }
     return s;
 }
@@ -1529,6 +1728,9 @@ inline const std::vector<LibAlbum>& Library::albumVecLocked() const {
         if (it == byKey.end()) {
             LibAlbum a; a.key = fnv_hex(rawKey); a.name = aName; a.artist = aArtist; a.year = t.year;
             a.legacyKey = legacyHash;
+            a.identitySource = t.albumFromDir ? LibAlbumIdentitySource::DirectoryInferred : t.albumIdentitySource;
+            if (t.album.empty()) a.identitySource = LibAlbumIdentitySource::DirectoryInferred;
+            a.onlineCoverEligible = lib_album_identity_trusted(a.identitySource) && !t.album.empty();
             // 同一目录（CD1/Disc 2 归一后）里还有几张别的专辑 —— 封面可信度的唯一依据
             auto dc = dirAlbumCount.find(dirKey);
             a.dirAlbums = (dc == dirAlbumCount.end()) ? 1 : dc->second;
@@ -1537,6 +1739,19 @@ inline const std::vector<LibAlbum>& Library::albumVecLocked() const {
             it = byKey.find(rawKey);
         }
         LibAlbum& a = albums_[it->second];
+        const auto trackSource = (t.albumFromDir || t.album.empty()) ? LibAlbumIdentitySource::DirectoryInferred : t.albumIdentitySource;
+        // Deterministic group summary: unknown outranks inferred, both veto
+        // release eligibility; otherwise any explicit assignment marks the group.
+        if (trackSource == LibAlbumIdentitySource::LegacyUnknown ||
+            a.identitySource == LibAlbumIdentitySource::LegacyUnknown)
+            a.identitySource = LibAlbumIdentitySource::LegacyUnknown;
+        else if (trackSource == LibAlbumIdentitySource::DirectoryInferred ||
+                 a.identitySource == LibAlbumIdentitySource::DirectoryInferred)
+            a.identitySource = LibAlbumIdentitySource::DirectoryInferred;
+        else if (trackSource == LibAlbumIdentitySource::UserAssigned ||
+                 a.identitySource == LibAlbumIdentitySource::UserAssigned)
+            a.identitySource = LibAlbumIdentitySource::UserAssigned;
+        a.onlineCoverEligible = a.onlineCoverEligible && lib_album_identity_trusted(trackSource);
         // ---- 封面来源（2026-10-27，见 lib_has_cover_file 上方的现场记录）----
         // 规则一句话：**内嵌永远首选；目录文件只在"一目录一专辑"时才算数**。
         //   * 同目录没有封面文件        ⟹ 索引里的 cv=1 只能来自内嵌，不必探测（零开销）
@@ -1551,14 +1766,15 @@ inline const std::vector<LibAlbum>& Library::albumVecLocked() const {
         }();
         int src = kCoverNone;
         if (t.hasCover) {
-            if (!dirCov)             src = kCoverEmbedded;
+            if (dirCov && embeddedCoverLocked(t.path)) src = kCoverEmbedded;
+            else if (!dirCov)             src = kCoverEmbedded;
             else if (a.dirAlbums <= 1) src = kCoverDirFile;
             // 2026-10-28（用户钦定的判据）：多专辑目录**不等于**封面不属于本专辑。
             // 只要文件夹名与这张专辑的名字对得上（归一化后相等或互相包含），那张 cover.jpg
             // 就是这张碟的 —— 继承它。对不上的（文件夹叫 2023、标签是 宴）才判为混装，
             // 交给逐首在线抓。上一版只写 dirAlbums<=1 一条，于是所有一目录多专辑的碟
             // 一起变空白，就是用户说的矫枉过正。
-            else if (lib_album_dir_matches(aName, dirOf[i])) src = kCoverDirFile;
+            else if (a.onlineCoverEligible && lib_album_dir_matches(aName, dirOf[i])) src = kCoverDirFile;
             else src = embeddedCoverLocked(t.path) ? kCoverEmbedded : kCoverNone;
         }
         if (src > a.coverSrc) a.coverSrc = src;
@@ -1570,6 +1786,10 @@ inline const std::vector<LibAlbum>& Library::albumVecLocked() const {
     for (auto& a : albums_) {
         // hasCover 的语义收紧了：**必须真的有一张属于本专辑的图**。
         // 老实现是"任一曲目 cv=1"（而 cv 又含目录文件）⟹ 本 BUG 里 10 张专辑全部 hasCover=true。
+        // Local ownership is independent of release/search eligibility. A
+        // directory group can retain its own embedded picture or its uniquely
+        // owned directory image without becoming a tagged release. The mixed
+        // directory/name-match gate above still requires trusted identity.
         a.hasCover = (a.coverSrc != kCoverNone);
         std::sort(a.idx.begin(), a.idx.end(), [&](size_t x, size_t y) {
             const int pDisc = discOf[x], qDisc = discOf[y];
@@ -1629,7 +1849,19 @@ inline bool Library::albumCover(const std::string& key, std::vector<unsigned cha
             if (a.key != key) continue;
             src = a.coverSrc;
             size_t probes = 0;                  // 内嵌判定最多问 6 首（防 200 首的合辑把 accept 线程拖住）
-            for (size_t ix : a.idx) {
+            auto candidates=a.idx;
+            if(a.coverSrc==kCoverEmbedded) {
+                // Do not spend the entire bounded probe budget on the first
+                // six known picture-less tracks when track7 owns the image.
+                auto rank=[&](size_t ix){
+                    if(ix>=tracks_.size())return 4;
+                    const auto it=embedMemo_.find(tracks_[ix].path);
+                    if(it!=embedMemo_.end())return it->second>0?0:3;
+                    return tracks_[ix].hasCover?1:2;
+                };
+                std::stable_sort(candidates.begin(),candidates.end(),[&](size_t x,size_t y){return rank(x)<rank(y);});
+            }
+            for (size_t ix : candidates) {
                 if (ix >= tracks_.size()) continue;
                 if (a.coverSrc == kCoverEmbedded) {
                     if (withCv.size() >= 3 || probes >= 6) break;
@@ -1703,46 +1935,66 @@ inline bool Library::albumCover(const std::string& key, std::vector<unsigned cha
 //   none  → 空（绝不外借同目录那张，那可能属于同目录里的另一张专辑）。
 inline bool Library::trackCover(const std::string& path, std::vector<unsigned char>& bytes, std::string& mime) const {
     int src = kCoverNone;
-    std::vector<std::string> order;
+    bool ownEmbedded = false;
+    std::vector<std::string> fallback;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         const std::string want = lib_path_key(path);
         size_t ix = tracks_.size();
         for (size_t i = 0; i < tracks_.size(); ++i)
             if (lib_path_key(tracks_[i].path) == want) { ix = i; break; }
-        if (ix == tracks_.size()) return false;          // 不在库里 ⟹ 调用方按旧行为走
-        const auto& v = albumVecLocked();
-        for (const auto& a : v) {
+        if (ix == tracks_.size()) return false;
+        ownEmbedded = embeddedCoverLocked(tracks_[ix].path);
+        for (const auto& a : albumVecLocked()) {
             if (std::find(a.idx.begin(), a.idx.end(), ix) == a.idx.end()) continue;
             src = a.coverSrc;
-            if (src == kCoverEmbedded) {
-                order.push_back(tracks_[ix].path);
+            if (src == kCoverEmbedded && a.onlineCoverEligible) {
                 size_t probes = 0;
-                for (size_t jx : a.idx) {                // 同一张专辑的其它曲目（最多再找 2 首）
+                for (size_t jx : a.idx) {
                     if (jx == ix || jx >= tracks_.size()) continue;
-                    if (order.size() >= 3 || probes >= 6) break;
+                    if (fallback.size() >= 2 || probes >= 6) break;
                     ++probes;
-                    if (embeddedCoverLocked(tracks_[jx].path)) order.push_back(tracks_[jx].path);
+                    if (embeddedCoverLocked(tracks_[jx].path)) fallback.push_back(tracks_[jx].path);
                 }
             }
             break;
         }
     }
-    bytes.clear();
-    mime = "image/png";
-    if (src == kCoverDirFile) { bytes = rta::audio::get_cover(path, mime); return true; }
-    if (src != kCoverEmbedded) return true;              // 本专辑没有属于自己的图：不借别人的
-    std::vector<unsigned char> small;
-    std::string smallMime;
-    for (const auto& p : order) {
-        std::string m;
-        std::vector<unsigned char> cand = lib_cover_embedded_bytes(p, m);
-        if (cand.size() >= 1024) { bytes.swap(cand); mime = m; return true; }
-        if (small.empty() && !cand.empty()) { small.swap(cand); smallMime = m; }
+    bytes.clear(); mime = "image/png";
+    if (ownEmbedded) {
+        bytes = lib_cover_embedded_bytes(path, mime);
+        if (!bytes.empty()) return true;
     }
-    bytes.swap(small);                                   // 只有小图（缩略/占位）：照给，让上层判 ≤128
-    if (!bytes.empty()) mime = smallMime;
-    return true;
+    if (src == kCoverDirFile) { bytes = rta::audio::get_cover(path, mime); return true; }
+    for (const auto& file : fallback) {
+        bytes = lib_cover_embedded_bytes(file, mime);
+        if (!bytes.empty()) return true;
+    }
+    return true; // Known track without owned/trusted artwork; caller must not borrow a directory image.
+}
+
+inline bool Library::albumIdentity(const std::string& key, LibAlbumIdentity& out) const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    for (const auto& a : albumVecLocked()) {
+        if (a.key != key) continue;
+        out = {a.key, a.legacyKey, a.name, a.artist, a.identitySource, a.onlineCoverEligible, a.dirAlbums};
+        return true;
+    }
+    out = {}; return false;
+}
+inline bool Library::trackAlbumIdentity(const std::string& path, LibAlbumIdentity& out) const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    const auto want = lib_path_key(path);
+    for (const auto& a : albumVecLocked()) for (size_t ix : a.idx) {
+        if (ix >= tracks_.size() || lib_path_key(tracks_[ix].path) != want) continue;
+        const auto& t = tracks_[ix];
+        const auto source = (t.albumFromDir || t.album.empty())
+            ? LibAlbumIdentitySource::DirectoryInferred : t.albumIdentitySource;
+        // Group identity is for navigation; confirmation belongs to this track.
+        out = {a.key, a.legacyKey, a.name, a.artist, source, a.onlineCoverEligible, a.dirAlbums};
+        return true;
+    }
+    out = {}; return false;
 }
 
 inline bool Library::trackAlbumKey(const std::string& path, std::string& key) const {
@@ -1779,7 +2031,7 @@ inline std::vector<LibCoverTerm> Library::albumsWithoutCover() const {
     const auto& v = albumVecLocked();
     out.reserve(v.size());
     for (const auto& a : v) {
-        if (a.hasCover) continue;                 // 库里已有**属于本专辑**的图（见 coverSrc）
+        if (!a.onlineCoverEligible) continue;                 // 库里已有**属于本专辑**的图（见 coverSrc）
         LibCoverTerm t;
         t.key = a.key; t.name = a.name; t.artist = a.artist;
         t.term = lib_cover_term(a.name, a.artist);
@@ -1792,7 +2044,7 @@ inline bool Library::albumCoverTerm(const std::string& key, LibCoverTerm& out) c
     if (key.empty()) return false;
     std::lock_guard<std::mutex> lk(mtx_);
     for (const auto& a : albumVecLocked()) {
-        if (a.key != key) continue;
+        if (a.key != key || !a.onlineCoverEligible) continue;
         out.key = a.key; out.name = a.name; out.artist = a.artist;
         out.term = lib_cover_term(a.name, a.artist);
         return true;
@@ -1819,7 +2071,7 @@ inline std::vector<LibApiCoverTerm> Library::albumsWithoutCoverTitles(size_t max
     const auto& v = albumVecLocked();
     out.reserve(v.size());
     for (const auto& a : v) {
-        if (a.hasCover) continue;                  // 库里已有图：与 albumsWithoutCover() 同一判据
+        if (!a.onlineCoverEligible) continue;                  // 库里已有图：与 albumsWithoutCover() 同一判据
         LibApiCoverTerm t;
         t.key = a.key; t.name = a.name; t.artist = a.artist;
         lib_api_titles_locked(tracks_, a, maxTitles, t.titles);
@@ -1833,7 +2085,7 @@ inline bool Library::albumCoverTermTitles(const std::string& key, size_t maxTitl
     if (key.empty()) return false;
     std::lock_guard<std::mutex> lk(mtx_);
     for (const auto& a : albumVecLocked()) {
-        if (a.key != key) continue;
+        if (a.key != key || !a.onlineCoverEligible) continue;
         out.key = a.key; out.name = a.name; out.artist = a.artist;
         lib_api_titles_locked(tracks_, a, maxTitles, out.titles);
         return true;
@@ -2137,7 +2389,7 @@ inline void Library::startScan(bool forceFull) {
                 //   索引一致性真正修掉的三条见 lib_probe [3][4][5] 的说明。
                 // 2026-10-26：旧版本索引（v4 及更早）里的标签是旧解析器写的，必须重探；
                 // 现代价只有一次（655 首约 1 s），换来标签修复与专辑归并真正生效。
-                const bool retagOld = idxIsV4;   // 只有 v4 需要"留结构、重探标签"；v5 直接复用，v3 已整份丢弃
+                const bool retagOld = !idxIsV6 || (oit != oldByPath.end() && old[oit->second].albumIdentitySource == LibAlbumIdentitySource::LegacyUnknown);   // v4/v5 来源不明，留结构并自动重探一次；v6 未知来源也必须重探。
                 if (!forceFull && !retagOld && !isIso && oit != oldByPath.end()) {
                     const LibTrack& o = old[oit->second];
                     if (!o.isCueTrack() && o.mtime == mt && o.size == sz) {
@@ -2145,6 +2397,14 @@ inline void Library::startScan(bool forceFull) {
                         // disc 列恒 0；这里就地补上 → 增量扫描也能自愈，不必靠升 #libIndexV 把用户的整份索引作废。
                         // 已有真实标签值的记录不会被改（lib_fill_album_disc_from_dir 只填空字段）。
                         LibTrack t2 = o;
+                        if(!idxHasSourceDepth)lib_migrate_source_depth(t2,ffprobe);
+                        if (lib_needs_wav_text_check(t2)) {
+                            // User-assigned and directory-derived album labels are independent of RIFF INFO.
+                            std::string album = t2.album;
+                            rta::meta::native::recover_wav_text(p, t2.title, t2.artist, album, t2.genre);
+                            if (t2.albumIdentitySource == LibAlbumIdentitySource::Tagged) t2.album = std::move(album);
+                            t2.wavTextChecked = true;
+                        }
                         lib_fill_album_disc_from_dir(t2, &dirMemo);
                         fresh[(size_t)i] = std::move(t2);
                         cachedCount.fetch_add(1, std::memory_order_relaxed);
@@ -2271,6 +2531,35 @@ inline void Library::startScan(bool forceFull) {
             fresh.swap(kept);
         }
 
+        // One physical image becomes uniquely addressable virtual tracks. Never retain
+        // a physical placeholder alongside successfully enumerated audio tracks.
+        {
+            std::vector<LibTrack> expanded;
+            for (auto& t : fresh) {
+                if (lib_is_iso_path(t.path)) {
+                    const auto imageTracks = rta::audio::sacd_tracks(t.path);
+                    if (!imageTracks.empty()) {
+                        for (const auto& it : imageTracks) {
+                            LibTrack v=t; v.path=it.path; v.title=it.title; v.trackNo=it.number;
+                            v.discNo=it.area=="2ch"?1:2; v.sampleRate=(int)it.rate;
+                            v.channels=it.channels;v.bits=1;v.duration=it.seconds();
+                            v.codec=it.dst?"SACD DST":"SACD DSD";v.artist=it.artist;v.albumArtist=it.albumArtist;v.year=it.year;
+                            if(!it.album.empty()){v.album=it.album;v.albumFromDir=false;v.albumIdentitySource=LibAlbumIdentitySource::Tagged;}
+                            if(v.album.empty())v.album=u8s(p8(t.path).stem().u8string());
+                            expanded.push_back(std::move(v));
+                        }
+                        continue;
+                    }
+                    const auto dvdTracks=rta::audio::dvd_audio_tracks(t.path);
+                    if(!dvdTracks.empty()){
+                        for(const auto& it:dvdTracks){auto info=rta::audio::dvd_audio_info(it.path);LibTrack v=t;v.path=it.path;v.title="Track "+std::to_string(it.track)+" (Group "+std::to_string(it.group)+", Title "+std::to_string(it.title)+")";v.trackNo=it.track;v.discNo=it.group;v.sampleRate=info.rate;v.channels=info.channels;v.bits=info.bits;v.duration=it.seconds();v.codec=it.mlp?"DVD-Audio MLP":"DVD-Audio LPCM";if(v.album.empty())v.album=u8s(p8(t.path).stem().u8string());expanded.push_back(std::move(v));}
+                        continue;
+                    }
+                }
+                expanded.push_back(std::move(t));
+            }
+            fresh.swap(expanded);
+        }
         const auto tEnd = std::chrono::steady_clock::now();
         const double durMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
 
@@ -2305,11 +2594,16 @@ inline void Library::startScan(bool forceFull) {
         //   （2026-10-27 第一版就数错了，扫描消息因此永远报 0 个镜像 —— 判据见 test_library [6]）。
         int isoCount = 0;
         for (auto& t : fresh) if (t.needsConvert()) ++isoCount;
+        lib_apply_user_metadata(fresh);
         const size_t nt = fresh.size();
         std::string text;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             tracks_.swap(fresh);
+            idxHasSourceDepth = true;
+            idxHasUnverifiedWav = std::any_of(tracks_.begin(), tracks_.end(), lib_needs_wav_text_check);
+            idxIsV6 = true; idxIsV5 = false; idxIsV4 = false; idxHasHeader = true;
+            idxHasUnknownSource = std::any_of(tracks_.begin(), tracks_.end(), [](const LibTrack& t) { return t.albumIdentitySource == LibAlbumIdentitySource::LegacyUnknown; });
             albumsDirty_ = true;
             embedMemo_.clear();        // 扫描换了整份索引 ⟹ 内嵌封面判定必须重问
             lastScanMs_.store(durMs);
@@ -2369,7 +2663,7 @@ inline void Library::startScan(bool forceFull) {
 // ---------------------------------------------------------------------------
 inline bool lib_file_exists(const std::string& p) {
     std::error_code ec;
-    try { return fsx::exists(p8(p), ec); } catch (const std::exception&) { return false; }
+    try { return fsx::exists(p8(rta::audio::sacd_physical_path(p)), ec); } catch (const std::exception&) { return false; }
 }
 
 // 调用方须持有 mtx_。返回被剔除的条数（不落盘 —— 由调用方决定时机）

@@ -1,0 +1,6 @@
+# Independent coefficient/frequency oracles, not playback dependencies.
+python-flint==0.9.0
+mpmath==1.3.0
+
+# Independent multilevel full-band quality/reader regression (not player runtime).
+numpy==2.5.1

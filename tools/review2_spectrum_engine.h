@@ -32,6 +32,11 @@ inline double mag(DC a) { return std::hypot(a.r.h + a.r.l, a.i.h + a.i.l); }
 inline double db(double a) { return 20 * log10(std::max(a, 1e-300)); }
 inline void fft(std::vector<DC> &a) {
   size_t n = a.size();
+  if(n<2)return;
+  if(n&(n-1))throw std::invalid_argument("Measurement FFT length must be a power of two");
+  size_t stages=0;for(size_t size=n;size>1;size>>=1)++stages;
+  if(stages>=sizeof(roots)/sizeof(roots[0]))
+    throw std::length_error("Measurement FFT exceeds its independently calibrated root table");
   for (size_t i = 1, j = 0; i < n; ++i) {
     size_t b = n >> 1;
     for (; j & b; b >>= 1)
@@ -52,6 +57,7 @@ inline void fft(std::vector<DC> &a) {
         a[i + k] = add(u, v);
         a[i + k + len / 2] = sub(u, v);
       }
+    if(len==n)break;
   }
 }
 inline DD divd(DD a, double b) {
@@ -73,6 +79,15 @@ inline DC rotation(double hz, double fs) {
   return {c, v};
 }
 inline double direct(const std::vector<double> &h, double hz, double fs) {
+  if (h.empty() || !std::isfinite(hz) || !std::isfinite(fs) || fs <= 0 ||
+      !std::all_of(h.begin(), h.end(), [](double x) { return std::isfinite(x); }))
+    throw std::invalid_argument("invalid direct-response coefficients/frequency/rate");
+  // Real FIR magnitudes are even and periodic. Cascade callers legitimately
+  // pass signed aliases after remainder(); do not reject those valid inputs.
+  hz = std::abs(std::remainder(hz, fs));
+  // Exact DC/Nyquist algebra: an analytic zero is not trigonometric roundoff.
+  if (hz == 0 || hz == fs / 2)
+    return rta::dsp::magnitude_db_exact(h, hz == 0 ? 0.0 : 1.0);
   DC w = rotation(hz, fs), z{{1, 0}, {0, 0}}, sum;
   for (double x : h) {
     sum = add(sum, {mul({x, 0}, z.r), mul({x, 0}, z.i)});

@@ -11,6 +11,7 @@
 // 只实现 GET/POST —— 流媒体接入只需要"把原始文件拉下来"和几个 JSON API。
 #pragma once
 #include "platform/http.h"
+#include "net/http_budget.h"
 #include <mutex>
 #include <string>
 #include <utility>
@@ -35,6 +36,17 @@ inline std::string percent_encode_path(const std::string& s) {
 }
 
 namespace http_detail {
+using TestTransport = std::function<rta::platform::HttpResult(const rta::platform::HttpRequest&)>;
+inline TestTransport& transport_for_test() { static thread_local TestTransport t; return t; }
+inline rta::platform::HttpResult send(rta::platform::HttpRequest req) {
+    req.deadline = http_deadline_slot();
+    req.timeoutMs = http_budget_timeout(req.timeoutMs);
+    if (http_budget_expired() || (http_budget_active() && req.timeoutMs == 0)) {
+        rta::platform::HttpResult r; r.error = "HTTP_BUDGET_EXCEEDED"; return r;
+    }
+    if (const auto& hook = transport_for_test()) return hook(req);
+    return rta::platform::http_request(req);
+}
 inline HttpResponse from_platform(rta::platform::HttpResult&& p) {
     HttpResponse r;
     r.ok          = p.ok;
@@ -82,7 +94,7 @@ inline HttpResponse http_post(const std::string& url, const std::string& body,
     req.contentType = contentType ? contentType : "application/json";
     req.timeoutMs   = timeoutMs;
     req.proxy       = http_proxy();
-    return http_detail::from_platform(rta::platform::http_request(req));
+    return http_detail::from_platform(http_detail::send(std::move(req)));
 }
 
 // 流式 POST（261024-05）：每从 socket 读到一段字节就调 onChunk —— 这是 LLM SSE「不用枯等」的底座。
@@ -101,7 +113,7 @@ inline HttpResponse http_post_stream(const std::string& url, const std::string& 
     req.timeoutMs   = timeoutMs;
     req.proxy       = http_proxy();
     req.onChunk     = onChunk;
-    return http_detail::from_platform(rta::platform::http_request(req));
+    return http_detail::from_platform(http_detail::send(std::move(req)));
 }
 
 // GET，可选附加请求头（每项形如 "名: 值"）
@@ -114,7 +126,7 @@ inline HttpResponse http_get(const std::string& url,
     req.headers   = headers;
     req.timeoutMs = timeoutMs;
     req.proxy     = http_proxy();
-    return http_detail::from_platform(rta::platform::http_request(req));
+    return http_detail::from_platform(http_detail::send(std::move(req)));
 }
 
 inline std::string http_get_text(const std::string& url,

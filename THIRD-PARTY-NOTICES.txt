@@ -1,4 +1,4 @@
-RLPlayer 2.0 —— 第三方组件授权说明（THIRD-PARTY NOTICES）
+﻿RLPlayer 2.0 —— 第三方组件授权说明（THIRD-PARTY NOTICES）
 ================================================================================
 
 本项目（RLPlayer）自身以 GNU 通用公共许可证第 3 版（GPL-3.0-or-later）发布，
@@ -84,3 +84,28 @@ RLPlayer 的 GPL 授权不延伸到这些厂商文件，也不因分发它们而
 
 如果你认为本包内的某个文件侵犯了你的权利，请通过上面的渠道联系我们，
 我们会立即核实并处理。
+
+
+7. Audio image readers and raw DST decoder (RLPlayer 3.3.0)
+SACD directory and packet syntax: SACD Ripper, Copyright (c) 2010-2015 by
+respective authors, GPL-2.0-or-later. https://github.com/sacd-ripper/sacd-ripper
+Raw DST decoder adapted from FFmpeg n7.1.1 libavcodec/dstdec.c,
+Copyright (c) 2014 Peter Ross, LGPL-2.1-or-later. Segmentation/mapping
+extensions are original RLPlayer code; no MPEG restricted reference decoder
+is incorporated. https://github.com/FFmpeg/FFmpeg/tree/n7.1.1
+DVD-Audio LPCM unpacking syntax/implementation adapted from FFmpeg
+pcm-dvda.c, Copyright (c) 2026 Kacper Michajlow, LGPL-2.1-or-later.
+https://github.com/FFmpeg/FFmpeg
+Preserved upstream notices, originals and adapted headers are provided in
+third-party/audio-images/. The combined player is GPL-3.0-or-later.
+
+8. macOS capability-planning contribution
+UPnP upsampling decisions and workstation interaction draw on RLPlayer-Mac
+v1.1.4.1, August Hu and contributors, GPL-3.0-or-later. Attribution in the
+ported source is retained. https://github.com/BH2VOQ/RLPlayer-Mac
+
+UDF layout reference: libdvdread dvd_udf.c, Christian Wolff (1999),
+Billy Biggs and Bjorn Englund, GPL-2.0-or-later. Original notices and
+reference source are retained in third-party/audio-images/.
+The exact modified RLPlayer source snapshot is in source/; corresponding
+FFmpeg and zlib sources and build recipes are in third-party/ffmpeg/.

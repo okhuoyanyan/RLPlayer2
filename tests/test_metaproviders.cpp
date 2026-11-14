@@ -480,14 +480,14 @@ int main() {
         const std::vector<ProviderDesc>& reg = provider_registry();
         // 2026-10-26（261026-07）：Discogs 已注册为**纯开关型**数据源（canSearch/canLyric 都为 false），
     // 让它在设置页可见、/api/providers 可返回、用户可关闭 —— 之前它在 enrich 里干活但完全不可见。
-    ck(reg.size() == 6, "注册表 6 项(四源 + dizzylab + discogs)", std::to_string(reg.size()));
+    ck(reg.size() == 7, "注册表 7 项(原六源 + MusicBrainz/CAA封面)", std::to_string(reg.size()));
     {
         const ProviderDesc* dg = nullptr;
         for (const auto& d : reg) if (std::string(d.id) == "discogs") { dg = &d; break; }
         ck(dg != nullptr, "Discogs 已在注册表内");
         if (dg) ck(!dg->canSearch && !dg->canLyric, "Discogs 为纯开关型（不参与搜索/歌词遍历）");
     }
-        if (reg.size() == 5) {
+        if (reg.size() >= 5) {
             ck(std::string(reg[0].id) == "dizzylab" && std::string(reg[1].id) == "qq" &&
                std::string(reg[2].id) == "netease" && std::string(reg[3].id) == "itunes" &&
                std::string(reg[4].id) == "lrclib",
@@ -638,7 +638,7 @@ int main() {
             for (const auto* p : v) { if (!s.empty()) s += ","; s += p->id; }
             return s;
         };
-        ck_eq(ids(art_cover_sources(on)), "dizzylab,qq,netease,itunes,discogs",
+        ck_eq(ids(art_cover_sources(on)), "dizzylab,qq,netease,itunes,discogs,musicbrainz",
               "封面候选源 = 矩阵 Cover 位 + 注册表正序");
         ck_eq(ids(art_artist_sources(on)), "dizzylab,qq,netease,discogs",
               "头像候选源 = 矩阵 ArtistImage 位 + 注册表正序");

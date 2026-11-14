@@ -14,6 +14,9 @@
 //（CreateProcessW 语义），改成 argv 会重新引入引号/反斜杠转义差异的风险。
 #pragma once
 #include <string>
+#include <cstddef>
+#include <functional>
+#include "platform/path.h"
 
 namespace rta::platform {
 
@@ -25,10 +28,22 @@ struct ProcessResult {
 
 ProcessResult run_hidden(const std::string& command_line_utf8, bool capture_output = false);
 
+// Bounded binary stdout streaming. Callback false or cancelled() true stops only
+// the exact process started by this call. stderr is retained up to 64 KiB.
+struct StreamProcessResult : ProcessResult { bool cancelled = false; };
+StreamProcessResult run_hidden_stream(const std::string& command_line_utf8,
+    const std::function<bool(const void*, size_t)>& on_stdout,
+    const std::function<bool()>& cancelled = {});
+
 // 找可执行文件：先看 exe 同目录（分发版把 ffmpeg.exe 放这里），再退回 PATH。
 // 找不到返回空串（调用方据此报"找不到 ffmpeg"）。
 // name 不带扩展名（如 "ffmpeg"）。
 std::string find_executable(const char* name);
+
+// 请宿主（托盘启动器）退出。Windows = FindWindow("RLPlayerTray") + PostMessage(WM_COMMAND, 1003)
+// —— 这是"通知它做它本来就会做的事"，**不是**结束进程（铁律 2：绝不 force-kill 进程树）。
+// 返回 false = 没找到窗口（启动器没在跑，或已经退出）。
+bool request_launcher_exit();
 
 } // namespace rta::platform
 

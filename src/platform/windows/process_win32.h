@@ -12,8 +12,13 @@
 #endif
 #include <windows.h>
 #include <string>
+#include <algorithm>
 
 #include "platform/windows/win_text.h"
+
+// request_launcher_exit 用 FindWindowW/PostMessageW（user32）。
+// 迁移前这条 pragma 写在 net/feedback.h / net/update_apply.h 里；实现收进平台层后跟过来。
+#pragma comment(lib, "user32.lib")
 
 namespace rta::platform {
 
@@ -58,6 +63,64 @@ inline ProcessResult run_hidden(const std::string& command_line_utf8, bool captu
     ::CloseHandle(pi.hProcess);
     out.exit_code = (int)code;
     return out;
+}
+
+// Drain two independent pipes so stderr can never corrupt binary PCM or fill
+// a blocking pipe. No process name or process tree is used for cancellation.
+inline StreamProcessResult run_hidden_stream(const std::string& command_line_utf8,
+    const std::function<bool(const void*, size_t)>& on_stdout,
+    const std::function<bool()>& cancelled) {
+    StreamProcessResult out;
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE rd=nullptr,wr=nullptr,errRd=nullptr,errWr=nullptr,input=nullptr;
+    auto close=[&](HANDLE& h){if(h&&h!=INVALID_HANDLE_VALUE)::CloseHandle(h);h=nullptr;};
+    auto cleanup=[&](){close(rd);close(wr);close(errRd);close(errWr);close(input);};
+    if(!::CreatePipe(&rd,&wr,&sa,65536)||!::CreatePipe(&errRd,&errWr,&sa,4096)){cleanup();return out;}
+    ::SetHandleInformation(rd,HANDLE_FLAG_INHERIT,0);::SetHandleInformation(errRd,HANDLE_FLAG_INHERIT,0);
+    input=::CreateFileW(L"NUL",GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,&sa,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    STARTUPINFOW si{};si.cb=sizeof(si);si.dwFlags=STARTF_USESHOWWINDOW|STARTF_USESTDHANDLES;si.wShowWindow=SW_HIDE;
+    si.hStdOutput=wr;si.hStdError=errWr;si.hStdInput=input;
+    PROCESS_INFORMATION pi{};std::wstring command=detail::widen(command_line_utf8);
+    if(!::CreateProcessW(nullptr,command.data(),nullptr,nullptr,TRUE,CREATE_NO_WINDOW,nullptr,nullptr,&si,&pi)){cleanup();return out;}
+    out.started=true;close(wr);close(errWr);close(input);::CloseHandle(pi.hThread);
+    bool stopping=false,callbackFailed=false;char buffer[65536];
+    auto stopOwnChild=[&](){if(!stopping){stopping=true;out.cancelled=true;::TerminateProcess(pi.hProcess,ERROR_CANCELLED);}};
+    for(;;){
+        if(cancelled&&cancelled())stopOwnChild();
+        bool received=false;
+        for(int stream=0;stream<2;++stream){
+            HANDLE pipe=stream?errRd:rd;DWORD available=0;
+            if(!::PeekNamedPipe(pipe,nullptr,0,nullptr,&available,nullptr)||!available)continue;
+            DWORD got=0;DWORD want=std::min<DWORD>(available,sizeof(buffer));
+            if(!::ReadFile(pipe,buffer,want,&got,nullptr)||!got)continue;
+            received=true;
+            if(stream){if(out.output.size()<65536)out.output.append(buffer,std::min<size_t>(got,65536-out.output.size()));}
+            else if(!stopping){
+                try{if(on_stdout&&!on_stdout(buffer,got))stopOwnChild();}
+                catch(...){callbackFailed=true;stopOwnChild();}
+            }
+        }
+        DWORD wait=::WaitForSingleObject(pi.hProcess,0);
+        if(wait==WAIT_OBJECT_0){
+            DWORD a=0,b=0;::PeekNamedPipe(rd,nullptr,0,nullptr,&a,nullptr);::PeekNamedPipe(errRd,nullptr,0,nullptr,&b,nullptr);
+            if(!a&&!b)break;
+        }
+        if(!received)::Sleep(2);
+    }
+    ::WaitForSingleObject(pi.hProcess,INFINITE);DWORD code=1;::GetExitCodeProcess(pi.hProcess,&code);out.exit_code=int(code);
+    ::CloseHandle(pi.hProcess);cleanup();
+    if(callbackFailed&&out.output.empty())out.output="stream callback failed";
+    return out;
+}
+
+// 语义 = 发一条启动器本来就认的 WM_COMMAND（ID_TRAY_EXIT = 1003，见 tools/launcher.cpp）。
+// 先按"类名 + 任意标题"找，再退到"类名 + 同名标题"（与迁移前 net/update_apply.h 一致）。
+inline bool request_launcher_exit() {
+    HWND h = ::FindWindowW(L"RLPlayerTray", nullptr);
+    if (!h) h = ::FindWindowW(L"RLPlayerTray", L"RLPlayerTray");
+    if (!h) return false;
+    ::PostMessageW(h, WM_COMMAND, (WPARAM)1003, 0);
+    return true;
 }
 
 inline std::string find_executable(const char* name) {

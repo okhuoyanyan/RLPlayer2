@@ -10,6 +10,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import struct
 from fractions import Fraction
 from pathlib import Path
@@ -66,9 +67,13 @@ def main():
     p.add_argument("--digits", type=int, default=90)
     p.add_argument("--preset")
     p.add_argument("--all-witnesses", action="store_true")
+    p.add_argument("--max-error-db", type=float, default=1e-6,
+                   help="Fail if a finite DD witness differs from the independent reference (default 1e-6 dB).")
     args = p.parse_args()
     if not 70 <= args.digits <= 500:
         p.error("--digits must be 70..500")
+    if not math.isfinite(args.max_error_db) or args.max_error_db <= 0:
+        p.error("--max-error-db must be finite and positive")
     mp.mp.dps = args.digits
     results = []
     for table in args.table:
@@ -123,6 +128,7 @@ def main():
                             frequency_hz=frequency, digits=args.digits, db90=str(db),
                             dd_db=dd, delta_dd_db=None if analytic_zero else str(mp.mpf(float(dd))-db),
                             coefficient_sha256=hashlib.sha256(raw).hexdigest())
+                item["analytic_zero"] = bool(analytic_zero)
                 if "exact_db" in row:
                     item["exact_db"] = row["exact_db"]
                     item["delta_exact_db"] = None if analytic_zero else str(mp.mpf(float(row["exact_db"]))-db)
@@ -131,7 +137,7 @@ def main():
                     item["binary_normalized_frequency"] = str(norm)
                     item["normalized_reference_db90"] = str(norm_db)
                     item["exact_arithmetic_error_db"] = None if norm_zero else str(mp.mpf(float(row["exact_db"]))-norm_db)
-                    item["analytic_zero"] = bool(norm_zero)
+                    item["normalized_analytic_zero"] = bool(norm_zero)
                     if norm_zero:
                         item["mathematical_db"]="-inf"
                         item["exact_zero_floor_correct"]=float(row["exact_db"])==-6000
@@ -146,6 +152,21 @@ def main():
         p.error("zero reference witnesses selected")
     finite_errors=[abs(float(x["delta_dd_db"])) for x in results if x["delta_dd_db"] is not None]
     print("POINTS", len(results), "ANALYTIC_ZEROS",sum(x.get("analytic_zero",False) for x in results),"MAX_FINITE_DD_ERROR_DB", max(finite_errors,default=0), flush=True)
+    mismatches = []
+    for item in results:
+        error = item["delta_dd_db"]
+        if error is None:
+            matched = float(item["dd_db"]) == -6000.0
+        else:
+            value = float(error)
+            matched = math.isfinite(value) and abs(value) <= args.max_error_db
+        item["reference_match"] = matched
+        if not matched:
+            mismatches.append(item["identity"])
+    args.output.write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding="utf-8")
+    if mismatches:
+        print("REFERENCE_MISMATCH", len(mismatches), ",".join(mismatches), flush=True)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

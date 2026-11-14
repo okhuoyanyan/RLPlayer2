@@ -10,7 +10,9 @@
 #    atrac3plus，组件 adpcm_g722 的运行时名是 g722）。写错名字会让守卫"看起来缺解码器"。
 #
 # 封面用的 mjpeg/png 属于【视频】解码器，不在本表（本表只比对音频解码器）；
-# 封面链路由 ctest ffmpeg_matrix 的 get_cover 断言覆盖。
+# 封面解码/编码名单由 verify_ffmpeg_lite.ps1 独立检查，verify_ffmpeg_png.py
+# 逐像素检验实际 PNG 编解码、FLAC 内嵌封面/重写后的尺寸及音频逐样本保真。
+# ctest ffmpeg_matrix 的 get_cover 返回 PNG 头不足以证明真的执行了 PNG 编解码。
 #
 # 分组：无损 / 有损 / 容器内 PCM / WMA 家族 / DSD / 冷门格式
 flac

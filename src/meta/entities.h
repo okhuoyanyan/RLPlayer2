@@ -1390,9 +1390,61 @@ private:
 //
 // 判据「是否走古典路径」= COMPOSER 非空。理由：没有作曲家的「作品」只是曲名，
 // 硬造 Work 层会让流行曲也长出空壳 Work（噪声）。有 COMPOSER 才说明这是古典/艺术音乐语境。
+// Only explicit role-prefixed credits are parsed. Unmarked slashes (AC/DC,
+// duet names, etc.) are part of a name, never a generic person separator.
+struct EntityArtistCredit {
+    std::string role;
+    std::string name;
+};
+inline bool entity_artist_credits(const std::string& raw, std::vector<EntityArtistCredit>& out) {
+    struct Prefix { const char* text; const char* role; };
+    static const Prefix prefixes[] = {
+        {"作曲","composer"},{"曲","composer"},{"composer","composer"},
+        {"komponist","composer"},{"compositeur","composer"},{"compositor","composer"},
+        {"编曲","arranger"},{"編曲","arranger"},{"arranger","arranger"},
+        {"arrangeur","arranger"},{"arreglista","arranger"},
+        {"作词","lyricist"},{"作詞","lyricist"},{"词","lyricist"},{"詞","lyricist"},
+        {"lyricist","lyricist"},{"lyrics","lyricist"},
+        {"歌","vocalist"},{"演唱","vocalist"},{"歌唱","vocalist"},
+        {"vocal","vocalist"},{"vocals","vocalist"},{"vocalist","vocalist"},
+        {"gesang","vocalist"},{"chant","vocalist"},{"voz","vocalist"},
+        {"演奏","performer"},{"performer","performer"},{"interpret","performer"},
+        {"interprète","performer"},{"intérprete","performer"}
+    };
+    auto prefixAt = [&](size_t pos, std::string& role, size_t& value) {
+        while(pos<raw.size() && (raw[pos]==' '||raw[pos]=='\t'||raw[pos]=='\r'||raw[pos]=='\n')) ++pos;
+        for(const auto& p:prefixes) {
+            const size_t len=std::strlen(p.text);
+            if(pos+len>raw.size() || entity_detail::ent_ascii_lower(raw.substr(pos,len))!=p.text) continue;
+            size_t end=pos+len;
+            while(end<raw.size() && (raw[end]==' '||raw[end]=='\t')) ++end;
+            if(raw.compare(end,1,":")==0) ++end;
+            else if(raw.compare(end,3,"：")==0) end+=3;
+            else continue;
+            role=p.role;value=end;return true;
+        }
+        return false;
+    };
+    std::string role;size_t value=0;
+    if(!prefixAt(0,role,value)) return false;
+    for(;;) {
+        size_t next=std::string::npos,nextValue=0;std::string nextRole;
+        for(size_t i=value;i<raw.size();++i) {
+            if(raw[i]!='/'&&raw[i]!=';'&&raw[i]!='|'&&raw[i]!='\n') continue;
+            if(prefixAt(i+1,nextRole,nextValue)){next=i;break;}
+        }
+        const std::string name=entity_detail::ent_trim_ascii_ws(raw.substr(value,next==std::string::npos?next:next-value));
+        if(!name.empty()) out.push_back({role,name});
+        if(next==std::string::npos) break;
+        role=nextRole;value=nextValue;
+    }
+    return true;
+}
 inline EntityGraph entity_graph_from_seed(const MetaSeed& s, long long ts) {
     EntityBuilder b(ts);
     const std::map<std::string, ClassicalField> cf = entity_read_classical(s.tags);
+    std::vector<EntityArtistCredit> artistCredits;
+    const bool explicitArtistCredits=entity_artist_credits(s.artist,artistCredits);
 
     // ---- 厂牌 / 企划 / 社团 ----
     std::string labelName = entity_classical_get(cf, "label");
@@ -1400,9 +1452,9 @@ inline EntityGraph entity_graph_from_seed(const MetaSeed& s, long long ts) {
     std::string seriesName = entity_classical_get(cf, "series");
     if (seriesName.empty()) seriesName = s.series;
     // 厂牌型艺人名（真实样本「塞壬唱片-MSR」）：它本身就是 Label，不是艺人 Person
-    if (labelName.empty() && entity_looks_label(s.artist)) labelName = s.artist;
+    if (labelName.empty() && !explicitArtistCredits && entity_looks_label(s.artist)) labelName = s.artist;
     if (seriesName.empty() && entity_label_also_series(labelName)) seriesName = labelName;
-    const bool artistIsLabel = entity_looks_label(s.artist) && !s.artist.empty();
+    const bool artistIsLabel = !explicitArtistCredits && entity_looks_label(s.artist) && !s.artist.empty();
 
     // ---- 古典标签（大小写不敏感；空则留空）----
     const std::string composer  = entity_classical_get(cf, "composer");
@@ -1416,7 +1468,7 @@ inline EntityGraph entity_graph_from_seed(const MetaSeed& s, long long ts) {
 
     // 古典样本常常只有 ARTIST（TEST 站「Czech National Symphony Orchestra」），
     // 而 artist 被判成 Group → 当作乐团（ensemble），否则会丢掉「乐团×指挥」这一层。
-    if (classical && ensemble.empty() && !s.artist.empty() &&
+    if (classical && ensemble.empty() && !explicitArtistCredits && !s.artist.empty() &&
         entity_artist_kind(s.artist) == EntityKind::Group) {
         ensemble = s.artist;
     }
@@ -1493,7 +1545,7 @@ inline EntityGraph entity_graph_from_seed(const MetaSeed& s, long long ts) {
         }
     } else {
         // 流行退化：Artist → Release → Track（再 Track → Recording）
-        if (!s.artist.empty() && !artistIsLabel) {
+        if (!s.artist.empty() && !artistIsLabel && !explicitArtistCredits) {
             const EntityKind ak = entity_artist_kind(s.artist);
             const std::string artistId = b.add(ak, s.artist, "tag");
             b.attr(artistId, "role", "artist", "tag");
@@ -1518,6 +1570,17 @@ inline EntityGraph entity_graph_from_seed(const MetaSeed& s, long long ts) {
         }
     }
 
+    if(explicitArtistCredits) {
+        b.attr(recordingId,"artistCredit",s.artist,"tag");
+        for(const auto& credit:artistCredits) {
+            const EntityKind kind=credit.role=="performer" ? entity_artist_kind(credit.name) : EntityKind::Person;
+            const std::string personId=b.add(kind,credit.name,"tag");
+            b.attr(personId,"role",credit.role,"tag");
+            b.link(recordingId,entity_rel::kCredit,personId,credit.role,"tag");
+            if(credit.role=="vocalist"||credit.role=="performer")
+                b.link(personId,entity_rel::kReleaseArtist,releaseId,"","tag");
+        }
+    }
     // ---- Recording → Release（两种路径都要，任务书明写 Recording→Release）----
     b.link(recordingId, entity_rel::kReleasedAs, releaseId, "", "tag");
 

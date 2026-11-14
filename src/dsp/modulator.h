@@ -1,4 +1,4 @@
-// modulator.h — SDM（sigma-delta）调制器：PCM -> DSD / 多电平 SDM
+﻿// modulator.h — SDM（sigma-delta）调制器：PCM -> DSD / 多电平 SDM
 //
 // 误差反馈结构（STF = 1，NTF 为高通）：
 //   w[n] = Σ_{k=1..N} p[k]·e[n-k] − Σ_{k=1..N} d[k]·w[n-k]
@@ -55,6 +55,8 @@
 #include <string>
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
+#include <stdexcept>
 #if defined(RTA_SDM_STEREO_DIAGNOSTICS)
 #include <atomic>
 #endif
@@ -449,7 +451,15 @@ inline double ntf_max_root_radius(const NtfPoly& n) {
 
 inline NtfPoly design_sdm_ntf(int order, double cutoff, double fs) {
     auto n=design_ntf_poly(order, cutoff, fs);
-    if (order==7 && fs>=40000000.0) n.sections=SdmNtfSections::butterworth(order,cutoff,fs);
+    // Expanded fifth/seventh-order coefficients lose the small differences
+    // between near-DC numerator/denominator terms. At narrow normalized corners
+    // that changes actual audio gain or injects in-band noise even while every
+    // protection counter remains zero. Preserve factors for these designs.
+    // Keep the existing high-rate seventh-order realization, and preserve the
+    // actual NTF radius/Hinf safety guards below; this is not an order override.
+    const bool narrow = order >= 5 && cutoff / fs <= .002;
+    if ((order==7 && fs>=40000000.0) || narrow)
+        n.sections=SdmNtfSections::butterworth(order,cutoff,fs);
     return n;
 }
 
@@ -562,6 +572,22 @@ struct SdmConfig {
 class SdmModulator {
 public:
     explicit SdmModulator(const SdmConfig& cfg) : cfg_(cfg) {
+        // Validate before indexing the fixed nine-sample histories. NaN must
+        // never turn a protection comparison into an implicit "disabled" flag.
+        if(cfg_.order<1||cfg_.order>8)
+            throw std::invalid_argument("SDM order must be between 1 and 8");
+        if(!std::isfinite(cfg_.fs)||cfg_.fs<=0.0)
+            throw std::invalid_argument("SDM sample rate must be finite and positive");
+        if(!std::isfinite(cfg_.cutoffHz)||cfg_.cutoffHz<=0.0||cfg_.cutoffHz>=cfg_.fs*.5)
+            throw std::invalid_argument("SDM corner must lie between zero and Nyquist");
+        if(!std::isfinite(cfg_.ditherLsb)||cfg_.ditherLsb<0.0)
+            throw std::invalid_argument("SDM dither must be finite and nonnegative");
+        if(!std::isfinite(cfg_.ntfHinf)||!std::isfinite(cfg_.oobGainDb))
+            throw std::invalid_argument("SDM noise-shaping budgets must be finite");
+        if(!std::isfinite(cfg_.minOsrForHighOrder)||cfg_.minOsrForHighOrder<0.0)
+            throw std::invalid_argument("SDM high-order OSR guard must be finite and nonnegative");
+        if(int(cfg_.family)<int(ModulatorFamily::Dsd)||int(cfg_.family)>int(ModulatorFamily::Ahm))
+            throw std::invalid_argument("Unknown SDM modulator family");
         if (cfg_.family == ModulatorFamily::Ahm) {
             int b = cfg_.ahmBits;
             if (b < 2) b = 8;
@@ -797,9 +823,14 @@ public:
           a.effectiveOrder_ != b.effectiveOrder_)
         return false;
       if (a.uses_sections() || b.uses_sections()) {
-        if (a.ntf_.sections.count!=4 || b.ntf_.sections.count!=4) return false;
-        process_binary_stereo_dispatch<7,true>(a,b,x,z,frames,sink);
-        return true;
+        if (a.ntf_.sections.count!=b.ntf_.sections.count) return false;
+        if (a.effectiveOrder_==5 && a.ntf_.sections.count==3) {
+          process_binary_stereo_dispatch<5,true>(a,b,x,z,frames,sink);return true;
+        }
+        if (a.effectiveOrder_==7 && a.ntf_.sections.count==4) {
+          process_binary_stereo_dispatch<7,true>(a,b,x,z,frames,sink);return true;
+        }
+        return false;
       }
       if (a.effectiveOrder_ == 5) {
         process_binary_stereo_dispatch<5>(a, b, x, z, frames, sink);
@@ -845,9 +876,10 @@ private:
     static void process_binary_stereo_local(SdmModulator &a, SdmModulator &b,
                                             const double *x, const double *z,
                                             size_t frames, Sink &sink) {
+      constexpr size_t sectionCount=(N+1)/2;
       __m128d eh[N + 1], wh[N + 1], pc[N + 1], dc[N + 1], gc1[4],gc2[4];
       if constexpr (Sections) {
-        for (size_t k=0;k<4;++k) {
+        for (size_t k=0;k<sectionCount;++k) {
           eh[k]=_mm_set_pd(b.sectionState_.z1[k],a.sectionState_.z1[k]);
           wh[k]=_mm_set_pd(b.sectionState_.z2[k],a.sectionState_.z2[k]);
           const auto& ca=a.ntf_.sections.c[k]; const auto& cb=b.ntf_.sections.c[k];
@@ -917,7 +949,7 @@ private:
       };
       const auto commit = [&] {
         if constexpr (Sections) {
-          for (size_t k=0;k<4;++k) {
+          for (size_t k=0;k<sectionCount;++k) {
             a.sectionState_.z1[k]=_mm_cvtsd_f64(eh[k]);
             b.sectionState_.z1[k]=_mm_cvtsd_f64(_mm_unpackhi_pd(eh[k],eh[k]));
             a.sectionState_.z2[k]=_mm_cvtsd_f64(wh[k]);
@@ -940,7 +972,7 @@ private:
           // Do not reassociate these operations or contract them into FMA.
           auto acc = zero;
           if constexpr (Sections) {
-            for (size_t k=0;k<4;++k) acc=strictAdd(acc,eh[k]);
+            for (size_t k=0;k<sectionCount;++k) acc=strictAdd(acc,eh[k]);
           } else {
             for (size_t k = 1; k <= N; ++k)
               acc = strictAdd(acc, strictMul(pc[k], eh[k - 1]));
@@ -951,7 +983,7 @@ private:
           if (_mm_movemask_pd(bad)) {
             acc = _mm_andnot_pd(bad, acc);
             if constexpr (Sections) {
-              for (size_t k=0;k<4;++k) { eh[k]=_mm_andnot_pd(bad,eh[k]); wh[k]=_mm_andnot_pd(bad,wh[k]); }
+              for (size_t k=0;k<sectionCount;++k) { eh[k]=_mm_andnot_pd(bad,eh[k]); wh[k]=_mm_andnot_pd(bad,wh[k]); }
             } else wh[0] = _mm_andnot_pd(bad, wh[0]);
           }
           auto u = strictAdd(_mm_set_pd(z[i], x[i]), acc);
@@ -999,7 +1031,7 @@ private:
           // Match scalar feedback correction, including +0.0 signed-zero behavior.
           e = strictAdd(e, dith);
           if constexpr (Sections) {
-            for (size_t k=0;k<4;++k) {
+            for (size_t k=0;k<sectionCount;++k) {
               auto out=strictAdd(e,eh[k]);
               auto next1=strictAdd(strictSub(strictMul(gc1[k],e),strictMul(pc[k],eh[k])),wh[k]);
               auto next2=strictSub(strictMul(gc2[k],e),strictMul(dc[k],eh[k]));

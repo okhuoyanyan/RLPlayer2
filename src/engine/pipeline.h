@@ -23,6 +23,7 @@
 #include "dsp/volume.h"
 #include "dsp/gpu_bridge.h"
 #include "dsp/loudness.h"
+#include "dsp/recording_cleanup.h"
 #include "dsp/peq.h"          // 261024-02 #6：20 段参数均衡（输入采样率、现有文件 EQ 之前）
 #include "dsp/dsd_rate_convert.h"   // 2026-10-27：DSD 异速率支路（DSD64→128/256…），PCM 路径不引用它
 #include "dsp/replaygain.h"         // 2026-10-27：ReplayGain 增益（只用 apply_gain / loudness_volume_db，纯头文件）
@@ -31,6 +32,7 @@
 #include <algorithm>
 #include <chrono>
 #include <memory>
+#include <atomic>
 
 namespace rta::engine {
 
@@ -75,6 +77,7 @@ struct PipelineConfig {
     //   不再用固定预算 taps/L（那会让 DSD1024 的 T 掉到 32，通带塌 −4 dB）。
     //   默认 false 保持既有行为逐位不变；播放路径（rtaweb）显式打开。
     bool     autoTaps = false;
+    bool     allowAutomaticCascade = true;
     // ★ 2026-10-30（261030-01 D-11）：允许走定点卷积。**只是允许** ——
     //   真正的闸门在 prepare() 里：源必须是整数 PCM ≤24 bit、输出 ≤24 bit、且无任何处理。
     //   闸门不满足时自动退回 double（实测那种情况下定点反而差 194 dB，见 test_fixed_conv §3b）。
@@ -85,17 +88,18 @@ struct PipelineConfig {
     bool                loudnessEnabled = false;
     dsp::LoudnessConfig loudness;
 
+    // Independent, opt-in recording noise cleanup before matrix/upsampling.
+    // This is a bounded adaptive denoiser, not an inverse model of an ADC.
+    dsp::RecordingCleanupConfig recordingCleanup;
+
     // ---- 输出 ----
     int      outBits    = 0;          // 0 = 与源相同
     int      outChannels= 0;          // 0 = 与源相同
-    // ★ 2026-10-30：**源文件的真实位深**（0 = 未知，退回按缓冲自身的 bits 判断）。
-    //
-    // 为什么必须有这个字段：解码器交给管线的缓冲位深是【容器位深】，不是源精度。
-    //   MP3/AAC 经 ffmpeg 解出来是 pcm_f32le（bits=32、isFloat=true），而它的真实源是
-    //   16 bit。旧判定只看 in.bits ⟹ 32→24 被当成「位深降低」、且 float 一律判死，
-    //   于是一个 16-bit 有损源在 24-bit 输出下**永远**报「非 bit-perfect」，
-    //   而同一台设备上 16-bit WAV 报的是「全程逐位一致」（实测同一会话内两种结论并存）。
-    //   判据必须问「源有多深」，不是「容器有多宽」。
+    // Source precision metadata (0 = unknown). For integer PCM this may be
+    // smaller than the decoder/container width. Lossy MP3/AAC has no intrinsic
+    // integer bit depth: a float32 decoder buffer must not be called a 16-bit
+    // source. This field informs DSP policy only; raw zero padding is allowed
+    // solely when the actual integer container is narrower than the output.
     int      sourceBits = 0;
     dsp::Shaper shaper  = dsp::Shaper::None;
     uint64_t seed       = 0xC0FFEEull;
@@ -163,6 +167,13 @@ inline void apply_resample_purpose(PipelineConfig& cfg, dsp::ResamplePurpose pur
 }
 
 struct PipelineStats {
+    bool usedRecordingCleanup = false;
+    double cleanupMeanReductionDb = 0.0, cleanupModifiedBinFraction = 0.0;
+    dsp::RecordingCleanupAutoState cleanupAutoState = dsp::RecordingCleanupAutoState::Manual;
+    bool cleanupAutoEstimateValid = false, cleanupAutoFrozenForDrain = false;
+    double cleanupEstimatedNoiseFloorDbfs = -144., cleanupAppliedNoiseFloorDbfs = -144.;
+    double cleanupAutoEvidenceCoverage = 0;
+    size_t cleanupAutoLearningFrames = 0, cleanupAutoRejectedMusicFrames = 0;
     bool usedLoudness = false;      // 等响度补偿是否实际生效（音量 >= 上界时为 false）
     bool     bitPerfect = false;
     bool     zeroPad    = false;
@@ -196,16 +207,22 @@ struct PipelineStats {
 
 class Pipeline {
 public:
-    explicit Pipeline(const PipelineConfig& cfg) : cfg_(cfg) {}
+    explicit Pipeline(const PipelineConfig& cfg) : requestedVolumeDb_(cfg.volumeDb),
+        requestedLoudnessDb_(cfg.volumeDb), volumeActive_(cfg.volumeEnabled && cfg.volumeDb != 0.0),
+        loudnessActive_(cfg.loudnessEnabled && dsp::loudness_effect_db(cfg.loudness,
+            dsp::replaygain::loudness_volume_db(cfg.volumeDb, cfg.replayGainDb)) > 1e-9), cfg_(cfg) {}
 
     const PipelineConfig& config() const { return cfg_; }
 
     bool hasAnyProcessing() const {
 
         if (cfg_.outRate && cfg_.outRate != 0) { /* 需与源率比较，见下 */ }
+        if (cfg_.recordingCleanup.enabled && cfg_.recordingCleanup.strength > 0 &&
+            cfg_.recordingCleanup.maxReductionDb > 0) return true;
         if (!cfg_.matrix.empty()) return true;
         if (cfg_.shaper != dsp::Shaper::None) return true;
-        if (cfg_.volumeEnabled && cfg_.volumeDb != 0.0) return true;
+        if (cfg_.volumeEnabled && (requestedVolumeDb_.load(std::memory_order_relaxed) != 0.0 ||
+                                  volumeActive_.load(std::memory_order_relaxed))) return true;
         if (cfg_.replayGainDb != 0.0) return true;      // ReplayGain 改样本值 ⟹ 不是直通
         // ★ 2026-10-29（两轮审查 F21）：预衰减漏判。
         //   preAttenDb 是 ISP/调制器余量预衰减（实际信号增益，负 dB），pipeline 在
@@ -217,9 +234,9 @@ public:
         // ★ 2026-10-29（F21 顺带）：等响度补偿也必须参与判定。
         //   旧代码完全没有这一条 ⟹ 音量 −40 dB + 开 Loudness（低音 +6 dB 真的在改样本）
         //   时仍报 bit-perfect=yes。判据与实际处理必须同源（铁律 3）。
-        if (cfg_.loudnessEnabled &&
+        if (cfg_.loudnessEnabled && (loudnessActive_.load(std::memory_order_relaxed) ||
             dsp::loudness_effect_db(cfg_.loudness,
-                dsp::replaygain::loudness_volume_db(cfg_.volumeDb, cfg_.replayGainDb)) > 1e-9)
+                dsp::replaygain::loudness_volume_db(requestedLoudnessDb_.load(std::memory_order_relaxed), cfg_.replayGainDb)) > 1e-9))
             return true;
         for (const auto& c : cfg_.channel) {
             if (!c.eq.empty() || c.delaySamples != 0 || !c.ir.empty() || c.gainDb != 0.0) return true;
@@ -234,10 +251,20 @@ public:
 
     // ★ 2026-10-29（两轮审查 F04）：播放中实时改音量，做在【输出采样率、调制/装箱之前】
     //   的 PCM 域 —— 这是 DSD/DoP 唯一数学正确的音量作用点（PCM 增益不能碰 1-bit 载波）。
-    //   只影响已建立的流式状态；volumeEnabled=false（CLI 未开音量）时是 no-op。
+    //   请求跨线程发布；首次处理前也生效，volumeEnabled=false 时仅更新等响度听音电平。
     //   与起播音量同一套渐变：动态变化会 ramp，0 dB 稳态逐位不变。
     void set_volume_db(double db) const {
-        if (ss_.vol) ss_.vol->set_gain_db(db);
+        if (!rta::audio::audio_finite(db)) return;
+        const double old = requestedVolumeDb_.exchange(db, std::memory_order_relaxed);
+        if (old != db && cfg_.volumeEnabled) volumeActive_.store(true, std::memory_order_relaxed);
+        requestedLoudnessDb_.store(db, std::memory_order_relaxed);
+    }
+
+    // PCM rendering applies its live gain in the sink; only the listening level
+    // is forwarded here so loudness follows without applying the gain twice.
+    // Setters publish requests only. Filter/volume state belongs to process().
+    void set_loudness_volume_db(double db) const {
+        if (rta::audio::audio_finite(db)) requestedLoudnessDb_.store(db, std::memory_order_relaxed);
     }
 
     // ---- 流结束排空（★ 2026-10-29 两轮审查 F17）----
@@ -255,8 +282,11 @@ public:
         const uint32_t inRate  = ss_.inRate ? ss_.inRate : 1u;
         const uint32_t outRate = cfg_.outRate ? cfg_.outRate : inRate;
         double inSamples = 0.0;
+        if (ss_.cleanup) inSamples += (double)ss_.cleanup->latency();
         if (ss_.rs) inSamples += std::max(0.0, ss_.rs->latencyInputSamples());
-        for (const auto& cv : ss_.conv) if (cv) inSamples += (double)cv->latency();
+        // Channel convolvers run in parallel, so they contribute one common
+        // maximum latency, never the sum of all channels.
+        inSamples += (double)ss_.convLatency;
         const double out = inSamples * (double)outRate / (double)inRate;
         return (out > 0.0) ? out : 0.0;
     }
@@ -283,6 +313,21 @@ public:
         return tail;
     }
 
+    // Adaptive STFT processing has finite overlap beyond delay compensation.
+    // Drain it in addition to convolution and resampler ringing, not as silence
+    // trimmed from the head. Input/output time bases are converted exactly once.
+    double recording_cleanup_tail_out_frames() const {
+        if (!ss_.ready || !ss_.cleanup) return 0.0;
+        const uint32_t inRate = ss_.inRate ? ss_.inRate : 1u;
+        const uint32_t outRate = cfg_.outRate ? cfg_.outRate : inRate;
+        return (double)ss_.cleanup->tail() * (double)outRate / (double)inRate;
+    }
+
+    // Diagnostics on the processing thread only, like prepared_resampler().
+    const dsp::RecordingCleanupStats* prepared_recording_cleanup_stats() const noexcept {
+        return ss_.cleanup ? &ss_.cleanup->stats() : nullptr;
+    }
+
     // FIR ringing after the last source sample, beyond delay compensation.
     // Nonlinear-phase filters report zero compensable delay but still retain
     // their complete causal tail. Callers drain this without trimming the head.
@@ -294,10 +339,17 @@ public:
         return std::max(0.0, naturalTail) * (double)outRate / (double)inRate;
     }
 
+    // Read-only access to the exact prepared object for independent numerical
+    // audits. Tools must not reconstruct a different autoTaps configuration.
+    const dsp::PolyphaseResampler* prepared_resampler() const noexcept {
+        return ss_.rs.get();
+    }
+
     // 喂一块零进管线，取出内部缓冲里剩下的样本。只能在流式状态建立后调用；
     // 未建立（逐位直通/无损展宽路径）时返回空 —— 那两条路径没有算法延迟。
     AudioBuffer drain_chunk(size_t frames = 4096, std::vector<std::vector<double>>* doubleOut = nullptr) const {
         if (!ss_.ready || frames == 0) return AudioBuffer{};
+        if (ss_.cleanup) ss_.cleanup->begin_drain();
         AudioBuffer z;
         z.rate = ss_.inRate;
         z.channels = ss_.inChannels;
@@ -318,6 +370,7 @@ public:
     // 重建 Pipeline 会重新设计 26 万抽头的滤波器（秒级），跳转会明显卡顿；
     // 这里只把历史清零，配合调用方的"预卷"（提前解码 0.5 秒再丢掉）即可无拖尾。
     void seek_reset() const {
+        if (ss_.cleanup) ss_.cleanup->reset();
         if (ss_.rs) ss_.rs->reset();
         // 卷积器按 IR 长度分块，跳转时用同一个 IR 重新装载即可清空历史
         for (size_t c = 0; c < ss_.conv.size(); ++c) {
@@ -331,21 +384,16 @@ public:
         for (auto& l : ss_.loud) if (l) l->reset();
         // 2026-10-25：延迟线改持久后，跳转也必须清历史（否则跳转后先吐出上一个位置的尾巴）
         for (auto& d : ss_.delay) d.reset();
+        for (auto& d : ss_.convAlign) d.reset();
         // ★ 2026-10-29（两轮审查 F20 位置 A）：PEQ 是【跨曲共享】的同一个引擎实例
         //   （rtaweb 的 g_peq），跳转必须清它的滤波历史 —— 否则跳转后先吐出旧位置的
         //   拖尾，切歌时同理（前曲脉冲 → 新曲静音仍非零）。系数不动，只清状态。
         if (cfg_.peq) cfg_.peq->reset_state();
     }
 
-    // ★ 2026-10-30：float 缓冲不再「一律判死」。
-    //
-    // 旧代码两句 「if (in.isFloat) return false;」 把「容器是 float」当成了「链路改了样本」，
-    // 这是两件事。float32 缓冲（ffmpeg 解 mp3/aac 的产物）只要**真实源位深 ≤ 输出位深**，
-    // 解码值就能被整数输出精确表示 ⟹ 链路本身一个比特都没改。
-    // 真正不能承诺的只有一种：不知道源有多深（sourceBits==0 且缓冲是 float）。
-    //
-    // 另外：float 缓冲的输出必然是整数格式，所以它不是「同格式逐位」而是「无损展宽」，
-    // 归到 willBeZeroPad 这一侧 —— 调用方（rtaweb）把 BP 与 Pad 都显示成「逐位一致」。
+    // Bit-perfect and zero padding describe the actual sample representation.
+    // sourceBits is metadata; it cannot prove float decoder samples lie on an
+    // integer grid, or justify shifting a wider integer container backwards.
     bool willBeBitPerfect(const AudioBuffer& in) const {
         if (cfg_.forceBitPerfect) return true;
         if (in.isFloat) return false;          // float→int 是格式转换，不算「同格式逐位」
@@ -356,7 +404,8 @@ public:
     }
 
     // 只做位深展宽（源位深 < 输出位深：样本值不变，只在低位补零）。
-    // 判据用**真实源位深** sourceBits；未知时：整数缓冲退回 in.bits，float 缓冲则不敢承诺。
+    // Only integer container widening can use raw shifts. All float conversions
+    // and integer narrowing use normalized numeric samples and quantization.
     bool willBeZeroPad(const AudioBuffer& in) const {
         if (cfg_.forceBitPerfect) return false;
         const uint32_t orr = cfg_.outRate ? cfg_.outRate : in.rate;
@@ -364,9 +413,7 @@ public:
         const int oc = cfg_.outChannels ? cfg_.outChannels : in.channels;
         if (orr != in.rate || oc != in.channels) return false;
         if (hasAnyProcessing()) return false;
-        const int sb = cfg_.sourceBits > 0 ? cfg_.sourceBits : (in.isFloat ? 0 : in.bits);
-        if (sb <= 0) return false;
-        return ob > sb;
+        return !in.isFloat && in.bits >= 8 && in.bits <= 32 && ob > in.bits && ob <= 32;
     }
 
     // Optional double planes stop before PCM quantization. DSD must quantize
@@ -420,6 +467,19 @@ public:
         // 首次调用（或配置变化）时建立持久流式状态；此后跨调用保持
         if (!ss_.ready || ss_.inRate != in.rate || ss_.inChannels != in.channels)
             prepare_stream(in, outCh);
+        // Consume control requests on this thread only; no GUI/render thread
+        // writes VolumeControl or Loudness filter histories.
+        const double volumeDb = requestedVolumeDb_.load(std::memory_order_relaxed);
+        if (ss_.vol && volumeDb != ss_.volumeDb) {
+            ss_.vol->set_gain_db(volumeDb);
+            ss_.volumeDb = volumeDb;
+        }
+        const double loudnessDb = requestedLoudnessDb_.load(std::memory_order_relaxed);
+        if (loudnessDb != ss_.loudnessDb) {
+            for (auto& l : ss_.loud)
+                l->set_volume_db(dsp::replaygain::loudness_volume_db(loudnessDb, cfg_.replayGainDb));
+            ss_.loudnessDb = loudnessDb;
+        }
         st.prepareMs = ss_.prepareMs;
         st.coeffBytes = ss_.coeffBytes;
 
@@ -428,6 +488,26 @@ public:
         for (size_t n = 0; n < nIn; ++n)
             for (int c = 0; c < inCh; ++c)
                 planes[(size_t)c][n] = in.sample(n, c);
+
+        // The adaptive recording denoiser receives source-domain samples and
+        // precedes all gain/EQ/routing, so its noise budget has a stable meaning.
+        if (ss_.cleanup) {
+            std::vector<double*> cp;
+            for (auto& p : planes) cp.push_back(p.data());
+            ss_.cleanup->process(cp.data(), inCh, nIn);
+            const auto& cs = ss_.cleanup->stats();
+            st.usedRecordingCleanup = ss_.cleanup->enabled();
+            st.cleanupMeanReductionDb = cs.meanReductionDb;
+            st.cleanupModifiedBinFraction = cs.modifiedBinFraction;
+            st.cleanupAutoState = cs.autoState;
+            st.cleanupAutoEstimateValid = cs.autoEstimateValid;
+            st.cleanupEstimatedNoiseFloorDbfs = cs.estimatedNoiseFloorDbfs;
+            st.cleanupAppliedNoiseFloorDbfs = cs.appliedNoiseFloorDbfs;
+            st.cleanupAutoEvidenceCoverage = cs.autoEvidenceCoverage;
+            st.cleanupAutoLearningFrames = cs.autoLearningFrames;
+            st.cleanupAutoRejectedMusicFrames = cs.autoRejectedMusicFrames;
+            st.cleanupAutoFrozenForDrain = cs.autoFrozenForDrain;
+        }
 
         // ---- ReplayGain（最靠输入的一级；见 PipelineConfig::replayGainDb 的三条理由）----
         // ★ 0 dB 必须整段跳过：apply_gain() 在 gainDb==0 时直接 return，一个样本都不碰。
@@ -580,6 +660,13 @@ public:
             }
         }
 
+        // Channels without an IR must share the convolver's buffering delay.
+        // Otherwise head trimming deletes their first B real frames and their
+        // entire signal leads the corrected channels by B frames.
+        for (int c = 0; c < outCh; ++c)
+            if ((size_t)c < ss_.convAlign.size())
+                for (auto& v : work[(size_t)c]) v = ss_.convAlign[(size_t)c].process(v);
+
         // ---- 阶段 5：重采样 ----
         if (st.outRate != in.rate && ss_.rs) {
             // ★ 使用持久重采样器：相位累加器与历史跨调用保持
@@ -615,10 +702,13 @@ public:
         // 音量 >= 上界时 bass_db()/treble_db() 均为 0，Loudness::process 会直接返回，
         // 因此 0 dB 场景下这一段是【完全旁路】，不影响比特完美。
         if (!ss_.loud.empty()) {
+            const bool wasActive = ss_.loud[0]->active();
             for (int c = 0; c < outCh && c < (int)ss_.loud.size(); ++c) {
                 ss_.loud[(size_t)c]->process(work[(size_t)c].data(), work[(size_t)c].size());
             }
-            st.usedLoudness = (ss_.loud[0]->bass_db() > 1e-9 || ss_.loud[0]->treble_db() > 1e-9);
+            const bool stillActive = ss_.loud[0]->active();
+            st.usedLoudness = wasActive || stillActive;
+            loudnessActive_.store(stillActive, std::memory_order_relaxed);
         }
 
         if (cfg_.volumeEnabled && ss_.vol) {
@@ -630,8 +720,11 @@ public:
             std::vector<double*> vp;
             vp.reserve(work.size());
             for (auto& w : work) vp.push_back(w.data());
+            const bool wasActive = ss_.vol->current_gain() != 1.0 || ss_.vol->ramping();
             ss_.vol->process_planes(vp.data(), (int)work.size(), nOut);
-            st.usedVolume = (cfg_.volumeDb != 0.0);
+            const bool stillActive = ss_.vol->current_gain() != 1.0 || ss_.vol->ramping();
+            st.usedVolume = wasActive || stillActive;
+            volumeActive_.store(stillActive, std::memory_order_relaxed);
         }
 
         if (doubleOut) {
@@ -684,6 +777,7 @@ private:
         int    inChannels = 0;
         std::unique_ptr<dsp::PolyphaseResampler> rs;
         std::unique_ptr<dsp::VolumeControl>      vol;
+        std::unique_ptr<dsp::RecordingCleanup>   cleanup;
         std::vector<dsp::Biquad>                 eq;      // 按输出声道展开的级联
         std::vector<size_t>                      eqPerCh; // 每声道的双二阶个数
         std::vector<dsp::Quantizer>              quant;
@@ -696,6 +790,9 @@ private:
         std::vector<std::unique_ptr<dsp::Loudness>> loud;             // 每声道（各自持有滤波状态）
         // 每输出声道延迟线（2026-10-25 修复：原先每块新建 ⟹ 每块丢 delaySamples 个样本）
         std::vector<dsp::DelayLine> delay;
+        std::vector<dsp::DelayLine> convAlign;
+        size_t convLatency = 0;
+        double volumeDb = 0.0, loudnessDb = 0.0;
         double prepareMs = 0.0;      // prepare_stream() 耗时（滤波器设计 + 状态分配）
         size_t coeffBytes = 0;       // 重采样器系数表字节数（多相 L × 每相抽头 × 8）
     };
@@ -706,17 +803,28 @@ private:
         ss_ = StreamState{};
         ss_.inRate = in.rate;
         ss_.inChannels = in.channels;
+        if (cfg_.recordingCleanup.enabled && cfg_.recordingCleanup.strength > 0 &&
+            cfg_.recordingCleanup.maxReductionDb > 0)
+            ss_.cleanup = std::make_unique<dsp::RecordingCleanup>(cfg_.recordingCleanup, in.rate, in.channels);
 
         const uint32_t outRate = cfg_.outRate ? cfg_.outRate : in.rate;
+        ss_.volumeDb = requestedVolumeDb_.load(std::memory_order_relaxed);
+        ss_.loudnessDb = requestedLoudnessDb_.load(std::memory_order_relaxed);
         if (outRate != in.rate) {
             dsp::ResamplerConfig rc;
             rc.inRate = in.rate; rc.outRate = outRate; rc.channels = outCh;
             rc.totalTaps = cfg_.taps; rc.attenDb = cfg_.attenDb; rc.transition = cfg_.transition;
             rc.window = cfg_.filterWindow; rc.phase = cfg_.filterPhase;
             rc.twoStage = cfg_.twoStage; rc.stage2Taps = cfg_.stage2Taps;
+            rc.allowAutomaticCascade = cfg_.autoTaps && cfg_.allowAutomaticCascade;
             // 2026-10-25：每相位抽头地板透传；
             // 2026-10-30（§4.3）：autoTaps 时按源反解 —— 与输出率解耦，DAC 率越高不会越糊。
             rc.minTapsPerInput = cfg_.minTapsPerInput;
+            rc.apodizing = cfg_.apodizing; rc.apodF1 = cfg_.apodF1; rc.apodF2 = cfg_.apodF2;
+            rc.autoTaps = cfg_.autoTaps;
+            rc = dsp::resolve_auto_taps(rc);
+            const auto preparationPlan = dsp::plan_resampler(rc);
+            const auto& integerStage = preparationPlan.stages[0];
             // D-11 闸门：定点只在「24 bit 整数直通」时精确，三条同时满足才启用。
             //   ① 输入是整数缓冲（float 缓冲说明源是浮点，转 int24 必丢精度）
             //   ② 源位深 ≤ 24（未知时用 in.bits）
@@ -727,10 +835,7 @@ private:
                        && (cfg_.sourceBits > 0 ? cfg_.sourceBits <= 24 : in.bits <= 24)
                        && (cfg_.outBits == 0 || cfg_.outBits <= 24)
                        && !hasAnyProcessing()
-                       && (double)((cfg_.autoTaps && rc.minTapsPerInput == 0)
-                                   ? dsp::solve_taps_per_phase(cfg_.filterWindow, cfg_.transition, cfg_.apodizing,
-                                                               cfg_.apodF1, cfg_.apodF2, cfg_.taps, 0, (double)in.rate)
-                                   : rc.minTapsPerInput) * (double)outRate * (double)outCh <= 250e6;
+                       && double(integerStage.T) * double(integerStage.config.outRate) * double(outCh) <= 250e6;
             // 实测（2026-10-30）：闸门工作正常 —— 无处理时 usedFixed=1，加 −0.5 dB 音量后自动退回 double。
             //
             // 【算力闸门】定点用 __int128 标量累加，实测约 200 MMAC/s；double 走 SIMD 约 2 GMAC/s。
@@ -739,11 +844,6 @@ private:
             // 此预算回退使用 double 乘累加，不能宣称仍是整数逐位精确；usedFixed 如实上报。
             ss_.usedFixed = rc.useFixed;
             // 定点路径在重采样器层已验证：test_fixed_conv §5 与 double 差 −274.2 dB。
-            if (cfg_.autoTaps && rc.minTapsPerInput == 0) {
-                rc.minTapsPerInput = dsp::solve_taps_per_phase(
-                    cfg_.filterWindow, cfg_.transition, cfg_.apodizing,
-                    cfg_.apodF1, cfg_.apodF2, cfg_.taps, 0, (double)in.rate);
-            }
             // ★ 2026-10-29（F22）：切趾三要素必须透传，否则"选了切趾等于没选"
             rc.apodizing = cfg_.apodizing;
             rc.apodF1    = cfg_.apodF1;
@@ -758,7 +858,7 @@ private:
             // ★ 2026-10-29（F01）：起播必须【立刻到位】，不能从单位增益淡入。
             //   旧写法 set_gain_db() 只启动 200 ms 从 1.0 → 目标的渐变 ⟹ 选 −60 dB 时
             //   开头 200 ms 是满幅（首样本 0.499947969 vs 目标 0.0005，差 59.9991 dB）。
-            ss_.vol->set_gain_db_snapped(cfg_.volumeDb);
+            ss_.vol->set_gain_db_snapped(ss_.volumeDb);
         }
         const int ob = cfg_.outBits ? cfg_.outBits : in.bits;
         if (cfg_.shaper != dsp::Shaper::None || ob < in.bits) {
@@ -781,7 +881,7 @@ private:
                 L->init((double)outRate);
                 // 提升量由【实际听音电平】决定：音量 + ReplayGain 造成的电平变化（一次性换算，
                 // 不是反馈回路 —— 绝不要把 appliedDb 再喂回 ReplayGain，见 replaygain.h 文件头）。
-                L->set_volume_db(dsp::replaygain::loudness_volume_db(cfg_.volumeDb, cfg_.replayGainDb));
+                L->set_volume_db(dsp::replaygain::loudness_volume_db(ss_.loudnessDb, cfg_.replayGainDb));
                 ss_.loud.push_back(std::move(L));
             }
         }
@@ -799,6 +899,12 @@ private:
                 }
             }
         }
+        for (const auto& cv : ss_.conv) if (cv) ss_.convLatency = std::max(ss_.convLatency, cv->latency());
+        ss_.convAlign.resize((size_t)outCh);
+        for (int c = 0; c < outCh; ++c) {
+            const size_t ownLatency = ss_.conv[(size_t)c] ? ss_.conv[(size_t)c]->latency() : 0;
+            ss_.convAlign[(size_t)c].set_samples(ss_.convLatency - ownLatency);
+        }
         ss_.eqPerCh.assign((size_t)outCh, 0);
         for (int c = 0; c < outCh; ++c) {
             if (c < (int)cfg_.channel.size()) {
@@ -814,6 +920,8 @@ private:
         ss_.ready = true;
     }
 
+    mutable std::atomic<double> requestedVolumeDb_, requestedLoudnessDb_;
+    mutable std::atomic<bool> volumeActive_, loudnessActive_;
     mutable bool lastGpuResampleUsed_ = false;
     PipelineConfig cfg_;
 };

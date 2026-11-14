@@ -43,6 +43,11 @@ int main(int argc, char** argv) {
     const char* want = (argc > 1) ? argv[1] : "UltraLite";
     const bool streamTest = (argc > 2 && !std::strcmp(argv[2], "--stream"));
     const bool pollMode = (argc > 3 && !std::strcmp(argv[3], "--poll"));
+    bool diagTest = false, drainOnly = false;
+    for (int i = 2; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--diag")) diagTest = true;
+        if (!std::strcmp(argv[i], "--drain")) drainOnly = true;
+    }
     bool perZero = false;   // true = 对齐重试时 periodicity 传 0（驱动默认周期）
     for (int i = 3; i < argc; ++i) if (!std::strcmp(argv[i], "--per0")) perZero = true;
 
@@ -167,6 +172,140 @@ int main(int argc, char** argv) {
         }
         ac->Stop(); ac->Release(); if (rc) rc->Release(); CloseHandle(ev);
         printf("（全程写的是全零静音，没有任何可听声音）\n");
+        dev->Release(); col->Release(); en->Release(); CoUninitialize();
+        return 0;
+    }
+
+    // ===== 诊断模式：设备到底按什么速率消费？（2026-11-13 ZiSan 1.536 MHz padding 恒 0）=====
+    // 现场：RLPlayer 在 1536000 Hz 独占时 GetCurrentPadding 恒为 0，于是 write_available
+    // 每拍都算得出"缓冲是空的"，8 s 素材 3.2 s 就"播完"。问题是有两种完全不同的成因：
+    //   ① 驱动在 1.5M 档不报告 padding，但设备确实按 1536000 消费 ⟹ 只是我们缺节流信号；
+    //   ② 设备根本没跑到 1536000（例如实际 768000）⟹ 那是能力问题，必须如实报错。
+    // 两者处置完全相反，所以必须用 IAudioClock 的**设备时钟位置**独立测一次消费速率。
+    // 全程写全零静音，不产生任何可听声音。
+    if (diagTest) {
+        uint32_t r = 1536000, bufMs = 100, secs = 5, perMs = 0;   // perMs=0 ⟹ 周期=缓冲
+        int ints[4] = {0,0,0,0}, ni = 0;
+        for (int i = 2; i < argc; ++i) {
+            if (!std::strcmp(argv[i], "--diag") || !std::strcmp(argv[i], "--poll") ||
+                !std::strcmp(argv[i], "--drain")) continue;
+            const int v = std::atoi(argv[i]);
+            if (v > 0 && ni < 4) ints[ni++] = v;
+        }
+        if (ni >= 1) r = (uint32_t)ints[0];
+        if (ni >= 2) bufMs = (uint32_t)ints[1];
+        if (ni >= 3) secs = (uint32_t)ints[2];
+        if (ni >= 4) perMs = (uint32_t)ints[3];
+        if (perMs == 0) perMs = bufMs;
+
+        const int ch = 2, cont = 4, valid = 24;
+        WAVEFORMATEXTENSIBLE wfx{};
+        wfx.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+        wfx.Format.nChannels = (WORD)ch;
+        wfx.Format.nSamplesPerSec = r;
+        wfx.Format.wBitsPerSample = (WORD)(cont * 8);
+        wfx.Format.nBlockAlign = (WORD)(ch * cont);
+        wfx.Format.nAvgBytesPerSec = r * wfx.Format.nBlockAlign;
+        wfx.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+        wfx.Samples.wValidBitsPerSample = (WORD)valid;
+        wfx.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+        wfx.SubFormat = SUB_PCM;
+
+        printf("=== 诊断: %u Hz, 缓冲 %u ms, 运行 %u s（写全零静音，无声）===\n",
+               (unsigned)r, (unsigned)bufMs, (unsigned)secs);
+        IAudioClient* ac = nullptr;
+        if (FAILED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ac)) || !ac) { printf("Activate 失败\n"); return 2; }
+        REFERENCE_TIME dur = (REFERENCE_TIME)bufMs * 10000;
+        // 事件驱动 vs 轮询必须分别测：RLPlayer 实际用的是轮询配方
+        //（PLAYBUF 里写的就是 "period=10.0ms,poll"），而驱动在两种模式下行为可以完全不同。
+        const DWORD dflags = pollMode ? 0 : AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+        printf("模式: %s\n", pollMode ? "轮询（无 EVENTCALLBACK）" : "事件驱动（EVENTCALLBACK）");
+        REFERENCE_TIME perRt = (REFERENCE_TIME)perMs * 10000;   // 周期（periodicity）
+        printf("请求: 缓冲 %u ms / 周期 %u ms\n", (unsigned)bufMs, (unsigned)perMs);
+        HRESULT hr = ac->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, dflags,
+                                    dur, perRt, (WAVEFORMATEX*)&wfx, nullptr);
+        if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+            UINT32 frames = 0;
+            if (SUCCEEDED(ac->GetBufferSize(&frames)) && frames) {
+                REFERENCE_TIME d2 = (REFERENCE_TIME)(10000.0 * 1000.0 * (double)frames / (double)r + 0.5);
+                ac->Release(); ac = nullptr;
+                dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ac);
+                hr = ac->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, dflags,
+                                    d2, perRt, (WAVEFORMATEX*)&wfx, nullptr);
+            }
+        }
+        printf("Initialize -> 0x%08lX\n", (unsigned long)(unsigned)hr);
+        if (hr != S_OK) { printf("Initialize 失败，终止\n"); return 2; }
+
+        UINT32 bufFrames = 0; ac->GetBufferSize(&bufFrames);
+        REFERENCE_TIME per = 0, minp = 0; ac->GetDevicePeriod(&per, &minp);
+        printf("缓冲=%u 帧，设备周期=%.2f ms\n", (unsigned)bufFrames, per / 10000.0);
+
+        IAudioClock* clk = nullptr;
+        ac->GetService(__uuidof(IAudioClock), (void**)&clk);
+        UINT64 clkFreq = 0;
+        if (clk) clk->GetFrequency(&clkFreq);
+        printf("IAudioClock %s, frequency=%llu\n", clk ? "可用" : "不可用", (unsigned long long)clkFreq);
+
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        ac->SetEventHandle(ev);
+        IAudioRenderClient* rc = nullptr;
+        ac->GetService(__uuidof(IAudioRenderClient), (void**)&rc);
+        if (!rc) { printf("GetService(RenderClient) 失败\n"); return 2; }
+
+        LARGE_INTEGER qf, q0, qn; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
+        hr = ac->Start();
+        printf("Start -> 0x%08lX\n", (unsigned long)(unsigned)hr);
+
+        unsigned long long written = 0, clkPos0 = 0; bool haveClk0 = false;
+        double lastPrint = -1.0; int padNonZero = 0, padZero = 0; UINT32 padMax = 0;
+        for (;;) {
+            QueryPerformanceCounter(&qn);
+            const double el = (double)(qn.QuadPart - q0.QuadPart) / (double)qf.QuadPart;
+            if (el >= (double)secs) break;
+            UINT32 pad = 0; ac->GetCurrentPadding(&pad);
+            if (pad == 0) ++padZero; else ++padNonZero;
+            if (pad > padMax) padMax = pad;
+            UINT32 room = (pad < bufFrames) ? (bufFrames - pad) : 0;
+            // 已知驱动语义：Start 之后 pad 会一直报"满"直到我们写进第一段数据
+            //（原代码 write_available 里同一条 bypass）。诊断里也必须照做，否则永远写不进去、
+            // 也就测不出设备到底消不消费。
+            if (room == 0 && written == 0) { room = bufFrames; printf("  [首写强制 GetBuffer(%u)]\n", (unsigned)room); }
+            // --drain：填满一次之后**不再写**，纯观察 padding 与设备时钟怎么走。
+            // 这是判定「padding 和时钟到底谁在撒谎」的唯一干净实验：
+            //   设备播放缓冲里的数据时，诚实的 padding 会一路降到 0，
+            //   同时时钟前进量应≈一个缓冲；撒谎的 padding 会卡在低值不动。
+            if (drainOnly && written > 0) room = 0;
+            if (room > 0) {
+                BYTE* data = nullptr;
+                if (SUCCEEDED(rc->GetBuffer(room, &data)) && data) {
+                    std::memset(data, 0, (size_t)room * ch * cont);
+                    if (SUCCEEDED(rc->ReleaseBuffer(room, 0))) written += room;
+                }
+            }
+            if (el - lastPrint >= 0.5) {
+                lastPrint = el;
+                unsigned long long pos = 0, qpc = 0;
+                if (clk && SUCCEEDED(clk->GetPosition(&pos, &qpc))) {
+                    if (!haveClk0) { clkPos0 = pos; haveClk0 = true; }
+                    const double dpos = (double)(pos - clkPos0);
+                    const double rate = (el > 0.05) ? dpos / el : 0.0;
+                    printf("  t=%.2fs pad=%u 已写=%llu 时钟位移=%.0f 设备实测=%.0f Hz (%.1f%%)\n",
+                           el, (unsigned)pad, written, dpos, rate,
+                           (r > 0) ? 100.0 * rate / (double)r : 0.0);
+                } else {
+                    printf("  t=%.2fs pad=%u 已写=%llu (无时钟)\n", el, (unsigned)pad, written);
+                }
+            }
+            WaitForSingleObject(ev, 10);
+        }
+        ac->Stop();
+        printf("统计: pad==0 %d 次, pad>0 %d 次, pad 最大=%u, 共写 %llu 帧（=%.3f s @%u）\n",
+               padZero, padNonZero, (unsigned)padMax, written,
+               (r > 0) ? (double)written / (double)r : 0.0, (unsigned)r);
+        if (clk) clk->Release();
+        rc->Release(); CloseHandle(ev); ac->Release();
+        printf("（全程全零静音，无任何可听声音）\n");
         dev->Release(); col->Release(); en->Release(); CoUninitialize();
         return 0;
     }

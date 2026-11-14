@@ -2,8 +2,11 @@
 // 用于设计高质量 windowed-sinc 低通原型滤波器（HQPlayer poly-sinc 家族的同族做法）
 #pragma once
 #include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
+#include "design_control.h"
 #include <cmath>
 #include <vector>
+#include <limits>
+#include <stdexcept>
 
 namespace rta::dsp {
 
@@ -33,7 +36,12 @@ inline double kaiser_beta_for_attenuation(double attenDb) {
 
 // 由阻带衰减与过渡带宽度(归一化到采样率)估算所需抽头数
 inline int kaiser_taps_for(double attenDb, double transitionNorm) {
+    if (!std::isfinite(attenDb) || !std::isfinite(transitionNorm) || transitionNorm <= 0.0)
+        throw std::invalid_argument("Kaiser attenuation and positive transition must be finite");
     double n = (attenDb - 8.0) / (2.285 * 2.0 * kPi * transitionNorm);
+    if (!std::isfinite(n) || n > double(std::numeric_limits<int>::max() - 2))
+        throw std::length_error("Kaiser transition requires an unrepresentable tap count");
+    if (n <= 2.0) return 3;
     int taps = (int)std::ceil(n) + 1;
     if (taps < 3) taps = 3;
     if ((taps & 1) == 0) ++taps;   // 取奇数，保证整数群延迟
@@ -42,11 +50,14 @@ inline int kaiser_taps_for(double attenDb, double transitionNorm) {
 
 // Kaiser 窗：长度 n（n>=1），0 <= i <= n-1，对称
 inline std::vector<double> kaiser_window(int n, double beta) {
+    check_design_cancel();
+    if (n < 1 || !std::isfinite(beta)) throw std::invalid_argument("Invalid Kaiser window length or beta");
     std::vector<double> w((size_t)n);
     if (n == 1) { w[0] = 1.0; return w; }
     const double denom = bessel_i0(beta);
     const double m = (double)(n - 1);
     for (int i = 0; i < n; ++i) {
+        if ((i & 4095) == 0) check_design_cancel();
         double r = (2.0 * i - m) / m;          // [-1, 1]
         double a = 1.0 - r * r;
         w[(size_t)i] = (a <= 0.0) ? 0.0 : bessel_i0(beta * std::sqrt(a)) / denom;

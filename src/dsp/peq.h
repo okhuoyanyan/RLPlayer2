@@ -94,7 +94,8 @@ inline std::vector<std::string> peq_builtin_preset_names() {
 inline bool peq_builtin_preset(const std::string& name, PeqSettings& out) {
     out = peq_flat_settings();
     out.presetName = name;
-    if (name == "Flat" || name.empty()) return true;
+    if (name == "Flat" || name.empty()) { out.bypass = true; return true; }
+    out.bypass = false;
     const auto f = peq_default_frequencies();
     auto set = [&](size_t i, double gain) {
         if (i < out.bands.size()) out.bands[i].gainDb = gain;

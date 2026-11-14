@@ -1,11 +1,6 @@
-// test_enrich.cpp — src/meta/enrich.h 的可离线纯函数(全离线,不发任何网络请求)
-//
-// 判据说明(铁律 3):enrich 的编排本体(搜索→评分→融合→落盘)是网络+文件系统流程,
-// 无法也不应伪造「离线编排测试」——它的真实验证是任务 F 的真实网络门禁(3 首实跑)。
-// 本测试只覆盖 enrich_detail 里抽成纯函数的「融合兜底/封面判定/LLM pick 解析/歌词
-// 句柄挑选/查询串拼装/采纳门槛」六件可离线逻辑,用最小构造断言「输入 → 选择」的映射。
-//
-// ⚠️ 未解决项(铁律 4):编排本体不在本测试覆盖内(不造假);以任务 F 实跑为回归基线。
+// test_enrich.cpp — 全离线的纯函数与可重复编排回归，不开音频设备。
+// 搜索与HTTP边界使用固定回包；评分、录音版本过滤、图片校验、真实磁盘提交、
+// 持久冷却和用户锁仍执行生产代码。不能据此宣称外部服务当日可用。
 #include "meta/enrich.h"
 #include <cstdio>
 #include <string>
@@ -44,7 +39,137 @@ int main() {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
-    std::printf("== meta/enrich 可离线纯函数(编排本体由真实网络门禁验证,见文件头)==\n");
+    std::printf("== meta/enrich 纯函数与可重复编排落盘回归 ==\n");
+
+    // 每张回退图必须独立证明是本曲录音；元数据 top1 通过不为其他候选背书。
+    {
+        Candidate a; a.title = "Song"; a.artist = "Artist"; a.coverUrl = "https://img/right";
+        Candidate wrong = a; wrong.title = "Song (Live)"; wrong.coverUrl = "https://img/live";
+        Candidate other = a; other.title = "Other"; other.coverUrl = "https://img/other";
+        std::vector<Candidate> c{a, wrong, other};
+        auto ranked = match_score_all(c, "Song", "Artist", "", 0);
+        auto urls = art_recording_cover_urls(ranked, c, "Song", "Artist", "", 0);
+        ck(urls.size() == 1 && urls.front() == a.coverUrl, "封面回退排除同名Live及低分错曲");
+        ck(art_recording_cover_urls(ranked, c, "Song", "", "", 0).empty(), "缺艺人无可靠身份则留空");
+        urls = art_recording_cover_urls(ranked, c, "Song (Live)", "Artist", "", 0);
+        ck(urls.size() == 1 && urls.front() == wrong.coverUrl, "Live仅取相同版本");
+        a.durationMs = 230000; c = {a}; ranked = match_score_all(c, "Song", "Artist", "", 180);
+        ck(art_recording_cover_urls(ranked, c, "Song", "Artist", "", 180).empty(), "同名艺人但时长差距大不得下载");
+    }
+
+    // 正常编排实测：搜索边界替身+真实评分/下载校验/按文件落盘，不开设备。
+    {
+        const auto dir = std::filesystem::temp_directory_path() / ("rl-enrich-song-" + std::to_string(GetCurrentProcessId()));
+        auto& store = MetaStore::instance(); store.setBaseDir(meta_string_of(dir));
+        EnrichOpts o; o.llm = false;
+        for (const auto& pd : provider_registry()) o.srcOn[pd.id] = false;
+        auto seed = [&](const std::string& file, const std::string& title) {
+            TrackMeta t; t.path = file;
+            t.fields["title"] = MetaValue{title, "user", 1, 1};
+            t.fields["artist"] = MetaValue{"Artist", "user", 1, 1};
+            store.save(t);
+        };
+        int searches = 0, downloads = 0;
+        set_enrich_search_for_test([&](const ProviderQuery& q) {
+            ++searches;
+            ck(q.dirName.empty() && q.circle.empty() && q.album.empty(), "目录分组名不进入单曲查询");
+            Candidate a; a.title = q.title; a.artist = q.artist;
+            a.source = "itunes"; a.coverUrl = "https://test/" + q.title;
+            Candidate wrong = a; wrong.title += " (Live)"; wrong.coverUrl = "https://test/wrong";
+            return std::vector<Candidate>{a, wrong};
+        });
+        bool lock = false, lockDuringDownload = false, failDownload = false;
+        o.withCoverUpdate = [&](const std::string&, const std::function<void()>& commit) { if (lock) return false; commit(); return true; };
+        o.allowCoverUpdate = [&](const std::string&) { return !lock; };
+        set_artwork_http_for_test([&](const ArtHttpRequest& q) {
+            ++downloads;
+            ck(q.url != "https://test/wrong", "错误录音从未下载");
+            if (lockDuringDownload) lock = true;
+            rta::net::HttpResponse r; r.status = failDownload ? 404 : 200;
+            std::string bytes(3000, q.url.back()); bytes[0] = (char)0xff; bytes[1] = (char)0xd8;
+            r.body.assign(bytes.begin(), bytes.end()); return r;
+        });
+        const std::string one = meta_string_of(dir / "Group @ Someone" / "one.wav");
+        const std::string two = meta_string_of(dir / "Group @ Someone" / "two.wav");
+        seed(one, "One"); seed(two, "Two");
+        auto a = enrich_track(one, false, o); auto b = enrich_track(two, false, o);
+        TrackMeta ta, tb; store.load(one, ta); store.load(two, tb);
+        ck(a.ok && b.ok && !ta.coverRelPath.empty() && !tb.coverRelPath.empty() && ta.coverRelPath != tb.coverRelPath,
+           "已有完整标签无图仍逐曲获取并提交不同缓存");
+        std::vector<unsigned char> oneBytes, twoBytes; std::string oneMime, twoMime;
+        ck(store.cover(one, oneBytes, oneMime) && store.cover(two, twoBytes, twoMime) && oneBytes != twoBytes,
+           "不同歌曲实际图片字节不互串");
+        ck(ta.fields.count("coverRecording") && tb.fields.count("coverRecording"), "逐曲图保留可信录音来源");
+        const int prior = searches; enrich_track(one, false, o);
+        ck(searches == prior, "正缓存再次播放零搜索");
+        const std::string three = meta_string_of(dir / "three.wav"); seed(three, "Three");
+        failDownload = true; enrich_track(three, false, o); const int afterFail = searches;
+        auto retry = enrich_track(three, false, o);
+        ck(retry.skipped && searches == afterFail, "失败缓存冷却阻止连续播放重复网络");
+        failDownload = false; enrich_track(three, true, o); store.load(three, ta);
+        ck(!ta.coverRelPath.empty(), "明确force可重试并成功提交");
+        const std::string four = meta_string_of(dir / "four.wav"); seed(four, "Four");
+        lockDuringDownload = true; enrich_track(four, false, o); store.load(four, ta);
+        std::vector<unsigned char> bytes; std::string mime;
+        ck(ta.coverRelPath.empty() && !store.cover(four, bytes, mime), "下载期间用户锁定阻止图片落盘");
+        ck(ta.fields["title"].source == "user" && ta.fields["title"].value == "Four", "用户确认字段不被后台覆盖");
+        lock = false; lockDuringDownload = false;
+        const std::string five = meta_string_of(dir / "five.wav"); seed(five, "Five");
+        bool nestedSkipped = false;
+        set_enrich_search_for_test([&](const ProviderQuery& q) {
+            ++searches;
+            nestedSkipped = enrich_track(five, true, o).skipped;
+            Candidate a; a.title = q.title; a.artist = q.artist; a.source = "itunes";
+            a.coverUrl = "https://test/broken";
+            Candidate b = a; b.source = "qq"; b.coverUrl = "https://test/valid";
+            Candidate wrong = a; wrong.title = "Wrong"; wrong.coverUrl = "https://test/wrong";
+            return std::vector<Candidate>{a, b, wrong};
+        });
+        int fallbackDownloads = 0;
+        set_artwork_http_for_test([&](const ArtHttpRequest& q) {
+            ++fallbackDownloads;
+            rta::net::HttpResponse r; r.status = q.url == "https://test/broken" ? 404 : 200;
+            std::string body(3000, 'x'); body[0] = (char)0xff; body[1] = (char)0xd8;
+            r.body.assign(body.begin(), body.end()); return r;
+        });
+        enrich_track(five, false, o); store.load(five, ta);
+        ck(nestedSkipped, "同曲重入被in-flight挡住");
+        ck(!ta.coverRelPath.empty() && fallbackDownloads == 2 && ta.fields["coverRecording"].source == "qq",
+           "首张失效后仅回退可靠同曲候选并保存实际来源");
+        const std::string six = meta_string_of(dir / "six.wav"); seed(six, "Six");
+        set_enrich_search_for_test([&](const ProviderQuery&) {
+            Candidate a; a.title = "Six (Live)"; a.artist = "Artist"; a.source = "itunes";
+            a.coverUrl = "https://test/wrong"; return std::vector<Candidate>{a};
+        });
+        const int beforeWrong = fallbackDownloads;
+        enrich_track(six, false, o); store.load(six, ta);
+        ck(ta.coverRelPath.empty() && fallbackDownloads == beforeWrong, "所有候选为错误录音时零图片下载且留空");
+        const std::string seven = meta_string_of(dir / "seven.wav"); seed(seven, "Seven");
+        set_enrich_search_for_test([&](const ProviderQuery& q) {
+            Candidate a; a.title = q.title; a.artist = q.artist; a.source = "itunes";
+            a.album = "Remote Album"; a.genre = "Remote Genre"; a.year = "2026";
+            a.coverUrl = "https://test/valid"; return std::vector<Candidate>{a};
+        });
+        enrich_track_artwork(seven, o); store.load(seven, ta);
+        ck(!ta.coverRelPath.empty() && ta.fields.size() == 3 && !ta.fields.count("album") &&
+           !ta.fields.count("genre") && !ta.fields.count("lyrics") && ta.fields["title"].source == "user",
+           "可视缺图专用入口仅提交图片及来源，不补写标签/歌词");
+        const std::string eight = meta_string_of(dir / "eight.wav"); seed(eight, "Eight");
+        set_artwork_http_for_test([&](const ArtHttpRequest&) {
+            TrackMeta current; store.load(eight, current);
+            current.fields["artist"] = MetaValue{"User Corrected Artist", "user", 999999, 1.0f};
+            store.save(current);
+            rta::net::HttpResponse r; r.status = 200;
+            std::string body(3000, 'x'); body[0] = (char)0xff; body[1] = (char)0xd8;
+            r.body.assign(body.begin(), body.end()); return r;
+        });
+        enrich_track_artwork(eight, o); store.load(eight, ta);
+        ck(ta.coverRelPath.empty() && ta.fields["artist"].value == "User Corrected Artist",
+           "下载期间用户修改识别字段，旧查询图片丢弃且用户字段保留");
+        set_enrich_search_for_test({}); set_artwork_http_for_test({});
+        std::printf("  编排计数 searches=%d downloads=%d\n", searches, downloads);
+        std::error_code ec; std::filesystem::remove_all(dir, ec);
+    }
 
     // ---- ed_query_string ----
     std::printf("-- ed_query_string --\n");

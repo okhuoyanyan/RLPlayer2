@@ -32,15 +32,16 @@ inline void classify(Result& r) {
 inline std::vector<double> prototype(const rta::dsp::FilterPreset& p,
  unsigned in, unsigned out, Result& r, bool manual=false, int twoStage=-1) {
   auto cfg=review2::production_config(p,in,out,manual);
-  if(twoStage>=0)cfg.twoStage=twoStage!=0;
+  if(twoStage>=0) {cfg.twoStage=twoStage!=0; cfg.allowAutomaticCascade=false;}
   rta::dsp::PolyphaseResampler rs(cfg);
   std::vector<double> h; rs.prototype_into(h);
   for(auto& x:h) x/=rs.upFactor();
   r.T=first_stage_taps(rs); r.stage2T=second_stage_taps(rs); r.L=rs.upFactor(); r.M=rs.downFactor();
   r.cascade=rs.two_stage();
   r.fs=review2::prototype_rate(rs,in,out); r.taps=h.size();
-  const auto m=rta::dsp::preset_metrics(p,in,in==96000?40000:20000);
-  r.passHz=m.passHz; r.stopHz=in-m.passHz; r.target=m.ceilingDb;
+  const auto bandRate=std::min(in,out);
+  const auto m=rta::dsp::preset_metrics(p,bandRate,rta::dsp::content_hz_for_rate(bandRate));
+  r.passHz=m.passHz; r.stopHz=bandRate-m.passHz; r.target=m.ceilingDb;
   r.excluded=m.excluded;
   r.finite=!h.empty() && std::all_of(h.begin(),h.end(),[](double v){return std::isfinite(v);});
   return h;

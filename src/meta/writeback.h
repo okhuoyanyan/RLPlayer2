@@ -4,11 +4,11 @@
 //   扩展名门(见下) → 收集非空字段 → ffmpeg remux(-c copy)到同目录 .rtatmp 临时文件 →
 //   PCM 门禁:新旧两份解码成同参数 PCM WAV(pcm_s32le)后逐字节比较(含长度) →
 //   不一致:删临时、报错、绝不动原文件;一致:dry-run 则删临时返回清单,否则
-//   备份(原文件移入 <store>/backups/<hash>.<ext>) + 原子替换(rename 临时→原路径)。
+//   备份(复制到 <store>/backups/<hash>.<ext>,原路径始终保留) + 原子替换(rename 临时→原路径)。
 //
 // 安全红线(本文件实现):
 //   ① 写回一律先写临时文件,校验通过才动原文件;② PCM 校验不一致绝不替换;
-//   ③ 绝不写 DSD(.dsf/.dff)与不可识别扩展名;④ 替换任一步失败都把原文件从备份搬回。
+//   ③ 绝不写 DSD(.dsf/.dff)与不可识别扩展名;④ 提交前不移走原件,替换失败仍保留原路径。
 //
 // 键名映射 —— 2026-10-22 实测(ffmpeg 9.0 full gyan build,样例 remux → ffprobe 读回):
 //   * Vorbis 注释家族(flac/ogg/opus/wv)写大写键,读回时 flac/ogg/opus 的
@@ -31,7 +31,9 @@
 #include "platform/fs.h"        // 删除 / 搬移 / 复制 + 系统错误码（写回安全红线全靠这几个操作）
 #include "platform/path.h"      // UTF-8 <-> 原生路径、临时目录、小写扩展名
 #include "platform/process.h"   // 调 ffmpeg / ffprobe（隐藏窗口、收日志）
+#include "platform/sysinfo.h"   // 独占临时名的进程 ID；不读取用户配置
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -970,7 +972,7 @@ inline bool writeback_pcm_identical(const std::string& wavA, const std::string& 
 
 struct WritebackOpts {
     bool dryRun = true;   // 默认 dry-run:全流程含 PCM 校验,但不替换原文件
-    bool backup = true;   // 替换前把原文件移入 <store>/backups/<hash>.<ext>
+    bool backup = true;   // 替换前复制原文件到 <store>/backups/<hash>.<ext>
     // ---- 内嵌封面写回(P2,2026-10-27)----
     // 默认【关闭】:写标签是「补数据」,写封面是「往容器里塞一大块二进制」,风险更高,
     // 由用户显式打开(Web 端 POST /api/writeback {"cover":true})。
@@ -993,6 +995,11 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
                                       const WritebackOpts& opts) {
     WritebackResult r;
     r.file = file;
+    // UI only serializes its own batch; CLI processes can write concurrently.
+    // Every transaction must validate and commit its own media/cover/PCM files.
+    static std::atomic<unsigned long long> transactionSerial{0};
+    const std::string transactionId = std::to_string(rta::platform::process_id()) + "_" +
+        std::to_string(transactionSerial.fetch_add(1, std::memory_order_relaxed));
 
     // ① 扩展名门(安全红线③:绝不写 DSD 与不可识别扩展)
     const std::string ext = rta::platform::lower_extension(file);
@@ -1066,6 +1073,7 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
     std::string coverMimeStr;                   // 图片 MIME(MP3 的 APIC 要写它)
     int coverStreamIndex = 0;
     bool addCover = false;
+    bool coverPrepared = false;               // 临时件通过封面门，不等于原文件已提交
     WbCoverInfo coverBefore;
     if (opts.cover) {
         if (!writeback_cover_supported(ext)) {
@@ -1108,7 +1116,7 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
                     coverBytesWanted.clear();
                 } else {
                     coverTmp = rta::platform::temp_dir_utf8() + "rta_wbcover_" +
-                               MetaStore::hashOf(file) + imgExt;
+                               MetaStore::hashOf(file) + "_" + transactionId + imgExt;
                     std::ofstream cf(meta_path_of(coverTmp), std::ios::binary);
                     cf.write(coverBytesWanted.data(), (std::streamsize)coverBytesWanted.size());
                     cf.close();
@@ -1127,10 +1135,10 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
         if (!coverTmp.empty()) rta::platform::remove_file(meta_path_of(coverTmp));
     };
 
-    // ④ 生成临时文件(先清掉上次崩溃可能留下的残留)
+    // ④ 独占临时文件。不会删除另一并发事务的产物；崩溃遗留也不影响新事务。
     //    MP3 + 封面:走「ID3v2 拼接」而不是 remux(理由见 writeback_mp3_splice 头注:
     //    这些 LAME 文件的 encoder delay 一过 remux 就丢,解码长度会变 ⟹ PCM 门禁永不过)。
-    const std::string temp = file + ".rtatmp";
+    const std::string temp = file + ".rta_" + transactionId + ".rtatmp";
     rta::platform::remove_file(meta_path_of(temp));
     std::string err;
     bool spliced = false;
@@ -1179,7 +1187,7 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
             r.err = "封面写回门禁失败:" + why + ";已删除临时文件,原文件未动";
             return r;
         }
-        r.coverWritten = true;
+        coverPrepared = true;
         r.coverNote = "front cover 已写入(" + std::to_string(coverBytesWanted.size()) +
                       "B," + (after.mime.empty() ? std::string("?") : after.mime) + ")";
     }
@@ -1188,7 +1196,7 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
     // ⑤ PCM 门禁:两份同参数解码(pcm_s32le)逐字节比较(含长度)
     // temp_dir_utf8() 返回带尾分隔符的临时目录（语义 = GetTempPathW），下面直接后缀拼接
     const std::string tmpDir = rta::platform::temp_dir_utf8();
-    const std::string tag = MetaStore::hashOf(file);
+    const std::string tag = MetaStore::hashOf(file) + "_" + transactionId;
     const std::string pcmOld = tmpDir + "rta_wb_" + tag + "_old.wav";
     const std::string pcmNew = tmpDir + "rta_wb_" + tag + "_new.wav";
     auto cleanup = [&]() {
@@ -1229,10 +1237,10 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
         return r;
     }
 
-    // ⑦ 备份:原文件移入 <store>/backups/<hash>.<ext>(同盘 MoveFileEx 原子;跨盘退化为复制)
+    // ⑦ 先复制备份，绝不移走原路径。两次 rename 之间的进程中断/恢复失败曾使
+    // 原路径消失；复制后只有最后一次原子替换才改变它，中断最多留下可清理的临时件。
     std::string backupNote;
-    bool movedNotCopied = false;
-    fsx::path backupUsed;                       // 实际备份位置(恢复防御要用真实路径)
+    fsx::path backupUsed;
     if (opts.backup) {
         const fsx::path backupDir = meta_path_of(MetaStore::instance().baseDir()) / "backups";
         fsx::create_directories(backupDir, ec);
@@ -1245,41 +1253,29 @@ inline WritebackResult writeback_file(const std::string& file, const TrackMeta& 
         }
         backupUsed = backup;
         const fsx::path srcP = meta_path_of(file);
-        if (rta::platform::move_file(srcP, backup, false)) {
-            movedNotCopied = true;
-        } else {
-            // 跨盘(move 不支持)或其它失败:退化为复制;原文件仍在,替换用 REPLACE_EXISTING
+        // fail_if_exists=true：另一事务抢先创建备份时也不覆盖已有原件。
+        if (!rta::platform::copy_file(srcP, backup, true)) {
             const int gle = rta::platform::last_error_code();
-            if (!rta::platform::copy_file(srcP, backup, false)) {
-                cleanup();
-                r.err = "备份失败(move 与 copy 均失败,GetLastError=" + std::to_string(gle) +
-                        ");原文件未动";
-                return r;
-            }
+            cleanup();
+            r.err = "备份失败(copy,GetLastError=" + std::to_string(gle) + ");原文件未动";
+            return r;
         }
-        backupNote = "原文件 → " + meta_string_of(backup) + (movedNotCopied ? "(移入)" : "(跨盘复制)");
+        backupNote = "原文件备份 → " + meta_string_of(backup) + "(复制,提交前原路径保持不变)";
     } else {
         backupNote = "无备份(--no-backup)";
     }
 
-    // ⑧ 替换:临时文件 rename 成原路径;失败则把原文件从备份搬回(防御)
+    // ⑧ 单次原子替换；失败时原件始终在原路径，已有备份保留供人工恢复。
     if (!rta::platform::move_file(meta_path_of(temp), meta_path_of(file), true)) {
         const int gle = rta::platform::last_error_code();
-        std::string restore = "未恢复";
-        if (movedNotCopied) {
-            const bool ok = rta::platform::move_file(backupUsed, meta_path_of(file), true);
-            restore = ok ? "已从备份搬回" : "搬回失败(备份在 " + meta_string_of(backupUsed) + ")";
-        } else if (opts.backup) {
-            // 跨盘复制路径:原文件还在,只需删掉复制物与临时件
-            rta::platform::remove_file(backupUsed);
-            restore = "原文件未被动过(跨盘复制路径)";
-        }
         cleanup();
-        r.err = "替换失败(GetLastError=" + std::to_string(gle) + ");" + restore;
+        r.err = "替换失败(GetLastError=" + std::to_string(gle) + ");原文件未动" +
+                (opts.backup ? ";备份保留在 " + meta_string_of(backupUsed) : std::string());
         return r;
     }
 
     r.ok = true;
+    r.coverWritten = coverPrepared;
     r.note = "已写 " + std::to_string(kvs.size()) + " 个字段: " + listed + ";PCM 逐字节一致;" +
              backupNote + (yearSkip.empty() ? "" : ";" + yearSkip) +
              (r.coverNote.empty()

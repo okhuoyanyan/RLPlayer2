@@ -503,6 +503,50 @@ inline bool lyrics_cache_load(const std::string& dir, const std::string& key, Ly
 // cacheDir：缓存目录（UTF-8）。空串 = 不缓存。主控在 rtaweb 里传
 // <exe 目录>\data\lyrics-cache；测试传临时目录。做成参数而不是全局变量：
 // 同一进程里可能有多个数据目录（便携版/测试），全局状态会让它们互相串味。
+// 2026-11-01（用户 261101 #1）：模型有时把「原文」和「译文」写在**同一行**（"原句 译文"），
+// 于是界面上看起来就是"原词跟翻译挤在一行"。这里在落结果前把回显的原文前缀剥掉，
+// 让每一行只留译文；剥不掉（或剥完为空）就原样保留 —— 绝不因为清洗把整行吞掉。
+//   只处理"行数一一对应"的翻译/繁体任务；音译/假名本来就该保留原文，不碰。
+inline std::string lyrics_strip_echoed_source(const std::string& original, const std::string& got) {
+    if (original.empty() || got.empty()) return got;
+    const std::string o = llm_trim(original);
+    if (o.empty()) return got;
+    std::string g = llm_trim(got);
+    if (g.size() <= o.size()) return got;
+    // 前缀必须**逐字符相同**（大小写不敏感，日文/中文没有大小写概念，无副作用）
+    for (size_t i = 0; i < o.size(); ++i) {
+        const unsigned char a = (unsigned char)o[i];
+        const unsigned char b = (unsigned char)g[i];
+        const unsigned char la = (a >= 'A' && a <= 'Z') ? (unsigned char)(a - 'A' + 'a') : a;
+        const unsigned char lb = (b >= 'A' && b <= 'Z') ? (unsigned char)(b - 'A' + 'a') : b;
+        if (la != lb) return got;
+    }
+    size_t p = o.size();
+    // 原文后面紧跟的分隔符：空白 / 制表 / 横线 / 冒号 / 竖线 / 箭头 / 括号
+    while (p < g.size()) {
+        const char c = g[p];
+        // 注意：这里**只列单字节**分隔符。把 0xE2 这种多字节首字节当分隔符会拆坏 "—"/"→"，
+        // 结果留下半截 UTF-8（实测："abc — 甲乙" 变成 "?? 甲乙"）。多字节交给下面那个循环。
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '-' || c == ':' ||
+            c == '|' || c == '(' || c == ')' || c == '/' || c == '~' || c == '=')
+            ++p;
+        else break;
+    }
+    // 跳过三字节的破折号/箭头（——、→）等常见分隔符
+    while (p + 2 < g.size() && (unsigned char)g[p] >= 0xE0) {
+        const unsigned char c1 = (unsigned char)g[p + 1], c2 = (unsigned char)g[p + 2];
+        // —(E2 80 94) –(E2 80 93) →(E2 86 92) ：(EF BC 9A) （(EF BC 88)
+        const bool dash = ((unsigned char)g[p] == 0xE2) &&
+                          (c1 == 0x80 || c1 == 0x86);
+        const bool colon = ((unsigned char)g[p] == 0xEF) && c1 == 0xBC && (c2 == 0x9A || c2 == 0x88);
+        if (!dash && !colon) break;
+        p += 3;
+        while (p < g.size() && (g[p] == ' ' || g[p] == '\t')) ++p;
+    }
+    const std::string rest = llm_trim(g.substr(std::min(p, g.size())));
+    return rest.empty() ? got : rest;   // 剥完为空 ⟹ 说明这行本来就是原文，保留原样
+}
+
 inline LyricsAiResult lyrics_ai_process(const LlmConfig& cfg, LyricsAiTask task,
                                         const std::vector<std::string>& lines,
                                         const std::string& sourceLang,
@@ -602,7 +646,10 @@ inline LyricsAiResult lyrics_ai_process(const LlmConfig& cfg, LyricsAiTask task,
     r.ok = true;
     r.tokens = reply.totalTokens;
     r.lines.assign(lines.size(), std::string());     // 空行位置保持空串
-    for (size_t k = 0; k < got.size(); ++k) r.lines[slots[k]] = got[k];
+    for (size_t k = 0; k < got.size(); ++k) {
+        const bool echoable = (task == LyricsAiTask::Translate || task == LyricsAiTask::TradChinese);
+        r.lines[slots[k]] = echoable ? lyrics_strip_echoed_source(lines[slots[k]], got[k]) : got[k];
+    }
 
     if (!cacheDir.empty()) lyrics_cache_save(cacheDir, key, r);   // 写缓存失败不影响本次结果
     return r;

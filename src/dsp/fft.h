@@ -2,6 +2,7 @@
 #pragma once
 #include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（输出进入音频样本）
 #include "kaiser.h"          // 提供 kPi
+#include "design_control.h"
 #include <vector>
 #include <complex>
 #include <cmath>
@@ -14,6 +15,7 @@ using cplx = std::complex<double>;
 
 // 原地基-2 FFT，n 必须是 2 的幂
 inline void fft(std::vector<cplx>& a, bool inverse = false) {
+    check_design_cancel();
     const size_t n = a.size();
     if (n < 2) return;
     if (n & (n - 1)) throw std::invalid_argument("FFT length must be a power of two");
@@ -25,17 +27,22 @@ inline void fft(std::vector<cplx>& a, bool inverse = false) {
     auto& roots = n <= 65536 ? cachedRoots : localRoots;
     if (roots.size() != n / 2) {
         std::vector<cplx>().swap(roots);
-        roots = std::vector<cplx>(n / 2);
-        for (size_t k = 0; k < roots.size(); ++k) {
+        // Publish roots only after successful completion. Cancellation must
+        // never leave a same-sized, partially initialized cache looking valid.
+        std::vector<cplx> fresh(n / 2);
+        for (size_t k = 0; k < fresh.size(); ++k) {
+            if ((k & 4095u) == 0) check_design_cancel();
             const double angle = -2.0 * kPi * ((double)k / (double)n);
-            roots[k] = cplx(std::cos(angle), std::sin(angle));
+            fresh[k] = cplx(std::cos(angle), std::sin(angle));
         }
-        roots[0] = cplx(1.0, 0.0);
-        if (n >= 4) roots[n / 4] = cplx(0.0, -1.0);
+        fresh[0] = cplx(1.0, 0.0);
+        if (n >= 4) fresh[n / 4] = cplx(0.0, -1.0);
+        roots.swap(fresh);
     }
     // Obtain roots before touching input, including on allocation failure.
     // 位反转置换
     for (size_t i = 1, j = 0; i < n; ++i) {
+        if ((i & 4095u) == 0) check_design_cancel();
         size_t bit = n >> 1;
         for (; j & bit; bit >>= 1) j ^= bit;
         j ^= bit;
@@ -46,6 +53,7 @@ inline void fft(std::vector<cplx>& a, bool inverse = false) {
         const size_t stride = n / len;
         for (size_t i = 0; i < n; i += len) {
             for (size_t k = 0; k < len / 2; ++k) {
+                if (((i + k) & 4095u) == 0) check_design_cancel();
                 const cplx w = inverse ? std::conj(roots[k * stride]) : roots[k * stride];
                 const cplx u = a[i + k];
                 const cplx v = a[i + k + len / 2] * w;

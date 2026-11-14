@@ -1,0 +1,11 @@
+RLPlayer audio-image support source notices
+
+SACD sector/TOC format reference: SACD Ripper, copyright 2010-2015 respective authors, GPL-2.0-or-later. See scarletbook.h/scarletbook_read.c and COPYING.SACD.
+
+DST decoder core adapted from FFmpeg n7.1.1 libavcodec/dstdec.c, Copyright (c) 2014 Peter Ross <pross@xvid.org>, LGPL-2.1-or-later. Original source and COPYING.LGPLv2.1 retained. RLPlayer returns raw DSD instead of PCM, adds bounded reads, segmentation and independent map parsing, and correct one-entry probability-table handling.
+
+DVD-Audio LPCM channel allocation and two-sample packing adapted from FFmpeg pcm-dvda.c, Copyright (c) 2026 Kacper Michajlow, LGPL-2.1-or-later. Original source retained.
+
+UDF layout cross-check reference: libdvdread dvd_udf.c, Copyright (C) 1999 Christian Wolff, modifications Billy Biggs and Bjorn Englund, GPL-2.0-or-later. Original source retained. RLPlayer uses its own bounded span mapping/CRC validation/AED chaining.
+
+PROVENANCE.json records upstream URLs, pinned commits when available, and exact SHA256 values. All changes distributed as part of RLPlayer under GPL-3.0-or-later.

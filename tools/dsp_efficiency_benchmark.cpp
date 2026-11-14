@@ -75,7 +75,7 @@ static Options parse(int argc,char**argv) {
         else if(k=="--input-wav")o.inputWav=val();
         else if(k=="--help") {
             std::cout<<"efficiency_benchmark --route pcm_pcm|pcm_dsd|dsd_direct|dsd_native_convert|dsd_decode_remod --source-rate Hz --target-rate Hz --seconds N --preset poly-sinc-short-lp --family dsd|ec|chebyshev|ahm --order N --gpu 0|1 --topology auto|single|cascade --block 4096 --decode-mode memory|stream --fixture absolute.dsf --input-wav absolute.wav\n"
-              <<"No device opened. PCM --input-wav requires exact 2ch integer PCM24, matching --source-rate and round(rate*seconds) frames; decoding is outside DSP timing. WAV inputs allow up to 60s; generated sources and DSD fixtures retain the original 10s limit. Without WAV, generates a 2ch -60dBFS 1kHz source outside timing. DSD fixture is generated only if absent, otherwise validated and reused. --selftest validates counters/markers without running a benchmark.\n";
+              <<"No device opened. PCM --input-wav requires exact 2ch integer PCM24, matching --source-rate and round(rate*seconds) frames; decoding is outside DSP timing. Inputs allow up to 60s within a 512MiB source/retained-native-output admission budget. Without WAV, generates a 2ch -60dBFS 1kHz source outside timing. DSD fixture is generated only if absent, otherwise validated and reused. --selftest validates counters/markers without running a benchmark.\n";
             std::exit(0);
         } else throw std::runtime_error("unknown argument: "+k);
     }
@@ -86,12 +86,16 @@ static Options parse(int argc,char**argv) {
     if(o.route!="pcm_pcm"&&o.route!="pcm_dsd"&&o.route!="dsd_direct"&&o.route!="dsd_native_convert"&&o.route!="dsd_decode_remod")throw std::runtime_error("invalid route");
     const bool pcmRoute=o.route=="pcm_pcm"||o.route=="pcm_dsd";
     if(!o.inputWav.empty()&&!pcmRoute)throw std::runtime_error("--input-wav is only valid for PCM-source routes");
-    const double maximumDuration=!o.inputWav.empty()?60.0:10.0;
+    const double maximumDuration=60.0;
     if(!o.source||!o.target||!o.block||o.block>262144||!(o.duration>0&&o.duration<=maximumDuration)||o.order<1||o.order>8||(o.gpu!=0&&o.gpu!=1))throw std::runtime_error("invalid numeric argument");
     if(o.topology!="auto"&&o.topology!="single"&&o.topology!="cascade")throw std::runtime_error("invalid topology");
     if(o.decode!="memory"&&o.decode!="stream")throw std::runtime_error("invalid decode mode");
     if(o.family!="dsd"&&o.family!="ec"&&o.family!="chebyshev"&&o.family!="ahm")throw std::runtime_error("invalid family");
     if((o.route=="dsd_direct"||o.route=="dsd_native_convert")&&o.gpu)throw std::runtime_error("these production routes do not use GPU; --gpu must be 0");
+    const long double sourceBytes=static_cast<long double>(o.source)*o.duration*(pcmRoute?8.0L:.25L);
+    const long double retainedOutputBytes=o.route=="dsd_native_convert"?static_cast<long double>(o.target)*o.duration*.25L:0;
+    if(sourceBytes+retainedOutputBytes>512.0L*1024*1024)
+        throw std::runtime_error("benchmark source/retained native output exceeds 512MiB admission budget");
     if(o.route.rfind("dsd_",0)==0&&o.fixture.empty())throw std::runtime_error("DSD routes require --fixture absolute.dsf");
     if(o.route=="dsd_direct"&&o.source!=o.target)throw std::runtime_error("DirectSDM requires identical bit rates");
     if(o.route=="dsd_native_convert"&&o.source==o.target)throw std::runtime_error("native convert requires different bit rates");

@@ -98,9 +98,12 @@ int main(int argc,char**argv){
   check(rejected,automatic?"auto budget rejects without reducing T":"manual final T budget is enforced");
  }
  {
-  auto c=config();c.minTapsPerInput=0;c.totalTaps=1<<22;c.phase=PhaseKind::Minimum;
+  auto c=config();c.minTapsPerInput=0;c.totalTaps=1<<22;c.phase=PhaseKind::Minimum;c.maxPrototypeTaps=1<<21;
   bool rejected=false;try{PolyphaseResampler manualHuge(c);}catch(const std::runtime_error&e){rejected=std::string(e.what()).find("budget")!=std::string::npos;}
-  check(rejected,"manual 4M prototype exceeds default 2M budget without allocation");
+  check(rejected,"manual 4M prototype exceeds an explicit 2M budget without allocation");
+   // 2026-11-01：默认预算 2^21 → 2^24（44.1k→384k 的 poly-sinc-xl 需要 3.68M 抽头）。
+   // 判据保留：超预算必须在不分配的前提下被拒绝；这里再把默认值本身钉住，防止被悄悄改回去。
+   check(ResamplerConfig{}.maxPrototypeTaps==(1<<24),"default prototype budget is 2^24 (covers 3.68M at 44.1->384k)");
  }
  {
   auto c=config();c.minTapsPerInput=0;c.totalTaps=16384;c.maxPrototypeTaps=0;

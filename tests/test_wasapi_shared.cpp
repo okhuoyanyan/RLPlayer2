@@ -1,4 +1,4 @@
-// test_wasapi_shared.cpp — WASAPI 共享输出后端
+﻿// test_wasapi_shared.cpp — WASAPI 共享输出后端
 //   2026-10-22：VM 事故热修（共享模式兜底）
 //   2026-10-24：共享模式多混音格式（float32 / int16 / int24(24-in-32) / int32 / 紧凑 24）
 //
@@ -640,8 +640,8 @@ int main(int argc, char** argv) {
     ck(shared_writable(9600, 4600, 100) == 100, "可用数据不足 → 夹到数据量");
     ck(shared_writable(9600, 20000, 100) == 0, "pad 异常超界 → 钳到 0（不下溢成巨数）");
 
-    // ---- §1.6 离线可测的 query 失败形态：不存在端点 → 错误非空 ----
-    {
+    // ---- §1.6 Endpoint query is a real OS device call, even for a fake ID. ----
+    if (!offlineOnly) {
         uint32_t r = 0; int ch = 0; bool f = true; std::string err;
         SharedSampleFmt qf = SharedSampleFmt::Float32;
         const bool ok = rta::audio::WasapiSharedOutput::query_mix_format(
@@ -655,7 +655,7 @@ int main(int argc, char** argv) {
     // ---- §2 设备 smoke：只写数字静音，≤1 秒，先打印横幅 ----
     if (offlineOnly) {
         std::printf("\n== wasapi_shared：§2 设备 smoke ==\n");
-        std::printf("  [SKIP] --offline / RTA_NO_DEVICE=1：只跑 §1 离线部分，不打开任何音频设备\n");
+        std::printf("  [SKIP] --offline / RTA_NO_DEVICE=1：UNVERIFIED_DEVICE: only synthetic packing assertions executed; endpoint query and playback not verified\n");
         std::printf("\n%s（失败 %d 项）\n", g_fail == 0 ? "wasapi_shared 离线部分全部通过" : "存在失败", g_fail);
         return g_fail == 0 ? 0 : 1;
     }

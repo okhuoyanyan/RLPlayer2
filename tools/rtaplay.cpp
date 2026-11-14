@@ -447,6 +447,8 @@ int main(int argc, char** argv) {
         printf("  --eq <file.txt>   REW/AutoEq 参数 EQ    --ir <ir.wav> 卷积脉冲响应\n");
         printf("  --matrix <spec>   路由, 如 0>0:0,1>1:0,0>1:-6\n");
         printf("  --volume <dB>     音量                   --gpu       卷积优先用 GPU\n");
+        printf("  --cleanup auto|manual|off  录音噪声清理（默认关闭；auto 无可信证据时不衰减）\n");
+        printf("  --cleanup-strength 0..1  --cleanup-noise-db -120..-60（噪声底仅 manual 使用）\n");
         printf("  --net <host:port> 走 RTANet 网络输出     --analyze   只跑管线不开设备\n");
         printf("  --buffer <ms> 独占缓冲   --seconds N 限时   --device <ID>   --loop\n");
         printf("  --asio-list       列出 ASIO 驱动（只读，不打开设备）\n");
@@ -545,6 +547,12 @@ int main(int argc, char** argv) {
     std::string asioDevice;      // 非空 = 走 ASIO 输出（名字 / 序号 / CLSID）
     bool nativeDsd = false;      // 原生 DSD（ASIO IoFormat），失败显式回落 DoP
     bool forceDop = false;       // 诊断：强制走 DoP 回落路径（验证"回落真的能出声/静音"）
+    bool cleanupModeCli=false,cleanupStrengthCli=false,cleanupNoiseCli=false;
+    auto cleanupNumber=[](const std::string& text,double lo,double hi,double& value) {
+        char* end=nullptr;const double x=strtod(text.c_str(),&end);
+        if(text.empty()||end==text.c_str()||*end||!rta::audio::audio_finite(x)||x<lo||x>hi)return false;
+        value=x;return true;
+    };
 
     for (int i = 2; i < argc; ++i) {
         std::string k = argv[i];
@@ -567,6 +575,20 @@ int main(int argc, char** argv) {
         else if (k == "--eq")     eqFile = next("");
         else if (k == "--ir")     irFile = next("");
         else if (k == "--volume") { cfg.volumeEnabled = true; cfg.volumeDb = atof(next("0").c_str()); }
+        else if (k == "--cleanup") {
+            const std::string mode=next("");cleanupModeCli=true;
+            if(mode!="auto"&&mode!="manual"&&mode!="off"){printf("!! --cleanup 必须是 auto、manual 或 off\n");return 1;}
+            cfg.recordingCleanup.enabled=mode!="off";
+            cfg.recordingCleanup.noiseMode=mode=="auto"?rta::dsp::RecordingCleanupNoiseMode::Auto:rta::dsp::RecordingCleanupNoiseMode::Manual;
+        }
+        else if (k == "--cleanup-strength") {
+            cleanupStrengthCli=true;
+            if(!cleanupNumber(next(""),0,1,cfg.recordingCleanup.strength)){printf("!! 清理强度须为 0..1 的有限数字\n");return 1;}
+        }
+        else if (k == "--cleanup-noise-db") {
+            cleanupNoiseCli=true;
+            if(!cleanupNumber(next(""),-120,-60,cfg.recordingCleanup.noiseFloorDbfs)){printf("!! 手动噪声底须为 -120..-60 dBFS 的有限数字\n");return 1;}
+        }
         else if (k == "--gpu")    { useGpu = true; cfg.gpuResample = true; }
         else if (k == "--matrix") matrixSpec = next("");
         else if (k == "--web")    { webPort = (uint16_t)atoi(next("8080").c_str()); webEnabled = true; }
@@ -628,6 +650,9 @@ int main(int argc, char** argv) {
             for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
         }
         if (ext == ".dsf" || ext == ".dff") {
+            if (cfg.recordingCleanup.enabled) {
+                printf("!! DirectSDM 逐位输出不能运行 PCM 录音清理；请关闭清理或使用 PCM/离线分析\n");return 1;
+            }
             AsioDriverEntry dev;
             std::string derr;
             if (!asio_resolve_driver(asioDevice, dev, derr)) { printf("!! %s\n", derr.c_str()); return 1; }
@@ -709,6 +734,20 @@ int main(int argc, char** argv) {
             else if (key == "taps"   && cfg.taps == 65536){ cfg.taps = atoi(val.c_str()); ++applied; }
             else if (key == "shaper" && cfg.shaper == rta::dsp::Shaper::None) { cfg.shaper = parse_shaper(val); ++applied; }
             else if (key == "volume")                      { cfg.volumeEnabled = true; cfg.volumeDb = atof(val.c_str()); ++applied; }
+            else if (key == "cleanup" && !cleanupModeCli) {
+                if(val!="0"&&val!="1"&&val!="false"&&val!="true"){printf("!! 配置 cleanup 必须是 0 或 1\n");return 1;}
+                cfg.recordingCleanup.enabled=val=="1"||val=="true";++applied;
+            }
+            else if (key == "cleanup_auto" && !cleanupModeCli) {
+                if(val!="0"&&val!="1"&&val!="false"&&val!="true"){printf("!! 配置 cleanup_auto 必须是 0 或 1\n");return 1;}
+                cfg.recordingCleanup.noiseMode=(val=="1"||val=="true")?rta::dsp::RecordingCleanupNoiseMode::Auto:rta::dsp::RecordingCleanupNoiseMode::Manual;++applied;
+            }
+            else if (key == "cleanup_strength" && !cleanupStrengthCli) {
+                if(!cleanupNumber(val,0,1,cfg.recordingCleanup.strength)){printf("!! 配置清理强度须为 0..1 的有限数字\n");return 1;}++applied;
+            }
+            else if (key == "cleanup_noise_db" && !cleanupNoiseCli) {
+                if(!cleanupNumber(val,-120,-60,cfg.recordingCleanup.noiseFloorDbfs)){printf("!! 配置噪声底须为 -120..-60 的有限数字\n");return 1;}++applied;
+            }
             else if (key == "gpu")                         { useGpu = (atoi(val.c_str()) != 0); cfg.gpuResample = useGpu; ++applied; }
             else if (key == "eq"     && eqFile.empty())    { eqFile = val; ++applied; }
             else if (key == "ir"     && irFile.empty())    { irFile = val; ++applied; }
@@ -945,6 +984,12 @@ int main(int argc, char** argv) {
     AudioBuffer out;
     std::vector<std::vector<double>> dsdPlanes;
 
+    // ★ 2026-11-01（P0）：管线准备会抛 std::runtime_error —— 例如某预设在该输出率下
+    //   原型抽头数超出 PolyphaseResampler 的预算（44.1k→384k 的 poly-sinc-xl 需要 3.68M 抽头，
+    //   旧预算 2^21）。以前这里没有 try/catch ⟹ 异常逃出 main ⟹ std::terminate ⟹
+    //   Windows 0xC0000409，看起来像崩溃（实测 exit=-1073740791）。
+    //   现在改成显式失败：打印原因 + 退出码 3，绝不抛到进程边界。
+    try {
     if (chunkFrames == 0 || chunkFrames >= in.frames()) {
         // 整块处理
         out = pl.process(in, &st, dsdMultiple > 0 ? &dsdPlanes : nullptr);
@@ -987,12 +1032,18 @@ int main(int argc, char** argv) {
                chunkFrames, (total + chunkFrames - 1) / chunkFrames, el,
                (double)total / (double)in.rate / (el > 0 ? el : 1e-9));
     }
+    } catch (const std::exception& e) {
+        printf("!! 管线准备失败：%s\n", e.what());
+        printf("   该滤波器在此输出采样率下的原型抽头数超出系数预算。\n");
+        printf("   可改选较短预设、降低输出采样率，或显式提高 maxPrototypeTaps。\n");
+        return 3;
+    }
 
     // Offline/export paths retain the complete causal FIR/IR tail. Trim only
     // compensable delay; MP/IP filters deliberately report zero head trimming.
     {
         const size_t delay = (size_t)std::llround(pl.algorithmic_latency_out_frames());
-        const size_t tail = (size_t)std::ceil(pl.convolution_tail_out_frames() + pl.resampler_tail_out_frames());
+        const size_t tail = (size_t)std::ceil(pl.convolution_tail_out_frames() + pl.resampler_tail_out_frames() + pl.recording_cleanup_tail_out_frames());
         const size_t before = dsdMultiple > 0 ? (dsdPlanes.empty() ? 0 : dsdPlanes[0].size()) : out.frames();
         const size_t requested = delay + tail;
         size_t appended = 0;
@@ -1142,6 +1193,12 @@ int main(int argc, char** argv) {
     }
 
     printf("管线: %s\n", st.bitPerfect ? "逐位直通" : (st.zeroPad ? "无损展宽" : "完整 DSP"));
+    if(cfg.recordingCleanup.enabled) {
+        printf("  录音清理: %s 状态=%s 有效估计=%d 衰减均值=%.6f dB\n",
+               cfg.recordingCleanup.noiseMode==rta::dsp::RecordingCleanupNoiseMode::Auto?"auto":"manual",
+               rta::dsp::recording_cleanup_auto_state_name(st.cleanupAutoState),st.cleanupAutoEstimateValid?1:0,st.cleanupMeanReductionDb);
+        if(st.cleanupAutoEstimateValid)printf("  估计噪声底: %.3f dBFS，应用预算: %.3f dBFS\n",st.cleanupEstimatedNoiseFloorDbfs,st.cleanupAppliedNoiseFloorDbfs);
+    }
     printf("  %u Hz/%d bit -> %u Hz/%d bit, %zu -> %zu 帧\n",
            st.inRate, st.inBits, st.outRate, st.outBits, st.inFrames, st.outFrames);
     if (st.tapsPerPhase) printf("  每相位 %d 抽头, 群延迟 %.2f 输入样本\n", st.tapsPerPhase, st.latencyInSamples);

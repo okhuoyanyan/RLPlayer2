@@ -5,6 +5,7 @@
 #include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（见该头注释）
 #include "kaiser.h"
 #include "response_precision.h"
+#include "design_control.h"
 #include <vector>
 #include <cmath>
 #include <cstddef>
@@ -22,6 +23,7 @@ struct LowpassSpec {
 // cutoff 以 Nyquist 为单位：0.5 表示 0.25*fs（即常见的"半带"以外的常规截止）。
 // 返回值已归一化到单位直流增益。
 inline std::vector<double> design_lowpass(const LowpassSpec& spec) {
+    check_design_cancel();
     int n = spec.taps;
     if (n < 3) n = 3;
     // Keep exact N. Even Type-II support has delay (N-1)/2; silently
@@ -37,6 +39,7 @@ inline std::vector<double> design_lowpass(const LowpassSpec& spec) {
     std::vector<double> h((size_t)n);
     double sum = 0.0;
     for (int i = 0; i < n; ++i) {
+        if ((i & 4095) == 0) check_design_cancel();
         double x = (double)i - m;
         double s = (x == 0.0) ? 2.0 * fc : std::sin(2.0 * kPi * fc * x) / (kPi * x);
         h[(size_t)i] = s * w[(size_t)i];

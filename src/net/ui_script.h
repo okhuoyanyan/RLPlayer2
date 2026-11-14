@@ -3,10 +3,17 @@
 // 视图：专辑 / 艺术家 / 曲目 / 文件夹 / 流媒体 / 队列 / 设置
 // 原则：以专辑为中心；搜索是全局的；任何一次点击都不应该让界面失去上下文。
 #pragma once
+#include <string>
+#include "ui_studio.h"
+#include "ui_waveform.h"
+#include "ui_eq_console.h"
+#include "ui_listening_home.h"
+#include "ui_listening_library.h"
+#include "ui_workbench_state.h"
 
 namespace rta::net {
 
-inline const char* rta_ui_script() {
+inline const char* rta_ui_core_script() {
     return R"JSEOF(
 var D = function (i) { return document.getElementById(i); };
 var WV = (window.chrome && window.chrome.webview) ? window.chrome.webview : null;
@@ -24,7 +31,7 @@ function openExternal(u) {
   if (WV) { wcmd('openurl:' + u); toast('已在系统浏览器打开'); }
   else {
     try { window.open(u, '_blank', 'noopener'); toast('已在浏览器新标签打开'); }
-    catch (e) { toast('打开失败：' + u); }
+    catch (e) { toast(tf('打开失败：{0}', [u])); }
   }
   return true;
 }
@@ -34,22 +41,27 @@ var S = {
   // 261026-08 #5/#6/#3：我的最爱 / 保存的队列 / 播放列表 的视图状态
   favs: [], sqs: [], sqName: '', pls: [], plOpen: '', plItems: {},
   vol: 0, loud: false, lastCur: '', roots: [], scanning: false, dur: 0, pos: 0,
-  volDb: 0, startDb: 0, theme: 'dark', queueHidden: false,
+  volDb: 0, startDb: 0, rawVolumeLocked:false, theme: 'dark', queueHidden: false,
   // 261024-04 #8：GUP 相关的两个运行时状态（gpuOn = 有 GPU；gpuUsed = 本次播放真的用了 GPU）
   gpuOn: false, gpuUsed: false
 };
+var VOLUME_WRITE={sequence:0,current:null,confirmed:null,statusBarrier:0};
+var VOLUME_ACTION_QUEUE=Promise.resolve();
 // 高级参数（设置页里改，params() 统一带上）。默认值与后端一致。
 var ADV = {
+  quickStart: 1,
   device: '', bits: 0, taps: 0, atten: 0, transition: 0, phase: '',
   modcut: 0, moddith: -1, ir: '', irgpu: 0, ramp: 0, theme: 'dark',
   // 房间校正自动应用（B3，2026-10-27）：1 = 播放时按当前布局自动挂 data\roomcorr\correction-<布局>.json。
   // 默认 1（用户原话「接上就是了」）；0 = 退回"只认手动 IR"的老行为。
   roomcorrauto: 1,
-  eq: '', modorder: 5, modfamily: 'dsd', gpuvendor: 'auto', directsdm: 0, dsdKind: 'fir', dsdConv: 'narrow',
+  eq: '', modorder: 5, modfamily: 'dsd', gpuvendor: 'auto', directsdm: 1, dsdKind: 'fir', dsdConv: 'narrow',
   // 输出后端与多声道
   // 261024-01 #9/#11：upnpDev = UPnP/DLNA 渲染器（设备描述 URL）；naaHost 自动发现填，
   // 手动框只是折叠兜底（用户原话：NAA 端点这个选项不应该出现，应该自动获取）。
   backend: 'wasapi', channels: 0, upnpDev: '',
+  upnpUpsample: 0, upnpForceRate: 0, upnpRateCeiling: 192000,
+  cleanup: 0, cleanupAuto: 1, cleanupStrength: .5, cleanupNoiseDb: -101.1,
   trim0: 0, trim1: 0, trim2: 0, trim3: 0, trim4: 0, trim5: 0, trim6: 0, trim7: 0,
   // 输入
   inBackend: 'none', inDev: '', inOffset: 0, inBuf: 100, inMonitor: 0, inSeconds: 0, inOut: '',
@@ -62,7 +74,7 @@ var ADV = {
   autoAnl: 1,
   // 2026-10-28：音频分析**模块总开关**（conf 键 anlmaster，默认 1）。
   // 与 autoAnl 的区别：autoAnl=0 只是不自动跑（卡还在，可手动跑）；
-  // anlMaster=0 是整块关掉（单曲页不渲染、不发请求、右键无入口）。
+  // anlMaster=0 是整块关掉（监控面板不渲染、不发请求、右键无入口）。
   anlMaster: 1
 };
 // 元数据补全开关（P1.5 注册表化）：总开关 metaon 与 DeepSeek metallm 固定两键；
@@ -95,7 +107,36 @@ var SEP = String.fromCharCode(92);
    没命中的字符串保持中文（首批未覆盖的词条），这是有意的降级，不是 bug。 */
 var I18N = { lang: "zh", map: {}, orig: new WeakMap(), attrOrig: new WeakMap(), observer: null, timer: 0 };
 function i18nNorm(s) { return String(s == null ? "" : s).replace(/\s+/g, " ").trim(); }
-function t(s) { var k = i18nNorm(s); var m = I18N.map; return (m && m[k]) || s; }
+// 2026-11-02（多语言审计抓到的真 bug）：i18nNorm 会 trim + 折叠空格，而语言包里大量「片段键」
+//   本身带首尾空格或双空格（如「（相对峰值 −60 dB；参考 」结尾就有一个空格）⟹ 规范化后永远查不到，
+//   t()/tf() 只能回落中文。实测设置页「Pre-ringing envelope 0.10 ms（相对峰值 −60 dB…）」恒为中文。
+//   修法：查表时**两种形态都试**——先规范化（兼容用户手改的词条），再原始（兼容片段键）。
+function i18nGet(map, raw) {
+  if (!map) return undefined;
+  var k = i18nNorm(raw);
+  if (Object.prototype.hasOwnProperty.call(map, k)) return map[k];
+  if (Object.prototype.hasOwnProperty.call(map, raw)) return map[raw];
+  return undefined;
+}
+function t(s) { var v = i18nGet(I18N.map, String(s == null ? "" : s)); return (v === undefined ? s : v); }
+// 2026-11-02（用户三次报同一类问题：外语界面里仍夹中文）：
+//   「运行时拼出来的句子」整串查不到表 —— 数字一变就是新串，永远命中不了。
+//   以前靠"给每种数字长度写一条正则规则"兜，规则越写越多、还总有漏（本次截图里三处全漏）。
+//   现在改用**带占位符的模板当键**：模板本身（含 {0} {1}）进语言包，译文可以自由调语序/量词，
+//   运行时只做占位符替换。为什么不用"片段拼接"：各语言语序不同，片段法必然拼出病句。
+//   未翻译时原样返回模板并替换，等于中文原样 —— 与旧的 fallback 行为一致。
+// 用法：tf('共 {0} 首', [n]) / tf('未发现转码痕迹 · 检出 {cut} kHz、下降 {edge} dB', {cut: c, edge: e})
+function tf(tpl, params) {
+  var m = I18N.map, s0 = i18nGet(m, tpl), s = (s0 === undefined ? tpl : s0);
+  if (!params) return s;
+  if (Object.prototype.toString.call(params) === '[object Array]') {
+    for (var i = 0; i < params.length; i++) s = s.split('{' + i + '}').join(String(params[i]));
+    return s;
+  }
+  for (var k in params) if (Object.prototype.hasOwnProperty.call(params, k))
+    s = s.split('{' + k + '}').join(String(params[k]));
+  return s;
+}
 // 计数/拼装串的规则表（键以 ~ 开头的是正则，值是替换串，$1 取捕获组）。
 // 为什么需要它：界面上大量文本是 "共 6 首" "14 张专辑" 这种运行时拼的，
 // 整串当键永远查不到；把数字当通配符才能翻。规则同样放在语言包 JSON 里（数据驱动，
@@ -127,16 +168,25 @@ function i18nNode(n) {
   // 值被程序改过（时钟/进度）⟹ 旧原文作废，重新记一份
   if (!rec || rec.trans !== o) { rec = { orig: o, trans: null }; I18N.orig.set(n, rec); }
   var key = i18nNorm(rec.orig); if (!key) return;
-  var tr = I18N.map[key];
+  var tr = i18nGet(I18N.map, rec.orig); if (tr === undefined) tr = I18N.map[key];
+  // 2026-11-02：允许"翻成空串"（值 === ""），例如分析表里的裸量词单元格「个」。
+  //   旧代码用 !tr 判断，空串被当成"没翻"，那颗字就永远留在界面上。
+  var hasTr = (tr !== undefined) || Object.prototype.hasOwnProperty.call(I18N.map, key);
   // 2026-10-30：整串没命中时，按 " · " / " | " 拆开逐段译（实测界面上大量文本是
   //   「未知艺术家 · 44.1k/16」「艺术家 · 年份 · 44.1k/16」这种拼装串，
   //   整串永远查不到，拆开后至少能把「未知艺术家」这类词条译掉）。
-  if (!tr || tr === key) {
+  if (!hasTr || tr === key) {
     // 规则要拿**归一化后**的串去试：DOM 里 "年份 2011" 中间可能是不换行空格或换行，
     // 直接对原始串跑正则永远不匹配（实测英文界面里这一条一直是中文）。
+    // 2026-11-02：空串也是**有效译文**（例如「【置信度擦线…】」整段要删掉）。
+    //   旧判断用 if(!byPat) / if(byPat && …) 会把 "" 当成"没匹配" ⟹ 那条规则永远不生效，
+    //   外语界面里仍会冒出中文横幅。改用 null 表示未命中（与 hasOwnProperty 那条修法同源）。
     var byPat = i18nByPattern(key);
-    if (!byPat || byPat === key) byPat = i18nByPattern(String(rec.orig));
-    if (byPat && byPat !== rec.orig) {
+    if (byPat === null || byPat === key) {
+      var byPat2 = i18nByPattern(String(rec.orig));
+      if (byPat2 !== null) byPat = byPat2;
+    }
+    if (byPat !== null && byPat !== rec.orig) {
       rec.trans = byPat;
       if (n.nodeValue !== byPat) n.nodeValue = byPat;
       return;
@@ -149,7 +199,7 @@ function i18nNode(n) {
         var pv = I18N.map[pk];
         // 拆开的每一段同样要过一遍规则表：像「队列末尾 · 共 7 首」这种，
         // 前半段是词条、后半段是计数串，只做精确查表会把后半段漏成中文。
-        if (!pv || pv === pk) { var pp = i18nByPattern(pk); if (!pp || pp === pk) pp = i18nByPattern(parts[pi]); if (pp && pp !== pk) pv = pp; }
+        if (!pv || pv === pk) { var pp = i18nByPattern(pk); if (pp === null || pp === pk) { var pp2 = i18nByPattern(parts[pi]); if (pp2 !== null) pp = pp2; } if (pp !== null && pp !== pk) pv = pp; }
         if (pv && pv !== pk) { buf += pv; changed = true; }
         else buf += parts[pi];
       }
@@ -175,7 +225,8 @@ function i18nEl(e) {
   for (var i = 0; i < at.length; i++) {
     var a = at[i], v = e.getAttribute(a); if (!v) continue;
     if (store[a] === undefined) store[a] = v;
-    var key = i18nNorm(store[a]), tr = I18N.map[key];
+    var key = i18nNorm(store[a]), tr = i18nGet(I18N.map, store[a]);
+    if (tr === undefined) tr = I18N.map[key];
     if (tr && tr !== key) { if (v !== tr) e.setAttribute(a, tr); }
   }
 }
@@ -213,10 +264,269 @@ function i18nWatch() {
     if (I18N.lang && I18N.lang !== "zh") applyI18n(document.body);
   }, 1500);
 }
+
+// ---------------- 多语言验收驱动（仅 RLPLAYER_QA=1 时由 tick 启动） ----------------
+// 页面自己动：展开音频分析的所有折叠块、打开 AI 抽屉、按步滚动，然后把两个面板的
+// innerText 回报给后端（写 qa_text.log）。外部脚本按 step 推进并逐屏截图。
+var QA = { on: false, last: -1, timer: 0, wantTransition: false, wantEqDialog: false };
+function qaDismissTip() {
+  // 截图前把浮动提示清掉（有的提示挂在顶层，截图里会压在按钮上，看起来像"叠字"）
+  var t = document.querySelectorAll('.tiptext,.tipbox,.tipr,.tipcard');
+  for (var i = 0; i < t.length; i++) t[i].remove();
+  var a = document.activeElement;
+  if (a && a !== document.body) { try { a.blur(); } catch (e) {} }
+}
+function qaPanelsText() {
+  if (QA.wantWorkbench) {
+    QA.wantWorkbench = 0;
+    var ids=['[data-studio-advanced=pcm]','[data-studio-advanced=output]','#npAnlDynSummary','#npAnlQualSummary','#npAnlFakeSummary','#npAnlMore'];
+    return '[WORKBENCH] '+JSON.stringify({view:S.view,mode:rlMode,viewport:[innerWidth,innerHeight],
+      state:rlConsole.state,comparison:{active:rlCompare.activeId,slots:rlCompare.slots},
+      paused:S.paused,metaFile:S.metaFile,lastCur:S.lastCur,queue:S.q,metadata:S.curMeta,
+      cover:D('cv').style.backgroundImage,homeCover:D('rlListenCover')&&D('rlListenCover').style.backgroundImage,
+      homeHasArt:!!(D('rlListenCover')&&D('rlListenCover').classList.contains('has-art')),
+      settingsHidden:document.querySelector('.side .nav[data-v=settings]').hidden,
+      dialogOpen:!!(D('rlListeningDialog')&&D('rlListeningDialog').open),
+      analysisReady:!!(ANL.cur&&ANL.cache[ANL.cur]),analysisExpanded:!!(D('npAnlGrid')&&!D('npAnlGrid').hidden),
+      legacyAnalysisControls:!!document.querySelector('#npPage #npAnlAuto,#npPage #npAnlNow'),monitorInStudio:!!document.querySelector('#rlStudio #npAnal'),
+      geometry:ids.map(function(id){var e=document.querySelector(id);if(!e)return null;var r=e.getBoundingClientRect();return{id:id,x:r.x,y:r.y,w:r.width,h:r.height};})});
+  }
+  // 2026-11-02（多语言全面审计）：dumpbody 模式下抓**整页可见文本**（按行去重），
+  //   用来逐页查残留中文；面板模式的判据不变，避免历史基线（7149 字符 / 132 行）失效。
+  if (QA.wantEqDialog) {
+    QA.wantEqDialog = 0;
+    var eqd=D('rlEqSaveDialog');
+    var rect=eqd?eqd.getBoundingClientRect():null;
+    return '[EQDIALOG] ' + JSON.stringify({open:!!(eqd&&eqd.open),rect:rect?{left:rect.left,top:rect.top,w:rect.width,h:rect.height}:null,viewport:[innerWidth,innerHeight]});
+  }
+  if (QA.wantTransition) {
+    QA.wantTransition = 0;
+    return '[TRANSITION] ' + JSON.stringify(window.__rlTransitionTrace || []);
+  }
+  if (QA.wantAttr) { QA.wantAttr = 0; return QA.attrDump || '[ATTR] 0'; }
+  if (QA.wantFull) {
+    QA.wantFull = 0;
+    var root = document.querySelector('#view') || document.body;
+    var txt = (root.innerText || document.body.innerText || '');
+    var seen = {}, out = [];
+    txt.split('\n').forEach(function (l) {
+      var s = l.replace(/\s+$/, '');
+      if (!s.trim() || seen[s]) return;
+      seen[s] = 1; out.push(s);
+    });
+    return '[BODY] ' + out.length + ' lines\n' + out.join('\n');
+  }
+  var a = document.querySelector('#npAnal');
+  var d = document.querySelector('#npDataBody');
+  var t1 = a ? (a.innerText || '') : '';
+  var t2 = d ? (d.innerText || '') : '';
+  // 把抽屉/分析条的屏幕矩形也报回来：截图之外再给一份"它确实在视口里"的证据
+  var dr = document.querySelector('#npDrawer');
+  var geo = '';
+  if (dr) {
+    var r = dr.getBoundingClientRect();
+    geo = '[drawer on=' + dr.classList.contains('on') + ' x=' + Math.round(r.left) + ' y=' + Math.round(r.top) +
+          ' w=' + Math.round(r.width) + ' h=' + Math.round(r.height) + ']\n';
+  }
+  if (a) { var ra = a.getBoundingClientRect(); geo += '[analysis y=' + Math.round(ra.top) + ' h=' + Math.round(ra.height) + ']\n'; }
+  if (dr) {
+    var cs = getComputedStyle(dr);
+    geo += '[style vis=' + cs.visibility + ' op=' + cs.opacity + ' z=' + cs.zIndex + ' tr=' + cs.transform +
+           ' bg=' + cs.backgroundColor + ' pos=' + cs.position + ']\n';
+    var host = dr.parentElement;
+    if (host) { var hs = getComputedStyle(host); geo += '[host id=' + host.id + ' pos=' + hs.position + ' ov=' + hs.overflow + ']\n'; }
+  }
+  t2 = geo + t2;
+  return '### ANALYSIS ###\n' + t1 + '\n### AI ###\n' + t2;
+}
+function qaExec(cmd) {
+  cmd = cmd || '';
+  // The existing opt-in QA bridge can drive only these real workspace controls.
+  // No arbitrary script or parameter is accepted through the HTTP QA channel.
+  if (cmd === 'nav:albums') { if (typeof rlNav === 'function') rlNav('albums'); return; }
+  if (cmd === 'nav:listening') { if (typeof rlNav === 'function') rlNav('listening'); return; }
+  if (cmd.indexOf('workbench:') === 0) {
+    var action=cmd.slice(10), selector='';
+    if(action==='state'){QA.wantWorkbench=1;return;}
+    if(action==='transition:trace'){QA.wantTransition=1;return;}
+    // 3.3.9：验收用 —— 打开 EQ 保存二级窗口并回报它的居中位置，便于真窗口截图核对。
+    if(action==='eqsave'){
+      if(typeof rlEqOpenDialog==='function'){rlEqOpenDialog('custom','');QA.wantEqDialog=1;}
+      return;
+    }
+    if(action==='eqsave:close'){var eqd=D('rlEqSaveDialog');if(eqd&&eqd.open)eqd.close();return;}
+    if(action==='mode:listen'||action==='mode:pro'){rlSetMode(action.slice(5),false);return;}
+    if(action==='save'){if(typeof rlStudioFlush==='function')rlStudioFlush().catch(function(){});return;}
+    if(action==='pin'){if(typeof rlStudioSetBoundary==='function')rlStudioSetBoundary('start');return;}
+    // 2026-11-12：四组左右箭头已按用户要求移除；QA 桥改为直接调用同一套切换函数，
+    // 不再依赖已不存在的 #rlStudioComparePrev/#rlStudioCompareNext。
+    if(action==='prev'||action==='next'){if(typeof rlStudioSelectDelta==='function')rlStudioSelectDelta(action==='prev'?-1:1);return;}
+    if(/^tab:(ab|eq|monitor)$/.test(action)){if(typeof rlStudioTab==='function')rlStudioTab(action.slice(4));return;}
+    if(action==='rack'||action==='top'||action==='segment'){
+      if((action==='rack'||action==='segment')&&typeof rlStudioTab==='function')rlStudioTab('ab');
+      var section=action==='rack'?D('rlStudioModFamily'):action==='segment'?D('rlStudioSegment'):D('rlStudio');
+      if(section)section.scrollIntoView({block:action==='segment'?'center':'start'});return;
+    }
+    if(/^card:(output|profile|style)$/.test(action)){rlOpenListeningCard(action.slice(5));return;}
+    if(/^style:(warm|balanced|sharp)$/.test(action))selector='[data-rl-listening-style='+action.slice(6)+']';
+    else if(/^slot:[ABCD]$/.test(action))selector='[data-studio-slot='+action.slice(5)+']';
+    else selector={apply:'#rlListeningDialogApply',cancel:'#rlListeningDialogCancel',save:'#rlStudioSlotSave',prev:'#rlStudioComparePrev',next:'#rlStudioCompareNext',pin:'#rlStudioPinCurrent'}[action]||'';
+    var control=selector&&document.querySelector(selector);
+    if(control&&!control.disabled&&control.getBoundingClientRect().width)control.click();
+    return;
+  }
+  if (cmd === 'np') { if (typeof openNowPlaying === 'function') openNowPlaying(); return; }
+  // 2026-11-02（多语言全面审计）：切到任意主视图，用来逐页抓文本查残留中文。
+  if (cmd.indexOf('view:') === 0) {
+    var v = cmd.slice(5);
+    try {
+      if (typeof setView === 'function') { setView(v); return; }
+      if (typeof openSettingsTab === 'function' && v === 'settings') { openSettingsTab('out'); return; }
+      location.hash = '#/' + v;
+    } catch (e) {}
+    return;
+  }
+  // 把整页可见文本回报（比只抓面板更能发现"列表头/toast/设置项"里的残留）
+  if (cmd === 'dumpbody') { QA.wantFull = 1; return; }
+  // QA-only native-host capture of the production feedback result renderer.
+  // Does not call submit, collect diagnostics, look up credentials, or send HTTP.
+  if (cmd === 'feedback-local') {
+    openSettingsTab('diag');
+    setTimeout(function () { fbShowResult({ uploaded: false, status: 503,
+      local: 'QA synthetic local fixture', error: 'QA synthetic transport failure; no request sent' }); }, 300);
+    QA.wantFull = 1;
+    return;
+  }
+  if (cmd === 'feedback-success') {
+    openSettingsTab('diag');
+    setTimeout(function () { fbShowResult({ uploaded: true, status: 201, id: 'FB-QA-LOCAL',
+      path: 'FB-QA-LOCAL', diag_stored: true });
+      var result = D('sp_fbresult'); if (result && result.scrollIntoView) result.scrollIntoView({ block: 'center' }); }, 300);
+    QA.wantFull = 1;
+    return;
+  }
+  if (cmd === 'update-manual' || cmd === 'update-quota') {
+    openSettingsTab('upd');
+    setTimeout(function () {
+      if (cmd === 'update-manual') updShowCheck({ ok: true, hasUpdate: true, latest: '4.0.0',
+        installMode: 'manual', reason: 'major-upgrade', cn: 'https://pan.baidu.com/s/QA-LOCAL',
+        global: 'https://github.com/okhuoyanyan/RLPlayer2/releases', extractionCode: 'QA-LOCAL', fullSize: 409276280 });
+      else updShowCheck({ ok: false, error: 'quota_exceeded：QA synthetic quota failure; no request sent',
+        latest: '3.2.3', cn: 'https://pan.baidu.com/s/QA-LOCAL',
+        global: 'https://github.com/okhuoyanyan/RLPlayer2/releases', extractionCode: 'QA-LOCAL' });
+      var card = D('sp_updcard'); if (card && card.scrollIntoView) card.scrollIntoView({ block: 'center' });
+    }, 300);
+    QA.wantFull = 1;
+    return;
+  }
+  // 2026-11-02：右键菜单 / 对话框审计入口（这些浮层不在页面文本里，dumpbody 抓不到，必须先打开）
+  if (cmd.indexOf('menu:') === 0) {
+    var what = cmd.slice(5);
+    try {
+      if (what === 'track') { showTrackMenu(300, 300, { path: (S.curPath || S.curFile || ''), cs: 0, ce: 0 }); }
+      else if (what === 'queue') { showQueueContextMenu(200, 200, 0); }
+      else if (what === 'lyric') { showLyricMenu(200, 200); }
+      else if (what === 'row') { showQueueRowMenu(200, 200, 0); }
+    } catch (e) {}
+    QA.wantFull = 1;
+    return;
+  }
+  // 更新对话框（设置-高级里的「检查更新」）
+  if (cmd === 'dlg:update') {
+    try { var b = document.querySelector('#sp_updcheck'); if (b) b.click(); } catch (e) {}
+    QA.wantFull = 1;
+    return;
+  }
+  // 2026-11-02：切设置页签（in/out/pcm/sdm/adv/eq/cal/meta），配合 dumpbody 逐页签审计
+  if (cmd.indexOf('stab:') === 0) {
+    try { openSettingsTab(cmd.slice(5)); } catch (e) { try { setView('settings'); } catch (e2) {} }
+    return;
+  }
+  // 2026-11-02：弹一条真实 toast 并立刻抓整页文本 —— 验证 toast（短命文本节点）也走 i18n
+  if (cmd.indexOf('toast:') === 0) {
+    var msg = cmd.slice(6);
+    try { toast(msg); } catch (e) {}
+    QA.wantFull = 1;
+    return;
+  }
+  // 2026-11-02：属性文本审计（title/placeholder/aria-label/alt/data-tip）。innerText 抓不到它们，
+  //   而这几个属性同样会露中文；命中后回报 "ATTR 标签|属性|值"。
+  if (cmd === 'dumpattr') {
+    var at = ['title', 'placeholder', 'aria-label', 'alt', 'data-tip'];
+    var out = [], seen = {};
+    var els = document.querySelectorAll('*');
+    for (var i = 0; i < els.length; i++) {
+      for (var k = 0; k < at.length; k++) {
+        var v = els[i].getAttribute && els[i].getAttribute(at[k]);
+        if (!v || !/[\u4e00-\u9fff]/.test(v)) continue;
+        var key = at[k] + '|' + v;
+        if (seen[key]) continue;
+        seen[key] = 1;
+        out.push('ATTR ' + els[i].tagName + '|' + at[k] + '|' + v);
+      }
+    }
+    QA.attrDump = '[ATTR] ' + out.length + ' 条\n' + out.join('\n');
+    QA.wantAttr = 1;
+    return;
+  }
+  // 2026-11-02：打开第 N 张专辑 / 第 N 位艺术家的详情页（多语言审计要覆盖详情页）
+  if (cmd.indexOf('album:') === 0) {
+    var ai = parseInt(cmd.slice(6), 10) || 0;
+    var cards = document.querySelectorAll('#gridAlb .alb, #albums .alb, .alb');
+    if (cards && cards[ai]) { cards[ai].click(); return; }
+    if (typeof openAlbum === 'function' && S.albums && S.albums[ai]) { openAlbum(S.albums[ai]); return; }
+    return;
+  }
+  if (cmd.indexOf('artist:') === 0) {
+    var ri = parseInt(cmd.slice(7), 10) || 0;
+    var ac = document.querySelectorAll('#gridArt .art, #artists .art, .art');
+    if (ac && ac[ri]) { ac[ri].click(); return; }
+    return;
+  }
+  // AI 抽屉：走 npDataActivateAll()（四类实体并行发），与点「AI 资料 ›」完全同一条路径
+  if (cmd === 'ai') { if (typeof npDataActivateAll === 'function') npDataActivateAll(); return; }
+  if (cmd === 'closeai') { if (typeof npDrawerClose === 'function') npDrawerClose(); return; }
+  if (cmd === 'expand') {
+    // 直接置到 L2（= 全部原始指标），不靠按钮文字匹配 —— i18n 之后按钮文案会变英文
+    if (typeof anlSetLvl === 'function') { anlSetLvl(2); return; }
+    var btns = document.querySelectorAll('#npAnal button, #npAnal .btn');
+    for (var i = 0; i < btns.length; i++) btns[i].click();
+    return;
+  }
+  if (cmd.indexOf('top:') === 0) {
+    var y0 = parseInt(cmd.slice(4), 10) || 0;
+    // 单曲页的滚动容器是 #npBody（不是 window）
+    var nb = document.querySelector('#npBody');
+    if (nb) nb.scrollTop = y0;
+    window.scrollTo(0, 0);
+    return;
+  }
+  if (cmd.indexOf('scroll:') === 0) {
+    var y = parseInt(cmd.slice(7), 10) || 0;
+    var el = document.querySelector('#npDataBody');
+    if (el) el.scrollTop = y;
+    return;
+  }
+}
+function qaTick() {
+  if (!QA.on) return;
+  fetch('/api/qa/next').then(function (r) { return r.json(); }).then(function (j) {
+    if (!j || j.step === QA.last || j.step < 0) return;
+    QA.last = j.step;
+    try { qaExec(j.cmd); } catch (e) {}
+    try { qaDismissTip(); } catch (e) {}
+    setTimeout(function () {
+      try { fetch('/api/qa/text?step=' + j.step, { method: 'POST', body: qaPanelsText() }).catch(function () {}); } catch (e) {}
+      fetch('/api/qa/done?step=' + j.step, { method: 'POST' }).catch(function () {});
+    }, 400);
+  }).catch(function () {});
+}
 function i18nApplyRtl() {
   var rtl = (I18N.lang === "ar");
   document.documentElement.dir = rtl ? "rtl" : "ltr";
   document.documentElement.lang = I18N.lang;
+  // 2026-11-02：语言标记挂到 body，供 .zh-only（如 QQ 群）按语言显示/隐藏
+  document.body.setAttribute('data-i18n-lang', I18N.lang || 'zh');
 }
 // 切语言前必须**先把译文还原成中文**，否则新语言包会把旧译文当成原文去查（永远查不到）。
 // 这是「用渲染结果当键」这套方案的唯一陷阱，必须显式处理。
@@ -245,11 +555,23 @@ function i18nRestore(root) {
 function i18nSetLang(code, persist) {
   return apiGetRaw("/api/i18n?lang=" + encodeURIComponent(code || "auto")).then(function (j) {
     i18nRestore(document.body);
+    // A parked settings form keeps its inputs but is outside the body walker.
+    // Restore its source strings while the previous language maps still exist.
+    if (typeof rlSettingsState !== 'undefined' && rlSettingsState) {
+      Object.keys(rlSettingsState.parked).forEach(function(mode) {
+        i18nRestore(rlSettingsState.parked[mode]);
+      });
+    }
     I18N.lang = j.lang || "zh";
     I18N.map = j.map || {};
     I18N.orig = new WeakMap(); I18N.attrOrig = new WeakMap(); I18N.pats = null;
     i18nApplyRtl();
     applyI18n(document.body);
+    if (typeof rlSyncHomeNavigation === 'function') rlSyncHomeNavigation();
+    if (typeof rlSettingsRoute==='function' && S.view==='settings')rlSettingsRoute(false);
+    if (typeof rlHomeActive === 'function' && rlHomeActive()) {
+      rlPaintHome(); rlPaintQueue();
+    }
     if (D("sp_uilang")) D("sp_uilang").value = code || "auto";
     if (persist !== false) { ADV.uiLang = code || "auto"; saveSettings(true); }
     return j;
@@ -264,6 +586,11 @@ function i18nBoot() {
     applyI18n(document.body);
     i18nWatch();
     if (D("sp_uilang") && j.setting) D("sp_uilang").value = j.setting;
+    // 2026-11-02（多语言审计抓到的真 bug）：首屏可能在语言包到达**之前**就渲染完，
+    // 那时 t()/tf() 只能返回中文原文；而拼进数字/设备名之后的串再也无法被文本节点替换命中
+    // （实测设置页「Pre-ringing envelope 0.10 ms（相对峰值 −60 dB…）」恒为中文）。
+    // 包一到就重渲染当前视图，让所有 t()/tf() 走一遍带词典的路径。
+    try { if (typeof setView === 'function' && S && S.view) setView(S.view, true); } catch (e) {}
     return j;
   }).catch(function () { /* 语言包拿不到就保持中文，不影响其它功能 */ });
 }
@@ -317,7 +644,84 @@ window.addEventListener('unhandledrejection', function (ev) {
   if (ev && ev.preventDefault) ev.preventDefault();
 });
 
+function playbackErrorText(message) {
+  var raw = String(message == null ? '' : message);
+  // Only fixed application-owned prefixes and exact known DSP messages are
+  // interpreted. Device names, filenames and other diagnostics stay verbatim.
+  var prefix = /^(?:渲染失败|Render failed|异常)\s*[:：]\s*/.exec(raw);
+  var body = prefix ? raw.slice(prefix[0].length) : raw;
+  var budget = /^Requested FIR exceeds the coefficient budget; quality was not reduced\. inRate=(\d+) outRate=(\d+) L=(\d+) M=(\d+) T=(\d+) taps=(\d+) budget=(\d+)\. Use a cascade or explicitly change the filter configuration\.$/.exec(body);
+  var localized = body;
+  if (budget) {
+    localized = tf('FIR 设计超出系数预算，已拒绝且未降低音质：{0} → {1} Hz，请求 {2} 个系数，预算 {3} 个。请启用两段式升频，或调整滤波器/输出率。', [budget[1], budget[2], budget[6], budget[7]]);
+  } else if ([
+    'Resampler sample rates must be positive', 'Resampler supports 1 to 64 channels',
+    'Resampler tap counts and budgets are invalid', 'Resampler transition must be finite and in [0,1)',
+    'Resampler attenuation must be finite and in [0,1000] dB', 'Unknown resampler window or phase',
+    'Invalid resampler phase mix', 'Invalid resampler apodization edges',
+    'Automatic tap design requires a positive transition'
+  ].indexOf(body) >= 0) {
+    localized = t('滤波器参数无效，已拒绝处理。请检查采样率、声道数、相位、衰减、过渡带及抽头设置。');
+  } else if ([
+    'Reduced resampler ratio exceeds the supported integer range', 'Resampler coefficient count overflow',
+    'Automatic source support exceeds the tap integer range', 'Transition requires an unrepresentable tap count',
+    'Cascade intermediate sample rate overflow', 'Cascade transition requires too many taps', 'FFT size overflow'
+  ].indexOf(body) >= 0) {
+    localized = t('滤波器配置超出支持范围，已拒绝处理且未降低音质。请使用两段式升频或调整滤波器/输出率。');
+  } else if (body === 'Filter preparation cancelled') {
+    localized = t('滤波器准备已取消，未开始输出。');
+  } else if (body === 'Manual FIR is invalid; playback was not started.') {
+    localized = t('手动 IR 无效，已拒绝播放。请检查文件、采样率、声道数和 FIR 数据。');
+  } else if (body === 'SDM_CORNER_QUALITY: One-bit noise-shaping corners below 100 kHz can distort the audio band; use 0/default 100 kHz or the EC family.') {
+    localized = t('低于 100 kHz 的 1-bit 噪声整形拐点可能造成音频带失真，已拒绝输出。请选择 0／默认 100 kHz，或使用 EC。');
+  } else if (body === 'SDM corner must be finite and positive') {
+    localized = t('SDM 拐点必须为 0 或 100～200 kHz；EC 族不使用此值，但仍须是 0～200 的有限数字。输入已保留，请修正后再保存。');
+  }
+  return prefix ? tf('渲染失败：{0}', [localized]) : localized;
+}
+var PLAYBACK_SETTINGS = { ready: false, loading: false, failed: false, invalidVolume: false, generation: 0 };
+function playbackSettingsMessage() {
+  if (PLAYBACK_SETTINGS.invalidVolume) return t('保存的音量无效，请修正为 -120～+20 dB 后重新读取播放设置。');
+  return t(PLAYBACK_SETTINGS.failed ? '播放设置读取失败，请重试后再手动播放。' : '正在读取播放设置，完成后请再次点击播放。');
+}
+function playbackSettingsBlocked() {
+  var message = playbackSettingsMessage();
+  toast(message);
+  return { ok: false, errorCode: 'PLAYBACK_SETTINGS_NOT_READY', error: message };
+}
+function ensurePlaybackSettings() {
+  if (PLAYBACK_SETTINGS.ready) return true;
+  playbackSettingsBlocked(); return false;
+}
+function updatePlaybackSettingsGate() {
+  ['vol', 'npVol', 'barVolInput', 'npVolInput', 'volFloor', 'npVolFloor'].forEach(function (id) {
+    var e = D(id); if (!e) return;
+    e.disabled = !PLAYBACK_SETTINGS.ready || isRawVolumeLocked();
+    e.style.visibility = PLAYBACK_SETTINGS.ready ? '' : 'hidden';
+    e.setAttribute('aria-busy', PLAYBACK_SETTINGS.ready ? 'false' : 'true');
+  });
+  if (D('volumePending')) {
+    D('volumePending').hidden=PLAYBACK_SETTINGS.ready&&!isRawVolumeLocked();
+    D('volumePending').textContent=t(PLAYBACK_SETTINGS.ready&&isRawVolumeLocked()?'设备调音':'音量尚未读取');
+    D('volumePending').title=isRawVolumeLocked()?rawVolumeMessage():'';
+  }
+  if (D('barVolDb')) D('barVolDb').hidden = !PLAYBACK_SETTINGS.ready;
+  ['volKnob','npVolKnob'].forEach(function(id){var e=D(id);if(!e)return;var locked=!PLAYBACK_SETTINGS.ready||isRawVolumeLocked();e.dataset.locked=String(locked);e.tabIndex=locked?-1:0;e.setAttribute('aria-disabled',String(locked));});
+  if (D('volFloor') && (!PLAYBACK_SETTINGS.ready || isRawVolumeLocked())) D('volFloor').disabled = true;
+  if (D('npVolLab') && !PLAYBACK_SETTINGS.ready) D('npVolLab').textContent = t('音量尚未读取');
+  if (D('playbackSettingsNotice')) D('playbackSettingsNotice').hidden = PLAYBACK_SETTINGS.ready;
+  if (D('playbackSettingsMsg')) D('playbackSettingsMsg').textContent = playbackSettingsMessage();
+  if (D('playbackSettingsRetry')) {
+    D('playbackSettingsRetry').hidden = !PLAYBACK_SETTINGS.failed;
+    D('playbackSettingsRetry').disabled = PLAYBACK_SETTINGS.loading;
+    D('playbackSettingsRetry').textContent = t('重新读取播放设置');
+    D('playbackSettingsRetry').onclick = function () { loadSettings(); };
+  }
+}
 function apiRaw(u, body) {
+  // A blocked action is resolved as a refusal, never retried or queued for later.
+  if (/^\/api\/(?:play|lib\/play|sq\/play|skip|pause|seek|cast\/start|input\/start|roomcorr\/measure|volume|settings|preset\/apply|workbench\/(?:apply|profile|eqpresets))(?:\?|$)/.test(u) && !PLAYBACK_SETTINGS.ready)
+    return Promise.resolve(playbackSettingsBlocked());
   // 2026-10-25（安全加固后）：/api/ 下的一律用 POST —— 后端现在把副作用端点限制为 POST
   // （GET 一律 405，防 <img src="/api/quit"> 这类 CSRF）。读端点 POST 也照常工作（handler 不看 method），
   // 所以这里统一 POST 既修好「无 body 的 api('/api/fav?...') 变成 GET 被拒」，也不用逐个调用点改。
@@ -326,7 +730,9 @@ function apiRaw(u, body) {
   if (body !== undefined) opt.body = body;
   var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
   if (ctrl) opt.signal = ctrl.signal;
-  var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 8000);
+  // Enrichment owns a 20s server budget; let its explicit result reach the UI.
+  var requestTimeout = /^\/api\/workbench\/(?:apply|profile|eqpresets)(?:\?|$)/.test(u) ? 35000 : (/^\/api\/enrich(?:\?|$)/.test(u) ? 22000 : 8000);
+  var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, requestTimeout);
   return fetch(u, opt).then(function (r) {
     clearTimeout(timer);
     if (!r.ok) {
@@ -334,7 +740,7 @@ function apiRaw(u, body) {
         var msg = '';
         try {
           var j = JSON.parse(txt);
-          if (j && j.error) msg = j.error;
+          if (j && j.error) msg = playbackErrorText(j.error);
           else if (j && j.message) msg = j.message;
         } catch (e) {
           msg = txt;
@@ -349,7 +755,11 @@ function apiRaw(u, body) {
         throw err;
       });
     }
-    return r.json();
+    return r.json().then(function (j) {
+      if (j && j.errorCode === 'ENRICH_BUDGET_EXCEEDED')
+        j.message = t('元数据网络整理已达到时间预算，可重试；已有结果不会丢失');
+      return j;
+    });
   }, function (e) {
     clearTimeout(timer);
     throw e;
@@ -403,6 +813,10 @@ function apiGetRaw(u) {
 //   · 需要重试时调用方显式传 {retry:true}（例如服务端已支持幂等键的场景）。
 function api(u, body, opts) {
   var o = opts || {};
+  if (/^\/api\/(?:workbench\/(?:apply|profile|eqpresets)|preset\/apply|peq(?:\/preset)?|opra\/apply)(?:\?|$)/.test(u) && !o.parameterTransport) {
+    var kind=rlSettingsFence.kind(u,body);
+    if(kind)return rlSettingsFence.request(function(){return api(u,body,Object.assign({},o,{parameterTransport:true}));},kind,o.parameterLease,body);
+  }
   var idem = (o.idempotent === true) || (body === undefined || body === null);
   return apiRaw(u, body).catch(function (err) {
     if (err && err.status && err.status >= 400 && err.status < 500) {
@@ -420,7 +834,7 @@ function api(u, body, opts) {
   });
 }
 // 非幂等动作的显式入口：语义与 api(u, body) 相同，但"永不自动重试"是硬约定。
-function apiAct(u, body) { return api(u, body, { retry: false }); }
+function apiAct(u, body, lease) { return api(u, body, { retry: false, parameterLease:lease }); }
 
 function renderPanelError(viewName, retryFn, err) {
   if (S.view !== viewName) return;
@@ -453,6 +867,86 @@ function syncRateFamilyPolicy() {
     ? '自动档优先同族；设备没有可用同族档位时允许跨族回退。发生转换时显示重采样，非逐位直通。'
     : '自动档只选择源采样率同族；手动指定跨族是你的主动选择，会保留目标并显示真实转换：重采样，非逐位直通。');
 }
+/* PROCESSING_SETTINGS_BEGIN */
+function processingSettingsValid(strength, noise) {
+  return String(strength).trim() !== '' && String(noise).trim() !== '' &&
+    Number.isFinite(Number(strength)) && Number(strength) >= 0 && Number(strength) <= 1 &&
+    Number.isFinite(Number(noise)) && Number(noise) >= -120 && Number(noise) <= -60;
+}
+function validateProcessingSettings() {
+  var strength=D('sp_cleanup_strength'), noise=D('sp_cleanup_noise');
+  var valid=processingSettingsValid(strength?strength.value:ADV.cleanupStrength,noise?noise.value:ADV.cleanupNoiseDb);
+  if(!valid)toast(t('清理强度须为 0～1，噪声底须为 -120～-60 dBFS，且必须是有限数字。请修正后再保存。'));
+  return valid;
+}
+function processingSettingsParam() {
+  return '&upnpUpsample='+(ADV.upnpUpsample?1:0)+'&upnpForceRate='+(ADV.upnpForceRate?1:0)
+    +'&upnpRateCeiling='+ADV.upnpRateCeiling+'&cleanup='+(ADV.cleanup?1:0)
+    +'&cleanup_auto='+(ADV.cleanupAuto===0?0:1)
+    +'&cleanup_strength='+ADV.cleanupStrength+'&cleanup_noise_db='+ADV.cleanupNoiseDb;
+}
+function syncCleanupNoiseMode() {
+  if(D('sp_cleanup_noise_mode'))D('sp_cleanup_noise_mode').value=ADV.cleanupAuto===0?'manual':'auto';
+  if(D('sp_cleanup_noise'))D('sp_cleanup_noise').disabled=ADV.cleanupAuto!==0;
+}
+function syncProcessingControls() {
+  [['sp_upnp_upsample',ADV.upnpUpsample],['sp_upnp_force',ADV.upnpForceRate],['sp_cleanup',ADV.cleanup]].forEach(function(x){if(D(x[0]))D(x[0]).checked=!!x[1];});
+  [['sp_upnp_ceiling',ADV.upnpRateCeiling],['sp_cleanup_strength',ADV.cleanupStrength],['sp_cleanup_noise',ADV.cleanupNoiseDb]].forEach(function(x){if(D(x[0])){if(D(x[0]).tagName==='SELECT')setSelectValue(D(x[0]),String(x[1]));else D(x[0]).value=String(x[1]);}});
+  syncCleanupNoiseMode();
+}
+/* PROCESSING_SETTINGS_END */
+/* CLEANUP_STATUS_BEGIN */
+function cleanupStatusText(p, context) {
+  var c = context || {}, finite = function (v) { return typeof v === 'number' && Number.isFinite(v) && v <= 0; };
+  if (!c.enabled) return t('录音清理已关闭。');
+  if (!p || typeof p.cleanupAuto !== 'boolean' || !p.cleanupAutoState || p.cleanupObserved === false)
+    return t('尚未测量；下次播放时生效。');
+  if (p.cleanupRequested === false || p.cleanupAuto !== !!c.auto ||
+      (!c.auto && typeof p.cleanupNoiseDb === 'number' && p.cleanupNoiseDb !== c.manualNoiseDb))
+    return t('设置已更改，下次播放时生效。');
+  var text;
+  if (c.auto) {
+    if (p.cleanupAutoState === 'estimated' && p.cleanupAutoEstimateValid === true && finite(p.cleanupEstimatedNoiseFloorDbfs)) {
+      text = tf('自动估计噪声底：{0} dBFS', [p.cleanupEstimatedNoiseFloorDbfs.toFixed(1)]);
+      text += ' · ' + (finite(p.cleanupAppliedNoiseFloorDbfs)
+        ? tf('本次采用：{0} dBFS', [p.cleanupAppliedNoiseFloorDbfs.toFixed(1)])
+        : t('尚未采用估计，暂不降噪。'));
+    } else text = t(p.cleanupAutoState === 'insufficient'
+      ? '证据不足，暂不降噪。' : '等待可信安静片段；证据不足，暂不降噪。');
+  } else text = finite(p.cleanupAppliedNoiseFloorDbfs) && p.cleanupAppliedNoiseFloorDbfs >= -120 && p.cleanupAppliedNoiseFloorDbfs <= -60
+    ? tf('手动噪声底：{0} dBFS', [p.cleanupAppliedNoiseFloorDbfs.toFixed(1)])
+    : t('尚未测量；下次播放时生效。');
+  if (!(c.playing || c.paused) || ((p.src || p.file) && (p.src || p.file) !== c.current))
+    text = tf('上次处理：{0}', [text]);
+  return text;
+}
+/* CLEANUP_STATUS_END */
+var CLEANUP_UI = {facts:null, source:'', currentFile:'', playbackKey:'', generation:0};
+function paintCleanupStatus() {
+  var node = D('sp_cleanup_status'); if (!node) return;
+  var cast = ADV.backend === 'upnp', facts = CLEANUP_UI.source === (cast ? 'cast' : 'local') ? CLEANUP_UI.facts : null;
+  node.textContent = cleanupStatusText(facts, {enabled:!!ADV.cleanup, auto:ADV.cleanupAuto!==0,
+    manualNoiseDb:ADV.cleanupNoiseDb, playing:cast ? !!(facts && facts.running) : S.playing,
+    paused:cast ? false : S.paused, current:cast ? ((facts && (facts.src || facts.file)) || '') : CLEANUP_UI.currentFile});
+}
+function observeCleanupReport(facts, source) {
+  if (source !== (ADV.backend === 'upnp' ? 'cast' : 'local')) return;
+  CLEANUP_UI.facts = facts || null; CLEANUP_UI.source = source;
+  paintCleanupStatus();
+}
+function refreshCleanupStatus() {
+  paintCleanupStatus();
+  if (!ADV.cleanup || S.view !== 'settings') return Promise.resolve();
+  var cast = ADV.backend === 'upnp', source = cast ? 'cast' : 'local';
+  var generation = ++CLEANUP_UI.generation, file = CLEANUP_UI.currentFile;
+  return api(cast ? '/api/cast/state' : '/api/signal').then(function (j) {
+    if (generation !== CLEANUP_UI.generation || S.view !== 'settings' ||
+        source !== (ADV.backend === 'upnp' ? 'cast' : 'local') || (!cast && file !== CLEANUP_UI.currentFile)) return;
+    observeCleanupReport(j && j.ok ? (cast ? j : j.path) : null, source);
+  }).catch(function () {
+    if (generation === CLEANUP_UI.generation) observeCleanupReport(null, source);
+  });
+}
 function params() {
   var dv = D('sDSD').value;              // 0 | dop64 | dop128 | dop256 | nat64 | nat128 | nat256
   var dsdN = 0, native = 0;
@@ -467,7 +961,7 @@ function params() {
          '&filterNx=' + encodeURIComponent(D('sFiltNx').value) +
          '&shaper=' + encodeURIComponent(D('sShap').value) +
          '&volume=' + S.vol +
-         '&loudness=' + (S.loud ? 1 : 0) +
+         '&loudness=' + (S.loud ? 1 : 0) + processingSettingsParam() +
          // ReplayGain：off / track / album + 防削波（后端 decide() → cfg.replayGainDb）
          '&rgmode=' + (ADV.rgmode || 'off') + '&rgclip=' + (ADV.rgclip ? 1 : 0) +
          '&isp=' + (D('sIsp').checked ? 1 : 0) +
@@ -758,8 +1252,8 @@ function rzApplyEdgeInset() {
 function chLayout(ch) {
   ch = parseInt(ch, 10) || 0;
   if (ch <= 0) return '';
-  if (ch === 1) return '单声道';
-  if (ch === 2) return '立体声';
+  if (ch === 1) return t('单声道');
+  if (ch === 2) return t('立体声');
   if (ch === 3) return '2.1';
   if (ch === 4) return '4.0';
   if (ch === 6) return '5.1';
@@ -776,7 +1270,7 @@ function chText(ch) {
   ch = parseInt(ch, 10) || 0;
   if (ch <= 0) return '—';
   var l = chLayout(ch);
-  return (l && l !== (ch + 'ch')) ? (ch + ' ch（' + l + '）') : (ch + ' ch');
+  return (l && l !== (ch + 'ch')) ? tf('{0} ch（{1}）', [ch, t(l)]) : (ch + ' ch');
 }
 // 行内后缀：多声道才追加（' · 5.1'），2.0 素材上界面与以前逐字相同
 function chSuffix(ch) {
@@ -802,26 +1296,50 @@ function head(title, subtitle, toolsHtml) {
 /* ---------------- 专辑视图 ---------------- */
 // 封面一律尝试加载：拿不到就让 img 自己消失，后面的首字母占位露出来。
 // （早期用 cv 标记决定是否请求，结果「扫描时没识别出封面」就永远不显示了）
+// 封面加载失败后的有限重试（见 albumCardHtml 里的注释）
+function covRetry(im) {
+  var n = parseInt(im.getAttribute('data-rt') || '0', 10);
+  if (n >= 3) { im.style.display = 'none'; return; }
+  im.setAttribute('data-rt', String(n + 1));
+  setTimeout(function () {
+    var u;
+    try { u = new URL(im.src, location.href); } catch (e) { im.style.display = 'none'; return; }
+    u.searchParams.set('_r', String(Date.now()));
+    im.style.display = '';
+    im.src = u.href;
+  }, 700 * (n + 1));
+}
+function albumIdentityLabel(a) {
+  var source = a && (a.albumIdentitySource || a.identitySource);
+  if (source === 'directory_inferred') return t('文件夹分组');
+  if (source === 'legacy_unknown') return t('来源待核实');
+  return '';
+}
 function albumCardHtml(a, i) {
   return '<div class=card data-i=' + i + '>' +
     // 2026-10-26（261026-02 #3）：封面端点现在**找不到就 404**（不再回 1x1 占位图），
     // 所以 onerror 必须是"隐藏 <img>、露出底下的首字母"，而不是让格子空着。
     '<div class=cv>' +
       '<div class=ph>' + esc((a.name || '?').slice(0, 1).toUpperCase()) + '</div>' +
-      '<img src="' + (a.cvUrl || ('/api/lib/cover?k=' + a.k)) + '" loading=lazy alt="" onerror="this.style.display=\'none\'">' +
+      // 2026-11-02（用户反馈「封面有时刷得出来有时候刷不出来，很随机」）：
+      //   服务端对并发抽图做了限流，抢不到槽位的请求会立刻 404（保护页面不被拖死）。
+      //   旧实现 onerror 直接隐藏，这一格就再也不重试了 ⟹ 看起来"随机缺图"。
+      //   现在：失败后按 0.7s / 1.4s / 2.1s 退避重试 3 次（带 cache-busting），仍失败才露首字母。
+      '<img data-album-key="' + esc(a.k) + '"' + (a.cv ? ' src="/api/lib/cover?k=' + encodeURIComponent(a.k) + '"' : '') +
+      ' loading=lazy alt="" onerror="covRetry(this)">' +
       '<div class=pl><svg width=13 height=13 viewBox="0 0 24 24" fill=#fff><path d="M8 5v14l11-7z"/></svg></div>' +
     '</div>' +
     '<div class=nm title="' + esc(a.name) + '">' + esc(a.name) + '</div>' +
-    '<div class=ar title="' + esc(a.artist) + '">' + esc(a.artist || '未知艺术家') +
+    '<div class=ar title="' + esc(a.artist) + '">' + (albumIdentityLabel(a) ? esc(albumIdentityLabel(a)) + ' · ' : '') + esc(a.artist || '未知艺术家') +
       (a.year ? '  \u00b7  ' + a.year : '') + (a.sr ? '  \u00b7  ' + fmtTag(a.sr, a.bits) : '') + '</div>' +
     '</div>';
 }
 // 2026-10-26（261026-02 #3）：封面抓取要有**看得见的进度**，并且进库页自动开跑。
 // 后端：POST /api/lib/cover/prefetch（副作用）· GET /api/lib/cover/progress → {running,done,total,hit,miss,fail}
-var COVP = { timer: 0 };
+var COVP = { timer: 0, cacheTimer: 0, cacheDeadline: 0 };
 function startCoverPrefetch() {
   api('/api/lib/cover/prefetch', '').then(function (j) {
-    if (j && j.ok && j.queued) toast('正在抓取封面：共 ' + j.queued + ' 张缺图');
+    if (j && j.ok && j.queued) toast(tf('正在抓取封面：共 {0} 张缺图', [j.queued]));
     // 2026-10-26 (261026-05): always poll while the backend is running.
     // Previously polling only started when THIS call queued something, so a job started
     // elsewhere (prefetch?all=1, or a still-running batch) finished without repainting the grid,
@@ -829,42 +1347,92 @@ function startCoverPrefetch() {
     if (j && j.ok && j.running) pollCoverProgress();
   }).catch(function () { });
 }
+// 刷新图片时保留当前视图和搜索；当前歌曲也可能刚获得封面。
+// Cache completion is independent of online-prefetch progress (e.g. local tag
+// extraction). Observe missing artwork briefly without restarting any provider.
+function stopCachedCoverImages() {
+  if (COVP.cacheTimer) clearInterval(COVP.cacheTimer);
+  COVP.cacheTimer = 0;
+}
+window.addEventListener('pagehide', stopCachedCoverImages);
+function watchCachedCoverImages() {
+  stopCachedCoverImages();
+  COVP.cacheDeadline = Date.now() + 60000;
+  COVP.cacheTimer = setInterval(function () {
+    if ((S.view !== 'albums' && S.view !== 'album') || Date.now() >= COVP.cacheDeadline) {
+      stopCachedCoverImages(); return;
+    }
+    refreshCoverImages(true);
+  }, 2000);
+}
+function refreshCoverImages(cacheOnly) {
+  if (!cacheOnly) refreshCurrentCover();
+  if (S.view !== 'albums' && S.view !== 'album') return;
+  var view = S.view, album = S.album;
+  // Retry only the track's own cache URL. A negative lookup must not prevent a
+  // later local/cache result, nor cause another online lookup on each retry.
+  Array.prototype.forEach.call(document.querySelectorAll('#list img[data-song-index]'), function (im) {
+    var item = im.songArtwork;
+    if (!item || !item.current() || !item.visible || !item.missing || item.cacheLoading) return;
+    item.cacheLoading = true;
+    im.src = item.url + '&_cov=' + Date.now();
+  });
+  var images = Array.prototype.filter.call(document.querySelectorAll('#list img[data-album-key]'), function (im) {
+    return !im.getAttribute('src') || im.style.display === 'none';
+  });
+  if (!images.length) return;
+  api('/api/lib/albums').then(function (j) {
+    if (!j || !j.ok || S.view !== view || (view === 'album' && S.album !== album)) return;
+    var available = new Set((j.albums || []).filter(function (a) { return a.cv; }).map(function (a) { return a.k; }));
+    Array.prototype.forEach.call(images, function (im) {
+      if (!im.isConnected || !available.has(im.dataset.albumKey)) return;
+      if (im.getAttribute('src') && im.style.display !== 'none') return;
+      im.style.display = '';
+      im.setAttribute('data-rt', '0');
+      im.src = '/api/lib/cover?k=' + encodeURIComponent(im.dataset.albumKey) + '&_cov=' + Date.now();
+    });
+  }).catch(function () {});
+}
 function pollCoverProgress() {
   if (COVP.timer) return;
+  COVP.lastHit = -1;
   COVP.timer = setInterval(function () {
     api('/api/lib/cover/progress').then(function (g) {
       if (!g || !g.ok) return;
       var el = D('covProg');
-      if (el) { el.style.display = 'flex'; el.textContent = '封面 ' + (g.done || 0) + '/' + (g.total || 0) + '（命中 ' + (g.hit || 0) + '）'; }
+      if (el) { el.style.display = 'flex'; el.textContent = tf('封面 {0}/{1}（命中 {2}）', [(g.done || 0), (g.total || 0), (g.hit || 0)]); }
+      // 2026-11-01（紧急）：后台每补到新图就**立刻**把网格里缺图的格子重指一次，
+      // 不等整批跑完。否则 178 张要跑几分钟，用户在这几分钟里只看到首字母。
+      if (g.running && (g.hit || 0) > (COVP.lastHit || 0)) {
+        COVP.lastHit = g.hit || 0;
+        refreshCoverImages();
+      }
       if (!g.running) {
         clearInterval(COVP.timer); COVP.timer = 0;
         if (el && g.done > 0) setTimeout(function () { el.style.display = 'none'; }, 2500);
         if (g.hit > 0) {
-          toast('封面已补齐 ' + g.hit + ' 张');
-          // Refresh only images in the current album grid. Reloading the library here
-          // steals tracks/artist/detail pages and discards the user's search/subset.
-          // No asynchronous list request means no later response can steal the view either.
-          if (S.view === 'albums') {
-            var stamp = String(Date.now());
-            Array.prototype.forEach.call(document.querySelectorAll('#list .card .cv img'), function (im) {
-              if (!im.getAttribute('src')) return;
-              var imageUrl = new URL(im.src, location.href);
-              imageUrl.searchParams.set('_cov', stamp);
-              im.style.display = ''; // A previous 404 hid the image; retry the completed cover.
-              im.src = imageUrl.href;
-            });
-          }
+          toast(tf('封面已补齐 {0} 张', [g.hit]));
+          refreshCoverImages();
         }
       }
     }).catch(function () { });
   }, 700);
 }
 
+var albumListRequest = 0;
 function loadAlbums(q, title) {
+  if(typeof rlPageTransitionBegin==='function')rlPageTransitionBegin('albums');
+  stopCachedCoverImages();
+  var request = ++albumListRequest;
   S.view = 'albums';
   startCoverPrefetch();     // 进库页就开跑（没有缺图时后端立即返回 queued=0）
   head(title || '专辑', '加载中…', '');
   api('/api/lib/albums?q=' + encodeURIComponent(q || '')).then(function (j) {
+    if (!q && request === albumListRequest && j && Array.isArray(j.albums) && typeof rlPaintShelf === 'function') {
+      rlHomeAlbums = j.albums.slice(0,3);
+      rlPaintShelf();
+    }
+    if (S.view !== 'albums' || request !== albumListRequest) return;
     S.albums = j.albums || [];
     if (!S.albums.length) {
       head(title || '专辑', '0 张', '');
@@ -880,7 +1448,7 @@ function loadAlbums(q, title) {
         '<button class="btn" id=bEmptyScan>🔄 ' + (hasRoots ? '重新扫描' : '扫描目录') + '</button>' +
         '</div></div>';
       D('list').innerHTML = emptyH;
-      if (D('bEmptyAddRoot')) D('bEmptyAddRoot').onclick = function () { openSettingsTab('adv'); };
+      if (D('bEmptyAddRoot')) D('bEmptyAddRoot').onclick = function () { rlOpenDailyTask('library'); };
       if (D('bEmptyScan')) D('bEmptyScan').onclick = function () { D('bScan').click(); };
       return;
     }
@@ -891,6 +1459,7 @@ function loadAlbums(q, title) {
     });
     h += '</div>';
     D('list').innerHTML = h;
+    watchCachedCoverImages();
     Array.prototype.forEach.call(D('list').querySelectorAll('.card'), function (e) {
       var a = S.albums[+e.dataset.i];
       e.onclick = function (ev) {
@@ -903,7 +1472,8 @@ function loadAlbums(q, title) {
     // 不放在 loadArtists 里，是因为用户可能一直在专辑页——那样头像永远不会被抓。
     artaWarmSoon();
   }).catch(function (e) {
-    renderPanelError('albums', function () { loadAlbums(q, title); }, e);
+    if (S.view === 'albums' && request === albumListRequest)
+      renderPanelError('albums', function () { loadAlbums(q, title); }, e);
   });
 }
 
@@ -948,11 +1518,12 @@ function toggleFav(filePath, ev) {
       }
     }
   }).catch(function (e) {
-    toast('收藏操作失败: ' + e);
+    toast(tf('收藏操作失败: {0}', [e]));
   });
 }
 
 function updateFavUi() {
+  rlPaintListeningFavorite();
   Array.prototype.forEach.call(document.querySelectorAll('.fav-btn'), function (btn) {
     if (btn.id === 'npFavBtn') return;
     var f = btn.dataset.file;
@@ -1410,12 +1981,87 @@ function syncAlbPlayAllBtn() {
   }
 }
 
+var albumArtwork = { generation: 0, observer: null, queue: [], active: 0 };
+function stopAlbumArtwork() {
+  stopCachedCoverImages();
+  albumArtwork.generation++;
+  albumArtwork.queue = [];
+  if (albumArtwork.observer) albumArtwork.observer.disconnect();
+  albumArtwork.observer = null;
+}
+function pumpAlbumArtwork() {
+  while (albumArtwork.active < 2 && albumArtwork.queue.length) {
+    var item = albumArtwork.queue.shift();
+    if (item.visible && item.current() && META.on) item.lookup();
+    else item.queued = false;
+  }
+}
+function bindAlbumArtwork(album) {
+  var generation = albumArtwork.generation;
+  var observer = new IntersectionObserver(function (entries) {
+    entries.forEach(function (entry) {
+      var item = entry.target.songArtwork;
+      item.visible = entry.isIntersecting;
+      if (!item.visible || !item.current()) return;
+      if (!item.started) {
+        item.started = true;
+        entry.target.src = item.url;
+      } else item.schedule();
+    });
+  });
+  albumArtwork.observer = observer;
+  Array.prototype.forEach.call(D('list').querySelectorAll('img[data-song-index]'), function (im) {
+    var track = album.tracks[Number(im.dataset.songIndex)];
+    if (!track || !track.path) return;
+    var file = encodeURIComponent(track.path);
+    var item = { url: '/api/cover?file=' + file, visible: false, missing: false, queued: false };
+    im.songArtwork = item;
+    item.current = function () {
+      return im.isConnected && generation === albumArtwork.generation && S.view === 'album' && S.album === album;
+    };
+    item.schedule = function () {
+      if (!item.missing || item.queued || !item.visible || !item.current() || !META.on) return;
+      item.queued = true;
+      albumArtwork.queue.push(item);
+      pumpAlbumArtwork();
+    };
+    item.lookup = function () {
+      albumArtwork.active++;
+      var deadline = Date.now() + 60000;
+      function done() { albumArtwork.active--; pumpAlbumArtwork(); }
+      function poll() {
+        if (!item.current() || !item.visible || !META.on) { item.queued = false; done(); return; }
+        api('/api/cover/lookup?file=' + file, '').then(function (j) {
+          if (item.current() && j && j.ok) {
+            if (j.hasCover && typeof j.coverUrl === 'string' && j.coverUrl.indexOf('/api/cover?') === 0 &&
+                new URL(j.coverUrl, location.href).searchParams.get('file') === track.path) {
+              im.src = j.coverUrl;
+            } else if (j.pending && item.visible && META.on && Date.now() < deadline) {
+              setTimeout(poll, Math.max(500, Math.min(2500, j.retryAfterMs || 1000)));
+              return;
+            }
+          }
+          done();
+        }, done);
+      }
+      poll();
+    };
+    im.onload = function () { item.cacheLoading = false; item.missing = false; im.style.visibility = 'visible'; };
+    im.onerror = function () { item.cacheLoading = false; im.style.visibility = 'hidden'; item.missing = true; item.schedule(); };
+    observer.observe(im);
+  });
+  watchCachedCoverImages();
+}
 function openAlbum(k) {
+  if(typeof rlPageTransitionBegin==='function')rlPageTransitionBegin('album');
   // 261024-05 #T2：打开另一张专辑 = 离开上一张 → 先停掉它的曲目预取队列（含在飞轮询）
   albPrefStop();
+  var artworkGeneration = albumArtwork.generation;
   S.view = 'album';
+  // 从聆听室点专辑卡时也要把右栏/导航切回浏览态；否则 noq 会把队列永久藏住。
+  D('app').classList.remove('noq');applyRTab(false);
   api('/api/lib/album?k=' + encodeURIComponent(k)).then(function (j) {
-    if (S.view !== 'album') return;   // 已切走 → 丢弃（否则会把别页内容覆写成专辑页）
+    if (S.view !== 'album' || artworkGeneration !== albumArtwork.generation) return;
     if (!j.ok) { toast(j.error || '打不开专辑'); return; }
     S.album = j;
     // 2026-10-26：封面 404 时不要留一块纯色空框 —— 用 <img> + 首字母底层（与列表页一致）
@@ -1435,9 +2081,10 @@ function openAlbum(k) {
     var albPlayTitle = isThisPlaying ? (S.paused ? '继续播放专辑' : '暂停播放') : '播放整张专辑';
     var h = '<div class=ahead><div class=cv style="position:relative">' +
             '<div class=ph>' + esc((j.name || '?').slice(0, 1).toUpperCase()) + '</div>' +
-            '<img src="' + (j.cvUrl || ('/api/lib/cover?k=' + j.k)) + '" alt="" onerror="this.style.display=\'none\'" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:inherit">' +
+            '<img data-album-key="' + esc(j.k) + '"' + (j.cv ? ' src="/api/lib/cover?k=' + encodeURIComponent(j.k) + '"' : '') +
+            ' alt="" onerror="this.style.display=\'none\'" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:inherit">' +
             '</div><div class=info>' +
-            '<div class=kind>ALBUM</div><h1 title="' + esc(j.name) + '">' + esc(j.name) + '</h1>' +
+            '<div class=kind>' + esc(albumIdentityLabel(j) || 'ALBUM') + '</div><h1 title="' + esc(j.name) + '">' + esc(j.name) + '</h1>' +
             '<div class=sub>' + sub.join(' \u00b7 ') + '</div>' +
             '<button class="btn pri" id=albPlayAll aria-label="播放整张专辑" title="' + albPlayTitle + '">' + albPlayText + '</button> ' +
             '<button class=btn id=aAdd>加入队列</button> ' +
@@ -1463,7 +2110,8 @@ function openAlbum(k) {
       h += '<div class="trow trow-track" data-i=' + i + ' style="grid-template-columns:28px 24px minmax(120px,1.6fr) minmax(0,1fr) 92px 58px 26px;gap:8px">' +
            '<div class=n>' + (t.n || (i + 1)) + '</div>' +
            favIconHtml(t.path, isFav) +
-           '<div class=tt title="' + esc(t.title) + '">' + esc(t.title) + '</div>' +
+           '<div class="tt album-song-title" title="' + esc(t.title) + '"><span class=album-song-art>' +
+           '<img alt="" data-song-index="' + i + '"></span><span class=album-song-label>' + esc(t.title) + '</span></div>' +
            '<div class=ar title="' + esc(t.artist || j.artist) + '">' + esc(t.artist || j.artist) + '</div>' +
            // P2（261027-05 A4）：专辑页曲目行也标多声道 —— /api/lib/album 的 tracks 带 ch 字段
            '<div class=bd>' + fmtTag(t.sr, t.bits, t.ch) + '</div>' +
@@ -1485,6 +2133,7 @@ function openAlbum(k) {
            '</div>';
     }
     D('list').innerHTML = h;
+    bindAlbumArtwork(j);
     head(j.name, j.tracks.length + ' 首', '<button class=btn id=bBackAlbums title="返回专辑列表" aria-label="返回专辑列表">← 返回专辑</button>');
     if (D('bBackAlbums')) D('bBackAlbums').onclick = function () { loadAlbums(); };
 
@@ -1505,7 +2154,7 @@ function openAlbum(k) {
         } else if (s && (s.error || s.pending)) {
           // 261024-04 #7：失败不弹错，只留一行可点击重试
           el.innerHTML = '<div class="summ-retry" id=albumSummRetry role=button tabindex=0>' +
-                         '资料整理失败（' + esc(s.error || '超时') + '）· 点击重试</div>';
+                         tf('资料整理失败（{0}）· 点击重试', [esc(s.error || '超时')]) + '</div>';
           var rb = D('albumSummRetry');
           if (rb) rb.onclick = function () { summaryOnce(albUrl, renderAlbumSummary, true); };
         } else {
@@ -1550,8 +2199,8 @@ function openAlbum(k) {
       x.onload = function () {
         try {
           var r = JSON.parse(x.responseText);
-          if (r && r.ok) { toast('封面已设置'); openAlbum(j.k); }
-          else { toast('设置失败：' + ((r && r.error) || '未知原因')); }
+          if (r && r.ok) { toast('封面已设置'); refreshCurrentCover(); openAlbum(j.k); }
+          else { toast(tf('设置失败：{0}', [((r && r.error) || '未知原因')])); }
         } catch (e) { toast('设置失败：响应无法解析'); }
       };
       x.onerror = function () { toast('设置失败：网络错误'); };
@@ -1615,6 +2264,7 @@ function albumTrackUrl(t, alb) {
 // 用户原话：「只在单曲播放页面才预取本曲所属的专辑，不是全部专辑」——专辑页的"整张"只能指
 // **当前打开的这张**，绝不能把上一张的待办带进下一张。
 function albPrefStop() {
+  stopAlbumArtwork();
   ALBPREF.live.v = 0;                    // 在飞请求的轮询/回调全部失效
   ALBPREF.gen++;
   ALBPREF.key = ''; ALBPREF.total = 0; ALBPREF.allTotal = 0; ALBPREF.done = 0; ALBPREF.active = 0;
@@ -1635,9 +2285,9 @@ function albPrefRender() {
   var pct = ALBPREF.total ? Math.round(ALBPREF.done / ALBPREF.total * 100) : 0;
   var isOver = ALBPREF.allTotal > ALBPREF.total;
   var txt = (ALBPREF.done >= ALBPREF.total)
-    ? (isOver ? ('已整理 ' + ALBPREF.done + '/' + ALBPREF.allTotal + '（其余可按需点开）')
-              : ('曲目资料已后台整理 ' + ALBPREF.total + ' 首'))
-    : ('正在后台整理曲目资料 ' + ALBPREF.done + ' / ' + ALBPREF.total);
+    ? (isOver ? (tf('已整理 {0}/{1}（其余可按需点开）', [ALBPREF.done, ALBPREF.allTotal]))
+              : (tf('曲目资料已后台整理 {0} 首', [ALBPREF.total])))
+    : (tf('正在后台整理曲目资料 {0} / {1}', [ALBPREF.done, ALBPREF.total]));
   box.innerHTML = '<div class="albprog"><span class=t>' + esc(txt) + '</span>' +
                   '<span class=bar><i style="width:' + pct + '%"></i></span></div>';
 }
@@ -1697,6 +2347,7 @@ function albumTrackPrefetch(alb) {
    服务端本来就从库里读同一份区间（双保险：索引是旧版时前端这份仍然能把起点带对），
    两者一致时行为完全相同 —— 判据"点第 2 轨从 0 开始计 pos"两边都成立。 */
 function playAlbum(k, i, cs, ce) {
+  if (!ensurePlaybackSettings()) return;
   api('/api/lib/play', 'k=' + encodeURIComponent(k) + '&i=' + (i || 0) + cueQuery(cs, ce) + '&' + params()).then(function (j) {
     if (!j.ok) { toast(j.error || '播放失败'); return; }
     toast('开始播放专辑'); loadQ();
@@ -1734,7 +2385,7 @@ function artistInitialHtml(name, size) {
 }
 // 兼容旧调用（详情页曾在别处引用过音符图标）
 function artistNoteSvg(size) { return artistInitialHtml('', size); }
-var ARTAV = { total: 0, ok: 0, miss: 0, timer: 0, round: 0, gen: 0, queue: [], deadline: 0, stopped: false, lastOkAt: 0 };
+var ARTAV = { total: 0, ok: 0, miss: 0, timer: 0, round: 0, gen: 0, queue: [], deadline: 0, stopped: false, lastOkAt: 0, hideGen: -1 };
 /* ---- 头像加载泵（2026-10-27 261027-03 #7）------------------------------------------
    用户本轮原话：「头像刚刚一直没出现…已经出现了。所以问题是加载时间太长，以及加载没有任何
    提示，也没有逐个出现，导致我判断出了问题」。旧实现（上面这段历史里那句「每轮重放 ≤48 张」）
@@ -1753,7 +2404,14 @@ var ARTAV = { total: 0, ok: 0, miss: 0, timer: 0, round: 0, gen: 0, queue: [], d
      · 失败按 0.9 s→8 s 退避重试，超过次数或总时限（150 s）才定案成「暂无图源」；
      · 进度 = 已定案（成功 + 确定没有）/ 总数 ⟹ 数字一直在动，且有明确终态。 */
 var ARTA_CONC = 6;                 // 同时最多 6 张（后端 WebUi 是 6 个 worker，再多只是排队）
-var ARTA_RETRIES = 4;      // 2026-10-29：后端有负缓存，缺图会稳定 404，重试 40 次纯属拖延             // 单张最多重试次数
+var ARTA_RETRIES = 4;
+// 2026-11-14（3.3.11）：快速重试用尽后的"慢速尾巴"（见 artaSettle 里的注释）
+var ARTA_SLOW_RETRIES = 24;   // 最多再慢试 24 次
+var ARTA_SLOW_MS = 15000;     // 每次间隔 15 s ⟹ 覆盖约 6 分钟的后台抓图窗口
+// 终态收敛阈值：旧值直接复用 ARTA_IDLE_MS(8 s)，会把慢速尾巴刚排上的重试立刻判死。
+// 现在只有「连续 30 s 一张新图都没进来」才收尾 —— 后台真停了就 30 s 内给完成态，
+// 后台还在供货就继续补图（进度条一直在动，不会出现"卡住"的观感）。
+var ARTA_FINAL_IDLE_MS = 30000;      // 2026-10-29：后端有负缓存，缺图会稳定 404，重试 40 次纯属拖延             // 单张最多重试次数
 var ARTA_MAXWAIT_MS = 150000;      // 单页总时限：到点就如实收尾，不再无限转
 // 「多久没有新图落地就收尾」：冷缓存时预热还在供货（一张 1~3 s），不能过早判死；
 // 供货停了 25 s 就定案成「暂无图源」，进度条进入完成态（用户要求：失败也要有终态）。
@@ -1808,15 +2466,18 @@ function artaRender() {
   if (!ARTAV.total) { box.innerHTML = ''; return; }
   var settled = ARTAV.ok + ARTAV.miss;
   var done = settled >= ARTAV.total;
+  // 2026-11-01（用户 261101 #1 追加）：全部命中缓存/负缓存时**根本不要出现这条** ——
+  //   旧实现会先渲染一次完成态再等 2.5 s 收起，用户看到的就是"每次刷页面闪一下"。
+  if (done && !ARTAV.fetched) { box.innerHTML = ''; return; }
   var pct = Math.round(settled / ARTAV.total * 100);
   var txt;
   if (done) {
     // 有缺图就如实写「暂无图源」，绝不写成「已补齐」（铁律 4）
     txt = ARTAV.miss
-      ? ('头像已加载 ' + ARTAV.ok + ' / ' + ARTAV.total + ' 位（' + ARTAV.miss + ' 位暂无图源，保留首字占位）')
-      : ('头像已加载 ' + ARTAV.ok + ' / ' + ARTAV.total + ' 位');
+      ? (tf('头像已加载 {0} / {1} 位（{2} 位暂无图源，保留首字占位）', [ARTAV.ok, ARTAV.total, ARTAV.miss]))
+      : (tf('头像已加载 {0} / {1} 位', [ARTAV.ok, ARTAV.total]));
   } else {
-    txt = '头像加载中 ' + ARTAV.ok + ' / ' + ARTAV.total + ' 位（逐张出现，缺图会自动重试）';
+    txt = tf('头像加载中 {0} / {1} 位（逐张出现，缺图会自动重试）', [ARTAV.ok, ARTAV.total]);
   }
   box.innerHTML = '<div class="albprog artprog' + (done ? ' done' : '') + '">' +
                   '<span class=t>' + esc(txt) + '</span>' +
@@ -1828,6 +2489,19 @@ function artaRender() {
     ARTA_MISS = {};
     artaStart();
   };
+  // 2026-11-01（用户 261101 #2）：跑完就**收起这一条**，不要永远挂在那里。
+  //   用户原话：「如果已经加载完成，那为什么不隐藏这一栏？专辑页面就没有类似的东西。」
+  //   专辑页的封面进度就是 2.5 s 后自己消失的（covProg），这里对齐同一行为。
+  //   缺图信息仍然如实存在（标题栏的「128 位」计数 + 首字母占位），不靠这条横幅才成立。
+  if (done && ARTAV.hideGen !== ARTAV.gen) {
+    ARTAV.hideGen = ARTAV.gen;
+    var g0 = ARTAV.gen;
+    setTimeout(function () {
+      if (g0 !== ARTAV.gen) return;          // 期间又开了新一轮：不要误清
+      var b = D('artProgWrap');
+      if (b) b.innerHTML = '';
+    }, 2500);
+  }
 }
 function artaSettle(st, ok) {
   if (st.state === 'ok' || st.state === 'miss') return;
@@ -1845,6 +2519,19 @@ function artaSettle(st, ok) {
   if (st.tries <= ARTA_RETRIES && Date.now() < ARTAV.deadline) {
     st.state = 'pending';
     st.due = Date.now() + Math.min(8000, 900 * st.tries);
+    return;
+  }
+  // 2026-11-14（3.3.11，用户反馈「艺术家头像全部不见了」）：
+  // 快速重试 4 次（≈9 s）用完就定案成"无图源"并写死负缓存 —— 但**全新曲库首次进页**时
+  // 后台抓头像要跑好几分钟（实测 09:32 开始、09:37:07 才 done），9 s 根本等不到。
+  // 结果：128 位全部显示首字占位，而且负缓存写死，只有手动刷新页面才会恢复。
+  // 修法：快速重试用尽后进"慢速尾巴" —— 只要后台还在陆续出图（lastOkAt 在 ARTA_IDLE_MS 内），
+  // 就每 ARTA_SLOW_MS 再试一次，最多 ARTA_SLOW_RETRIES 次（≈6 分钟），不再提前写死负缓存。
+  st.slow = st.slow || 0;
+  if (st.slow < ARTA_SLOW_RETRIES && Date.now() - ARTAV.lastOkAt <= ARTA_IDLE_MS) {
+    st.slow++;
+    st.state = 'pending';
+    st.due = Date.now() + ARTA_SLOW_MS;
     return;
   }
   st.state = 'miss';
@@ -1868,7 +2555,7 @@ function artaTick(gen) {
   // 终态收敛（用户要求「失败也要有终态，不要一直转圈」）：只要还有成功进来，就说明预热
   // 还在供货，继续等；一旦连续 ARTA_IDLE_MS 没有新图落地，就把还在重试的按「暂无图源」
   // 定案，进度条进入「已加载 x / y」完成态（并给一个重试入口）。
-  if (!allDone && now - ARTAV.lastOkAt > ARTA_IDLE_MS) {
+  if (!allDone && now - ARTAV.lastOkAt > ARTA_FINAL_IDLE_MS) {
     for (var j = 0; j < ARTAV.queue.length; j++) {
       var s3 = ARTAV.queue[j];
       if (s3.state === 'ok' || s3.state === 'miss') continue;
@@ -1897,6 +2584,7 @@ function artaTick(gen) {
     s2.state = 'inflight';
     busy++;
     ARTAV.round++;
+    ARTAV.fetched = 1;                 // 本轮真的发过硬请求（决定横幅要不要出现，见 artaRender）
     s2.im.src = artistImgUrl(s2.n, ARTAV.round);
   }
 }
@@ -1908,6 +2596,7 @@ function artaStart() {
   ARTAV.queue = []; ARTAV.round = 0; ARTAV.stopped = false;
   ARTAV.deadline = Date.now() + ARTA_MAXWAIT_MS;
   ARTAV.lastOkAt = Date.now();
+  ARTAV.fetched = 0;
   var gen = ARTAV.gen;
   Array.prototype.forEach.call(imgs, function (im) {
     var nm = im.getAttribute('data-n') || '';
@@ -1964,6 +2653,7 @@ function artaPoll() { /* 轮询已被泵取代（见 artaStart）：保留空函
 // 2026-10-26（261026-05 #1）：支持按关键词过滤（搜索栏在艺术家页搜索时用）。
 // q 为空 = 全部；非空 = 只保留名字包含关键词的艺术家（不区分大小写）。
 function loadArtists(q) {
+  if(typeof rlPageTransitionBegin==='function')rlPageTransitionBegin('artists');
   S.view = 'artists';
   var kw = String(q || '').trim().toLowerCase();
   // 2026-10-29：#2 不再在这里 artaStop() —— 切页就把泵掐掉是「切换页面还会打断」的根因。
@@ -1987,7 +2677,7 @@ function loadArtists(q) {
     order.sort(function (x, y) { return x.localeCompare(y, 'zh'); });
     if (kw) {
       order = order.filter(function (k) { return String(k).toLowerCase().indexOf(kw) >= 0; });
-      head('艺术家', order.length + ' 位（搜索：' + q + '）', '');
+      head('艺术家', tf('{0} 位（搜索：{1}）', [order.length, q]), '');
     } else {
       head('艺术家', order.length + ' 位', '');
     }
@@ -2031,6 +2721,7 @@ function renderAlbumSubset(who) {
   var h = '<div class=grid>';
   S.albums.forEach(function (a, i) { h += albumCardHtml(a, i); });
   D('list').innerHTML = h + '</div>';
+  watchCachedCoverImages();
   D('bArtistBio').onclick = function () { openArtistProfile(who); };
   D('bAll').onclick = function () { loadAlbums(''); };
   Array.prototype.forEach.call(D('list').querySelectorAll('.card'), function (e) {
@@ -2129,7 +2820,8 @@ function openArtistProfile(who, refresh) {
 
   var wantSumm = aiSummaryOn();
   var summState = { done: false, res: null, enabled: wantSumm, skipBio: false };
-  var uSumm = '/api/entity/summary?kind=person&name=' + encodeURIComponent(who) + '&lang=zh' +
+  var uSumm = '/api/entity/summary?kind=person&name=' + encodeURIComponent(who) +
+              '&lang=' + encodeURIComponent(I18N.lang || 'zh') +
               (refresh ? '&refresh=1' : '');
   var onSumm = function (s) {
     summState.done = true; summState.res = s;
@@ -2150,7 +2842,7 @@ function openArtistProfile(who, refresh) {
       // 261024-04 #7：失败不弹错，只留一行可点击重试
       el.style.display = '';
       el.innerHTML = '<div class="summ-retry" id=artistSummRetry role=button tabindex=0>' +
-                     '资料整理失败（' + esc(ss.error || '超时') + '）· 点击重试</div>';
+                     tf('资料整理失败（{0}）· 点击重试', [esc(ss.error || '超时')]) + '</div>';
       var rb = D('artistSummRetry');
       if (rb) rb.onclick = function () { summaryOnce(uSumm, onSumm, true); };
     } else {
@@ -2224,10 +2916,10 @@ function renderArtistProfile(who, j, summary) {
   if (isOk) {
     var firstDate = mats[0].fetched_at ? fmtDate(mats[0].fetched_at) : '';
     if (j.from_cache) {
-      subText = '缓存 · ' + (firstDate || '近期') + ' 取回' + (j.offline ? ' · 离线' : '');
+      subText = tf('缓存 · {0} 取回{1}', [(firstDate || '近期'), (j.offline ? ' · 离线' : '')]);
     } else {
       // 261024-04 #5：去掉「权威」二字（用户要求全文案不再出现「权威资料 / 权威词条」）
-      subText = '资料' + (firstDate ? (' · ' + firstDate + ' 取回') : '');
+      subText = tf('资料{0}', [(firstDate ? (' · ' + firstDate + ' 取回') : '')]);
     }
   }
   // 261024-01 #3a：没有资料时**不显示**「资料暂缺」这类状态小字 —— 顶部只留名字，
@@ -2312,7 +3004,7 @@ function renderArtistProfile(who, j, summary) {
       h += '<div class="trow source-row" style="cursor:default;display:flex;align-items:center;gap:12px;padding:9px 14px;border-radius:9px;background:var(--hov)">' +
            '<span class=badge>' + esc(srcName) + '</span>' +
            '<span style="font-weight:600;font-size:12.5px;color:var(--txt)">' + esc(m.title) + '</span>' +
-           '<span style="font-size:11.5px;color:var(--mut2);margin-right:auto">' + (fDate ? ('取回于 ' + fDate) : '') + '</span>' +
+           '<span style="font-size:11.5px;color:var(--mut2);margin-right:auto">' + (fDate ? (tf('取回于 {0}', [fDate])) : '') + '</span>' +
            citationChipHtml(m.url, '复制链接', false) +
            '</div>';
     });
@@ -2335,6 +3027,7 @@ function renderArtistProfile(who, j, summary) {
 
 /* ---------------- 古典作品与版本推荐（P3④b Discogs L4 / 261023-03 第4条） ---------------- */
 function loadWorksView(initialTitle, initialComposer, fromNp) {
+  if(typeof rlPageTransitionBegin==='function')rlPageTransitionBegin('works');
   S.view = 'works';
   S.worksFrom = fromNp ? 'np' : '';
   setView('works');
@@ -2417,6 +3110,7 @@ function loadWorksView(initialTitle, initialComposer, fromNp) {
 }
 
 function openWorkVersions(workTitle, composer, refresh) {
+  if(typeof rlPageTransitionBegin==='function')rlPageTransitionBegin('work');
   // 261023-03 第4条：切走后再点别的栏目时，异步回调必须能识别自己已经过期。
   // 两道保险：① S.view 守卫（离开 works 直接丢弃）；② 请求序号（同一视图内连点只认最后一次）。
   if (S.view !== 'works') return;
@@ -2479,9 +3173,9 @@ function renderWorkVersions(workTitle, composer, j) {
   var releaseCount = (typeof j.releaseCount === 'number') ? j.releaseCount : ((typeof j.release_count === 'number') ? j.release_count : perfs.length);
 
   // 头部概要卡片
-  var subStr = (composer ? ('作曲家: ' + esc(composer) + ' · ') : '') +
-               (j.from_cache ? ('缓存 · ' + fmtDate(j.generated_at) + (j.offline ? ' · 离线' : '')) : 'Discogs 实时') +
-               ' · 不同演绎 ' + distinctCount + ' / 发行版本 ' + releaseCount;
+  var subStr = (composer ? (tf('作曲家: {0} · ', [esc(composer)])) : '') +
+               (j.from_cache ? (tf('缓存 · {0}{1}', [fmtDate(j.generated_at), (j.offline ? ' · 离线' : '')])) : 'Discogs 实时') +
+               tf(' · 不同演绎 {0} / 发行版本 {1}', [distinctCount, releaseCount]);
   h += '<div class="ahead work-head" style="margin-bottom:16px;padding:16px 20px;background:var(--hov);border-radius:10px">' +
        '<div class=kind style="font-size:11px;font-weight:600;letter-spacing:1px;color:var(--mut2)">CLASSICAL WORK · 古典作品</div>' +
        '<h1 style="margin:4px 0 6px;font-size:20px;font-weight:700;color:var(--txt)">' + esc(workTitle) + '</h1>' +
@@ -2565,11 +3259,12 @@ function renderWorkVersions(workTitle, composer, j) {
   });
 }
 function loadTracks(q) {
+  if(typeof rlPageTransitionBegin==='function')rlPageTransitionBegin('tracks');
   S.view = 'tracks';
   S.tracksQuery = q || '';
   // 评审：搜索结果页顶栏搜索框不回显当前关键词 → 这里同步（用户正在输入时值本来就相同，不会打断输入）
   if (D('q') && String(D('q').value) !== String(q || '')) D('q').value = q || '';
-  head(q ? ('搜索：' + q) : '曲目', '搜索中…', '');
+  head(q ? (tf('搜索：{0}', [q])) : '曲目', '搜索中…', '');
   api('/api/lib/search?q=' + encodeURIComponent(q || '')).then(function (j) {
     if (S.view !== 'tracks') return;   // 已切走（261023-01 #4 同类问题）→ 丢弃，别覆写当前页面
     var t = j.tracks || [];
@@ -2623,7 +3318,7 @@ function renderTracksView() {
   var t = S.currentTracks || [];
   var q = S.tracksQuery || '';
   var totalCount = t.length;
-  head(q ? ('搜索：' + q) : '曲目', totalCount + ' 首', '');
+  head(q ? (tf('搜索：{0}', [q])) : '曲目', totalCount + ' 首', '');
   if (!totalCount) {
     if (q) {
       var emptyH = '<div class=empty id=searchEmpty style="padding:48px 20px;text-align:center">' +
@@ -2717,8 +3412,8 @@ function renderTracksView() {
       rowsContainer.appendChild(node);
     }
     rendered = next;
-    var sub = sorted.length > BATCH ? (sorted.length + ' 首 · 已显示 ' + rendered + ' 首') : (sorted.length + ' 首');
-    head(q ? ('搜索：' + q) : '曲目', sub, '');
+    var sub = sorted.length > BATCH ? (sorted.length + tf(' 首 · 已显示 {0} 首', [rendered])) : (sorted.length + ' 首');
+    head(q ? (tf('搜索：{0}', [q])) : '曲目', sub, '');
   }
 
   appendNextBatch();
@@ -2737,6 +3432,7 @@ function renderTracksView() {
 
 /* ---------------- 文件夹 ---------------- */
 function loadFiles(d) {
+  if(typeof rlPageTransitionBegin==='function')rlPageTransitionBegin('files');
   S.view = 'files';
   api('/api/files?dir=' + encodeURIComponent(d || '')).then(function (j) {
     // 与 loadTracks 同一类问题（261023-01 #4）：请求在路上时用户可能已经切走，
@@ -2803,6 +3499,7 @@ function loadFiles(d) {
 
 /* ---------------- 最近播放 ---------------- */
 function loadRecent() {
+  if(typeof rlPageTransitionBegin==='function')rlPageTransitionBegin('recent');
   S.view = 'recent';
   head('最近播放', '加载中…', '');
   api('/api/recent').then(function (j) {
@@ -2826,7 +3523,7 @@ function loadRecent() {
     D('list').innerHTML = h + '</div>';
     Array.prototype.forEach.call(D('list').querySelectorAll('.trow'), function (e) {
       e.onclick = function () { playPath(it[+e.dataset.i].path); };
-      e.oncontextmenu = function (ev) { ev.preventDefault(); addPath(it[+e.dataset.i].path); };
+      e.oncontextmenu = function (ev) { ev.preventDefault(); showTrackMenu(ev.clientX, ev.clientY, { path: it[+e.dataset.i].path }); };
     });
   }).catch(function (e) {
     renderPanelError('recent', loadRecent, e);
@@ -2896,6 +3593,7 @@ function ensureSequentialMode(cb) {
   api('/api/playmode?mode=1').then(function () { applyRep(1); cb(); }).catch(function () { cb(); });
 }
 function playWholeListFrom(files, start, label) {
+  if (!ensurePlaybackSettings()) return;
   files = (files || []).filter(function (f) { return !!f; });
   if (!files.length) { toast('这个列表是空的'); return; }
   var i = parseInt(start, 10) || 0;
@@ -2905,9 +3603,9 @@ function playWholeListFrom(files, start, label) {
     api('/api/queue/set', 'files=' + encodeURIComponent(files.join(String.fromCharCode(10)))).then(function (j) {
       if (!j || j.ok === false) { toast((j && j.error) || '建立队列失败'); return; }
       playPath(files[i]);
-      toast('从第 ' + (i + 1) + ' 首开始顺序播放' + (label ? ('：' + label) : '') + '（共 ' + files.length + ' 首）');
+      toast(tf('从第 {0} 首开始顺序播放{1}（共 {2} 首）', [(i + 1), (label ? ('：' + label) : ''), files.length]));
       if (S.view === 'queue') renderQueuePage();
-    }).catch(function (e) { toast('播放失败: ' + e); });
+    }).catch(function (e) { toast(tf('播放失败: {0}', [e])); });
   });
 }
 function playWholeList(files, label) { playWholeListFrom(files, 0, label); }
@@ -2921,6 +3619,7 @@ function playWholeList(files, label) { playWholeListFrom(files, 0, label); }
      ③ 单击只选中（不播放）—— 否则双击会先播单曲再播整列，听起来像"卡了一下又从头"。
    底部不再挂「我的歌单」区块（那是左栏的事），顶部不再有「▶ 播放全部」。 */
 function loadFavs() {
+  if(typeof rlPageTransitionBegin==='function')rlPageTransitionBegin('favs');
   S.view = 'favs';
   head('我的最爱', '加载中…', '');
   api('/api/fav/list?meta=1').then(function (j) {
@@ -2979,7 +3678,7 @@ function unfavFromFavs(file, ev) {
     FAV_SET.delete(file);
     toast('已取消收藏');
     if (S.view === 'favs') loadFavs();
-  }).catch(function (e) { toast('取消收藏失败: ' + e); });
+  }).catch(function (e) { toast(tf('取消收藏失败: {0}', [e])); });
 }
 
 // 确认弹窗（同样不用 window.confirm：WebView2/CDP 里原生对话框会挂住页面，测不了也点不动）
@@ -3014,47 +3713,42 @@ function renderSavedQueues() {
   }).catch(function () {});
 }
 function paintSavedQueues() {
-  {
-    var box = D('sqList'); if (!box) return;
-    // #2（261027-03）：标题固定为「我的歌单」。空列表只放**状态**，不放操作指引 ——
-    // 用户原话：「我的歌单下面那句话"队列页 保存为歌单 可新建"是多余的，删除」。
-    // 保留一行极短的占位是有意的：①空态仍然表达"这里能放歌单"（标题 + 空态行）；
-    // ②它是 .sqhd 的首项，删干净会让「播放 / 我的歌单」两块的
-    //   「标题→首项间距」失去可比对象（上一轮刚统一到 6.00px，见 ui_page.h 的 .sec/.sqhd 注释）。
-    var h = '<div class=sqhd>我的歌单</div>';
-    if (!S.sqs.length) {
-      h += '<div class=sqempty>暂无歌单</div>';
-    }
-    S.sqs.forEach(function (q, i) {
-      // 261027-04 #3：用户「我的歌单，我尝试添加了一个歌单，只有自定义名字，名字前面没有图标，
-      //   请为歌单添加一个通用的图标标识，跟上面的播放队列/最近播放/我的最爱等对齐」。
-      // 旧版：.sqrow 靠 padding-left:38px 预留了图标槽（所以文字确实对齐），但槽里**空着** —— 用户看到的就是"没图标"。
-      // 现在：同一条 16px 线性图标（stroke=currentColor，颜色继承 .nav 的 var(--mut)）；
-      //   padding-left 38→12，图标 16 + gap 10 ⟹ 文字左边缘仍是 8+12+16+10=46.00px，与一级导航逐像素相同。
-      h += '<div class="nav sqrow" data-v=sq data-sq="' + esc(q.name) + '" data-i=' + i + '>' +
-           '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">' +
-             '<path d="M4 7h9M4 12h9M4 17h6"/>' +
-             '<path d="M18.6 16.6V7.3l3.2-.9"/>' +
-             '<circle cx="17" cy="16.8" r="1.8"/>' +
-           '</svg>' +
-           '<span class=sqn title="' + esc(q.name) + '">' + esc(q.name) + '</span>' +
-           '<span class="sqb ren" title="重命名">✎</span>' +
-           '<span class="sqb del" title="删除">×</span></div>';
-    });
-    box.innerHTML = h;
-    Array.prototype.forEach.call(box.querySelectorAll('.sqrow'), function (e) {
-      var q = S.sqs[+e.dataset.i]; if (!q) return;
-      e.onclick = function (ev) {
-        if (ev.target.classList.contains('sqb')) return;
-        renderSavedQueuePage(q.name);
-      };
-      var r1 = e.querySelector('.ren'); if (r1) r1.onclick = function (ev) { ev.stopPropagation(); renameQueueDialog(q.name); };
-      var r2 = e.querySelector('.del'); if (r2) r2.onclick = function (ev) { ev.stopPropagation(); deleteSavedQueue(q.name); };
-    });
-  }
+  var box = D('sqList'); if (!box) return;
+  // 2026-11-12：复刻 QQ 音乐 —— 标题右侧「+」新建，歌单行双击改名，单击进详情。
+  var h = '<div class=sqhd><span>我的歌单</span><button type=button class=sqadd id=sqNewBtn title="新建歌单" aria-label="新建歌单">+</button></div>';
+  if (!S.sqs.length) h += '<div class=sqempty>暂无歌单，点 + 新建</div>';
+  S.sqs.forEach(function (q, i) {
+    h += '<div class="nav sqrow" data-v=sq data-sq="' + esc(q.name) + '" data-i=' + i + ' title="双击改名">' +
+         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">' +
+           '<path d="M4 7h9M4 12h9M4 17h6"/>' +
+           '<path d="M18.6 16.6V7.3l3.2-.9"/>' +
+           '<circle cx="17" cy="16.8" r="1.8"/>' +
+         '</svg>' +
+         '<span class=sqn title="' + esc(q.name) + '">' + esc(q.name) + '</span>' +
+         '<span class="sqb ren" title="重命名">✎</span>' +
+         '<span class="sqb del" title="删除">×</span></div>';
+  });
+  box.innerHTML = h;
+  if (D('sqNewBtn')) D('sqNewBtn').onclick = function (ev) { ev.stopPropagation(); createPlaylistDialog(); };
+  Array.prototype.forEach.call(box.querySelectorAll('.sqrow'), function (e) {
+    var q = S.sqs[+e.dataset.i]; if (!q) return;
+    var clickTimer = 0;
+    e.onclick = function (ev) {
+      if (ev.target.closest && ev.target.closest('.sqb')) return;
+      clearTimeout(clickTimer);
+      clickTimer = setTimeout(function () { renderSavedQueuePage(q.name); }, 220);
+    };
+    e.ondblclick = function (ev) {
+      if (ev.target.closest && ev.target.closest('.sqb')) return;
+      clearTimeout(clickTimer); renameQueueDialog(q.name);
+    };
+    var r1 = e.querySelector('.ren'); if (r1) r1.onclick = function (ev) { ev.stopPropagation(); renameQueueDialog(q.name); };
+    var r2 = e.querySelector('.del'); if (r2) r2.onclick = function (ev) { ev.stopPropagation(); deleteSavedQueue(q.name); };
+  });
 }
 function renderSavedQueuePage(name) {
   if (!name) return;
+  if(typeof rlPageTransitionBegin==='function')rlPageTransitionBegin('sq');
   S.view = 'sq'; S.sqName = name;
   head(name, '加载中…', '');
   api('/api/sq/info?name=' + encodeURIComponent(name)).then(function (j) {
@@ -3092,6 +3786,7 @@ function renderSavedQueuePage(name) {
   }).catch(function (e) { renderPanelError('sq', function () { renderSavedQueuePage(name); }, e); });
 }
 function playSavedQueue(name, i) {
+  if (!ensurePlaybackSettings()) return;
   i = i || 0;
   ensureSequentialMode(function () {
     api('/api/sq/play?name=' + encodeURIComponent(name) + '&i=' + i).then(function (j) {
@@ -3100,26 +3795,46 @@ function playSavedQueue(name, i) {
         var it = (info && info.items) || [];
         var k = Math.min(Math.max(0, i), Math.max(0, it.length - 1));
         if (it[k]) playPath(it[k].file, it[k].cs, it[k].ce);
-        toast('播放队列：' + name + '（' + it.length + ' 首）');
+        toast(tf('播放队列：{0}（{1} 首）', [name, it.length]));
         loadQ();
       });
-    }).catch(function (e) { toast('播放失败: ' + e); });
+    }).catch(function (e) { toast(tf('播放失败: {0}', [e])); });
   });
+}
+function createPlaylistDialog(onCreated) {
+  askText({ title: '新建歌单', ok: '新建', placeholder: '例如 夜深人静', hint: '只新建一个空歌单，不会改动当前播放队列。', onOk: function (name) {
+    api('/api/sq/create?name=' + encodeURIComponent(name)).then(function (j) {
+      if (!j || !j.ok) throw Error((j && j.error) || '新建失败');
+      toast(tf('已新建歌单：{0}', [name]));
+      renderSavedQueues();
+      if (typeof onCreated === 'function') onCreated(name);
+    }).catch(function (e) { toast(e.message || '新建失败'); });
+  } });
+}
+function addTrackToPlaylist(name, tk) {
+  if (!name || !tk || !tk.path) return Promise.resolve();
+  return api('/api/sq/add?name=' + encodeURIComponent(name) + '&file=' + encodeURIComponent(tk.path) + cueQuery(tk.cs, tk.ce)).then(function (j) {
+    if (!j || !j.ok) throw Error((j && j.error) || '添加失败');
+    toast(tf('已添加到歌单：{0}（{1} 首）', [name, j.count]));
+    renderSavedQueues();
+    if (S.view === 'sq' && S.sqName === name) renderSavedQueuePage(name);
+    return j;
+  }).catch(function (e) { toast(e.message || '添加失败'); });
 }
 function saveQueueDialog() {
   var n = (S.q && S.q.items) ? S.q.items.length : 0;
   if (!n) { toast('队列是空的，先加几首歌再保存'); return; }
   askText({ title: '保存为歌单', ok: '保存', value: S.sqName || '',
     placeholder: '例如 夜深人静',
-    hint: '把现在这 ' + n + ' 首（含顺序与 CUE 区间）存成一个歌单；写入 rlplayer-savedqueues.conf，重启后仍在',
+    hint: tf('把现在这 {0} 首（含顺序与 CUE 区间）存成一个歌单；写入 rlplayer-savedqueues.conf，重启后仍在', [n]),
     onOk: function (name) {
       api('/api/sq/save?name=' + encodeURIComponent(name)).then(function (j) {
         if (!j || !j.ok) { toast((j && j.error) || '保存失败'); return; }
-        toast('已存为歌单：' + j.name + '（' + j.count + ' 首）');
+        toast(tf('已存为歌单：{0}（{1} 首）', [j.name, j.count]));
         renderSavedQueues();
         if (S.view === 'favs') loadFavs();
         else if (S.view === 'sq') renderSavedQueuePage(j.name);
-      }).catch(function (e) { toast('保存失败: ' + e); });
+      }).catch(function (e) { toast(tf('保存失败: {0}', [e])); });
     } });
 }
 function renameQueueDialog(name) {
@@ -3128,26 +3843,26 @@ function renameQueueDialog(name) {
     onOk: function (to) {
       api('/api/sq/rename?from=' + encodeURIComponent(name) + '&to=' + encodeURIComponent(to)).then(function (j) {
         if (!j || !j.ok) { toast((j && j.error) || '改名失败'); return; }
-        toast('已改名为：' + j.to);
+        toast(tf('已改名为：{0}', [j.to]));
         if (S.sqName === name) S.sqName = j.to;
         renderSavedQueues();
         if (S.view === 'sq') renderSavedQueuePage(j.to);
         else if (S.view === 'favs') loadFavs();
-      }).catch(function (e) { toast('改名失败: ' + e); });
+      }).catch(function (e) { toast(tf('改名失败: {0}', [e])); });
     } });
 }
 function deleteSavedQueue(name) {
   askConfirm({ title: '删除歌单', ok: '删除',
-    text: '删除歌单「' + name + '」？只删这份歌单，不动当前播放队列。',
+    text: tf('删除歌单「{0}」？只删这份歌单，不动当前播放队列。', [name]),
     onOk: function () {
       api('/api/sq/delete?name=' + encodeURIComponent(name)).then(function (j) {
         if (!j || !j.ok) { toast((j && j.error) || '删除失败'); return; }
-        toast('已删除：' + name);
+        toast(tf('已删除：{0}', [name]));
         if (S.sqName === name) S.sqName = '';
         renderSavedQueues();
         if (S.view === 'sq') { setView('favs'); loadFavs(); }
         else if (S.view === 'favs') loadFavs();
-      }).catch(function (e) { toast('删除失败: ' + e); });
+      }).catch(function (e) { toast(tf('删除失败: {0}', [e])); });
     } });
 }
 
@@ -3168,8 +3883,10 @@ function cueQuery(cs, ce) {
   return '&cue_start=' + encodeURIComponent(cs) +
          (ce >= 0 ? ('&cue_end=' + encodeURIComponent(ce)) : '');
 }
-function playPath(f, cs, ce) {
-  api('/api/play', 'file=' + encodeURIComponent(f) + cueQuery(cs, ce) + '&' + params()).then(function (j) {
+function playPath(f, cs, ce, queueIndex) {
+  if (!ensurePlaybackSettings()) return;
+  var selected = Number.isSafeInteger(queueIndex) && queueIndex >= 0 ? '&queueIndex=' + queueIndex : '';
+  api('/api/play', 'file=' + encodeURIComponent(f) + cueQuery(cs, ce) + selected + '&' + params()).then(function (j) {
     if (j && j.ok === false) { toast(j.error || '播放失败'); return; }
     toast('开始播放'); loadQ();
   });
@@ -3178,6 +3895,7 @@ function addPath(f) {
   api('/api/add', 'file=' + encodeURIComponent(f)).then(function () { toast('已加入队列'); loadQ(); });
 }
 function playRemote(it) {
+  if (!ensurePlaybackSettings()) return;
   api('/api/play', 'rid=' + encodeURIComponent(it.id) + '&rsuffix=' + encodeURIComponent(it.sf || '') + '&' + params())
     .then(function (j) { if (!j.ok) toast(j.error || '播放失败'); else loadQ(); });
 }
@@ -3199,6 +3917,20 @@ function showTrackMenu(x, y, tk) {
   }
   item('立即播放', function () { playPath(tk.path, tk.cs, tk.ce); });
   item('加入播放队列', function () { addPathCue(tk.path, tk.cs, tk.ce); });
+  // 2026-11-12：QQ 音乐式「添加到 → 歌单」子菜单（我的歌单 = /api/sq 具名队列）。
+  (function(){
+    var addWrap=document.createElement('div');addWrap.className='ctxitem has-sub';addWrap.innerHTML='<span>添加到</span><span class=ctxarrow>›</span>';
+    var sub=document.createElement('div');sub.className='ctxsub';
+    function subItem(label,fn,muted){var d=document.createElement('div');d.className='ctxitem'+(muted?' ctxmuted':'');d.textContent=label;if(fn)d.onclick=function(ev){ev.stopPropagation();hideContextMenu();fn();};sub.appendChild(d);}
+    var names=(S.sqs||[]).map(function(q){return q.name;});
+    if(!names.length)subItem('暂无歌单',null,true);
+    names.forEach(function(name){subItem(name,function(){addTrackToPlaylist(name,tk);});});
+    subItem('＋ 新建歌单…',function(){createPlaylistDialog(function(name){addTrackToPlaylist(name,tk);});});
+    addWrap.appendChild(sub);
+    addWrap.onclick=function(ev){ev.stopPropagation();addWrap.classList.toggle('open');};
+    if(typeof x==='number'&&x>innerWidth-240)addWrap.classList.add('flip');
+    m.appendChild(addWrap);
+  })();
   // 分析 + 多版本对比。两项都只读文件（/api/health 流式解码、/api/compare 对齐后分析），不开音频设备。
   // 2026-10-27（261027-04 #4）：设置页「分析」页签已删除（用户要求搬到单曲页）。
   // P3（2026-10-27 261027-05 C4，用户：「有损检测就是假无损检测，归类到一起就行」）：
@@ -3253,7 +3985,7 @@ function showQueueContextMenu(x, y, idx) {
     hideContextMenu();
     if (S.q && S.q.items && S.q.items[idx]) {
       var c = (S.q.cues || [])[idx] || [-1, -1];
-      playPath(S.q.items[idx], c[0], c[1]);
+      playPath(S.q.items[idx], c[0], c[1], idx);
     }
   };
 
@@ -3297,8 +4029,11 @@ function updateNextTrackInfo() {
   var repMode = (D('sRep') && D('sRep').value) || '0';
   var nextIdx = curIdx + 1;
   var hasNext = true;
-  if (nextIdx >= qLen) {
-    if (repMode === '1') {
+  if (repMode === '2') {
+    // 单曲循环：下一首就是当前曲目，不能再显示「队列末尾」自我否认循环。
+    nextIdx = Math.max(0, curIdx);
+  } else if (nextIdx >= qLen) {
+    if (repMode === '1' || repMode === '3') {
       nextIdx = 0;
     } else {
       hasNext = false;
@@ -3307,14 +4042,18 @@ function updateNextTrackInfo() {
   var remain = Math.max(0, qLen - 1 - (curIdx >= 0 ? curIdx : 0));
   var text = '';
   var tip = '';
-  if (hasNext && qLen > 0) {
+  if (repMode === '2' && qLen > 0) {
+    var loopTitle = nam(S.q.items[Math.max(0, curIdx)] || '');
+    text = '单曲循环: ' + loopTitle;
+    tip = tf('单曲循环：{0}（播完从头重播）', [loopTitle]);
+  } else if (hasNext && qLen > 0) {
     var nextPath = S.q.items[nextIdx] || '';
     var nextTitle = nam(nextPath);
     text = '下一首: ' + nextTitle + (remain > 0 ? (' · 剩 ' + remain + ' 首') : '');
-    tip = '下一首：' + nextTitle + '（队列共 ' + qLen + ' 首，剩余 ' + remain + ' 首）';
+    tip = tf('下一首：{0}（队列共 {1} 首，剩余 {2} 首）', [nextTitle, qLen, remain]);
   } else {
     text = '队列末尾' + (qLen > 0 ? (' · 共 ' + qLen + ' 首') : '');
-    tip = '当前已是队列最后一首（共 ' + qLen + ' 首）';
+    tip = tf('当前已是队列最后一首（共 {0} 首）', [qLen]);
   }
   if (el) {
     el.textContent = text;
@@ -3343,10 +4082,11 @@ function loadQ() {
     // 写请求后 2 秒内不采信轮询结果，让"最后一次用户操作"胜出。
     var pmFresh = (Date.now() - PM_PENDING) < 2000;
     if (D('sRep') && pmd !== undefined && !pmFresh) { D('sRep').value = String(pmd); applyRep(pmd); }
-    D('rcnt').textContent = '共 ' + S.q.items.length + ' 首';
+    D('rcnt').textContent = tf('共 {0} 首', [S.q.items.length]);
     updateNextTrackInfo();
+    if (typeof rlHomeActive === 'function' && rlHomeActive()) { rlPaintQueue(); rlPaintHome(); }
     if (!S.q.items.length) {
-      D('qlist').innerHTML = '<div class=empty style="padding:26px 14px">队列为空<br><span style="font-size:11px">右键专辑或曲目可加入</span></div>';
+      D('qlist').innerHTML = '<div class=empty style="padding:26px 14px">' + t('队列为空') + '<br><span style="font-size:11px">' + t('右键专辑或曲目可加入') + '</span></div>';
       return;
     }
     var h = '';
@@ -3362,7 +4102,7 @@ function loadQ() {
       e.onclick = function (ev) {
         if (ev.target.classList.contains('qdel')) return;
         var c = (S.q.cues || [])[i] || [-1, -1];
-        playPath(S.q.items[i], c[0], c[1]);
+        playPath(S.q.items[i], c[0], c[1], i);
       };
       e.oncontextmenu = function (ev) {
         ev.preventDefault();
@@ -3397,15 +4137,105 @@ function buildNpMetaHtml(m) {
   [['year', '年份'], ['genre', '流派'], ['albumArtist', '专辑艺术家']].forEach(function (p) {
     var v = m[p[0]];
     if (!v) return;
-    chips += '<span class=badge title="' + esc('来源: ' + (src[p[0]] || '本地标签')) + '">' +
-             esc(p[1] + '  ' + v) + '</span>';
+    chips += '<span class=badge title="' + esc(tf('来源: {0}', [(src[p[0]] || '本地标签')])) + '">' +
+             esc(t(p[1]) + '  ' + v) + '</span>';
   });
   chips += '<span class="badge g" title="标签/封面/歌词已由在线来源补全，可在设置-元数据补全关闭">已补全</span>';
   return chips;
 }
+function refreshCurrentCover() {
+  if (!S.lastCur || S.coverRefreshTimer) return;
+  S.coverRefreshTimer = setTimeout(function () {
+    S.coverRefreshTimer = 0;
+    if (S.lastCur) loadMeta(S.lastCur);
+  }, 150);
+}
+function saveTrackCover(file, image) {
+  if (!file || !image) return Promise.reject(new Error('Missing cover target'));
+  return new Promise(function (resolve, reject) {
+    var x = new XMLHttpRequest();
+    x.open('POST', '/api/cover/set?file=' + encodeURIComponent(file));
+    x.timeout = 20000;
+    x.onload = function () {
+      var result;
+      try { result = JSON.parse(x.responseText); }
+      catch (e) { reject(new Error(t('设置失败：响应无法解析'))); return; }
+      if (x.status < 200 || x.status >= 300 || !result || result.ok !== true) {
+        reject(new Error((result && result.error) || t('设置失败'))); return;
+      }
+      if (S.lastCur === file) loadMeta(file);
+      resolve(result);
+    };
+    x.onerror = x.ontimeout = function () { reject(new Error(t('设置失败：网络错误'))); };
+    x.send(image);
+  });
+}
+function resetTrackCover(file) {
+  if (!file) return Promise.resolve();
+  return api('/api/cover/reset?file=' + encodeURIComponent(file), '').then(function (result) {
+    if (!result || result.ok !== true) throw new Error((result && result.error) || t('设置失败'));
+    if (S.lastCur === file) loadMeta(file);
+    return result;
+  });
+}
+function stopCurrentCachedCover() {
+  var watch = S.coverCacheWatch;
+  S.coverCacheWatch = null;
+  if (!watch) return;
+  clearInterval(watch.timer);
+  if (watch.image) watch.image.onload = watch.image.onerror = null;
+}
+// Retry only the exact current file's local image endpoint. Reloading full
+// metadata here could start unrelated online/LLM work merely to repaint art.
+function watchCurrentCachedCover(file) {
+  stopCurrentCachedCover();
+  var watch = { file: file, request: S.metaRequest, deadline: Date.now() + 60000, image: null };
+  S.coverCacheWatch = watch;
+  function current() {
+    return S.coverCacheWatch === watch && S.lastCur === file && S.metaRequest === watch.request;
+  }
+  watch.timer = setInterval(function () {
+    if (!current() || Date.now() >= watch.deadline) { if (S.coverCacheWatch === watch) stopCurrentCachedCover(); return; }
+    if (watch.image) return;
+    var image = watch.image = new Image();
+    var url = '/api/cover?file=' + encodeURIComponent(file) + '&_cov=' + Date.now();
+    image.onload = function () {
+      if (!current()) return;
+      var bg = 'url(' + JSON.stringify(url) + ')';
+      D('cv').style.backgroundImage = bg;
+      if (S.curMeta) { S.curMeta.hasCover = true; S.curMeta.coverUrl = url; }
+      if (D('npPage') && D('npPage').classList.contains('on')) {
+        D('npbg').style.backgroundImage = bg;
+        D('npCover').src = url;
+        D('npCover').style.display = '';
+      }
+      stopCurrentCachedCover();
+    };
+    image.onerror = function () { if (current()) watch.image = null; };
+    image.src = url;
+  }, 2000);
+}
+window.addEventListener('pagehide', stopCurrentCachedCover);
 function loadMeta(f) {
   if (!f) return;
-  api('/api/meta?file=' + encodeURIComponent(f)).then(function (m) {
+  stopCurrentCachedCover();
+  var request = S.metaRequest = (S.metaRequest || 0) + 1;
+  if (S.metaFile !== f) {
+    S.metaFile = f;
+    S.curMeta = null;
+    S.curCh = 0;
+    S.npMetaHtml = '';
+    D('cv').style.backgroundImage = '';
+    D('npt').textContent = nam(f);
+    D('npt').title = nam(f);
+    D('npart').textContent = '';
+    D('npart').title = '';
+    if (D('npPage') && D('npPage').classList.contains('on')) renderNp();
+  }
+  function current() { return request === S.metaRequest && S.lastCur === f; }
+  return api('/api/meta?file=' + encodeURIComponent(f)).then(function (m) {
+    if (!current()) return;
+    if (!m || m.ok === false) throw new Error('Metadata unavailable');
     S.curMeta = m;
     // P2（261027-05 A4）：当前曲目的**源**声道数。底栏 / 单曲页副标题要标多声道，
     // 而 /api/status 没有声道字段（不许改 rtaweb.cpp）⟹ 只能从这次 /api/meta 里取。
@@ -3417,16 +4247,21 @@ function loadMeta(f) {
     var sub = [];
     if (m.artist) sub.push(m.artist);
     if (m.album) sub.push(m.album);
+    else if (m.folderName) sub.push(tf('文件夹：{0}', [m.folderName]));
     var subStr = sub.join(' \u00b7 ');
     D('npart').textContent = subStr;
     D('npart').title = subStr;
-    D('cv').style.backgroundImage = m.hasCover ? "url('/api/cover?file=" + encodeURIComponent(f) + "')" : '';
+    var coverUrl = typeof m.coverUrl === 'string' && m.coverUrl.indexOf('/api/cover?') === 0
+      ? m.coverUrl : '/api/cover?file=' + encodeURIComponent(f) + '&_cov=' + request;
+    D('cv').style.backgroundImage = m.hasCover ? 'url(' + JSON.stringify(coverUrl) + ')' : '';
+    if (!m.hasCover) watchCurrentCachedCover(f);
     // 补全芯片：存全局，renderNp 统一填进 #npMeta；整页开着就立刻刷一次（meta 是异步回来的）
     S.npMetaHtml = buildNpMetaHtml(m);
     if (D('npPage') && D('npPage').classList.contains('on')) {
       renderNp();   // renderNp 内部已调 updateNpSummary(S.curMeta)，不再重复请求
     }
   }).catch(function () {
+    if (!current()) return;
     S.curCh = 0;                       // 取不到元数据 ⟹ 不标声道（宁可不标，也不标错的）
     var tName = nam(f);
     D('npt').textContent = tName;
@@ -3465,13 +4300,85 @@ function bpBadgeInfo() {
   } else {
     t = 'PCM-PCM 升频'; c = 'bp-up'; title = title || 'PCM 源 → 更高 PCM 采样率';
   }
-  if (S.bpFallback) title = (title ? title + '；' : '') + '降级原因：' + S.bpFallback;
+  if (S.bpFallback) title = (title ? title + '；' : '') + tf('降级原因：{0}', [S.bpFallback]);
   return { text: t, cls: c, title: title };
 }
 
+function syncPlaybackCaption(j, srcCh) {
+  var caption = j.error || ((j.playing ? (j.paused ? '已暂停' : '播放中') : '已停止') +
+    (j.outRate ? ' \u00b7 ' + j.outRate + ' Hz / ' + j.outBits + ' bit' : '') + chSuffix(srcCh));
+  if (D('nps')) D('nps').textContent = caption;
+  // The open track page otherwise keeps the caption captured by renderNp()
+  // before an asynchronous decoder/IR failure arrived.
+  if (D('npSub') && D('npPage') && D('npPage').classList.contains('on')) {
+    var artist = (D('npart') && D('npart').textContent) || '';
+    D('npSub').textContent = artist + (caption ? '  ·  ' + caption : '');
+  }
+}
+var statusRequest = 0, statusApplied = 0;
 function tick() {
+  var request = ++statusRequest;
   api('/api/status').then(function (j) {
+    // A delayed poll must not restore the preceding track, artwork, or seek position.
+    if (!j || j.ok === false || request <= statusApplied) return;
+    statusApplied = request;
+    if (j && j.error) j.error = playbackErrorText(j.error);
+    // 2026-11-01：测试钩子（后端只在设了 RLPLAYER_START_VIEW 时才给这个字段）。
+    // 合成输入进不到 WebView2 子窗口，验收截图必须能直达某个页面。
+    // 2026-11-01：多语言覆盖率采集（只在后端 RLPLAYER_I18N_DEBUG=1 时才为 true）。
+    //   把「渲染后仍是中文、语言包里也没有」的文本/属性上报后端日志，用来生成待译清单。
+    if (j && j.i18nDebug && !S.i18nDbg) {
+      S.i18nDbg = 1;
+      setInterval(function () {
+        if (!I18N.map || I18N.lang === 'zh') return;
+        var miss = {}, out = [];
+        var w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+        var n = w.currentNode;
+        while (n) {
+          var s = i18nNorm(n.nodeValue);
+          if (s && /[\u4e00-\u9fff]/.test(s) && !I18N.map[s] && !i18nByPattern(s) && !miss[s]) {
+            miss[s] = 1; if (out.length < 400) out.push(s);
+          }
+          n = w.nextNode();
+        }
+        var at = i18nAttrs();
+        Array.prototype.forEach.call(document.querySelectorAll('[title],[placeholder],[aria-label],[alt],[data-tip]'), function (e) {
+          for (var i = 0; i < at.length; i++) {
+            var v = i18nNorm(e.getAttribute(at[i]));
+            if (v && /[\u4e00-\u9fff]/.test(v) && !I18N.map[v] && !i18nByPattern(v) && !miss[v]) { miss[v] = 1; if (out.length < 400) out.push(v); }
+          }
+        });
+        if (out.length) fetch('/api/i18n/miss', { method: 'POST', body: JSON.stringify(out) }).catch(function () { });
+      }, 2500);
+    }
+    if (!S.startApplied && j && j.startView) {
+      S.startApplied = 1;
+      var sv = String(j.startView).split(':');
+      setTimeout(function () {
+        if (sv[0] === 'settings') { openSettingsTab(sv[1] || 'input'); return; }
+        if (sv[0] === 'np') { if (typeof openNowPlaying === 'function') openNowPlaying(); return; }
+        // 走真实导航点击：setView() 只切类名，各视图的数据加载挂在导航按钮的 onclick 上
+        var nav = document.querySelector('.nav[data-v="' + sv[0] + '"]');
+        if (nav) nav.click(); else if (sv[0]) setView(sv[0]);
+      }, 1200);
+    }
+    // 2026-11-02（用户反馈）：共享 WASAPI 下「永远不是 bit-perfect」但界面不提示。
+    //   底栏芯片现在会是 bit-perfect=no 且 tooltip 写明原因；这里再给一次性 toast，
+    //   否则用户只会觉得"怎么调都不是"。每进程只提示一次，不打扰。
+    if (j && j.outShared && j.playing && !S.sharedHinted) {
+      S.sharedHinted = 1;
+      toast('共享输出：采样经 Windows 混音器，无法 bit-perfect。设置 → 输出 改为「WASAPI（独占 · 事件驱动）」');
+    }
+    if (j && j.qa && !QA.on) { QA.on = true; QA.timer = setInterval(qaTick, 500); }
     S.playing = !!j.playing; S.paused = !!j.paused; S.dur = j.dur; S.pos = j.pos;
+    // Re-label a cached report only when the existing playback state changes.
+    // No signal request, measurement, or audio scan is started by this observer.
+    var cleanupPlaybackKey = [j.current || '', S.playing, S.paused].join('|');
+    if (cleanupPlaybackKey !== CLEANUP_UI.playbackKey) {
+      if (CLEANUP_UI.currentFile !== (j.current || '') && CLEANUP_UI.source === 'local') CLEANUP_UI.facts = null;
+      CLEANUP_UI.currentFile = j.current || ''; CLEANUP_UI.playbackKey = cleanupPlaybackKey;
+      paintCleanupStatus();
+    }
     // 2026-10-27（261027-04 #4）：单曲页分析条的数据源 —— 用 /api/status 的 current 驱动
     // 「播放就自动分析一次」。选它而不是用 /api/play 的返回值，是因为 skip / 上一首 / 队列自动
     // 切歌 / UPnP 投放**都不经过** /api/play，只有 current 是所有这些路径的共同出口。
@@ -3490,36 +4397,29 @@ function tick() {
     if (typeof j.summaryEnabled === 'boolean') META.summaryEnabled = j.summaryEnabled;
     // 正在播放整页：进度条 / 时间 / 播放图标
     if (D('npPage') && D('npPage').classList.contains('on')) {
-      if (D('npBar') && S.dur > 0) D('npBar').style.width = Math.min(100, S.pos / S.dur * 100) + '%';
-      if (D('npPos')) D('npPos').textContent = fmt(S.pos);
-      if (D('npDur')) D('npDur').textContent = fmt(S.dur);
       if (D('npIcP')) D('npIcP').setAttribute('d', (S.playing && !S.paused)
         ? 'M7 5h4v14H7zM13 5h4v14h-4z' : 'M8 5l12 7-12 7z');
-      syncVolUi();     // 音量可能在别处改（键盘 ↑↓ / 底栏滑块），整页跟着走
       renderNpLyric();
     }
-    S.volDb = (typeof j.volDb === 'number') ? j.volDb : S.vol;
+    syncVolumeStatus(j,false,request);
+    syncTransportSeek(j);
     S.startDb = (typeof j.startDb === 'number') ? j.startDb : S.vol;
     // 信号链弹层开着时，音量节点要跟着实时变（否则就是在显示过期数据）
     if (D('chainVol') && D('modal').classList.contains('on')) D('chainVol').textContent = volText(S.volDb);
     if (D('chainTiming') && D('modal').classList.contains('on')) {
       var dspB = (typeof j.dspBlockMs === 'number' && j.dspBlockMs > 0) ? j.dspBlockMs.toFixed(2) + ' ms/块' : '';
-      var dspT = (typeof j.dspTotalMs === 'number' && j.dspTotalMs > 0) ? '（累计 ' + j.dspTotalMs.toFixed(1) + ' ms）' : '';
+      var dspT = (typeof j.dspTotalMs === 'number' && j.dspTotalMs > 0) ? tf('（累计 {0} ms）', [j.dspTotalMs.toFixed(1)]) : '';
       var dspStr = (dspB || dspT) ? (dspB + dspT) : '–';
       var decStr = (typeof j.decodeMs === 'number' && j.decodeMs > 0) ? (j.decodeMs >= 1000 ? (j.decodeMs/1000).toFixed(2) + ' s' : j.decodeMs.toFixed(1) + ' ms') : '–';
       var wavStr = '–';
       if (typeof j.ffmpegMs === 'number' && j.ffmpegMs > 0) {
         wavStr = '转码写 ' + j.ffmpegMs.toFixed(1) + ' ms' + (typeof j.wavReadMs === 'number' && j.wavReadMs > 0 ? ' / 读 ' + j.wavReadMs.toFixed(1) + ' ms' : '');
       } else if (typeof j.wavReadMs === 'number' && j.wavReadMs > 0) {
-        wavStr = '读取 ' + j.wavReadMs.toFixed(1) + ' ms';
+        wavStr = tf('读取 {0} ms', [j.wavReadMs.toFixed(1)]);
       }
       var scanStr = (typeof j.scanMs === 'number' && j.scanMs > 0) ? (j.scanMs >= 1000 ? (j.scanMs/1000).toFixed(2) + ' s' : j.scanMs.toFixed(0) + ' ms') : '–';
-      D('chainTiming').textContent = '解码 ' + decStr + '  \u00b7  临时WAV ' + wavStr + '  \u00b7  DSP ' + dspStr + '  \u00b7  库扫描 ' + scanStr;
+      D('chainTiming').textContent = tf('解码 {0}  \u00b7  临时WAV {1}  \u00b7  DSP {2}  \u00b7  库扫描 {3}', [decStr, wavStr, dspStr, scanStr]);
     }
-    var pct = (j.dur > 0 ? Math.min(100, j.pos / j.dur * 100) : 0) + '%';
-    if (D('bar')) D('bar').style.width = pct;
-    D('tpos').textContent = fmt(j.pos);
-    D('tdur').textContent = fmt(j.dur);
     D('icP').setAttribute('d', S.playing && !S.paused
       ? 'M7 5h4v14H7zM13 5h4v14h-4z'                     /* 暂停图标 */
       : 'M8 5v14l11-7z');                                 /* 播放图标 */
@@ -3531,11 +4431,10 @@ function tick() {
       // 声道数只能从 /api/meta（loadMeta 存的 S.curCh）取：/api/status 的响应里没有声道字段，
       // 而本轮不允许改 rtaweb.cpp（/api/meta 明确带 channels，见 rtaweb.cpp:11299）。
       var srcCh = (typeof S.curCh === 'number' && S.curCh > 0) ? S.curCh : 0;
-      D('nps').textContent = (j.playing ? (j.paused ? '已暂停' : '播放中') : '已停止') +
-        (j.outRate ? ' \u00b7 ' + j.outRate + ' Hz / ' + j.outBits + ' bit' : '') + chSuffix(srcCh);
-      if (D('nps')) D('nps').title = srcCh > 0 ? ('源文件 ' + chText(srcCh)) : '';
+      syncPlaybackCaption(j, srcCh);
+      if (D('nps')) D('nps').title = srcCh > 0 ? (tf('源文件 {0}', [chText(srcCh)])) : '';
       D('fmt').textContent = j.outRate ? ((Math.round(j.outRate / 100) / 10) + 'k/' + j.outBits + chSuffix(srcCh)) : '--';
-      if (D('fmt')) D('fmt').title = srcCh > 0 ? ('源文件 ' + chText(srcCh)) : '输出格式';
+      if (D('fmt')) D('fmt').title = srcCh > 0 ? (tf('源文件 {0}', [chText(srcCh)])) : '输出格式';
       updateNextTrackInfo();
       // 261024-04 #8：底栏 GPU 徽标只表示「GPU **真的参与**了本次播放」。
       // 后端新字段 gpuUsed（本次播放 GPU 是否实际参与）；字段还没上线时回退旧的 gpu 字段。
@@ -3545,12 +4444,12 @@ function tick() {
       S.gpuOn = !!j.gpu;
       D('gpub').style.display = S.gpuUsed ? '' : 'none';
       D('gpub').title = S.gpuUsed ? 'GPU 参与本次播放'
-        : (S.gpuOn ? 'GPU 可用 · 本次未参与（信号链里绿色节点才会亮）' : 'GPU 未参与本次播放');
+        : (S.gpuOn ? t('GPU 可用 · 本次未参与（信号链里绿色节点才会亮）') : t('GPU 未参与本次播放'));
     } else {
       S.gpuUsed = false; S.gpuOn = false;
       D('fmt').textContent = '--';
       D('gpub').style.display = 'none';
-      if (S.lastCur) { S.lastCur = ''; D('npt').textContent = '未播放'; D('npart').textContent = ''; D('nps').textContent = '选择一个专辑开始'; D('cv').style.backgroundImage = ''; S.npMetaHtml = ''; if (D('npMeta')) D('npMeta').innerHTML = ''; }
+      if (S.lastCur) { stopCurrentCachedCover(); S.lastCur = ''; S.metaFile = ''; S.curMeta = null; S.metaRequest = (S.metaRequest || 0) + 1; D('npt').textContent = '未播放'; D('npart').textContent = ''; D('nps').textContent = '选择一个专辑开始'; D('cv').style.backgroundImage = ''; S.npMetaHtml = ''; if (D('npMeta')) D('npMeta').innerHTML = ''; }
       updateNextTrackInfo();
     }
     // 2026-10-23 #1：底栏常驻一个「b-p」徽标，不打开信号链也能知道当前是否 bit-perfect。
@@ -3564,7 +4463,10 @@ function tick() {
       D('bpBadge').title = bi.title;
       D('bpBadge').style.display = bi.text ? '' : 'none';
     }
-    if (j.error) D('nps').textContent = j.error;
+    if (j.error && !j.current) syncPlaybackCaption(j, 0);
+    rlLastStatus = j;
+    if (S.view==='settings' && D('rlPresetApply')) rlPaintPreset();
+    if (rlHomeActive()) rlPaintHome();
     syncAlbPlayAllBtn();
   }).catch(function () { });
 }
@@ -3572,7 +4474,60 @@ function tick() {
 /* ---------------- 播放设置持久化 ---------------- */
 var SET_KEYS = [['sRate','rate'], ['sRateFamilyPolicy','rateFamilyPolicy'], ['sFilt','filter'], ['sFiltNx','filterNx'], ['sShap','shaper'],
                 ['sDSD','dsd'], ['sBuf','buffer'], ['sIsp','isp'], ['s2s','twostage'], ['sGpu','gpuvendor']];
+function analysisAutoStatus() {
+  if (ANL.master === 0)
+    return t('模块已关闭：单曲页不显示分析卡，也不会再请求分析数据');
+  return tf('当前：{0}　·　已在单曲页展示，不需要额外操作', [t(ANL.auto ? '开' : '关')]);
+}
+var settingsSaveQueue=Promise.resolve();
+function persistSettings(body,volumeWrite,stamp) {
+  var skippedGroup=false,skippedFields=[];
+  if(!stamp&&!volumeWrite)rlSettingsFence.mark(body);
+  function send() {
+   function dispatch(){
+    if(volumeWrite&&(VOLUME_WRITE.current!==volumeWrite||volumeWrite.sequence!==VOLUME_WRITE.sequence||!volumeWrite.accepted||isRawVolumeLocked()))return {ok:false,stale:true};
+    // Debounced callers may have built their body before a new gesture began.
+    // Re-check at dispatch, and never turn an optimistic value into a preference.
+    var data=new URLSearchParams(body),volume=confirmedVolumeForSave();
+    var reconciliation=rlSettingsFence.reconcile(data,stamp);
+    skippedGroup=reconciliation.group;skippedFields=reconciliation.removed;
+    if(data.has('volume')){
+      data.delete('volume');
+      if(volume!==null&&(!volumeWrite||volume===volumeWrite.value))data.set('volume',String(volume));
+    }
+    if(!data.toString())return {ok:true,skipped:true};
+    return api('/api/settings', data.toString());
+   }
+   return rlSettingsFence.hasParameters(body)?rlSettingsFence.legacy(dispatch,stamp):dispatch();
+  }
+  var next=settingsSaveQueue.then(send,send);
+  settingsSaveQueue=next.then(function(){},function(){});
+  return next.then(function(j){
+    if(j&&j.stale)return j;
+    if(!j||!j.ok){toast(tf('保存失败：{0}',[t((j&&j.error)||'保存失败')]));return j;}
+    if(skippedGroup)return rlSettingsFence.readback().then(function(){return {ok:false,stale:true,errorCode:'STALE_GROUP_SETTINGS',preferencesSaved:!j.skipped,skippedFields:skippedFields};});
+    if(skippedFields.length)return Object.assign({},j,{rebased:true,skippedFields:skippedFields});
+    return j;
+  }).catch(function(){toast(t('保存失败：服务没响应'));});
+}
+function sdmCornerSettingsValid(value, family) {
+  var corner = (value === '' || value === undefined || value === null) ? 0 : Number(value);
+  return Number.isFinite(corner) && corner >= 0 && corner <= 200 &&
+    (family === 'ec' || corner === 0 || corner >= 100);
+}
+function validateSdmCornerSettings() {
+  var field = D('sp_modcut'), familyField = D('sp_modfamily');
+  var value = field && field.value !== undefined ? field.value : ADV.modcut;
+  var family = (familyField && familyField.value) || ADV.modfamily || 'dsd';
+  if (sdmCornerSettingsValid(value, family)) return true;
+  toast(t('SDM 拐点必须为 0 或 100～200 kHz；EC 族不使用此值，但仍须是 0～200 的有限数字。输入已保留，请修正后再保存。'));
+  return false;
+}
 function saveSettings(immediate) {
+  if (!ensurePlaybackSettings()) return Promise.resolve({ok:false,errorCode:'PLAYBACK_SETTINGS_NOT_READY'});
+  if (!validateSdmCornerSettings()) return Promise.resolve({ok:false,errorCode:'SDM_CORNER_QUALITY'});
+  if (!validateProcessingSettings()) return Promise.resolve({ok:false,errorCode:'PROCESSING_INPUT'});
+  var settingsStamp=rlSettingsFence.capture();
   var body = '';
   SET_KEYS.forEach(function (p) {
     var e = D(p[0]); if (!e) return;
@@ -3580,7 +4535,10 @@ function saveSettings(immediate) {
     if (body) body += '&';
     body += p[1] + '=' + encodeURIComponent(v);
   });
-  body += '&volume=' + S.vol + '&loudness=' + (D('sLoud').checked ? '1' : '0');
+  var confirmedVolume=confirmedVolumeForSave();
+  if(confirmedVolume!==null)body+='&volume='+confirmedVolume;
+  body += '&loudness=' + (D('sLoud').checked ? '1' : '0');
+  body += processingSettingsParam();
   body += '&rgmode=' + (ADV.rgmode || 'off') + '&rgclip=' + (ADV.rgclip ? 1 : 0);
   // 261027-04 #4：播放时自动分析开关（conf 键 autoanl；默认 1）
   body += '&autoanl=' + (ANL.auto ? 1 : 0);
@@ -3589,6 +4547,7 @@ function saveSettings(immediate) {
   body += '&theme=' + encodeURIComponent(S.theme || 'dark');
   // 2026-10-30（用户 261029-03 #1/#3）：界面语言（conf 键 uilang；"auto" = 跟随系统）
   body += '&uilang=' + encodeURIComponent(ADV.uiLang || 'auto');
+  body += '&quickstart=' + (ADV.quickStart === 0 ? 0 : 1);
   body += '&device=' + encodeURIComponent(ADV.device || '') + '&bits=' + (ADV.bits || 0)
         + '&taps=' + (ADV.taps || 0) + '&atten=' + (ADV.atten || 0)
         + '&transition=' + (ADV.transition || 0) + '&phase=' + encodeURIComponent(ADV.phase || '')
@@ -3629,16 +4588,25 @@ function saveSettings(immediate) {
           }).join('');
   clearTimeout(window._setT);
   if (immediate) {
-    api('/api/settings', body);
+    return persistSettings(body,undefined,settingsStamp);
   } else {
-    window._setT = setTimeout(function () { api('/api/settings', body); }, 300);
+    window._setT = setTimeout(function () { persistSettings(body,undefined,settingsStamp); }, 300);
   }
 }
 function loadSettings() {
+  var generation = ++PLAYBACK_SETTINGS.generation;
+  PLAYBACK_SETTINGS.ready = false; PLAYBACK_SETTINGS.loading = true; PLAYBACK_SETTINGS.failed = false; PLAYBACK_SETTINGS.invalidVolume = false;
+  updatePlaybackSettingsGate();
   // 2026-10-27 P0：必须用 apiGetRaw（真 GET）。api() 会走 POST，只回 {merged:true}、不回 kv，
   // 导致这里 kv 恒空 —— 设置控件全停在默认值，而 saveSettings() 又会把默认值写回 conf。
-  apiGetRaw('/api/settings').then(function (j) {
+  return apiGetRaw('/api/settings').then(function (j) {
+    if (generation !== PLAYBACK_SETTINGS.generation) return {ok:false,stale:true};
+    if (!j || j.ok !== true || !j.kv || typeof j.kv !== 'object') throw new Error('Invalid playback settings response');
     var kv = j.kv || {};
+    var restoredVolume = kv.volume === undefined ? -60 : Number(kv.volume);
+    if ((kv.volume !== undefined && String(kv.volume).trim() === '') || !Number.isFinite(restoredVolume) || restoredVolume < -120 || restoredVolume > 20) {
+      var volumeError = new Error('Invalid saved volume'); volumeError.invalidVolume = true; throw volumeError;
+    }
     // 2026-10-30（用户 261029-03 #1/#3）：界面语言必须在**碰任何 DOM 之前**落定 ——
     //   它是"界面能不能看懂"的前提，而本函数后面有一批裸 D(...) 调用（元素不在就抛 TypeError，
     //   整个 .then 会从那一行中断，见下方 anlmaster 事故链）。放这里，任何后续错误都带不偏它。
@@ -3646,6 +4614,7 @@ function loadSettings() {
       ADV.uiLang = kv.uilang || 'auto';
       if (D('sp_uilang')) D('sp_uilang').value = ADV.uiLang;
     }
+    ADV.quickStart = (kv.quickstart === '0' || kv.quickstart === 'false') ? 0 : 1;
     // 2026-10-28（P0，真机定位）：**先落这两个开关，再碰任何 DOM**。
     //   事故链：本函数中间有一批「裸 D(...)」调用，例如
     //     3298: if (kv.loudness !== undefined) { D('sLoud').checked = ... }
@@ -3690,8 +4659,12 @@ function loadSettings() {
     }
     // 2026-10-28：这两行原本是「裸 D(...)」，元素不存在时抛 TypeError 会把整个 .then 打断
     //   （上面注释里那条事故链就是它们触发的）。加判空，缺元素时只跳过 UI 同步，不影响状态。
-    if (kv.volume !== undefined) {
-      S.vol = parseFloat(kv.volume) || 0;
+    {
+      var volumeWrite=VOLUME_WRITE.current;
+      if(!volumeWrite||!volumeWrite.pending&&!volumeWrite.awaitChange&&(!volumeWrite.commitRequested||volumeWrite.persisted)){
+        VOLUME_WRITE.confirmed=isRawVolumeLocked()?0:restoredVolume;
+        S.vol=restoredVolume;
+      }
       if (D('vol')) { D('vol').value = S.vol; syncVolUi(); }
     }
     if (kv.loudness !== undefined) {
@@ -3722,6 +4695,14 @@ function loadSettings() {
     if (kv.channels !== undefined) ADV.channels = parseInt(kv.channels, 10) || 0;
     // naahost：NAA 已删除（261024-05）。老 conf 里有这行也直接忽略，不读进状态、不回写。
     if (kv.upnpdev !== undefined) ADV.upnpDev = kv.upnpdev || '';
+    if(kv.upnpUpsample!==undefined)ADV.upnpUpsample=(kv.upnpUpsample==='1'||kv.upnpUpsample==='true')?1:0;
+    if(kv.upnpForceRate!==undefined)ADV.upnpForceRate=(kv.upnpForceRate==='1'||kv.upnpForceRate==='true')?1:0;
+    if(kv.upnpRateCeiling!==undefined)ADV.upnpRateCeiling=Number(kv.upnpRateCeiling)||192000;
+    if(kv.cleanup!==undefined)ADV.cleanup=(kv.cleanup==='1'||kv.cleanup==='true')?1:0;
+    ADV.cleanupAuto=(kv.cleanup_auto==='0'||kv.cleanup_auto==='false')?0:1;
+    if(kv.cleanup_strength!==undefined)ADV.cleanupStrength=Number(kv.cleanup_strength);
+    if(kv.cleanup_noise_db!==undefined)ADV.cleanupNoiseDb=Number(kv.cleanup_noise_db);
+    syncProcessingControls();
     if (kv.trim !== undefined) {
       var tv = String(kv.trim).split(',');
       for (var ti = 0; ti < 8; ti++) ADV['trim' + ti] = parseFloat(tv[ti]) || 0;
@@ -3797,14 +4778,30 @@ function loadSettings() {
         var cm = D('sp_anlmaster'); if (cm) cm.checked = !!ANL.master;
         var ca = D('sp_autoanl');   if (ca) ca.checked = !!ANL.auto;
         var msg = D('sp_anlmsg');
-        if (msg) msg.textContent = ANL.master
-          ? ('当前：' + (ANL.auto ? '开' : '关') + '　·　已在单曲页展示，不需要额外操作')
-          : '模块已关闭：单曲页不显示分析卡，也不会再请求分析数据';
+        if (msg) msg.textContent = analysisAutoStatus();
         // 主题也要跟上（否则用户改了主题、重启后又看到旧色）
         try { setTheme(kv.theme || 'dark', false); } catch (e4) { }
       }
     } catch (e) { }
-  }).catch(function () { });
+    PLAYBACK_SETTINGS.ready = true; PLAYBACK_SETTINGS.loading = false; PLAYBACK_SETTINGS.failed = false;
+    RATE_UI.savedKey=(ADV.backend||'wasapi')+'|'+(ADV.device||'');
+    loadRates();
+    updatePlaybackSettingsGate(); syncVolUi();
+    applyQuickStartPreference(ADV.quickStart);
+    if(rlHomeActive())rlConsole.refresh().catch(function(){});
+    if (S.view==='settings' && D('rlOutputKind') && rlSettingsState.task==='out')rlInitOutput();
+    if (typeof rlSettingsState!=='undefined' && rlSettingsState.pendingPreset) {
+      rlSettingsState.syncPreset=rlSettingsState.pendingPreset;rlSettingsState.pendingPreset=null;
+      if(D('setpage') && D('setpage').dataset.rlSurface==='pro')rlSyncProfessionalForm();
+    }
+    return {ok:true};
+  }).catch(function (error) {
+    if (generation !== PLAYBACK_SETTINGS.generation) return {ok:false,stale:true};
+    PLAYBACK_SETTINGS.ready = false; PLAYBACK_SETTINGS.loading = false; PLAYBACK_SETTINGS.failed = true;
+    PLAYBACK_SETTINGS.invalidVolume = !!(error && error.invalidVolume);
+    updatePlaybackSettingsGate();
+    return {ok:false,errorCode:'PLAYBACK_SETTINGS_NOT_READY'};
+  });
 }
 
 /* ---------------- 元数据源开关（P1.5：/api/providers 注册表驱动） ---------------- */
@@ -3853,14 +4850,14 @@ function wbPoll() {
   api('/api/writeback/status').then(function (j) {
     if (!j || !j.ok) { WB_BUSY = 0; wbButtons(0); wbMsg(''); return; }
     if (j.running) {
-      wbMsg('写回进行中 ' + (j.done || 0) + '/' + (j.total || 0) + '…');
+      wbMsg(tf('写回进行中 {0}/{1}…', [(j.done || 0), (j.total || 0)]));
       setTimeout(wbPoll, 800);
       return;
     }
     WB_BUSY = 0; wbButtons(0); wbMsg('');
-    if (j.error) { toast('写回未执行：' + j.error); return; }
+    if (j.error) { toast(tf('写回未执行：{0}', [j.error])); return; }
     toast('写入 ' + (j.written || 0) + '，跳过 ' + (j.skipped || 0) + '，失败 ' + (j.failed || 0) +
-          '；失败清单见 rlplayer-meta' + SEP + 'writeback-failures.json');
+          tf('；失败清单见 rlplayer-meta{0}writeback-failures.json', [SEP]));
   }).catch(function () { WB_BUSY = 0; wbButtons(0); wbMsg(''); });
 }
 // 页面（重）打开时同步一次在跑状态：中途刷新页面也能恢复禁用并接上轮询
@@ -3876,8 +4873,8 @@ function wbPreview() {
   WB_BUSY = 1; wbButtons(1); wbMsg('正在扫描 MetaBase…');
   api('/api/writeback?dry=1').then(function (j) {
     WB_BUSY = 0; wbButtons(0); wbMsg('');
-    if (!j || !j.ok) { toast('预览失败：' + ((j && j.error) || '未知错误')); return; }
-    toast((j.writable || 0) + ' 首可写，' + (j.skipped || 0) + ' 首跳过');
+    if (!j || !j.ok) { toast(tf('预览失败：{0}', [((j && j.error) || '未知错误')])); return; }
+    toast((j.writable || 0) + tf(' 首可写，{0} 首跳过', [(j.skipped || 0)]));
   }).catch(function () { WB_BUSY = 0; wbButtons(0); wbMsg(''); toast('预览失败：网络错误'); });
 }
 function wbApply() {
@@ -3886,7 +4883,7 @@ function wbApply() {
   api('/api/writeback', '{"apply":true}').then(function (j) {
     if (!j || !j.ok || !j.started) {
       WB_BUSY = 0; wbButtons(0); wbMsg('');
-      toast('无法启动写回：' + ((j && j.error) || '未知错误'));
+      toast(tf('无法启动写回：{0}', [((j && j.error) || '未知错误')]));
       return;
     }
     wbPoll();
@@ -3942,12 +4939,12 @@ function updateDevMixHint() {
   var t = devMixText(ADV.device);
   var bk = (D('sp_backend') && D('sp_backend').value) || ADV.backend || 'wasapi';
   var tail;
-  if (parseInt(ADV.channels, 10) > 0) tail = '；「输出声道数」= ' + parseInt(ADV.channels, 10) + '，以此为准';
+  if (parseInt(ADV.channels, 10) > 0) tail = tf('；「输出声道数」= {0}，以此为准', [parseInt(ADV.channels, 10)]);
   else if (bk === 'wasapi-shared') tail = '；共享模式输出恒等于设备混音声道数';
   else if (bk === 'wasapi') tail = '；「输出声道数」= 跟随源，独占播放时实际声道随源文件变化';
   else tail = '；「输出声道数」= 跟随源';
   el.innerHTML = '按 <b>' + n + ' 声道</b> 显示' +
-    (devCh ? ('（设备混音 ' + devCh + ' ch' + (t ? (' · ' + esc(t.replace(/^(\d+) 声道 · /, ''))) : '') + '）') : '') + tail;
+    (devCh ? (tf('（设备混音 {0} ch{1}）', [devCh, (t ? (' · ' + esc(t.replace(/^(\d+) 声道 · /, ''))) : '')])) : '') + tail;
 }
 // 重建微调网格（设备切换 / 声道数切换 / 后端切换都走它，保证标签与实际声道一一对应）
 // 注意：只重画 UI，**不改 ADV.channels** —— 设备报 4ch 时 sp_ch 里没有 4 这个选项，
@@ -3976,7 +4973,7 @@ function loadDeviceList() {
     list.forEach(function (d) {
       var dm = DEVMIX[d.id];
       h += '<option value="' + esc(d.id) + '">' + esc(d.name) +
-           (d.default ? '（默认）' : '') +
+           (d.default ? t('（默认）') : '') +
            (dm && dm.channels ? ('  ·  ' + dm.channels + 'ch' + (dm.mixRate ? ('/' + (dm.mixRate / 1000) + 'k') : '')) : '') +
            '</option>';
     });
@@ -3984,47 +4981,63 @@ function loadDeviceList() {
     sel2.value = ADV.device || '';
     sel2.onchange = function () {
       ADV.device = this.value;
-      if (bk === 'wasapi') loadRates();   // 只有 WASAPI 能查设备支持的采样率
+      loadRates();
       // #4 核心：换设备 ⟹ 按该设备的 channels 重建声道微调（2 → L/R；6 → L/R/C/LFE/Ls/Rs；8 → 7.1）
       repaintTrims();
       saveSettings();
       var dm = devMixOf(this.value);
-      toast(dm && dm.channels ? ('输出设备已选择（' + dm.channels + ' 声道），下次播放生效')
+      toast(dm && dm.channels ? (tf('输出设备已选择（{0} 声道），下次播放生效', [dm.channels]))
                              : '输出设备已选择，下次播放生效');
     };
     repaintTrims();      // 首屏：此时 DEVMIX 已有值，微调按设备声道数渲染
   }).catch(function () { });
 }
 
-function loadRates() {
-  api('/api/rates' + (ADV.device ? ('?device=' + encodeURIComponent(ADV.device)) : '')).then(function (j) {
-    var list = j.rates || [];
-    if (!list.length) return;
-    var max = list[list.length - 1];
-    var sel = D('sRate');
-    Array.prototype.forEach.call(sel.options, function (o) {
-      if (o.value === 'max') { o.textContent = t('自动（按族策略选最高）'); o.title = t('设备最高支持') + ' ' + max + ' Hz'; return; }
-      // ★ 'follow' 必须在这里 return：它是枚举值、不是数字。漏掉这一条会让它
-      //   掉进下面的 parseInt 分支（parseInt('follow') = NaN）⟹ 判为"设备不支持"
-      //   ⟹ o.disabled=true 且 sel.value 被强制改成 'max'，于是"跟随系统"永远选不上。
-      //   2026-10-22 功能1 实测踩到：全新安装本该是 follow，页面显示的却是 max。
-      if (o.value === 'follow') {
-        o.textContent = j.sysRate ? ('\u8ddf\u968f\u7cfb\u7edf\uff08' + j.sysRate + ' Hz\uff09')
-                                  : '\u8ddf\u968f\u7cfb\u7edf';
+var RATE_UI={generation:0,savedKey:'',model:null};
+function paintRateOptions(model) {
+  RATE_UI.model=model;
+  ['sRate','sp_rate'].forEach(function(id) {
+    var sel=D(id);if(!sel)return;
+    var selected=sel.value,list=model.rates||[],known=model.status==='known';
+    sel.dataset.rlRateState=model.status;
+    Array.prototype.forEach.call(sel.options,function(o) {
+      o.disabled=false;o.title='';
+      if(o.value==='max') {
+        o.textContent=t('自动（按族策略选最高）');
+        o.title=known?t('设备最高支持')+' '+Math.max.apply(Math,list)+' Hz':t(model.status==='offline'?'离线处理，不打开音频设备。':'设备能力未确认');
         return;
       }
-      if (o.value === 'src') return;
-      var r = parseInt(o.value, 10);
-      var ok = list.indexOf(r) >= 0;
-      o.disabled = !ok;
-      if (!ok && sel.value === o.value) sel.value = 'max';
-      o.textContent = String(r) + (ok ? '' : '  \uff08\u8bbe\u5907\u4e0d\u652f\u6301\uff09');
+      if(o.value==='follow') {o.textContent=t('跟随系统')+(model.sysRate?'（'+model.sysRate+' Hz）':'');return;}
+      if(o.value==='src')return;
+      var rate=Number(o.value);if(!Number.isFinite(rate)||rate<=0)return;
+      var unsupported=known&&list.indexOf(rate)<0;
+      o.disabled=unsupported;
+      o.textContent=String(rate)+(unsupported?'  '+t('（设备不支持）'):model.status==='offline'?'  '+t('（离线处理）'):!known?'  '+t('（能力未确认）'):'');
     });
-    var nm = j.device ? ('\u8f93\u51fa\u8bbe\u5907\uff1a' + j.device) : '';
-    if (nm && D('devName')) D('devName').textContent = nm;
-  }).catch(function () { });
+    // Capability is descriptive: keep saved values and edits, even if unsupported.
+    sel.value=selected;
+  });
+  if(model.device&&D('devName'))D('devName').textContent=t('输出设备：')+model.device;
+  if(typeof rlStudioSync==='function'&&typeof rlMode!=='undefined'&&rlMode==='pro')rlStudioSync();
 }
-
+function loadRates() {
+  var generation=++RATE_UI.generation,backend=ADV.backend||'wasapi',device=ADV.device||'';
+  var key=backend+'|'+device,ready=PLAYBACK_SETTINGS.ready;
+  var status=ready&&backend==='null'?'offline':'unknown';
+  paintRateOptions({status:status,rates:[]});
+  // /api/rates probes WASAPI. Its default DAC is not an ASIO or Null capability.
+  if(!ready||backend==='null'||backend==='upnp')return Promise.resolve();
+  var asio=backend==='asio';
+  if(asio&&RATE_UI.savedKey!==key)return Promise.resolve();
+  return api(asio?'/api/preset/caps':'/api/rates'+(device?'?device='+encodeURIComponent(device):'')).then(function(j) {
+    if(generation!==RATE_UI.generation||key!==(ADV.backend||'wasapi')+'|'+(ADV.device||''))return;
+    var result=asio&&j&&j.device||j||{},list=Array.isArray(result.rates)?result.rates.filter(function(r){return Number.isFinite(r)&&r>0;}):[];
+    var known=!!(j&&j.ok&&list.length&&(asio?result.backend==='asio':backend==='wasapi'));
+    paintRateOptions({status:known?'known':'unknown',rates:list,sysRate:!asio&&j&&j.sysRate||0,device:asio?result.name:j&&j.device});
+  }).catch(function() {
+    if(generation===RATE_UI.generation)paintRateOptions({status:'unknown',rates:[]});
+  });
+}
 /* ---------------- 媒体库状态 ---------------- */
 // 2026-10-24（用户 261024-01 #6/#7）：本地音乐库页用「数字」代替一段说明文字 ——
 // 曲目 / 专辑 / 扫描线程 / 上次扫描耗时 一眼可见，说明文字全部收进 (?)。
@@ -4052,20 +5065,23 @@ function loadLibStats() {
     if (S.scanning) {
       if (bScanEl) {
         bScanEl.classList.add('spinning');
-        bScanEl.title = '正在扫描音乐库 (' + (j.scanned || 0) + '/' + (j.total || 0) + ')';
+        bScanEl.title = tf('正在扫描音乐库 ({0}/{1})', [(j.scanned || 0), (j.total || 0)]);
       }
       D('scanbar').style.display = '';
       var pct = j.total > 0 ? Math.min(100, j.scanned / j.total * 100) : 0;
       D('scanfill').style.width = pct + '%';
-      D('cnt').textContent = '扫描中 ' + j.scanned + '/' + j.total;
+      D('cnt').textContent = tf('扫描中 {0}/{1}', [j.scanned, j.total]);
     } else {
       if (bScanEl) {
         bScanEl.classList.remove('spinning');
-        bScanEl.title = '重新扫描音乐库';
+        bScanEl.title = t('重新扫描音乐库');
       }
       D('scanbar').style.display = 'none';
       if (wasScanning) {
-        var msg = '扫描完成：共 ' + (j.tracks || 0) + ' 首曲目，' + (j.albums || 0) + ' 张专辑';
+        // A v5 index migration can establish the current track's album/cover
+        // identity while it remains selected. Re-resolve it when scanning ends.
+        refreshCurrentCover();
+        var msg = tf('扫描完成：共 {0} 首曲目，{1} 张专辑', [(j.tracks || 0), (j.albums || 0)]);
         toast(msg);
         window._lastScanSummary = { tracks: j.tracks, albums: j.albums };
         if (S.view === 'albums') loadAlbums('');
@@ -4088,11 +5104,13 @@ function loadLibStats() {
       });
     }
     if (S.view === 'settings' && D('sp_roots')) drawRoots();
+    if (typeof rlDailyNode==='function' && S.view==='settings' && D('rlFolderList')) rlDrawDailyRoots();
   }).catch(function () { });
 }
 
 /* ---------------- 流媒体 ---------------- */
 function loadRemote(id) {
+  if(typeof rlPageTransitionBegin==='function')rlPageTransitionBegin('remote');
   S.view = 'remote';
   api('/api/src/browse?id=' + encodeURIComponent(id || '')).then(function (j) {
     if (j.err && !(j.items || []).length) {
@@ -4104,7 +5122,7 @@ function loadRemote(id) {
         esc(j.err) + '<br>支持 Navidrome / Subsonic / Emby（只取原始文件，不转码）。先在「设置 → 流媒体」添加并启用一台服务器，保存后回到这里即可浏览。</div>' +
         '<button class="btn pri" id=remoteGoSet>去设置里配置</button>' +
         '<button class="btn" id=remoteRetry style="margin-left:8px">重试</button></div>';
-      if (D('remoteGoSet')) D('remoteGoSet').onclick = function () { openSettingsTab('stream'); };
+      if (D('remoteGoSet')) D('remoteGoSet').onclick = function () { rlOfferProfessional('stream'); };
       if (D('remoteRetry')) D('remoteRetry').onclick = function () { loadRemote(id || ''); };
       return;
     }
@@ -4152,14 +5170,14 @@ function srcShowForm(open, s) {
   if (!open) { SRC.editing = ''; return; }
   SRC.editing = s ? String(s.id) : '';
   var ft = D('sp_src_ftitle');
-  if (ft) ft.textContent = s ? ('编辑服务器 · ' + (s.name || s.base || '')) : '添加服务器';
+  if (ft) ft.textContent = s ? (tf('编辑服务器 · {0}', [(s.name || s.base || '')])) : '添加服务器';
   D('sp_src_name').value = s ? (s.name || '') : '';
   D('sp_src_kind').value = s ? (s.kind || 'subsonic') : 'subsonic';
   D('sp_src_base').value = s ? (s.base || '') : '';
   D('sp_src_user').value = s ? (s.user || '') : '';
   D('sp_src_pass').value = '';
   D('sp_src_pass').placeholder = s ? '留空 = 保持原密码' : '密码';
-  srcFormMsg(s ? ('正在编辑「' + (s.name || s.base) + '」') : '');
+  srcFormMsg(s ? (tf('正在编辑「{0}」', [(s.name || s.base)])) : '');
   var f = D('sp_src_name'); if (f) f.focus();
 }
 function srcFormBody() {
@@ -4203,16 +5221,16 @@ function renderSrcList() {
       if (a === 'test') { srcTestSaved(id, b); return; }
       if (a === 'on') {
         api('/api/src/config', 'action=active&id=' + encodeURIComponent(id)).then(function (j) {
-          if (!j || !j.ok) { toast('启用失败：' + ((j && j.error) || '未知错误')); return; }
-          toast('已启用「' + (s ? (s.name || s.base) : id) + '」');
+          if (!j || !j.ok) { toast(tf('启用失败：{0}', [((j && j.error) || '未知错误')])); return; }
+          toast(tf('已启用「{0}」', [(s ? (s.name || s.base) : id)]));
           loadSrcConfig();
         }).catch(function () { toast('启用失败：服务没响应'); });
         return;
       }
       if (a === 'del') {
-        if (!confirm('删除服务器「' + (s ? (s.name || s.base) : id) + '」？只删配置，不动已下载缓存。')) return;
+        if (!confirm(tf('删除服务器「{0}」？只删配置，不动已下载缓存。', [(s ? (s.name || s.base) : id)]))) return;
         api('/api/src/config', 'action=remove&id=' + encodeURIComponent(id)).then(function (j) {
-          if (!j || !j.ok) { toast('删除失败：' + ((j && j.error) || '未知错误')); return; }
+          if (!j || !j.ok) { toast(tf('删除失败：{0}', [((j && j.error) || '未知错误')])); return; }
           if (String(SRC.editing) === String(id)) srcShowForm(false);
           toast('已删除');
           loadSrcConfig();
@@ -4254,7 +5272,7 @@ function srcSave() {
              (SRC.editing ? ('&id=' + encodeURIComponent(SRC.editing)) : '') + '&' + srcFormBody();
   srcFormMsg('保存中…');
   api('/api/src/config', body).then(function (j) {
-    if (!j || !j.ok) { srcFormMsg('保存失败：' + ((j && j.error) || '未知错误'), false); return; }
+    if (!j || !j.ok) { srcFormMsg(tf('保存失败：{0}', [((j && j.error) || '未知错误')]), false); return; }
     var wasEdit = !!SRC.editing;
     srcShowForm(false);
     toast(wasEdit ? '服务器已更新' : '服务器已添加');
@@ -4288,19 +5306,695 @@ function discoverDlna() {
 }
 
 /* ---------------- 视图切换 ---------------- */
-// 2026-10-23（合并 r4-shell 的"EQ 移入设置页" + r4-np 的"单曲页 EQ 芯片"）：
+// 2026-10-23（合并 r4-shell 的tf('EQ 移入设置页{0}', [r4-np]) 的"单曲页 EQ 芯片"）：
 // 以前 EQ 是一级视图（setView('eq') + loadEqView()），现在它是设置页里的一个页签。
 // 统一走这个入口，别再直接 setView('eq')（那个视图已经不存在）。
-function openSettingsTab(g) {
-  setView('settings');
+function openSettingsTab(g, remember) {
+  if(['pcm','sdm','eq'].indexOf(g)>=0){
+    if(rlMode!=='pro')rlSetMode('pro',!!remember);setView('listening');
+    if(typeof rlOpenStudioModule==='function')rlOpenStudioModule(g);return;
+  }
+  if(rlMode!=='pro') rlSetMode('pro',!!remember);
+  setView('settings',true);
   var b = document.querySelector('#setpage .stab[data-g=' + (g || 'eq') + ']');
   if (b) b.click();
   var sp = document.getElementById('setpage');
   if (sp && sp.scrollTo) sp.scrollTo(0, 0);
 }
-function setView(v) {
+/* QUICK_START_LOGIC_BEGIN */
+// Capability-first workstation flow inspired by RLPlayer-Mac (GPL-3.0-or-later).
+function quickStartModel(caps, backend, runtime) {
+  var d = (caps && caps.ok && caps.device) || {}, r = runtime || {};
+  var remote = backend === 'upnp', shared = backend === 'wasapi-shared', offline=backend==='null';
+  var known = !offline && !remote && !!(caps && caps.ok && d.name && Array.isArray(d.rates) && d.rates.length && d.maxRate > 0);
+  var nativeDsd = backend === 'asio' && d.dsdNative === true;
+  return {name: offline?t('离线处理（Null）'):(remote?t('请查看投放设备能力'):(d.name || t('未知'))), backend: backend || 'wasapi', known: known,
+    remote: remote, shared: shared, offline:offline, maxRate: known ? d.maxRate : 0,
+    pcmReady: known && !remote && !shared,
+    dsdReady: known && !remote && !shared && (nativeDsd || d.dop === true),
+    dsdRoute: nativeDsd ? 'Native DSD' : (d.dop ? 'DoP' : t('不支持')),
+    dsdMax: nativeDsd ? d.dsdNativeMax : d.dopMax,
+    gpuAvailable: !!r.gpuOn, gpuUsed: !!r.gpuUsed,
+    recommended: known && !remote && !shared ? 'pcm' : '', notes: (caps && caps.notes) || []};
+}
+function quickStartHtml(m) {
+  var chip = function (label, value) { return '<div class=qs-cap><span>' + esc(t(label)) + '</span><strong>' + esc(value) + '</strong></div>'; };
+  var choices = [['bitperfect', '原音直通', '保持源采样率；关闭会改变样本的处理。', true],
+    ['pcm', 'PCM 升频', '根据设备能力设置 PCM 升频。', m.pcmReady],
+    ['dsd', 'DSD 升频', '通过 Native DSD 或 DoP 输出。', m.dsdReady]];
+  var h = '<section class=quick-start aria-labelledby=qsTitle><div class=qs-intro><div><div class=qs-eyebrow>RLPLAYER / START</div>'
+    + '<h1 id=qsTitle>' + esc(t('快速开始')) + '</h1><p>' + esc(t('先确认输出，再选择你的播放方式。')) + '</p></div>'
+    + '<button class=btn id=qsEnterLibrary>' + esc(t('打开音乐库')) + ' →</button></div>'
+    + '<div class=qs-device><div><span class=qs-label>' + esc(t('当前设备')) + '</span><strong>' + esc(m.name) + '</strong>'
+    + '<span class=qs-backend>' + esc(m.backend) + '</span></div><button class=btn id=qsRefresh>' + esc(t('刷新硬件能力')) + '</button></div>'
+    + '<div class=qs-caps>' + chip('PCM', m.remote ? t('请查看投放设备能力') : (m.maxRate ? (m.maxRate / 1000 + ' kHz') : t('未知')))
+    + chip('DSD', m.dsdReady ? (m.dsdRoute + ' · ' + (m.dsdMax || t('未知'))) : (m.remote ? t('请查看投放设备能力') : t('不支持')))
+    + chip('GPU', m.gpuUsed ? t('本次正在使用') : (m.gpuAvailable ? t('可用，本次未使用') : t('CPU 处理'))) + '</div>';
+  if (m.remote || m.shared || !m.known) h += '<p class=qs-note role=status>' + esc(t(m.remote ? '投放格式以远端设备声明为准，本机声卡能力不适用。' : (m.shared ? '共享输出经过系统混音，不承诺逐位直通。' : (m.offline?'离线处理，不打开音频设备。':'能力尚未确认，请先选择输出设备。')))) + '</p>';
+  h += '<h2>' + esc(t('选择播放方式')) + '</h2><div class=qs-profiles>';
+  choices.forEach(function (c) {
+    h += '<button class=qs-profile data-qs-profile="' + c[0] + '" aria-pressed=false' + (c[3] ? '' : ' disabled') + '><span class=qs-profile-top><strong>' + esc(t(c[1])) + '</strong>'
+      + (m.recommended === c[0] ? '<span class=qs-recommend>' + esc(t('推荐')) + '</span>' : '') + '</span><span>' + esc(t(c[2])) + '</span><span class=qs-profile-action>' + esc(t(c[3] ? '查看并应用' : '当前能力未确认或不支持')) + ' →</span></button>';
+  });
+  h += '</div><div id=qsPreview class=qs-preview hidden aria-live=polite></div><h2>' + esc(t('下一步')) + '</h2><div class=qs-actions>';
+  [['qsChooseMusic', '添加音乐目录'], ['qsChooseOutput', '选择输出'], ['qsInspectSignal', '查看信号链'], ['qsOpenEq', 'EQ / 声音校准']].forEach(function (a) {
+    h += '<button class=qs-action id=' + a[0] + '>' + esc(t(a[1])) + '<span>↗</span></button>';
+  });
+  return h + '</div><p class=qs-foot>' + esc(t('这里只更改你确认的设置，不会自动播放。高级参数仍可在设置中调整。')) + '</p></section>';
+}
+/* QUICK_START_LOGIC_END */
+var quickStartSelection = '', quickStartGeneration = 0, quickStartRuntime = '';
+/* QUICK_START_PREFERENCE_BEGIN */
+var QUICK_START_PREF = {loaded:false, initial:true, navigated:false, saving:false};
+function quickStartEnabled() {
+  return QUICK_START_PREF.loaded && ADV.quickStart !== 0;
+}
+function syncQuickStartVisibility() {
+  var nav=D('navQuickStart');if(nav){nav.hidden=true;nav.style.display='none';}
+  var settings=document.querySelector('.side .nav[data-v=settings]');
+  if(settings)settings.hidden=rlMode!=='pro';
+}
+function applyQuickStartPreference(value) {
+  ADV.quickStart=value===0?0:1;QUICK_START_PREF.loaded=true;syncQuickStartVisibility();
+  if(QUICK_START_PREF.initial&&!QUICK_START_PREF.navigated)setView('listening');
+  QUICK_START_PREF.initial=false;
+}
+function saveQuickStartPreference(value) {
+  if (!ensurePlaybackSettings() || QUICK_START_PREF.saving) {
+    syncQuickStartVisibility(); return Promise.resolve({ok:false});
+  }
+  var next = value ? 1 : 0;
+  QUICK_START_PREF.saving = true;
+  if (D('sp_quickstart')) D('sp_quickstart').disabled = true;
+  // This appearance preference must not re-save volume or any audio parameter.
+  return persistSettings('quickstart=' + next).then(function (j) {
+    QUICK_START_PREF.saving = false;
+    if (j && j.ok) applyQuickStartPreference(next);
+    else syncQuickStartVisibility();
+    return j || {ok:false};
+  });
+}
+/* QUICK_START_PREFERENCE_END */
+// A presentation preference never enters the audio configuration or preset planner.
+var rlMode = 'listen', rlLastStatus = null, rlHomeAlbums = [];
+function rlSetMode(mode, remember) {
+  rlMode = mode === 'pro' ? 'pro' : 'listen';
+  document.documentElement.dataset.rlMode = rlMode;
+  if (remember) {
+    try { localStorage.setItem('rlplayer-ui-mode', rlMode); } catch (_) {}
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('#rlViewModes [data-rl-mode]'), function (button) {
+    button.setAttribute('aria-pressed', String(button.dataset.rlMode === rlMode));
+  });
+  if (typeof rlSettingsState!=='undefined' && rlSettingsState) {
+    if(mode==='listen' && S.view==='settings')setView('listening');
+    else if(S.view==='settings')rlSettingsRoute(false);
+  }
+  if (D('rlListenHome')) rlPaintHome();
+  if(typeof rlConsole!=='undefined' && PLAYBACK_SETTINGS.ready)rlConsole.refresh().catch(function(){});
+  rlSyncHomeNavigation();
+}
+(function () {
+  var saved;
+  try { saved = localStorage.getItem('rlplayer-ui-mode'); } catch (_) {}
+  rlSetMode(saved, false);
+  D('rlViewModes').onclick = function (event) {
+    var button = event.target.closest('button[data-rl-mode]');
+    if (button && button.dataset.rlMode !== rlMode) rlSetMode(button.dataset.rlMode, true);
+  };
+})();
+function rlSetText(id, value) {
+  var el = D(id);
+  if (el && el.textContent !== value) el.textContent = value;
+}
+function rlHomeActive() { return S.view === 'station' || S.view === 'listening'; }
+function rlHomeLabel() { return t(rlMode === 'pro' ? '数字音乐台' : '聆听室'); }
+function rlSetNavCurrent(button, current) {
+  button.classList.toggle('on', current);
+  if (current) button.setAttribute('aria-current', 'page');
+  else button.removeAttribute('aria-current');
+}
+function rlSyncHomeNavigation() {
+  var label=rlHomeLabel(),nav=D('rlHomeNavLabel');
+  rlSetText('rlHomeNavLabel',label);syncQuickStartVisibility();
+  if(!rlHomeActive())return;
+  if(nav)rlSetNavCurrent(nav.closest('.nav'),true);
+  head(label,'','');
+}
+function rlNav(view) {
+  var link = document.querySelector('.side .nav[data-v="' + view + '"]');
+  if (link) link.click();
+}
+function rlHomeButton(id, label, primary) {
+  return '<button type=button class="btn' + (primary ? ' pri' : '') + '" id=' + id + '>' + esc(label) + '</button>';
+}
+function rlInstallHome() {
+  if (D('rlListenHome')) return;
+  var pathNode = function (title, id) {
+    return '<div class=rlPathNode><small>' + esc(title) + '</small><strong id=' + id + '></strong></div>';
+  };
+  D('list').innerHTML = '<section id=rlListenHome aria-labelledby=rlHomeTitle><header class=rlListenHeading><h1 id=rlHomeTitle></h1>'
+     + '</header><div class=rlListenGrid><section class=rlListenHero>'
+    + '<div class=rlListenCover id=rlListenCover aria-hidden=true></div><div class=rlListenInfo>'
+    + '<div class=rlListenStatus id=rlListenStatus></div><h2 class=rlListenTitle id=rlListenTitle></h2>'
+    + '<p class=rlListenMeta id=rlListenMeta></p><div class=rlListenActions>'
+    + '<button type=button class=btn id=rlListenFavorite aria-pressed=false disabled><svg width=17 height=17 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=1.8 aria-hidden=true><path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z"/></svg><span></span></button>' + rlHomeButton('rlListenMore', '打开曲目详情')
+    + '</div></div></section><section class=rlListenQueue><div class=rlQueueHeading><h2>' + esc('播放队列') + '</h2>'
+    + rlHomeButton('rlQueueOpen', '查看全部') + '</div><div id=rlListenQueueList></div></section></div>'
+    + '<section class=rlProPath id=rlProPath><div class=rlQueueHeading><h2>' + esc('实际信号路径') + '</h2>'
+    + rlHomeButton('rlChainOpen', '查看信号链') + '</div><div class=rlPathNodes>'
+    + pathNode('源文件','rlPathSource') + pathNode('声音处理','rlPathProcessing') + pathNode('设备输出','rlPathOutput') + '</div></section>'
+    + '<section id=rlHomeShelf hidden><div class=rlQueueHeading><h2>' + esc('专辑') + '</h2>'
+    + rlHomeButton('rlLibraryOpen', '打开音乐库') + '</div><div class=rlShelfItems id=rlShelfItems></div></section></section>';
+
+  D('rlListenFavorite').onclick = function (event) {
+    var file=this.dataset.file;if(file)toggleFav(file,event);
+  };
+  D('rlListenMore').onclick = function () {
+    var queued = (S.q.items || [])[S.q.index || 0];
+    if (S.lastCur && (S.playing || !queued || queued === S.lastCur)) openNowPlaying(); else if (queued) rlNav('albums');
+    else { rlOpenDailyTask('library'); }
+  };
+  D('rlQueueOpen').onclick = function () { rlNav('queue'); };
+  D('rlLibraryOpen').onclick = function () { rlNav('albums'); };
+  D('rlChainOpen').onclick = showChain;
+  D('rlListenQueueList').onclick = function (event) {
+    var row = event.target.closest('[data-rl-index]');
+    if (!row) return;
+    var index = Number(row.dataset.rlIndex), q = S.q;
+    if (!q || !q.items[index]) return;
+    var cue = (q.cues || [])[index] || [-1,-1];
+    playPath(q.items[index],cue[0],cue[1],index);
+  };
+  D('rlShelfItems').onclick = function (event) {
+    var button = event.target.closest('[data-rl-album]');
+    if (button) openAlbum(button.dataset.rlAlbum);
+  };
+  rlInstallStudio();
+  rlInstallListeningControls();
+  applyI18n(D('rlListenHome'));
+  rlPaintShelf();
+}
+function rlPaintShelf() {
+  var shelf = D('rlHomeShelf');
+  if (!shelf || !rlHomeActive()) return;
+  var list = D('rlShelfItems');
+  var html = rlHomeAlbums.map(function (a) {
+    return '<button type=button class=rlShelfItem data-rl-album="' + esc(a.k) + '"><span class=rlShelfCover aria-hidden=true>'
+      + (a.cv ? '<img alt="" loading=lazy src="/api/lib/cover?k=' + encodeURIComponent(a.k) + '" onerror="this.hidden=true">' : '')
+      + '</span><span><strong>' + esc(a.name) + '</strong><small>' + esc(a.artist || '') + '</small></span></button>';
+  }).join('');
+  if (list.rlHtml !== html) { list.rlHtml = html; list.innerHTML = html; }
+  shelf.hidden = !rlHomeAlbums.length;
+}
+function rlPaintQueue() {
+  var list = D('rlListenQueueList');
+  if (!list || !rlHomeActive()) return;
+  var q = S.q, items = q.items || [], index = Math.min(Math.max(q.index || 0, 0), items.length-1);
+  var start = Math.max(0, Math.min(index, items.length - 4)), end = Math.min(items.length, start+4);
+  var html = '';
+  for (var j=start; j<end; j++) {
+    var cue = (q.cues || [])[j] || [], title = nam(items[j]);
+    if (cue[0] >= 0) title += ' · ' + fmt(cue[0]);
+    html += '<button type=button class="rlListenQueueRow' + (j === index ? ' on' : '') + '" data-rl-index=' + j
+      + (j === index ? ' aria-current=true' : '') + '><span class=rlQueueNumber>' + (j+1) + '</span><span class=rlQueueTitle>' + esc(title) + '</span></button>';
+  }
+  if (!html) html = '<p class=rlQueueEmpty>' + esc(t('队列为空')) + '</p>';
+  if (list.rlHtml !== html) { list.rlHtml=html; list.innerHTML=html; }
+  rlPaintStudioQueue();
+}
+function rlPaintListeningFavorite(file) {
+  var heart=D('rlListenFavorite');if(!heart)return;
+  file=file===undefined?heart.dataset.file:String(file||'');heart.dataset.file=file;
+  var on=!!file&&FAV_SET.has(file),label=t(on?'取消收藏':'收藏');
+  heart.disabled=!file;heart.classList.toggle('on',on);heart.setAttribute('aria-pressed',String(on));heart.setAttribute('aria-label',label);heart.title=label;heart.querySelector('span').textContent=label;
+}
+function rlPaintHome() {
+  var home = D('rlListenHome');
+  if (!home || !rlHomeActive()) return;
+  var q = S.q || {}, index = q.index || 0, queued = (q.items || [])[index] || '';
+  var file = S.playing ? S.lastCur : (queued || S.lastCur), cue = (q.cues || [])[index] || [];
+  var current = !!file && file === S.lastCur, m = current && S.metaFile === file ? S.curMeta : null;
+  var facts = rlLastStatus && rlLastStatus.current === S.lastCur && rlLastStatus.playing ? rlLastStatus : null;
+  rlSetText('rlHomeTitle', rlHomeLabel());
+  var status = S.playing ? (S.paused ? '已暂停' : '播放中') : (file ? '队列待播' : '未播放');
+  rlSetText('rlListenStatus', t(status));
+  var title = m && m.title || (file ? nam(file) : t('等你选一张唱片'));
+  if (file && file === queued && cue[0] >= 0) title += ' · ' + fmt(cue[0]);
+  rlSetText('rlListenTitle', title);
+  rlSetText('rlListenMeta', m ? [m.artist,m.album || m.folderName].filter(Boolean).join(' · ') : (file ? parentFolder(file) : t('从音乐库选择专辑，或添加音乐目录。')));
+  var art = D('rlListenCover'), bg = current && S.metaFile === file ? D('cv').style.backgroundImage : '';
+  if (art.dataset.image !== bg) {
+    art.dataset.image = bg; art.style.backgroundImage = bg; art.classList.toggle('has-art', !!bg);
+  }
+  rlPaintListeningFavorite(file);
+  rlSetText('rlListenMore', t(current ? '打开曲目详情' : (queued ? '打开音乐库' : '添加音乐目录')));
+  D('rlProPath').hidden = rlMode !== 'pro';
+  var pending = t('等候播放'), sourceFmt = m && (m.sr || m.rate || m.sampleRate);
+  rlSetText('rlPathSource', facts ? (sourceFmt ? (sourceFmt / 1000) + ' kHz' : nam(facts.current)) : pending);
+  var badge = facts ? bpBadgeInfo() : null;
+  rlSetText('rlPathProcessing', facts ? (badge.text || t('未知')) : pending);
+  rlSetText('rlPathOutput', facts && facts.outRate > 0 ? (facts.outRate / 1000) + ' kHz' + (facts.outBits > 0 ? ' / ' + facts.outBits + ' bit' : '') : pending);
+  rlPaintStudio({file:file,current:current,m:m,facts:facts,title:title,status:status,bg:bg});
+  rlPaintListeningControls();
+}
+function rlFocus(id) {
+  var field = D(id);
+  if (!field) return;
+  field.scrollIntoView({block:'center'});
+  field.focus({preventScroll:true});
+}
+// The two forms keep their own DOM and unfinished entries. Only the active
+// fragment is attached, so professional tabs never become daily task controls.
+var rlSettingsState = {parked:{}, task:'home', deviceDirty:false, deviceBusy:false, deviceGeneration:0,
+  profile:'', caps:null, applying:false, libraryBusy:false, updateBusy:false, update:null, staged:false};
+var rlTasks = {
+  out:['选择输出设备','设备和声道','out'], preset:['选择播放方式','原音直通或升频','out'],
+  library:['选择音乐目录','添加或管理本地音乐','adv'], diag:['问题反馈','记录问题与诊断信息','diag'],
+  upd:['关于与更新','版本与增量更新','upd'], pro:['打开专业参数','查看全部调整选项','out']
+};
+function rlDailyButton(id,label,primary) {
+  return '<button type=button id="'+id+'" class="btn'+(primary?' pri':'')+'">'+esc(label)+'</button>';
+}
+function rlDailyField(id,label,control) {
+  return '<div class=rlDailyField><label for="'+id+'">'+esc(label)+'</label>'+control+'</div>';
+}
+function rlDailySection(key,content) {
+  return '<section class=rlDailyDetail data-rl-detail='+key+' hidden><h2 tabindex=-1>'+esc(rlTasks[key][0])+'</h2>'+content+'</section>';
+}
+function rlDailyStatus(id) { return '<p class=rlDailyStatus role=status aria-live=polite id='+id+'></p>'; }
+function rlSettingsMenu() {
+  var home='<section id=rlDailyMenu><h2 id=rlSettingsTitle tabindex=-1>日常设置</h2><div class=rlSettingTasks>';
+  Object.keys(rlTasks).forEach(function(key) { var row=rlTasks[key];
+    home+='<button type=button data-rl-task='+key+'><strong>'+esc(row[0])+'</strong><small>'+esc(row[1])+'</small></button>'; });
+  home+='</div><button type=button class=btn data-rl-task=help>快捷键与技巧</button></section>';
+  var out=rlDailyField('rlOutputKind','播放设备类型','<select id=rlOutputKind></select>')
+    +rlDailyField('rlOutputDevice','输出设备','<select id=rlOutputDevice></select>')
+    +'<div class=rlDailyActions>'+rlDailyButton('rlOutputSave','保存输出设备',true)+rlDailyButton('rlOutputRefresh','刷新设备')+'</div>'+rlDailyStatus('rlOutputMsg');
+  var preset='<div class=rlDailyActions>'
+    +[['bitperfect','原音直通'],['pcm','PCM 升频'],['dsd','DSD 升频']].map(function(p){return '<button type=button class=btn data-rl-profile='+p[0]+' aria-pressed=false>'+esc(p[1])+'</button>';}).join('')
+    +'</div>'+rlDailyStatus('rlPresetHint')+'<div id=rlPresetPreview hidden><p id=rlPresetPlan></p>'+rlDailyButton('rlPresetApply','应用预设',true)+'</div>'+rlDailyStatus('rlPresetMsg');
+  var library=rlDailyField('rlFolderPath','添加音乐目录','<input id=rlFolderPath type=text spellcheck=false dir=auto placeholder="D:&#92;Music">')
+    +'<div class=rlDailyActions>'+rlDailyButton('rlFolderPick','选择文件夹')+rlDailyButton('rlFolderAdd','添加并扫描',true)+rlDailyButton('rlFolderScan','重新扫描音乐库')+'</div>'
+    +'<h3>音乐目录</h3><ul id=rlFolderList></ul>'+rlDailyStatus('rlFolderMsg');
+  var fb='<p>提交时会附上版本、设备、设置与脱敏日志，用于排查问题。</p>'
+    +rlDailyField('rlFbTitle','标题','<input id=rlFbTitle type=text maxlength=140>')
+    +rlDailyField('rlFbBody','详细描述','<textarea id=rlFbBody rows=4></textarea>')
+    +'<div class=rlDailyActions>'+rlDailyButton('rlFbPreview','先看会发送什么')+rlDailyButton('rlFbSubmit','提交反馈',true)+'</div>'
+    +rlDailyStatus('rlFbMsg')+'<div id=rlFbPreviewbox style="display:none" class=rlDailyResult></div><p id=rlFbResult class=rlDailyResult></p>';
+  var update='<p><span>当前版本</span> <strong id=rlUpdateVersion>—</strong></p><div class=rlDailyActions>'
+    +rlDailyButton('rlUpdateCheck','检查更新',true)+rlDailyButton('rlUpdateDownload','下载更新')+rlDailyButton('rlUpdateManual','下载完整版')
+    +rlDailyButton('rlUpdateBaidu','百度网盘')+rlDailyButton('rlUpdateApply','立即更新并重启')+'</div>'+rlDailyStatus('rlUpdateMsg')+'<p id=rlUpdateNotes class=rlDailyResult></p>';
+  return '<div id=rlListenSettings>'+rlDailyButton('rlSettingsBack','返回日常设置')+home+rlDailySection('out',out)+rlDailySection('preset',preset)
+    +rlDailySection('library',library)+rlDailySection('diag',fb)+rlDailySection('upd',update)+'</div>';
+}
+function rlDailyNode(id) { return rlSettingsState.root && rlSettingsState.root.querySelector('#'+id); }
+function rlDailySay(id,text) { var el=rlDailyNode(id); if(el) el.textContent=text||''; }
+function rlSetSettingsSurface(mode) {
+  var page=D('setpage'), state=rlSettingsState, before=page.dataset.rlSurface;
+  if(before===mode) return;
+  if(before) {
+    var parked=document.createDocumentFragment();
+    while(page.firstChild) parked.appendChild(page.firstChild);
+    state.parked[before]=parked;
+  }
+  page.dataset.rlSurface=mode;
+  page.dataset.rlSettings=mode==='listen'?'home':'detail';
+  if(state.parked[mode]) {page.appendChild(state.parked[mode]); delete state.parked[mode];}
+  else if(mode==='pro') { state.syncPreset=null;state.syncDevice=false;renderSettingsPage(); }
+  else {page.innerHTML=rlSettingsMenu();state.root=D('rlListenSettings');rlBindDaily();}
+  applyI18n(page);
+  if(mode==='pro')rlSyncProfessionalForm();
+}
+function rlSyncProfessionalForm() {
+  var state=rlSettingsState,page=D('setpage');
+  if(state.syncDevice) {
+    if(D('sp_backend')) D('sp_backend').value=ADV.backend;
+    applyBackendState();loadDeviceList();state.syncDevice=false;
+  }
+  if(state.syncPreset) {
+    var draft=settingsProfessionalDraft(), group=page.querySelector('.stab.on')?.dataset.g;
+    renderSettingsPage();
+    restoreProfessionalDraft(draft,group,state.syncPreset);state.syncPreset=null;
+  }
+}
+function settingsProfessionalDraft() {
+  var draft={};
+  D('setpage').querySelectorAll('input[id],textarea[id],select[id]').forEach(function(el){
+    if(el.dataset.rlEdited==='1' || ['sp_fbtitle','sp_fbbody','sp_fbsteps','sp_root'].indexOf(el.id)>=0)
+      draft[el.id]=el.type==='checkbox'?el.checked:el.value;
+  });
+  return draft;
+}
+function restoreProfessionalDraft(draft, group, profile) {
+  var replaced=['sp_rate','sp_filt','sp_filtNx','sp_shaper','sp_taps','sp_dsdrate','sp_outmode','sp_2s','sp_sdmo1','sp_sdmoNx','sp_directsdm'];
+  if(profile==='bitperfect') replaced=replaced.concat(['sp_eq','sp_ir','sp_phase','sp_irgpu','sp_isp','sp_loud','sp_roomauto','sp_cleanup','sp_rgmode','sp_atten','sp_transition','peqBypass']);
+  Object.keys(draft).forEach(function(id){var el=D(id);if(!el||replaced.indexOf(id)>=0)return;
+    if(el.type==='checkbox')el.checked=draft[id];else el.value=draft[id];el.dataset.rlEdited='1';});
+  var tab=group&&D('setpage').querySelector('.stab[data-g="'+group+'"]');if(tab)tab.click();
+}
+function rlSettingsRoute(reset) {
+  if(reset)rlSettingsState.proGroup='';
+  rlSetSettingsSurface('pro');
+  head(t('专业模式'),'', '');
+}
+function rlOfferProfessional(group) {openSettingsTab(group);}
+function rlOpenDailyTask(task,proGroup) {
+  if(task==='library' && rlMode==='listen'){rlOpenInlineLibrary();return;}
+  if(rlMode==='listen' && (task==='out'||task==='preset')){
+    if(!rlHomeActive())setView('listening');
+    if(typeof rlOpenListeningCard==='function')rlOpenListeningCard(task==='out'?'output':'profile');
+    return;
+  }
+  openSettingsTab(proGroup||(rlTasks[task]||rlTasks.out)[2]);
+}
+function rlShowDaily(task,focus) {
+  var root=rlSettingsState.root;if(!root||!root.isConnected)return;
+  var previous=rlSettingsState.task;
+  if(!rlTasks[task]||task==='pro')task='home';
+  rlSettingsState.task=task;
+  D('setpage').dataset.rlSettings=task==='home'?'home':'detail';
+  D('rlDailyMenu').hidden=task!=='home';D('rlSettingsBack').hidden=task==='home';
+  root.querySelectorAll('[data-rl-detail]').forEach(function(section){section.hidden=section.dataset.rlDetail!==task;});
+  head(t(task==='home'?'日常设置':rlTasks[task][0]),'', '');
+  if(task==='out')rlInitOutput();
+  if(task==='preset')rlInitPreset();
+  if(task==='library')rlDrawDailyRoots();
+  if(task==='upd')rlReadUpdateState();
+  if(focus){var target=task==='home'&&rlTasks[previous]?root.querySelector('[data-rl-task="'+previous+'"]'):
+    task==='home'?D('rlSettingsTitle'):root.querySelector('[data-rl-detail="'+task+'"] h2');if(target)target.focus();}
+}
+function rlBindDaily() {
+  var root=rlSettingsState.root;
+  root.addEventListener('click',function(event){
+    var b=event.target.closest('[data-rl-task]');if(!b)return;
+    var task=b.dataset.rlTask;
+    if(task==='help')D('bHelp').click();
+    else if(task==='pro')openSettingsTab(rlSettingsState.proGroup||'out',true);
+    else rlShowDaily(task,true);
+  });
+  D('rlSettingsBack').onclick=function(){rlShowDaily('home',true);};
+  D('rlOutputKind').onchange=function(){rlSettingsState.deviceDirty=true;rlDevices('');};
+  D('rlOutputDevice').onchange=function(){rlSettingsState.deviceDirty=true;};
+  D('rlOutputSave').onclick=rlSaveOutput;
+  D('rlOutputRefresh').onclick=function(){rlDevices(D('rlOutputDevice').value);};
+  root.querySelectorAll('[data-rl-profile]').forEach(function(b){b.onclick=function(){rlSettingsState.profile=b.dataset.rlProfile;rlDailySay('rlPresetMsg','');rlPaintPreset();};});
+  D('rlPresetApply').onclick=rlApplyDailyPreset;
+  D('rlFolderPick').hidden=!WV;
+  D('rlFolderPick').onclick=function(){if(WV)wcmd('pick-music-folder');};
+  D('rlFolderAdd').onclick=rlAddFolder;D('rlFolderScan').onclick=rlScanFolder;
+  function feedbackField(id){var key=id.slice(5);return rlDailyNode('rlFb'+key.charAt(0).toUpperCase()+key.slice(1));}
+  D('rlFbPreview').onclick=function(){fbPreview(feedbackField);};
+  D('rlFbSubmit').onclick=function(){fbSubmit(feedbackField);};
+  D('rlUpdateCheck').onclick=rlCheckUpdate;D('rlUpdateDownload').onclick=rlDownloadUpdate;
+  D('rlUpdateManual').onclick=function(){rlManualUpdate('github');};D('rlUpdateBaidu').onclick=function(){rlManualUpdate('baidu');};
+  D('rlUpdateApply').onclick=rlInstallUpdate;
+  ['rlUpdateDownload','rlUpdateManual','rlUpdateBaidu','rlUpdateApply'].forEach(function(id){D(id).hidden=true;});
+}
+function rlInitOutput() {
+  var state=rlSettingsState, kind=D('rlOutputKind'), device=D('rlOutputDevice'), bk=ADV.backend||'wasapi';
+  if(state.deviceDirty && kind.options.length)return;
+  var kinds=[['wasapi-shared','Windows 共享输出'],['wasapi','Windows 独占输出'],['asio','ASIO']];
+  if(!kinds.some(function(o){return o[0]===bk;}))kinds.push([bk,bk==='upnp'?'UPnP / DLNA':bk==='null'?'离线处理（Null）':bk]);
+  kind.replaceChildren();kinds.forEach(function(o){kind.add(new Option(t(o[1]),o[0]));});kind.value=bk;
+  rlDevices(ADV.device||'');
+}
+function rlDevices(chosen) {
+  var state=rlSettingsState, gen=++state.deviceGeneration, kind=rlDailyNode('rlOutputKind').value, select=rlDailyNode('rlOutputDevice');
+  var editable=['wasapi','wasapi-shared','asio'].indexOf(kind)>=0;
+  select.disabled=true;rlDailyNode('rlOutputSave').disabled=true;
+  if(!editable){select.replaceChildren(new Option(chosen||t('当前设备'),chosen));rlDailySay('rlOutputMsg',t('可选择 Windows 或 ASIO 本地输出。'));return;}
+  apiGetRaw(kind==='asio'?'/api/asiodevices':'/api/devices').then(function(j){
+    if(gen!==state.deviceGeneration)return;
+    if(!j||!j.ok)throw Error((j&&j.error)||t('加载失败'));
+    var list=(j.devices||j.drivers||[]).filter(function(d){return d&&d.id;});
+    select.replaceChildren(new Option(t('默认设备'),''));
+    list.forEach(function(d){select.add(new Option(d.name||d.id,d.id));});
+    if(chosen&&!list.some(function(d){return d.id===chosen;}))select.add(new Option(chosen,chosen));
+    select.value=chosen;select.disabled=false;rlDailyNode('rlOutputSave').disabled=state.deviceBusy;
+    rlDailySay('rlOutputMsg',t('更改将在停止后重新播放时使用。'));
+  }).catch(function(e){if(gen===state.deviceGeneration)rlDailySay('rlOutputMsg',e.message||t('加载失败'));});
+}
+function rlSaveOutput(){
+  var state=rlSettingsState;if(!ensurePlaybackSettings()||state.deviceBusy)return;
+  var kind=rlDailyNode('rlOutputKind'), device=rlDailyNode('rlOutputDevice'), button=rlDailyNode('rlOutputSave');
+  if(device.disabled)return;
+  var bk=kind.value,id=device.value;state.deviceBusy=true;button.disabled=kind.disabled=device.disabled=true;
+  apiAct('/api/settings','backend='+encodeURIComponent(bk)+'&device='+encodeURIComponent(id)).then(function(j){
+    if(!j||!j.ok)throw Error((j&&j.error)||t('保存失败'));
+    return apiGetRaw('/api/settings');
+  }).then(function(j){
+    if(!j||!j.ok||!j.kv||j.kv.backend!==bk||(j.kv.device||'')!==id) throw Error(t('无法确认已保存，请重试。'));
+    ADV.backend=bk;ADV.device=id;state.deviceDirty=false;state.syncDevice=true;_capsCache=null;
+    rlDailySay('rlOutputMsg',t('输出设备已保存，停止后重新播放时使用。'));
+    if(D('sp_backend')){D('sp_backend').value=bk;applyBackendState();loadDeviceList();state.syncDevice=false;}
+  }).catch(function(e){rlDailySay('rlOutputMsg',e.message||t('保存失败'));}).finally(function(){state.deviceBusy=false;button.disabled=kind.disabled=device.disabled=false;});
+}
+function rlInitPreset() {
+  var state=rlSettingsState;state.caps=null;rlPaintPreset();
+  var bk=ADV.backend;
+  loadPresetCaps(true).then(function(j){if(bk===ADV.backend){state.caps=j;rlPaintPreset();}});
+}
+function rlPaintPreset() {
+  var state=rlSettingsState, root=state.root;if(!root||state.task!=='preset')return;
+  var model=quickStartModel(state.caps,ADV.backend,S), profile=state.profile;
+  if((profile==='pcm'&&!model.pcmReady)||(profile==='dsd'&&!model.dsdReady))profile='';
+  root.querySelectorAll('[data-rl-profile]').forEach(function(b){
+    var k=b.dataset.rlProfile;b.disabled=state.applying||(k==='pcm'&&!model.pcmReady)||(k==='dsd'&&!model.dsdReady);
+    b.setAttribute('aria-pressed',String(k===profile));
+  });
+  rlDailySay('rlPresetHint',t(S.playing||S.paused?'请先停止播放，再应用预设。':!model.pcmReady?'能力尚未确认，请先选择输出设备。':'选择一种方式，先查看会更改的设置。'));
+  rlDailyNode('rlPresetPreview').hidden=!profile;
+  if(profile)rlDailySay('rlPresetPlan',t(profile==='bitperfect'?
+    '保留当前音量，恢复源采样率，关闭 EQ、卷积、响度、房间校正、修复与预衰减，复位声道增益。音量衰减或共享输出时不能逐位直通。':
+    '按设备能力替换升频、滤波与抖动设置，保留当前音量、EQ、卷积和校准。'));
+  rlDailyNode('rlPresetApply').disabled=!profile||state.applying||S.playing||S.paused||!PLAYBACK_SETTINGS.ready;
+}
+function rlApplyDailyPreset(){
+  var state=rlSettingsState, profile=state.profile;
+  if(!ensurePlaybackSettings()||state.applying||rlDailyNode('rlPresetApply').disabled)return;
+  state.applying=true;rlPaintPreset();
+  apiGetRaw('/api/status').then(function(j){
+    if(!j||!j.ok||j.playing||j.paused)throw Error(t('请先停止播放，再应用预设。'));
+    return apiAct('/api/preset/apply?profile='+encodeURIComponent(profile)+'&preserve_processing=1&keep_volume=1&require_stopped=1','');
+  }).then(function(j){
+    if(!j||!j.ok)throw Error((j&&j.error)||t('应用预设失败'));
+    state.pendingPreset=profile;state.profile='';
+    return loadSettings();
+  }).then(function(j){if(!j||!j.ok)throw Error(t('无法确认已保存，请重试。'));rlDailySay('rlPresetMsg',t('预设已应用。'));})
+    .catch(function(e){rlDailySay('rlPresetMsg',e.message||t('应用预设失败'));})
+    .finally(function(){state.applying=false;rlPaintPreset();});
+}
+function rlDrawDailyRoots(){
+  var list=rlDailyNode('rlFolderList');if(!list)return;
+  var roots=S.roots||[], key=JSON.stringify(roots)+'|'+I18N.lang;
+  if(list.rlKey===key)return;list.rlKey=key;list.replaceChildren();
+  (roots.length?roots:[t('还没有添加目录')]).forEach(function(path){var li=document.createElement('li');li.textContent=path;list.appendChild(li);});
+}
+function rlReceiveMusicFolder(path){
+  if(typeof rlListeningFolderPicked==='function'&&rlListeningFolderPicked(path))return;
+  var field=rlDailyNode('rlFolderPath');if(typeof path==='string'&&path&&field){field.value=path;if(field.isConnected)field.focus();}
+}
+function rlFolderBusy(busy){rlSettingsState.libraryBusy=busy;['rlFolderAdd','rlFolderScan','rlFolderPick','rlFolderPath'].forEach(function(id){rlDailyNode(id).disabled=busy;});}
+function rlScanRequest(){return apiAct('/api/lib/scan','').then(function(j){if(!j||!j.ok)throw Error((j&&j.error)||t('扫描失败'));loadLibStats();});}
+function rlScanFolder(){if(rlSettingsState.libraryBusy)return;rlFolderBusy(true);
+  rlScanRequest().then(function(){rlDailySay('rlFolderMsg',t('开始扫描音乐库'));}).catch(function(e){rlDailySay('rlFolderMsg',e.message);}).finally(function(){rlFolderBusy(false);});}
+function rlAddFolder(){
+  var field=rlDailyNode('rlFolderPath'),path=field.value.trim();if(rlSettingsState.libraryBusy)return;
+  if(!path){rlDailySay('rlFolderMsg',t('请填写目录'));field.focus();return;}
+  rlFolderBusy(true);
+  apiAct('/api/lib/roots','add='+encodeURIComponent(path)).then(function(j){
+    if(!j||!j.ok)throw Error((j&&j.error)||t('添加失败'));
+    field.value='';loadLibStats();
+    return rlScanRequest().then(function(){rlDailySay('rlFolderMsg',t('已添加，正在扫描'));},
+      function(e){rlDailySay('rlFolderMsg',t('目录已保存。')+' '+e.message);});
+  }).catch(function(e){rlDailySay('rlFolderMsg',e.message);}).finally(function(){rlFolderBusy(false);});
+}
+function rlReadUpdateState(){
+  var s=rlSettingsState;
+  apiGetRaw('/api/update/state').then(function(j){
+    if(!j||!j.ok)return;
+    rlDailySay('rlUpdateVersion',j.current||'—');s.updateBlocked=j.pendingPhase==='rollback_failed';s.staged=!!j.staged;
+    if(s.updateBlocked)rlDailySay('rlUpdateMsg',tf('上次回滚未完成，备份已保留：{0}',[j.pendingDetail||'']));
+    else if(s.staged)rlDailySay('rlUpdateMsg',tf('已下好 v{0} 的更新包，点「立即更新并重启」生效',[j.stagedVersion||'']));
+    rlUpdateButtons();
+  }).catch(function(e){rlDailySay('rlUpdateMsg',e.message);});
+}
+function rlUpdateButtons(){
+  var s=rlSettingsState,j=s.update||{}, manual=j.installMode==='manual'||j.install_mode==='manual',blocked=!!s.updateBlocked;
+  rlDailyNode('rlUpdateCheck').disabled=s.updateBusy||blocked;
+  var download=rlDailyNode('rlUpdateDownload');download.hidden=blocked||s.staged||!j.hasUpdate||manual;download.disabled=s.updateBusy||!j.filesToDownload;
+  rlDailyNode('rlUpdateApply').hidden=blocked||!s.staged;rlDailyNode('rlUpdateApply').disabled=s.updateBusy;
+  var fallback=manual||String(j.error||'').indexOf('quota_exceeded')>=0;
+  rlDailyNode('rlUpdateManual').hidden=!fallback||!(j.global||j.globalUrl);rlDailyNode('rlUpdateBaidu').hidden=!fallback||!(j.cn||j.cnUrl);
+}
+function rlUpdateError(e){rlDailySay('rlUpdateMsg',e&&e.message||t('网络错误'));rlSettingsState.updateBusy=false;rlUpdateButtons();}
+function rlCheckUpdate(){
+  var s=rlSettingsState;if(s.updateBusy||s.updateBlocked)return;
+  s.updateBusy=true;s.update=null;rlDailySay('rlUpdateNotes','');rlUpdateButtons();rlDailySay('rlUpdateMsg',t('正在检查…（最长 8 秒）'));
+  function check(force){apiGetRaw('/api/update/check'+(force?'?force=1':'')).then(function(j){
+    if(j&&j.checking){setTimeout(function(){check(false);},700);return;}
+    s.update=j||{};s.updateBusy=false;rlUpdateButtons();
+    if(!j||!j.ok)throw Error(tf('检查失败：{0}',[(j&&j.error)||t('未知原因')]));
+    rlDailySay('rlUpdateMsg',j.hasUpdate?tf('发现新版本 v{0}',[j.latest]):tf('已是最新版本 v{0}',[j.current||j.latest||'—']));
+    rlDailySay('rlUpdateNotes',j.notes||'');
+  }).catch(rlUpdateError);}check(true);
+}
+function rlManualUpdate(target){var j=rlSettingsState.update||{},url=target==='baidu'?(j.cn||j.cnUrl):(j.global||j.globalUrl);
+  if(!url||!extUrlAllowed(url))return;apiAct('/api/update/manual',JSON.stringify({target:target})).catch(function(){});openExternal(url);}
+function rlDownloadUpdate(){
+  var s=rlSettingsState,btn=rlDailyNode('rlUpdateDownload');if(s.updateBusy||s.updateBlocked||btn.hidden||btn.disabled)return;
+  s.updateBusy=true;rlUpdateButtons();rlDailySay('rlUpdateMsg',t('正在下载…'));
+  function poll(){apiGetRaw('/api/update/progress').then(function(p){
+    if(!p||p.phase==='error'||p.error)throw Error((p&&p.error)||t('下载失败'));
+    if(p.phase==='ready'||p.canApply){s.updateBusy=false;s.staged=true;rlUpdateButtons();rlDailySay('rlUpdateMsg',t('下载已完成。'));return;}
+    rlDailySay('rlUpdateMsg',t('正在下载…')+' '+(p.pct||0)+'%');setTimeout(poll,700);
+  }).catch(rlUpdateError);}
+  apiAct('/api/update/download','').then(function(j){if(!j||!j.ok)throw Error((j&&j.error)||t('下载失败'));poll();}).catch(rlUpdateError);
+}
+function rlInstallUpdate(){
+  var s=rlSettingsState;if(s.updateBusy||s.updateBlocked||!s.staged)return;
+  if(!(s.updateArm>Date.now())){s.updateArm=Date.now()+6000;rlDailySay('rlUpdateMsg',t('再点一次：更新并退出'));return;}
+  s.updateArm=0;s.updateBusy=true;rlUpdateButtons();
+  apiAct('/api/update/apply','').then(function(j){if(!j||!j.ok)throw Error((j&&j.error)||t('下载失败'));
+    rlDailySay('rlUpdateMsg',t('程序即将退出，重新打开即完成更新'));}).catch(rlUpdateError);
+}
+
+
+function paintQuickStart(caps) {
+  rlInstallHome();rlSyncHomeNavigation();rlPaintHome();rlPaintQueue();rlPaintShelf();
+}
+function previewQuickStart(profile) {
+  var btn = document.querySelector('[data-qs-profile="' + profile + '"]');
+  if (!btn || btn.disabled || !D('qsPreview')) return;
+  quickStartSelection = profile;
+  Array.prototype.forEach.call(document.querySelectorAll('[data-qs-profile]'), function (b) {
+    b.setAttribute('aria-pressed', b.dataset.qsProfile === profile ? 'true' : 'false');
+  });
+  var box = D('qsPreview'); box.hidden = false;
+  var desc = profile === 'bitperfect' ? '将设置音量 0 dB、源采样率，并关闭 EQ、IR、等响度和其他处理。'
+    : '将按设备能力配置滤波与输出，保留 EQ 和校准；预设参数会替换当前升频设置。';
+  box.innerHTML = '<div><strong>' + esc(t('应用前确认')) + '</strong><p>' + esc(t(desc)) + '</p><small>' + esc(t(S.playing ? '请先停止播放，再应用预设。' : '不会启动播放，也不会改变音乐库或队列。'))
+    + '</small></div><button class="btn pri" id=qsApply' + (S.playing ? ' disabled' : '') + '>' + esc(t('应用预设')) + '</button>';
+  D('qsApply').onclick = function () {
+    if (S.playing) return;
+    this.disabled = true;
+    applyPreset(profile,{preserveProcessing:true}).then(function (j) { if (j && j.ok) quickStartSelection = ''; if (S.view === 'station') paintQuickStart(_capsCache); });
+  };
+}
+function renderQuickStart(force) {
+  var generation = ++quickStartGeneration;
+  paintQuickStart(_capsCache);
+  loadPresetCaps(!!force).then(function (j) {
+    if (S.view === 'station' && generation === quickStartGeneration) paintQuickStart(j || _capsCache);
+  });
+}
+// 2026-11-12（3.3.8）：整页切换原子化。
+// 根因不是右栏显示太早，而是左页的封面/列表还在异步到达：旧实现只藏右栏，右栏位置先露出
+// 主题背景（浅色/蓝色主题下就是黑块），左页封面随后才逐张出现。现在切页时主区+右栏一起藏，
+// 主题色遮罩盖住内容区；等左页 DOM 有内容、首屏图片解码完成（最多 320ms）后同一帧揭示两侧。
+var RL_PAGE_TRANSITION={on:false,timer:0,slowTimer:0,frame:0,observer:null,started:0,target:'',endToken:0,oldText:'',contentChanged:false};
+function rlPageTransitionNow(){return (typeof performance!=='undefined'&&performance.now)?performance.now():Date.now();}
+function rlPageTransitionTrace(tag){
+  try{
+    var main=document.querySelector('.main'),right=D('right'),veil=D('pageVeil'),list=D('list');
+    var trace=window.__rlTransitionTrace||(window.__rlTransitionTrace=[]);
+    trace.push({t:Math.round(rlPageTransitionNow()),tag:tag,target:RL_PAGE_TRANSITION.target,
+      main:main?getComputedStyle(main).visibility:'',right:right?getComputedStyle(right).visibility:'',
+      veil:veil?getComputedStyle(veil).display:'',children:list?list.children.length:0,
+      text:list?String(list.textContent||'').trim().length:0,
+      imgs:list?list.querySelectorAll('img').length:0,
+      pending:list?Array.prototype.filter.call(list.querySelectorAll('img'),function(i){return !i.complete;}).length:0,
+      visiblePending:list?Array.prototype.filter.call(list.querySelectorAll('img'),function(i){if(i.complete)return false;var r=i.getBoundingClientRect();return r.width>0&&r.height>0&&r.bottom>0&&r.top<(window.innerHeight||800)&&r.right>0&&r.left<(window.innerWidth||1200);}).length:0});
+    if(trace.length>120)trace.splice(0,trace.length-120);
+  }catch(e){}
+}
+function rlPageTransitionBegin(target){
+  var app=D('app');if(!app)return;
+  target=target||S.view;
+  if(target==='listening'||target==='station'||target==='settings'||target==='queue'){rlPageTransitionEnd(true);return;}
+  RL_PAGE_TRANSITION.on=true;RL_PAGE_TRANSITION.target=target;
+  RL_PAGE_TRANSITION.started=rlPageTransitionNow();
+  var oldList=D('list');RL_PAGE_TRANSITION.oldText=oldList?String(oldList.textContent||'').trim():'';RL_PAGE_TRANSITION.contentChanged=false;
+  app.classList.remove('rlSwitchSlow');
+  // 只有在 90ms 内还没画完才铺遮罩：常见页（专辑缓存命中）根本不会闪，慢页才用同色遮罩过渡。
+  clearTimeout(RL_PAGE_TRANSITION.slowTimer);
+  RL_PAGE_TRANSITION.slowTimer=setTimeout(function(){if(RL_PAGE_TRANSITION.on)app.classList.add('rlSwitchSlow');},90);
+  app.classList.add('rlPageSwitching');
+  window.__rlTransitionTrace=[];
+  rlPageTransitionTrace('begin');
+  clearTimeout(RL_PAGE_TRANSITION.timer);
+  RL_PAGE_TRANSITION.timer=setTimeout(function(){rlPageTransitionEnd(true);},6000);
+  rlPageTransitionWatch();
+}
+function rlPageTransitionEnd(force){
+  if(!RL_PAGE_TRANSITION.on)return;
+  if(!force&&rlPageTransitionNow()-RL_PAGE_TRANSITION.started<70){
+    clearTimeout(RL_PAGE_TRANSITION.timer);
+    RL_PAGE_TRANSITION.timer=setTimeout(function(){rlPageTransitionTryEnd();},35);
+    return;
+  }
+  RL_PAGE_TRANSITION.on=false;
+  clearTimeout(RL_PAGE_TRANSITION.timer);RL_PAGE_TRANSITION.timer=0;
+  if(RL_PAGE_TRANSITION.frame&&typeof cancelAnimationFrame==='function')cancelAnimationFrame(RL_PAGE_TRANSITION.frame);
+  RL_PAGE_TRANSITION.frame=0;
+  if(RL_PAGE_TRANSITION.observer){try{RL_PAGE_TRANSITION.observer.disconnect();}catch(e){}RL_PAGE_TRANSITION.observer=null;}
+  clearTimeout(RL_PAGE_TRANSITION.slowTimer);RL_PAGE_TRANSITION.slowTimer=0;
+  var app=D('app');if(app)app.classList.remove('rlPageSwitching','rlSwitchSlow');
+  rlPageTransitionTrace('end');
+}
+function rlPageTransitionWatch(){
+  var list=D('list');if(!list)return;
+  if(RL_PAGE_TRANSITION.observer){try{RL_PAGE_TRANSITION.observer.disconnect();}catch(e){}RL_PAGE_TRANSITION.observer=null;}
+  if(typeof MutationObserver!=='function'||typeof requestAnimationFrame!=='function')return;
+  var observer=new MutationObserver(function(){rlPageTransitionTryEnd();});
+  observer.observe(list,{childList:true,subtree:true,characterData:true});
+  RL_PAGE_TRANSITION.observer=observer;
+}
+function rlPageTransitionTryEnd(){
+  if(!RL_PAGE_TRANSITION.on)return;
+  if(RL_PAGE_TRANSITION.frame&&typeof cancelAnimationFrame==='function')cancelAnimationFrame(RL_PAGE_TRANSITION.frame);
+  var token=++RL_PAGE_TRANSITION.endToken;
+  // 双 rAF：先让本次 innerHTML 完成布局，再检查内容/封面；两侧始终在同一帧揭示。
+  RL_PAGE_TRANSITION.frame=requestAnimationFrame(function(){
+    RL_PAGE_TRANSITION.frame=requestAnimationFrame(function(){
+      if(!RL_PAGE_TRANSITION.on||token!==RL_PAGE_TRANSITION.endToken)return;
+      rlPageTransitionTrace('probe');
+      var list=D('list');if(!list)return rlPageTransitionEnd(true);
+      if(!list.children.length||!String(list.textContent||'').trim())return; // 还在 loading 空态，等下一次 DOM 更新
+      var nowText=String(list.textContent||'').trim();
+      if(!RL_PAGE_TRANSITION.contentChanged&&nowText===RL_PAGE_TRANSITION.oldText&&rlPageTransitionNow()-RL_PAGE_TRANSITION.started<700)return; // 还是旧页，等新页替换
+      RL_PAGE_TRANSITION.contentChanged=true;
+      // 只等首屏可见封面：178 张全部 decode 会把切页拖到数秒；首屏就绪即可整页揭示，
+      // 首屏以下继续由浏览器懒加载，不会出现「右边先出、左边封面最后才一张张冒出来」。
+      var vh=window.innerHeight||800,vw=window.innerWidth||1200;
+      var imgs=Array.prototype.slice.call(list.querySelectorAll('img')).filter(function(img){
+        if(img.complete)return false;var r=img.getBoundingClientRect();
+        return r.width>0&&r.height>0&&r.bottom>0&&r.top<vh&&r.right>0&&r.left<vw;
+      }).slice(0,24);
+      if(!imgs.length)return rlPageTransitionEnd();
+      var done=false,finish=function(){if(done)return;done=true;rlPageTransitionEnd();};
+      var timer=setTimeout(finish,500);
+      Promise.all(imgs.map(function(img){
+        if(img.decode)return img.decode().catch(function(){});
+        return new Promise(function(resolve){
+          if(img.complete)return resolve();
+          img.addEventListener('load',resolve,{once:true});img.addEventListener('error',resolve,{once:true});
+        });
+      })).then(function(){clearTimeout(timer);finish();},function(){clearTimeout(timer);finish();});
+    });
+  });
+}
+function setView(v, sameViewRefresh) {
+  if(v==='station')v='listening';
+  if(typeof rlPageTransitionBegin==='function')rlPageTransitionBegin(v);
+  if(v==='settings'&&rlMode!=='pro')rlSetMode('pro',true);
+  if (v !== 'settings') ++CLEANUP_UI.generation;
+  if (!sameViewRefresh || v !== S.view) QUICK_START_PREF.navigated = true;
+  var blockedQuickStart = false;
+  if (blockedQuickStart) v = 'albums';
   // 261024-05 #T2：离开专辑页 → 立即停掉整张专辑的曲目预取队列，切页面后不再发旧 key 的请求
-  if (v !== 'album') albPrefStop();
+  if (v !== 'album' && (v !== 'albums' || S.view !== 'albums')) albPrefStop();
   S.view = v;
   // 2026-10-23（uicheck 复现的真实 bug）：全局搜索框有 260ms 防抖，输入后立刻点左侧别的导航，
   // 定时器仍会触发 setView('tracks')+loadTracks，把用户刚切的页面顶掉（队列页就是这么被换掉的）。
@@ -4308,39 +6002,17 @@ function setView(v) {
   if (typeof searchTimer !== 'undefined' && searchTimer) { clearTimeout(searchTimer); searchTimer = 0; }
   // 作品页入口收进单曲页后，仍在内部使用 works 视图；离开 works 时清掉"从正在播放返回"的标记
   if (v !== 'works') S.worksFrom = '';
-  // 设置页里「用户正在写、但重渲染会丢」的输入做快照/还原。
-// 为什么只认 text/textarea：select 与 checkbox 的真相在 ADV/S 状态里，重渲染本就应该按状态重建；
-// 如果把它们也快照回去，反而会出现「设置改了但控件显示旧值」的新 bug。
-var SET_DRAFT_IDS = ['sp_fbtitle', 'sp_fbbody', 'sp_fbsteps'];
-
-function settingsDraftSnapshot() {
-  var out = {};
-  for (var i = 0; i < SET_DRAFT_IDS.length; i++) {
-    var el = D(SET_DRAFT_IDS[i]);
-    if (el && typeof el.value === 'string' && el.value !== '') out[SET_DRAFT_IDS[i]] = el.value;
-  }
-  return out;
-}
-
-function settingsDraftRestore(snap) {
-  if (!snap) return;
-  for (var k in snap) {
-    if (!Object.prototype.hasOwnProperty.call(snap, k)) continue;
-    var el = D(k);
-    if (el) el.value = snap[k];
-  }
-}
 Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
     var on = e.dataset.v === v || (v === 'artist' && e.dataset.v === 'artists') || (v === 'work' && e.dataset.v === 'works');
     // #6：保存的队列是左栏的**二级条目**，只能亮当前那一个（否则所有 sqrow 会一起高亮）
     if (e.dataset.sq) on = (v === 'sq' && e.dataset.sq === S.sqName);
-    e.classList.toggle('on', on);
+    rlSetNavCurrent(e, on);
   });
   var isSet = (v === 'settings');
   // 设置页占满整屏：右栏（队列/歌词）在这里没有意义，直接藏掉。
   // 走 #app.noq 这套已有的网格规则，否则网格会留一个空列。
   // 2026-10-23（UI 评审 #8）：播放队列页自己就是队列，右侧抽屉再显示一份同样的队列是重复信息
-  D('app').classList.toggle('noq', isSet || S.queueHidden || v === 'queue');
+  D('app').classList.toggle('noq', isSet || S.queueHidden || v === 'queue' || v === 'station' || v === 'listening');
   D('app').classList.toggle('setmode', isSet);   // 设置页隐藏 crumb，页签自己吸顶
   applyRTab(isSet);
   if (D('setpage')) D('setpage').classList.toggle('on', isSet);
@@ -4351,17 +6023,19 @@ Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
   if (D('list')) D('list').style.display = isSet ? 'none' : '';
   if (!isSet && D('scanbar')) D('scanbar').style.display = S.scanning ? '' : 'none';
   if (isSet) {
-    // 2026-10-29（用户反馈 FB-20261028-CMGW7 #1：「诊断这里，一旦切出去重新切回来，之前写的内容就不见了」）：
-    //   根因就是下面这句 renderSettingsPage() —— 它把 #setpage 整个 innerHTML 换掉，
-    //   输入框全部重建 ⟹ 用户填了一半的反馈内容清零。
-    //   修法：进页面前把「用户在编辑、且不会被设置值覆盖」的输入做一次快照，渲染完原样填回。
-    //   只快照**文本类**控件（input/textarea），不碰 select/checkbox —— 那些本来就该由设置值决定。
-    var snap = settingsDraftSnapshot();
-    head('设置', '所有参数都在这里，改完点「保存」', '');
-    renderSettingsPage();
-    settingsDraftRestore(snap);
+    rlSettingsRoute(!sameViewRefresh);
+  }
+  else if (v === 'station') { renderQuickStart(); if (D('scanbar')) D('scanbar').style.display = 'none'; }
+  else if (v === 'listening') {
+    rlInstallHome();
+    if (D('rlQuickSetup')) D('rlQuickSetup').remove();
+    rlSyncHomeNavigation();
+    rlPaintHome(); rlPaintQueue(); rlPaintShelf();
+    if(PLAYBACK_SETTINGS.ready)rlConsole.refresh().catch(function(){});
+    if (D('scanbar')) D('scanbar').style.display = 'none';
   }
   else if (D('scanbar')) D('scanbar').style.display = S.scanning ? '' : 'none';
+  if (blockedQuickStart) loadAlbums('');
 }
 
 Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
@@ -4370,6 +6044,15 @@ Array.prototype.forEach.call(document.querySelectorAll('.nav'), function (e) {
     var v = e.dataset.v;
     if (!v) return;
     setView(v);
+    if (v === 'station' && D('rlQuickSetup')) {
+      var setup = D('rlQuickSetup');
+      setup.open = true;
+      rlSyncHomeNavigation();
+      setup.querySelector('summary').focus({preventScroll:true});
+      setup.scrollIntoView({block:'start'});
+    } else if (v === 'listening' && D('rlListenHome')) {
+      D('rlListenHome').scrollIntoView({block:'start'});
+    }
     if (v === 'albums') loadAlbums('');
     else if (v === 'artists') loadArtists();
     else if (v === 'tracks') loadTracks('');
@@ -4433,14 +6116,31 @@ D('q').onkeydown = function (e) {
 
 /* ---------------- 控件 ---------------- */
 D('bStop').onclick = function () { api('/api/stop', '').then(function(){ loadQ(); }); };
-D('bNext').onclick = function () { api('/api/skip?dir=1', '').then(loadQ); };
-D('bPrev').onclick = function () { api('/api/skip?dir=-1', '').then(loadQ); };
+function skipTrack(dir) {
+  if (!ensurePlaybackSettings()) return;
+  // Before this session's first play, backend skip parameters may still be defaults.
+  if (!S.playing) {
+    var q = S.q || {}, items = q.items || [];
+    if (!items.length) { toast('队列是空的，先拖一首歌进来'); return; }
+    var i = (((q.index || 0) + dir) % items.length + items.length) % items.length;
+    var cue = (q.cues || [])[i] || [-1, -1];
+    playPath(items[i], cue[0], cue[1], i); return;
+  }
+  api('/api/skip?dir=' + dir, '').then(loadQ);
+}
+D('bNext').onclick = function () { skipTrack(1); };
+D('bPrev').onclick = function () { skipTrack(-1); };
 function playOrPause() {
+  if (!ensurePlaybackSettings()) return;
   if (!S.playing) {
     // 停止之后点播放：必须重新起播并把最新参数（采样率/滤波器/位深…）一起下发，
     // 只发 /api/pause 是不会有任何反应的（本轮用户报的就是这个）。
-    var f = (S.q && S.q.items && S.q.items.length) ? S.q.items[S.q.index || 0] : S.lastCur;
-    if (f) { playPath(f); return; }
+    var q = S.q || {}, i = q.index || 0;
+    if (q.items && q.items[i]) {
+      var cue = (q.cues || [])[i] || [-1, -1];
+      playPath(q.items[i], cue[0], cue[1], i); return;
+    }
+    if (S.lastCur) { playPath(S.lastCur); return; }
     toast('队列是空的，先拖一首歌进来');
     return;
   }
@@ -4457,8 +6157,8 @@ D('npClose').onclick = closeNowPlaying;
 if (D('npDataClose')) D('npDataClose').onclick = function () { npDrawerClose(); npDataRenderBody(); };
 if (D('npDrawerBg')) D('npDrawerBg').onclick = function () { npDrawerClose(); npDataRenderBody(); };
 // 整页里的播放控件：直接复用底栏那套动作，避免两处逻辑漂移
-D('npPrev').onclick = function () { api('/api/skip?dir=-1', '').then(loadQ); };
-D('npNext').onclick = function () { api('/api/skip?dir=1', '').then(loadQ); };
+D('npPrev').onclick = function () { skipTrack(-1); };
+D('npNext').onclick = function () { skipTrack(1); };
 D('npPlay').onclick = playOrPause;
 D('npStop').onclick = function () { api('/api/stop', '').then(loadQ); };
 // ---- 播放模式（四态）：底栏 #bRep、整页 #npRep、设置页 #sp_rep 共用 #sRep 的值（唯一真相源）----
@@ -4488,17 +6188,14 @@ function repIconHtml(mode, size) {
 }
 function applyRep(v) {
   v = parseInt(v, 10) || 0;
-  ['repOne', 'npRepOne'].forEach(function (id) {
-    var e = D(id); if (e) e.style.display = (v === 2) ? '' : 'none';
-  });
   var i1 = D('repIco'); if (i1) i1.innerHTML = repIconHtml(v, 17);
   var i2 = D('npIco');  if (i2) i2.innerHTML = repIconHtml(v, 18);
   ['bRep', 'npRep'].forEach(function (id) {
     var e = D(id); if (!e) return;
     e.style.color = (v === 0) ? '' : 'var(--acc-text)';
     e.dataset.mode = String(v);                       // 自检/脚本可读的机器可判据
-    e.title = '播放模式：' + PM_LABEL[v] + '（点击切换）';
-    e.setAttribute('aria-label', '播放模式：' + PM_LABEL[v]);
+    e.title = tf('播放模式：{0}（点击切换）', [t(PM_LABEL[v])]);
+    e.setAttribute('aria-label', tf('播放模式：{0}', [t(PM_LABEL[v])]));
   });
 }
 function cycleRep() {
@@ -4512,37 +6209,201 @@ function cycleRep() {
   applyRep(next);
   // #5（261026-09）：设置页的「播放模式」下拉（sp_rep）与隐藏镜像（sp_shuf）已删除 ——
   // 底栏 #bRep / 单曲页 #npRep 就是唯一入口，不再需要往设置页同步镜像值。
-  toast('播放模式：' + PM_LABEL[next]);
+  toast(tf('播放模式：{0}', [t(PM_LABEL[next])]));
   return next;
 }
 // ---- 音量：整页滑块是 #vol 的镜像，两边都只改 S.vol + 下发 /api/volume ----
 // setVol() 是唯一入口（键盘 ↑↓ 也用它）；syncVolUi() 把状态刷到所有镜像控件。
-function syncVolUi() {
-  ['vol', 'npVol'].forEach(function (id) {
-    var e = D(id);
-    if (e && Math.abs(parseFloat(e.value) - S.vol) > 1e-9) e.value = S.vol;
-  });
-  var lab = D('npVolLab');
-  if (lab) lab.textContent = (S.vol > 0 ? '+' : '') + S.vol.toFixed(1) + ' dB';
+// ---- 2026-11-12：音量旋钮（0 dB 在正上方，负值向左、正值向右，对数映射让 0 dB 附近刻度更密）----
+var VOL_MIN=-120,VOL_MAX=20,VOL_STEP=0.5;
+function volClamp(db){db=Number(db);if(!Number.isFinite(db))return 0;return Math.round(Math.max(VOL_MIN,Math.min(VOL_MAX,db))*10)/10;}
+// 以 0 dB 为圆心：0→0.5；负值用 log1p(-db/8)/log1p(120/8) 铺满左半弧；正值同理铺满右半弧。
+function volDbToNorm(db){
+  db=Math.max(VOL_MIN,Math.min(VOL_MAX,Number(db)||0));
+  if(db>=0)return 0.5+0.5*Math.log1p(db/8)/Math.log1p(VOL_MAX/8);
+  return 0.5-0.5*Math.log1p(-db/8)/Math.log1p(-VOL_MIN/8);
 }
+function volNormToDb(norm){
+  norm=Math.max(0,Math.min(1,Number(norm)||0));
+  if(norm>=0.5)return volClamp(8*(Math.exp(((norm-0.5)/0.5)*Math.log1p(VOL_MAX/8))-1));
+  return volClamp(-8*(Math.exp(((0.5-norm)/0.5)*Math.log1p(-VOL_MIN/8))-1));
+}
+function rlVolPoint(norm,r){var a=(-135+270*Math.max(0,Math.min(1,norm))-90)*Math.PI/180;return [32+r*Math.cos(a),32+r*Math.sin(a)];}
+function rlVolArcPath(norm){
+  if(norm<=0.0001)return '';
+  // 2026-11-14 真机（3.3.10 用户反馈「音量弧线仍然偏移」）：
+  // 弧从 −225° 顺时针扫 270×norm 度，而 large-arc-flag 只在**扫角 > 180°** 时才为 1。
+  // 旧代码写 norm>0.5（= 扫角 135°）就置 1 ⟹ 0 dB 附近（norm≈0.53）被画成另一条 216° 的大弧，
+  // 绕到左下角，看起来就是「弧线跑到圈外、和刻度不同心」。实测包围盒：轨道 48×41 居中，
+  // 弧 41×47.7 且中心左偏 37px。正确阈值是 180/270 = 2/3。
+  var a=rlVolPoint(0,24),b=rlVolPoint(norm,24),large=(270*norm)>180?1:0;
+  return 'M'+a[0].toFixed(2)+' '+a[1].toFixed(2)+' A24 24 0 '+large+' 1 '+b[0].toFixed(2)+' '+b[1].toFixed(2);
+}
+var RL_VOL_TICKS=[-120,-60,-30,-18,-12,-9,-6,-3,0,3,6,12,20];
+function rlPaintVolumeKnob(prefix,db,locked){
+  var knob=D(prefix+'Knob');if(!knob)return;
+  db=volClamp(db);locked=!!locked;
+  var norm=volDbToNorm(db),angle=(-135+270*norm-90)*Math.PI/180;
+  var arc=D(prefix+'KnobArc');if(arc)arc.setAttribute('d',rlVolArcPath(norm));
+  var needle=D(prefix+'KnobNeedle');
+  if(needle){needle.setAttribute('x2',(32+19*Math.cos(angle)).toFixed(2));needle.setAttribute('y2',(32+19*Math.sin(angle)).toFixed(2));}
+  var val=D(prefix+'KnobVal');if(val)val.textContent=db.toFixed(1);
+  knob.setAttribute('aria-valuenow',db.toFixed(1));
+  knob.setAttribute('aria-valuetext',db.toFixed(1)+' dB');
+  knob.setAttribute('aria-disabled',String(locked));
+  knob.dataset.locked=String(locked);
+  knob.tabIndex=locked?-1:0;
+  var ticks=D(prefix+'KnobTicks');
+  if(ticks&&!ticks.rlBuilt){
+    var h='';
+    RL_VOL_TICKS.forEach(function(v){var n=volDbToNorm(v),major=(v===-120||v===-60||v===-12||v===0||v===6||v===12||v===20);var p1=rlVolPoint(n,major?29.2:28.4),p2=rlVolPoint(n,major?25.8:26.6);h+='<line class="rlVolTick'+(major?' major':'')+'" x1="'+p1[0].toFixed(2)+'" y1="'+p1[1].toFixed(2)+'" x2="'+p2[0].toFixed(2)+'" y2="'+p2[1].toFixed(2)+'"/>';});
+    ticks.innerHTML=h;ticks.rlBuilt=true;
+  }
+}
+function rlBindVolumeKnob(prefix){
+  var knob=D(prefix+'Knob');if(!knob||knob.rlKnobBound)return;knob.rlKnobBound=true;
+  var dragging=false,pendingEvent=null,rafId=0;
+  function paint(ev){
+    if(isRawVolumeLocked()||!PLAYBACK_SETTINGS.ready)return;
+    var r=knob.getBoundingClientRect();if(!r.width)return;
+    var deg=Math.atan2(ev.clientX-(r.left+r.width/2),(r.top+r.height/2)-ev.clientY)*180/Math.PI;
+    var norm=(Math.max(-135,Math.min(135,deg))+135)/270;
+    setVol(volNormToDb(norm),true);
+  }
+  // 3.3.9：拖动按帧合并，一帧最多画一次 —— 旧实现每个 pointermove 都重画 SVG，
+  // 高频事件下弧线与数字会落在不同帧，看起来就是“错位”。
+  function schedule(ev){
+    pendingEvent=ev;
+    if(rafId)return;
+    rafId=requestAnimationFrame(function(){rafId=0;var e=pendingEvent;pendingEvent=null;if(dragging&&e)paint(e);});
+  }
+  function stopDrag(){
+    if(!dragging)return;dragging=false;
+    if(rafId&&typeof cancelAnimationFrame==='function')cancelAnimationFrame(rafId);
+    rafId=0;pendingEvent=null;commitVolumeGesture();
+  }
+  // 只有真实按下左键才进入拖动；鼠标只是移过（未按下）绝不改音量。
+  knob.addEventListener('pointerdown',function(ev){
+    if(knob.dataset.locked==='true')return;
+    if(ev.button!==0&&ev.pointerType==='mouse')return;
+    ev.preventDefault();dragging=true;paint(ev);
+    try{knob.setPointerCapture(ev.pointerId);}catch(e){}
+  });
+  knob.addEventListener('pointermove',function(ev){
+    if(!dragging)return;
+    if(ev.pointerType==='mouse'&&ev.buttons===0){stopDrag();return;}
+    schedule(ev);
+  });
+  knob.addEventListener('pointerup',stopDrag);
+  knob.addEventListener('pointercancel',stopDrag);
+  knob.addEventListener('lostpointercapture',stopDrag);
+  window.addEventListener('pointerup',stopDrag);
+  window.addEventListener('blur',stopDrag);
+  knob.addEventListener('wheel',function(ev){if(knob.dataset.locked==='true')return;ev.preventDefault();var step=ev.shiftKey?0.1:VOL_STEP;setVol(volClamp((Number(S.vol)||0)+(ev.deltaY>0?-step:step)),true);commitVolumeGesture();},{passive:false});
+  knob.addEventListener('keydown',function(ev){
+    if(knob.dataset.locked==='true')return;
+    var step=ev.shiftKey?0.1:VOL_STEP,cur=Number(S.vol)||0,next=null;
+    if(ev.key==='ArrowUp'||ev.key==='ArrowRight')next=cur+step;
+    else if(ev.key==='ArrowDown'||ev.key==='ArrowLeft')next=cur-step;
+    else if(ev.key==='PageUp')next=cur+6;
+    else if(ev.key==='PageDown')next=cur-6;
+    else if(ev.key==='Home')next=VOL_MIN;
+    else if(ev.key==='End')next=VOL_MAX;
+    if(next===null)return;ev.preventDefault();ev.stopPropagation();setVol(volClamp(next),true);commitVolumeGesture();
+  });
+  knob.addEventListener('dblclick',function(){if(knob.dataset.locked==='true')return;setVol(0,true);commitVolumeGesture();});
+  var mute=D(prefix+'Floor');
+  if(mute){['pointerdown','click','dblclick'].forEach(function(type){mute.addEventListener(type,function(ev){ev.stopPropagation();});});}
+}
+['vol','npVol'].forEach(rlBindVolumeKnob);
+var volumeRestore = null, volumeGestureUntil = 0;
+function confirmedVolumeForSave() {
+  if(VOLUME_WRITE.current&&VOLUME_WRITE.current.pending)return null;
+  var value=isRawVolumeLocked()?0:VOLUME_WRITE.confirmed;
+  return typeof value==='number'&&Number.isFinite(value)&&value>=-120&&value<=20?value:null;
+}
+function persistVolumeGesture(write) {
+  if(!write||VOLUME_WRITE.current!==write||write.sequence!==VOLUME_WRITE.sequence||!write.accepted||!write.commitRequested)return Promise.resolve({ok:false,stale:true});
+  if(write.savePromise)return write.savePromise;
+  write.savePromise=persistSettings('volume='+write.value,write).then(function(j){if(j&&j.ok&&!j.skipped)write.persisted=true;return j;});
+  return write.savePromise;
+}
+function commitVolumeGesture() {
+  var write=VOLUME_WRITE.current;
+  if(!write||write.sequence!==VOLUME_WRITE.sequence||isRawVolumeLocked())return;
+  write.awaitChange=false;write.commitRequested=true;
+  if(write.accepted)return persistVolumeGesture(write);
+  if(write.promise)return write.promise.then(function(){return persistVolumeGesture(write);});
+}
+function isRawVolumeLocked() {return S.rawVolumeLocked===true;}
+function rawVolumeMessage() {return t('原始 DSD 音量由设备控制。请使用设备音量，或切回 PCM / 可处理的 DoP 路径。');}
+function syncVolumeStatus(j,authoritative,request) {
+  // Only backend session facts can lock volume. A Native/Direct preset alone
+  // does not prove that raw transport is actually active.
+  if(!authoritative&&typeof request==='number'&&request<=VOLUME_WRITE.statusBarrier)return;
+  var wasLocked=isRawVolumeLocked();
+  S.rawVolumeLocked=j.rawVolumeLocked===true||j.volumeWritable===false;
+  if(typeof j.volDb==='number'&&Number.isFinite(j.volDb))S.volDb=j.volDb;
+  if(isRawVolumeLocked()) {
+    if(VOLUME_WRITE.current){++VOLUME_WRITE.sequence;VOLUME_WRITE.current=null;}
+    VOLUME_WRITE.confirmed=0;S.vol=S.volDb=0;volumeRestore=null;volumeGestureUntil=0;
+  }
+  else if((authoritative||wasLocked)&&Number.isFinite(S.volDb)){S.vol=S.volDb;volumeGestureUntil=0;}
+  if(!VOLUME_WRITE.current||!VOLUME_WRITE.current.pending)VOLUME_WRITE.confirmed=S.volDb;
+  if(PLAYBACK_SETTINGS.ready)syncVolUi(S.playing||authoritative?S.volDb:S.vol);
+}
+function syncVolUi(live) {
+  var ready=PLAYBACK_SETTINGS.ready,locked=isRawVolumeLocked();
+  if(locked){S.vol=0;volumeRestore=null;volumeGestureUntil=0;}
+  updatePlaybackSettingsGate();
+  if(!ready){if(D('npVolLab'))D('npVolLab').textContent=t('音量尚未读取');return;}
+  var pending=VOLUME_WRITE.current&&VOLUME_WRITE.current.pending;
+  var db=locked?0:!pending&&typeof live==='number'&&Number.isFinite(live)&&Date.now()>=volumeGestureUntil?live:S.vol;
+  if(!Number.isFinite(db))return;
+  var label=db.toFixed(1)+' dB';
+  ['vol','npVol'].forEach(function(id){var e=D(id);if(!e)return;if(Math.abs(Number(e.value)-db)>1e-9)e.value=db;e.setAttribute('aria-valuetext',label);e.title=locked?rawVolumeMessage():t('音量（dB）；正增益可能削波');});
+  ['barVolInput','npVolInput'].forEach(function(id){var e=D(id);if(!e)return;if(locked||document.activeElement!==e){e.value=db.toFixed(1);e.removeAttribute('aria-invalid');}e.title=locked?rawVolumeMessage():t('输入 -120 至 +20 dB，Enter 确认，Esc 取消。');});
+  rlPaintVolumeKnob('vol',db,locked);rlPaintVolumeKnob('npVol',db,locked);
+  ['barVolDb','npVolLab'].forEach(function(id){var lab=D(id);if(lab){lab.hidden=false;lab.textContent=label;}});
+  ['npRawVolumeNotice','rlStudioRawVolumeNotice'].forEach(function(id){var notice=D(id);if(!notice)return;notice.hidden=!locked;notice.textContent=id==='npRawVolumeNotice'?t('设备调音'):rawVolumeMessage();notice.title=rawVolumeMessage();});
+  ['volFloor','npVolFloor'].forEach(function(id){var floor=D(id);if(!floor)return;var muted=db<=-120;floor.disabled=locked||!ready||muted&&volumeRestore===null;floor.setAttribute('aria-pressed',String(!locked&&muted));floor.title=locked?rawVolumeMessage():t(muted&&volumeRestore!==null?'恢复先前音量':'静音')+(muted&&volumeRestore!==null?' ('+volumeRestore.toFixed(1)+' dB)':' (−120 dB)');floor.setAttribute('aria-label',floor.title);});
+  document.querySelectorAll('[data-volume-step]').forEach(function(button){button.disabled=!ready||locked||(Number(button.dataset.volumeStep)>0?db>=VOL_MAX:db<=VOL_MIN);button.title=locked?rawVolumeMessage():t('每次 0.5 dB；按住 Shift 每次 0.1 dB。');});
+}
+function toggleVolumeMute(){
+  if(!ensurePlaybackSettings())return;
+  if(isRawVolumeLocked()){syncVolUi();return;}
+  var db=Number(D('vol').value);
+  if(db<=-120){if(volumeRestore===null)return;var restored=volumeRestore;setVol(restored);}
+  else{volumeRestore=db;setVol(-120);}
+  commitVolumeGesture();
+}
+['volFloor','npVolFloor'].forEach(function(id){if(D(id))D(id).onclick=toggleVolumeMute;});
+function commitPreciseVolume(field){
+  if(!ensurePlaybackSettings()||isRawVolumeLocked()){syncVolUi();return;}
+  var text=field.value.trim(),value=Number(text);
+  if(!text||!Number.isFinite(value)||value<VOL_MIN||value>VOL_MAX){field.setAttribute('aria-invalid','true');toast(t('请输入 -120 至 +20 dB 的音量。'));return;}
+  value=Math.round(value*10)/10;field.value=value.toFixed(1);field.removeAttribute('aria-invalid');
+  if(value===Number(S.vol)&&(!VOLUME_WRITE.current||VOLUME_WRITE.current.value===value)){commitVolumeGesture();return;}
+  setVol(value,true);commitVolumeGesture();
+}
+['barVolInput','npVolInput'].forEach(function(id){var field=D(id);if(!field)return;
+  field.addEventListener('change',function(){commitPreciseVolume(field);});
+  field.addEventListener('keydown',function(event){
+    if(event.key==='Enter'){event.preventDefault();event.stopPropagation();commitPreciseVolume(field);field.blur();syncVolUi();}
+    else if(event.key==='Escape'){event.preventDefault();event.stopPropagation();field.value=Number(S.vol).toFixed(1);field.removeAttribute('aria-invalid');field.blur();syncVolUi();}
+  });
+});
+document.querySelectorAll('[data-volume-step]').forEach(function(button){button.onclick=function(event){if(!ensurePlaybackSettings()||isRawVolumeLocked())return;var delta=Number(button.dataset.volumeStep);if(event.shiftKey)delta=delta>0?.1:-.1;setVol(Math.round((Number(S.vol)+delta)*10)/10,true);commitVolumeGesture();};});
 if (D('npRep')) D('npRep').onclick = cycleRep;
 if (D('npVol')) {
   D('npVol').oninput = function () {
-    S.vol = parseFloat(this.value);
-    var v = D('vol'); if (v) v.value = S.vol;
-    syncVolUi();
-    api('/api/volume?db=' + S.vol.toFixed(1), '');
+    setVol(Number(this.value),true);
   };
-  D('npVol').addEventListener('change', function () { saveSettings(); });
+  D('npVol').addEventListener('change',commitVolumeGesture);
 }
-D('npSeek').onclick = function (ev) {
-  if (!S.dur) return;
-  var r = this.getBoundingClientRect();
-  doSeek((ev.clientX - r.left) / Math.max(1, r.width));
-};
 D('tq').onclick = function () {
   S.queueHidden = !S.queueHidden;
-  D('app').classList.toggle('noq', S.queueHidden || S.view === 'settings');
+  applyRTab(S.view === 'settings');
 };
 // #2：唯一写入口 = /api/playmode（0关/1专辑循环/2单曲循环/3随机）。
 D('sRep').onchange = function () {
@@ -4562,9 +6423,7 @@ D('sShuf').onchange = function () {
   applyRep(m);
 };
 D('vol').oninput = function () {
-  S.vol = parseFloat(this.value);
-  if (typeof syncVolUi === 'function') syncVolUi();   // 整页滑块是镜像，必须一起动
-  api('/api/volume?db=' + S.vol.toFixed(1), '');   // 播放中即时生效，不必重开
+  setVol(Number(this.value),true);
 };
 D('sLoud').onchange = function () { S.loud = this.checked; saveSettings(); };
 // 参数类控件改动后自动落盘（下次启动还在）
@@ -4572,7 +6431,7 @@ D('sLoud').onchange = function () { S.loud = this.checked; saveSettings(); };
   var e = D(id); if (!e) return;
   e.addEventListener('change', saveSettings);
 });
-D('vol').addEventListener('change', saveSettings);
+D('vol').addEventListener('change',commitVolumeGesture);
 // 2026-10-24 #5：旧的「流媒体服务器」单表单（srcSave/saveSrc）已删除，改由设置页「流媒体」页签的
 // bindSrcPage() 绑定（多服务器列表）。这里的隐藏快捷面板不保留副本。
 D('bUpnp').onclick = function () {
@@ -4595,7 +6454,7 @@ D('bUpnp').onclick = function () {
 D('bNet').onclick = function () {
   api('/api/net').then(function (j) {
     D('netMsg').innerHTML = '本机：http://127.0.0.1:' + j.port + '/<br>' +
-      (j.lan ? ('局域网：http://' + esc(j.ip) + ':' + j.port + '/（已开启）')
+      (j.lan ? (tf('局域网：http://{0}:{1}/（已开启）', [esc(j.ip), j.port]))
              : ('局域网访问：未开启（用 <code>--lan</code> 启动即可以 http://' + esc(j.ip) + ':' + j.port + '/ 访问）'));
   });
 };
@@ -4605,7 +6464,7 @@ D('bHelp').onclick = function () {
   D('mtitle').textContent = '快捷键与提示';
   D('modal').classList.add('on');
   var rows = [
-    ['空格', '暂停 / 继续'], ['← →', '后退 / 前进 5 秒'], ['↑ ↓', '音量增减 1 dB'],
+    ['空格', '暂停 / 继续'], ['← →', '后退 / 前进 5 秒'], ['↑ ↓', '音量增减 0.5 dB（Shift 0.1）'],
     ['n / p', '下一首 / 上一首'], ['s', '停止'], ['l', '歌词'], ['i', '信号链'],
     // 261027-03 #3：这四条原来和实现对不上（「右键队列条目」在队列页根本没实现，
     // 曲目页右键是"直接加入"不弹菜单）—— 现在两边都已对齐，且补上可见的「＋」入口。
@@ -4630,10 +6489,6 @@ D('bHelp').onclick = function () {
 };
 D('mclose').onclick = function () { D('modal').classList.remove('on'); };
 D('modal').onclick = function (e) { if (e.target === D('modal')) D('modal').classList.remove('on'); };
-D('seek').onclick = function (e) {
-  var r = this.getBoundingClientRect();
-  doSeek((e.clientX - r.left) / r.width);
-};
 D('bScan').onclick = function () {
   api('/api/lib/scan', '').then(function () { toast('开始扫描音乐库'); loadLibStats(); });
 };
@@ -4652,7 +6507,70 @@ D('bAddRoot').onclick = function () {
 
 // 261024-02 #4：seek 统一走这里 —— 发完请求立刻清掉歌词的手动滚动保护并重定位，
 // 不等下一次 400ms tick（否则跳转后歌词要"愣一下"才跟上）。
+var seekControls = [
+  { input:'transportSeek', bar:'bar', pos:'tpos', dur:'tdur' },
+  { input:'npTransportSeek', bar:'npBar', pos:'npPos', dur:'npDur' }
+];
+function paintTransportTime(control, seconds, duration) {
+  var node = D(control.input);
+  var position = Math.max(0, Math.min(duration, Number(seconds) || 0));
+  node.setAttribute('aria-valuetext', fmt(position) + ' / ' + fmt(duration));
+  D(control.bar).style.width = (duration ? 100 * position / duration : 0) + '%';
+  D(control.pos).textContent = fmt(position);
+  D(control.dur).textContent = fmt(duration);
+}
+var npWaveform=null,npWaveformFile='';
+function syncNpWaveform(status){
+  var host=D('npWaveform');if(!host||typeof rlMountWaveform!=='function')return;
+  if(!D('npPage')||!D('npPage').classList.contains('on')){if(npWaveform){npWaveform.destroy();npWaveform=null;}return;}
+  var current=status||rlLastStatus||{},file=status?status.current||'':S.lastCur||'',duration=status?status.dur:S.dur,position=status?status.pos:S.pos;
+  var cueStart=Number.isFinite(current.cueStart)&&current.cueStart>=0?current.cueStart:0,cueLength=Number.isFinite(current.cueEnd)&&current.cueEnd>cueStart?current.cueEnd-cueStart:0;
+  var trackKey=JSON.stringify([file,current.queueIndex,cueStart,cueLength]);
+  var props={file:file,duration:duration,position:position,trackKey:trackKey,clipStart:cueStart,clipLength:cueLength,disabled:!S.playing,onSeek:function(seconds){if(file===(S.lastCur||'')&&npWaveformFile===trackKey&&S.dur>0)doSeek(seconds/S.dur);}};
+  if(!npWaveform||host.rlWaveform!==npWaveform)npWaveform=rlMountWaveform(host,props);else npWaveform.update(props);
+  npWaveformFile=trackKey;
+}
+function syncTransportSeek(status) {
+  syncNpWaveform(status);
+  var duration = Number.isFinite(status.dur) && status.dur > 0 ? status.dur : 0;
+  seekControls.forEach(function (control) {
+    var node = D(control.input);
+    if (!node) return;
+    node.disabled = !status.playing || !duration;
+    node.max = Math.max(duration, 0.001);
+    if (control.gesture && control.file !== status.current) control.cancelled = true;
+    control.file = status.current || '';
+    if (!control.gesture || control.cancelled) node.value = Math.max(0, Number(status.pos) || 0);
+    paintTransportTime(control, Number(node.value), duration);
+  });
+}
+seekControls.forEach(function (control) {
+  var node = D(control.input);
+  if (!node) return;
+  node.title = t('拖动或点击跳转。方向键移动 5 秒，Home / End 跳至两端。');
+  node.addEventListener('pointerdown', function () { control.gesture = true; control.cancelled = false; });
+  node.addEventListener('input', function () {
+    if (!control.cancelled) paintTransportTime(control, Number(node.value), S.dur);
+  });
+  node.addEventListener('change', function () {
+    if (!control.cancelled && !node.disabled && S.dur > 0) doSeek(Number(node.value) / S.dur);
+    control.gesture = false; control.cancelled = false;
+  });
+  node.addEventListener('pointerup', function () { control.gesture = false; });
+  node.addEventListener('pointercancel', function () { control.gesture = false; control.cancelled = true; });
+  node.addEventListener('keydown', function (event) {
+    var delta = {ArrowLeft:-5, ArrowDown:-5, ArrowRight:5, ArrowUp:5};
+    if (!(event.key in delta) && event.key !== 'Home' && event.key !== 'End') return;
+    event.preventDefault();
+    if (node.disabled || !S.dur) return;
+    var at = event.key === 'Home' ? 0 : event.key === 'End' ? S.dur : Number(node.value) + delta[event.key];
+    node.value = Math.max(0, Math.min(S.dur, at));
+    paintTransportTime(control, Number(node.value), S.dur);
+    doSeek(Number(node.value) / S.dur);
+  });
+});
 function doSeek(frac) {
+  if (!S.playing || !(S.dur > 0) || !Number.isFinite(frac)) return;
   var f = Math.max(0, Math.min(0.9999, frac));
   api('/api/seek?pos=' + f.toFixed(4), '');
   lyricReposition();
@@ -4663,17 +6581,59 @@ function seekRel(d) {
   if (!S.dur || S.dur <= 0) return;
   doSeek((S.pos + d) / S.dur);
 }
-function setVol(v) {
+function setVol(v,awaitChange) {
+  if (!ensurePlaybackSettings()) return;
+  if(isRawVolumeLocked()){syncVolUi();return Promise.resolve({ok:false,rawVolumeLocked:true});}
+  if (!Number.isFinite(v)) return;
+  v = Math.round(Math.max(VOL_MIN, Math.min(VOL_MAX, v))*10)/10;
+  var write={sequence:++VOLUME_WRITE.sequence,value:v,pending:true,accepted:false,awaitChange:awaitChange===true,commitRequested:false,persisted:false};
+  VOLUME_WRITE.current=write;
+  if (v > VOL_MIN) volumeRestore = null;
+  volumeGestureUntil = Date.now() + 900;
   S.vol = v;
   D('vol').value = v;
   if (typeof syncVolUi === 'function') syncVolUi();   // 整页滑块跟随（同一个 S.vol）
-  api('/api/volume?db=' + v.toFixed(1), '');
+  var action=VOLUME_ACTION_QUEUE.then(function(){
+    if(VOLUME_WRITE.current!==write||write.sequence!==VOLUME_WRITE.sequence||isRawVolumeLocked()){write.pending=false;return {ok:false,stale:true};}
+    return api('/api/volume?db=' + v.toFixed(1), '');
+  });
+  VOLUME_ACTION_QUEUE=action.then(function(){},function(){});
+  write.promise=action.then(function(j){
+    if(j&&j.stale)return j;
+    if(!j||j.ok===false)throw Error(j&&j.error||t('切换失败'));
+    write.pending=false;
+    if(VOLUME_WRITE.current!==write||write.sequence!==VOLUME_WRITE.sequence)return {ok:false,stale:true};
+    write.accepted=true;
+    if(typeof j.db==='number'&&Number.isFinite(j.db)&&j.db>=VOL_MIN&&j.db<=VOL_MAX)write.value=j.db;
+    VOLUME_WRITE.confirmed=write.value;VOLUME_WRITE.statusBarrier=statusRequest;S.volDb=S.vol=write.value;
+    syncVolUi();
+    if(write.commitRequested)persistVolumeGesture(write);
+    return j;
+  }).catch(function(){
+    write.pending=false;
+    if(VOLUME_WRITE.current!==write||write.sequence!==VOLUME_WRITE.sequence)return {ok:false,stale:true};
+    write.awaitChange=false;write.commitRequested=false;
+    // A rejected gesture cannot leave its optimistic attenuation on screen.
+    volumeGestureUntil=0;volumeRestore=null;
+    if(Number.isFinite(S.volDb)){S.vol=S.volDb;syncVolUi(S.volDb);}
+    var request=++statusRequest;
+    return apiGetRaw('/api/status').then(function(j){
+      if(!j||j.ok===false)throw Error();
+      if(VOLUME_WRITE.current!==write||write.sequence!==VOLUME_WRITE.sequence)return {ok:false,stale:true};
+      if(request>statusApplied){statusApplied=request;syncVolumeStatus(j,true);}
+      toast(t('音量更改未生效，已重新读取实际音量。'));
+      return {ok:false};
+    }).catch(function(){tick();return {ok:false};});
+  });
+  return write.promise;
 }
 
 
 /* ---------------- 右栏标签页 ---------------- */
 var RTAB = 'q';
 function applyRTab(forceHide) {
+  forceHide=forceHide||S.queueHidden||S.view==='settings'||S.view==='queue'||S.view==='station'||S.view==='listening';
+  D('app').classList.toggle('noq',!!forceHide);
   D('qlist').style.display = (!forceHide && RTAB === 'q') ? '' : 'none';
   D('lyricbox').style.display = (!forceHide && RTAB === 'l') ? '' : 'none';
   D('qclr').style.display = (RTAB === 'q') ? '' : 'none';
@@ -4897,15 +6857,25 @@ function volText(liveDb) {
   if (Math.abs(v) < 0.05) return '0.0 dB（逐位无损）';
   var s = v.toFixed(1) + ' dB';
   if (typeof S.startDb === 'number' && Math.abs(S.startDb - v) >= 0.05)
-    s += '（起播 ' + S.startDb.toFixed(1) + ' dB，实时微调 ' + (v - S.startDb).toFixed(1) + ' dB）';
+    s += tf('（起播 {0} dB，实时微调 {1} dB）', [S.startDb.toFixed(1), (v - S.startDb).toFixed(1)]);
   return s;
+}
+function sdmOrderText(p) {
+  if (p.directSdm) return t('未调制（1-bit 直通）');
+  var requested = Number(p.modOrderRequested) || 0, effective = Number(p.modOrder) || 0;
+  if (effective > 0) return requested > 0
+    ? tf('请求 {0} 阶 · 实际 {1} 阶 SDM', [requested, effective])
+    : tf('实际 {0} 阶 SDM', [effective]);
+  return requested > 0 ? tf('请求 {0} 阶 · 实际阶数待确认', [requested]) : t('实际阶数待确认');
 }
 function showChain() {
   D('mtitle').textContent = '信号链';
   D('modal').classList.add('on');
+  var shortcuts = '<p class=transportKeys>' + esc(t('↑ / ↓ 调节音量，Shift + ← / → 跳转 5 秒。')) + '</p>';
   api('/api/signal').then(function (j) {
-    if (!j.ok) { D('mbody').innerHTML = '<div class=empty>还没有开始播放</div>'; return; }
+    if (!j.ok) { D('mbody').innerHTML = '<div class=empty>还没有开始播放</div>' + shortcuts; return; }
     var p = j.path;
+    observeCleanupReport(p, 'local');
     var nodes = [];
     // 2026-10-23（用户 261023-02 #1）：把「本次是否 bit-perfect」放在**最显眼的位置**（第一条），
     // 并且结论来自后端的权威判定（/api/signal 的 bitPerfect 字段），不再让用户自己从一堆字段里推。
@@ -4920,7 +6890,7 @@ function showChain() {
       else if (bp === 'lossy') { label = '链路逐位 · 源本身有损'; color = '#38bdf8'; icon = '\u25cf'; }
       else if (bp === 'no') { label = '非 bit-perfect'; color = '#fbbf24'; icon = '!'; }
       else { label = 'BIT-PERFECT 状态未知'; color = '#94a3b8'; icon = '?'; }
-      nodes.push({ k: icon + ' ' + label, v: why || '（本次未记录）', _bp: bp, _color: color });
+      nodes.push({ k: icon + ' ' + t(label), v: why || t('（本次未记录）'), _bp: bp, _color: color });
     }());
     nodes.push({ k: '源文件', v: nam(p.src) + (p.codec ? '  \u00b7  ' + p.codec.toUpperCase() : '') });
     // P2（261027-05 A4）：解码环也要标多声道 —— 原来只有 "6 ch"，用户得自己知道 6 ch 就是 5.1。
@@ -4934,13 +6904,15 @@ function showChain() {
     //    p.convGpu ?? p.irGpu 兜底；后端加好后本兜底自动失效（新字段优先），到时候可以删掉兜底。
     var convGpu = (typeof p.convGpu === 'boolean') ? p.convGpu : (p.irGpu === true);
     var sigGpuUsed = (typeof p.gpuUsed === 'boolean') ? p.gpuUsed : !!S.gpuUsed;
-    if (p.resample) nodes.push({ k: '采样率转换', v: (p.filter || 'Kaiser sinc') + '  \u00b7  ' + p.phase + '  \u00b7  ' + p.taps + ' 抽头' + (p.twoStage ? '  \u00b7  两段式' : '') + '  \u2192  ' + p.outRate + ' Hz' + (sigGpuUsed ? '  \u00b7  GPU' : ''), gpu: !!sigGpuUsed });
+    nodes.push({k:t('录音噪声清理'),v:cleanupStatusText(p,{enabled:!!ADV.cleanup,auto:ADV.cleanupAuto!==0,
+      manualNoiseDb:ADV.cleanupNoiseDb,playing:S.playing,paused:S.paused,current:CLEANUP_UI.currentFile})});
+    if (p.resample) nodes.push({ k: '采样率转换', v: (p.filter || 'Kaiser sinc') + '  \u00b7  ' + p.phase + '  \u00b7  ' + p.taps + t(' 抽头') + (p.twoStage ? t('  ·  两段式') : '') + '  \u2192  ' + p.outRate + ' Hz' + (sigGpuUsed ? '  \u00b7  GPU' : ''), gpu: !!sigGpuUsed });
     else nodes.push({ k: '采样率转换', v: '旁路（源采样率与输出一致，逐位直通）' });
     // 261024-04 #8：EQ / 卷积单独成一环，并且**只有卷积真的走 GPU 时**才标绿（后端 convGpu 字段）
     if (p.eq || p.conv) {
       var eqParts = [];
-      if (p.eq) eqParts.push('参数 EQ' + (ADV.eq ? (' ' + nam(ADV.eq)) : ''));
-      if (p.conv) eqParts.push('FIR 卷积' + (ADV.ir ? (' ' + nam(ADV.ir)) : ''));
+      if (p.eq) eqParts.push(tf('参数 EQ{0}', [(ADV.eq ? (' ' + nam(ADV.eq)) : '')]));
+      if (p.conv) eqParts.push(tf('FIR 卷积{0}', [(ADV.ir ? (' ' + nam(ADV.ir)) : '')]));
       nodes.push({ k: 'EQ / 卷积', v: eqParts.join('  \u00b7  ') + '  \u00b7  ' + (convGpu ? 'GPU 计算' : 'CPU 计算'), gpu: convGpu });
     }
     // B3（2026-10-27）：房间校正自动应用 —— 单独一环。它和上面手填的 IR 是两件不同的事：
@@ -4950,11 +6922,11 @@ function showChain() {
     if (p.roomCorr && typeof p.roomCorr === 'object') {
       var rc = p.roomCorr;
       if (rc.applied) {
-        nodes.push({ k: '房间校正 已应用（' + (rc.file || '校正集') + '）',
+        nodes.push({ k: tf('房间校正 已应用（{0}）', [(rc.file || '校正集')]),
           v: (rc.layout || '?') + ' 布局  \u00b7  ' + (rc.ch || 0) + ' 声道  \u00b7  ' + (rc.taps || 0) +
              ' 抽头  \u00b7  ' + (rc.fs || 0) + ' Hz' +
              (rc.subDelaySamples || rc.subGainDb ? ('  \u00b7  超低对齐 ' + (+rc.subDelaySamples || 0).toFixed(1) +
-               ' 样 / ' + (+rc.subGainDb || 0).toFixed(1) + ' dB（未接进播放链）') : '') +
+               tf(' 样 / {0} dB（未接进播放链）', [(+rc.subGainDb || 0).toFixed(1)])) : '') +
              (rc.why ? ('  \u00b7  ' + rc.why) : '') });
       } else if (rc.enabled) {
         nodes.push({ k: rc.mismatch ? '房间校正 未应用（布局不匹配）' : '房间校正 未应用',
@@ -4972,10 +6944,10 @@ function showChain() {
         (p.dsdNativeTypeCode ? '（' + p.dsdNativeTypeCode + '）' : '') +
         '  \u00b7  ' + (p.dsdNativeRate || p.outRate) + ' Hz  \u00b7  1-bit 直送驱动（不经 PCM / DoP）' });
     } else if (p.dsd) {
-      nodes.push({ k: 'DSD 调制', v: 'DSD' + p.dsd + '（' + (p.dsdRate / 1000000).toFixed(4) + ' MHz）\u00b7 1-bit \u00b7 ' + (p.modOrder || 5) + ' 阶 SDM' });
+      nodes.push({ k: p.directSdm ? t('DSD 直通') : t('DSD 调制'), v: 'DSD' + p.dsd + '（' + (p.dsdRate / 1000000).toFixed(4) + ' MHz）\u00b7 1-bit \u00b7 ' + sdmOrderText(p) });
       // 载波率必须用 p.carrier：DirectSDM / 回落的信号链里 outRate 记的是 DSD 位率（2822400），
       // DoP 真正开给设备的率是 carrier（DSD64 -> 176400）。旧写法会把 2822400 说成"24-bit 载波"。
-      nodes.push({ k: 'DoP 封装', v: '24-bit 载波 ' + (p.carrier || p.outRate) + ' Hz \u00b7 标记 0x05/0xFA 交替' });
+      nodes.push({ k: 'DoP 封装', v: t('24-bit 载波 ') + (p.carrier || p.outRate) + t(' Hz · 标记 0x05/0xFA 交替') });
     } else {
       nodes.push({ k: '抖动 / 噪声整形', v: (p.shaper && p.shaper !== 'none') ? p.shaper : '无（逐位）' });
     }
@@ -4984,14 +6956,16 @@ function showChain() {
     if (p.modFallback) nodes.push({ k: 'DSD 实际处理说明', v: p.modFallback });
     if (p.preAtten && p.preAtten < 0) {
       nodes.push({ k: '峰值保护', v: '检测到过采样峰值 ' + (p.ispPeak * 100).toFixed(1) + '%（' + p.ispOver +
-        ' 个点超出满幅）→ 预衰减 ' + p.preAtten.toFixed(1) + ' dB' });
+        tf(' 个点超出满幅）→ 预衰减 {0} dB', [p.preAtten.toFixed(1)]) });
     }
     if (p.loudness) nodes.push({ k: '等响度补偿', v: '开启' });
     nodes.push({ k: '音量', v: volText(p.volume), id: 'chainVol' });
-    nodes.push({ k: '输出', v: p.device + '  \u00b7  ' + p.outRate + ' Hz / ' + p.outBits + ' bit / ' + p.outCh +
+    var isNullOutput = p.device === 'Null 输出（不出声）';
+    var endpointRate = p.dsd && !p.dsdNative ? (p.carrier || p.outRate) : p.outRate;
+    nodes.push({ k: '输出', v: (isNullOutput ? t('Null 输出（不出声）') : p.device) + '  \u00b7  ' + endpointRate + ' Hz / ' + p.outBits + ' bit / ' + p.outCh +
       ' ch' + (chMark(p.outCh) ? '（' + chLayout(p.outCh) + '）' : '') +
-      '  \u00b7  ' + ((ADV.backend === 'wasapi-shared') ? '共享模式（非 bit-perfect）' : '独占模式') +
-      '  \u00b7  缓冲 ' + p.buffer + ' ms' });
+      (isNullOutput ? '' : ('  \u00b7  ' + t((ADV.backend === 'wasapi-shared') ? '共享模式（非 bit-perfect）' : '独占模式'))) +
+      tf('  \u00b7  缓冲 {0} ms', [p.buffer]) });
 
     var tDec = (typeof p.decodeMs === 'number' && p.decodeMs > 0)
       ? (p.decodeMs >= 1000 ? (p.decodeMs / 1000).toFixed(2) + ' s' : p.decodeMs.toFixed(1) + ' ms')
@@ -4999,16 +6973,16 @@ function showChain() {
     var tWav = '–';
     if (typeof p.ffmpegMs === 'number' && p.ffmpegMs > 0) {
       tWav = '转码写 ' + p.ffmpegMs.toFixed(1) + ' ms' +
-             (typeof p.wavReadMs === 'number' && p.wavReadMs > 0 ? ' / 读 ' + p.wavReadMs.toFixed(1) + ' ms' : '');
+             (typeof p.wavReadMs === 'number' && p.wavReadMs > 0 ? tf(' / 读 {0} ms', [p.wavReadMs.toFixed(1)]) : '');
     } else if (typeof p.wavReadMs === 'number' && p.wavReadMs > 0) {
-      tWav = '读取 ' + p.wavReadMs.toFixed(1) + ' ms';
+      tWav = tf('读取 {0} ms', [p.wavReadMs.toFixed(1)]);
     }
     var tDsp = '–';
     if (typeof p.dspBlockMs === 'number' && p.dspBlockMs > 0) {
       tDsp = p.dspBlockMs.toFixed(2) + ' ms/块' +
-             (typeof p.dspTotalMs === 'number' && p.dspTotalMs > 0 ? '（累计 ' + p.dspTotalMs.toFixed(1) + ' ms）' : '');
+             (typeof p.dspTotalMs === 'number' && p.dspTotalMs > 0 ? tf('（累计 {0} ms）', [p.dspTotalMs.toFixed(1)]) : '');
     } else if (typeof p.dspTotalMs === 'number' && p.dspTotalMs > 0) {
-      tDsp = '累计 ' + p.dspTotalMs.toFixed(1) + ' ms';
+      tDsp = tf('累计 {0} ms', [p.dspTotalMs.toFixed(1)]);
     }
     var tScan = (typeof p.scanMs === 'number' && p.scanMs > 0)
       ? (p.scanMs >= 1000 ? (p.scanMs / 1000).toFixed(2) + ' s' : p.scanMs.toFixed(0) + ' ms')
@@ -5016,7 +6990,7 @@ function showChain() {
 
     nodes.push({
       k: '耗时统计',
-      v: '解码 ' + tDec + '  \u00b7  临时WAV ' + tWav + '  \u00b7  DSP ' + tDsp + '  \u00b7  库扫描 ' + tScan,
+      v: tf('解码 {0}  \u00b7  临时WAV {1}  \u00b7  DSP {2}  \u00b7  库扫描 {3}', [tDec, tWav, tDsp, tScan]),
       id: 'chainTiming'
     });
     var h = '<div class=chain>';
@@ -5033,7 +7007,7 @@ function showChain() {
     });
     h += '</div>';
     h += '<div style="margin-top:14px;font-size:11px;color:#5b6478;line-height:1.7">绿色节点表示该环节本次由 GPU 实际参与计算（没参与就不标绿）。<br>只要每一环都不做多余处理，输出就是逐位（bit-perfect）的。</div>';
-    D('mbody').innerHTML = h;
+    D('mbody').innerHTML = h + shortcuts;
   }).catch(function () { D('mbody').innerHTML = '<div class=empty>读取失败</div>'; });
 }
 
@@ -5166,7 +7140,7 @@ function backendHint() {
     // 那会让界面宣称"推到 127.0.0.1"而其实根本没发现端点（本轮截图自检抓到）。
     var ep = (epSel && epSel.value) || '';
     // 未发现时的原因已经写在黄色结论行（sp_naa_msg）里，这里不再重复，避免同一屏两遍同样的话。
-    m.textContent = 'NAA：把 PCM 按 RTANet 协议推到 ' + (ep || '端点（尚未发现）') + '（端点机需运行 rtanet_rx）。';
+    m.textContent = tf('NAA：把 PCM 按 RTANet 协议推到 {0}（端点机需运行 rtanet_rx）。', [(ep || '端点（尚未发现）')]);
   } else if (bk === 'upnp') {
     // 261024-01 #9：后端下拉新增「UPnP / DLNA 投放」。提示用渲染器**名字**，不回显整条描述 URL。
     var devSel = D('sp_upnp_dev');
@@ -5179,7 +7153,7 @@ function backendHint() {
   } else if (bk === 'asio') {
     if (ASIO_DRIVERS === null) m.textContent = 'ASIO：正在检测本机驱动…';
     else if (!ASIO_DRIVERS.length) m.textContent = 'ASIO：本机未检测到 ASIO 驱动。';
-    else m.textContent = 'ASIO：本机驱动 ' + ASIO_DRIVERS.join('、') + '。';
+    else m.textContent = tf('ASIO：本机驱动 {0}。', [ASIO_DRIVERS.join('、')]);
   }
 }
 
@@ -5194,10 +7168,10 @@ function loadInputDevices() {
     list.forEach(function (d) {
       var name = d.name || '';
       if (d.isLoopback && name.indexOf('[Loopback]') !== 0 && name.indexOf('[回环]') !== 0) {
-        name = '[回环] ' + name;
+        name = tf('[回环] {0}', [name]);
       }
       if (d.isDefault) {
-        name += '（默认）';
+        name += t('（默认）');
       }
       hh += '<option value="' + esc(d.id) + '">' + esc(name) + '</option>';
     });
@@ -5234,13 +7208,13 @@ function updateInputStateUi(st) {
   var fEl = D('sp_stat_frames');
   if (fEl) {
     var sec = (typeof st.seconds === 'number') ? st.seconds.toFixed(1) : '0.0';
-    fEl.textContent = (st.frames || 0) + ' 帧 (' + sec + 's)';
+    fEl.textContent = (st.frames || 0) + tf(' 帧 ({0}s)', [sec]);
   }
 
   var sEl = D('sp_stat_spec');
   if (sEl) {
     if (st.rate && st.channels) {
-      sEl.textContent = st.rate + ' Hz / ' + st.channels + ' 声道' + (st.device ? (' · ' + st.device) : '');
+      sEl.textContent = st.rate + ' Hz / ' + st.channels + tf(' 声道{0}', [(st.device ? (' · ' + st.device) : '')]);
     } else {
       sEl.textContent = st.device ? st.device : '-';
     }
@@ -5255,7 +7229,7 @@ function updateInputStateUi(st) {
 
   var xEl = D('sp_stat_xrun');
   if (xEl) {
-    xEl.textContent = '溢出 ' + (st.overflow || 0) + ' / 欠载 ' + (st.underflow || 0);
+    xEl.textContent = tf('溢出 {0} / 欠载 {1}', [(st.overflow || 0), (st.underflow || 0)]);
     xEl.style.color = ((st.overflow || 0) > 0 || (st.underflow || 0) > 0) ? 'var(--err)' : '';
   }
 
@@ -5345,13 +7319,13 @@ function startInputCapture() {
     } else {
       var err = (j && j.error) || '启动失败';
       if (D('sp_inmsg')) D('sp_inmsg').textContent = err;
-      toast('启动失败: ' + err);
+      toast(tf('启动失败: {0}', [err]));
       pollInputState();
     }
   }).catch(function (e) {
     var err = (e && e.message) || '网络或接口错误';
     if (D('sp_inmsg')) D('sp_inmsg').textContent = err;
-    toast('启动失败: ' + err);
+    toast(tf('启动失败: {0}', [err]));
     pollInputState();
   });
 }
@@ -5368,7 +7342,7 @@ function stopInputCapture() {
       pollInputState();
     } else {
       var err = (j && j.error) || '停止失败';
-      toast('停止失败: ' + err);
+      toast(tf('停止失败: {0}', [err]));
       pollInputState();
     }
   }).catch(function (e) {
@@ -5524,7 +7498,10 @@ function syncUpnpDev(value) {
   ADV.upnpDev = value || '';
   if (D('sp_cast_dev') && D('sp_cast_dev').value !== value) D('sp_cast_dev').value = value;
   if (D('sp_upnp_dev') && D('sp_upnp_dev').value !== value) D('sp_upnp_dev').value = value;
-  saveSettings();
+  if (!ensurePlaybackSettings()) return Promise.resolve({ok:false,errorCode:'PLAYBACK_SETTINGS_NOT_READY'});
+  // Device discovery owns this preference alone; a delayed DSP form snapshot
+  // must never overwrite a newer workbench transaction.
+  return persistSettings('upnpdev=' + encodeURIComponent(ADV.upnpDev));
 }
 function scanCastDevices(force) {
   var msg = D('sp_cast_devmsg');
@@ -5541,12 +7518,12 @@ function scanCastDevices(force) {
     populateCastDevices();
     if (msg) {
       msg.textContent = _castDevices.length
-        ? ('共发现 ' + _castDevices.length + ' 个渲染器')
+        ? (tf('共发现 {0} 个渲染器', [_castDevices.length]))
         : '未发现 UPnP/DLNA 渲染器（可能未开机、不在同一子网，或 SSDP 组播被代理/防火墙拦截）';
     }
     if (msg2) {
       msg2.textContent = _castDevices.length
-        ? ('共发现 ' + _castDevices.length + ' 个渲染器')
+        ? (tf('共发现 {0} 个渲染器', [_castDevices.length]))
         : '未发现 UPnP/DLNA 渲染器：确认数播已开启 UPnP/DLNA 且与本机同一子网';
     }
   }).catch(function () {
@@ -5629,8 +7606,8 @@ function initCastControls() {
       for (var i = 0; i < _castDevices.length; i++) if (castDevValue(_castDevices[i]) === v) d = _castDevices[i];
       var msg = D('sp_cast_devmsg');
       if (msg) {
-        msg.textContent = d ? ((d.model ? ('型号: ' + d.model + ' · ') : '') + (d.hasAVTransport ? '支持 AVTransport' : '未知传输服务'))
-                            : (v ? ('已选择：' + v) : '点「重新发现」扫描局域网里的 MediaRenderer');
+        msg.textContent = d ? ((d.model ? (tf('型号: {0} · ', [d.model])) : '') + (d.hasAVTransport ? '支持 AVTransport' : '未知传输服务'))
+                            : (v ? (tf('已选择：{0}', [v])) : '点「重新发现」扫描局域网里的 MediaRenderer');
       }
     };
   }
@@ -5681,13 +7658,13 @@ function applyCastUi(st) {
   if (nb) {
     nb.innerHTML = castIconSvg();
     nb.classList.toggle('on', running);
-    nb.title = running ? ('点击停止投放并恢复本机输出（已投放到 ' + nm + (st.phase ? (' · 阶段：' + st.phase) : '') + '）')
+    nb.title = running ? (tf('点击停止投放并恢复本机输出（已投放到 {0}{1}）', [nm, (st.phase ? tf(' · 阶段：{0}', [st.phase]) : '')]))
                        : '把当前曲目推送到 UPnP / DLNA 设备';
   }
   var badge = D('castBadge');
   if (badge) {
     badge.style.display = running ? 'inline-flex' : 'none';
-    badge.title = running ? ('正在投放到 ' + nm) : '';
+    badge.title = running ? (tf('正在投放到 {0}', [nm])) : '';
   }
   var push = D('sp_cast_push'), stop = D('sp_cast_stop');
   if (stop) stop.disabled = !running;
@@ -5702,6 +7679,7 @@ function pollCastState(once) {
               || (D('npPage') && D('npPage').classList.contains('on'))
               || (CAST.state && CAST.state.running);
   api('/api/cast/state').then(function (st) {
+    observeCleanupReport(st && st.ok ? st : null, 'cast');
     // 2026-10-29（#9 的连带）：投放失败后把后端回退，否则 ADV.backend 一直停在 upnp，
     // 用户之后每次播放都会再走一次注定失败的投放（表现为「点了没反应 / 又自动暂停」）。
     if (st && st.running) CAST.wasRunning = true;
@@ -5710,7 +7688,7 @@ function pollCastState(once) {
       if (ADV.backend === 'upnp') {
         ADV.backend = CAST.prevBackend || 'wasapi';
         saveSettings();
-        toast('投放失败：' + (st.error || '未知原因') + '，已回到本机输出');
+        toast(tf('投放失败：{0}，已回到本机输出', [(st.error || '未知原因')]));
       }
     }
     applyCastUi(st);
@@ -5764,7 +7742,7 @@ function castPush(file, devOverride) {
     ADV.upnpDev = dev;
     saveSettings();
     playPath(file);
-    toast('已推送到 ' + castDevNameOf(dev));
+    toast(tf('已推送到 {0}', [castDevNameOf(dev)]));
     pollCastState(true);
   };
   var dev = (devOverride || ADV.upnpDev || '').trim();
@@ -5778,7 +7756,7 @@ function castStop() {
     if (back === 'upnp') back = 'wasapi';
     ADV.backend = back;
     saveSettings();
-    toast('已停止投放，输出回到 ' + back);
+    toast(tf('已停止投放，输出回到 {0}', [back]));
     if (S.lastCur) playPath(S.lastCur);
     pollCastState(true);
   }).catch(function () { toast('停止投放失败'); });
@@ -5838,7 +7816,7 @@ function channelNames(n) {
   if (n === 6) return ['左', '右', '中置', '低音', '左环绕', '右环绕'];
   if (n === 8) return ['左', '右', '中置', '低音', '左环绕', '右环绕', '左后', '右后'];
   var out = [];
-  for (var i = 0; i < n; ++i) out.push('声道 ' + (i + 1));
+  for (var i = 0; i < n; ++i) out.push(tf('声道 {0}', [(i + 1)]));
   return out;
 }
 function bindTrims() {
@@ -5901,13 +7879,16 @@ function bindPhaseHint() {
   // 2026-10-24 #7：一行说清「预设 / 实际」，不再展开解释什么叫覆盖。
   // 261030-01 规格 v2.1（D-13 / D-16）：名字后面挂「抑制 @ 预振铃」两个数字。
   // 后端 preset_metrics() 是唯一真相源，前端不重算规则（否则必然漂移）。
-  var metrics = (typeof it.ceilingDb === 'number') ? (' · 目标抑制 ' + it.ceilingDb + ' dB') : '';
+  // 2026-11-01（多语言）：这一行是运行时拼装串，i18n 的整串匹配抓不到 ⟹ 每段都过 t()。
+  var metrics = (typeof it.ceilingDb === 'number') ? (' · ' + t('目标抑制') + ' ' + it.ceilingDb + ' dB') : '';
   if (it.ringMeasured && typeof it.ringMs === 'number') {
-    metrics += ' · 峰前包络 ' + it.ringMs.toFixed(2) + ' ms（相对峰值 −60 dB；参考 '
+    metrics += ' · ' + t('峰前包络') + ' ' + it.ringMs.toFixed(2) + ' ms' + t('（相对峰值 −60 dB；参考 ')
       + (it.ringReferenceInRate / 1000) + ' → ' + (it.ringReferenceOutRate / 1000)
-      + ' kHz，PCM 预设；不是群延迟）';
+      + ' kHz' + t('，PCM 预设；不是群延迟）');
   }
-  var tapTxt = (typeof it.T === 'number' && it.T > 0) ? ('（T=' + it.T + '）') : ('（抽头 ' + it.taps + '）');
+  var tapTxt = (typeof it.T === 'number' && it.T > 0)
+    ? t('（T=§）').replace('§', it.T)
+    : t('（抽头 §）').replace('§', it.taps);
   // 261030-01：这行是运行时拼装串，i18n 的「文本节点整串匹配」抓不到 ⟹ 直接走 t()。
   // 数字与单位（dB / ms / T=）语言无关，不进字典。
   // ★ 2026-10-31（§7.4 L1）：选了「自动」时，先说清它到底解析成了哪个预设 ——
@@ -5936,7 +7917,7 @@ function llmRender(j) {
   if (!m) return;
   if (!LLM.loaded) { m.textContent = '读取配置中…'; return; }
   var s = LLM.configured
-    ? ('已配置：' + LLM.masked + '（模型 ' + LLM.model + '）')
+    ? (tf('已配置：{0}（模型 {1}）', [LLM.masked, LLM.model]))
     : '未配置 —— 填入 DeepSeek API Key 后点「保存 Key」';
   m.textContent = s + '；key 只存本机 rlplayer-llm.conf，不进安装包、界面从不回显明文' +
     (LLM.proxy ? '；配置里的 proxy= 行已保留' : '');
@@ -5950,7 +7931,7 @@ function llmPost(body, okMsg) {
   return fetch('/api/llm', { method: 'POST', body: body })
     .then(function (r) { return r.json(); })
     .then(function (j) {
-      if (!j || !j.ok) { toast('操作失败：' + ((j && j.error) || '未知错误')); return j; }
+      if (!j || !j.ok) { toast(tf('操作失败：{0}', [((j && j.error) || '未知错误')])); return j; }
       var e = D('sp_llmkey');
       if (e) e.value = '';                       // 明文绝不在 DOM 里停留
       llmRender(j);
@@ -5971,8 +7952,8 @@ function llmTest() {
   fetch('/api/llm/test').then(function (r) { return r.json(); }).then(function (j) {
     if (b) { b.disabled = false; b.textContent = '测试连接'; }
     if (!m) return;
-    if (j && j.ok) m.textContent = '连接成功：模型 ' + j.model + '，耗时 ' + j.latencyMs + ' ms（key 有效）';
-    else m.textContent = '连接失败：' + ((j && j.error) || '未知错误');
+    if (j && j.ok) m.textContent = tf('连接成功：模型 {0}，耗时 {1} ms（key 有效）', [j.model, j.latencyMs]);
+    else m.textContent = tf('连接失败：{0}', [((j && j.error) || '未知错误')]);
   }).catch(function () {
     if (b) { b.disabled = false; b.textContent = '测试连接'; }
     if (m) m.textContent = '连接失败：服务没响应';
@@ -6060,8 +8041,8 @@ function llmModelsLoad(force) {
 function llmSaveModel(v) {
   v = String(v || '').replace(/^\s+|\s+$/g, '');
   if (!v) { toast('模型 id 不能为空'); llmModelRender(); return; }
-  if (v === LLM.model) { toast('当前已经在用 ' + v); return; }
-  llmPost('model=' + encodeURIComponent(v), '模型已切换为 ' + v).then(function (j) {
+  if (v === LLM.model) { toast(tf('当前已经在用 {0}', [v])); return; }
+  llmPost('model=' + encodeURIComponent(v), tf('模型已切换为 {0}', [v])).then(function (j) {
     if (j && j.ok) { LLM.model = j.model || v; llmModelRender(); llmModelsLoad(false); }
   });
 }
@@ -6083,6 +8064,12 @@ function setSelectValue(sel, val) {
     opt.textContent = strVal;
     sel.appendChild(opt);
   }
+  // Empty means no selected preset here; keep the persisted value unchanged.
+  if (sel.id === 'sp_filt' && strVal === '') {
+    for (var j = 0; j < sel.options.length; j++) {
+      if (sel.options[j].value === '') sel.options[j].textContent = t('未选择滤波器');
+    }
+  }
   sel.value = strVal;
 }
 
@@ -6092,7 +8079,7 @@ function presetCardHtml() {
   var maxRate = dev.maxRate ? (dev.maxRate + ' Hz') : '- Hz';
   var dsdStr = '-';
   if (dev.dsdNative !== undefined) {
-    dsdStr = dev.dsdNative ? ('是（最高 ' + (dev.dsdNativeMax || 'dsd256') + '）') : '否';
+    dsdStr = dev.dsdNative ? (tf('是（最高 {0}）', [(dev.dsdNativeMax || 'dsd256')])) : t('否');
   }
   var pcmTargetRate = dev.maxRate ? dev.maxRate : '384000';
   var dsdTarget = (dev.dsdNative && dev.dsdNativeMax) ? dev.dsdNativeMax : (dev.dopMax || dev.dsdNativeMax || 'dsd256');
@@ -6117,7 +8104,7 @@ function presetCardHtml() {
         + '刷新</button>'
         + '</div>'
         + '<div class=preset-caps-line id=presetCapsInfo>'
-        + '当前设备：' + esc(name) + ' · 最高 ' + esc(maxRate) + ' · 原生 DSD ' + esc(dsdStr)
+        + tf('当前设备：{0} · 最高 {1} · 原生 DSD {2}', [esc(name), esc(maxRate), esc(dsdStr)])
         + '</div>'
         + '<div class=preset-grid>'
         + '<button class=preset-btn id=presetBitPerfect aria-label="原音直通（bit-perfect）">'
@@ -6157,18 +8144,18 @@ function renderPresetCaps(j) {
   var dev = j.device || {};
   var name = dev.name || '默认设备';
   var maxRate = dev.maxRate ? (dev.maxRate + ' Hz') : '未知';
-  var dsdStr = dev.dsdNative ? ('是（最高 ' + (dev.dsdNativeMax || 'dsd256') + '）') : '否';
+  var dsdStr = dev.dsdNative ? (tf('是（最高 {0}）', [(dev.dsdNativeMax || 'dsd256')])) : t('否');
 
   if (D('presetCapsInfo')) {
-    D('presetCapsInfo').textContent = '当前设备：' + name + ' · 最高 ' + maxRate + ' · 原生 DSD ' + dsdStr;
+    D('presetCapsInfo').textContent = tf('当前设备：{0} · 最高 {1} · 原生 DSD {2}', [name, maxRate, dsdStr]);
   }
   var pcmTargetRate = dev.maxRate ? dev.maxRate : '384000';
   if (D('presetPcmSub')) {
-    D('presetPcmSub').textContent = '升到设备最高档（当前 ' + pcmTargetRate + '），tight 滤波 + 每相位 512 抽头';
+    D('presetPcmSub').textContent = tf('升到设备最高档（当前 {0}），tight 滤波 + 每相位 512 抽头', [pcmTargetRate]);
   }
   var dsdTarget = (dev.dsdNative && dev.dsdNativeMax) ? dev.dsdNativeMax : (dev.dopMax || dev.dsdNativeMax || 'dsd256');
   if (D('presetDsdSub')) {
-    D('presetDsdSub').textContent = '升到 ' + dsdTarget + '，EC-7 调制器';
+    D('presetDsdSub').textContent = tf('升到 {0}，EC-7 调制器', [dsdTarget]);
   }
   if (D('presetDsdBadge')) {
     if (dev.dsdNative === false) {
@@ -6217,6 +8204,23 @@ function loadPresetCaps(force) {
 }
 
 function applyPresetControls(applied, profile) {
+  if(applied && (applied.clearProcessing===true || profile==='bitperfect')) {
+    ADV.eq='';ADV.ir='';ADV.irgpu=0;ADV.atten=0;ADV.transition=0;ADV.phase='';S.loud=false;
+    for(var ci=0;ci<8;++ci)ADV['trim'+ci]=0;
+    ['sp_eq','sp_ir','sp_phase'].forEach(function(id){if(D(id))D(id).value='';});
+    ['sLoud','sp_loud'].forEach(function(id){if(D(id))D(id).checked=false;});
+    if(profile==='bitperfect') {
+      ADV.roomcorrauto=0;ADV.cleanup=0;ADV.upnpUpsample=0;ADV.upnpForceRate=0;ADV.rgmode='off';
+      if(D('sp_roomauto'))D('sp_roomauto').checked=false;
+      if(D('sp_rgmode'))D('sp_rgmode').value='off';
+      clearTimeout(PEQ_TIMER);if(PEQ_STATE)PEQ_STATE.bypass=true;if(D('peqBypass'))D('peqBypass').checked=true;
+      peqLoadState();syncProcessingControls();
+    }
+  }
+  ADV.sdmFilt='';ADV.sdmFiltNx='';ADV.taps=0;if(D('sp_taps'))D('sp_taps').value='0';
+  if(applied&&applied.modfamily)ADV.modfamily=applied.modfamily;
+  if(applied&&applied.modorder)ADV.modorder=Number(applied.modorder);
+  if(applied&&applied.directsdm!==undefined)ADV.directsdm=Number(applied.directsdm)?1:0;
   if (!applied || typeof applied !== 'object') return;
 
   var r = applied.rate !== undefined ? applied.rate : applied.sRate;
@@ -6271,12 +8275,13 @@ function applyPresetControls(applied, profile) {
   var vol = applied.volume !== undefined ? applied.volume : applied.vol;
   if (vol === undefined && profile === 'bitperfect') vol = 0;
   if (vol !== undefined) {
-    var vNum = Number(vol) || 0;
+    var vNum = volClamp(Number(vol) || 0);
     S.vol = vNum;
     S.volDb = vNum;
     if (D('vol')) D('vol').value = String(vNum);
     if (D('volDb')) D('volDb').textContent = vNum.toFixed(1) + ' dB';
-    api('/api/volume', 'vol=' + vNum).catch(function () {});
+    syncVolUi(vNum);
+    api('/api/volume?db=' + encodeURIComponent(vNum), '').catch(function () {});
   }
 
   var isp = applied.isp !== undefined ? applied.isp : applied.sIsp;
@@ -6311,20 +8316,23 @@ function applyPresetControls(applied, profile) {
     }
   }
 
-  saveSettings(true);
+  var saved=saveSettings(true);
   tick();
   if (typeof syncLiveSignal === 'function') syncLiveSignal();
   if (typeof updateSignalChain === 'function') updateSignalChain();
   if (D('modal') && D('modal').classList.contains('on')) showChain();
+  return saved;
 }
 
-function applyPreset(profile) {
+function applyPreset(profile, options) {
+  if (!ensurePlaybackSettings()) return Promise.resolve({ok:false,errorCode:'PLAYBACK_SETTINGS_NOT_READY'});
   var bBp = D('presetBitPerfect'), bPcm = D('presetPcm'), bDsd = D('presetDsd');
   if (bBp) bBp.disabled = true;
   if (bPcm) bPcm.disabled = true;
   if (bDsd) bDsd.disabled = true;
 
-  return api('/api/preset/apply?profile=' + encodeURIComponent(profile), '').then(function (j) {
+  clearTimeout(window._setT);clearTimeout(PEQ_TIMER);
+  return api('/api/preset/apply?profile=' + encodeURIComponent(profile)+'&keep_volume=1'+(options&&options.preserveProcessing?'&preserve_processing=1':''), '').then(function (j) {
     if (bBp) bBp.disabled = false;
     if (bPcm) bPcm.disabled = false;
     if (bDsd) bDsd.disabled = false;
@@ -6334,18 +8342,17 @@ function applyPreset(profile) {
       return j;
     }
 
-    if (j.applied) {
-      applyPresetControls(j.applied, profile);
-    }
-
+    return Promise.resolve(j.applied ? applyPresetControls(j.applied, profile) : null).then(function(saved){
+    if(saved && !saved.ok){if(saved.stale)toast(t('当前组已切换，请重新操作'));return saved;}
     if (j.notes && Array.isArray(j.notes) && j.notes.length) {
       j.notes.forEach(function (note, idx) {
         setTimeout(function () { toast(note); }, idx * 1200);
       });
     } else {
-      toast('已应用 ' + (profile === 'bitperfect' ? '原音直通' : (profile === 'pcm' ? 'PCM 升频' : 'DSD 升频')) + ' 预设');
+      toast(tf('已应用 {0} 预设', [(profile === 'bitperfect' ? '原音直通' : (profile === 'pcm' ? 'PCM 升频' : 'DSD 升频'))]));
     }
     return j;
+    });
   }).catch(function (err) {
     if (bBp) bBp.disabled = false;
     if (bPcm) bPcm.disabled = false;
@@ -6382,6 +8389,7 @@ function bindPresetCard() {
 }
 
 function renderSettingsPage() {
+  ++CLEANUP_UI.generation;
   var filts = D('sFilt') ? D('sFilt').innerHTML : '';
   // Nx 下拉必须带上"跟随 1x"（空值），否则重建后浏览器退回第一项，一保存就把 Nx 改掉
   var filtsNx = '<option value="">跟随 1x（不单独指定）</option>' + filts;
@@ -6389,17 +8397,16 @@ function renderSettingsPage() {
   var BK = ADV.backend || 'wasapi';
   var CH = String(ADV.channels || 0);
   var h = '';
+  // Static labels use their source text. The DOM translator records each source
+  // so the same form can change language without replacing unfinished inputs.
 
   // 2026-10-26（261026-01 #2）：官方推荐预设卡片**移进「输出」面板**（用户：不要做在所有东西外面）。
   // ---------- 页签（对齐 HQPlayer：Inputs / Outputs / PCM / SDM / Advanced） ----------
   h += '<div class=stabs>'
      + '<button class="stab on" data-g=in>输入</button>'
      + '<button class=stab data-g=out>输出</button>'
-     + '<button class=stab data-g=pcm>PCM</button>'
-     + '<button class=stab data-g=sdm>SDM</button>'
      + '<button class=stab data-g=adv>高级</button>'
      // #6（2026-10-27 用户 261026-09）：EQ 页内容臃肿 ⟹ 拆成 EQ / 声音校准 两个页签。
-     + '<button class=stab data-g=eq>EQ</button>'
      + '<button class=stab data-g=cal>声音校准</button>'
      + '<button class=stab data-g=meta>元数据</button>'
      // 2026-10-27（261027-04 #4）：**删除**「分析」页签 —— 用户原话「设置-分析，整个功能页不应该
@@ -6418,7 +8425,6 @@ function renderSettingsPage() {
   // 2026-10-26（261026-01 #2）：官方推荐预设卡片放在这里（用户要求「做到输出里面」）
   h += '<div class="spane" data-g=out>'
      // 2026-10-26（261026-01 #2）：官方推荐预设放在「输出」面板最上方（用户要求「做到输出里面」）。
-     + presetCardHtml()
      + sgroup('输出后端', '独占 = bit-perfect；共享 = 兼容性最好（虚拟机 / 远程桌面）',
          // 261024-04 #2：用户要求「放在后端那个选项的右边」—— bit-perfect 直通按钮从独立一行挪进
          // 「后端」下拉的同一行（flex 行，底对齐；下拉可缩、按钮 nowrap，窄窗也不换行）。
@@ -6447,6 +8453,10 @@ function renderSettingsPage() {
       + '<select id=sp_upnp_dev style="flex:1"><option value="">（正在发现…）</option></select>'
       + '<button class=btn id=sp_upnp_scan style="white-space:nowrap">重新发现</button>'
       + '</div>'
+      + chk('sp_upnp_upsample', '投放前升频', !!ADV.upnpUpsample, '目标采样率与滤波器使用 PCM 页设置；保持源采样率时不会升频。',true)
+      + chk('sp_upnp_force','强制使用未声明的目标率',!!ADV.upnpForceRate,'仍遵守同族整数倍和上限；设备可能拒播。',true)
+      + sel('sp_upnp_ceiling','投放采样率上限',[88200,96000,176400,192000,352800,384000,705600,768000].map(function(r){return opt(r,r/1000+' kHz',ADV.upnpRateCeiling);}).join(''),'只选择位深、声道与速率同时匹配的设备格式。')
+      + '<div class=hint>'+esc('先在本机准备完整 WAV，再向设备供源；准备时可以停止取消。')+'</div>'
       + '<div class=hint id=sp_upnp_msg>播放 / 切歌自动投放到该渲染器（与下方「投放」共用会话）</div>'
       + '</div>'
        // 2026-10-24（261024-02 #8）：一键直通预设（源采样率 + 无抖动 + 0 dB + 无 EQ/IR + 独占）。
@@ -6529,6 +8539,12 @@ function renderSettingsPage() {
        + sel('sp_2s', '两段式升频',
              opt('auto', '自动（推荐）', D('s2s').value) + opt('1', '开启', D('s2s').value) + opt('0', '关闭', D('s2s').value),
              '自动：PCM 按滤波器预设，DSD 使用级联。开启或关闭会覆盖自动选择。'))
+     + sgroup('录音噪声清理','在输入 PCM 域自适应降噪，可与 PCM 升频或 DSD 调制组合；逐位 DSD 不经过此处理。',
+         chk('sp_cleanup','启用录音噪声清理',!!ADV.cleanup,'默认关闭。降低噪声会改变样本，不能恢复录音中已丢失的信息。',true)
+        + sel('sp_cleanup_noise_mode','噪声底模式',opt('auto','自动估计（推荐）',ADV.cleanupAuto===0?'manual':'auto')+opt('manual','手动',ADV.cleanupAuto===0?'manual':'auto'),'自动模式仅从可信安静片段估计；证据不足时暂不降噪。手动值会保留。')
+       + sel('sp_cleanup_strength','清理强度',opt(.25,'轻柔',ADV.cleanupStrength)+opt(.5,'标准',ADV.cleanupStrength)+opt(.75,'强力',ADV.cleanupStrength),'强度范围 0～1；更高强度可能影响微弱细节。')
+        + num({id:'sp_cleanup_noise',label:'手动噪声底（dBFS）'},ADV.cleanupNoiseDb,-120,-60,.1,'仅手动模式使用；自动模式保留此值，不把它当作测量结果。')
+        + '<div class="sfld wide"><label>' + esc('清理实况') + '</label><div class=hint id=sp_cleanup_status role=status></div><button type=button class=btn id=sp_cleanup_refresh>' + esc('刷新清理状态') + '</button></div>')
      + sgroup('抖动与保护', '按采样率自动重标定',
          sel('sp_shaper', '抖动 / 噪声整形', shaps, 'auto = 按输出位深自动选型')
        + chk('sp_isp', '过采样峰值保护（ISP）', D('sIsp').checked, '检测到插值峰值超满幅时预衰减'))
@@ -6560,12 +8576,13 @@ function renderSettingsPage() {
               opt('dsd', 'DSD 标准（Butterworth NTF，1-bit）', ADV.modfamily || 'dsd') +
               opt('chebyshev', 'Chebyshev（可配带外增益与截止，1-bit 保护运行于 5 阶）', ADV.modfamily || 'dsd') +
               opt('ec', 'EC 误差反馈（频带零点扩展消除）', ADV.modfamily || 'dsd') +
-              opt('ahm', 'AHM 多电平（6~8 bit 风格）', ADV.modfamily || 'dsd'),
-              '多种 NTF 滤波与量化架构')
+              opt('ahm', 'AHM 算法（当前为 1-bit DSD 输出）', ADV.modfamily || 'dsd'),
+              '多种 NTF 滤波与量化架构；AHM 当前为 1-bit DSD 输出。真正 6/8-bit 多电平可用随包离线导出工具 rlmultilevel；该文件不直接发送到 DoP / ASIO DAC')
         + sel('sp_modorder', '调制器阶数',
-             opt(5, '5 阶（DSD64 起）', ADV.modorder || 5) + opt(7, '7 阶（需 DSD128 以上）', ADV.modorder || 5),
-             '7 阶在低采样率或 Chebyshev 1-bit 下不稳定，程序会自动降为 5 阶')
-       + num({ id: 'sp_modcut', label: '噪声整形拐点（kHz，0 = 100）' }, ADV.modcut, 0, 200, 5)
+             opt(5, '5 阶（请求值）', ADV.modorder || 5) + opt(7, '7 阶（请求值）', ADV.modorder || 5),
+             '实际阶数由调制器族、NTF 稳定性与 OSR 质量门决定；以信号链显示为准')
+       + num({ id: 'sp_modcut', label: '噪声整形拐点（kHz，0 = 100）' }, ADV.modcut, 0, 200, 5,
+             '0 使用已验证的默认 100 kHz；非 EC 的 1-bit 输出只允许 0 或 100～200 kHz，低值因已证音频带失真而拒绝，绝不静默改值；EC 按 Hinf 综合，不使用此值')
        + num({ id: 'sp_moddith', label: '调制器抖动（LSB，-1 = 默认）' }, ADV.moddith, -1, 1, 0.001, '抑制空闲音'))
      + sgroup('SDM 源（DSD 文件）', '原生读取 + DirectSDM',
          chk('sp_directsdm', 'DirectSDM：DSD 源同速率直通（逐位一致）', ADV.directsdm == 1,
@@ -6643,7 +8660,7 @@ function renderSettingsPage() {
        + opt('ru', 'Русский', ADV.uiLang || 'auto')
        + opt('es', 'Español', ADV.uiLang || 'auto')
        + opt('ar', 'العربية', ADV.uiLang || 'auto')
-       + '</select></div>')
+        + '</select></div>')
      + sgroup('GPU',
          sel('sp_gpu', 'GPU 后端',
              opt('auto', '自动', ADV.gpuvendor || 'auto') + opt('amd', 'AMD（HIP）', ADV.gpuvendor || 'auto') +
@@ -6675,7 +8692,7 @@ function renderSettingsPage() {
       //      #sLoud 是 display:none 的参数源，信号链页只是只读展示）⟹ 按「不许把功能删没了」
       //      的约束**保留**，并挪到「输出」页的「音量与等响度」组（原来挂在「高级-播放」里）。
       // 2026-10-27（261027-04 #4）：新增「音频分析」组 —— 用户要求「自动分析要能被关掉」。
-      // 默认开；关掉后播放不再自动跑（单曲页仍可手动点「重新分析」）。
+      // 关闭自动分析后仍保留已经缓存的结果。
       + sgroup('音频分析', '正在播放那首歌的动态 / 音质 / 假无损，展示在单曲页；播放时自动分析一次',
           // 2026-10-28（用户要求）：**模块总开关**。
           // 关掉后：单曲页那块框整个消失（包括"自动分析已关闭"的提示框）、右键菜单没有分析入口、
@@ -6685,13 +8702,9 @@ function renderSettingsPage() {
               '右键菜单不再有「查看分析」入口、也不会再向后台请求任何分析数据。' +
               '如果你只是不想每次播放都自动跑、但仍想手动看结果，用下面的「播放时自动分析」。') +
           chk('sp_autoanl', '播放时自动分析', ANL.auto !== 0,
-              '默认开。每首本地曲目开始播放时自动跑一次（只读文件、不开音频设备）；' +
-              '结果按 路径+大小+mtime 缓存，同一首再播是秒出。' +
-              '不想每次播放都吃 CPU 就关掉它 —— 关掉后单曲页那块仍可手动点「重新分析」。' +
-              '流媒体 / 网络共享 / CD 音轨一律不自动分析。')
+              '开启后会自动分析当前曲目并缓存结果。关闭后仍可查看已有结果。')
         + '<div class="sfld wide"><div class=hint id=sp_anlmsg>' +
-            '当前：' + (ANL.auto ? '开' : '关') + '　·　' +
-            '已在单曲页展示，不需要额外操作</div></div>')
+            analysisAutoStatus() + '</div></div>')
       + '</div>';
   // EQ       = 20 段 PEQ + 耳机 EQ（OPRA）      —— 手调，改的是"音色"
   // 声音校准 = 房间校正向导 + 校正文件（EQ/IR） —— 测量与外部文件，改的是"系统误差"
@@ -6806,6 +8819,7 @@ function renderSettingsPage() {
        + 'rlplayer-settings.conf · rlplayer-library.conf · rlplayer-llm.conf · rlplayer-feedback.conf · '
        + 'rlplayer-playlist.txt · rlplayer-savedqueues.conf · rlplayer-favs.json · data\\（库索引/封面缓存/房间校正集） · '
        + 'covercache\\ · WebView2Runtime\\ · playlists\\。'
+       + '跨大版本或 WebView2 更新时，请按提示通过百度网盘（国内）或 GitHub（国外）手动安装完整版。'
        + '</div>'
        + '<div class="sfld wide" id=sp_updcard style="display:none;margin-top:14px">'
        + '<div class=meta-card>'
@@ -6818,6 +8832,8 @@ function renderSettingsPage() {
        + '<div class=hint id=sp_updmsg style="margin-top:8px"></div>'
        + '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">'
        + '<button class="btn pri" id=sp_upddl>下载更新</button>'
+       + '<button class="btn pri" id=sp_updcn style="display:none">国内下载：百度网盘</button>'
+       + '<button class=btn id=sp_updglobal style="display:none">国外下载：GitHub</button>'
        + '<button class=btn id=sp_updapply style="display:none">立即更新并重启</button>'
        + '<button class=btn id=sp_updskip style="font-size:12px">跳过此版本</button>'
        + '</div></div></div>')
@@ -6831,8 +8847,9 @@ function renderSettingsPage() {
          + '<div><b>测试鸣谢</b>　Miyu、正在下载99%</div>'
          + '<div style="margin-top:8px"><b>官方主页</b>　'
          + '<a href="#" class="eflink" data-url="https://rlplayer.rainlain.com">rlplayer.rainlain.com</a>'
-         + '<span style="color:var(--mut2);font-size:11.5px">（即将上线）</span></div>'
-         + '<div><b>粉丝和反馈 Q 群</b>　'
+         + '</div>'
+         // 2026-11-02（用户）：Q 群只在中文界面显示；其他语种整行隐藏（切语言即时生效）
+         + '<div class="zh-only"><b>粉丝和反馈 Q 群</b>　'
          + '<a href="#" class="eflink" data-url="https://qm.qq.com/q/895816505">895816505</a></div>'
          + '<div style="margin-top:8px;color:var(--mut2);font-size:11.5px">'
          + '本程序以 GNU 通用公共许可证第 3 版（GPL-3.0-or-later）发布；'
@@ -6873,7 +8890,7 @@ function renderSettingsPage() {
        + '<div class=meta-card>'
        + '<div class=mh>DeepSeek 接入' + tip('只用于上面的「AI 增强」；不填也能用全部本地与公开数据源') + '</div>'
        + '<label style="display:block;font-size:11px;color:var(--mut);margin-bottom:5px">DeepSeek API Key' +
-           tip('只存本机 build' + SEP + 'rlplayer-llm.conf；不进安装包，界面永不回显明文') + '</label>'
+           tip(tf('只存本机 build{0}rlplayer-llm.conf；不进安装包，界面永不回显明文', [SEP])) + '</label>'
        + '<input type=password id=sp_llmkey autocomplete=off spellcheck=false placeholder="sk-…（粘贴后点保存，只显示掩码）" style="width:100%">'
        + '<div class=hint id=sp_llmmsg style="margin-top:6px">读取配置中…</div>'
        + '<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">'
@@ -6908,9 +8925,12 @@ function renderSettingsPage() {
   // 底部按钮（不随页签切换）
   h += '<div class=setfoot><button class="btn pri" id=sp_save>保存设置</button>'
      + '<button class=btn id=sp_reset>恢复默认</button><span class=sp></span>'
-     + '<span style="font-size:11.5px;color:var(--mut2)">改动在下一次播放时生效</span></div>';
+     + '<span style="font-size:11.5px;color:var(--mut2)">播放参数在停止后重新播放时使用</span></div>';
 
   D('setpage').innerHTML = h;
+  D('setpage').oninput = function(event) {
+    if(event.target.id)event.target.dataset.rlEdited='1';
+  };
 
   bindPresetCard();
   loadPresetCaps(false);
@@ -6928,6 +8948,7 @@ function renderSettingsPage() {
    ['sp_loud', 'sLoud'], ['sp_isp', 'sIsp'], ['sp_2s', 's2s']].forEach(function (pair) {
     var a = D(pair[0]), b = D(pair[1]);
     if (!a || !b) return;
+    if (pair[0] === 'sp_filt') { setSelectValue(a, b.value); return; }
     if (a.type === 'checkbox') { a.checked = b.checked; return; }
     if (a.tagName === 'SELECT') {
       for (var i = 0; i < a.options.length; i++) {
@@ -6956,12 +8977,14 @@ function renderSettingsPage() {
   // 页签切换（输入 / 输出 / PCM / SDM / 高级）
   Array.prototype.forEach.call(document.querySelectorAll('#setpage .stab'), function (b) {
     b.onclick = function () {
+      D('setpage').dataset.rlSettings='detail';
       Array.prototype.forEach.call(document.querySelectorAll('#setpage .stab'), function (x) {
         x.classList.toggle('on', x === b);
       });
       Array.prototype.forEach.call(document.querySelectorAll('#setpage .spane'), function (p) {
         p.classList.toggle('on', p.dataset.g === b.dataset.g);
       });
+      if (b.dataset.g === 'pcm') refreshCleanupStatus();
       // 评审 #12：诊断页是纯操作页（导出/写回），底部「保存设置/恢复默认」在这里没有意义 → 隐藏。
       // 2026-10-24 #5：流媒体页的增删改/启用都是即时落盘，同样不需要底部保存。
       var foot = document.querySelector('#setpage .setfoot');
@@ -6990,6 +9013,7 @@ function renderSettingsPage() {
   // 输出后端 / 声道 / 微调
   D('sp_backend').onchange = function () {
     ADV.backend = this.value;
+    loadRates();
     saveSettings();
     backendHint();
     applyBackendState();
@@ -6998,6 +9022,15 @@ function renderSettingsPage() {
     if (this.value === 'upnp') scanCastDevices(true);
   };
   // 261024-05：NAA 端点下拉绑定已删除（控件不再存在）
+  [['sp_upnp_upsample','upnpUpsample'],['sp_upnp_force','upnpForceRate'],['sp_cleanup','cleanup']].forEach(function(x){if(D(x[0]))D(x[0]).onchange=function(){ADV[x[1]]=this.checked?1:0;saveSettings();if(x[1]==='cleanup')refreshCleanupStatus();};});
+  [['sp_upnp_ceiling','upnpRateCeiling'],['sp_cleanup_strength','cleanupStrength'],['sp_cleanup_noise','cleanupNoiseDb']].forEach(function(x){if(D(x[0]))D(x[0]).onchange=function(){if(!validateProcessingSettings())return;ADV[x[1]]=Number(this.value);saveSettings();};});
+  if(D('sp_cleanup_noise_mode'))D('sp_cleanup_noise_mode').onchange=function(){
+    if(!validateProcessingSettings()){syncCleanupNoiseMode();return;}
+    ADV.cleanupAuto=this.value==='manual'?0:1;syncCleanupNoiseMode();saveSettings();refreshCleanupStatus();
+  };
+  if(D('sp_cleanup_refresh'))D('sp_cleanup_refresh').onclick=refreshCleanupStatus;
+  paintCleanupStatus();
+  syncProcessingControls();
   // 261024-01 #9：目标渲染器与「投放」区块同一个选择（不出现两套互相打架的控制）
   if (D('sp_upnp_scan')) D('sp_upnp_scan').onclick = function () { scanCastDevices(true); };
   if (D('sp_upnp_dev')) D('sp_upnp_dev').onchange = function () { syncUpnpDev(this.value); backendHint(); };
@@ -7037,7 +9070,7 @@ function renderSettingsPage() {
     backendHint();
     if (D('sp_backendmsg')) D('sp_backendmsg').textContent = volSet
       ? '已切到 bit-perfect 直通：源采样率 + 无抖动 + 0 dB + 无 EQ/IR + 独占。下次播放生效。'
-      : '已改采样率/抖动/EQ，但音量仍是 ' + volNow.toFixed(1) + ' dB（非 0）→ 仍非 bit-perfect。';
+      : tf('已改采样率/抖动/EQ，但音量仍是 {0} dB（非 0）→ 仍非 bit-perfect。', [volNow.toFixed(1)]);
     toast(volSet ? '已切到 bit-perfect 直通（下次播放生效）' : '已改采样率/抖动/EQ；音量未动，仍非 bit-perfect');
   };
   D('sp_ch').onchange = function () {
@@ -7131,7 +9164,7 @@ function renderSettingsPage() {
   if (D('sp_autoanl')) D('sp_autoanl').onchange = function () {
     anlSetAuto(this.checked);
     var m = D('sp_anlmsg');
-    if (m) m.textContent = '当前：' + (ANL.auto ? '开' : '关') + '　·　已在单曲页展示，不需要额外操作';
+    if (m) m.textContent = analysisAutoStatus();
   };
   // 2026-10-28（用户紧急反馈）：「设置-高级-音频分析 → 启用音频分析模块」取消勾选、保存、刷新后又自动勾上。
   // 真因：sp_anlmaster 这个复选框**从来没有绑定 onchange**（anlSetMaster 定义了却零调用点）⟹
@@ -7207,11 +9240,12 @@ function renderSettingsPage() {
     var m = D('sp_gpumsg');
     if (m) {
       // 2026-10-24 #7：只在页面上留一句结论，DLL 明细收进 (?) 提示（动态内容写 title）。
-      m.textContent = '当前状态：' + (j.available ? 'GPU 可用' : '走 CPU（未找到可执行的 GPU 后端）');
-      m.title = 'rtagpu.dll=' + (j.amd ? '有' : '无') +
-                '，rtagpu_cuda.dll=' + (j.cuda ? (j.cudaUsable === false ? '有（本机不可用）' : '有（可用）') : '无') +
-                '，AMD HIP 运行库=' + (j.hip ? '有' : '无') +
-                '；厂商偏好=' + (j.vendor || 'auto');
+      m.textContent = tf('当前状态：{0}', [(j.available ? t('GPU 可用') : t('走 CPU（未找到可执行的 GPU 后端）'))]);
+      m.title = tf('rtagpu.dll={0}，rtagpu_cuda.dll={1}，AMD HIP 运行库={2}',
+                   [(j.amd ? t('有') : t('无')),
+                    (j.cuda ? (j.cudaUsable === false ? t('有（本机不可用）') : t('有（可用）')) : t('无')),
+                    (j.hip ? t('有') : t('无'))]) +
+                tf('；厂商偏好={0}', [(j.vendor || 'auto')]);
     }
   }).catch(function () { });
   // ASIO 驱动列表（Native DSD 需要 ASIO 后端）
@@ -7224,7 +9258,7 @@ function renderSettingsPage() {
     // 2026-10-24（原生 DSD 接入）：Native DSD 已接通 ASIO 原生通道，这里只交代前提。
     // 后端 ASIO / 源 DSD / 音量 0 dB / 无 PCM 处理；同族整数倍率转换还需设备接受目标位率。
     m.textContent = d.length
-      ? ('本机 ASIO 驱动 ' + d.length + ' 个 · Native DSD 需后端 ASIO、源为 DSD、音量 0 dB、无 EQ / 卷积；支持设备可用的同族整数倍率转换，同位率未转换时可 bit-perfect，转换后非 bit-perfect；驱动拒绝时回落 DoP')
+      ? (tf('本机 ASIO 驱动 {0} 个 · Native DSD 需后端 ASIO、源为 DSD、音量 0 dB、无 EQ / 卷积；支持设备可用的同族整数倍率转换，同位率未转换时可 bit-perfect，转换后非 bit-perfect；驱动拒绝时回落 DoP', [d.length]))
       : '本机未检测到 ASIO 驱动 · Native DSD 不可用（DoP 仍可用）';
     m.title = d.length ? d.join('、') : '';
   }).catch(function () { });
@@ -7235,8 +9269,8 @@ function renderSettingsPage() {
   D('sp_save').onclick = applySettings;
   D('sp_reset').onclick = function () {
     if (!confirm('把所有参数恢复成默认值？')) return;
-    ADV = { device: '', bits: 0, taps: 0, atten: 0, transition: 0, phase: '', modcut: 0, moddith: -1, ir: '', irgpu: 0, ramp: 0, theme: S.theme, modorder: 5, modfamily: 'dsd', directsdm: 0, dsdKind: 'fir', dsdConv: 'narrow',
-            backend: 'wasapi', channels: 0,
+    ADV = { device: '', bits: 0, taps: 0, atten: 0, transition: 0, phase: '', modcut: 0, moddith: -1, ir: '', irgpu: 0, ramp: 0, theme: S.theme, modorder: 5, modfamily: 'dsd', directsdm: 1, dsdKind: 'fir', dsdConv: 'narrow',
+            backend: 'wasapi', channels: 0, quickStart: 1, cleanupAuto: 1,
             inBackend: 'none', inDev: '', inOffset: 0, inBuf: 100, inMonitor: 0, inSeconds: 0, inOut: '',
             rgmode: 'off', rgclip: 1, autoAnl: 1 };
     // 元数据两键的默认：自动补全开；AI 增强关（联网计费项默认关，避免「恢复默认」反而产生费用）。
@@ -7251,6 +9285,8 @@ function renderSettingsPage() {
     saveSettings(); renderSettingsPage(); toast('已恢复默认');
   };
   D('sp_theme').onchange = function () { setTheme(this.value); };
+  if (D('sp_quickstart')) D('sp_quickstart').onchange = function () { saveQuickStartPreference(this.checked); };
+  syncQuickStartVisibility();
   D('sp_addroot').onclick = function () {
     var d = (D('sp_root').value || '').trim();
     if (!d) { toast('请填目录'); return; }
@@ -7451,7 +9487,7 @@ function getTargetCurveDescInfo(details, author) {
   var authorName = author || 'AutoEQ';
   return {
     name: details || (authorName + ' 专业校准预设'),
-    scene: '由 ' + authorName + ' 依据测量数据生成的校准滤波，平直化固有频响缺陷。',
+    scene: tf('由 {0} 依据测量数据生成的校准滤波，平直化固有频响缺陷。', [authorName]),
     tech: '基于 AutoEq 优化算法与专业人工耳测量数据计算所得的双二阶 IIR 滤波器组。'
   };
 }
@@ -7560,7 +9596,7 @@ function micCalPaint(j) {
     if (cr) cr.textContent = '-';
     if (sub) sub.textContent = '没有校准文件时，测到的房间响应会带上麦克风自身的误差';
     if (hint) hint.textContent = (j && j.error)
-      ? ('读取失败：' + j.error)
+      ? (tf('读取失败：{0}', [j.error]))
       : '未导入校准文件：测量仍可进行，但结果会包含麦克风自身误差。';
     return;
   }
@@ -7571,7 +9607,7 @@ function micCalPaint(j) {
   if (cr) {
     var a = (typeof j.minDb === 'number') ? j.minDb.toFixed(2) : '-';
     var b = (typeof j.maxDb === 'number') ? j.maxDb.toFixed(2) : '-';
-    cr.textContent = (j.points || 0) + ' 个点 · ' + a + ' ~ ' + b + ' dB';
+    cr.textContent = (j.points || 0) + tf(' 个点 · {0} ~ {1} dB', [a, b]);
   }
   if (hint) hint.textContent = '已导入：房间测量会按这条曲线扣除麦克风频响（只补偿幅度，相位不变）。';
 }
@@ -7592,15 +9628,15 @@ function micCalImportText(name, text) {
     body: 'name=' + encodeURIComponent(name) + '&content=' + encodeURIComponent(text)
   }).then(function (r) { return r.json(); }).then(function (j) {
     if (!j || !j.ok) {
-      if (msg) msg.textContent = '导入失败：' + ((j && j.error) || '未知原因');
+      if (msg) msg.textContent = tf('导入失败：{0}', [((j && j.error) || '未知原因')]);
       toast('校准文件导入失败');
       return;
     }
     if (msg) msg.textContent = '';
-    toast('已导入校准：' + (j.name || '') + '（' + (j.points || 0) + ' 点）');
+    toast(tf('已导入校准：{0}（{1} 点）', [(j.name || ''), (j.points || 0)]));
     micCalPaint(j);
   }).catch(function (e) {
-    if (msg) msg.textContent = '导入失败：' + (e && e.message ? e.message : '网络错误');
+    if (msg) msg.textContent = tf('导入失败：{0}', [(e && e.message ? e.message : '网络错误')]);
   });
 }
 function micCalBind() {
@@ -7785,7 +9821,7 @@ function rcWizRender() {
   var dots = '';
   for (var i = 1; i <= RCW.total; i++) dots += '<i class="rw-dot' + (i <= RCW.step ? ' on' : '') + '"></i>';
   D('rcDots').innerHTML = dots;
-  D('rcStep').textContent = '第 ' + RCW.step + ' / ' + RCW.total + ' 步';
+  D('rcStep').textContent = tf('第 {0} / {1} 步', [RCW.step, RCW.total]);
   D('rwTitle').textContent = s.t;
   var body = s.b;
   if (RCW.step === 2) {
@@ -7795,7 +9831,7 @@ function rcWizRender() {
             RC_LAYOUTS.map(function (o) {
               return '<option' + (o === RCW.layout ? ' selected' : '') + '>' + o + '</option>';
             }).join('') + '</select></label>' +
-            '<span class=rcnote>当前选择：<b id=rcLayoutNow>' + RCW.layout + '</b></span></div>';
+            '<span class=rcnote>' + t('当前选择：') + '<b id=rcLayoutNow>' + RCW.layout + '</b></span></div>';
   }
   D('rcBody').innerHTML = body;
   if (D('rcLayout')) {
@@ -7811,8 +9847,8 @@ function rcWizRender() {
       '<div class=rcsub style="line-height:1.9">' +
         '播放设备：<select id=rcPlaySel style="max-width:340px;vertical-align:middle"></select>（共享模式，不独占）<br>' +
         '采集设备：<select id=rcCapSel style="max-width:340px;vertical-align:middle"></select><br>' +
-        '声道布局：<b>' + RCW.layout + '</b> · 时长：<b><span id=rcSecsVal>' + RCW.seconds + '</span> 秒/声道</b>' +
-        ' · 电平：<b><span id=rcLevelVal>' + RCW.levelDb + '</span> dBFS</b><br>' +
+        t('声道布局：') + '<b>' + RCW.layout + '</b>' + tf(' · 时长：<b><span id=rcSecsVal>{0}</span> 秒/声道</b>', [RCW.seconds]) +
+        tf(' · 电平：<b><span id=rcLevelVal>{0}</span> dBFS</b><br>', [RCW.levelDb]) +
         '<span class=warnline>扫频会盖过正在播放的音乐；测量期间请静音其它程序。</span>' +
       '</div>' +
       '<div style="margin-top:10px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">' +
@@ -7853,7 +9889,7 @@ function rcBindMeasurePanel() {
     for (var i = 0; i < arr.length; i++) {
       var d = arr[i];
       opt += '<option value="' + esc(d.id || '') + '"' + (d['default'] ? ' selected' : '') + '>' +
-             esc((d.name || d.id) + (d['default'] ? '（默认）' : '')) + '</option>';
+             esc((d.name || d.id) + (d['default'] ? t('（默认）') : '')) + '</option>';
     }
     sel.innerHTML = opt;
     RCW.playDev = sel.value;
@@ -7866,7 +9902,7 @@ function rcBindMeasurePanel() {
     for (var i = 0; i < arr.length; i++) {
       var d = arr[i];
       opt += '<option value="' + esc(d.id || '') + '"' + (d.isDefault ? ' selected' : '') + '>' +
-             esc((d.name || d.id) + (d.isDefault ? '（默认）' : '')) + '</option>';
+             esc((d.name || d.id) + (d.isDefault ? t('（默认）') : '')) + '</option>';
     }
     sel.innerHTML = opt;
     RCW.capDev = sel.value;
@@ -7897,14 +9933,14 @@ function rcPollStart() {
     api('/api/roomcorr/status').then(function (j) {
       if (!j) return;
       if (j.running) {
-        rcProg('第 ' + j.step + ' / ' + j.totalSteps + ' 步' + (j.stepName ? '：' + j.stepName : '') +
-               (j.channel ? ' · 声道 ' + j.channel : '') + ' …');
+        rcProg(tf('第 {0} / {1} 步{2}', [j.step, j.totalSteps, (j.stepName ? tf('：{0}', [j.stepName]) : '')]) +
+               (j.channel ? tf(' · 声道 {0}', [j.channel]) : '') + ' …');
       } else {
         rcPollStop();
         if (D('rcStop')) D('rcStop').style.display = 'none';
         if (D('rcGo')) D('rcGo').disabled = false;
         if (j.hasCorrectionSet) {
-          rcProg('✅ 测量完成：' + (j.layout || RCW.layout) + ' · ' + j.irTaps + ' taps @ ' + j.irFs + ' Hz' +
+          rcProg(tf('✅ 测量完成：{0} · {1} taps @ {2} Hz', [(j.layout || RCW.layout), j.irTaps, j.irFs]) +
                  (j.warnings && j.warnings.length ? '<br>⚠️ ' + j.warnings.join('；') : ''));
           var dl = D('bRoomDl'); if (dl) dl.style.display = '';
           RCW.done = true;
@@ -7921,7 +9957,7 @@ function rcStatusRefresh() {
   api('/api/roomcorr/status').then(function (j) {
     if (!j) return;
     var el = D('rcStatus'), sub = D('rcStatusSub');
-    if (el) el.textContent = j.hasCorrectionSet ? ('已测量 · ' + (j.layout || '')) : '未测量';
+    if (el) el.textContent = j.hasCorrectionSet ? (tf('已测量 · {0}', [(j.layout || '')])) : '未测量';
     if (sub) sub.textContent = j.hasCorrectionSet
       ? (j.irTaps + ' taps @ ' + j.irFs + ' Hz' + (j.file ? ' · ' + j.file.split('\\').pop() : ''))
       : '点「开始向导」跑一次测量';
@@ -7936,9 +9972,9 @@ function rcAutoSync() {
   if (!el) return;
   var on = (ADV.roomcorrauto !== 0);
   api('/api/roomcorr/status').then(function (j) {
-    var disk = (j && j.hasCorrectionSet) ? ('磁盘上有校正集：' + (j.layout || '?') + ' · ' + j.irTaps + ' taps @ ' + j.irFs + ' Hz') : '磁盘上还没有校正集（先跑一次向导）';
+    var disk = (j && j.hasCorrectionSet) ? (tf('磁盘上有校正集：{0} · {1} taps @ {2} Hz', [(j.layout || '?'), j.irTaps, j.irFs])) : '磁盘上还没有校正集（先跑一次向导）';
     var ch = (ADV.channels || 0);
-    var cnt = ch > 0 ? ('当前输出 ' + ch + ' 声道') : '当前输出跟随源文件声道数';
+    var cnt = ch > 0 ? (tf('当前输出 {0} 声道', [ch])) : '当前输出跟随源文件声道数';
     var localMatch = '';
     var LAY = { '2.0': 2, '2.1': 3, '5.1': 6, '7.1': 8, '5.1.2': 8, '7.1.4': 12 };
     if (j && j.hasCorrectionSet && ch > 0 && LAY[j.layout] && LAY[j.layout] !== ch)
@@ -7946,7 +9982,7 @@ function rcAutoSync() {
                    ' 声道），当前按 ' + ch + ' 声道输出 ⟹ 播放时不会应用。</span>';
     el.innerHTML = (on ? '自动应用：<strong>开</strong>' : '自动应用：<strong>关</strong>（只用下面手动的 IR）') +
       ' · ' + disk + ' · ' + cnt + localMatch;
-  }).catch(function () { el.textContent = '自动应用：' + (on ? '开' : '关'); });
+  }).catch(function () { el.textContent = tf('自动应用：{0}', [(on ? '开' : '关')]); });
 }
 function rcWizOpen() {
   var box = rcWizEnsure();
@@ -8157,7 +10193,7 @@ function peqResetBand(i) {
   tr.querySelector('.peqQ').value = '1.41';
   peqSyncNodes();
   peqScheduleApply(100);
-  peqMsg('第 ' + i + ' 段已复位（0.0 dB / Q 1.41）');
+  peqMsg(tf('第 {0} 段已复位（0.0 dB / Q 1.41）', [i]));
 }
 function peqSvgPoint(ev) {
   var box = D('peqCurve');
@@ -8345,8 +10381,8 @@ function peqAutoPreamp() {
   var inp = D('peqPreamp');
   if (inp) inp.value = pre;
   peqApply();
-  peqMsg('自动前级：曲线峰值 +' + maxGain.toFixed(1) + ' dB → 前级 ' + pre + ' dB（留出 ' + Math.abs(pre).toFixed(0) + ' dB 余量）');
-  toast('自动前级 ' + pre + ' dB（峰值 +' + maxGain.toFixed(1) + ' dB）');
+  peqMsg(tf('自动前级：曲线峰值 +{0} dB → 前级 {1} dB（留出 {2} dB 余量）', [maxGain.toFixed(1), pre, Math.abs(pre).toFixed(0)]));
+  toast(tf('自动前级 {0} dB（峰值 +{1} dB）', [pre, maxGain.toFixed(1)]));
 }
 function peqRender(j) {
   PEQ_STATE = j;
@@ -8389,10 +10425,10 @@ function peqStatusRender(j) {
   if (bypass) {
     txt = 'PEQ 当前：已旁路（PEQ 不生效，信号直通）';
   } else if (active === 0 && Math.abs(pre) < 0.001) {
-    txt = 'PEQ 当前：生效 · ' + (total || 20) + ' 段全为 0 dB、前级 0 dB（不改变声音）';
+    txt = tf('PEQ 当前：生效 · {0} 段全为 0 dB、前级 0 dB（不改变声音）', [(total || 20)]);
   } else {
     txt = 'PEQ 当前：生效 · ' + active + ' / ' + (total || 20) + ' 段非 0 dB' +
-          (Math.abs(pre) >= 0.001 ? ('、前级 ' + pre.toFixed(1) + ' dB') : '') + '（输出已被 EQ 改变）';
+          (Math.abs(pre) >= 0.001 ? (tf('、前级 {0} dB', [pre.toFixed(1)])) : '') + '（输出已被 EQ 改变）';
   }
   tx.textContent = txt;
   el.title = txt;
@@ -8408,12 +10444,12 @@ function peqApply() {
     + '&bands=' + encodeURIComponent(peqBandsParam());
   peqMsg('应用中…');
   api('/api/peq', body).then(function (j) {
-    if (!j || !j.ok) { peqMsg('失败：' + ((j && j.error) || '未知错误')); return; }
+    if (!j || !j.ok) { peqMsg(tf('失败：{0}', [((j && j.error) || '未知错误')])); return; }
     PEQ_STATE = j;
     peqDrawCurve(j.points);   // 只刷新曲线，不重建输入框（避免打断正在输入的光标）
     peqStatusRender(j);       // 261024-04 #3：状态行刷新（以后端返回值为准）
-    peqMsg('已应用（' + (j.bypass ? '旁路' : '生效') + ' · 采样率 ' + Math.round(j.fs) + ' Hz）');
-  }).catch(function (e) { peqMsg('失败：' + e); });
+    peqMsg(tf('已应用（{0} · 采样率 {1} Hz）', [(j.bypass ? '旁路' : '生效'), Math.round(j.fs)]));
+  }).catch(function (e) { peqMsg(tf('失败：{0}', [e])); });
 }
 function peqLoadState() {
   return api('/api/peq').then(function (j) {
@@ -8422,13 +10458,13 @@ function peqLoadState() {
 }
 function peqPresetAction(action, name) {
   api('/api/peq/preset', 'action=' + encodeURIComponent(action) + '&name=' + encodeURIComponent(name || '')).then(function (j) {
-    if (!j || !j.ok) { toast('预设操作失败：' + ((j && j.error) || '未知错误')); return; }
+    if (!j || !j.ok) { toast(tf('预设操作失败：{0}', [((j && j.error) || '未知错误')])); return; }
     peqRender(j);
-    if (action === 'load') toast('已加载预设：' + name);
-    else if (action === 'save') toast('已保存预设：' + name);
+    if (action === 'load') toast(tf('已加载预设：{0}', [name]));
+    else if (action === 'save') toast(tf('已保存预设：{0}', [name]));
     else if (action === 'reset') toast('已重置为 Flat');
     else toast('已删除预设');
-  }).catch(function (e) { toast('预设操作失败：' + e); });
+  }).catch(function (e) { toast(tf('预设操作失败：{0}', [e])); });
 }
 function initPeqControls() {
   if (!D('peqBypass')) return;   // 当前页面没有 PEQ 卡（例如还没渲染设置页）
@@ -8451,7 +10487,7 @@ function initPeqControls() {
   };
   if (D('peqDelete')) D('peqDelete').onclick = function () {
     var sel = D('peqPreset'); if (!sel) return;
-    if (confirm('删除用户预设「' + sel.value + '」？（内置预设不能删除）')) peqPresetAction('delete', sel.value);
+    if (confirm(tf('删除用户预设「{0}」？（内置预设不能删除）', [sel.value]))) peqPresetAction('delete', sel.value);
   };
   if (D('peqReset')) D('peqReset').onclick = function () {
     if (confirm('重置为 Flat（20 段全部 0dB）？')) peqPresetAction('reset', 'Flat');
@@ -8477,9 +10513,9 @@ function initEqViewLogic() {
     copyChip.onclick = function () {
       var text = 'https://opra.roon.app/';
       if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(function () { toast('已复制来源链接: ' + text); });
+        navigator.clipboard.writeText(text).then(function () { toast(tf('已复制来源链接: {0}', [text])); });
       } else {
-        toast('来源链接: ' + text);
+        toast(tf('来源链接: {0}', [text]));
       }
     };
   }
@@ -8521,9 +10557,9 @@ function initEqViewLogic() {
       if (!allHits.length) {
         hint.textContent = '未找到匹配的耳机型号，请尝试不同关键词';
       } else if (allHits.length > 30) {
-        hint.textContent = '共匹配到 ' + allHits.length + ' 款耳机，已显示前 30 条。继续输入更具体关键词以精确筛选…';
+        hint.textContent = tf('共匹配到 {0} 款耳机，已显示前 30 条。继续输入更具体关键词以精确筛选…', [allHits.length]);
       } else {
-        hint.textContent = '匹配到 ' + hits.length + ' 款耳机型号';
+        hint.textContent = tf('匹配到 {0} 款耳机型号', [hits.length]);
       }
       hint.style.display = 'block';
     }
@@ -8583,11 +10619,11 @@ function initEqViewLogic() {
               '<b style="font-size:13.5px;color:var(--txt);line-height:1.35">' + esc((p.author || 'OPRA') + (p.details ? (' · ' + p.details) : '')) + '</b>' +
               '<span class="badge" style="background:var(--hov);white-space:nowrap">' + p.bandsCount + ' 段</span>' +
               '</div>' +
-              '<div style="font-size:11px;color:var(--mut2)">目标曲线：' + esc(curve.name) + '</div>' +
+              '<div style="font-size:11px;color:var(--mut2)">' + tf('目标曲线：{0}', [esc(curve.name)]) + '</div>' +
               '<div class="tc-curve" title="目标曲线示意（手绘近似，非测量数据）">' + targetCurveSvg(curve.kind) + '</div>' +
               '<div style="font-size:12px;color:var(--txt2);line-height:1.5;margin:8px 0 0;background:var(--card);padding:8px 10px;border-radius:6px;border:1px solid var(--line)">' +
-              '说明：' + esc(curve.scene) + '</div>' +
-              '<div style="font-size:11.5px;color:var(--mut2);margin-top:8px">前级增益：<b>' + p.gainDb + ' dB</b> · 频段数：<b>' + p.bandsCount + ' 段</b></div>' +
+              '<span>' + tf('说明：{0}', [esc(curve.scene)]) + '</span></div>' +
+              tf('<div style="font-size:11.5px;color:var(--mut2);margin-top:8px">前级增益：<b>{0} dB</b> · 频段数：<b>{1} 段</b></div>', [p.gainDb, p.bandsCount]) +
               '</div>' +
               '<div style="margin-top:12px;display:flex;align-items:center;justify-content:space-between;gap:8px">' +
               '<span style="font-size:11px;color:var(--mut2)">点击卡片选中</span>' +
@@ -8624,7 +10660,7 @@ function initEqViewLogic() {
         };
       });
     }).catch(function (err) {
-      if (msg) msg.textContent = '获取失败: ' + err;
+      if (msg) msg.textContent = tf('获取失败: {0}', [err]);
       if (presetsBox) presetsBox.innerHTML = '<div class=empty style="padding:20px 0">网络错误或预设获取失败</div>';
     });
   }
@@ -8635,8 +10671,8 @@ function initEqViewLogic() {
     targetInfo.innerHTML = '<div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start">' +
       '<div style="flex:1;min-width:260px">' +
       '<div style="font-weight:700;font-size:13px;margin-bottom:6px;color:var(--txt)">' + esc(curve.name) + ' · 目标曲线说明</div>' +
-      '<div style="margin-bottom:5px"><b style="color:var(--txt)">是什么：</b>' + esc(curve.tech) + '</div>' +
-      '<div><b style="color:var(--txt)">适合谁：</b>' + esc(curve.scene) + '</div>' +
+      '<div style="margin-bottom:5px">' + tf('是什么：{0}', ['<b style="color:var(--txt)"></b>' + esc(curve.tech)]) + '</div>' +
+      '<div>' + tf('适合谁：{0}', [esc(curve.scene)]) + '</div>' +
       '</div>' +
       '<div style="flex:0 0 260px;min-width:220px" class="tc-curve">' +
       '<div style="font-size:10.5px;color:var(--mut2);margin-bottom:2px">目标曲线示意（手绘近似）</div>' +
@@ -8644,7 +10680,7 @@ function initEqViewLogic() {
       '</div>' +
       '</div>' +
       '<div style="margin-top:10px;font-size:11.5px;color:var(--mut2);border-top:1px dashed var(--line);padding-top:8px">' +
-      '前级增益：' + p.gainDb + ' dB（独立衰减防削波） · 滤波段数：' + p.bandsCount + ' 段 · 预设：' + esc(p.details || p.id) + '</div>';
+      tf('前级增益：{0} dB（独立衰减防削波） · 滤波段数：{1} 段 · 预设：{2}', [p.gainDb, p.bandsCount, esc(p.details || p.id)]) + '</div>';
     targetInfo.style.display = 'block';
   }
 
@@ -8658,7 +10694,8 @@ function initEqViewLogic() {
       var appliedPath = j.eqPath || j.path;
       if (appliedPath) ADV.eq = appliedPath;
       if (D('sp_eq')) D('sp_eq').value = ADV.eq;
-      saveSettings(true);
+      return Promise.resolve(saveSettings(true)).then(function(saved){
+      if(!saved||!saved.ok){if(saved&&saved.stale)toast(t('当前组已切换，请重新操作'));return saved;}
       toast('已应用调音预设到 EQ');
       Array.prototype.forEach.call(presetsBox.querySelectorAll('.preset-card'), function (c) {
         var isThis = (c.dataset.id === eid);
@@ -8668,6 +10705,8 @@ function initEqViewLogic() {
       });
       var p = presets.find(function (x) { return x.id === eid; });
       if (p) showTargetCurveInfo(p);
+      return saved;
+      });
     });
   }
 
@@ -8696,8 +10735,7 @@ function initEqViewLogic() {
       if (D('sp_eq')) ADV.eq = (D('sp_eq').value || '').trim();
       if (D('sp_ir')) ADV.ir = (D('sp_ir').value || '').trim();
       if (D('sp_irgpu')) ADV.irgpu = D('sp_irgpu').checked ? 1 : 0;
-      saveSettings(true);
-      toast('已保存房间校正设置');
+      return Promise.resolve(saveSettings(true)).then(function(saved){if(saved&&saved.ok)toast('已保存房间校正设置');else if(saved&&saved.stale)toast(t('当前组已切换，请重新操作'));return saved;});
     };
   }
 
@@ -8767,7 +10805,7 @@ function qualFacts(h, path) {
                 isFinite(roll) && roll >= 0.4 * fs;
   var noAudio = silent || dc || impulse;
   var why = silent ? (isFinite(peak) && peak <= -120 ? '全静音（峰值 ≤ −120 dBFS）'
-                                                    : '整轨都低于 −60 dBFS（silence ' + sil.toFixed(1) + '%）')
+                                                    : tf('整轨都低于 −60 dBFS（silence {0}%）', [sil.toFixed(1)]))
           : dc ? '纯直流（峰值因子 ≈ 0、谱重心 < 100 Hz）'
           : impulse ? '单点冲激（峰值因子 ≥ 40 dB、95% 滚降 ≥ 0.4×采样率）' : '';
   return {
@@ -8780,7 +10818,7 @@ function qualFacts(h, path) {
 // 谱四项（重心/倾斜/95% 滚降/>10k 占比）不展示的原因；空串 = 可以展示。
 function qualSpectralHide(F) {
   if (!F.available) return '样本不足，未出结论';
-  if (F.noAudio) return '素材无有效音频：' + F.noAudioWhy;
+  if (F.noAudio) return tf('素材无有效音频：{0}', [F.noAudioWhy]);
   if (F.dsd) return 'DSD / DSD 化素材：噪声整形把能量推到 50–100 kHz，四项无意义';
   if (F.fs > 0 && F.fs < 44100) return '采样率 ' + (F.fs / 1000).toFixed(1) + ' kHz < 44.1 kHz：10 kHz 以上频段不存在';
   return '';
@@ -8791,13 +10829,13 @@ function qualSpectralHide(F) {
 function qualClipText(q) {
   var runs = Number(q.clipped_runs), pct = Number(q.clipped_pct), longest = Number(q.longest_clip_run);
   if (isFinite(runs) && runs > 0) {
-    return { head: '有数字削波 ' + anlNum(runs, 0) + ' 段 · 最长 ' + anlNum(longest, 0) + ' 样本',
-             sub: anlNum(q.clipped_samples, 0) + ' 样本 / ' + anlNum(pct, 4) + ' %（上界，含单样本越限）',
+    return { head: tf('有数字削波 {0} 段 · 最长 {1} 样本', [anlNum(runs, 0), anlNum(longest, 0)]),
+             sub: anlNum(q.clipped_samples, 0) + tf(' 样本 / {0} %（上界，含单样本越限）', [anlNum(pct, 4)]),
              sparse: false };
   }
   if (isFinite(pct) && pct > 0) {
     return { head: '0 段 · 仅零星单样本越限，非连续削波',
-             sub: anlNum(q.clipped_samples, 0) + ' 样本 / ' + anlNum(pct, 4) + ' %（上界，含单样本越限）',
+             sub: anlNum(q.clipped_samples, 0) + tf(' 样本 / {0} %（上界，含单样本越限）', [anlNum(pct, 4)]),
              sparse: true };
   }
   return { head: '无削波', sub: '0 样本 / 0 %（上界，含单样本越限）', sparse: false };
@@ -8809,7 +10847,7 @@ function qualStereoText(q) {
   if (isFinite(corr) && corr > 0.99995 && isFinite(loss) && loss < 0.05) {
     return '双声道但左右完全相同（等同单声道）';
   }
-  var s = '相关 ' + anlNum(corr, 4) + ' / 单声道损失 ' + anlNum(loss, 2) + ' dB';
+  var s = tf('相关 {0} / 单声道损失 {1} dB', [anlNum(corr, 4), anlNum(loss, 2)]);
   if (isFinite(loss) && loss >= 60 && isFinite(corr) && corr < -0.9) {
     s += ' —— 可能是极性反相（老录音常见），不一定是错误';
   }
@@ -8850,7 +10888,7 @@ function openCompareModal(path) {
         if (c.checked) sel.push(dir + '\\' + c.dataset.n);
       });
       if (sel.length < 2) { D('cmpMsg').textContent = '至少勾选 2 个版本'; return; }
-      D('cmpMsg').textContent = '正在对齐并分析 ' + sel.length + ' 个版本…';
+      D('cmpMsg').textContent = tf('正在对齐并分析 {0} 个版本…', [sel.length]);
       D('cmpGo').disabled = true;
       apiRaw('/api/compare', JSON.stringify({ files: sel })).then(function (r) {
         D('cmpGo').disabled = false;
@@ -8858,7 +10896,7 @@ function openCompareModal(path) {
         D('cmpOut').innerHTML = renderCompare(r);
       }).catch(function (e) {
         D('cmpGo').disabled = false;
-        D('cmpMsg').textContent = '对比失败：' + (e && e.message ? e.message : e);
+        D('cmpMsg').textContent = tf('对比失败：{0}', [(e && e.message ? e.message : e)]);
       });
     };
   }).catch(function (e) {
@@ -8989,7 +11027,7 @@ function renderCompare(r) {
 // 用户原话：「主页-分析和设置-分析，整个功能页不应该放到这里，直接将分析放到正在播放的那首歌
 // 音乐上，播放就自动运行一次分析，在单曲播放页面上放置入口展示（动态、音质、假无损）。」
 //
-// 落点：单曲页 #npAnal（markup 与 CSS 见 ui_page.h），三类各一块：
+// 落点：数字音乐台「音质监控」#npAnal（完整指标与原判据保留），三类各一块：
 //   ① 动态   —— TT DR / R128 LUFS / LRA / 样本峰值 / 真峰(dBTP，2026-10-27 加)
 //   ② 音质   —— 削波 / 谱重心 / 信噪比 / THD+N（THD+N 对音乐素材通常「不适用」，如实显示）
 //   ③ 假无损 —— 判定【四档：疑似有损 / 带宽受限（不判假）/ 证据不足 / 未发现】
@@ -9118,24 +11156,24 @@ function anlFakeLine(h) {
   var dur = Number(h.duration_sec) || 0;
   var durTxt = dur > 0 ? ((dur < 10 ? dur.toFixed(2) : dur.toFixed(1)) + ' s') : '很短';
   if (v === 'lossy') {
-    return { t: '疑似有损转码 · 截止 ' + (cut || '?') + ' kHz、下降 ' + edge + ' dB', c: 'warn' };
+    return { t: tf('疑似有损转码 · 截止 {0} kHz、下降 {1} dB', [cut || '?', edge]), c: 'warn' };
   }
   if (v === 'band_limited') {
-    return { t: '有效带宽受限 ' + cut + ' kHz · 母带低通/升频，不判假', c: '' };
+    return { t: tf('有效带宽受限 {0} kHz · 母带低通/升频，不判假', [cut]), c: '' };
   }
   // 2026-10-30：第五档「源本身有损」。它回答的是"问题不适用"，不是"证据不足"：
   // 假无损的定义是【有损内容被转制进无损容器】，源本身就是 mp3 时不存在这个前提。
   // 实测（天门 - レトロスペクティブ京都.mp3）：cutoff 15.4 kHz、置信度 0.42 ⟹ 旧实现给
   // "证据不足"，用户完全无从判断；现在直接说清"它是 mp3，不用查"。
   if (v === 'source_lossy') {
-    return { t: '源本身是有损格式 · 不存在假无损问题' + (cut ? '（截止 ' + cut + ' kHz 仅供参考）' : ''), c: '' };
+    return { t: tf('源本身是有损格式 · 不存在假无损问题', []) + (cut ? tf('（截止 {0} kHz 仅供参考）', [cut]) : ''), c: '' };
   }
   if (v === 'unclear') {
-    if (fill < 0.5) return { t: '证据不足 · 素材过短（' + durTxt + '），不构成判据', c: 'mut' };
-    return { t: '证据不足 · 置信度 ' + conf + '% < 50%，检出 ' + (cut || '?') + ' kHz', c: 'mut' };
+    if (fill < 0.5) return { t: tf('证据不足 · 素材过短（{0}），不构成判据', [durTxt]), c: 'mut' };
+    return { t: tf('证据不足 · 置信度 {0}% < 50%，检出 {1} kHz', [conf, cut || '?']), c: 'mut' };
   }
   if (!(cutHz > 0)) return { t: '未发现转码痕迹 · 未检出频谱截止（满带宽）', c: 'ok' };
-  return { t: '未发现转码痕迹 · 检出 ' + cut + ' kHz、下降 ' + edge + ' dB、置信 ' + conf + '% ⟹ 不构成判据',
+  return { t: tf('未发现转码痕迹 · 检出 {0} kHz、下降 {1} dB、置信 {2}% ⟹ 不构成判据', [cut, edge, conf]),
            c: (conf >= 40 ? 'mut' : 'ok') };
 }
 
@@ -9147,10 +11185,11 @@ function anlFakeNote(h) {
   var dur = Number(h.duration_sec) || 0;
   var conf = Math.round((Number(h.confidence) || 0) * 100);
   var durTxt = dur > 0 ? ((dur < 10 ? dur.toFixed(2) : dur.toFixed(1)) + ' s') : '很短';
-  if (fill > 0 && fill < 0.5) parts.push('素材过短（' + durTxt + '，谱窗仅 ' + Math.round(fill * 100) + '% 有实样）只作参考');
-  else if (fill > 0 && fill < 0.999) parts.push('素材偏短（' + durTxt + '），置信度已打折');
-  if (win === 1) parts.push('仅 1 个谱窗');
-  if (conf >= 40 && conf < 50) parts.push('置信度擦线（' + conf + '% ≈ 50% 阈值）');
+  if (fill > 0 && fill < 0.5) parts.push(tf('素材过短（{0}，谱窗仅 {1}% 有实样）只作参考', [durTxt, Math.round(fill * 100)]));
+  else if (fill > 0 && fill < 0.999) parts.push(tf('素材偏短（{0}），置信度已打折', [durTxt]));
+  if (win === 1) parts.push(t('仅 1 个谱窗'));
+  if (conf >= 40 && conf < 50) parts.push(tf('置信度擦线（{0}% ≈ 50% 阈值）', [conf]));
+  // 2026-11-02：前缀是本函数拼的中文，拼完再进 DOM 就过了 i18n 的整串匹配 ⟹ 这里先过 t()
   var head = parts.length ? ('【' + parts.join(' · ') + '】 ') : '';
   return head + String(h.reason || '');
 }
@@ -9191,14 +11230,9 @@ function anlCardHtml(id, title, sub, line, kv, note) {
 // ============================================================================
 var ANL_LVLS = ['摘要', '详细', '全部指标'];
 
-// ① 动态摘要：按 DR 分档 —— <6 压缩严重 / 6~10 中等 / 10~14 良好 / >14 高动态
+// 摘要复用展开结果的既有 DR 分档，避免同一份指标出现两个结论。
 function anlDynBrief(h) {
-  var dr = Number(h && h.dr_db);
-  if (!(dr > 0)) return { t: '样本太短 · 未出结论', c: 'mut' };
-  if (dr < 6) return { t: '压缩严重 · 响度战争母带', c: 'warn' };
-  if (dr < 10) return { t: '中等动态 · 流行/摇滚常见', c: '' };
-  if (dr <= 14) return { t: '良好动态 · 古典/爵士常见', c: 'ok' };
-  return { t: '高动态 · 轻响层次清楚', c: 'ok' };
+  return anlDynLine(h||{});
 }
 
 // ② 音质摘要：0 段削波 + SNR 高 ⟹「干净」；有段 ⟹「有 N 段削波」。
@@ -9211,10 +11245,10 @@ function anlQualBrief(h) {
   if (F.noAudio) return { t: '素材无有效音频', c: 'mut' };
   var runs = Number(q.clipped_runs) || 0;
   var snr = Number(q.snr_db);
-  if (runs > 0) return { t: '有 ' + anlNum(runs, 0) + ' 段削波 · 母带压过头', c: 'warn' };
+  if (runs > 0) return { t: tf('有 {0} 段削波 · 母带压过头', [anlNum(runs, 0)]), c: 'warn' };
   if (Number(q.clipped_pct) > 0) return { t: '仅零星单样本越限 · 非连续削波', c: '' };
   if (isFinite(snr) && snr > 0 && snr < 60) {
-    return { t: '无削波 · SNR ' + anlNum(snr, 0) + ' dB（流行母带常见）', c: '' };
+    return { t: tf('无削波 · SNR {0} dB（流行母带常见）', [anlNum(snr, 0)]), c: '' };
   }
   return { t: '干净 · 无明显削波', c: 'ok' };
 }
@@ -9226,10 +11260,10 @@ function anlFakeBrief(h) {
   var fv = (h && h.fake_verdict) || (h && h.lossless_suspected ? 'lossy' : 'none');
   var cutHz = Number(h && h.cutoff_hz) || 0;
   var cut = cutHz > 0 ? (cutHz / 1000).toFixed(1) + ' kHz' : '';
-  if (fv === 'lossy') return { t: '疑似有损 · 截止 ' + (cut || '?'), c: 'warn' };
-  if (fv === 'band_limited') return { t: '带宽受限 · 截止 ' + (cut || '?'), c: '' };
+  if (fv === 'lossy') return { t: tf('疑似有损 · 截止 {0}', [cut || '?']), c: 'warn' };
+  if (fv === 'band_limited') return { t: tf('带宽受限 · 截止 {0}', [cut || '?']), c: '' };
   if (fv === 'unclear') return { t: '证据不足 · 不构成判据', c: 'mut' };
-  return { t: '未发现 · 带宽正常' + (cut ? '（' + cut + '）' : ''), c: 'ok' };
+  return { t: tf('未发现 · 带宽正常', []) + (cut ? tf('（{0}）', [cut]) : ''), c: 'ok' };
 }
 
 // 分析卡里那一格「声道」：>2 声道时把布局名当值、把"N ch"当单位（2 列格子很窄，写全会被省略号吃掉）
@@ -9247,7 +11281,10 @@ function chCellUnit(h) {
 // L0 的单行卡：标题在左、摘要贴右，**只有一行**（折叠态的全部内容）
 function anlL0Card(id, title, sub, brief) {
   var plain = String(title).replace(/^[\u2460-\u2462]\s*/, '');
-  return '<div class="npanal-card l0" id=' + id + ' title="' + esc(plain + '：' + brief.t) + '">' +
+  // 2026-11-02（多语言审计）：title 是属性，文本节点替换碰不到；而 plain 去掉了序号「②」，
+  //   它本身不是词条 ⟹ 提示里永远是「音质：…」。改用带序号的整标题（有词条）+ 可译的冒号。
+  var tt = (t(title) !== title) ? t(title) : t(plain);
+  return '<div class="npanal-card l0" id=' + id + ' title="' + esc(tt + t('：') + t(brief.t)) + '">' +
          '<div class=ct>' + esc(title) + '<i>' + esc(sub) + '</i></div>' +
          '<div class="npanal-verdict ' + (brief.c || '') + '">' + esc(brief.t) + '</div></div>';
 }
@@ -9260,7 +11297,7 @@ function anlL0Card(id, title, sub, brief) {
 function anlIncompleteHtml(h) {
   if (!h || !(h.incomplete === true || h.status === 'incomplete')) return '';
   var d = Number(h.declared_sec) || 0, a = Number(h.duration_sec) || 0;
-  var txt = h.note || ('文件可能不完整：容器声明 ' + d.toFixed(3) + ' s，实际解码 ' + a.toFixed(3) + ' s');
+  var txt = h.note || tf('文件可能不完整：容器声明 {0} s，实际解码 {1} s', [d.toFixed(3), a.toFixed(3)]);
   return '<div class=npanal-card id=npAnlWarn style="grid-column:1/-1;' +
          'border-color:var(--warn,#e6a23c);background:rgba(230,162,60,.10)">' +
          '<div class=ct style="color:var(--warn,#e6a23c)">⚠ 文件可能不完整' +
@@ -9268,7 +11305,7 @@ function anlIncompleteHtml(h) {
          '<div class="npanal-verdict warn" style="color:var(--warn,#e6a23c)">' + esc(txt) + '</div>' +
          (d > 0 ? ('<div class=hint style="line-height:1.55">容器声明 ' + d.toFixed(3) +
                    ' s ／ 实际可解码 ' + a.toFixed(3) + ' s（' + (100 * a / d).toFixed(1) + '%）' +
-                   '　·　等拷贝/下载完成后再点一次「重新分析」就会恢复正常</div>') : '') +
+                   '　·　结果仅覆盖当前可读取的片段</div>') : '') +
          '</div>';
 }
 
@@ -9296,9 +11333,10 @@ function anlCardsHtml(h, path, lvl) {
                 '4× 过采样算出的样本间真峰（dBTP）。样本峰永远 ≤ 0 dBFS，真峰可以 > 0 —— 判"母带是否过载"只能看这一格'];
   var dynNote = '';
   if (isFinite(tp) && Number(h.peak_dbfs) > -299 && tp > -0.05) {
-    dynNote = '真峰 ' + (tp > 0 ? '+' : '') + tp.toFixed(2) + ' dBTP ⟹ 母带已过载'
-            + (tp > 0.3 ? '（样本之间超出满幅 ' + tp.toFixed(1) + ' dB，重采样/加 EQ 后会削波）' : '')
-            + '；样本峰值 ' + anlNum(h.peak_dbfs, 2) + ' dBFS 只反映样本点';
+    dynNote = tf('真峰 {0} dBTP ⟹ 母带已过载{1}；样本峰值 {2} dBFS 只反映样本点',
+            [(tp > 0 ? '+' : '') + tp.toFixed(2),
+             (tp > 0.3 ? tf('（样本之间超出满幅 {0} dB，重采样/加 EQ 后会削波）', [tp.toFixed(1)]) : ''),
+             anlNum(h.peak_dbfs, 2)]);
   }
   var dyn = anlCardHtml('npAnlDyn', '① 动态', 'TT DR / R128', anlDynLine(h), anlKV([
     ['DR', anlNum(h.dr_db, 1), 'dB', 'TT 动态范围：最响与最轻段落的电平差（同一母带内越大越活，跨曲目不可直接比）。' +
@@ -9320,7 +11358,7 @@ function anlCardsHtml(h, path, lvl) {
   } else {
     if (F.noAudio) qualCells.push(['素材', '无有效音频', '', F.noAudioWhy + ' —— 这种素材上谱类指标会输出一整套"看起来有效"的 0 值']);
     qualCells.push(['削波', clip.head, '',
-                    '判据（段数）：连续 ≥3 样本 ≥ −0.0087 dBFS 才算一段；' + clip.sub]);
+                    tf('判据（段数）：连续 ≥3 样本 ≥ −0.0087 dBFS 才算一段；{0}', [clip.sub])]);
     if (!F.noAudio) qualCells.push(['峰值因子', anlNum(q.crest_db, 1), 'dB', '峰值 − RMS；派生量，全静音/纯直流会是 0 dB']);
     var specWhy = qualSpectralHide(F);
     if (specWhy) {
@@ -9450,9 +11488,9 @@ function anlDeepHtml(h, path) {
   // 6. 说明与限定（后端 reason + 前端前置限定词 + 共有的 caveat）
   var notes = [];
   var fakeNote = anlFakeNote(h);
-  if (fakeNote) notes.push('无损性依据：' + fakeNote);
-  if (h.note) notes.push('文件完整性：' + h.note);
-  if (q.note) notes.push('quality 备注：' + q.note);
+  if (fakeNote) notes.push(tf('无损性依据：{0}', [fakeNote]));
+  if (h.note) notes.push(tf('文件完整性：{0}', [t(h.note)]));
+  if (q.note) notes.push(tf('quality 备注：{0}', [t(q.note)]));   // 备注文本本身也要过一遍词典（后端给的是中文原串）
   notes.push('谱类四项同一首不同段落可差 1.8× / 10 dB ⟹ 跨版本比较必须同段；轻度的谐波失真本页测不出（IMD 需双音素材）。');
   return '<div class=npanal-det id=npAnlFull>' +
     '<div class=dh>全部原始指标 · 判定依据' +
@@ -9484,67 +11522,74 @@ function anlStatusText() {
   var p = ANL.cur;
   if (!p) return '播放一首歌就会自动分析一次';
   var nm = String(p).replace(/^.*[\\\/]/, '');
-  if (ANL.busy[p]) return '正在分析 · ' + nm + ' · 已 ' + (ANL.elapsed / 1000).toFixed(1) + ' s';
+  if (ANL.busy[p]) return tf('正在分析 · {0} · 已 {1} s', [nm, (ANL.elapsed / 1000).toFixed(1)]);
   if (ANL.cache[p]) {
     // 三种来源必须分得清（判据「第二次 <100ms 或 cached=true」就靠这一行）：
     //   front   = 同一页面里的前端缓存（连 /api/health 都没打）
     //   backend = 打了后端但命中进程内缓存（cached=true，0 ms）
     //   new     = 真算了一遍
     var t = ANL.elapsed >= 1000 ? (ANL.elapsed / 1000).toFixed(2) + ' s' : anlNum(ANL.elapsed, 0) + ' ms';
-    if (ANL.src === 'front') return nm + ' · 已缓存（本次未重算）';
-    if (ANL.src === 'backend') return nm + ' · 后端缓存命中 · ' + t;
-    return nm + ' · 首次计算 · ' + t;
+    if (ANL.src === 'front') return tf('{0} · 已缓存（本次未重算）', [nm]);
+    if (ANL.src === 'backend') return tf('{0} · 后端缓存命中 · {1}', [nm, t]);
+    return tf('{0} · 首次计算 · {1}', [nm, t]);
   }
-  if (ANL.err) return '分析失败：' + ANL.err;
-  if (!ANL.auto) return '自动分析已关闭 · 可点右上「重新分析」手动跑';
-  return '等待分析 · ' + nm;
+  if (ANL.err) return tf('分析失败：{0}', [ANL.err]);
+  if (!ANL.auto) return '自动分析已关闭，可在专业模式设置中打开';
+  return tf('等待分析 · {0}', [nm]);
 }
 
 // ---- 折叠控件（P1）：三级之间的按钮由这里生成/回收 ----
 // 为什么在 JS 里建而不是写在 ui_page.h 的 markup 里：分析卡的 markup 是公共骨架，
 // 本轮只被允许往 ui_page.h 追加**CSS**（另一条线同时在改别的区域）。放这里也保证
 // 「没有结果时控件不存在」—— 空面板上摆一个「展开」按钮是骗人的。
-function anlCtlBar() {
-  var hd = document.querySelector('#npAnal .npanal-hd');
-  if (!hd) return null;
-  var bar = D('npAnlCtl');
-  if (!bar) {
-    bar = document.createElement('span');
-    bar.id = 'npAnlCtl';
-    bar.className = 'npanal-ctl';
-    var sp = hd.querySelector('.sp');
-    if (sp && sp.nextSibling) hd.insertBefore(bar, sp.nextSibling);
-    else hd.appendChild(bar);
-  }
-  return bar;
+function rlStudioMonitorHTML(){
+  return '<p class=digitalFootnote>'+esc(t('以下指标反映音源文件，不是处理后的实时输出。'))+'</p><p class=digitalFootnote id=rlMonitorCueNote hidden>'+esc(t('当前播放为分轨片段；音质分析针对源文件。'))+'</p><div class=rlMonitorControls><label><input id=rlMonitorEnabled type=checkbox>'+esc(t('启用音质监控'))+'</label><label><input id=rlMonitorAuto type=checkbox>'+esc(t('播放时自动分析'))+'</label><button type=button class=btn id=npAnlNow hidden>'+esc(t('重试'))+'</button></div>'
+    +'<div class=npanal id=npAnal data-studio-monitor=1 data-state=idle><div class=npanal-line id=npAnlCtl aria-label="'+esc(t('音频分析'))+'">'
+    +[['npAnlDyn','动态'],['npAnlQual','音质'],['npAnlFake','假无损']].map(function(item){return '<button type=button class=npanal-summary id='+item[0]+'Summary aria-controls=npAnlGrid><span>'+esc(t(item[1]))+'</span><strong>'+esc(t('等待分析'))+'</strong></button>';}).join('')
+    +'<button type=button class=npanal-btn id=npAnlMore aria-controls=npAnlGrid>'+esc(t('收起'))+'</button></div><div id=npAnlSt class=npanal-status role=status></div><div class=npanal-grid id=npAnlGrid></div></div>';
 }
-// has = 当前有没有结果可展开。没有结果 ⟹ 控件整组隐藏（不是置灰：置灰仍占版面）
+function rlAttachStudioMonitor(){
+  if(!D('npAnal'))return;
+  ANL.lvl=2;
+  if(D('rlMonitorEnabled'))D('rlMonitorEnabled').onchange=function(){anlSetMaster(this.checked);rlPaintStudioMonitor();};
+  if(D('rlMonitorAuto'))D('rlMonitorAuto').onchange=function(){anlSetAuto(this.checked);rlPaintStudioMonitor();};
+  anlBindUi();rlPaintStudioMonitor();
+}
+function rlPaintStudioMonitor(frame){
+  var file=frame&&frame.file||ANL.cur,current=rlLastStatus&&rlLastStatus.current===file?rlLastStatus:typeof rlConsole!=='undefined'&&rlConsole.state&&rlConsole.state.file===file?rlConsole.state:null;
+  if(D('rlMonitorCueNote'))D('rlMonitorCueNote').hidden=!(current&&Number.isFinite(current.cueStart)&&current.cueStart>=0);
+  if(frame&&frame.file!==undefined)anlUpdateCur(frame.file||'');
+  if(D('rlMonitorEnabled'))D('rlMonitorEnabled').checked=!!ANL.master;
+  if(D('rlMonitorAuto')){D('rlMonitorAuto').checked=!!ANL.auto;D('rlMonitorAuto').disabled=!ANL.master;}
+  if(D('npAnlNow')){D('npAnlNow').disabled=!ANL.master||!ANL.cur||!!ANL.busy[ANL.cur];D('npAnlNow').hidden=!ANL.master||!ANL.cur||!ANL.err;}
+  anlPaint();
+}
+function anlCtlBar() {return D('npAnlCtl');}
 function anlSyncCtl(has) {
-  var bar = anlCtlBar();
-  if (!bar) return;
-  var box = D('npAnal');
-  var lvl = (ANL.lvl === 1 || ANL.lvl === 2) ? ANL.lvl : 0;
-  if (box) box.dataset.lvl = String(lvl);   // DOM 判据读这一格
-  if (!has) { bar.innerHTML = ''; return; }
-  var h = '<span class=npanal-lvltxt title="当前展开级别：0=摘要 1=指标格 2=全部原始指标">' +
-          ANL_LVLS[lvl] + '</span>';
-  if (lvl > 0) {
-    h += '<button class=npanal-btn id=npAnlFold title="收起一级（' +
-         (lvl === 2 ? '回到指标格' : '收起回摘要') + '）">\u25BE 收起</button>';
+  var box=D('npAnal'),bar=D('npAnlCtl'),grid=D('npAnlGrid');
+  if(!box||!bar)return;
+  var expanded=has&&ANL.lvl>0;
+  box.dataset.lvl=expanded?'2':'0';
+  if(grid)grid.hidden=has&&!expanded;
+  var labels=['动态','音质','假无损'],ids=['npAnlDyn','npAnlQual','npAnlFake'];
+  var result=has&&ANL.cache[ANL.cur],busy=ANL.cur&&ANL.busy[ANL.cur];
+  var brief=result?[anlDynBrief(result),anlQualBrief(result),anlFakeBrief(result)]:[];
+  labels.forEach(function(label,i) {
+    var node=D(ids[i]+'Summary'),value=node&&node.querySelector('strong');
+    if(!node||!value)return;
+    var message=brief[i]?t(brief[i].t):t(busy?'分析中':ANL.err?'分析失败':ANL.auto?'等待分析':'未分析');
+    value.textContent=message;value.className=brief[i]?brief[i].c||'':'mut';
+    node.title=t(label)+' · '+message+(result&&result.incomplete?' · '+t('文件可能不完整'):'');
+    node.disabled=!has;node.setAttribute('aria-expanded',String(expanded));
+    node.onclick=function(){ANL.lvl=2;anlPaint();var target=D(ids[i]);if(target)target.scrollIntoView({block:'nearest'});};
+  });
+  var button=D('npAnlMore');
+  if(button){
+    button.textContent=t(expanded?'收起':'展开');
+    button.disabled=!has;button.setAttribute('aria-expanded',String(expanded));
+    button.onclick=function(){anlSetLvl(expanded?0:2);};
   }
-  if (lvl < 2) {
-    h += '<button class=npanal-btn id=npAnlMore title="' +
-         (lvl === 0 ? '展开：三块 + 2×2 指标格' : '再展开：全部原始指标（19 项 + 判定依据）') + '">' +
-         (lvl === 0 ? '\u25B4 展开' : '\u25B4 展开全部') + '</button>';
-  }
-  if (lvl === 2) {
-    h += '<button class=npanal-btn id=npAnlMin title="直接折叠回摘要（L0）">\u23F7 全部收起</button>';
-  }
-  bar.innerHTML = h;
-  var b;
-  if ((b = D('npAnlFold'))) b.onclick = function () { anlSetLvl(lvl - 1); };
-  if ((b = D('npAnlMore'))) b.onclick = function () { anlSetLvl(lvl + 1); };
-  if ((b = D('npAnlMin'))) b.onclick = function () { anlSetLvl(0); };
+  if(result&&result.incomplete){var q=D('npAnlQualSummary');if(q){q.querySelector('strong').textContent=t('文件可能不完整');q.querySelector('strong').className='warn';}}
 }
 // 唯一的级别写入口：任何地方改级别都走它（并立即重绘）
 function anlSetLvl(n) {
@@ -9575,6 +11620,7 @@ function anlPaint(full) {
   var p = ANL.cur;
   var h = p ? ANL.cache[p] : null;
   var busy = !!(p && ANL.busy[p]);
+  if(D('npAnlNow')){D('npAnlNow').hidden=!ANL.err||!p;D('npAnlNow').disabled=busy;}
   var box = D('npAnal');
   if (box) box.dataset.state = !p ? 'idle' : (busy ? 'busy' : (h ? 'ready' : (ANL.err ? 'error' : 'idle')));
   var st = D('npAnlSt');
@@ -9582,21 +11628,21 @@ function anlPaint(full) {
   var btn = D('npAnlAuto');
   if (btn) {
     btn.classList.toggle('on', !!ANL.auto);
-    btn.textContent = '自动分析：' + (ANL.auto ? '开' : '关');
+    btn.textContent = ANL.auto ? t('自动分析：开') : t('自动分析：关');
     btn.title = ANL.auto ? '关掉后播放不再自动分析（也可以在 设置-高级 改）'
                          : '打开后每次播放新的一首都会自动分析一次（也可以在 设置-高级 改）';
   }
   anlSyncCtl(!!h);                 // 折叠控件：有结果才出现（心跳也要刷，否则收起后按钮会残留）
   if (full === false) return;      // 心跳只刷状态行
   if (busy) { grid.innerHTML = anlSkeletonHtml(); return; }
-  if (h) { grid.innerHTML = anlCardsHtml(h, p, ANL.lvl); return; }
+  if (h) { grid.innerHTML = ANL.lvl>0?anlCardsHtml(h,p,2):''; return; }
   if (!p) { grid.innerHTML = anlEmptyHtml('还没有在播放 · 播放一首本地曲目就会自动分析（动态 / 音质 / 假无损）'); return; }
-  if (ANL.err) { grid.innerHTML = anlEmptyHtml('分析失败：' + ANL.err); return; }
+  if (ANL.err) { grid.innerHTML = anlEmptyHtml(tf('分析失败：{0}', [ANL.err])); return; }
   if (!ANL.auto) {
-    grid.innerHTML = anlEmptyHtml('自动分析已关闭 —— 点右上「重新分析」手动跑一次，或去 设置-高级 打开开关');
+    grid.innerHTML = anlEmptyHtml('自动分析已关闭，可在专业模式设置中打开');
     return;
   }
-  grid.innerHTML = anlEmptyHtml('等待分析 · ' + String(p).replace(/^.*[\\\/]/, ''));
+  grid.innerHTML = anlEmptyHtml(tf('等待分析 · {0}', [String(p).replace(/^.*[\\\/]/, '')]));
 }
 
 // 发起一次分析（异步；调用方只需给路径）
@@ -9618,6 +11664,8 @@ function anlRun(path, force) {
   anlFetch(url, undefined, 240000).then(function (j) {
     ANL.busy[path] = false;
     var h = (j && j.health) || null;
+    if(j&&j.ok&&h)ANL.cache[path]=h;
+    if(ANL.cur!==path)return;
     ANL.elapsed = Date.now() - ANL.t0;
     if (typeof j.runs === 'number') ANL.stat.runs = j.runs;
     if (typeof j.hits === 'number') ANL.stat.hits = j.hits;
@@ -9636,6 +11684,7 @@ function anlRun(path, force) {
     if (ANL.cur === path) anlPaint();
   }).catch(function (e) {
     ANL.busy[path] = false;
+    if(ANL.cur!==path)return;
     ANL.elapsed = Date.now() - ANL.t0;
     ANL.err = (e && e.message ? e.message : String(e));
     if (ANL.cur === path) anlPaint();
@@ -9647,13 +11696,14 @@ function anlUpdateCur(cur) {
   cur = String(cur || '');
   if (ANL.cur !== cur) {
     ANL.cur = cur;
+    ANL.autoDone = '';
     ANL.err = '';
     ANL.cached = false;
     ANL.src = '';
     ANL.elapsed = 0;
     // P1（用户 261027-05 A5「换歌要回到 L0」）：换歌一律折叠回摘要。
     // 只在这一处归零 ⟹ 同一首歌的暂停/拖动/重绘/重进单曲页都保持用户选过的级别。
-    ANL.lvl = 0;
+    ANL.lvl = D('npAnal')&&D('npAnal').dataset.studioMonitor==='1'?2:0;
     anlPaint();                       // 换歌：立刻把面板切到「这首歌」
   }
   if (!cur || !ANL.auto) return;
@@ -9684,9 +11734,7 @@ function anlSetMaster(on) {
     if (ANL.auto && ANL.cur && !ANL.cache[ANL.cur] && anlIsLocal(ANL.cur)) anlRun(ANL.cur, false);
   }
   var m2 = D('sp_anlmsg');
-  if (m2) m2.textContent = ANL.master
-    ? ('当前：' + (ANL.auto ? '开' : '关') + '　·　已在单曲页展示，不需要额外操作')
-    : '模块已关闭：单曲页不显示分析卡，也不会再请求分析数据';
+  if (m2) m2.textContent = analysisAutoStatus();
 }
 
 // 开关（单曲页按钮 / 设置-高级 / 都走这里，写同一个 adv 键并落盘）
@@ -9782,33 +11830,61 @@ function updSet(id, text) { var e = D(id); if (e) e.textContent = text; }
 function updShowCheck(j) {
   if (!j) j = {};
   if (j.current) updSet('sp_updcur', j.current);
+  if (UPD.recoveryBlocked) return;
+  UPD.manualCn = j.cn || j.cnUrl || UPD.manualCn || '';
+  UPD.manualGlobal = j.global || j.globalUrl || UPD.manualGlobal || 'https://github.com/okhuoyanyan/RLPlayer2/releases';
+  UPD.manualCode = j.extractionCode || UPD.manualCode || '';
   var card = D('sp_updcard');
+  var dl = D('sp_upddl'), cn = D('sp_updcn'), global = D('sp_updglobal'), apply = D('sp_updapply');
   if (!j.ok) {
-    if (card) card.style.display = 'none';
-    updSet('sp_updstate', '检查失败：' + (j.error || j.checkError || '未知原因'));
+    var why = String(j.error || j.checkError || '未知原因');
+    if (why.indexOf('quota_exceeded') >= 0) {
+      if (card) card.style.display = '';
+      updSet('sp_updver', j.latest ? ('v' + j.latest) : '—');
+      updSet('sp_updplan', t('服务器本月增量配额已用完，请到百度网盘或 GitHub 下载完整版，或下月重试。'));
+      updSet('sp_updnotes', ''); updSet('sp_updfiles', UPD.manualCode ? tf('百度网盘提取码：{0}', [UPD.manualCode]) : '');
+      if (dl) { dl.style.display = 'none'; dl.disabled = true; }
+      if (apply) apply.style.display = 'none';
+      if (cn) { cn.style.display = UPD.manualCn ? '' : 'none'; cn.disabled = !UPD.manualCn; }
+      if (global) { global.style.display = ''; global.disabled = false; }
+    } else if (card) card.style.display = 'none';
+    updSet('sp_updstate', tf('检查失败：{0}', [why]));
     return;
   }
   if (!j.hasUpdate) {
     if (card) card.style.display = 'none';
-    updSet('sp_updstate', j.upToDate ? ('已是最新版本 v' + (j.latest || j.current)) : ('当前 v' + j.current));
+    updSet('sp_updstate', j.upToDate ? (tf('已是最新版本 v{0}', [(j.current || j.latest)])) : ('当前 v' + j.current));
     return;
   }
   if (card) card.style.display = '';
   updSet('sp_updver', 'v' + j.latest);
-  var plan = '增量：需下载 ' + (j.filesToDownload | 0) + ' 个文件 / ' + (j.downloadText || '—') +
-             '，跳过 ' + (j.filesUnchanged | 0) + ' 个 / ' + (j.skippedText || '—');
-  if (j.fullBytes > 0) plan += '；全量包 ' + updNum(j.fullBytes);
-  updSet('sp_updplan', plan);
-  updSet('sp_updsize', j.publishedAt ? ('　发布 ' + j.publishedAt) : '');
+  var manual = j.installMode === 'manual' || j.install_mode === 'manual';
+  if (manual) {
+    var reason = j.reason === 'major-upgrade' ? t('跨大版本更新需要重新安装完整版。') :
+      (j.reason === 'webview2-update' ? t('本次包含 WebView2 更新，需要重新安装完整版。') : t('本次更新需要重新安装完整版。'));
+    updSet('sp_updplan', reason + t(' 服务器只提供增量更新，不会自动下载完整包。') +
+      (j.fullSize > 0 ? tf(' 完整包约 {0}。', [updNum(j.fullSize)]) : ''));
+    updSet('sp_updfiles', UPD.manualCode ? tf('百度网盘提取码：{0}', [UPD.manualCode]) : '');
+    if (dl) { dl.style.display = 'none'; dl.disabled = true; }
+    if (apply) apply.style.display = 'none';
+    if (cn) { cn.style.display = UPD.manualCn ? '' : 'none'; cn.disabled = !UPD.manualCn; }
+    if (global) { global.style.display = UPD.manualGlobal ? '' : 'none'; global.disabled = !UPD.manualGlobal; }
+  } else {
+    var plan = '增量：需下载 ' + (j.filesToDownload | 0) + ' 个文件 / ' + (j.downloadText || '—') +
+               tf('，跳过 {0} 个 / {1}', [(j.filesUnchanged | 0), (j.skippedText || '—')]);
+    updSet('sp_updplan', plan);
+    var list = j.files || [], fl = '', i;
+    for (i = 0; i < list.length && i < 12; i++) fl += '+ ' + list[i].path + '  ' + updNum(list[i].size) + '\n';
+    if (list.length > 12) fl += tf('… 还有 {0} 个\n', [(list.length - 12)]);
+    updSet('sp_updfiles', fl);
+    if (dl) { dl.style.display = ''; dl.disabled = (j.filesToDownload | 0) === 0; dl.textContent = '下载更新'; }
+    if (cn) cn.style.display = 'none';
+    if (global) global.style.display = 'none';
+  }
+  updSet('sp_updsize', j.publishedAt ? (tf('　发布 {0}', [j.publishedAt])) : '');
   updSet('sp_updnotes', j.notes || '（这次没有写更新说明）');
-  var list = j.files || [], fl = '', i;
-  for (i = 0; i < list.length && i < 12; i++) fl += '+ ' + list[i].path + '  ' + updNum(list[i].size) + '\n';
-  if (list.length > 12) fl += '… 还有 ' + (list.length - 12) + ' 个\n';
-  updSet('sp_updfiles', fl);
-  var dl = D('sp_upddl');
-  if (dl) { dl.style.display = ''; dl.disabled = (j.filesToDownload | 0) === 0; dl.textContent = '下载更新'; }
   var sk = D('sp_updskip'); if (sk) sk.style.display = '';
-  updSet('sp_updstate', '发现新版本 v' + j.latest);
+  updSet('sp_updstate', tf('发现新版本 v{0}', [j.latest]));
 }
 
 function updPollCheck() {
@@ -9821,6 +11897,7 @@ function updPollCheck() {
 }
 
 function updCheck() {
+  if (UPD.recoveryBlocked) return;
   updSet('sp_updstate', '正在检查…（最长 8 秒）');
   var btn = D('sp_updcheck'); if (btn) btn.disabled = true;
   api('/api/update/check?force=1').then(function (j) {
@@ -9829,29 +11906,36 @@ function updCheck() {
     updShowCheck(j || {});
   }).catch(function (e) {
     if (btn) btn.disabled = false;
-    updSet('sp_updstate', '检查失败：' + (e && e.message ? e.message : e));
+    updSet('sp_updstate', tf('检查失败：{0}', [(e && e.message ? e.message : e)]));
   });
 }
 
 function updPollProgress() {
+  if (UPD.recoveryBlocked) return;
   api('/api/update/progress').then(function (p) {
     if (!p) { setTimeout(updPollProgress, 900); return; }
     var bar = D('sp_updbar');
     if (bar) bar.style.width = (p.pct || 0) + '%';
     if (p.phase === 'error') {
-      updSet('sp_updmsg', '下载失败：' + (p.error || '未知原因'));
-      var b = D('sp_upddl'); if (b) { b.disabled = false; b.style.display = ''; }
+      var why = String(p.error || '未知原因'), quota = why.indexOf('quota_exceeded') >= 0;
+      updSet('sp_updmsg', tf('下载失败：{0}', [why]) + (quota ? t(' 请改用百度网盘或 GitHub 手动下载完整版，或下月重试。') : ''));
+      var b = D('sp_upddl'); if (b) { b.disabled = false; b.style.display = quota ? 'none' : ''; }
+      if (quota) {
+        var cn = D('sp_updcn'), global = D('sp_updglobal');
+        if (cn) { cn.style.display = UPD.manualCn ? '' : 'none'; cn.disabled = !UPD.manualCn; }
+        if (global) { global.style.display = ''; global.disabled = false; }
+      }
       return;
     }
     if (p.phase === 'ready' || p.canApply) {
       if (bar) bar.style.width = '100%';
-      updSet('sp_updmsg', '已就绪：' + (p.files | 0) + ' 个文件已逐个校验 sha256 并解压到暂存区。点「立即更新并重启」生效。');
+      updSet('sp_updmsg', tf('已就绪：{0} 个文件已逐个校验 sha256 并解压到暂存区。点「立即更新并重启」生效。', [(p.files | 0)]));
       var ap = D('sp_updapply'); if (ap) ap.style.display = '';
       var dl = D('sp_upddl'); if (dl) { dl.disabled = false; dl.style.display = 'none'; }
       return;
     }
     var label = { downloading: '下载中', verifying: '校验 sha256…', extracting: '解压中…',
-                  'downloading-one-by-one': '逐文件补下…', 'downloading-full': '回落到全量包…',
+                  'downloading-one-by-one': '逐文件补下…', 'downloading-objects': '下载增量对象…',
                   checking: '检查中…' }[p.phase] || p.phase;
     updSet('sp_updmsg', label + '  ' + (p.pct || 0) + '%   ' + updNum(p.downloaded) + ' / ' +
                         updNum(p.total) + '   ' + (p.speedText || ''));
@@ -9860,23 +11944,29 @@ function updPollProgress() {
 }
 
 function updDownload() {
+  if (UPD.recoveryBlocked) return;
   var btn = D('sp_upddl'); if (btn) btn.disabled = true;
   var barwrap = D('sp_updbarwrap'); if (barwrap) barwrap.style.display = '';
   updSet('sp_updmsg', '正在下载…');
   api('/api/update/download', '').then(function (j) {
     if (!j || !j.ok) {
-      updSet('sp_updmsg', '下载没能开始：' + ((j && j.error) || '未知原因'));
+      updSet('sp_updmsg', tf('下载没能开始：{0}', [((j && j.error) || '未知原因')]));
       if (btn) btn.disabled = false;
       return;
     }
     updPollProgress();
   }).catch(function (e) {
-    updSet('sp_updmsg', '下载没能开始：' + (e && e.message ? e.message : e));
+    updSet('sp_updmsg', tf('下载没能开始：{0}', [(e && e.message ? e.message : e)]));
     if (btn) btn.disabled = false;
   });
 }
 
 function updApply() {
+  if (UPD.recoveryBlocked) {
+    UPD.applyArm = false;
+    updSet('sp_updmsg', tf('上次回滚未完成，备份已保留：{0}', [UPD.recoveryDetail || '']));
+    return;
+  }
   var btn = D('sp_updapply');
   if (!UPD.applyArm) {
     UPD.applyArm = true;
@@ -9889,14 +11979,14 @@ function updApply() {
   if (btn) { btn.disabled = true; btn.textContent = '正在退出…'; }
   api('/api/update/apply', '').then(function (j) {
     if (!j || !j.ok) {
-      updSet('sp_updmsg', '没能开始更新：' + ((j && j.error) || '未知原因'));
+      updSet('sp_updmsg', tf('没能开始更新：{0}', [((j && j.error) || '未知原因')]));
       if (btn) { btn.disabled = false; btn.textContent = '立即更新并重启'; }
       return;
     }
-    updSet('sp_updmsg', '程序正在退出…重新打开 RLPlayer 即完成更新（v' + j.version + '）。');
+    updSet('sp_updmsg', tf('程序正在退出…重新打开 RLPlayer 即完成更新（v{0}）。', [j.version]));
     toast('程序即将退出，重新打开即完成更新');
   }).catch(function (e) {
-    updSet('sp_updmsg', '没能开始更新：' + (e && e.message ? e.message : e));
+    updSet('sp_updmsg', tf('没能开始更新：{0}', [(e && e.message ? e.message : e)]));
     if (btn) { btn.disabled = false; btn.textContent = '立即更新并重启'; }
   });
 }
@@ -9906,48 +11996,70 @@ function updSkip() {
   if (!v || v === '—') { toast('先检查更新'); return; }
   api('/api/update/skip', JSON.stringify({ version: v })).then(function () {
     var card = D('sp_updcard'); if (card) card.style.display = 'none';
-    updSet('sp_updstate', '已跳过 v' + v + '（删掉 rlplayer-update.conf 里的 skip= 可恢复提示）');
-    toast('已跳过 v' + v);
+    updSet('sp_updstate', tf('已跳过 v{0}（删掉 rlplayer-update.conf 里的 skip= 可恢复提示）', [v]));
+    toast(tf('已跳过 v{0}', [v]));
   }).catch(function () { toast('跳过失败'); });
 }
 
+function updRenderState(s) {
+  if (!s) return;
+  var wasBlocked = UPD.recoveryBlocked;
+  UPD.recoveryBlocked = s.pendingPhase === 'rollback_failed';
+  UPD.recoveryDetail = s.pendingDetail || '';
+  if (s.current) updSet('sp_updcur', s.current);
+  var failed = s.pendingPhase === 'rolled_back' || s.pendingPhase === 'apply_failed' || UPD.recoveryBlocked;
+  var state = D('sp_updstate'); if (state) state.style.color = UPD.recoveryBlocked ? '#e66' : '';
+  if (!UPD.recoveryBlocked && wasBlocked) {
+    updSet('sp_updmsg','');var oldMsg=D('sp_updmsg');if(oldMsg)oldMsg.style.color='';
+  }
+  if (UPD.recoveryBlocked) {
+    var text = tf('上次回滚未完成，备份已保留：{0}', [UPD.recoveryDetail]);
+    updSet('sp_updstate', text);updSet('sp_updmsg', text);
+    var msg = D('sp_updmsg'); if (msg) msg.style.color = '#e66';
+    UPD.applyArm = false;
+  } else if (s.pendingPhase === 'rolled_back') {
+    updSet('sp_updstate', tf('上次更新失败已自动回滚：{0}', [UPD.recoveryDetail]));
+  } else if (s.pendingPhase === 'apply_failed') {
+    updSet('sp_updstate', tf('上次替换失败，恢复详情：{0}', [UPD.recoveryDetail]));
+  } else if (s.pendingPhase === 'ready') {
+    updSet('sp_updstate', tf('有已下载但还没生效的更新（v{0}），重启后生效', [(s.pendingVersion || '')]));
+  }
+  var ap = D('sp_updapply');
+  if (ap) {ap.disabled=!!UPD.recoveryBlocked;if(UPD.recoveryBlocked)ap.style.display='none';}
+  if (s.staged || UPD.recoveryBlocked) {
+    var card = D('sp_updcard'); if (card) card.style.display = '';
+    if (ap && !UPD.recoveryBlocked) ap.style.display = '';
+    var dl = D('sp_upddl'); if (dl) dl.style.display = 'none';
+    if (s.staged) updSet('sp_updver', 'v' + s.stagedVersion);
+    if (!failed) updSet('sp_updstate', tf('已下好 v{0} 的更新包，点「立即更新并重启」生效', [s.stagedVersion]));
+  }
+}
 function updBind() {
   if (D('sp_updcheck')) D('sp_updcheck').onclick = updCheck;
   if (D('sp_upddl')) D('sp_upddl').onclick = updDownload;
+  if (D('sp_updcn')) D('sp_updcn').onclick = function () {
+    api('/api/update/manual', JSON.stringify({ target: 'baidu' })).catch(function () {});
+    openExternal(UPD.manualCn);
+  };
+  if (D('sp_updglobal')) D('sp_updglobal').onclick = function () {
+    api('/api/update/manual', JSON.stringify({ target: 'github' })).catch(function () {});
+    openExternal(UPD.manualGlobal);
+  };
   if (D('sp_updapply')) D('sp_updapply').onclick = updApply;
   if (D('sp_updskip')) D('sp_updskip').onclick = updSkip;
   // 进页面先把当前版本与上次更新结果刷出来（不发网络）
   api('/api/update/state').then(function (s) {
-    if (!s) return;
-    if (s.current) updSet('sp_updcur', s.current);
-    if (s.pendingPhase === 'rolled_back') {
-      updSet('sp_updstate', '上次更新失败已自动回滚：' + (s.pendingDetail || ''));
-    } else if (s.pendingPhase === 'apply_failed') {
-      updSet('sp_updstate', '上次替换失败已回滚：' + (s.pendingDetail || ''));
-    } else if (s.pendingPhase === 'ready') {
-      updSet('sp_updstate', '有已下载但还没生效的更新（v' + (s.pendingVersion || '') + '），重启后生效');
-    }
-    if (s.staged) {
-      var card = D('sp_updcard'); if (card) card.style.display = '';
-      var ap = D('sp_updapply'); if (ap) ap.style.display = '';
-      var dl = D('sp_upddl'); if (dl) dl.style.display = 'none';
-      updSet('sp_updver', 'v' + s.stagedVersion);
-      updSet('sp_updstate', '已下好 v' + s.stagedVersion + ' 的更新包，点「立即更新并重启」生效');
-    }
+    updRenderState(s);
   }).catch(function () {});
-  // 缓存里的检查结果（5 分钟）—— 没有就顺手起一次后台检查
-  api('/api/update/check').then(function (j) {
-    if (j && j.checked && !j.checking) updShowCheck(j);
-    else if (j && j.checking) setTimeout(updPollCheck, 700);
-  }).catch(function () {});
+  // A network version check starts only after the user's Check button.
 }
 
 
 // ============================================================================
 // 一键反馈（261027-01 #1；后端 = src/net/feedback.h，端点 = POST /api/feedback）
 // ----------------------------------------------------------------------------
-// 为什么不用 api()/apiRaw()：那两个帮手把超时写死 8 s，而后端的反馈总预算是 14 s
-// （取 token ≤2.5 s + HTTP ≤11 s）。用 8 s 会在"其实正在上传"时误报失败，用户会重复提交。
+// 本地端点只创建后台任务，页面轮询任务状态；慢网络不会阻塞播放器其它本地 API。
+// 同一表单在重试前复用幂等键，避免服务器已收到而客户端超时时生成重复工单。
 // 为什么不用 window.prompt/confirm：CDP 自检下原生对话框会把页面挂住（本项目踩过），
 // 统一走自绘 #modal 与页内状态行。
 // 返回的七个字段全部原样列出：uploaded / status / path / sha / local / error / message。
@@ -9956,16 +12068,17 @@ function updBind() {
 // 预览：把「会发送的」与「不会发送的」两栏摊开给用户看。
 // 数据来自后端 /api/feedback/preview —— 它走的正是提交时那个 build_payload()，
 // 所以预览里报的日志行数、脱敏规则数就是提交时的真实值，不是另拼的假清单。
-function fbPreview() {
-  var box = D('sp_fbpreviewbox'), btn = D('sp_fbpreview'), msg = D('sp_fbmsg');
+function fbPreview(fields) {
+  var field=typeof fields==='function'?fields:D;
+  var box = field('sp_fbpreviewbox'), btn = field('sp_fbpreview'), msg = field('sp_fbmsg');
   if (!box) return;
   if (btn) btn.disabled = true;
-  if (msg) msg.textContent = '正在生成预览…';
+  if (msg) msg.textContent = t('正在生成预览…');
   var payload = {
-    type:  (D('sp_fbtype')  || {}).value || 'bug',
-    title: ((D('sp_fbtitle') || {}).value || '').trim(),
-    body:  ((D('sp_fbbody')  || {}).value || '').trim(),
-    steps: ((D('sp_fbsteps') || {}).value || '').trim()
+    type:  (field('sp_fbtype')  || {}).value || 'bug',
+    title: ((field('sp_fbtitle') || {}).value || '').trim(),
+    body:  ((field('sp_fbbody')  || {}).value || '').trim(),
+    steps: ((field('sp_fbsteps') || {}).value || '').trim()
   };
   fetch('/api/feedback/preview', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -9975,89 +12088,137 @@ function fbPreview() {
     if (msg) msg.textContent = '';
     if (!j || !j.ok) {
       box.style.display = 'block';
-      box.textContent = '预览失败：' + ((j && j.error) || '未知原因');
+      box.textContent = tf('预览失败：{0}', [((j && j.error) || '未知原因')]);
       return;
     }
-    var L = [];
-    L.push('<b style="color:var(--fg)">会发送这些</b>');
-    L.push('· 你填的内容：类型「' + j.type_label + '」、标题、详细描述、复现步骤');
-    L.push('· 版本：RLPlayer ' + j.version + '（' + j.build + '）');
-    L.push('· 系统：' + j.os + ' · ' + j.cpu + ' · ' + j.cpu_threads + ' 线程 · 内存 ' + j.ram_total_mb + ' MB');
-    L.push('· 显卡：' + (j.gpu || '（未探测）'));
-    L.push('· 播放状态：' + (j.playing ? '正在播放' : '未播放') + ' · 后端 ' + (j.backend || '-'));
-    L.push('· 设置快照（' + j.settings_keys + ' 项）与输出端点');
-    L.push('· 日志尾：' + j.log_lines + ' 行 / ' + j.log_kb + ' KB（播放日志 + 启动日志）');
-    L.push('');
-    L.push('<b style="color:var(--fg)">不会发送</b>');
-    L.push('· 你的音乐文件、封面缓存、曲库索引');
-    L.push('· 已自动打码：API Key、token、密码、Authorization 头（共 ' + j.redaction_rules + ' 条规则）');
-    L.push('· 用户名统一替换为 &lt;user&gt;');
-    L.push('');
-    L.push('<span style="color:var(--mut2)">预览就是最终内容。确认无误再点「提交反馈」。</span>');
-    box.innerHTML = L.join('<br>');
+    box.replaceChildren();
+    function line(text,emphasis) {
+      var item=document.createElement(emphasis?'strong':'div');
+      item.textContent=text;box.appendChild(item);
+    }
+    var bytes=j.payload_bytes;
+    line(t('会发送这些'),true);
+    if(typeof bytes==='number' && Number.isSafeInteger(bytes) && bytes>=0) {
+      var size=bytes<1024?bytes+' B':bytes<1048576?(bytes/1024).toFixed(1)+' KiB':(bytes/1048576).toFixed(2)+' MiB';
+      line(tf('诊断大小：{0} / 8 MiB（{1} 字节）',[size,String(bytes)]));
+      if(bytes>8*1024*1024)line(t('诊断超过 8 MiB，服务器无法接收这份诊断。'));
+    }
+    line(tf('· 你填的内容：类型「{0}」、标题、详细描述、复现步骤',[j.type_label]));
+    line(tf('· 版本：RLPlayer {0}（{1}）',[j.version,j.build]));
+    line(tf('· 系统：{0} · {1} · {2} 线程 · 内存 {3} MB',[j.os,j.cpu,j.cpu_threads,j.ram_total_mb]));
+    line(tf('· 显卡：{0}',[j.gpu||t('（未探测）')]));
+    line(tf('· 播放状态：{0} · 后端 {1}',[t(j.playing?'正在播放':'未播放'),j.backend||'-']));
+    line(tf('· 设置快照（{0} 项）与输出端点',[j.settings_keys]));
+    line(tf('· 日志尾：{0} 行 / {1} KB（播放日志 + 启动日志）',[j.log_lines,j.log_kb]));
+    line(t('不会发送'),true);
+    line(t('· 你的音乐文件、封面缓存、曲库索引'));
+    line(tf('· 已自动打码：API Key、token、密码、Authorization 头（共 {0} 条规则）',[j.redaction_rules]));
+    line(t('· 用户名统一替换为 <user>'));
+    line(t('预览就是最终内容。确认无误再点「提交反馈」。'));
+
     box.style.display = 'block';
   }).catch(function (e) {
     if (btn) btn.disabled = false;
     if (msg) msg.textContent = '';
     box.style.display = 'block';
-    box.textContent = '预览失败：' + (e && e.message ? e.message : '网络错误');
+    box.textContent = tf('预览失败：{0}', [(e && e.message ? e.message : '网络错误')]);
   });
 }
 
-function fbSubmit() {
-  var msg = D('sp_fbmsg'), out = D('sp_fbresult'), btn = D('sp_fbsubmit');
+function fbShowResult(j, fields) {
+  var field=typeof fields==='function'?fields:D;
+  var msg = field('sp_fbmsg'), out = field('sp_fbresult');
+  var errorText = String(j.error || '');
+  if (errorText === '反馈服务响应无效，无法确认已提交') errorText = t(errorText);
+  var lines = [
+    'uploaded: ' + (j.uploaded ? 'true' : 'false'),
+    'status:   ' + (j.status === undefined ? '-' : j.status),
+    'path:     ' + (j.path || '-'),
+    'sha:      ' + (j.sha || '-'),
+    'local:    ' + (j.local || '-'),
+    'error:    ' + (j.error || '-')
+  ];
+  // 2026-10-28：技术字段照旧原样保留（排查要用），但在它上面先给一段人话结论。
+  var head = [];
+  if (j.uploaded) {
+    head.push(tf('✅ 已提交成功{0}', [(j.path ? (t('，编号 ') + j.path) : '')]));
+    head.push(t('我们能看到你填的内容和附带的诊断信息，不需要你再单独发日志。'));
+    head.push(t('有回访时请带上这个编号。'));
+  } else if (j.local) {
+    head.push(t('⚠️ 未能自动上传，反馈已保存到：'));
+    head.push('　' + j.local);
+    head.push(t('把这个文件发到 Q 群 895816505 即可，内容与自动上传的完全一样。'));
+  } else {
+    head.push(tf('❌ 提交失败{0}', [(errorText ? ('：' + errorText) : '')]));
+    head.push(t('可以重试，或把下方内容截图发到 Q 群 895816505。'));
+  }
+  head.push('');
+  head.push(t('—— 技术细节（反馈给开发者时贴这段即可）——'));
+  if (out && typeof fields==='function') out.textContent=head.slice(0,-2).join('\n');
+  else if (out) out.textContent = head.join('\n') + '\n' + lines.join('\n') + (j.message ? ('\n\n' + j.message) : '');
+  if (msg) msg.textContent = j.uploaded ? t('已上传，感谢反馈！') : (j.local ? t('反馈已保存到本地') : t('提交失败'));
+  toast(j.uploaded ? t('反馈已上传') : (j.local ? t('反馈已保存到本地') : (errorText || t('提交失败'))));
+  if (j.uploaded) { fbSubmit.key = ''; fbSubmit.fingerprint = ''; }
+  fbSubmit.busy = false;
+}
+function fbSubmit(fields) {
+  var field=typeof fields==='function'?fields:D;
+  var msg = field('sp_fbmsg'), out = field('sp_fbresult'), btn = field('sp_fbsubmit');
+  if (fbSubmit.busy) return;
   var payload = {
-    type:  (D('sp_fbtype')  || {}).value || 'bug',
-    title: ((D('sp_fbtitle') || {}).value || '').trim(),
-    body:  ((D('sp_fbbody')  || {}).value || '').trim(),
-    steps: ((D('sp_fbsteps') || {}).value || '').trim()
+    type:  (field('sp_fbtype')  || {}).value || 'bug',
+    title: ((field('sp_fbtitle') || {}).value || '').trim(),
+    body:  ((field('sp_fbbody')  || {}).value || '').trim(),
+    steps: ((field('sp_fbsteps') || {}).value || '').trim()
   };
   if (!payload.title && !payload.body) { toast('标题和详细描述至少要填一个'); return; }
+  var fingerprint = JSON.stringify(payload);
+  if (fbSubmit.fingerprint !== fingerprint) {
+    fbSubmit.fingerprint = fingerprint;
+    fbSubmit.key = '';
+  }
+  if (!fbSubmit.key) {
+    var bytes = new Uint8Array(16), hex = '';
+    if (typeof crypto !== 'undefined' && crypto.getRandomValues) crypto.getRandomValues(bytes);
+    else { var seed = String(Date.now()) + String(Math.random()); for (var i = 0; i < bytes.length; ++i) bytes[i] = seed.charCodeAt(i % seed.length) & 255; }
+    for (var j = 0; j < bytes.length; ++j) hex += ('0' + bytes[j].toString(16)).slice(-2);
+    fbSubmit.key = hex;
+  }
+  payload.idempotency_key = fbSubmit.key;
   if (out) out.textContent = '';
-  if (msg) msg.textContent = '正在打包并上传…（含日志尾，最长约 14 秒）';
+  if (msg) msg.textContent = t('正在后台打包并上传；慢网络下也可以继续使用播放器。');
   if (btn) btn.disabled = true;
-  var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-  var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 30000);
+  fbSubmit.busy = true;
+  function poll(job) {
+    fetch('/api/feedback/status?job=' + encodeURIComponent(job)).then(function (r) { return r.json(); }).then(function (state) {
+      if (!state || !state.done) {
+        if (msg) msg.textContent = t('反馈正在后台上传，请稍候…');
+        setTimeout(function () { poll(job); }, 600);
+        return;
+      }
+      fbSubmit.busy = false;
+      if (btn) btn.disabled = false;
+      fbShowResult(state.result || { uploaded: false, error: '反馈服务响应无效，无法确认已提交' }, fields);
+    }).catch(function () {
+      if (msg) msg.textContent = t('本地状态读取暂时失败，正在继续等待后台结果…');
+      setTimeout(function () { poll(job); }, 1200);
+    });
+  }
   fetch('/api/feedback', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload), signal: ctrl ? ctrl.signal : undefined
-  }).then(function (r) { return r.json(); }).then(function (j) {
-    clearTimeout(timer);
+    body: JSON.stringify(payload)
+  }).then(function (r) { return r.json(); }).then(function (result) {
+    if (result && result.accepted && result.job) { poll(result.job); return; }
+    fbSubmit.busy = false;
     if (btn) btn.disabled = false;
-    var lines = [
-      'uploaded: ' + (j.uploaded ? 'true' : 'false'),
-      'status:   ' + (j.status === undefined ? '-' : j.status),
-      'path:     ' + (j.path || '-'),
-      'sha:      ' + (j.sha || '-'),
-      'local:    ' + (j.local || '-'),
-      'error:    ' + (j.error || '-')
-    ];
-    // 2026-10-28：技术字段照旧原样保留（排查要用），但在它上面先给一段人话结论。
-    var head = [];
-    if (j.uploaded) {
-      head.push('✅ 已提交成功' + (j.path ? ('，编号 ' + j.path) : ''));
-      head.push('我们能看到你填的内容和附带的诊断信息，不需要你再单独发日志。');
-      head.push('有回访时请带上这个编号。');
-    } else if (j.local) {
-      head.push('⚠️ 没有自动上传（本机未配置上传凭据），反馈已保存到：');
-      head.push('　' + j.local);
-      head.push('把这个文件发到 Q 群 895816505 即可，内容与自动上传的完全一样。');
-    } else {
-      head.push('❌ 提交失败' + (j.error ? ('：' + j.error) : ''));
-      head.push('可以重试，或把下方内容截图发到 Q 群 895816505。');
-    }
-    head.push('');
-    head.push('—— 技术细节（反馈给开发者时贴这段即可）——');
-    if (out) out.textContent = head.join('\n') + '\n' + lines.join('\n') + (j.message ? ('\n\n' + j.message) : '');
-    if (msg) msg.textContent = j.uploaded ? '已上传，感谢反馈！' : (j.local ? '已存到本地（无上传凭据）' : '提交失败');
-    toast(j.message || (j.uploaded ? '反馈已上传' : '反馈已保存到本地'));
+    fbShowResult(result || { uploaded: false, error: '反馈服务响应无效，无法确认已提交' }, fields);
   }).catch(function (e) {
-    clearTimeout(timer);
+    fbSubmit.busy = false;
     if (btn) btn.disabled = false;
-    var why = (e && e.name === 'AbortError') ? '请求超时（30 s）' : (e && e.message ? e.message : String(e));
+    var why = (e && e.message ? e.message : String(e));
     if (out) out.textContent = 'error: ' + why;
     if (msg) msg.textContent = '提交失败';
-    toast('反馈提交失败：' + why);
+    toast(tf('反馈提交失败：{0}', [why]));
   });
 }
 
@@ -10124,12 +12285,12 @@ function exportDiagZip() {
       if (!(v[0] === 0x50 && v[1] === 0x4B && v[2] === 0x03 && v[3] === 0x04)) throw new Error('不是 ZIP');
       var name = 'rlplayer-diag-' + diagStamp() + '.zip';
       downloadBlob(blob, name);
-      diagMsg('已导出 ' + name + '（' + Math.round(blob.size / 1024) + ' KB）');
-      toast('诊断包已导出：' + name);
+      diagMsg(tf('已导出 {0}（{1} KB）', [name, Math.round(blob.size / 1024)]));
+      toast(tf('诊断包已导出：{0}', [name]));
     });
   }).catch(function (e) {
     diagMsg('');
-    toast('诊断包导出失败：' + (e && e.message ? e.message : e));
+    toast(tf('诊断包导出失败：{0}', [(e && e.message ? e.message : e)]));
   }).then(function () { if (btn) btn.disabled = false; });
 }
 
@@ -10146,7 +12307,7 @@ function exportDiag() {
     if (noDiag) throw new Error('diag not available');
     var name = 'rlplayer-diag-' + diagStamp() + '.json';
     downloadBlob(new Blob([t], { type: 'application/json' }), name);
-    diagMsg('已导出 ' + name);
+    diagMsg(tf('已导出 {0}', [name]));
     toast('诊断 JSON 已导出');
   }).catch(function () {
     diagMsg('');
@@ -10182,6 +12343,7 @@ function collectSettings() {
   ADV.transition = parseFloat(D('sp_transition').value) || 0;
   ADV.phase = D('sp_phase').value || '';
   ADV.modorder = parseInt(D('sp_modorder').value, 10) || 5;
+  if (D('sp_modfamily')) ADV.modfamily = D('sp_modfamily').value || 'dsd';
   ADV.modcut = parseFloat(D('sp_modcut').value) || 0;
   ADV.moddith = (D('sp_moddith').value === '') ? -1 : parseFloat(D('sp_moddith').value);
   if (D('sp_eq')) ADV.eq = (D('sp_eq').value || '').trim();
@@ -10238,11 +12400,16 @@ function collectSettings() {
 }
 
 function applySettings() {
+  if (!ensurePlaybackSettings()) return Promise.resolve({ok:false,errorCode:'PLAYBACK_SETTINGS_NOT_READY'});
+  if (!validateSdmCornerSettings()) return Promise.resolve({ok:false,errorCode:'SDM_CORNER_QUALITY'});
   collectSettings();
-  saveSettings(true);
-  // 顺带把音乐库目录那一栏的输入也处理掉
-  var extra = (D('sp_root') && D('sp_root').value.trim()) ? ('&rootpending=1') : '';
-  toast('设置已保存' + extra);
+  return saveSettings(true).then(function (j) {
+    // persistSettings already displays the failure. A click is not proof of a
+    // committed write: only acknowledge success after the backend confirms it.
+    if (!j || !j.ok) {if(j&&j.stale)toast(t('当前组已切换，请重新操作'));return j;}
+    var extra = (D('sp_root') && D('sp_root').value.trim()) ? ('&rootpending=1') : '';
+    toast(tf('设置已保存{0}', [extra]));
+  });
 }
 
 /* ---------------- 键盘快捷键 ---------------- */
@@ -10260,6 +12427,18 @@ document.addEventListener('keydown', function (e) {
     }
     return;
   }
+  if (t.isContentEditable) return;
+  // Keep native keyboard activation on buttons and disclosure summaries. A
+  // focused mode or settings button must never turn Space into a playback action.
+  if (e.key === ' ' && t.closest && t.closest('button,summary,a[href]')) return;
+  if (t.closest && t.closest('#rlViewModes') && /^Arrow/.test(e.key)) {
+    e.preventDefault();
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      var other = document.querySelector('#rlViewModes [data-rl-mode="' + (t.dataset.rlMode === 'pro' ? 'listen' : 'pro') + '"]');
+      if (other) other.focus();
+    }
+    return;
+  }
   if (e.key === ' ') { e.preventDefault(); D('bPause').click(); }
   else if (e.key === 'ArrowRight') {
     e.preventDefault();
@@ -10271,8 +12450,8 @@ document.addEventListener('keydown', function (e) {
     if (e.shiftKey) seekRel(-5);
     else D('bPrev').click();
   }
-  else if (e.key === 'ArrowUp') { e.preventDefault(); setVol(Math.min(0, S.vol + 1)); }
-  else if (e.key === 'ArrowDown') { e.preventDefault(); setVol(Math.max(-60, S.vol - 1)); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); setVol(Number(D('vol').value)+(e.shiftKey?.1:.5),true);commitVolumeGesture(); }
+  else if (e.key === 'ArrowDown') { e.preventDefault(); setVol(Number(D('vol').value)-(e.shiftKey?.1:.5),true);commitVolumeGesture(); }
   else if (e.key === 'n') D('bNext').click();
   else if (e.key === 'p') D('bPrev').click();
   else if (e.key === 's') D('bStop').click();
@@ -10374,7 +12553,7 @@ function applyQueueSort(by) {
     var lines = idx.map(function (i) { return queueItemLine(items, cues, i); });
     return api('/api/qorder', 'files=' + encodeURIComponent(lines.join('\n'))).then(function (j) {
       if (j && j.ok === false) { toast(j.error || '排序失败'); renderQueuePage(); return; }
-      toast('已按「' + (QSORT_LABEL[by] || by) + '」重排 ' + n + ' 首（可点「↩ 撤销排序」还原）');
+      toast(tf('已按「{0}」重排 {1} 首（可点「↩ 撤销排序」还原）', [(QSORT_LABEL[by] || by), n]));
       renderQueuePage(); loadQ();
     });
   }).catch(function () { renderQueuePage(); });
@@ -10383,7 +12562,7 @@ function applyQueueSort(by) {
 function undoQueueSort() {
   api('/api/qsort?by=default', '').then(function (j) {
     if (j && j.ok === false) { toast(j.error || '没有可撤销的排序'); renderQueuePage(); return; }
-    toast('已撤销排序，还原为排序前那 ' + ((j && j.n) || 0) + ' 首的顺序');
+    toast(tf('已撤销排序，还原为排序前那 {0} 首的顺序', [((j && j.n) || 0)]));
     renderQueuePage(); loadQ();
   }).catch(function () { renderQueuePage(); });
 }
@@ -10411,7 +12590,7 @@ function showQueueRowMenu(x, y, i) {
     m.appendChild(d);
   }
   var f = (S.q && S.q.items) ? S.q.items[i] : '';
-  item('\u25b6 立即播放', function () { var c = (S.q.cues || [])[i] || [-1, -1]; playPath(f, c[0], c[1]); });
+  item('\u25b6 立即播放', function () { var c = (S.q.cues || [])[i] || [-1, -1]; playPath(f, c[0], c[1], i); });
   item('\u00d7 从队列移除', function () { removeQueueItem(i); }, 'danger');
   document.body.appendChild(m);
   _activeCtxMenu = m;
@@ -10459,7 +12638,7 @@ function openQueueAddPanel() {
         function add() {
           api('/api/add', 'file=' + encodeURIComponent(x.path) + cueQuery(x.cs, x.ce)).then(function (rr) {
             if (rr && rr.ok === false) { toast(rr.error || '加入失败'); return; }
-            toast('已加入队列：' + (x.title || nam(x.path)) + '（队列共 ' + ((rr && rr.count) || '?') + ' 首）');
+            toast(tf('已加入队列：{0}（队列共 {1} 首）', [(x.title || nam(x.path)), ((rr && rr.count) || '?')]));
             loadQ();
             if (S.view === 'queue') renderQueuePage();
             var b = e.querySelector('.qaddbtn');
@@ -10484,6 +12663,91 @@ function openQueueAddPanel() {
 }
 
 /* ---------------- 播放队列（主视图） ---------------- */
+// Browser file inputs omit the parent directory. Ask only when a relative
+// item actually needs it, and never derive an absolute path from the song library.
+function m3uWindowsPath(value, folder) {
+  var raw = String(value || '').trim();
+  if (!raw || /[\u0000-\u001f]/.test(raw)) throw new Error('歌单包含不支持的路径或格式');
+  if (/^file:/i.test(raw)) {
+    var fileUrl = new URL(raw);
+    if (fileUrl.search || fileUrl.hash) throw new Error('歌单包含不支持的路径或格式');
+    raw = decodeURIComponent(fileUrl.pathname);
+    if (fileUrl.hostname) raw = '//' + fileUrl.hostname + raw;
+    else if (/^\/[a-z]:\//i.test(raw)) raw = raw.slice(1);
+  }
+  if (/[\u0000-\u001f]/.test(raw)) throw new Error('歌单包含不支持的路径或格式');
+  raw = raw.replace(/\//g,'\\');
+  if (/^\\\\[?.]\\/.test(raw) || /^[a-z]:[^\\]/i.test(raw) || /^\\(?!\\)/.test(raw) ||
+      (/^[a-z][\w+.-]*:/i.test(raw) && !/^[a-z]:\\/i.test(raw))) throw new Error('歌单包含不支持的路径或格式');
+  var match = /^(?:([a-z]:)\\|\\\\([^\\]+)\\([^\\]+)(?:\\|$))/i.exec(raw);
+  if (!match) {
+    if (!folder) return null;
+    return m3uWindowsPath(folder.replace(/\\+$/,'') + '\\' + raw, '');
+  }
+  var root = match[1] || ('\\\\' + match[2] + '\\' + match[3]);
+  var parts = [];
+  raw.slice(match[0].length).split('\\').forEach(function (component) {
+    if (component === '..') { if (parts.length) parts.pop(); }
+    else if (component && component !== '.') {
+      if (/[<>:"|?*]/.test(component)) throw new Error('歌单包含不支持的路径或格式');
+      parts.push(component);
+    }
+  });
+  return root + '\\' + parts.join('\\');
+}
+function parseTransportM3u(text, folder) {
+  var items = [], needsFolder = false, cue = '';
+  String(text).replace(/^\uFEFF/,'').split(/\r\n|\n|\r/).forEach(function (raw) {
+    var line = raw.trim();
+    if (!line) return;
+    if (/^#EXT-X-/i.test(line)) throw new Error('歌单包含不支持的路径或格式');
+    if (/^#RTA-CUE\b/i.test(line)) {
+      var m = /^#RTA-CUE\s+(\S+)\s+(\S+)$/i.exec(line), a = m && Number(m[1]), b = m && Number(m[2]);
+      if (!m || cue || !Number.isFinite(a) || !Number.isFinite(b) || a < 0 || (b !== -1 && b <= a)) throw new Error('歌单包含不支持的路径或格式');
+      cue = '\t' + a + '\t' + b; return;
+    }
+    if (line[0] === '#') return;
+    var item = m3uWindowsPath(line, folder);
+    if (!item) needsFolder = true;
+    items.push((item || '') + cue); cue = '';
+  });
+  if (!items.length || cue) throw new Error('歌单包含不支持的路径或格式');
+  return {items:items, needsFolder:needsFolder};
+}
+function importTransportM3u(file) {
+  if (!file) return;
+  if (!/\.m3u8?$/i.test(file.name)) { toast(t('歌单包含不支持的路径或格式')); return; }
+  if (file.size > 16*1024*1024) { toast(t('歌单过大')); return; }
+  function preview(text, folder) {
+    var parsed;
+    try { parsed = parseTransportM3u(text, folder); }
+    catch (_) { toast(t('歌单包含不支持的路径或格式')); return; }
+    if (parsed.needsFolder && !folder) {
+      askText({title:t('请输入歌单所在文件夹'), placeholder:'D:\\Music', onOk:function (value) {
+        try {
+          var absolute = m3uWindowsPath(value, '');
+          if (!absolute) throw new Error();
+          preview(text, absolute);
+        } catch (_) { toast(t('歌单包含不支持的路径或格式')); }
+      }});
+      return;
+    }
+    var body = 'require_stopped=1&files=' + encodeURIComponent(parsed.items.join('\n'));
+    if (body.length > 16*1024*1024) { toast(t('歌单过大')); return; }
+    askConfirm({title:t('导入 M3U 到队列'),text:tf('将按歌单顺序替换当前队列，共 {0} 首。导入后可保存为歌单。',[parsed.items.length]),
+      ok:t('替换队列'),onOk:function () {
+        if (S.playing) { toast(t('请先停止播放，再替换队列。')); return; }
+        api('/api/queue/set',body).then(function (j) {
+          if (!j || !j.ok) { toast(j && j.error || t('导入失败')); return; }
+          loadQ(); if (S.view === 'queue') renderQueuePage();
+        }).catch(function () { toast(t('导入失败')); });
+      }});
+  }
+  file.arrayBuffer().then(function (data) {
+    var text = new TextDecoder('utf-8',{fatal:true}).decode(data); preview(text,'');
+  }).catch(function () { toast(t('请将歌单另存为 UTF-8 编码。')); });
+}
+
 function renderQueuePage() {
   S.view = 'queue';
   // 2026-10-23（自检暴露）：标题原来只在 /api/queue 回来后才写 → 本地接口虽快，但慢的时候
@@ -10508,6 +12772,7 @@ function renderQueuePage() {
     //   窄窗（<1100px）允许整行 wrap，但左右两组各自 flex:none，换行后仍成组、不散。
     var h = '<div class=qhd>' +
             '<button class="btn pri" id=qAddBtn title="搜索曲库并加入队列（追加在末尾，不动已在队列里的歌）">\uff0b 添加曲目</button>';
+    h += '<button type=button class=btn id=qImportM3u>' + esc(t('导入 M3U 到队列')) + '</button><input id=qM3uFile type=file accept=".m3u,.m3u8" hidden>';
     // 2026-10-27（铁律 11 抓到的真 bug，两次修都没修好，最终定案）：
     //   原方案把「保存为歌单 / 清空队列」放进 .qhdend 靠 margin-left:auto / 弹性占位推到最右。
     //   CDP 量得到（x=537 w=184 h=38，连红底诊断样式都生效），实机就是看不见 ——
@@ -10560,7 +12825,7 @@ function renderQueuePage() {
         e.onclick = function (ev) {
           if (ev.target.closest && ev.target.closest('.qdel')) return;
           var c = (S.q.cues || [])[i] || [-1, -1];
-          playPath(S.q.items[i], c[0], c[1]);
+          playPath(S.q.items[i], c[0], c[1], i);
         };
         // 右键菜单（此前队列页没有 → 帮助浮层里那句「右键队列条目 → 从队列移除」是空头支票）
         e.oncontextmenu = function (ev) { ev.preventDefault(); ev.stopPropagation(); showQueueRowMenu(ev.clientX, ev.clientY, i); };
@@ -10577,6 +12842,8 @@ function renderQueuePage() {
       });
     }
     if (D('qAddBtn')) D('qAddBtn').onclick = function () { openQueueAddPanel(); };
+    D('qImportM3u').onclick = function () { D('qM3uFile').value=''; D('qM3uFile').click(); };
+    D('qM3uFile').onchange = function () { importTransportM3u(this.files[0]); };
     if (D('qSort')) D('qSort').onchange = function () { var v = this.value; this.value = ''; if (v) applyQueueSort(v); };
     if (D('qSortUndo')) D('qSortUndo').onclick = function () { undoQueueSort(); };
     if (D('qSaveSq')) D('qSaveSq').onclick = function () { saveQueueDialog(); };
@@ -10595,6 +12862,7 @@ function openNowPlaying() {
   if (S.lastCur) {
     loadLyrics(S.lastCur);
     if (!S.curMeta) loadMeta(S.lastCur);
+    else if (!S.curMeta.hasCover && !S.coverCacheWatch) watchCurrentCachedCover(S.lastCur);
   }
   renderNp();
   // 261024-04 #7：进入单曲页立刻自动加载这首歌的 AI 整理（不必等 400ms 的 renderNp 轮询）
@@ -10604,7 +12872,7 @@ function openNowPlaying() {
   syncVolUi();
   pollCastState(true);   // 261024-02 #5：进来就取一次投放状态（按钮文案/高亮由 applyCastUi 统一刷）
 }
-function closeNowPlaying() { var pg = D('npPage'); if (pg) pg.classList.remove('on'); }
+function closeNowPlaying() { stopCurrentCachedCover(); var pg = D('npPage'); if (pg) pg.classList.remove('on'); }
 
 /* ---------------- 单曲页「资料」面板（用户 261023-04 #7/#9） ----------------
    数据：GET /api/entity/summary?kind=track|release|person&name=..&artist=..&lang=zh
@@ -10673,20 +12941,20 @@ function npEqChipsHtml() {
   var h = '';
   var eq = ADV.eq || '', ir = ADV.ir || '';
   if (eq) {
-    h += '<button class=chip id=npEqChip title="' + esc('当前 EQ：' + npFileName(eq) + '（点击打开 EQ 设置）') + '">' +
+    h += '<button class=chip id=npEqChip title="' + esc(tf('当前 EQ：{0}（点击打开 EQ 设置）', [npFileName(eq)])) + '">' +
          '<svg width=11 height=11 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 style="vertical-align:-1px"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>EQ</button>';
   }
   if (ir) {
-    h += '<button class=chip id=npIrChip title="' + esc('当前 IR：' + npFileName(ir) + '（点击打开 声音校准）') + '">' +
+    h += '<button class=chip id=npIrChip title="' + esc(tf('当前 IR：{0}（点击打开 声音校准）', [npFileName(ir)])) + '">' +
          '<svg width=11 height=11 viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=2 style="vertical-align:-1px"><path d="M3 12h3l2-6 3 12 2-8 2 4h6"/></svg>IR</button>';
   }
   return h;
 }
 function npBindEqChips() {
   var eq = D('npEqChip'), ir = D('npIrChip');
-  if (eq) eq.onclick = function () { closeNowPlaying(); openSettingsTab('eq'); };
+  if (eq) eq.onclick = function () { closeNowPlaying(); rlOfferProfessional('eq'); };
   // #6：IR 属于「声音校准」页签，EQ 芯片进「EQ」页签（各进各的地方，不再都跳 EQ）
-  if (ir) ir.onclick = function () { closeNowPlaying(); openSettingsTab('cal'); };
+  if (ir) ir.onclick = function () { closeNowPlaying(); rlOfferProfessional('cal'); };
 }
 function npDataReset() {
   // 261024-05 #T2：切歌 → 取消上一首所有在飞/轮询中的资料请求（旧实体的轮询不该继续打后端）
@@ -10831,7 +13099,7 @@ function npAiEntryHtml() {
   var line = npAiStateLine();
   return '<button class="npchip npai' + cls + (isOpen ? ' on' : '') + '" id=npAiEntry' +
          ' title="' + esc(isOpen ? '收起曲目信息'
-             : (npAiReady() ? '展开曲目信息（这首歌 · 专辑 · 艺术家 一起看）'
+             : (npAiReady() ? t('展开曲目信息（这首歌 · 专辑 · 艺术家 一起看）')
                              : '曲目信息未整理 —— 点开看怎么开启')) + '"' +
          ' style="justify-content:flex-start;gap:7px">' +
          // 2026-10-29（#3）：不再强调 AI —— 标题就写「曲目信息」，去掉彩色圆点与箭头（多余装饰）
@@ -10863,7 +13131,7 @@ function npDataStatHtml(kind, st) {
   // 261024-05 A12：AI 关闭时「专辑」标签只有本地曲目 —— 不能显示永远等不到的"整理中…"
   if (kind === 'release' && !npAiReady()) {
     var ln = ((st && st.local && st.local.tracks) || []).length;
-    return ln ? ('本地曲目 · ' + ln + ' 首') : '本地曲库';
+    return ln ? (tf('本地曲目 · {0} 首', [ln])) : '本地曲库';
   }
   if (!st || st.state === 'idle' || st.state === 'loading') {
     if (kind === 'release' && st && st.local) return '本地曲目已就绪 · AI 整理中…';
@@ -10872,7 +13140,7 @@ function npDataStatHtml(kind, st) {
   if (st.state === 'error') return '暂无资料';
   if (st.state === 'local') {
     var n0 = ((st.local && st.local.tracks) || []).length;
-    return n0 ? ('本地曲目 · ' + n0 + ' 首') : '本地曲库';
+    return n0 ? (tf('本地曲目 · {0} 首', [n0])) : '本地曲库';
   }
   var d = st.data || {};
   if (kind === 'work') {
@@ -10901,7 +13169,7 @@ function npDataRenderProgress(st, kind) {
   var sec = (typeof prog.elapsedMs === 'number' && prog.elapsedMs >= 0)
     ? (prog.elapsedMs / 1000).toFixed(1) + 's' : '';
   var statTxt = (chars > 0 || sec)
-    ? ('已生成 ' + chars + ' 字' + (sec ? (' · ' + sec) : ''))
+    ? (tf('已生成 {0} 字{1}', [chars, (sec ? (' · ' + sec) : '')]))
     : '';
   var phaseTxt = prog.phase || '正在整理资料…';
 
@@ -10934,7 +13202,7 @@ function npDataRenderProgress(st, kind) {
     if (phaseEl) phaseEl.style.display = 'none';
     if (statEl) {
       statEl.style.display = '';
-      statEl.textContent = statTxt || ('已生成 ' + chars + ' 字');
+      statEl.textContent = statTxt || (tf('已生成 {0} 字', [chars]));
     }
     if (textEl) {
       textEl.style.display = '';
@@ -10949,7 +13217,7 @@ function npDataRenderProgress(st, kind) {
     }
     if (statEl) {
       statEl.style.display = '';
-      statEl.textContent = statTxt || ('已生成 ' + chars + ' 字');
+      statEl.textContent = statTxt || (tf('已生成 {0} 字', [chars]));
     }
     if (textEl) {
       textEl.style.display = 'none';
@@ -11033,9 +13301,9 @@ function npDataWorkBody(d) {
            '<div class=npdhint style="margin-top:6px">作品：' + esc(w.name) + (w.composer ? (' · ' + esc(w.composer)) : '') + '</div>' +
            '<div style="margin-top:8px"><button class=btn id=npWorkRetry>重试查询</button></div>';
   }
-  var sub = (d.from_cache ? ('缓存 · ' + (d.generated_at ? fmtDate(d.generated_at) : '')) : 'Discogs 实时') +
+  var sub = (d.from_cache ? (tf('缓存 · {0}', [(d.generated_at ? fmtDate(d.generated_at) : '')])) : 'Discogs 实时') +
             ' · 不同演绎 ' + (typeof d.distinctCount === 'number' ? d.distinctCount : perfs.length) +
-            ' / 发行版本 ' + (typeof d.releaseCount === 'number' ? d.releaseCount : perfs.length);
+            tf(' / 发行版本 {0}', [(typeof d.releaseCount === 'number' ? d.releaseCount : perfs.length)]);
   var h = '<div class=npdhint style="margin-bottom:6px">' + esc(sub) + '</div>';
   perfs.forEach(function (p) {
     var ens = p.ensemble || p.orchestra || '';
@@ -11075,7 +13343,7 @@ function npAiProgressHtml(st) {
   var chars = (typeof p.chars === 'number') ? p.chars : (clean ? clean.length : 0);
   var sec = (typeof p.elapsedMs === 'number' && p.elapsedMs >= 0) ? (p.elapsedMs / 1000).toFixed(1) + 's' : '';
   var h = '<div class=npdhint>' + esc(p.phase || '正在整理…') +
-          (chars > 0 ? (' · 已 ' + chars + ' 字') : '') + (sec ? (' · ' + sec) : '') + '</div>';
+          (chars > 0 ? (tf(' · 已 {0} 字', [chars])) : '') + (sec ? (' · ' + sec) : '') + '</div>';
   if (clean) h += '<div class=npdstream-text style="max-height:120px;overflow:auto;white-space:pre-wrap;font-size:11.5px;color:var(--txt2);margin-top:4px">' + esc(clean) + '</div>';
   return h;
 }
@@ -11212,7 +13480,8 @@ function npDataRenderBody(force) {
 var NPLIB = { key: '', album: null };
 function npLocalAlbum(name, artist, cb) {
   var key = String(name || '') + '|' + String(artist || '');
-  if (NPLIB.key === key) { cb(NPLIB.album); return; }
+  // 只缓存成功结果：扫描尚未结束时的未找到/失败不能永久挡住稍后入库的专辑。
+  if (NPLIB.key === key && NPLIB.album) { cb(NPLIB.album); return; }
   api('/api/lib/albums?q=' + encodeURIComponent(name || '')).then(function (j) {
     var list = (j && j.albums) || [], hit = null, i;
     for (i = 0; i < list.length; i++) {
@@ -11261,7 +13530,7 @@ function npReleaseBody(st) {
     var chars = (typeof prog.chars === 'number') ? prog.chars : (cleanText ? cleanText.length : 0);
     var sec = (typeof prog.elapsedMs === 'number' && prog.elapsedMs >= 0)
       ? (prog.elapsedMs / 1000).toFixed(1) + 's' : '';
-    var statTxt = (chars > 0 || sec) ? ('已生成 ' + chars + ' 字' + (sec ? (' · ' + sec) : '')) : '';
+    var statTxt = (chars > 0 || sec) ? (tf('已生成 {0} 字{1}', [chars, (sec ? (' · ' + sec) : '')])) : '';
     h += '<div id=npdStreamWrap data-kind="release" style="margin-bottom:12px;padding:10px 12px;border-radius:8px;background:var(--hov);border:1px solid var(--line)">';
     if (!cleanText && !isJson) {
       h += '<div class=npdhint id=npdStreamPhase>' + esc(prog.phase || '正在整理…') + (sec ? (' · ' + sec) : '') + '</div>';
@@ -11339,7 +13608,8 @@ function npSummUrl(kind, t, force) {
     if (an) albQ = '&album=' + encodeURIComponent(an);
   }
   return '/api/entity/summary?kind=' + kind + '&name=' + encodeURIComponent((t && t.name) || '') +
-         ((t && t.artist) ? ('&artist=' + encodeURIComponent(t.artist)) : '') + albQ + '&lang=zh' +
+         ((t && t.artist) ? ('&artist=' + encodeURIComponent(t.artist)) : '') + albQ +
+         '&lang=' + encodeURIComponent(I18N.lang || 'zh') +
          (force ? '&refresh=1' : '');
 }
 function npPrefetchRelease() {
@@ -11579,9 +13849,7 @@ var NP_COVER_PLACEHOLDER = 'data:image/svg+xml;charset=utf-8,' + encodeURICompon
 
 function renderNp() {
   var pg = D('npPage'); if (!pg || !pg.classList.contains('on')) return;
-  // 2026-10-27（261027-04 #4）：进单曲页先把分析条画出来（状态 + 已缓存的结果）。
-  // 数据本身由 tick()→anlUpdateCur 在播放开始时抓，这里只负责"打开就能看到"，不发起任何请求。
-  anlPaint();
+  syncNpWaveform();
   D('npTitle').textContent = (D('npt') && D('npt').textContent) || '未播放';
   var sub = (D('npart') && D('npart').textContent) || '';
   var st = (D('nps') && D('nps').textContent) || '';
@@ -11591,6 +13859,11 @@ function renderNp() {
   if (chm && st.indexOf(chm) < 0) st = st + '  ·  ' + chm;
   D('npSub').textContent = sub + (st ? '  ·  ' + st : '');
   if (D('npKind')) D('npKind').textContent = npPlayingKindText(S.curMeta);
+  if (D('npSetCover')) D('npSetCover').disabled = !S.lastCur;
+  if (D('npResetCover')) {
+    D('npResetCover').disabled = !S.lastCur;
+    D('npResetCover').style.display = S.curMeta && S.curMeta.coverSource === 'track_manual' ? '' : 'none';
+  }
   // 元数据补全芯片 + 当前 EQ/IR 芯片（loadMeta / loadSettings 异步回来时也会走到这里刷一次）
   if (D('npMeta')) {
     // 261024-02 #5：单曲页「推送到设备」按钮（状态来自 /api/cast/state，与流媒体页/底栏同源）
@@ -11647,9 +13920,43 @@ function lyricViewSave() {
   } catch (e) { }
 }
 // 歌词内容指纹：换歌/换词就作废已翻译结果（否则会把上一首的译文贴到这一首）
+// 2026-11-01（用户 261101 #1）：很多下载来的 LRC 把「原文 译文」写在同一行
+// （实测：教えて！ もっとあなたの事 告诉我更多 关于你的事）。界面照原样显示就成了
+// 「原词和翻译挤在一行」—— 用户在截图里指的就是这个。
+// 这里只在**显示时**拆成两行：歌词文本、时间轴、高亮索引都不动（LY.lines 保持原样）。
+// 判据（宁可少拆，不可误拆）：
+//   ① 左边必须有假名或拉丁字母（说明它是原文）；
+//   ② 右边必须**没有**假名也没有拉丁字母（说明它只可能是译文）；
+//   ③ 右边至少 2 个汉字；不足 4 个汉字时还必须含「简体专用字」，避免把「君の名は 世界」拆开。
+var LY_CN_ONLY = /[你这们说时让给还没关于对从会来过么样爱见开关门东车马鸟书长写认识觉边远样]/;
+function lyricSplitPair(s) {
+  var t = String(s || '').trim();
+  if (!t) return { main: t, sub: '' };
+  var KANA = /[\u3040-\u30ff]/, LATIN = /[A-Za-z]/, CJK = /[\u3400-\u9fff]/;
+  if (!KANA.test(t) && !LATIN.test(t)) return { main: t, sub: '' };   // 纯中文行：不分
+  var best = -1;
+  for (var i = 0; i < t.length; i++) {
+    var c = t[i];
+    if (c !== ' ' && c !== '\u3000' && c !== '/' && c !== '\uff0f') continue;
+    var left = t.slice(0, i).trim(), right = t.slice(i + 1).trim();
+    if (!left || !right) continue;
+    if (KANA.test(right) || LATIN.test(right)) continue;
+    if (!(KANA.test(left) || LATIN.test(left))) continue;
+    var han = right.replace(/[^\u3400-\u9fff]/g, '').length;
+    if (han < 2) continue;
+    if (han < 4 && !LY_CN_ONLY.test(right)) continue;
+    best = i;                                                         // 取**第一个**合法切点：
+    break;                                                            // 译文内部还有空格时，
+                                                                      // 取最后一个会把译文劈成两半（实测踩到）
+  }
+  if (best < 0) return { main: t, sub: '' };
+  return { main: t.slice(0, best).trim(), sub: t.slice(best + 1).trim() };
+}
 function lyricKey() {
   if (!LY.lines.length) return "";
-  return LY.lines.length + "|" + (LY.lines[0] ? LY.lines[0].s : "") + "|" + (LY.raw ? LY.raw.length : 0);
+  // Full request content, rather than first line + length: equal-length songs
+  // often share an opening line. JSON also preserves line boundaries exactly.
+  return JSON.stringify(LY.lines.map(function (line) { return line.s; }));
 }
 function lyricTargetLang() {
   if (LYVIEW.lang) return LYVIEW.lang;
@@ -11658,7 +13965,7 @@ function lyricTargetLang() {
 // 该任务当前可用的结果行（指纹不匹配就当没有）
 function lyricExtra(kind) {
   var d = LYVIEW.data[kind];
-  if (!d || d.key !== lyricKey() || !d.lines || !d.lines.length) return null;
+  if (!d || d.key !== lyricKey() || d.lang !== lyricTargetLang() || !d.lines || !d.lines.length) return null;
   return d.lines;
 }
 function applyLyricView() {
@@ -11675,8 +13982,17 @@ function lyricAi(kind) {
   // 界面里的开关名（trans/furi）与后端任务名（translate/furigana）不是一套词，
   // 直接透传会 400「kind 非法」（实测踩到）。这里显式映射。
   var apiKind = { trans: "translate", translit: "translit", furi: "furigana", trad: "trad" }[kind] || kind;
+  // Capture before starting HTTP. A late success or failure belongs to this
+  // exact request, never to whichever song/language happens to be open later.
+  var requestKey = lyricKey(), requestLang = lyricTargetLang();
+  var requests = LYVIEW.requests || (LYVIEW.requests = {});
+  var requestId = (requests[kind] || 0) + 1;
+  requests[kind] = requestId;
+  function currentRequest() {
+    return requests[kind] === requestId && lyricKey() === requestKey && lyricTargetLang() === requestLang;
+  }
   var body = "kind=" + encodeURIComponent(apiKind) +
-             "&lang=" + encodeURIComponent(lyricTargetLang()) +
+             "&lang=" + encodeURIComponent(requestLang) +
              "&lines=" + encodeURIComponent(JSON.stringify(lines));
   toast(kind === "translate" ? "正在翻译歌词…" : "正在处理歌词…");
   // 不能用 api()：apiRaw 里硬编码 8 秒超时（那是给普通设置/列表请求定的）。
@@ -11697,6 +14013,7 @@ function lyricAi(kind) {
     });
   }).then(function (j) {
     clearTimeout(timer);
+    if (!currentRequest()) return;
     if (!j.ok) {
       // 2026-10-30 实测踩到：请求失败时开关留在"开"⟹ 用户再点一次变成"关"，
       //   界面上什么都不会发生（既没译文也没提示），看起来像"点了没反应"。
@@ -11705,11 +14022,12 @@ function lyricAi(kind) {
       toast(j.error || "处理失败");
       return;
     }
-    LYVIEW.data[kind] = { key: lyricKey(), lines: j.lines || [] };
+    LYVIEW.data[kind] = { key: requestKey, lang: requestLang, lines: j.lines || [] };
     applyLyricView();
     toast(j.cached ? "已载入（缓存）" : "完成");
   }).catch(function (e) {
     clearTimeout(timer);
+    if (!currentRequest()) return;
     LYVIEW[kind] = 0; lyricViewSave(); applyLyricView();   // 同上：失败即回退开关
     toast((e && e.message) ? e.message : "处理失败（网络或模型不可用）");
   });
@@ -11792,7 +14110,7 @@ function renderNpLyric() {
   // 行集合或"带轴/纯文本"状态变化才重建 DOM（否则每 400ms 轮询都重建会把用户正在读的行冲掉）
   // 2026-10-30：字号/译文/音译/假名/繁体任一变化都必须重建 DOM，
   // 否则用户点了右键菜单「翻译歌词」看不到任何变化（旧 key 只含行数与有无时间轴）。
-  var key = LY.lines.length + ':' + (timed ? 1 : 0) + ':' + LYVIEW.size + ':' +
+  var key = lyricKey() + ':' + lyricTargetLang() + ':' + (timed ? 1 : 0) + ':' + LYVIEW.size + ':' +
             (LYVIEW.trans ? 1 : 0) + (LYVIEW.translit ? 1 : 0) + (LYVIEW.furi ? 1 : 0) + (LYVIEW.trad ? 1 : 0);
   if (box.dataset.n !== key) {
     box.dataset.n = key;
@@ -11805,11 +14123,15 @@ function renderNpLyric() {
     var lvFu = LYVIEW.furi ? lyricExtra('furi') : null;
     var lvTd = LYVIEW.trad ? lyricExtra('trad') : null;
     LY.lines.forEach(function (l, i) {
-      var body = (lvTd && lvTd[i]) ? lvTd[i] : l.s;
+      var raw = (lvTd && lvTd[i]) ? lvTd[i] : l.s;
+      // 双语 LRC 的「原文 译文」在这里拆开（纯显示层，不动时间轴与高亮）
+      var pair = lyricSplitPair(raw);
+      var body = pair.main;
       if (lvFu && lvFu[i]) body = '<span class=ly-furi>' + esc(lvFu[i]) + '</span>' + esc(body);
       else body = esc(body);
       h += '<div class=npline data-i=' + i + '>' + body;
       if (lvTr && lvTr[i]) h += '<div class=ly-tr>' + esc(lvTr[i]) + '</div>';
+      else if (pair.sub) h += '<div class=ly-tr>' + esc(pair.sub) + '</div>';
       if (lvPh && lvPh[i]) h += '<div class=ly-ph>' + esc(lvPh[i]) + '</div>';
       h += '</div>';
     });
@@ -11898,7 +14220,7 @@ function addMany(paths) {
   var i = 0, n = 0;
   (function step() {
     if (i >= paths.length) {
-      toast('已加入 ' + n + ' 项');
+      toast(tf('已加入 {0} 项', [n]));
       loadQ();
       if (S.view === 'queue') renderQueuePage();
       return;
@@ -11909,11 +14231,32 @@ function addMany(paths) {
     }).catch(step);
   })();
 }
+// 2026-11-13 反馈 FB-20261113-A916DFDBD3「CD无法拖入播放」：
+// 拖文件夹时浏览器会把 desktop.ini / 封面 jpg / 说明 txt 一起给过来。旧实现照单全传，
+// 后端也不筛，于是 desktop.ini 进了队列，播到它才报"ffmpeg 解不了"——用户看到的
+// 就是"CD 拖不进去"。这里先按扩展名过滤，跳过的数量如实告诉用户。
+var RL_DROP_EXT = { wav:1, wave:1, flac:1, alac:1, m4a:1, mp3:1, aac:1, ogg:1, opus:1,
+                    wma:1, ape:1, wv:1, aif:1, aiff:1, aifc:1, caf:1, mka:1,
+                    dsf:1, dff:1, cue:1, iso:1 };
+function rlDropExt(name) {
+  var m = /\.([A-Za-z0-9]+)$/.exec(String(name || ''));
+  return m ? m[1].toLowerCase() : '';
+}
 function dropFiles(e) {
   var paths = pathsFromDrop(e);
   if (paths.length) { addMany(paths); return; }
   var files = e.dataTransfer.files ? Array.prototype.slice.call(e.dataTransfer.files) : [];
   if (!files.length) return;
+  var skipped = 0;
+  files = files.filter(function (f) {
+    if (RL_DROP_EXT[rlDropExt(f.name)]) return true;
+    ++skipped; return false;
+  });
+  if (!files.length) {
+    toast(skipped ? tf('跳过 {0} 个非音频文件', [skipped]) : '没有可加入的文件');
+    return;
+  }
+  if (skipped) toast(tf('跳过 {0} 个非音频文件', [skipped]));
   // 某些情况下浏览器不给真实路径：把内容上传到本机服务，再由服务端入队
   var done = 0, added = [];
   files.forEach(function (f) {
@@ -11989,7 +14332,7 @@ function phTextWidth(q, txt) {
 function syncSearchPh() {
   var q = D('q');
   if (!q) return;
-  var FULL = '搜索专辑 / 艺术家 / 曲目…', SHORT = '搜索…';
+  var FULL = t('搜索专辑 / 艺术家 / 曲目…'), SHORT = t('搜索…');
   var cs = getComputedStyle(q);
   var avail = (q.clientWidth || 0) - (parseFloat(cs.paddingLeft) || 0) -
               (parseFloat(cs.paddingRight) || 0) - 2;   // -2：左右边框
@@ -12008,6 +14351,25 @@ initFavs();
 // #6（261026-08）：左栏「保存的队列」列表（我的最爱下面）启动就渲染，重启后能立刻看到
 renderSavedQueues();
 if (D('npFavBtn')) D('npFavBtn').onclick = function (ev) { if (S.lastCur) toggleFav(S.lastCur, ev); };
+if (D('npSetCover')) D('npSetCover').onclick = function () {
+  if (!S.lastCur) return;
+  S.coverEditFile = S.lastCur;
+  D('npCoverFile').value = '';
+  D('npCoverFile').click();
+};
+if (D('npCoverFile')) D('npCoverFile').onchange = function (event) {
+  var image = event.target.files && event.target.files[0];
+  var file = S.coverEditFile;
+  if (!image || !file) return;
+  saveTrackCover(file, image).then(function () { toast('歌曲封面已设置'); })
+    .catch(function (error) { toast(tf('设置失败：{0}', [error.message || String(error)])); });
+};
+if (D('npResetCover')) D('npResetCover').onclick = function () {
+  var file = S.lastCur;
+  if (!file) return;
+  resetTrackCover(file).then(function () { toast('已恢复自动封面'); })
+    .catch(function (error) { toast(tf('设置失败：{0}', [error.message || String(error)])); });
+};
 // 2.0 UI-1：单曲页「加入队列」与「推送到设备」移到底部控制排（与音量同一行，图标展示）
 function initNpBottomControls() {
   var oldAdd = document.querySelector('.npinfo #npAddQ');
@@ -12034,7 +14396,7 @@ if (D('npAddQ')) D('npAddQ').onclick = function () {
   api('/api/add', 'file=' + encodeURIComponent(S.lastCur)).then(function (j) {
     if (j && j.ok === false) { toast(j.error || '加入失败'); return; }
     var n = (j && j.count) || 0;
-    toast('已加入队列：' + nam(S.lastCur) + (n ? ('（共 ' + n + ' 首）') : ''));
+    toast(tf('已加入队列：{0}{1}', [nam(S.lastCur), (n ? ('（共 ' + n + ' 首）') : '')]));
     loadQ();
   }).catch(function () { toast('加入失败'); });
 };
@@ -12052,7 +14414,13 @@ loadSettings();
 //   但即使 loadSettings 还没回来，i18nBoot 也会先用 /api/i18n 的默认值把界面译好。
 i18nBoot();
 loadRates();
+// The saved preference arrives asynchronously. Start in the library and let
+// the first successful read choose the landing page only if navigation is untouched.
+syncQuickStartVisibility();
 loadAlbums('');
+setInterval(function () {
+  if(rlHomeActive()&&PLAYBACK_SETTINGS.ready&&!rlConsole.busy)rlConsole.refresh().catch(function(){});
+}, 2500);
 loadQ();
 loadSrcConfig();
 tick();
@@ -12060,6 +14428,11 @@ setInterval(tick, 400);
 setInterval(loadQ, 3000);
 setInterval(loadLibStats, 2000);
 )JSEOF";
+}
+
+inline const char* rta_ui_script() {
+    static const std::string script = std::string(rta_ui_waveform_js()) + "\n" + rta_ui_workbench_state_js() + "\n" + rta_ui_eq_console_js() + "\n" + rta_ui_studio_js() + "\n" + rta_ui_listening_home_js() + "\n" + rta_ui_listening_library_js() + "\n" + rta_ui_core_script();
+    return script.c_str();
 }
 
 } // namespace rta::net

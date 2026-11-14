@@ -35,6 +35,17 @@ inline std::string temp_dir_utf8() {
     return detail::narrow(tmp);
 }
 
+// 系统目录（= GetSystemDirectoryW，无尾分隔符）。
+// 迁移前 net/update.h 的 tar_exe() 里是 "wstring(sys, n)"，n >= MAX_PATH 时会越界读
+// （GetSystemDirectoryW 在缓冲区不够时返回**需要的长度**）—— 那里不可达，这里按
+// "n 非法就返回空串"处理，调用方回落到 PATH 上的 tar.exe。
+inline std::string system_dir_utf8() {
+    wchar_t sys[MAX_PATH] = {0};
+    const UINT n = ::GetSystemDirectoryW(sys, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return "";
+    return detail::narrow(std::wstring(sys, n));
+}
+
 // Windows 分发是"便携式"：配置与数据全部落在 exe 同目录（rlplayer-*.conf / rlplayer-meta /
 // remote-cache / webview2 / logs...）。Mac 组必须提供等价规则，见 PLATFORM.md §6。
 inline std::string config_dir_utf8() { return module_dir_utf8(); }

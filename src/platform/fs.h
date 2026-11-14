@@ -11,6 +11,7 @@
 #pragma once
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace rta::platform {
 
@@ -38,6 +39,45 @@ int last_error_code();
 inline bool atomic_replace(const std::filesystem::path& from, const std::filesystem::path& to) {
     return move_file(from, to, true);
 }
+
+// ---------------- 目录 / 属性 / 兜底搬移（261031：net/update.h、net/update_apply.h 的 IO 收口） ----------------
+// 这些操作的语义在各平台**不等价**（属性位、重解析点、跨卷 rename），所以必须由平台保证。
+
+// 目录是否存在（Windows = GetFileAttributesW 且带 FILE_ATTRIBUTE_DIRECTORY）
+bool is_directory(const std::filesystem::path& p);
+
+// 文件大小（字节）。取不到返回 -1（Windows = GetFileAttributesExW 失败）
+long long file_size(const std::filesystem::path& p);
+
+// 创建**一级**目录（父目录必须已存在）。已存在返回 false —— 与 CreateDirectoryW 一致，
+// 递归是调用方的事（它要处理"父目录不存在就逐级建"的策略与报错文案）。
+bool create_directory(const std::filesystem::path& p);
+
+// 删除**空**目录（Windows = RemoveDirectoryW）
+bool remove_directory(const std::filesystem::path& p);
+
+// 清掉只读等属性（Windows = SetFileAttributesW(p, FILE_ATTRIBUTE_NORMAL)）。
+// 返回值只是"这次调用成功了没有"，调用方历来忽略（失败时后续的删除/改名自己会报错）。
+bool set_normal_attributes(const std::filesystem::path& p);
+
+// 是否是重解析点（junction / symlink / mount point）。路径不存在返回 false。
+// 用途：更新落地前拒绝穿越链接（防止把文件写到安装目录之外）。
+bool is_reparse_point(const std::filesystem::path& p);
+
+// 目录项：只给"叶子名 + 是不是目录"，内核用不到其它属性
+struct DirEntry {
+    std::string name;      // UTF-8 叶子名
+    bool is_dir = false;
+};
+
+// 枚举目录（Windows = FindFirstFileW(dir + "\*")，"." ".." 已过滤）。
+// 返回 false = 打不开目录（不存在/无权限）。**不排序**：保持原生枚举顺序，
+// 因为调用方（增量安装清单）依赖"同一目录两次枚举顺序一致"。
+bool list_directory(const std::filesystem::path& dir, std::vector<DirEntry>& out);
+
+// 搬家（"必须搬过去"的语义）：同卷 MoveFileEx（覆盖已存在目标）优先；失败（跨卷等）
+// 退回"复制 + 删除源"。逐字等价于迁移前 net/update_apply.h 的 move_file()。
+bool move_or_copy_file(const std::filesystem::path& from, const std::filesystem::path& to);
 
 } // namespace rta::platform
 

@@ -922,6 +922,12 @@ private:
         // 绝不能在驱动回调里调：会重入驱动（实测 2 秒左右访问冲突）。
     }
 
+    // 2026-11-12：音量允许 +20 dB 后，实时增益 > 1。ASIO 整型分支以前直接 llround 后强转，
+    // 超满幅会溢出回绕（正峰变负峰，听感是爆裂）。这里统一先饱和再转，float 分支也夹到 ±1。
+    static double asio_saturate(double v, double lo, double hi) {
+        if (!std::isfinite(v)) return 0.0;
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
     static void write_channel(void* dst, const int32_t* src, size_t stride, size_t n,
                               ASIOSampleType t, int srcBits, double gain = 1.0) {
         // 归一化因子：管线 int32 = srcBits 位定标
@@ -935,7 +941,7 @@ private:
                 int32_t* d = (int32_t*)dst;
                 for (size_t i = 0; i < n; ++i) {
                     const double v = (double)src[i * stride] * inv;
-                    d[i] = (int32_t)llround((unity ? v : v * gain) * 2147483647.0);
+                    d[i] = (int32_t)llround(asio_saturate((unity ? v : v * gain) * 2147483647.0, -2147483647.0, 2147483647.0));
                 }
                 break;
             }
@@ -944,7 +950,7 @@ private:
                 for (size_t i = 0; i < n; ++i) {
                     const double v = (double)src[i * stride] * inv;
                     // 24-bit 满幅：DoP 的标记位在最低 8 位，round-trip 必须精确
-                    const int32_t q = (int32_t)llround((unity ? v : v * gain) * 8388607.0);
+                    const int32_t q = (int32_t)llround(asio_saturate((unity ? v : v * gain) * 8388607.0, -8388607.0, 8388607.0));
                     const uint32_t u = (uint32_t)q;
                     d[i * 3 + 0] = (unsigned char)(u & 0xFF);
                     d[i * 3 + 1] = (unsigned char)((u >> 8) & 0xFF);
@@ -956,7 +962,7 @@ private:
                 int16_t* d = (int16_t*)dst;
                 for (size_t i = 0; i < n; ++i) {
                     const double v = (double)src[i * stride] * inv;
-                    d[i] = (int16_t)llround((unity ? v : v * gain) * 32767.0);
+                    d[i] = (int16_t)llround(asio_saturate((unity ? v : v * gain) * 32767.0, -32767.0, 32767.0));
                 }
                 break;
             }
@@ -964,7 +970,7 @@ private:
                 float* d = (float*)dst;
                 for (size_t i = 0; i < n; ++i) {
                     const double v = (double)src[i * stride] * inv;
-                    d[i] = (float)(unity ? v : v * gain);
+                    d[i] = (float)asio_saturate(unity ? v : v * gain, -1.0, 1.0);
                 }
                 break;
             }
