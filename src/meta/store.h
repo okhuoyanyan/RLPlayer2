@@ -128,9 +128,21 @@ inline bool meta_write_atomic(const fsx::path& file, const std::string& bytes) {
         f.close();
         if (!flushed || f.fail()) { fsx::remove(tmp, ec); return false; } // Keep old file on write/flush/close failure
     }
-    fsx::rename(tmp, file, ec);                     // 同盘 rename，原子生效
-    if (ec) { fsx::remove(tmp, ec); return false; }
-    return true;
+    // 2026-11-16（门禁 audit_app 实测）：Windows 上 MoveFileEx 的"替换已有文件"会被
+    //   杀软/索引器/其它进程的**瞬时句柄**挡住，返回 ERROR_ACCESS_DENIED(5) /
+    //   ERROR_SHARING_VIOLATION(32)。audit_app 的 360 次并发替换里稳定出现 2~3 次这种
+    //   失败（JSON 本身从未损坏，invalid_final_rounds=0/30）。旧实现一次失败就放弃，
+    //   于是"原子写"在真实机器上偶发丢一次写入。
+    //   这里只对瞬时错误做**有界重试**（8 次 × 5 ms ≈ 40 ms），仍失败才返回 false ——
+    //   真正的权限/磁盘错误照样暴露，不会被吞掉。
+    for (int attempt = 0; ; ++attempt) {
+        fsx::rename(tmp, file, ec);                 // 同盘 rename，原子生效
+        if (!ec) return true;
+        if (attempt >= 8) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    { std::error_code rm; fsx::remove(tmp, rm); }
+    return false;
 }
 
 

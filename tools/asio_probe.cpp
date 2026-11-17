@@ -1,4 +1,4 @@
-﻿// asio_probe.cpp — ASIO 后端的分步验证探针（不发声）
+// asio_probe.cpp — ASIO 后端的分步验证探针（不发声）
 //
 // 为什么要分步：ASIO 是一套固定顺序的虚函数表，一旦顺序错，调用会直接崩。
 // 所以先只走前面几项（创建 / 取名 / 声道 / 缓冲 / 采样率），确认不崩、返回值合理，
@@ -6,13 +6,17 @@
 //
 // 用法：
 //   asio_probe                列出驱动与能力（只读，不创建缓冲）
+//   asio_probe --clsid X      只读探测该 CLSID，不枚举/初始化其他驱动
 //   asio_probe --dsd          同上，并追加【原生 DSD 取证】：DSD 采样率、通道类型码、
 //                             ASIOFuture(kAsioGetIoFormat / kAsioCanDoIoFormat) 的原始返回
 //   asio_probe --stream <n>   对第 n 个驱动做 createBuffers + start + 1 秒静音推送
-//   asio_probe --dsd-create <n|--clsid X> [--rate 2822400] [--ch 2] [--ms 1000]
+//   asio_probe --check <n|--clsid X>  只做 PCM open/start/stop 预检
+//   asio_probe --stream <n|--clsid X> [--rate 48000] [--ch 2] [--ms 1000]
+//   asio_probe --dsd-create <n|--clsid X> [--dsd-rate 2822400] [--ch 2] [--ms 1000]
 //                             真机：切 kASIODSDFormat → 设 DSD 位率 → createBuffers →
 //                             start → 推【平衡 DSD 静音码 0x69/0x96】→ stop/dispose → 恢复 PCM。
 //                             每一步都打印原始 ASE 码，绝不只是 OK/FAIL。
+//                             DSD 动作下 --rate 是 --dsd-rate 的别名；同时指定不同值会拒绝。
 //
 // ⚠️ 判据（铁律 3）：ASIO 的 "DSD 能力" 不是靠猜类型码，而是看三点同时成立：
 //   (1) ASIOFuture(kAsioSetIoFormat, kASIODSDFormat) 返回 ASE_SUCCESS(0x3f4847a0) 且 formatType 仍是 1；
@@ -20,6 +24,7 @@
 //   (3) canSampleRate(DSD 位率) = ASE_OK 且 ASIOCreateBuffers 返回 ASE_OK。
 //   只要有一条不成立，就不是原生 DSD（可能只是 DoP 伪装）。
 #include "audio/asio_out.h"
+#include "audio/asio_probe_options.h"
 #include <cstdio>
 #include <cstring>
 #include <cctype>
@@ -522,9 +527,17 @@ static int stream_test(const AsioDriverEntry& e, double rate, int ch, void* hwnd
         pushed += drv.push(zeros.data(), n);
         if (before / 16384 != pushed / 16384) printf("  pushed %zu\n", pushed);
     }
-    Sleep(300);
+    // 收尾也必须继续喂：旧实现推完就 Sleep(300)，环被抽空后的尾部欠载会被算进
+    // 「稳态欠载」——那是探针自己的空转，不是驱动/格式的问题（铁律 3）。
+    const size_t tailTotal = (size_t)(rate * 0.3);
+    size_t tailPushed = 0;
+    while (tailPushed < tailTotal) {
+        const size_t n = (size_t)drv.buffer_size();
+        if (drv.free_frames() < n) { Sleep(1); continue; }
+        tailPushed += drv.push(zeros.data(), n);
+    }
     drv.stop();
-    printf("推送 %zu 帧，欠载 %llu 次\n", pushed, drv.underruns());
+    printf("推送 %zu 帧（含收尾 300 ms），欠载 %llu 次\n", pushed + tailPushed, drv.underruns());
     drv.close();
     return 0;
 }
@@ -532,89 +545,70 @@ static int stream_test(const AsioDriverEntry& e, double rate, int ch, void* hwnd
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     setvbuf(stdout, nullptr, _IONBF, 0);   // 崩溃时也要看到崩溃前打印到哪一步
+    AsioProbeOptions options;
+    std::string parseError;
+    if (!parse_asio_probe_options(argc, argv, options, parseError)) {
+        std::fprintf(stderr, "参数错误: %s\n%s", parseError.c_str(), asio_probe_usage());
+        return 2;
+    }
+    if (options.help) { std::printf("%s", asio_probe_usage()); return 0; }
+    // Parse before COM/registry/device access. A selector never chooses an action.
     AddVectoredExceptionHandler(1, &probe_veh);
     const HRESULT ci = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    (void)ci;
+    if (FAILED(ci)) { printf("COM 初始化失败 0x%08lx\n", (unsigned long)ci); return 1; }
 
-    auto list = asio_enum_drivers();
-    printf("注册表里 ASIO 驱动 %zu 个：\n", list.size());
-    for (size_t i = 0; i < list.size(); ++i) printf("  [%zu] %s\n", i, list[i].name.c_str());
+    std::vector<AsioDriverEntry> list;
+    int selected = options.deviceIndex;
+    if (!options.clsid.empty()) {
+        // An explicit CLSID is sufficient to instantiate the requested driver;
+        // registry enumeration must never broaden a targeted read-only probe.
+        list.push_back({"CLSID 指定驱动", options.clsid});
+        selected = 0;
+    } else {
+        list = asio_enum_drivers();
+        printf("注册表里 ASIO 驱动 %zu 个：\n", list.size());
+        for (size_t i = 0; i < list.size(); ++i) printf("  [%zu] %s\n", i, list[i].name.c_str());
+    }
     if (list.empty()) { printf("（没有 ASIO 驱动）\n"); CoUninitialize(); return 1; }
-
-    int streamIdx = -1, dsdIdx = -1;
-    double rate = 48000, dsdRate = 2822400.0;
-    int ch = 2;
-    bool useHwnd = false, nopCb = false, checkOnly = false, withDsd = false;
-    bool rateFirst = false, outReady = false, allCh = false, spin = false;
-    bool probeBuf = false;
-    long bufBytes = 0, fillBytes = 0;
-    std::string wantClsid;
-    int ms = 1000;
-    for (int i = 1; i < argc; ++i) {
-        // 只有后面确实跟着数字才当序号吃掉，否则会误吞 --clsid 这类开关（本轮踩到）
-        if (!std::strcmp(argv[i], "--stream") && i + 1 < argc && (isdigit((unsigned char)argv[i + 1][0]) || argv[i + 1][0] == '-'))
-            streamIdx = atoi(argv[++i]);
-        else if (!std::strcmp(argv[i], "--dsd-create") && i + 1 < argc && isdigit((unsigned char)argv[i + 1][0]))
-            dsdIdx = atoi(argv[++i]);
-        else if (!std::strcmp(argv[i], "--dsd")) withDsd = true;
-        else if (!std::strcmp(argv[i], "--rate") && i + 1 < argc) rate = atof(argv[++i]);
-        else if (!std::strcmp(argv[i], "--dsd-rate") && i + 1 < argc) dsdRate = atof(argv[++i]);
-        else if (!std::strcmp(argv[i], "--ch") && i + 1 < argc) ch = atoi(argv[++i]);
-        else if (!std::strcmp(argv[i], "--check")) checkOnly = true;
-        else if (!std::strcmp(argv[i], "--clsid") && i + 1 < argc) wantClsid = argv[++i];
-        else if (!std::strcmp(argv[i], "--ms") && i + 1 < argc) ms = atoi(argv[++i]);
-        else if (!std::strcmp(argv[i], "--buf") && i + 1 < argc) bufBytes = atol(argv[++i]);
-        else if (!std::strcmp(argv[i], "--rate-first")) rateFirst = true;
-        else if (!std::strcmp(argv[i], "--outready"))  outReady = true;
-        else if (!std::strcmp(argv[i], "--allch"))     allCh = true;
-        else if (!std::strcmp(argv[i], "--spin"))      spin = true;
-        else if (!std::strcmp(argv[i], "--probe-buf"))  probeBuf = true;
-        else if (!std::strcmp(argv[i], "--bytes") && i + 1 < argc) fillBytes = atol(argv[++i]);
-        else if (!std::strcmp(argv[i], "--hwnd")) useHwnd = true;
-        else if (!std::strcmp(argv[i], "--nop"))  nopCb = true;
+    if (options.action != AsioProbeAction::Inspect && (selected < 0 || selected >= (int)list.size())) {
+        printf("设备序号超出范围: %d（共 %zu 个驱动）；没有执行任何探测\n", selected, list.size());
+        CoUninitialize();
+        return 4;
     }
-    if (!wantClsid.empty()) {
-        streamIdx = -1; dsdIdx = -1;
-        for (size_t i = 0; i < list.size(); ++i) if (list[i].clsid == wantClsid) { streamIdx = (int)i; }
-        if (streamIdx < 0) { printf("找不到 CLSID %s\n", wantClsid.c_str()); return 4; }
-        dsdIdx = streamIdx;
-    }
-    if (ms < 50) ms = 50;
-    if (ms > 5000) ms = 5000;      // 探针只做短时取证；长时验证交给 rtaplay
-    void* hw = useHwnd ? (void*)make_hidden_window(GetModuleHandleW(nullptr)) : nullptr;
-    if (useHwnd) printf("sysHandle=%p\n", hw);
+    void* hw = options.useHwnd ? (void*)make_hidden_window(GetModuleHandleW(nullptr)) : nullptr;
+    if (options.useHwnd) printf("sysHandle=%p\n", hw);
 
-    if (dsdIdx >= 0 && dsdIdx < (int)list.size()) {
+    if (options.action == AsioProbeAction::DsdCreate) {
         DsdTestOpts o;
-        o.dsdRate = dsdRate;
-        o.ch = ch;
-        o.ms = ms;
-        o.bufBytes = bufBytes;
-        o.rateFirst = rateFirst;
-        o.outReady = outReady;
-        o.nopCb = nopCb;
-        o.allCh = allCh;
-        o.spin = spin;
-        o.probeBuf = probeBuf;
-        o.fillBytes = fillBytes;
+        o.dsdRate = options.dsdRate;
+        o.ch = options.channels;
+        o.ms = options.milliseconds;
+        o.bufBytes = options.bufferUnits;
+        o.rateFirst = options.rateFirst;
+        o.outReady = options.outReady;
+        o.nopCb = options.nopCallback;
+        o.allCh = options.allChannels;
+        o.spin = options.spin;
+        o.fillBytes = options.fillBytes;
         o.hwnd = hw;
-        const int rc = dsd_create_test(list[(size_t)dsdIdx], o);
+        const int rc = dsd_create_test(list[(size_t)selected], o);
         CoUninitialize();
         return rc;
     }
-    if (checkOnly && streamIdx >= 0 && streamIdx < (int)list.size()) {
-        const int rc = check_test(list[(size_t)streamIdx], rate, ch);
+    if (options.action == AsioProbeAction::PcmCheck) {
+        const int rc = check_test(list[(size_t)selected], options.rate, options.channels);
         CoUninitialize();
         return rc;
     }
-    if (streamIdx >= 0 && streamIdx < (int)list.size()) {
-        printf("sysHandle=%p nopCallback=%d\n", hw, (int)nopCb);
-        const int rc = stream_test(list[(size_t)streamIdx], rate, ch, hw, nopCb, ms);
+    if (options.action == AsioProbeAction::PcmStream) {
+        printf("sysHandle=%p nopCallback=%d\n", hw, (int)options.nopCallback);
+        const int rc = stream_test(list[(size_t)selected], options.rate, options.channels, hw, options.nopCallback, options.milliseconds);
         CoUninitialize();
         return rc;
     }
-    for (size_t i = 0; i < list.size(); ++i) probe_one(list[i], (int)i, withDsd);
+    bool ok = true;
+    for (size_t i = 0; i < list.size(); ++i) ok = probe_one(list[i], (int)i, options.withDsd) && ok;
     printf("\n（只做了只读探测，没有创建缓冲、没有开流、没有声音）\n");
     CoUninitialize();
-    return 0;
+    return ok ? 0 : 1;
 }

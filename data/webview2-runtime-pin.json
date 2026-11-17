@@ -1,0 +1,3767 @@
+{
+  "schema": 1,
+  "runtimeVersion": "157.0.4341.46",
+  "baselineRelease": "3.3.18",
+  "files": [
+    {
+      "path": "157.0.4341.46.manifest",
+      "bytes": 226,
+      "sha256": "2901c16dadc4c293c5385bee334d68f1e70c4039dbc83f16b88a43b60cf91c8c"
+    },
+    {
+      "path": "AdSelectionAttestationsPreloaded/ad-selection-attestations.dat",
+      "bytes": 63,
+      "sha256": "dc94c97fb9437a5137a1d47b376e212732a15cb1266148792b94da6fa9939d17"
+    },
+    {
+      "path": "AdSelectionAttestationsPreloaded/manifest.json",
+      "bytes": 128,
+      "sha256": "e92ad2a1a517ec4c6db1538513b0a529966249182b3a571fab3941ea3eff5ff0"
+    },
+    {
+      "path": "BHO/ie_to_edge_bho.dll",
+      "bytes": 474440,
+      "sha256": "d6b3035ceaf5b4a89949a3a80b574acc00c71ef35ed6fab4398434696f0e0e85"
+    },
+    {
+      "path": "BHO/ie_to_edge_bho_64.dll",
+      "bytes": 595272,
+      "sha256": "78eea3417d278f362f1558d85cf4a421a6f01ea0fd6fb092f9a78e110c457813"
+    },
+    {
+      "path": "BHO/ie_to_edge_stub.exe",
+      "bytes": 535368,
+      "sha256": "3356916367e74e1fcc960eb92ba7d23ad483b675f07e812ec83bc18c52197bd6"
+    },
+    {
+      "path": "concrt140.dll",
+      "bytes": 384264,
+      "sha256": "03340120b0ba55806b545a43f657d7c76d0167b309b811c08751d28669e83f3a"
+    },
+    {
+      "path": "cookie_exporter.exe",
+      "bytes": 122184,
+      "sha256": "452d44faab286bf46e64c3f0398a5fcc3e12da644d8caacadb661cfe10e8f4e2"
+    },
+    {
+      "path": "Copilot.dat",
+      "bytes": 8192,
+      "sha256": "d79e27858722fcb4c2db9a7fa6bb4fb958eb90c2ab12fd35370be8c05dee7878"
+    },
+    {
+      "path": "copilot_overlay_images_100_percent.pak",
+      "bytes": 8684,
+      "sha256": "3e11d07e0829c1d8547915f351370e775d3c18958df60a8b7b2ddf817df27d08"
+    },
+    {
+      "path": "copilot_overlay_images_200_percent.pak",
+      "bytes": 23614,
+      "sha256": "09f33744da33ec4290d78c830b76e6ff09e1611016dea2090f871b75f5fa8364"
+    },
+    {
+      "path": "copilot_overlay_unscaled_images.pak",
+      "bytes": 38789,
+      "sha256": "7a8bf84c03de5113410d6f3b5a98ef9fd2a12407df72446e2f16fd916f3747af"
+    },
+    {
+      "path": "d3dcompiler_47.dll",
+      "bytes": 4763944,
+      "sha256": "0b39280607601d6a639bc7f9c98fcfa888cc4c9bb73f1212fec9c2e49e2738d0"
+    },
+    {
+      "path": "dual_engine_adapter_x64.dll",
+      "bytes": 5688008,
+      "sha256": "886699c2b4254809b36d453f0bc1f2bb5718bd60d9e1394e28232c07c1556db5"
+    },
+    {
+      "path": "dxcompiler.dll",
+      "bytes": 20537672,
+      "sha256": "56484f46ff24c2106a0da7589f0a48b527a11e480fcde7c1ca89a56368f4f772"
+    },
+    {
+      "path": "EBWebView/x64/EmbeddedBrowserWebView.dll",
+      "bytes": 9103688,
+      "sha256": "9b5fd599c0570d3d281412d70e11c24584eba2befec394bbee716e4edb741859"
+    },
+    {
+      "path": "EBWebView/x86/EmbeddedBrowserWebView.dll",
+      "bytes": 5835080,
+      "sha256": "adb9fa8bd45aabb5b0f2efc8f49727ac07ea5547358e93f6797245f01aede5e8"
+    },
+    {
+      "path": "Edge.dat",
+      "bytes": 12288,
+      "sha256": "aad5a84356ee96f3d6ca9742b23b6124eafba558f6d60ceed6c3067dac459c81"
+    },
+    {
+      "path": "edge_feedback/camera_mf_trace.wprp",
+      "bytes": 24910,
+      "sha256": "3f2eb6455f54365c27829f85dd64ca0bafaa8577a6c8e79a54a6dd4c67df6470"
+    },
+    {
+      "path": "edge_feedback/mf_trace.wprp",
+      "bytes": 12735,
+      "sha256": "79a228f8f85310c27c292055d9e0e9b827c319c2472b4ba5b40e88851bc4b4f3"
+    },
+    {
+      "path": "edge_game_assist/EdgeGameAssist.msix",
+      "bytes": 1019266,
+      "sha256": "09cc15820436b7192bad340b9a202f0e30c295dcf8b642cd691b3eb790aceda6"
+    },
+    {
+      "path": "edge_game_assist/VERSION",
+      "bytes": 10,
+      "sha256": "01ead2a790d96684b49de8a573713763e33ae2798f07b479f4fde1e26b303d7a"
+    },
+    {
+      "path": "EdgeWebView.dat",
+      "bytes": 8192,
+      "sha256": "482297326005fcb6e961e9b3e327e4cbb151901e7ca55cbe2bf982823bc06934"
+    },
+    {
+      "path": "elevation_service.exe",
+      "bytes": 4035400,
+      "sha256": "f81733d5f31b9dcc66cf8072ed7ab7192556b7fd04e4e93824dadacf17942a12"
+    },
+    {
+      "path": "eventlog_provider.dll",
+      "bytes": 16200,
+      "sha256": "30a58fb29d258db90a691ad8e1cfae9438d340b7ee9d565b581a6c7d88a4311d"
+    },
+    {
+      "path": "Extensions/external_extensions.json",
+      "bytes": 99,
+      "sha256": "a68cafd7d78d5c671c2560656653f2a4d83ab66d87a8728356a88fb1f477b3e6"
+    },
+    {
+      "path": "ffmpeg.dll",
+      "bytes": 3112776,
+      "sha256": "c8b778295250a2343db8fe7c967de580190dca885d98467a4d950f116d6ae031"
+    },
+    {
+      "path": "icudtl.dat",
+      "bytes": 12409424,
+      "sha256": "8fa69fc9ebcce09fa8ffac89afcf8088e8f70a177fa90d80a90668f5389f2579"
+    },
+    {
+      "path": "identity_helper.exe",
+      "bytes": 2611528,
+      "sha256": "ccff4bd1804fc6ab81c88d5261fd5ed7b78c92e9e3531cb1b7699654c5dbc164"
+    },
+    {
+      "path": "identity_proxy/beta.identity_helper.exe.manifest",
+      "bytes": 1447,
+      "sha256": "8b6f3769fc0367421e2748c9775bbf16645b502621a8aeef4974c58bfa067864"
+    },
+    {
+      "path": "identity_proxy/canary.identity_helper.exe.manifest",
+      "bytes": 1449,
+      "sha256": "752501569cc4654ab70553d4b5df8bb24f7d234392085ce4e5cb3b53015278f7"
+    },
+    {
+      "path": "identity_proxy/dev.copilot.identity_helper.exe.manifest",
+      "bytes": 1440,
+      "sha256": "f17b7ba4dc3f9707f08fb2565ba45028e834b2f27899ea8f225d5ebc4ec5da52"
+    },
+    {
+      "path": "identity_proxy/dev.identity_helper.exe.manifest",
+      "bytes": 1446,
+      "sha256": "cb0972f33728eca989501b59578a0e28a4f5608e2d04862ca184a408425b61b9"
+    },
+    {
+      "path": "identity_proxy/dev.officehub.identity_helper.exe.manifest",
+      "bytes": 1462,
+      "sha256": "b0ccd055fcc33942d9bc195bc6b59998ebc0db2ada831974c2fb9c4820acc34e"
+    },
+    {
+      "path": "identity_proxy/internal.copilot.identity_helper.exe.manifest",
+      "bytes": 1445,
+      "sha256": "3f9f1e327986139edc43c44db3bb197fd51865d8ad89abd63256c0997c7c6110"
+    },
+    {
+      "path": "identity_proxy/internal.identity_helper.exe.manifest",
+      "bytes": 1451,
+      "sha256": "4c803818803f8271add36596b7b55d68dfc5a277d7f9757c7d49e571feff66cf"
+    },
+    {
+      "path": "identity_proxy/internal.officehub.identity_helper.exe.manifest",
+      "bytes": 1467,
+      "sha256": "95e525a3f0707e7a0bf73467ccc7c1b2c6a7f3a11b44994f4fdf85a4811004ff"
+    },
+    {
+      "path": "identity_proxy/resources.pri",
+      "bytes": 3744,
+      "sha256": "e689383d49a50dd886a43b6921e586f0c15007f8296213d3c0fcf00b220483e8"
+    },
+    {
+      "path": "identity_proxy/stable.copilot.identity_helper.exe.manifest",
+      "bytes": 1436,
+      "sha256": "18fd5f38e38ae47d6749b8a47aead0c000c3af506a57113e5916c6a3bddb43c2"
+    },
+    {
+      "path": "identity_proxy/stable.identity_helper.exe.manifest",
+      "bytes": 1449,
+      "sha256": "4a048d22363e0ec10fad2bab34adcd0edceba732d29f993ff897ed28a5653dda"
+    },
+    {
+      "path": "identity_proxy/stable.officehub.identity_helper.exe.manifest",
+      "bytes": 1458,
+      "sha256": "4732b7f026290fe6eb4582de0eebd5c973c2df1e51d38a319531b1e2ce7075ae"
+    },
+    {
+      "path": "identity_proxy/win10/copilot.identity_helper.Sparse.Dev.msixbundle",
+      "bytes": 19689,
+      "sha256": "2769e068d167bd51206c98c5c15f5602404700e125ccb949fc20d24797e9150e"
+    },
+    {
+      "path": "identity_proxy/win10/copilot.identity_helper.Sparse.Dev.p7x",
+      "bytes": 10186,
+      "sha256": "a39830691e33160220eb9988325985105c605eecc72841f8ea4bbce4645afd5b"
+    },
+    {
+      "path": "identity_proxy/win10/copilot.identity_helper.Sparse.Internal.msixbundle",
+      "bytes": 19689,
+      "sha256": "24695651028919d96b0ca7b4ef95a8052d091ba5329456f2b97e56ab9aaeed0d"
+    },
+    {
+      "path": "identity_proxy/win10/copilot.identity_helper.Sparse.Internal.p7x",
+      "bytes": 10189,
+      "sha256": "8e428523971dbfda33206a31a477140e0ccb2b9f58187abae0beee6c4388fdf9"
+    },
+    {
+      "path": "identity_proxy/win10/copilot.identity_helper.Sparse.Stable.msixbundle",
+      "bytes": 19616,
+      "sha256": "2a964b2e26a930330f2a5b284370b23962471eae9627f36a7c51bf0dee405c70"
+    },
+    {
+      "path": "identity_proxy/win10/copilot.identity_helper.Sparse.Stable.p7x",
+      "bytes": 10186,
+      "sha256": "fb76eda62266d500be5aed8af3e172404dc6e4df604827ea0820f63f8a820b1f"
+    },
+    {
+      "path": "identity_proxy/win10/identity_helper.Sparse.Beta.msix",
+      "bytes": 51366,
+      "sha256": "e42903cf157ac5440c95d79ae1c04b9325b843390fed30222b5264a622473a59"
+    },
+    {
+      "path": "identity_proxy/win10/identity_helper.Sparse.Beta.p7x",
+      "bytes": 10454,
+      "sha256": "452cb2b14d4b80b750a76aee274fc9dfd93ce6870eda58984ed1caeb6dd12636"
+    },
+    {
+      "path": "identity_proxy/win10/identity_helper.Sparse.Canary.msix",
+      "bytes": 51154,
+      "sha256": "b089169255d3fa3aebf1795bfcd4e205ea3235a21f738ce5263e3d20281d27ea"
+    },
+    {
+      "path": "identity_proxy/win10/identity_helper.Sparse.Canary.p7x",
+      "bytes": 10454,
+      "sha256": "60d91fe5069a325b1fd7242cb3718a8f01a92781cb4ccc6cd7808d35ce2bf3dc"
+    },
+    {
+      "path": "identity_proxy/win10/identity_helper.Sparse.Dev.msix",
+      "bytes": 50817,
+      "sha256": "30477455e9147afa88a5e66a5dbb68cd3f8a834f48482dad76b06c0c7cd2c975"
+    },
+    {
+      "path": "identity_proxy/win10/identity_helper.Sparse.Dev.p7x",
+      "bytes": 10454,
+      "sha256": "9c28197770be4f9dfe47a6261a63cbd62f0e4fc79ceff12f4398be614d35bde8"
+    },
+    {
+      "path": "identity_proxy/win10/identity_helper.Sparse.Internal.msix",
+      "bytes": 53929,
+      "sha256": "721a6063ada75d2966c5848f9f906c1f1149a54bd9775caecc264f82230dcff2"
+    },
+    {
+      "path": "identity_proxy/win10/identity_helper.Sparse.Internal.p7x",
+      "bytes": 10457,
+      "sha256": "ca33035aed1a4de998514596ae820b6d9e1f5445071a419e871b3c9eed4a37b0"
+    },
+    {
+      "path": "identity_proxy/win10/identity_helper.Sparse.Stable.msix",
+      "bytes": 53919,
+      "sha256": "2e1169322526c23129ef48f06eb3a5f32fdeacbcefc820f1c5e8d7fa13a74e4d"
+    },
+    {
+      "path": "identity_proxy/win10/identity_helper.Sparse.Stable.p7x",
+      "bytes": 10454,
+      "sha256": "65f92fcc026cf0e25dde75145efcc8c268a68aec4bd248f354d11369d780f3bf"
+    },
+    {
+      "path": "identity_proxy/win10/officehub.identity_helper.Sparse.Dev.msixbundle",
+      "bytes": 54613,
+      "sha256": "6d0406478bb00ef907cc7c402bf9ab5d51ab8d6d50d36a1d8fb625e64a5bc65b"
+    },
+    {
+      "path": "identity_proxy/win10/officehub.identity_helper.Sparse.Dev.p7x",
+      "bytes": 10454,
+      "sha256": "cd08d9da3ccc82df9e770809d5363a615b658610e96ea275b226b155a95b539c"
+    },
+    {
+      "path": "identity_proxy/win10/officehub.identity_helper.Sparse.Internal.msixbundle",
+      "bytes": 54636,
+      "sha256": "f3ab0288b087063952fea67f0c4de15e6b49bc7573081534a0317911edfb2d72"
+    },
+    {
+      "path": "identity_proxy/win10/officehub.identity_helper.Sparse.Internal.p7x",
+      "bytes": 10454,
+      "sha256": "83381693b2b7b064164d28a0aa693013c77ffe0a4b788ed96f336daa5b0e0710"
+    },
+    {
+      "path": "identity_proxy/win10/officehub.identity_helper.Sparse.Stable.msixbundle",
+      "bytes": 54653,
+      "sha256": "63c81fe668f0807a5b87db18f82db553bca559b58233f2e04cf6a8796203578b"
+    },
+    {
+      "path": "identity_proxy/win10/officehub.identity_helper.Sparse.Stable.p7x",
+      "bytes": 10454,
+      "sha256": "c4429d01b79995cc94d0f7d448816b44d36b429aeeaf87e7b90a388be9375e8c"
+    },
+    {
+      "path": "identity_proxy/win11/copilot.identity_helper.Sparse.Dev.msixbundle",
+      "bytes": 21048,
+      "sha256": "30af079fc5ea57f739557ef4ec10c35ede3f942288fe8377a14f00a5d9f972f7"
+    },
+    {
+      "path": "identity_proxy/win11/copilot.identity_helper.Sparse.Dev.p7x",
+      "bytes": 10185,
+      "sha256": "3b92d3969d34bebd4d4ad6dff62c5988699ce31cecfa7425b864f12bee168993"
+    },
+    {
+      "path": "identity_proxy/win11/copilot.identity_helper.Sparse.Internal.msixbundle",
+      "bytes": 21052,
+      "sha256": "2057de922879773177bb42046674b04065bb9dc0a9ed45371e8fd4ef4ea7a672"
+    },
+    {
+      "path": "identity_proxy/win11/copilot.identity_helper.Sparse.Internal.p7x",
+      "bytes": 10186,
+      "sha256": "2eb4195bcb06b79433ea9bbf11d30735b2f5a29ccb36a75fc20faf6457c77e59"
+    },
+    {
+      "path": "identity_proxy/win11/copilot.identity_helper.Sparse.Stable.msixbundle",
+      "bytes": 20982,
+      "sha256": "71b3582716a3b0b6c0b09baa295a4b4be6d321f2da656372a1be17faa84a32d2"
+    },
+    {
+      "path": "identity_proxy/win11/copilot.identity_helper.Sparse.Stable.p7x",
+      "bytes": 10186,
+      "sha256": "2dc30b6102c103ded3a3bdc4bf10adf5167002591cc124afb49db123d56d886f"
+    },
+    {
+      "path": "identity_proxy/win11/identity_helper.Sparse.Beta.msix",
+      "bytes": 51366,
+      "sha256": "453cd1f90e8e364db273fad83ae1edc1441b26dcbb8579ea53c576f869ff5d86"
+    },
+    {
+      "path": "identity_proxy/win11/identity_helper.Sparse.Beta.p7x",
+      "bytes": 10454,
+      "sha256": "53b68800dd8658ce992feaafcae14313e732f628ae249dc4b3eb9a4b1ec0d0b2"
+    },
+    {
+      "path": "identity_proxy/win11/identity_helper.Sparse.Canary.msix",
+      "bytes": 51155,
+      "sha256": "c29d2cad9d9e88d3948fb22db33c9e5f51400fbc5948bd06b8a03c31e7a65e0e"
+    },
+    {
+      "path": "identity_proxy/win11/identity_helper.Sparse.Canary.p7x",
+      "bytes": 10454,
+      "sha256": "6e1f6dbbc263a380a645c3f9f05dd33377b9f4b1f038823fc5676709c0df1605"
+    },
+    {
+      "path": "identity_proxy/win11/identity_helper.Sparse.Dev.msix",
+      "bytes": 50819,
+      "sha256": "3e4a837b369561a6d4d63a09297d89b1ff7acd76fb0b298228a8640608908a42"
+    },
+    {
+      "path": "identity_proxy/win11/identity_helper.Sparse.Dev.p7x",
+      "bytes": 10454,
+      "sha256": "8d22a3266375128e5f79a08667dc0e237862ccfd9313620ca0b601205fbd6342"
+    },
+    {
+      "path": "identity_proxy/win11/identity_helper.Sparse.Internal.msix",
+      "bytes": 53927,
+      "sha256": "25b3a927bd8a640d1399bc0c408f8aa399ad4a5fd951fddc0f978236bbd4a8fe"
+    },
+    {
+      "path": "identity_proxy/win11/identity_helper.Sparse.Internal.p7x",
+      "bytes": 10457,
+      "sha256": "90bcb40b2b707f6ea1b880b6a188fd4183a1f0a0fccd04f01d1d1bb7784b3012"
+    },
+    {
+      "path": "identity_proxy/win11/identity_helper.Sparse.Stable.msix",
+      "bytes": 53909,
+      "sha256": "d9855607c1335aeedaa807b29692bd98ebcd133f75523ec63bc6a33eddfdaf62"
+    },
+    {
+      "path": "identity_proxy/win11/identity_helper.Sparse.Stable.p7x",
+      "bytes": 10453,
+      "sha256": "deadd7d09a241601021a9734bbd9f5285e17129c59f1f46a069cd484a555004c"
+    },
+    {
+      "path": "identity_proxy/win11/officehub.identity_helper.Sparse.Dev.msixbundle",
+      "bytes": 57313,
+      "sha256": "d29d245a171f33785372bfe774bedc0fc0a1f50de490788ab7d783b56551fc2b"
+    },
+    {
+      "path": "identity_proxy/win11/officehub.identity_helper.Sparse.Dev.p7x",
+      "bytes": 10454,
+      "sha256": "efa32eba3b1abcfcfa4a6d4a23b12dd3bdec3406fbe7b5cbac7d1fa226bf126d"
+    },
+    {
+      "path": "identity_proxy/win11/officehub.identity_helper.Sparse.Internal.msixbundle",
+      "bytes": 57342,
+      "sha256": "43d126ece76b4497575fc04d3a4016eddb91789a03cfe8c8ee779564fd481a3d"
+    },
+    {
+      "path": "identity_proxy/win11/officehub.identity_helper.Sparse.Internal.p7x",
+      "bytes": 10454,
+      "sha256": "9e9572bbee4b9998becd35e52be1647a5d9e546594b944f6aca6f84384c09a21"
+    },
+    {
+      "path": "identity_proxy/win11/officehub.identity_helper.Sparse.Stable.msixbundle",
+      "bytes": 57330,
+      "sha256": "0f5e4c5c45fc44a3120d1259b52a8388cd8102b060fe57c810d97a5272f52a8d"
+    },
+    {
+      "path": "identity_proxy/win11/officehub.identity_helper.Sparse.Stable.p7x",
+      "bytes": 10454,
+      "sha256": "659cd821ef73b45a342fd7fe2cde11c827206d663da58cfb781b8cfcd62cfd82"
+    },
+    {
+      "path": "Installer/msedge_7z.data",
+      "bytes": 6357,
+      "sha256": "73af4334e3b59436e9317494f4a8d8ea7c0bb6022c014ba474d0b862caa18007"
+    },
+    {
+      "path": "Installer/setup.exe",
+      "bytes": 6386504,
+      "sha256": "6fe92b5ca87cdfc4d23069552b5be6adc23ef7f2c3a710d1957f550f143bb159"
+    },
+    {
+      "path": "learning_tools.dll",
+      "bytes": 1311048,
+      "sha256": "a0ad381d2a535f1bb4d41f1e882f94d639ce7555144c071a1e246bd1111e78a0"
+    },
+    {
+      "path": "Locales/en-US.pak",
+      "bytes": 997676,
+      "sha256": "537adb2ce168d8fbf509a3311a557f9649eab1e3dc2cf1247b38010787db94a1"
+    },
+    {
+      "path": "Locales/zh-CN.pak",
+      "bytes": 956158,
+      "sha256": "40cfd53eee907d15357dc2084fe8a76f02143937ef9271bfae7f958aa11d9f98"
+    },
+    {
+      "path": "MEIPreload/manifest.json",
+      "bytes": 238,
+      "sha256": "44844cf3dde6e80087ae0e6bf0d9326d7ef7d23326d24ac83af0850be26923d2"
+    },
+    {
+      "path": "MEIPreload/preloaded_data.pb",
+      "bytes": 8254,
+      "sha256": "c6070a157b4e28d16fbccbd233e93846ddb070c85e1a1bc64469b7a5f1424fad"
+    },
+    {
+      "path": "microsoft_shell_integration.dll",
+      "bytes": 463688,
+      "sha256": "a8dd8ea654f79b7d2063297f7e9639e201e20e1337ab6cf82724b7c6882b3cc2"
+    },
+    {
+      "path": "mip_core_gn.dll",
+      "bytes": 8604488,
+      "sha256": "b107d7f58549c89be043144957f4a055d33589ec1a0cbd2c8b75c56e9ac365e7"
+    },
+    {
+      "path": "msedge.dll",
+      "bytes": 358096712,
+      "sha256": "cb4951a5e61986871b698cdb5e74f7dbf27577dd5eaffe157ef8a57dd499672d"
+    },
+    {
+      "path": "msedge.dll.sig",
+      "bytes": 1389,
+      "sha256": "8cf184a64900ef663ba8e577c14d61181e39eb0753a69fe6046557d027064764"
+    },
+    {
+      "path": "msedge.exe.sig",
+      "bytes": 1389,
+      "sha256": "86f949fb9f45340ad74956aebb0b8345cc939465c1533d652e0e9f49071c07b5"
+    },
+    {
+      "path": "msedge_100_percent.pak",
+      "bytes": 1175012,
+      "sha256": "08f8fa0e922dd9216e75540b311468b0f08db0a58b28c724c34852a86de8664f"
+    },
+    {
+      "path": "msedge_200_percent.pak",
+      "bytes": 1865129,
+      "sha256": "c306af1e77de8fc484f57370dd0b5f4ddcddd4166a97be0929a4d09556aabd36"
+    },
+    {
+      "path": "msedge_elf.dll",
+      "bytes": 4070216,
+      "sha256": "cc37e4fe26b8c4606c91d61f6cd1ccd16c4ae6beddfede56e84ecc576f6c1d4b"
+    },
+    {
+      "path": "msedge_proxy.exe",
+      "bytes": 2833224,
+      "sha256": "244dd3844ee69e06433879fbc460b6e5a89ebfb3c2036e6924b465c3584fe09f"
+    },
+    {
+      "path": "msedge_wer.dll",
+      "bytes": 125768,
+      "sha256": "f638926da84f48ce2edd4bf1243b53c55ef231bbb0a4fdf47af2586c2f7340b1"
+    },
+    {
+      "path": "msedgewebview2.exe",
+      "bytes": 4532040,
+      "sha256": "7d46f9e074d3630f52cca1ee8de6840d8edf18700901348540c2690b79d7fd9d"
+    },
+    {
+      "path": "msedgewebview2.exe.sig",
+      "bytes": 1389,
+      "sha256": "38be9cec2e4f8c9d5ca70fc7da6c27fc1231804040b4e1cc064e5f571818c1fd"
+    },
+    {
+      "path": "mspdf.dll",
+      "bytes": 18895680,
+      "sha256": "d3b54cb9185cce52b9818a305315175bc9797868d65d34f6f080c23be230a5c7"
+    },
+    {
+      "path": "msvcp140.dll",
+      "bytes": 653576,
+      "sha256": "9f42bf65ffa0bc393a3131ace1f894de745ae99e399e9281d8e763bd7b9013c3"
+    },
+    {
+      "path": "msvcp140_codecvt_ids.dll",
+      "bytes": 41224,
+      "sha256": "233a368341188b33ef2267aba6b2c5be70d98e67de2eaba52c870d34cfbdddeb"
+    },
+    {
+      "path": "notification_helper.exe",
+      "bytes": 2903368,
+      "sha256": "d3132b5598819f62cb81e5de472b7c913a5ba7bec993a39a83ed499658447868"
+    },
+    {
+      "path": "oneauth.dll",
+      "bytes": 6673224,
+      "sha256": "80965bdfce05e28b88159506f1bbd75bdc95de137794230f83c338f92d94f994"
+    },
+    {
+      "path": "oneds.dll",
+      "bytes": 3551560,
+      "sha256": "28be2477db91aad85b92e193a941bd9f77b278557bbc548b7cb8514965ff9467"
+    },
+    {
+      "path": "onnxruntime.dll",
+      "bytes": 11260744,
+      "sha256": "43ebe3867e92274f03edce90dddbdcabc624c5943f12535bf0d09a352248c090"
+    },
+    {
+      "path": "onramp.dll",
+      "bytes": 474440,
+      "sha256": "eb4ca2696b82b0b109dbba9fef284eb7732943cb8e97ba6f3d94f9a1f331c002"
+    },
+    {
+      "path": "PdfPreview/PdfPreviewHandler.dll",
+      "bytes": 261448,
+      "sha256": "f933e21565422150a1ff1e0321c8201c7b11b5ed8aaec860f889cf582c924d0a"
+    },
+    {
+      "path": "platform_experiences_helper.exe",
+      "bytes": 3222344,
+      "sha256": "e32a1b083cebe5360e3a3ede14306be1a3135020ec1d1a5996162cd60718412a"
+    },
+    {
+      "path": "prefs_enclave_x64.dll",
+      "bytes": 116456,
+      "sha256": "63d54cd851d643eef8f0884a0815bb0015d4dba9bbebd115723c47e68f82909a"
+    },
+    {
+      "path": "ResiliencyLinks/AdSelectionAttestationsPreloaded/ad-selection-attestations.dat.DATA",
+      "bytes": 63,
+      "sha256": "dc94c97fb9437a5137a1d47b376e212732a15cb1266148792b94da6fa9939d17"
+    },
+    {
+      "path": "ResiliencyLinks/AdSelectionAttestationsPreloaded/manifest.json.DATA",
+      "bytes": 128,
+      "sha256": "e92ad2a1a517ec4c6db1538513b0a529966249182b3a571fab3941ea3eff5ff0"
+    },
+    {
+      "path": "ResiliencyLinks/Copilot.dat.DATA",
+      "bytes": 8192,
+      "sha256": "d79e27858722fcb4c2db9a7fa6bb4fb958eb90c2ab12fd35370be8c05dee7878"
+    },
+    {
+      "path": "ResiliencyLinks/copilot_overlay_images_100_percent.pak.DATA",
+      "bytes": 8684,
+      "sha256": "3e11d07e0829c1d8547915f351370e775d3c18958df60a8b7b2ddf817df27d08"
+    },
+    {
+      "path": "ResiliencyLinks/copilot_overlay_images_200_percent.pak.DATA",
+      "bytes": 23614,
+      "sha256": "09f33744da33ec4290d78c830b76e6ff09e1611016dea2090f871b75f5fa8364"
+    },
+    {
+      "path": "ResiliencyLinks/copilot_overlay_unscaled_images.pak.DATA",
+      "bytes": 38789,
+      "sha256": "7a8bf84c03de5113410d6f3b5a98ef9fd2a12407df72446e2f16fd916f3747af"
+    },
+    {
+      "path": "ResiliencyLinks/Edge.dat.DATA",
+      "bytes": 12288,
+      "sha256": "aad5a84356ee96f3d6ca9742b23b6124eafba558f6d60ceed6c3067dac459c81"
+    },
+    {
+      "path": "ResiliencyLinks/edge_feedback/camera_mf_trace.wprp.DATA",
+      "bytes": 24910,
+      "sha256": "3f2eb6455f54365c27829f85dd64ca0bafaa8577a6c8e79a54a6dd4c67df6470"
+    },
+    {
+      "path": "ResiliencyLinks/edge_feedback/mf_trace.wprp.DATA",
+      "bytes": 12735,
+      "sha256": "79a228f8f85310c27c292055d9e0e9b827c319c2472b4ba5b40e88851bc4b4f3"
+    },
+    {
+      "path": "ResiliencyLinks/edge_game_assist/EdgeGameAssist.msix.DATA",
+      "bytes": 1019266,
+      "sha256": "09cc15820436b7192bad340b9a202f0e30c295dcf8b642cd691b3eb790aceda6"
+    },
+    {
+      "path": "ResiliencyLinks/edge_game_assist/VERSION.DATA",
+      "bytes": 10,
+      "sha256": "01ead2a790d96684b49de8a573713763e33ae2798f07b479f4fde1e26b303d7a"
+    },
+    {
+      "path": "ResiliencyLinks/EdgeWebView.dat.DATA",
+      "bytes": 8192,
+      "sha256": "482297326005fcb6e961e9b3e327e4cbb151901e7ca55cbe2bf982823bc06934"
+    },
+    {
+      "path": "ResiliencyLinks/Extensions/external_extensions.json.DATA",
+      "bytes": 99,
+      "sha256": "a68cafd7d78d5c671c2560656653f2a4d83ab66d87a8728356a88fb1f477b3e6"
+    },
+    {
+      "path": "ResiliencyLinks/icudtl.dat.DATA",
+      "bytes": 12409424,
+      "sha256": "8fa69fc9ebcce09fa8ffac89afcf8088e8f70a177fa90d80a90668f5389f2579"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/resources.pri.DATA",
+      "bytes": 3744,
+      "sha256": "e689383d49a50dd886a43b6921e586f0c15007f8296213d3c0fcf00b220483e8"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/copilot.identity_helper.Sparse.Dev.msixbundle.DATA",
+      "bytes": 19689,
+      "sha256": "2769e068d167bd51206c98c5c15f5602404700e125ccb949fc20d24797e9150e"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/copilot.identity_helper.Sparse.Dev.p7x.DATA",
+      "bytes": 10186,
+      "sha256": "a39830691e33160220eb9988325985105c605eecc72841f8ea4bbce4645afd5b"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/copilot.identity_helper.Sparse.Internal.msixbundle.DATA",
+      "bytes": 19689,
+      "sha256": "24695651028919d96b0ca7b4ef95a8052d091ba5329456f2b97e56ab9aaeed0d"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/copilot.identity_helper.Sparse.Internal.p7x.DATA",
+      "bytes": 10189,
+      "sha256": "8e428523971dbfda33206a31a477140e0ccb2b9f58187abae0beee6c4388fdf9"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/copilot.identity_helper.Sparse.Stable.msixbundle.DATA",
+      "bytes": 19616,
+      "sha256": "2a964b2e26a930330f2a5b284370b23962471eae9627f36a7c51bf0dee405c70"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/copilot.identity_helper.Sparse.Stable.p7x.DATA",
+      "bytes": 10186,
+      "sha256": "fb76eda62266d500be5aed8af3e172404dc6e4df604827ea0820f63f8a820b1f"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/identity_helper.Sparse.Beta.msix.DATA",
+      "bytes": 51366,
+      "sha256": "e42903cf157ac5440c95d79ae1c04b9325b843390fed30222b5264a622473a59"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/identity_helper.Sparse.Beta.p7x.DATA",
+      "bytes": 10454,
+      "sha256": "452cb2b14d4b80b750a76aee274fc9dfd93ce6870eda58984ed1caeb6dd12636"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/identity_helper.Sparse.Canary.msix.DATA",
+      "bytes": 51154,
+      "sha256": "b089169255d3fa3aebf1795bfcd4e205ea3235a21f738ce5263e3d20281d27ea"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/identity_helper.Sparse.Canary.p7x.DATA",
+      "bytes": 10454,
+      "sha256": "60d91fe5069a325b1fd7242cb3718a8f01a92781cb4ccc6cd7808d35ce2bf3dc"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/identity_helper.Sparse.Dev.msix.DATA",
+      "bytes": 50817,
+      "sha256": "30477455e9147afa88a5e66a5dbb68cd3f8a834f48482dad76b06c0c7cd2c975"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/identity_helper.Sparse.Dev.p7x.DATA",
+      "bytes": 10454,
+      "sha256": "9c28197770be4f9dfe47a6261a63cbd62f0e4fc79ceff12f4398be614d35bde8"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/identity_helper.Sparse.Internal.msix.DATA",
+      "bytes": 53929,
+      "sha256": "721a6063ada75d2966c5848f9f906c1f1149a54bd9775caecc264f82230dcff2"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/identity_helper.Sparse.Internal.p7x.DATA",
+      "bytes": 10457,
+      "sha256": "ca33035aed1a4de998514596ae820b6d9e1f5445071a419e871b3c9eed4a37b0"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/identity_helper.Sparse.Stable.msix.DATA",
+      "bytes": 53919,
+      "sha256": "2e1169322526c23129ef48f06eb3a5f32fdeacbcefc820f1c5e8d7fa13a74e4d"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/identity_helper.Sparse.Stable.p7x.DATA",
+      "bytes": 10454,
+      "sha256": "65f92fcc026cf0e25dde75145efcc8c268a68aec4bd248f354d11369d780f3bf"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/officehub.identity_helper.Sparse.Dev.msixbundle.DATA",
+      "bytes": 54613,
+      "sha256": "6d0406478bb00ef907cc7c402bf9ab5d51ab8d6d50d36a1d8fb625e64a5bc65b"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/officehub.identity_helper.Sparse.Dev.p7x.DATA",
+      "bytes": 10454,
+      "sha256": "cd08d9da3ccc82df9e770809d5363a615b658610e96ea275b226b155a95b539c"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/officehub.identity_helper.Sparse.Internal.msixbundle.DATA",
+      "bytes": 54636,
+      "sha256": "f3ab0288b087063952fea67f0c4de15e6b49bc7573081534a0317911edfb2d72"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/officehub.identity_helper.Sparse.Internal.p7x.DATA",
+      "bytes": 10454,
+      "sha256": "83381693b2b7b064164d28a0aa693013c77ffe0a4b788ed96f336daa5b0e0710"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/officehub.identity_helper.Sparse.Stable.msixbundle.DATA",
+      "bytes": 54653,
+      "sha256": "63c81fe668f0807a5b87db18f82db553bca559b58233f2e04cf6a8796203578b"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win10/officehub.identity_helper.Sparse.Stable.p7x.DATA",
+      "bytes": 10454,
+      "sha256": "c4429d01b79995cc94d0f7d448816b44d36b429aeeaf87e7b90a388be9375e8c"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/copilot.identity_helper.Sparse.Dev.msixbundle.DATA",
+      "bytes": 21048,
+      "sha256": "30af079fc5ea57f739557ef4ec10c35ede3f942288fe8377a14f00a5d9f972f7"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/copilot.identity_helper.Sparse.Dev.p7x.DATA",
+      "bytes": 10185,
+      "sha256": "3b92d3969d34bebd4d4ad6dff62c5988699ce31cecfa7425b864f12bee168993"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/copilot.identity_helper.Sparse.Internal.msixbundle.DATA",
+      "bytes": 21052,
+      "sha256": "2057de922879773177bb42046674b04065bb9dc0a9ed45371e8fd4ef4ea7a672"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/copilot.identity_helper.Sparse.Internal.p7x.DATA",
+      "bytes": 10186,
+      "sha256": "2eb4195bcb06b79433ea9bbf11d30735b2f5a29ccb36a75fc20faf6457c77e59"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/copilot.identity_helper.Sparse.Stable.msixbundle.DATA",
+      "bytes": 20982,
+      "sha256": "71b3582716a3b0b6c0b09baa295a4b4be6d321f2da656372a1be17faa84a32d2"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/copilot.identity_helper.Sparse.Stable.p7x.DATA",
+      "bytes": 10186,
+      "sha256": "2dc30b6102c103ded3a3bdc4bf10adf5167002591cc124afb49db123d56d886f"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/identity_helper.Sparse.Beta.msix.DATA",
+      "bytes": 51366,
+      "sha256": "453cd1f90e8e364db273fad83ae1edc1441b26dcbb8579ea53c576f869ff5d86"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/identity_helper.Sparse.Beta.p7x.DATA",
+      "bytes": 10454,
+      "sha256": "53b68800dd8658ce992feaafcae14313e732f628ae249dc4b3eb9a4b1ec0d0b2"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/identity_helper.Sparse.Canary.msix.DATA",
+      "bytes": 51155,
+      "sha256": "c29d2cad9d9e88d3948fb22db33c9e5f51400fbc5948bd06b8a03c31e7a65e0e"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/identity_helper.Sparse.Canary.p7x.DATA",
+      "bytes": 10454,
+      "sha256": "6e1f6dbbc263a380a645c3f9f05dd33377b9f4b1f038823fc5676709c0df1605"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/identity_helper.Sparse.Dev.msix.DATA",
+      "bytes": 50819,
+      "sha256": "3e4a837b369561a6d4d63a09297d89b1ff7acd76fb0b298228a8640608908a42"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/identity_helper.Sparse.Dev.p7x.DATA",
+      "bytes": 10454,
+      "sha256": "8d22a3266375128e5f79a08667dc0e237862ccfd9313620ca0b601205fbd6342"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/identity_helper.Sparse.Internal.msix.DATA",
+      "bytes": 53927,
+      "sha256": "25b3a927bd8a640d1399bc0c408f8aa399ad4a5fd951fddc0f978236bbd4a8fe"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/identity_helper.Sparse.Internal.p7x.DATA",
+      "bytes": 10457,
+      "sha256": "90bcb40b2b707f6ea1b880b6a188fd4183a1f0a0fccd04f01d1d1bb7784b3012"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/identity_helper.Sparse.Stable.msix.DATA",
+      "bytes": 53909,
+      "sha256": "d9855607c1335aeedaa807b29692bd98ebcd133f75523ec63bc6a33eddfdaf62"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/identity_helper.Sparse.Stable.p7x.DATA",
+      "bytes": 10453,
+      "sha256": "deadd7d09a241601021a9734bbd9f5285e17129c59f1f46a069cd484a555004c"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/officehub.identity_helper.Sparse.Dev.msixbundle.DATA",
+      "bytes": 57313,
+      "sha256": "d29d245a171f33785372bfe774bedc0fc0a1f50de490788ab7d783b56551fc2b"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/officehub.identity_helper.Sparse.Dev.p7x.DATA",
+      "bytes": 10454,
+      "sha256": "efa32eba3b1abcfcfa4a6d4a23b12dd3bdec3406fbe7b5cbac7d1fa226bf126d"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/officehub.identity_helper.Sparse.Internal.msixbundle.DATA",
+      "bytes": 57342,
+      "sha256": "43d126ece76b4497575fc04d3a4016eddb91789a03cfe8c8ee779564fd481a3d"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/officehub.identity_helper.Sparse.Internal.p7x.DATA",
+      "bytes": 10454,
+      "sha256": "9e9572bbee4b9998becd35e52be1647a5d9e546594b944f6aca6f84384c09a21"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/officehub.identity_helper.Sparse.Stable.msixbundle.DATA",
+      "bytes": 57330,
+      "sha256": "0f5e4c5c45fc44a3120d1259b52a8388cd8102b060fe57c810d97a5272f52a8d"
+    },
+    {
+      "path": "ResiliencyLinks/identity_proxy/win11/officehub.identity_helper.Sparse.Stable.p7x.DATA",
+      "bytes": 10454,
+      "sha256": "659cd821ef73b45a342fd7fe2cde11c827206d663da58cfb781b8cfcd62cfd82"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/af.pak.DATA",
+      "bytes": 1115914,
+      "sha256": "f10a62ace53fa74aa40a268e5a71472e507c3663358c29ad657345338027258a"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/am.pak.DATA",
+      "bytes": 1648047,
+      "sha256": "e4c9253a2b42b32e04ba5b43c47c639fa2df186c6353a6022cb7f1875ddbb9a7"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ar.pak.DATA",
+      "bytes": 1709443,
+      "sha256": "427a13ba9b16344b6839ce9b180b7d075355d5c78271d81d9cf0389438391bcb"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/as.pak.DATA",
+      "bytes": 2436256,
+      "sha256": "3165007e4a565871e8b820cb89f26bf1556da4ca851ea4a6f42c0fd8bed12bb2"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/az.pak.DATA",
+      "bytes": 1284908,
+      "sha256": "ab1e74fa328e1c8ce31ab7955ba077292b3db849f5b7f28600d9f7c16c98ca74"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/bg.pak.DATA",
+      "bytes": 1923225,
+      "sha256": "9b6f86a99d8c7f4f52ecc435e08f1a5e0179586a38097fff4a6967a2d8b55b0a"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/bn-IN.pak.DATA",
+      "bytes": 2519587,
+      "sha256": "7f497d33168092bf28eab89020bab08979fafb6222c11ed8b9b9b0c5dbce135d"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/bs.pak.DATA",
+      "bytes": 1193157,
+      "sha256": "f7a3d76d13e38ea50efd804f0b3d0895967787504b63f874e5d5557e434d0c4d"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ca-Es-VALENCIA.pak.DATA",
+      "bytes": 1251568,
+      "sha256": "efb49c86617e79a81242afba96895fa4e4fb0131f0a227c37a4fb2f48d7d7c69"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ca.pak.DATA",
+      "bytes": 1253059,
+      "sha256": "be2fd0d8f6c3c0d3add87a2e8ff8955db9625795afad38107036068c41829c9e"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_af.pak.DATA",
+      "bytes": 65146,
+      "sha256": "c72447fa7559cc7723b3cf60ae7fb9837beed6bfc27c060f210a4939aa60feab"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_am.pak.DATA",
+      "bytes": 95236,
+      "sha256": "97af527a9c04f35ec2730a6f4d69dfaa40b4beb0a55f1137dc36692559cd6673"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ar.pak.DATA",
+      "bytes": 92138,
+      "sha256": "8b2210ab2fbbc63526d16a30ab3d90bae4e536bb8f2d2f46510e21f2decba8ef"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_as.pak.DATA",
+      "bytes": 142024,
+      "sha256": "9205ca01bbc24db1defc805f875a40ce5fe713c1f6b6ce8da375616b702f5cbf"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_az.pak.DATA",
+      "bytes": 73213,
+      "sha256": "3bb51e16fc775be2415baec7850409551a0346fccc9c8806fb23588a4b08baa6"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_bg.pak.DATA",
+      "bytes": 108089,
+      "sha256": "acb71a1a788363d51c11a11ea24706f83bf38d84b8e7546ed050f1019ed1c4e8"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_bn-IN.pak.DATA",
+      "bytes": 148441,
+      "sha256": "717e7015d60c31fd498174233f34005c1f654e870bfad0e18a986adf394ef812"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_bs.pak.DATA",
+      "bytes": 67772,
+      "sha256": "d88724ca8fc9121b1e79d2ede9df401141af4f5f6d639f2569b9c2224c76a761"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ca-Es-VALENCIA.pak.DATA",
+      "bytes": 71410,
+      "sha256": "f66306ad8ff7338e0dc99f7c786535011a132cb56126b00e3606b757afa7c509"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ca.pak.DATA",
+      "bytes": 71197,
+      "sha256": "5ed5e2878dbe2988214b3e8d53a4dd4076c8786a7d5bb4298734b0c586592a5e"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_cs.pak.DATA",
+      "bytes": 69351,
+      "sha256": "3bca4d6fec9ba76f6e794293849110a3d346439c5c3c339879518731d9e2ca04"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_cy.pak.DATA",
+      "bytes": 69492,
+      "sha256": "7587307e34b403893c2da3e1cacf4f80fa07a59dac4673c8e21fe015a9cf7c3a"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_da.pak.DATA",
+      "bytes": 64674,
+      "sha256": "088b17b10efe74e316ef9eab9ae920e9fe20e80007675e5c9cc6615f76f23594"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_de.pak.DATA",
+      "bytes": 72199,
+      "sha256": "5a409cd5405412dbc156b9dea12db86f7d7ba7c34bd7db30d591814c20cbcc30"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_el.pak.DATA",
+      "bytes": 122440,
+      "sha256": "9639e1b4315ecae4e583670da4000a2e2b361d225cec1d3fbfaeace0cc395835"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_en-GB.pak.DATA",
+      "bytes": 59559,
+      "sha256": "d712571680c01edcf276e73745062e1c75f5f8dce0f8f69102a5d1e10ff3991f"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_en-US.pak.DATA",
+      "bytes": 58915,
+      "sha256": "50cdb0f643d4e3f1bdeba2a0ccadd5f751b53d677911f8dd0fc4deffe9685867"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_es-419.pak.DATA",
+      "bytes": 69694,
+      "sha256": "034a13554cca9012b38e48668be1c8ad9829fd6f560d7d92acdc9deef18d31b7"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_es.pak.DATA",
+      "bytes": 69499,
+      "sha256": "4b2270a885fc6b9b2c7c1aec27bec7678807309075a8573b068e471968e25cd7"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_et.pak.DATA",
+      "bytes": 63511,
+      "sha256": "64fcdc32dc7db9e688fc423dd8de2f84d9b7f6db97d77fcda1772a6ff91f83d4"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_eu.pak.DATA",
+      "bytes": 65472,
+      "sha256": "9af524936da1285b1dff3a8cf12e99ef8f080843390848a26114a736e73c6f9b"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_fa.pak.DATA",
+      "bytes": 101734,
+      "sha256": "c04dcae3eca3ed4983f3fba81502c886730ee764ffafec95dc36a56ee84e3f7c"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_fi.pak.DATA",
+      "bytes": 67003,
+      "sha256": "7312369ca9b6b5a0aac7aa65e6cfde783d04545dbd19ecbc53bd50d309d40d5d"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_fil.pak.DATA",
+      "bytes": 72906,
+      "sha256": "97c92c36d068202b6655a0ceff0ab4e7e1f8c2f8b20e1c8c12b153d2b1bb1080"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_fr-CA.pak.DATA",
+      "bytes": 76767,
+      "sha256": "5bf985b560a2b6583f19efa4984e2d67466642dd06107a3e4118ed7e899c8663"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_fr.pak.DATA",
+      "bytes": 76254,
+      "sha256": "5af49b71f1bf56d15f1eef689b1386c5ee9ef5e2a889aac819c9f9e3e6cc7251"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ga.pak.DATA",
+      "bytes": 76241,
+      "sha256": "6284e58959f782289ed1f2d82ce959ec5ee8797218f59e3232983776651dedf1"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_gd.pak.DATA",
+      "bytes": 78049,
+      "sha256": "e5a31a483a024b3e0463673652adc645287cbea6423429524813024455b739e1"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_gl.pak.DATA",
+      "bytes": 67942,
+      "sha256": "21bdfce394916dfc146b8e1902f8f97be3f10778ff29631539cb2c347bd46402"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_gu.pak.DATA",
+      "bytes": 143617,
+      "sha256": "412fd43b128dab5b96827f0234d16e75aa31ee6ded922f4ee88d5781015cd3ae"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_he.pak.DATA",
+      "bytes": 82452,
+      "sha256": "adb1a1aac4613a4e4f1d37eabce6bb075dd3a6a573820588f51b2f1da2530791"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_hi.pak.DATA",
+      "bytes": 140509,
+      "sha256": "63e14c79d7cfa3eb44aa5440308675a970a966afdd676659b1c266b431bf2a9f"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_hr.pak.DATA",
+      "bytes": 68307,
+      "sha256": "11077be0cf28906b9b19ba51d97971f3509be7e6ba9552280208fa45066d609d"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_hu.pak.DATA",
+      "bytes": 73209,
+      "sha256": "e0e141338d6bf6fef2941315ee148028e474393fd99aa88f85dc3e5c2dcea95a"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_id.pak.DATA",
+      "bytes": 64794,
+      "sha256": "db3394d4235d09370969224e0f5baac8c61264dac34facb7cff08af8f479fc9c"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_is.pak.DATA",
+      "bytes": 68834,
+      "sha256": "f389ee934eba9770bd276a233da8cee4e4be80cd61289bbc9268a8d1b4f70103"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_it.pak.DATA",
+      "bytes": 69334,
+      "sha256": "7688ae95543e12e198d7f39d2e3bbf2f033634f59da88638e03871e2076e6bf0"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ja.pak.DATA",
+      "bytes": 83922,
+      "sha256": "65a530941d7091eb1eee75d76b1da27e2756ee61dda3fdd3766cec677c54c7a9"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ka.pak.DATA",
+      "bytes": 151395,
+      "sha256": "6495229440714197788258fda6dd590bf704807ab15b1d296c3545e80ff56800"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_kk.pak.DATA",
+      "bytes": 111364,
+      "sha256": "ccbefa124a7ae89255c0e384c9a1f59335d6f8e688f954a74e69a6a65fc0d9a5"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_km.pak.DATA",
+      "bytes": 152458,
+      "sha256": "dbb9c6c298d812f27842a77d40483873659773612a4266c8747c704040f0a548"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_kn.pak.DATA",
+      "bytes": 154694,
+      "sha256": "d3acc875dfa5f971ccc9c5489d50ccb690e6b38eee83f55e8c5d6333adab767c"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ko.pak.DATA",
+      "bytes": 72391,
+      "sha256": "aa1429dd546bf476a449dfa6c2324c600fe97524ed6c1876b3924f56444e1d32"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_kok.pak.DATA",
+      "bytes": 134068,
+      "sha256": "f4b88c4b43f8582ed447a17ae6daeed4175117c2961054223379e202b0896638"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_lb.pak.DATA",
+      "bytes": 70062,
+      "sha256": "f3105d9bb32b037138465b75dc5a8508f0fef48cd0d479a0b2331c7eee5b8836"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_lo.pak.DATA",
+      "bytes": 138001,
+      "sha256": "9b03d665e55c1e673e159122bebadfb83f40279140c4f65bcf5aa2da708fb627"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_lt.pak.DATA",
+      "bytes": 72376,
+      "sha256": "3269e858be9dd8366b365fadaec8fa6194756f8ef558b82976e9e05ba9e84e4a"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_lv.pak.DATA",
+      "bytes": 69766,
+      "sha256": "d5650f462538780be553322aee42722117f2f21eee706d2642edbdd46b48f087"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_mi.pak.DATA",
+      "bytes": 70655,
+      "sha256": "cd4a133c7d65ee4fd1cd284348b3dbb0469e34fff3a352b5e7c6becc919a3d37"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_mk.pak.DATA",
+      "bytes": 109574,
+      "sha256": "57bdc2d3b8a52b7dd6148fb6bcfce3e40015cf82909887b504d2d3a03309b712"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ml.pak.DATA",
+      "bytes": 171695,
+      "sha256": "4954710bdae95fc489064f5b1f17afa2daa6db046cf9b20a7d9e59274472bb65"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_mr.pak.DATA",
+      "bytes": 144167,
+      "sha256": "c69a3032d77e8aa56c6843c660339fb2bf7347f1bc7d9bab16ad569a34e62bdb"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ms.pak.DATA",
+      "bytes": 67133,
+      "sha256": "9111db2c70427762884809e3dde4902827f4c6727a396f5f1414f0efd9a76b2c"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_mt.pak.DATA",
+      "bytes": 72750,
+      "sha256": "ef1be16b41af6dfe5a48353a07c8c7fb71bc51ce53eb683d9d255e350dcedc16"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_nb.pak.DATA",
+      "bytes": 63046,
+      "sha256": "26dd342c322d345faf278fea840de25c7195185423a63fb6a4d214b9708593ab"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ne.pak.DATA",
+      "bytes": 148077,
+      "sha256": "c6d6d616c153f63535b7d672ee1d4a2f8e90c791220e63978b8f4b03b2d40824"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_nl.pak.DATA",
+      "bytes": 67852,
+      "sha256": "ad3098f1c90a24233746d33cba068a3a0a0e29895e884384e1712f5b8f85ce66"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_nn.pak.DATA",
+      "bytes": 62910,
+      "sha256": "d428c63f748d1b40d346b348995e6f0614a2a155aeb360bf581cd584064e820e"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_or.pak.DATA",
+      "bytes": 154625,
+      "sha256": "1d35fbd17c9a11479e6e14ccba26094abfc382c984fa11624f2ec94770f6fb08"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_pa.pak.DATA",
+      "bytes": 147300,
+      "sha256": "9d6121762ea784b81d372d3bf4dfeb5e2ac2d9adcf8f271af4f023cdebd38418"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_pl.pak.DATA",
+      "bytes": 74745,
+      "sha256": "5392410395daf1d9927c7780cd8eb37568d9f5d285a3bacf5f4f207a59dfcdef"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_pt-BR.pak.DATA",
+      "bytes": 68144,
+      "sha256": "d6e86f1efe82f98b51377471d22829d5fd6954fe08891a34d22ab68e5060c3cd"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_pt-PT.pak.DATA",
+      "bytes": 70393,
+      "sha256": "606c4d17756fd0e6117506884af60d7e9939a703e520c19d7824b937424b2817"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_qu.pak.DATA",
+      "bytes": 70343,
+      "sha256": "dd483a4a7063013095be24874d167377327fbda97d991b08308dda9eba0b0330"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ro.pak.DATA",
+      "bytes": 71308,
+      "sha256": "533aa30390bcf83b3b8dfae8b5a4882f414a9278c00ab4eaebb20168ee0f7c72"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ru.pak.DATA",
+      "bytes": 109668,
+      "sha256": "8b5a6483cf8d03cdb7260ed69c69bba6a8abefe4aaaa4c8c33974e9cedd22d5c"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_sk.pak.DATA",
+      "bytes": 70851,
+      "sha256": "121a535469cb54db6522f5fbffdcb482ff50feda969c08b98ef52d08da3a8735"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_sl.pak.DATA",
+      "bytes": 68529,
+      "sha256": "a16741e456004f2f7006e9c26e6d5b1ecf3af7cf109faa5b085d6ac6e6283efe"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_sq.pak.DATA",
+      "bytes": 70422,
+      "sha256": "3d656a1ee55da81aca5b736c9c9b4ca1cad978d45895fe80ce8d6e581972cda8"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_sr-Cyrl-BA.pak.DATA",
+      "bytes": 105506,
+      "sha256": "aa1f8ff81534fb8f75c33369ceeef9cb9c5fce5a7ce605905fbe4e891e484cc1"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_sr-Latn-RS.pak.DATA",
+      "bytes": 68509,
+      "sha256": "77c52431383b994434327942bd30f91484499f53bac854ca5232374abcf28f76"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_sr.pak.DATA",
+      "bytes": 107122,
+      "sha256": "fd894de3046462f91dff6e4f48cbe4087d095020c51c1bc83b9d5b74e35a8c54"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_sv.pak.DATA",
+      "bytes": 64169,
+      "sha256": "b26b7b5b8d1a21c5cfa5e978ad165c8b97427d42c97781491a177fe8e54f5fc3"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ta.pak.DATA",
+      "bytes": 166804,
+      "sha256": "a3bc7525812d3fd9514cb3faf9c10745dc08924a9a9dbdfe7f9072bac2da2b68"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_te.pak.DATA",
+      "bytes": 153625,
+      "sha256": "c19edb87ab7a7962716dc85a9b1f5804cdf010f47f243669df88596a2c43bd6f"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_th.pak.DATA",
+      "bytes": 135615,
+      "sha256": "60030eb94f782ac8be65ddeb4d0d4791a5984c7190036ad8e5cf12801b8b0ff9"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_tr.pak.DATA",
+      "bytes": 69912,
+      "sha256": "ad92610e45220de4f15b70fd2d3cf2d006c70b3c28fd635dbc30ac6405ff055d"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_tt.pak.DATA",
+      "bytes": 106543,
+      "sha256": "1fb5893820b06bc768ec8ad4c794c5328e6835b8bb73109422c19323f739d32e"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ug.pak.DATA",
+      "bytes": 107750,
+      "sha256": "c503f2bb78ca65bc7be4b05aa19f0c34c2c14988e2968719e3b04732a7bd5217"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_uk.pak.DATA",
+      "bytes": 105962,
+      "sha256": "d10f18931fb197bde829fc423b98328feea6d8566f7133abccfcc68350dca363"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_ur.pak.DATA",
+      "bytes": 103928,
+      "sha256": "b772f59d40c5f2b2aa67479fa5604979152c6841b342e4cd77ae1eb398dca204"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_vi.pak.DATA",
+      "bytes": 80039,
+      "sha256": "86bb8764a7d41b4aeaabae254a4ba65a9943dba90e524651d2d1b5a953b8915b"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_zh-CN.pak.DATA",
+      "bytes": 55950,
+      "sha256": "32a4f7586e9cb96766bbbb2ff541a1460c7bbdf19f47f4726ac8a00e6bc156af"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/copilot_overlay_strings_zh-TW.pak.DATA",
+      "bytes": 58162,
+      "sha256": "495bdbf02ccc419379ed4680f9be1ecc260353cda7a87aec96a81d29692bd7d6"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/cs.pak.DATA",
+      "bytes": 1245864,
+      "sha256": "b31f8b2aa0f308032b5f789ba6d2fc250d96d3dd5214f10f70d68001c8238715"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/cy.pak.DATA",
+      "bytes": 1233239,
+      "sha256": "38cc81cf1529bc32034ac81e90ec8f7f1b46954b4805c90f0b794f6ab613b0dc"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/da.pak.DATA",
+      "bytes": 1118556,
+      "sha256": "ccfda509970e5fc679a6ceb3b96c35be0e1f1cff19f86895367118a201b702a4"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/de.pak.DATA",
+      "bytes": 1247658,
+      "sha256": "5534e370a1087147f82d3b2f6d20a6e8ce69088769a97bfb751c61f0b7220f89"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/el.pak.DATA",
+      "bytes": 2125504,
+      "sha256": "0fdd1558697ff97eb3a06d46743cb411ac2ad6481a36c5774bed20083e6d20de"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/en-GB.pak.DATA",
+      "bytes": 1017006,
+      "sha256": "a5c8cb18cab888b7899b27b2ee1a2250cc4aa27d27b00a9596607e8c73a9ba8e"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/en-US.pak.DATA",
+      "bytes": 997676,
+      "sha256": "537adb2ce168d8fbf509a3311a557f9649eab1e3dc2cf1247b38010787db94a1"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/es-419.pak.DATA",
+      "bytes": 1237742,
+      "sha256": "1f7fe95781b7b562eb2b6aa171c55d7d67538e1a4241310cd5362807afba1256"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/es.pak.DATA",
+      "bytes": 1238441,
+      "sha256": "507eb2c1a5f4fb6a3b54b11eeaa8841abe356efedc1cec6530292ac030d93a44"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/et.pak.DATA",
+      "bytes": 1106694,
+      "sha256": "963fc50940d4cdbeb543a89e63db34231ac10ba0a63f8d70be87ac24ce2bf222"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/eu.pak.DATA",
+      "bytes": 1150154,
+      "sha256": "ff8ea9aaa12ea0ac68bb6ed96700d1be1fac3aa00e040600b22b011770d8a969"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/fa.pak.DATA",
+      "bytes": 1733306,
+      "sha256": "1d438ba06716887d28e6f10e7a2a954cf0e07acd12fdbc4d5459c05d2de63784"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/fi.pak.DATA",
+      "bytes": 1155452,
+      "sha256": "c689682085625e9e02d1cd976ac7068fc096c11b9f29722036e69bf43a28462e"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/fil.pak.DATA",
+      "bytes": 1247241,
+      "sha256": "ff1a0e3d61a13c651732f534bd1de7ae92c2795ddd2c82b171de3c25bfd5e818"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/fr-CA.pak.DATA",
+      "bytes": 1331209,
+      "sha256": "43be041bf872d80d986c2dad68039e61ff795968fe7d18f30553ad87a93ca6c0"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/fr.pak.DATA",
+      "bytes": 1319292,
+      "sha256": "81051b58fa0145c81a59ec8e3b6a711ac2d8c30c4bbe9d943790a5e72de482b9"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ga.pak.DATA",
+      "bytes": 1326044,
+      "sha256": "a43623f09e4ab9c974115bb28e1f3faf36acae906b9291719ccd07d80896ad6c"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/gd.pak.DATA",
+      "bytes": 1401020,
+      "sha256": "f277b35d7738de8e115a6d35f51820bcc0bbba9bd08dc9b00dd633c1408e49e9"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/gl.pak.DATA",
+      "bytes": 1186031,
+      "sha256": "f35df613ed4e762b689fd4faf2d383f3f64828de66cd1dedac36a77a5e818989"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/gu.pak.DATA",
+      "bytes": 2387882,
+      "sha256": "7fdb2c05a26ee74d5b31c9d6d1ee9a777fa9c770091be3f33c13643772d1f567"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/he.pak.DATA",
+      "bytes": 1439291,
+      "sha256": "3071775096d29ff8bc1eab9bec56578ca4c2564af1b1f30ebb10429763bffd1a"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/hi.pak.DATA",
+      "bytes": 2380035,
+      "sha256": "5845f7103e494002733456a5885127ba1eb7f8e6cec14d7a9c80a835d9731bc3"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/hr.pak.DATA",
+      "bytes": 1208918,
+      "sha256": "12065ac395421468abdf1972d9d6c9ce73ebbf7442dfcc4c5acceed78fdeb514"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/hu.pak.DATA",
+      "bytes": 1278154,
+      "sha256": "466c8d0a0fde887f21e7385666d78ddb53566833b5c09ae3ea01c48094f706ee"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/id.pak.DATA",
+      "bytes": 1092381,
+      "sha256": "eb7f58f653c256296e05768cc7d7291ce6cf01657236a9e00054da4733e0f664"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/is.pak.DATA",
+      "bytes": 1173303,
+      "sha256": "4d6ddc29c732d1a684a4ee226ebd06c9fad25181068ea129d026461d5f4032e4"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/it.pak.DATA",
+      "bytes": 1220139,
+      "sha256": "9d04c6a0fa6e8b3171c62bcdc615112d746a156d6a03b12389428d310c60b839"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ja.pak.DATA",
+      "bytes": 1425288,
+      "sha256": "7488a1389eec0f8769186c686d2aa3df42f25b4c13c3ee52f457bddbfbb22805"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ka.pak.DATA",
+      "bytes": 2663858,
+      "sha256": "36525243df477ba5d7990bb7a6db371afee1d38b3efc5ca8df7f0793350f1ef4"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/kk.pak.DATA",
+      "bytes": 1884385,
+      "sha256": "43d9c64c60fdaf224f94f09716762b19652631b720605653bafc22cf36fcbc62"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/km.pak.DATA",
+      "bytes": 2566018,
+      "sha256": "7ce57b14362f06b0ef6e76f9a0eb690e841eca05df71a9588b0fb7d940baec14"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/kn.pak.DATA",
+      "bytes": 2671371,
+      "sha256": "065c613e9ec672e7239f7a1cbbdd44aa6e7849b1879a3bc40eb5bc9b8f2da8c7"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ko.pak.DATA",
+      "bytes": 1199616,
+      "sha256": "08711218ef15c42433dab8209fe4c499ddbeae9cd6dde787113822ea1d951593"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/kok.pak.DATA",
+      "bytes": 2301508,
+      "sha256": "3cd345b47cbf8dda0f130bd0ea1edf5a71295e05ec5fb960a1d8e0e05e3d8ca5"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/lb.pak.DATA",
+      "bytes": 1204696,
+      "sha256": "612b340f18c7983f61fe87dc967c4e54f0c53db11e896b13aab490df92fed0e0"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/lo.pak.DATA",
+      "bytes": 2330003,
+      "sha256": "383f5732f54cf10bdaeeb4ffe8529eb8d8abe0957ec133b49ee6d815cf7dd517"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/lt.pak.DATA",
+      "bytes": 1263953,
+      "sha256": "4a9b4c753f445dc5ebe5dfe7621c9f30d5d36ce25bd5cf9e416a6933fe14f0fa"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/lv.pak.DATA",
+      "bytes": 1230892,
+      "sha256": "931fcdc078c5c108d1e888b3fc6870bc1be49ced634b3fd698a203a810f4330b"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/mi.pak.DATA",
+      "bytes": 1204401,
+      "sha256": "7fe8b07400c76fcc5e4c8fa573d1d1d7bd51deb53b8ba21525c342329a4eefeb"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/mk.pak.DATA",
+      "bytes": 1919426,
+      "sha256": "a90d1c14e222d5876761c5e51a1d813a867d96de86f865fe4a1012cb6dd2a665"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ml.pak.DATA",
+      "bytes": 2926792,
+      "sha256": "647b9bbd2ce37e3fe549d4d04641543c3e33bd6a56eec8f3e1836d7c96774890"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/mr.pak.DATA",
+      "bytes": 2407283,
+      "sha256": "0ccb6e7d41677073852f69ff9641060a78f64b495aa843384ba09282fcdbcf6c"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ms.pak.DATA",
+      "bytes": 1127525,
+      "sha256": "2a063580f2a44a91eac6f70586dc5400280c611381c8048622e6ade4a8836473"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/mt.pak.DATA",
+      "bytes": 1283759,
+      "sha256": "bdab401b4f3dd3f52deb87ca2345bda8571f91d65f6fd3d6c4b6a6a1147eed6c"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/nb.pak.DATA",
+      "bytes": 1087189,
+      "sha256": "04775331cb028c3a44377004af6968dbb9eb5d9488317bf9791d94844ecb2ecc"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ne.pak.DATA",
+      "bytes": 2553452,
+      "sha256": "d5cb9c54cfb6804d5a16aa000f23985d252f2d40479a632f04927c9da8bcb85e"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/nl.pak.DATA",
+      "bytes": 1165097,
+      "sha256": "dd62ec7918c359aa4a3ecd90610321f22dd6b31338988cadae2eb649cc5e4281"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/nn.pak.DATA",
+      "bytes": 1091758,
+      "sha256": "68389df38e411443f660c6873b7361f70fca1804e13ade1de082eb504becfc6a"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/or.pak.DATA",
+      "bytes": 2654070,
+      "sha256": "da1d28f31d810031f24403be9fe34376d37930c74028723fb315473df56efb25"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/pa.pak.DATA",
+      "bytes": 2427336,
+      "sha256": "fc80660b94352c282ea19fc88e90236cbb3d0a5836e7b01f8960ba1bac29fff6"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/pl.pak.DATA",
+      "bytes": 1294036,
+      "sha256": "ea9ce87687dce26283024d1401aa014d3d7fd96b156ba3de6d3789d8848983c3"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/pt-BR.pak.DATA",
+      "bytes": 1196670,
+      "sha256": "73cbb027bb9803c035a465ffcde2d48d435d097da8052a3be9a3f6a5b9870c8e"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/pt-PT.pak.DATA",
+      "bytes": 1235309,
+      "sha256": "54ea240e18cf4db6ac98616e434a60ea17c73a3fdd4bed4faf58ef268345c264"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/qu.pak.DATA",
+      "bytes": 1238277,
+      "sha256": "858352850f7131375efa44edcf659f2e42a5b0833bfa03f2c7351532654a9017"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ro.pak.DATA",
+      "bytes": 1249028,
+      "sha256": "8b82a01e7ffc895e90df530654659c13b452d5c54f3fe6b1825c975e7a4d9795"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ru.pak.DATA",
+      "bytes": 1962606,
+      "sha256": "c9d659aef9342a05237324ee7ec6c3cbc62d8c5128bbf5235d7347373faa186d"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/sk.pak.DATA",
+      "bytes": 1269872,
+      "sha256": "f10b02064a3d7da1c296c4c4e49e099c5e715be2e396c1ff550710c98c26e2a3"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/sl.pak.DATA",
+      "bytes": 1203979,
+      "sha256": "242cfbf0465eabf948fd31f606b43dc2a5eb5ad3863c2bd94005718525d8aecc"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/sq.pak.DATA",
+      "bytes": 1225687,
+      "sha256": "8b7b0679c028e13734b8c72e2115fdc46244ad057a52678f8291c371454002e4"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/sr-Cyrl-BA.pak.DATA",
+      "bytes": 1857550,
+      "sha256": "b6bc8fd22311f5e609dd3b647138d3d6d582efe542065e8b0fc589fd01794439"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/sr-Latn-RS.pak.DATA",
+      "bytes": 1198453,
+      "sha256": "a6580a84663296c546d3cc26cedf5b329675f1172e55b183449493dddcae3ffa"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/sr.pak.DATA",
+      "bytes": 1875951,
+      "sha256": "bdacef36c0aadcb2cd6c686118cb73690925fabfb2c7cccef7ffca8d8f029120"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/sv.pak.DATA",
+      "bytes": 1118893,
+      "sha256": "384323c25d583a62081844769c5fe2b8314794ee58be2346769f9bf8bc9c7100"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ta.pak.DATA",
+      "bytes": 2912252,
+      "sha256": "0abf5123a7e300abe557f833d570a760b0f1eb5d9f72a064f55d2712b8edc0ad"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/te.pak.DATA",
+      "bytes": 2631639,
+      "sha256": "d1cc292e3294a47c3839909082bad492fcbf039a4fad2c84a2047a786c85f396"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/th.pak.DATA",
+      "bytes": 2304616,
+      "sha256": "964ef68817dff4079524935dd66ad6f2ce1d3e134d2380d4e704c6983239b236"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/tr.pak.DATA",
+      "bytes": 1200266,
+      "sha256": "092fcb0d0bc834a06b1f0b0b6d974b96c8f34f4b26616d1ef1e57d1a1ecaa613"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/tt.pak.DATA",
+      "bytes": 1891262,
+      "sha256": "e88aa626f0d1f8f39ed2fea89c71cf297751c75f5f2bdff8294c6d94c15af97f"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ug.pak.DATA",
+      "bytes": 1831415,
+      "sha256": "dc8b7018336e4abe814f7c3ae90692266480b2186468e2a08eab93416fd70a91"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/uk.pak.DATA",
+      "bytes": 1926169,
+      "sha256": "4b7ed15ca1b0bfff4aaa82393b4b3a861dea64c45947c646335b15fb4b8106ae"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/ur.pak.DATA",
+      "bytes": 1752041,
+      "sha256": "e40bedebabc301da072bd580d73a5e6f1ff8901a59f3bc7fba8bff4277a760e8"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/vi.pak.DATA",
+      "bytes": 1373099,
+      "sha256": "91638cd5dce4a83474ad413029331679d7f1863d9876436f577a863ee522dd3b"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/zh-CN.pak.DATA",
+      "bytes": 956158,
+      "sha256": "40cfd53eee907d15357dc2084fe8a76f02143937ef9271bfae7f958aa11d9f98"
+    },
+    {
+      "path": "ResiliencyLinks/Locales/zh-TW.pak.DATA",
+      "bytes": 989409,
+      "sha256": "eb479950a7fff1c766f5ca7f0310e10bafefda7a3735c2b872d478892a3ac198"
+    },
+    {
+      "path": "ResiliencyLinks/MEIPreload/manifest.json.DATA",
+      "bytes": 238,
+      "sha256": "44844cf3dde6e80087ae0e6bf0d9326d7ef7d23326d24ac83af0850be26923d2"
+    },
+    {
+      "path": "ResiliencyLinks/MEIPreload/preloaded_data.pb.DATA",
+      "bytes": 8254,
+      "sha256": "c6070a157b4e28d16fbccbd233e93846ddb070c85e1a1bc64469b7a5f1424fad"
+    },
+    {
+      "path": "ResiliencyLinks/msedge.dll.sig.DATA",
+      "bytes": 1389,
+      "sha256": "8cf184a64900ef663ba8e577c14d61181e39eb0753a69fe6046557d027064764"
+    },
+    {
+      "path": "ResiliencyLinks/msedge.exe.sig.DATA",
+      "bytes": 1389,
+      "sha256": "86f949fb9f45340ad74956aebb0b8345cc939465c1533d652e0e9f49071c07b5"
+    },
+    {
+      "path": "ResiliencyLinks/msedge_100_percent.pak.DATA",
+      "bytes": 1175012,
+      "sha256": "08f8fa0e922dd9216e75540b311468b0f08db0a58b28c724c34852a86de8664f"
+    },
+    {
+      "path": "ResiliencyLinks/msedge_200_percent.pak.DATA",
+      "bytes": 1865129,
+      "sha256": "c306af1e77de8fc484f57370dd0b5f4ddcddd4166a97be0929a4d09556aabd36"
+    },
+    {
+      "path": "ResiliencyLinks/msedgewebview2.exe.sig.DATA",
+      "bytes": 1389,
+      "sha256": "38be9cec2e4f8c9d5ca70fc7da6c27fc1231804040b4e1cc064e5f571818c1fd"
+    },
+    {
+      "path": "ResiliencyLinks/resources.pak.DATA",
+      "bytes": 34062176,
+      "sha256": "982f0c5f0a51b95be8849a3726f9f2c1e20326c3d415869155af19393d7908f6"
+    },
+    {
+      "path": "ResiliencyLinks/textInputMethod.sccd.DATA",
+      "bytes": 18615,
+      "sha256": "f88664c021237bbc0299b5ae3f5686b915e3007bf2902be8186ad847476447bf"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/manifest.json.DATA",
+      "bytes": 132,
+      "sha256": "de864bf0ab8abacfba536d4e9764eca658f903bd2457f955e128c4ee181c7e58"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Mu/Advertising.DATA",
+      "bytes": 19889,
+      "sha256": "231be4e0be45f588b161634c816b9a5a49f530c0dcb55461d37715a94482dca1"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Mu/Analytics.DATA",
+      "bytes": 4036,
+      "sha256": "bba2063d20d70f4ab06dc2ae04c2564cc2b8c631b6dab68248957dbdf107fdd2"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Mu/CompatExceptions.DATA",
+      "bytes": 689,
+      "sha256": "5b462316a51c918d0bae95959bf827cb9c72bbd84ffb0e43b750aa91fbf3ba53"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Mu/Content.DATA",
+      "bytes": 4486,
+      "sha256": "9a63f38e22b8573cbd47a4ef7b67ccb0934b87239e075c5cfafc7a1014e340c6"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Mu/Cryptomining.DATA",
+      "bytes": 552,
+      "sha256": "bdee796bf07922c152d770cd5928955f1b12c12515c4db6fc0ab8d2ad0c44c4e"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Mu/Entities.DATA",
+      "bytes": 69999,
+      "sha256": "f6e93c83d9e3cfdff064535647cee76fc85aa1c86fd22a93dcf3d2c377346d94"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Mu/Fingerprinting.DATA",
+      "bytes": 1113,
+      "sha256": "05b29240a28bb75b4535d558edc510eb92df0ac27e9502498b99cdbc576b8298"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Mu/LICENSE.DATA",
+      "bytes": 35147,
+      "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Mu/Other.DATA",
+      "bytes": 34,
+      "sha256": "2b4a47b82cbe70e34407c7df126a24007aff8b45d5716db384d27cc1f3b30707"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Mu/Social.DATA",
+      "bytes": 754,
+      "sha256": "4955c3e7f56641a4ae0ce9c79b4ceee4b21733b0f6dedc980bf8d822a792eba2"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Mu/TransparentAdvertisers.DATA",
+      "bytes": 105,
+      "sha256": "d2cd0bef5f45daf490c53e705d6f67dfe12390c72a00efa6f5117432bd8edb8c"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Sigma/Advertising.DATA",
+      "bytes": 21511,
+      "sha256": "5c62ee354070033dba1bad40dcde115a81db45943b2274fae7059a5aa5c61d33"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Sigma/Analytics.DATA",
+      "bytes": 3349,
+      "sha256": "d303be86132f8d7131941d41736694c2e29647ebaeccb38c0976fe66616ec8af"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Sigma/Content.DATA",
+      "bytes": 5938,
+      "sha256": "70c295600066e9d3feeacd6bfc735bbcac6243694e4259477822d3db252729e1"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Sigma/Cryptomining.DATA",
+      "bytes": 32,
+      "sha256": "696e930706b5d391eb8778f73b0627ffc2be7f6c9a3e7659170d9d37fc4a97b5"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Sigma/Entities.DATA",
+      "bytes": 131834,
+      "sha256": "a5409d2c6a8cbd9339a95a5e09fcaedd4546a49d47fc4ebeda2d8749cfc66987"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Sigma/Fingerprinting.DATA",
+      "bytes": 2307,
+      "sha256": "5306139881e81eebffd97de016130fdbb04e3ae976d94ad7a74e5dee63fbafcd"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Sigma/LICENSE.DATA",
+      "bytes": 66,
+      "sha256": "44071e0fcffb9a9a32e8fa7010bb18dbc41afd0b176f81bf700b15b638a88a51"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Sigma/Other.DATA",
+      "bytes": 34,
+      "sha256": "2b4a47b82cbe70e34407c7df126a24007aff8b45d5716db384d27cc1f3b30707"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Sigma/Social.DATA",
+      "bytes": 3434,
+      "sha256": "28ac79097cf67587a228fdfe4746a1a9b31dae94d5a63bb3fcaa82443d69e7af"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/Sigma/Staging.DATA",
+      "bytes": 1361,
+      "sha256": "f90f4cb0976a046e93978971b58fba24bc93b0129e8612fdd0e5646a1bebed22"
+    },
+    {
+      "path": "ResiliencyLinks/Trust Protection Lists/trust_protection_lists.bin.DATA",
+      "bytes": 241960,
+      "sha256": "bfceac1ea10e376b91e2e158d4cd90b4f25882567a2dfb774c3350b0d44496ed"
+    },
+    {
+      "path": "ResiliencyLinks/v8_context_snapshot.bin.DATA",
+      "bytes": 770184,
+      "sha256": "7762651e640d5a9140b5a7763426d7bfbc155dbdc0ea0978f0745b622e129b55"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square150x150Logo.scale-100.png.DATA",
+      "bytes": 5679,
+      "sha256": "3e1e8531b44780927616ba57ed049739b0688054cf79902f316d728121b30c20"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square150x150Logo.scale-125.png.DATA",
+      "bytes": 9097,
+      "sha256": "24dca41c8493f5489ede402fc1db1fba4cf352ce1c97b2f457d439e05f009aec"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square150x150Logo.scale-150.png.DATA",
+      "bytes": 11516,
+      "sha256": "de0b8248d74d0842f134759a42df2effbd09fda27329094771547b1911768906"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square150x150Logo.scale-200.png.DATA",
+      "bytes": 16451,
+      "sha256": "46d2a464c7a68e42dd2fd94786062097886b92ff774bfb3e81b2637c2a47fac9"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square150x150Logo.scale-400.png.DATA",
+      "bytes": 51853,
+      "sha256": "be286065381c7f3cf76d16b9edbe138fcfdf54121636d73e8b81ea61bda4c230"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square310x310Logo.scale-100.png.DATA",
+      "bytes": 13312,
+      "sha256": "216dd7f008b2db23c8b52154431cbafacffd5369922c6f770444a461468fc470"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square310x310Logo.scale-125.png.DATA",
+      "bytes": 21388,
+      "sha256": "e0a2a162d7af07f90a9c61390868b5b45b224b7efe217a9536ae983aa4558331"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square310x310Logo.scale-150.png.DATA",
+      "bytes": 25891,
+      "sha256": "19238e710039b72ca9a5c90aadf19f9b2ade248ff11fbb1da40eb00658cb417c"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square310x310Logo.scale-200.png.DATA",
+      "bytes": 42326,
+      "sha256": "20c8ef43c52f9b73ec06fa21dfdcf1c4f2eff383ba585cc9eb126509928ddcfb"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square310x310Logo.scale-400.png.DATA",
+      "bytes": 141040,
+      "sha256": "466c3da61c83b21a05a17936a51193ec4d3144e4a05807e11daeca808a25bbeb"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.scale-100.png.DATA",
+      "bytes": 1729,
+      "sha256": "1f89f703e128486a60ca278656237c9a2f0565cdedd47032668b769bea0161d9"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.scale-125.png.DATA",
+      "bytes": 2119,
+      "sha256": "9e45a0e43debaff3e0658dd14eacc60e20e58be33531107a5c9d5e13279873d4"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.scale-150.png.DATA",
+      "bytes": 2879,
+      "sha256": "bfca667f88a471d52df94892f94f13f99f4f843dad99861802d8096990e873e8"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.scale-200.png.DATA",
+      "bytes": 4393,
+      "sha256": "19524b0d0620625343d6d405215b53145e19ab65c87a6538505d899c3d0a52a2"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.scale-400.png.DATA",
+      "bytes": 12215,
+      "sha256": "8105a8f455ee67c4e0dbe36357213d8ad1c6ce9c3b8b83ef37514738a693a33c"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-16.png.DATA",
+      "bytes": 712,
+      "sha256": "7178dd5bc48d6ff995828f3f2a7906065d793ce4970f85afc1e77b2790ae49d4"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-16_altform-lightunplated.png.DATA",
+      "bytes": 712,
+      "sha256": "7178dd5bc48d6ff995828f3f2a7906065d793ce4970f85afc1e77b2790ae49d4"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-16_altform-unplated.png.DATA",
+      "bytes": 712,
+      "sha256": "7178dd5bc48d6ff995828f3f2a7906065d793ce4970f85afc1e77b2790ae49d4"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-24.png.DATA",
+      "bytes": 1094,
+      "sha256": "64f6457f930d6f430f8b3406e21975e3ad6fd02b6e3a3e87f89859482af44553"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-24_altform-lightunplated.png.DATA",
+      "bytes": 1094,
+      "sha256": "64f6457f930d6f430f8b3406e21975e3ad6fd02b6e3a3e87f89859482af44553"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-24_altform-unplated.png.DATA",
+      "bytes": 1094,
+      "sha256": "64f6457f930d6f430f8b3406e21975e3ad6fd02b6e3a3e87f89859482af44553"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-256.png.DATA",
+      "bytes": 36011,
+      "sha256": "f9d61c7401470e90dca42059ceab50cd0c205e3831d087e6208a333ee3f88191"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-256_altform-lightunplated.png.DATA",
+      "bytes": 36011,
+      "sha256": "f9d61c7401470e90dca42059ceab50cd0c205e3831d087e6208a333ee3f88191"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-256_altform-unplated.png.DATA",
+      "bytes": 36011,
+      "sha256": "f9d61c7401470e90dca42059ceab50cd0c205e3831d087e6208a333ee3f88191"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-32.png.DATA",
+      "bytes": 1673,
+      "sha256": "8fd64f98c8f3895a2937fd7ae858fa148f7d629c9099d058c4ad04079e6577e4"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-32_altform-lightunplated.png.DATA",
+      "bytes": 1673,
+      "sha256": "8fd64f98c8f3895a2937fd7ae858fa148f7d629c9099d058c4ad04079e6577e4"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-32_altform-unplated.png.DATA",
+      "bytes": 1673,
+      "sha256": "8fd64f98c8f3895a2937fd7ae858fa148f7d629c9099d058c4ad04079e6577e4"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-48.png.DATA",
+      "bytes": 2737,
+      "sha256": "b990991aa8214801f70c972eab9ac5bc51b86661e23dfe2ebb42dce717122570"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-48_altform-lightunplated.png.DATA",
+      "bytes": 2737,
+      "sha256": "b990991aa8214801f70c972eab9ac5bc51b86661e23dfe2ebb42dce717122570"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square44x44Logo.targetsize-48_altform-unplated.png.DATA",
+      "bytes": 2737,
+      "sha256": "b990991aa8214801f70c972eab9ac5bc51b86661e23dfe2ebb42dce717122570"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square71x71Logo.scale-100.png.DATA",
+      "bytes": 3769,
+      "sha256": "39bcefbfe5d46cb4dedfc36177c91aa5ca5cd42e05531e75c7a5f1355b870c35"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square71x71Logo.scale-125.png.DATA",
+      "bytes": 6049,
+      "sha256": "4ff1db37946cb4d34c11545aff788a39fdbbfd143dcbf8222f4ac99a10fbbba6"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square71x71Logo.scale-150.png.DATA",
+      "bytes": 7594,
+      "sha256": "614bd7e65dabd5f203e34f074f5c18c6dd42ff7073c40c0c2b72a9e69f6a04f8"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square71x71Logo.scale-200.png.DATA",
+      "bytes": 10936,
+      "sha256": "b2f760b68afc7bb7707ca22113a1d7d768f5d526e2ed9a312e1ae87706ef5802"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Square71x71Logo.scale-400.png.DATA",
+      "bytes": 32337,
+      "sha256": "0ce42ff7cb2160610c72406faf179ba97abafb1e3a41af0c72c53667500eff3f"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/StoreLogo.scale-100.png.DATA",
+      "bytes": 1924,
+      "sha256": "d8b68b8f2b711d6d0e6c70e3eefb9849b230eab09898ba2cc41f875147dc88e5"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/StoreLogo.scale-125.png.DATA",
+      "bytes": 2870,
+      "sha256": "89f442b13a396dca2e5dced1b163a97ec0135cacba3852d197ef059a42173048"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/StoreLogo.scale-150.png.DATA",
+      "bytes": 3581,
+      "sha256": "372d66f1f3f98b6bb73cd390ea536d264bfcac2013a8006d4ff120b0a9c4c6fd"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/StoreLogo.scale-200.png.DATA",
+      "bytes": 4807,
+      "sha256": "9b9227b3cad28d7588336fdaa347a7549a3287e956d05f1800cb1f5836292a0a"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/StoreLogo.scale-400.png.DATA",
+      "bytes": 13726,
+      "sha256": "8e1c8b92bf111e1031b04ace4bc7f445c5d99ee6ae9bd1a15254044276d10be2"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Wide310x150Logo.scale-100.png.DATA",
+      "bytes": 5958,
+      "sha256": "af9949879e4219aeacd0fab8508396eec04f92eba203831bc5ba0f656ad59d47"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Wide310x150Logo.scale-125.png.DATA",
+      "bytes": 9551,
+      "sha256": "4d5d40e86ffaf34ba6ae66a5f1e77aef14c191326d940d1da5073142d124b318"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Wide310x150Logo.scale-150.png.DATA",
+      "bytes": 12372,
+      "sha256": "fb163ab50c56a128e4134ab2ec7c1285d7f029a8840071f364af72837be0ea75"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Wide310x150Logo.scale-200.png.DATA",
+      "bytes": 17896,
+      "sha256": "96778a1c701d12fa2f008cb66cf25faeb22d6d2b6b8436b461a02d7869c530a4"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotAppStable/Wide310x150Logo.scale-400.png.DATA",
+      "bytes": 57790,
+      "sha256": "da0549ed8ef2b50a129d306551b3f2a92635fe382b3dd1370ede55b01563cab2"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square150x150Logo.scale-100.png.DATA",
+      "bytes": 5959,
+      "sha256": "c47bac6254a1bfba81c4ee148996190d50dbe1d7e8852d4c15a15264be536932"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square150x150Logo.scale-125.png.DATA",
+      "bytes": 8755,
+      "sha256": "803ac015d066b56113372cbe6ced289408abaf6e4db8b394e9662917faa342f0"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square150x150Logo.scale-150.png.DATA",
+      "bytes": 12117,
+      "sha256": "444f1a53274b4056b6c2af899405169b6013d3b850ee244e17fcf3fa3e613be6"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square150x150Logo.scale-200.png.DATA",
+      "bytes": 16994,
+      "sha256": "9bf6222c685b307badb8652f15c98f69ceb667f358815322316a1cb9ea19ab70"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square150x150Logo.scale-400.png.DATA",
+      "bytes": 52538,
+      "sha256": "aba3aed7773b241d6afb5990f816abf41f470a1798d015e843f20a2c7f4ce697"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square310x310Logo.scale-100.png.DATA",
+      "bytes": 13761,
+      "sha256": "fa5f9a6131c990b77b14b78191f5a2cc2e1a895bc25d2938b4a0a1cbf673bd45"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square310x310Logo.scale-125.png.DATA",
+      "bytes": 21317,
+      "sha256": "e78953da3c55b2c236a1cc3d90c62e0d98ed15e3ac65adeefa400286bd42b7dc"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square310x310Logo.scale-150.png.DATA",
+      "bytes": 26515,
+      "sha256": "ca6938203e564469501c05f9d8ca8bf974151c300aa2e435b8724638e4c3ff99"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square310x310Logo.scale-200.png.DATA",
+      "bytes": 42558,
+      "sha256": "770d0ae1859f7fe2416aac9e2334f9463d3e6872b798b6a9b75acf7118559c98"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square310x310Logo.scale-400.png.DATA",
+      "bytes": 138820,
+      "sha256": "d1f3cee65852cf462ed497e031063655f7e772bc19e3f7b2a2ea7060ebb8b5d1"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.scale-100.png.DATA",
+      "bytes": 1666,
+      "sha256": "08d903ae8340ddfeb6a021165b98aa22934c8af88284e024fbdc929ae81adff9"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.scale-125.png.DATA",
+      "bytes": 2264,
+      "sha256": "70b13c68a18b67a7c90ff9170d8d22c88a1d869bb617ebe37fefac3f7dc2cadd"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.scale-150.png.DATA",
+      "bytes": 2972,
+      "sha256": "b9e9c91121bc1fea270de92a65a0775bbf1f2dfd082a06d5913234f83c9764f6"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.scale-200.png.DATA",
+      "bytes": 4320,
+      "sha256": "8562b604ae1fa2f28b294233892007036cfa2cfdcee893dbbc4680372f566f97"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.scale-400.png.DATA",
+      "bytes": 11841,
+      "sha256": "20eb0f54833a93cc7cb018db080fa607dd9ccdd9142e4e183343b07c3e4a12d5"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-16.png.DATA",
+      "bytes": 676,
+      "sha256": "d4c83595780905a7a802103e51890b5943d27dd6ddf39b585571ab99db3bb448"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-16_altform-lightunplated.png.DATA",
+      "bytes": 694,
+      "sha256": "6bd79374381bf669360e2c852b2f5cf4680d972c30eff7f861d1959f2c48c2ee"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-16_altform-unplated.png.DATA",
+      "bytes": 676,
+      "sha256": "d4c83595780905a7a802103e51890b5943d27dd6ddf39b585571ab99db3bb448"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-24.png.DATA",
+      "bytes": 1158,
+      "sha256": "75cc3b4fa4a6df9e814aed8604185044cabf5672fefbba78abc9040c72e8f23b"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-24_altform-lightunplated.png.DATA",
+      "bytes": 1191,
+      "sha256": "9d0f3e54761f32ed4f059159a191f4237435eeb5f3f03079b1888fa734e5e23f"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-24_altform-unplated.png.DATA",
+      "bytes": 1158,
+      "sha256": "75cc3b4fa4a6df9e814aed8604185044cabf5672fefbba78abc9040c72e8f23b"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-256.png.DATA",
+      "bytes": 33527,
+      "sha256": "39f15d2cf5c8890dc30ffe124c6087255c1574911671ba58ea01da34166960ef"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-256_altform-lightunplated.png.DATA",
+      "bytes": 36221,
+      "sha256": "3cdc34a70bb08eaded4060ba1ce9e4cfa73757bba21ac9820dd8b3e700d1b204"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-256_altform-unplated.png.DATA",
+      "bytes": 33527,
+      "sha256": "39f15d2cf5c8890dc30ffe124c6087255c1574911671ba58ea01da34166960ef"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-32.png.DATA",
+      "bytes": 1611,
+      "sha256": "730a6b7e4b84888b7516f3dbe556537e40a70e863e5a415c3684219d10843225"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-32_altform-lightunplated.png.DATA",
+      "bytes": 1685,
+      "sha256": "501d1e99a8e938dfbc73b51198061181f9703faf4e5c8b565f57edf379851303"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-32_altform-unplated.png.DATA",
+      "bytes": 1611,
+      "sha256": "730a6b7e4b84888b7516f3dbe556537e40a70e863e5a415c3684219d10843225"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-48.png.DATA",
+      "bytes": 2833,
+      "sha256": "37f6102ec9df23e3986a290f9f115303132b7802f928a7f8ec6ec9e0f4f7293d"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-48_altform-lightunplated.png.DATA",
+      "bytes": 3022,
+      "sha256": "2b5a2a018feb24cc73e451cb9d84680e3f15493e0c3e8475cc1f2c613fac842c"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square44x44Logo.targetsize-48_altform-unplated.png.DATA",
+      "bytes": 2833,
+      "sha256": "37f6102ec9df23e3986a290f9f115303132b7802f928a7f8ec6ec9e0f4f7293d"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square71x71Logo.scale-100.png.DATA",
+      "bytes": 4147,
+      "sha256": "ecaab46aa6b66cdb4d3b5039c963ac3dd183c5bd24dda44bc818abadf2757a4d"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square71x71Logo.scale-125.png.DATA",
+      "bytes": 6172,
+      "sha256": "ecc7817c43fe29c39b6240fdcc842b6f455d54f4b9271b04bdfc426abe980a99"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square71x71Logo.scale-150.png.DATA",
+      "bytes": 7758,
+      "sha256": "39c3bb03fdf0a67ad52c403b757d56834dc6dd383f894be5b88efae1ad1ec604"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square71x71Logo.scale-200.png.DATA",
+      "bytes": 11788,
+      "sha256": "7a1258f62a217c872daa8433c7a5605bdba7d991270d338780641aad2456ad71"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Square71x71Logo.scale-400.png.DATA",
+      "bytes": 34198,
+      "sha256": "73aac844e1168bb5ca688de8a99e8ba637ae1bfa24183689b4c7756aafb0f245"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/StoreLogo.scale-100.png.DATA",
+      "bytes": 2061,
+      "sha256": "91f2bc06ac2aadb4c1aa858d55b1cae5914b92b16df9db2b0ec730b5ddd82bd7"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/StoreLogo.scale-125.png.DATA",
+      "bytes": 2941,
+      "sha256": "43ba6a64ad6fcd8fabf356f61844f731d62ac8cfd13f8685e01e9da5edece12b"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/StoreLogo.scale-150.png.DATA",
+      "bytes": 3608,
+      "sha256": "887f65825e2ea1d1b752a0bcbb941628a46b6721815a906852fb533c30d606a7"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/StoreLogo.scale-200.png.DATA",
+      "bytes": 5141,
+      "sha256": "f6bdf46def2efcc0895deae0e67a217cd05a24cdadefd0c4cd5ef4d8c46f2a02"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/StoreLogo.scale-400.png.DATA",
+      "bytes": 14499,
+      "sha256": "b63f98724bc1e380f2f4d76a5a7b167a2df285fdc49f151e36011e2ac485c2ee"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Wide310x150Logo.scale-100.png.DATA",
+      "bytes": 6215,
+      "sha256": "2dc22368cd31e0e4405e95de122e6a4d3757cc54e87ec981e5975f1ed7129b0a"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Wide310x150Logo.scale-125.png.DATA",
+      "bytes": 9400,
+      "sha256": "0b70c28419c41f2097659fcdd9766918337813d43f74ea280e223f4e193d078c"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Wide310x150Logo.scale-150.png.DATA",
+      "bytes": 12960,
+      "sha256": "b404219aca8d899a658247f5c355030217673fa1f24c8b1d735af81c790b79fc"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Wide310x150Logo.scale-200.png.DATA",
+      "bytes": 18432,
+      "sha256": "09818bd6f958fe66255b78d94fcbeda453d95a8593b7befd9cf72eee67475f17"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotDev/Wide310x150Logo.scale-400.png.DATA",
+      "bytes": 59010,
+      "sha256": "3e62242d121fbfd45f13c9a89c115e5a8f5f547eda88394dc536c0f43d3cf230"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square150x150Logo.scale-100.png.DATA",
+      "bytes": 3332,
+      "sha256": "dfd4c03450db10284801be677afd8124ff78ca84605bd00c527b008e472abd97"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square150x150Logo.scale-125.png.DATA",
+      "bytes": 4364,
+      "sha256": "5fb6f0a532bbb0e6bc6853324c203fabcdfa7347bd0497c7ad725b81aab6513f"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square150x150Logo.scale-150.png.DATA",
+      "bytes": 5690,
+      "sha256": "9e9229cbb0b7e17bf689f2171bdb2046367867ae083991ca7eed306c61629ec7"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square150x150Logo.scale-200.png.DATA",
+      "bytes": 8255,
+      "sha256": "584afa296caff0c21eb276e5fc001f95c12db5c5edcf01a3e6df5fa1d4f6a68c"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square150x150Logo.scale-400.png.DATA",
+      "bytes": 21941,
+      "sha256": "b314b8f57783772973d5ecd23fa73871a987f34ce417cf81467a30327390e84a"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square310x310Logo.scale-100.png.DATA",
+      "bytes": 8500,
+      "sha256": "5b174f22a2f1de898a07b68852dadbc13c20f366271839a98a0f3b9669cfc926"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square310x310Logo.scale-125.png.DATA",
+      "bytes": 11809,
+      "sha256": "5302514b2ce7575cc9cd6493b550489ed47bd791a55ae3b860dd13af05163348"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square310x310Logo.scale-150.png.DATA",
+      "bytes": 15054,
+      "sha256": "6f49b090e1a529aa77a3791da20dcd812f21eba3676573354169f98fdfd82414"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square310x310Logo.scale-200.png.DATA",
+      "bytes": 23015,
+      "sha256": "417c9c3430433c4258ec6f8e8e2bdb805907fa432b735c081cdd90c98f842663"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square310x310Logo.scale-400.png.DATA",
+      "bytes": 67290,
+      "sha256": "2f7a260eb90e460544d4f19cfd07d37311804c8dc196a794bbf0b724d9200fbe"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.scale-100.png.DATA",
+      "bytes": 1854,
+      "sha256": "622da209a7d65d1ca1bcbe7cd30530394a08ede7ad5d5c216880f1bd4e16cec7"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.scale-125.png.DATA",
+      "bytes": 2526,
+      "sha256": "319872a38d59fe8ed44fee0f0f1f3563fc346bca6541cbe887bc187f6aa039e3"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.scale-150.png.DATA",
+      "bytes": 3214,
+      "sha256": "e2674d714196905d3dbd17f2d7ca959c85ed3cd96ce109a6346a9a50fdeb23d9"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.scale-200.png.DATA",
+      "bytes": 4530,
+      "sha256": "e2c82b79b4a0eff6f68e0c735efd914b45aa217c7e7577dd799e010852c6a65b"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.scale-400.png.DATA",
+      "bytes": 11211,
+      "sha256": "654b8a18e9babbfb9cd165fae3c78e09ea5ee339670a772ae56ed430ffb772d7"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-16.png.DATA",
+      "bytes": 733,
+      "sha256": "e350f572722e0283882cc0b025a017e0d2af86f27f7bc4aa0d43a947f7f34b9f"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-16_altform-lightunplated.png.DATA",
+      "bytes": 733,
+      "sha256": "e350f572722e0283882cc0b025a017e0d2af86f27f7bc4aa0d43a947f7f34b9f"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-16_altform-unplated.png.DATA",
+      "bytes": 693,
+      "sha256": "765fd8cc48b6a4b1555241bf891b268761d157a16677c66f22a3b870dffb2c80"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-24.png.DATA",
+      "bytes": 1242,
+      "sha256": "99b7b5b3c4e65cd3698b84f63843b46c3fed43890acedacb0a8a1216c780de0c"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-24_altform-lightunplated.png.DATA",
+      "bytes": 1242,
+      "sha256": "99b7b5b3c4e65cd3698b84f63843b46c3fed43890acedacb0a8a1216c780de0c"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-24_altform-unplated.png.DATA",
+      "bytes": 1069,
+      "sha256": "2d1afaa893144238ed0ba9029d790aca78ee6be545ec3abfce16ebcaf9b3ad42"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-256.png.DATA",
+      "bytes": 18522,
+      "sha256": "0c9d897605c2d7f3d8651af5da42f4cddcafeb5e3723e70ce8be43fad23ac938"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-256_altform-lightunplated.png.DATA",
+      "bytes": 26968,
+      "sha256": "82f48acd1a1f01068015f1cbbbff6e824680654865cef25d51f1b93172c00a7d"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-256_altform-unplated.png.DATA",
+      "bytes": 18522,
+      "sha256": "0c9d897605c2d7f3d8651af5da42f4cddcafeb5e3723e70ce8be43fad23ac938"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-32.png.DATA",
+      "bytes": 1815,
+      "sha256": "587931975cfa3e99eb58c0eb9dda54426570a168fe1069f947cf28b0bce9d01d"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-32_altform-lightunplated.png.DATA",
+      "bytes": 1815,
+      "sha256": "587931975cfa3e99eb58c0eb9dda54426570a168fe1069f947cf28b0bce9d01d"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-32_altform-unplated.png.DATA",
+      "bytes": 1567,
+      "sha256": "e4002fa6646b95ee9b10a8007643afdd1c3cd25b1ebe63a82a5c9223be6040f4"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-48.png.DATA",
+      "bytes": 2999,
+      "sha256": "0cc26eeb19dff61cf0c5b28d10d89eaa771b1596a95d3a469a79262fad7c283c"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-48_altform-lightunplated.png.DATA",
+      "bytes": 2999,
+      "sha256": "0cc26eeb19dff61cf0c5b28d10d89eaa771b1596a95d3a469a79262fad7c283c"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square44x44Logo.targetsize-48_altform-unplated.png.DATA",
+      "bytes": 2739,
+      "sha256": "fc0d83820988419f8e6e952fff4e48b5641b5398af639829456d5b0af2d99ce0"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square71x71Logo.scale-100.png.DATA",
+      "bytes": 2111,
+      "sha256": "eb9fb4ba49edfb0559ea7166eefb92ee2225abce94f7fdba00568b1c407ca01c"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square71x71Logo.scale-125.png.DATA",
+      "bytes": 2811,
+      "sha256": "25ad779810d29bd6b4c7b21ec15a252274576ba716b82189c476689100ba1e86"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square71x71Logo.scale-150.png.DATA",
+      "bytes": 3474,
+      "sha256": "c8c1a3b483f2b0ba57a3e6aff7ee52ff242910904191f44019b480e592c336ac"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square71x71Logo.scale-200.png.DATA",
+      "bytes": 5001,
+      "sha256": "f72572d70b0cea3840083908bc650351d220e5cb03a7927841dfa2d96a2a97d9"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Square71x71Logo.scale-400.png.DATA",
+      "bytes": 12960,
+      "sha256": "1ea542ef282247fce202b78eab5d9aa8b3d9da45186a4e2d7f55e9eff2643064"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/StoreLogo.scale-100.png.DATA",
+      "bytes": 3125,
+      "sha256": "1183fb06941b6bc0e9c39bd104747c4856698fe4fed92f1f0d650551bccf7e13"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/StoreLogo.scale-125.png.DATA",
+      "bytes": 4198,
+      "sha256": "d3bf18a9679edddb80c36eb99a157e8dc96491554f80d74573560090009e4163"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/StoreLogo.scale-150.png.DATA",
+      "bytes": 5285,
+      "sha256": "8b2f72912f932be07dc8f45bd9e13b1c8eaf0a7fa6ecbc9af344d61b1f7d0701"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/StoreLogo.scale-200.png.DATA",
+      "bytes": 7520,
+      "sha256": "6838afa2acf4c942c34b53a6abc752d53f136d519dbc3cb73813b9c6f8092cf4"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/StoreLogo.scale-400.png.DATA",
+      "bytes": 19029,
+      "sha256": "cf7108ee6a3520ac4562aff7c337787804f9794aaa31ef694de31aa9c019ef70"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Wide310x150Logo.scale-100.png.DATA",
+      "bytes": 3534,
+      "sha256": "419a4851e4011a2b3ad6bc8f489c0d82af9ec619832dd2c1e81a9febf6c4c21e"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Wide310x150Logo.scale-125.png.DATA",
+      "bytes": 4649,
+      "sha256": "a27e88c0fa96c7a6344e65cd72b9764e9a9278b2944b69a000e073c7f0943335"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Wide310x150Logo.scale-150.png.DATA",
+      "bytes": 6113,
+      "sha256": "0738922ba4f22b6ce38097d2645055ec40fc89d1ee31cb0b9a33728efd7badc6"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Wide310x150Logo.scale-200.png.DATA",
+      "bytes": 8972,
+      "sha256": "24cfa266b8c42244c590aeb01f9ccabfbc02cf2cbcb7a7f96e4fdb097aba03f9"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/CopilotStable/Wide310x150Logo.scale-400.png.DATA",
+      "bytes": 24709,
+      "sha256": "1a9f83fa021f98046e2793c6bcadd8ce58606b80146a3911782fc058f1db5d7d"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/Logo.png.DATA",
+      "bytes": 29175,
+      "sha256": "4eaf8c7a247db0985bb8c0412c00c9cdda927f27b5c333f855f0b4f5043fd120"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/LogoBeta.png.DATA",
+      "bytes": 27112,
+      "sha256": "d2c06cae33602d7a49c718f5e079f9c0abdeab899d26c4c1ff7f0fbeb37ecf30"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/LogoCanary.png.DATA",
+      "bytes": 27333,
+      "sha256": "86b786370f51a6cec29b7cc6092a56274a60bbaf361391e1844263b09c7012c7"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/LogoCopilot.png.DATA",
+      "bytes": 21941,
+      "sha256": "b314b8f57783772973d5ecd23fa73871a987f34ce417cf81467a30327390e84a"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/LogoCopilotApp.png.DATA",
+      "bytes": 51853,
+      "sha256": "be286065381c7f3cf76d16b9edbe138fcfdf54121636d73e8b81ea61bda4c230"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/LogoCopilotDev.png.DATA",
+      "bytes": 52538,
+      "sha256": "aba3aed7773b241d6afb5990f816abf41f470a1798d015e843f20a2c7f4ce697"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/LogoDev.png.DATA",
+      "bytes": 27104,
+      "sha256": "cc5674d80cb4484f16c03b273662b732c4465d34cdd5038990983601589456d6"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/ResearcherOn.png.DATA",
+      "bytes": 7057,
+      "sha256": "af406717e7ae9f3b33da27fd9572ddfd193818a3d6f729bd0319c6818fe11f04"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/resources.dev.pri.DATA",
+      "bytes": 79368,
+      "sha256": "2f38fd92ce7af301490481e42eec2dac76ff46bc450b8a3ef0e6839b8d81bc20"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/resources.internal.pri.DATA",
+      "bytes": 79384,
+      "sha256": "629a2bfbb123b06b7950454069c4dd23569aa279351e34fa18285e56a5baa065"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/resources.officehub.dev.pri.DATA",
+      "bytes": 79408,
+      "sha256": "bed8fcb733b93fcf58151da68d676498bba64a4d268a734442dad5eaa9d00c8b"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/resources.officehub.internal.pri.DATA",
+      "bytes": 79432,
+      "sha256": "0355e331ac51ea9b84b51953a990d7ba8a591981b6dae0437d5fd685f8ff64df"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/resources.officehub.pri.DATA",
+      "bytes": 79392,
+      "sha256": "4184810aa8ce32c54ce658e8a01ef2ee3581818a926cc4b6b54f4c844672cc71"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/resources.pri.DATA",
+      "bytes": 79352,
+      "sha256": "074327df71135fc55d9589eacdfd0a55571e217d0cdd1d9ef9ed0d3987f2300a"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/SmallLogo.png.DATA",
+      "bytes": 14830,
+      "sha256": "b228b0337b1a34287b92d8bc3df91ba817a358d07ffc610e452244873b0b317c"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/SmallLogoBeta.png.DATA",
+      "bytes": 14316,
+      "sha256": "9d1a28640320bd4560a3f43127be8df02e5c4a0a18da725db359ab8b262a3bee"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/SmallLogoCanary.png.DATA",
+      "bytes": 13874,
+      "sha256": "d9c92117542208cc96b91f78deef5c1f44369e2fd4a8bfde80a83cb2c7c7d6bc"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/SmallLogoCopilot.png.DATA",
+      "bytes": 11211,
+      "sha256": "654b8a18e9babbfb9cd165fae3c78e09ea5ee339670a772ae56ed430ffb772d7"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/SmallLogoCopilotApp.png.DATA",
+      "bytes": 12215,
+      "sha256": "8105a8f455ee67c4e0dbe36357213d8ad1c6ce9c3b8b83ef37514738a693a33c"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/SmallLogoCopilotDev.png.DATA",
+      "bytes": 11841,
+      "sha256": "20eb0f54833a93cc7cb018db080fa607dd9ccdd9142e4e183343b07c3e4a12d5"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/SmallLogoDev.png.DATA",
+      "bytes": 13783,
+      "sha256": "38069508ca742cf17efe8dd8ba5ac5686ebcf7b8387ad9ea48b4d006e857380e"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/vision.contrast-black.svg.DATA",
+      "bytes": 1697,
+      "sha256": "d0e67f345be87b0b594769487c2058783dc64be0ce486ee4ce2b0d982eaa388b"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/vision.contrast-white.svg.DATA",
+      "bytes": 1697,
+      "sha256": "4574b3b61dcbfe4b9910ef218ce308c363a6d4a5629e47384b34b36d2d4b1758"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/vision.svg.DATA",
+      "bytes": 1702,
+      "sha256": "2643fc75bcc01ab8df55ca53690d3b3b6f0c3f734747055c0deb4dfdc1f9e790"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/vision.theme-dark.svg.DATA",
+      "bytes": 1697,
+      "sha256": "d0e67f345be87b0b594769487c2058783dc64be0ce486ee4ce2b0d982eaa388b"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/vision.theme-light.svg.DATA",
+      "bytes": 1702,
+      "sha256": "2643fc75bcc01ab8df55ca53690d3b3b6f0c3f734747055c0deb4dfdc1f9e790"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/voice.contrast-black.svg.DATA",
+      "bytes": 1155,
+      "sha256": "6682eabc1213a4a061acfa0eb120f28a858ed5d781d4eea0e0002da0cd8f4a4a"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/voice.contrast-white.svg.DATA",
+      "bytes": 1155,
+      "sha256": "b53e2ffcc3b495c639255961d4e250591e33d71e17b60346b3fce281f2f77c55"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/voice.svg.DATA",
+      "bytes": 1160,
+      "sha256": "3bce7881de3bb31c51c4632c5a663069f634f3012979fca3fdf1ce47f940fdfe"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/voice.theme-dark.svg.DATA",
+      "bytes": 1155,
+      "sha256": "6682eabc1213a4a061acfa0eb120f28a858ed5d781d4eea0e0002da0cd8f4a4a"
+    },
+    {
+      "path": "ResiliencyLinks/VisualElements/voice.theme-light.svg.DATA",
+      "bytes": 1160,
+      "sha256": "3bce7881de3bb31c51c4632c5a663069f634f3012979fca3fdf1ce47f940fdfe"
+    },
+    {
+      "path": "ResiliencyLinks/vk_swiftshader_icd.json.DATA",
+      "bytes": 106,
+      "sha256": "32d83ff113fef532a9f97e0d2831f8656628ab1c99e9060f0332b1532839afd9"
+    },
+    {
+      "path": "ResiliencyLinks/WidevineCdm/_platform_specific/win_x64/widevinecdm.dll.sig.DATA",
+      "bytes": 1389,
+      "sha256": "431956dc1e7a00f2ca6cc3ae2d50927cace7d45c2a3de4642922459562c33ab8"
+    },
+    {
+      "path": "ResiliencyLinks/WidevineCdm/LICENSE.DATA",
+      "bytes": 473,
+      "sha256": "20de375707692099b3132084695377ce5fec0aec05813dedcce094b8eda44386"
+    },
+    {
+      "path": "ResiliencyLinks/WidevineCdm/manifest.json.DATA",
+      "bytes": 1002,
+      "sha256": "dca3cd7a673d0776a085c0b8958a85bdd8392923db21a0b55f4d37210f752322"
+    },
+    {
+      "path": "resources.pak",
+      "bytes": 34062176,
+      "sha256": "982f0c5f0a51b95be8849a3726f9f2c1e20326c3d415869155af19393d7908f6"
+    },
+    {
+      "path": "show_third_party_software_licenses.bat",
+      "bytes": 270,
+      "sha256": "3e867e263b64592b2dad5c334b6aa46d0bb46a20aa0db01c5ff08c707c3e148d"
+    },
+    {
+      "path": "telclient.dll",
+      "bytes": 4119368,
+      "sha256": "ed640ecab38880d5be7d5664247021c8e04564ab7d2456143fb72e4a726909d3"
+    },
+    {
+      "path": "textInputMethod.sccd",
+      "bytes": 18615,
+      "sha256": "f88664c021237bbc0299b5ae3f5686b915e3007bf2902be8186ad847476447bf"
+    },
+    {
+      "path": "Trust Protection Lists/manifest.json",
+      "bytes": 132,
+      "sha256": "de864bf0ab8abacfba536d4e9764eca658f903bd2457f955e128c4ee181c7e58"
+    },
+    {
+      "path": "Trust Protection Lists/Mu/Advertising",
+      "bytes": 19889,
+      "sha256": "231be4e0be45f588b161634c816b9a5a49f530c0dcb55461d37715a94482dca1"
+    },
+    {
+      "path": "Trust Protection Lists/Mu/Analytics",
+      "bytes": 4036,
+      "sha256": "bba2063d20d70f4ab06dc2ae04c2564cc2b8c631b6dab68248957dbdf107fdd2"
+    },
+    {
+      "path": "Trust Protection Lists/Mu/CompatExceptions",
+      "bytes": 689,
+      "sha256": "5b462316a51c918d0bae95959bf827cb9c72bbd84ffb0e43b750aa91fbf3ba53"
+    },
+    {
+      "path": "Trust Protection Lists/Mu/Content",
+      "bytes": 4486,
+      "sha256": "9a63f38e22b8573cbd47a4ef7b67ccb0934b87239e075c5cfafc7a1014e340c6"
+    },
+    {
+      "path": "Trust Protection Lists/Mu/Cryptomining",
+      "bytes": 552,
+      "sha256": "bdee796bf07922c152d770cd5928955f1b12c12515c4db6fc0ab8d2ad0c44c4e"
+    },
+    {
+      "path": "Trust Protection Lists/Mu/Entities",
+      "bytes": 69999,
+      "sha256": "f6e93c83d9e3cfdff064535647cee76fc85aa1c86fd22a93dcf3d2c377346d94"
+    },
+    {
+      "path": "Trust Protection Lists/Mu/Fingerprinting",
+      "bytes": 1113,
+      "sha256": "05b29240a28bb75b4535d558edc510eb92df0ac27e9502498b99cdbc576b8298"
+    },
+    {
+      "path": "Trust Protection Lists/Mu/LICENSE",
+      "bytes": 35147,
+      "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+    },
+    {
+      "path": "Trust Protection Lists/Mu/Other",
+      "bytes": 34,
+      "sha256": "2b4a47b82cbe70e34407c7df126a24007aff8b45d5716db384d27cc1f3b30707"
+    },
+    {
+      "path": "Trust Protection Lists/Mu/Social",
+      "bytes": 754,
+      "sha256": "4955c3e7f56641a4ae0ce9c79b4ceee4b21733b0f6dedc980bf8d822a792eba2"
+    },
+    {
+      "path": "Trust Protection Lists/Mu/TransparentAdvertisers",
+      "bytes": 105,
+      "sha256": "d2cd0bef5f45daf490c53e705d6f67dfe12390c72a00efa6f5117432bd8edb8c"
+    },
+    {
+      "path": "Trust Protection Lists/Sigma/Advertising",
+      "bytes": 21511,
+      "sha256": "5c62ee354070033dba1bad40dcde115a81db45943b2274fae7059a5aa5c61d33"
+    },
+    {
+      "path": "Trust Protection Lists/Sigma/Analytics",
+      "bytes": 3349,
+      "sha256": "d303be86132f8d7131941d41736694c2e29647ebaeccb38c0976fe66616ec8af"
+    },
+    {
+      "path": "Trust Protection Lists/Sigma/Content",
+      "bytes": 5938,
+      "sha256": "70c295600066e9d3feeacd6bfc735bbcac6243694e4259477822d3db252729e1"
+    },
+    {
+      "path": "Trust Protection Lists/Sigma/Cryptomining",
+      "bytes": 32,
+      "sha256": "696e930706b5d391eb8778f73b0627ffc2be7f6c9a3e7659170d9d37fc4a97b5"
+    },
+    {
+      "path": "Trust Protection Lists/Sigma/Entities",
+      "bytes": 131834,
+      "sha256": "a5409d2c6a8cbd9339a95a5e09fcaedd4546a49d47fc4ebeda2d8749cfc66987"
+    },
+    {
+      "path": "Trust Protection Lists/Sigma/Fingerprinting",
+      "bytes": 2307,
+      "sha256": "5306139881e81eebffd97de016130fdbb04e3ae976d94ad7a74e5dee63fbafcd"
+    },
+    {
+      "path": "Trust Protection Lists/Sigma/LICENSE",
+      "bytes": 66,
+      "sha256": "44071e0fcffb9a9a32e8fa7010bb18dbc41afd0b176f81bf700b15b638a88a51"
+    },
+    {
+      "path": "Trust Protection Lists/Sigma/Other",
+      "bytes": 34,
+      "sha256": "2b4a47b82cbe70e34407c7df126a24007aff8b45d5716db384d27cc1f3b30707"
+    },
+    {
+      "path": "Trust Protection Lists/Sigma/Social",
+      "bytes": 3434,
+      "sha256": "28ac79097cf67587a228fdfe4746a1a9b31dae94d5a63bb3fcaa82443d69e7af"
+    },
+    {
+      "path": "Trust Protection Lists/Sigma/Staging",
+      "bytes": 1361,
+      "sha256": "f90f4cb0976a046e93978971b58fba24bc93b0129e8612fdd0e5646a1bebed22"
+    },
+    {
+      "path": "Trust Protection Lists/trust_protection_lists.bin",
+      "bytes": 241960,
+      "sha256": "bfceac1ea10e376b91e2e158d4cd90b4f25882567a2dfb774c3350b0d44496ed"
+    },
+    {
+      "path": "unified_copilot_telemetry.dll",
+      "bytes": 1789768,
+      "sha256": "4d5fbb9d3de434b7d2598f25cfc32871fe00c5e385abbf56935c7b78a7bfba96"
+    },
+    {
+      "path": "v8_context_snapshot.bin",
+      "bytes": 770184,
+      "sha256": "7762651e640d5a9140b5a7763426d7bfbc155dbdc0ea0978f0745b622e129b55"
+    },
+    {
+      "path": "vccorlib140.dll",
+      "bytes": 360712,
+      "sha256": "957e7029c6911c72d7761fd381d44f59029c29397b9a745b5187194973446ab5"
+    },
+    {
+      "path": "vcruntime140.dll",
+      "bytes": 188680,
+      "sha256": "2759ed091bcb2e3581d141b25a17dfe3cf99ecbcb275d66f9a5f4474c8581390"
+    },
+    {
+      "path": "vcruntime140_1.dll",
+      "bytes": 60168,
+      "sha256": "e979d896dbea87a6e19a472e6f6eb7a241ec6c4cd936c3dda75d1710e2f351f9"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square150x150Logo.scale-100.png",
+      "bytes": 5679,
+      "sha256": "3e1e8531b44780927616ba57ed049739b0688054cf79902f316d728121b30c20"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square150x150Logo.scale-125.png",
+      "bytes": 9097,
+      "sha256": "24dca41c8493f5489ede402fc1db1fba4cf352ce1c97b2f457d439e05f009aec"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square150x150Logo.scale-150.png",
+      "bytes": 11516,
+      "sha256": "de0b8248d74d0842f134759a42df2effbd09fda27329094771547b1911768906"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square150x150Logo.scale-200.png",
+      "bytes": 16451,
+      "sha256": "46d2a464c7a68e42dd2fd94786062097886b92ff774bfb3e81b2637c2a47fac9"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square150x150Logo.scale-400.png",
+      "bytes": 51853,
+      "sha256": "be286065381c7f3cf76d16b9edbe138fcfdf54121636d73e8b81ea61bda4c230"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square310x310Logo.scale-100.png",
+      "bytes": 13312,
+      "sha256": "216dd7f008b2db23c8b52154431cbafacffd5369922c6f770444a461468fc470"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square310x310Logo.scale-125.png",
+      "bytes": 21388,
+      "sha256": "e0a2a162d7af07f90a9c61390868b5b45b224b7efe217a9536ae983aa4558331"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square310x310Logo.scale-150.png",
+      "bytes": 25891,
+      "sha256": "19238e710039b72ca9a5c90aadf19f9b2ade248ff11fbb1da40eb00658cb417c"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square310x310Logo.scale-200.png",
+      "bytes": 42326,
+      "sha256": "20c8ef43c52f9b73ec06fa21dfdcf1c4f2eff383ba585cc9eb126509928ddcfb"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square310x310Logo.scale-400.png",
+      "bytes": 141040,
+      "sha256": "466c3da61c83b21a05a17936a51193ec4d3144e4a05807e11daeca808a25bbeb"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.scale-100.png",
+      "bytes": 1729,
+      "sha256": "1f89f703e128486a60ca278656237c9a2f0565cdedd47032668b769bea0161d9"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.scale-125.png",
+      "bytes": 2119,
+      "sha256": "9e45a0e43debaff3e0658dd14eacc60e20e58be33531107a5c9d5e13279873d4"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.scale-150.png",
+      "bytes": 2879,
+      "sha256": "bfca667f88a471d52df94892f94f13f99f4f843dad99861802d8096990e873e8"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.scale-200.png",
+      "bytes": 4393,
+      "sha256": "19524b0d0620625343d6d405215b53145e19ab65c87a6538505d899c3d0a52a2"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.scale-400.png",
+      "bytes": 12215,
+      "sha256": "8105a8f455ee67c4e0dbe36357213d8ad1c6ce9c3b8b83ef37514738a693a33c"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-16.png",
+      "bytes": 712,
+      "sha256": "7178dd5bc48d6ff995828f3f2a7906065d793ce4970f85afc1e77b2790ae49d4"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-16_altform-lightunplated.png",
+      "bytes": 712,
+      "sha256": "7178dd5bc48d6ff995828f3f2a7906065d793ce4970f85afc1e77b2790ae49d4"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-16_altform-unplated.png",
+      "bytes": 712,
+      "sha256": "7178dd5bc48d6ff995828f3f2a7906065d793ce4970f85afc1e77b2790ae49d4"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-24.png",
+      "bytes": 1094,
+      "sha256": "64f6457f930d6f430f8b3406e21975e3ad6fd02b6e3a3e87f89859482af44553"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-24_altform-lightunplated.png",
+      "bytes": 1094,
+      "sha256": "64f6457f930d6f430f8b3406e21975e3ad6fd02b6e3a3e87f89859482af44553"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-24_altform-unplated.png",
+      "bytes": 1094,
+      "sha256": "64f6457f930d6f430f8b3406e21975e3ad6fd02b6e3a3e87f89859482af44553"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-256.png",
+      "bytes": 36011,
+      "sha256": "f9d61c7401470e90dca42059ceab50cd0c205e3831d087e6208a333ee3f88191"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-256_altform-lightunplated.png",
+      "bytes": 36011,
+      "sha256": "f9d61c7401470e90dca42059ceab50cd0c205e3831d087e6208a333ee3f88191"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-256_altform-unplated.png",
+      "bytes": 36011,
+      "sha256": "f9d61c7401470e90dca42059ceab50cd0c205e3831d087e6208a333ee3f88191"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-32.png",
+      "bytes": 1673,
+      "sha256": "8fd64f98c8f3895a2937fd7ae858fa148f7d629c9099d058c4ad04079e6577e4"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-32_altform-lightunplated.png",
+      "bytes": 1673,
+      "sha256": "8fd64f98c8f3895a2937fd7ae858fa148f7d629c9099d058c4ad04079e6577e4"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-32_altform-unplated.png",
+      "bytes": 1673,
+      "sha256": "8fd64f98c8f3895a2937fd7ae858fa148f7d629c9099d058c4ad04079e6577e4"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-48.png",
+      "bytes": 2737,
+      "sha256": "b990991aa8214801f70c972eab9ac5bc51b86661e23dfe2ebb42dce717122570"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-48_altform-lightunplated.png",
+      "bytes": 2737,
+      "sha256": "b990991aa8214801f70c972eab9ac5bc51b86661e23dfe2ebb42dce717122570"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square44x44Logo.targetsize-48_altform-unplated.png",
+      "bytes": 2737,
+      "sha256": "b990991aa8214801f70c972eab9ac5bc51b86661e23dfe2ebb42dce717122570"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square71x71Logo.scale-100.png",
+      "bytes": 3769,
+      "sha256": "39bcefbfe5d46cb4dedfc36177c91aa5ca5cd42e05531e75c7a5f1355b870c35"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square71x71Logo.scale-125.png",
+      "bytes": 6049,
+      "sha256": "4ff1db37946cb4d34c11545aff788a39fdbbfd143dcbf8222f4ac99a10fbbba6"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square71x71Logo.scale-150.png",
+      "bytes": 7594,
+      "sha256": "614bd7e65dabd5f203e34f074f5c18c6dd42ff7073c40c0c2b72a9e69f6a04f8"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square71x71Logo.scale-200.png",
+      "bytes": 10936,
+      "sha256": "b2f760b68afc7bb7707ca22113a1d7d768f5d526e2ed9a312e1ae87706ef5802"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Square71x71Logo.scale-400.png",
+      "bytes": 32337,
+      "sha256": "0ce42ff7cb2160610c72406faf179ba97abafb1e3a41af0c72c53667500eff3f"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/StoreLogo.scale-100.png",
+      "bytes": 1924,
+      "sha256": "d8b68b8f2b711d6d0e6c70e3eefb9849b230eab09898ba2cc41f875147dc88e5"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/StoreLogo.scale-125.png",
+      "bytes": 2870,
+      "sha256": "89f442b13a396dca2e5dced1b163a97ec0135cacba3852d197ef059a42173048"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/StoreLogo.scale-150.png",
+      "bytes": 3581,
+      "sha256": "372d66f1f3f98b6bb73cd390ea536d264bfcac2013a8006d4ff120b0a9c4c6fd"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/StoreLogo.scale-200.png",
+      "bytes": 4807,
+      "sha256": "9b9227b3cad28d7588336fdaa347a7549a3287e956d05f1800cb1f5836292a0a"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/StoreLogo.scale-400.png",
+      "bytes": 13726,
+      "sha256": "8e1c8b92bf111e1031b04ace4bc7f445c5d99ee6ae9bd1a15254044276d10be2"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Wide310x150Logo.scale-100.png",
+      "bytes": 5958,
+      "sha256": "af9949879e4219aeacd0fab8508396eec04f92eba203831bc5ba0f656ad59d47"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Wide310x150Logo.scale-125.png",
+      "bytes": 9551,
+      "sha256": "4d5d40e86ffaf34ba6ae66a5f1e77aef14c191326d940d1da5073142d124b318"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Wide310x150Logo.scale-150.png",
+      "bytes": 12372,
+      "sha256": "fb163ab50c56a128e4134ab2ec7c1285d7f029a8840071f364af72837be0ea75"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Wide310x150Logo.scale-200.png",
+      "bytes": 17896,
+      "sha256": "96778a1c701d12fa2f008cb66cf25faeb22d6d2b6b8436b461a02d7869c530a4"
+    },
+    {
+      "path": "VisualElements/CopilotAppStable/Wide310x150Logo.scale-400.png",
+      "bytes": 57790,
+      "sha256": "da0549ed8ef2b50a129d306551b3f2a92635fe382b3dd1370ede55b01563cab2"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square150x150Logo.scale-100.png",
+      "bytes": 5959,
+      "sha256": "c47bac6254a1bfba81c4ee148996190d50dbe1d7e8852d4c15a15264be536932"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square150x150Logo.scale-125.png",
+      "bytes": 8755,
+      "sha256": "803ac015d066b56113372cbe6ced289408abaf6e4db8b394e9662917faa342f0"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square150x150Logo.scale-150.png",
+      "bytes": 12117,
+      "sha256": "444f1a53274b4056b6c2af899405169b6013d3b850ee244e17fcf3fa3e613be6"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square150x150Logo.scale-200.png",
+      "bytes": 16994,
+      "sha256": "9bf6222c685b307badb8652f15c98f69ceb667f358815322316a1cb9ea19ab70"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square150x150Logo.scale-400.png",
+      "bytes": 52538,
+      "sha256": "aba3aed7773b241d6afb5990f816abf41f470a1798d015e843f20a2c7f4ce697"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square310x310Logo.scale-100.png",
+      "bytes": 13761,
+      "sha256": "fa5f9a6131c990b77b14b78191f5a2cc2e1a895bc25d2938b4a0a1cbf673bd45"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square310x310Logo.scale-125.png",
+      "bytes": 21317,
+      "sha256": "e78953da3c55b2c236a1cc3d90c62e0d98ed15e3ac65adeefa400286bd42b7dc"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square310x310Logo.scale-150.png",
+      "bytes": 26515,
+      "sha256": "ca6938203e564469501c05f9d8ca8bf974151c300aa2e435b8724638e4c3ff99"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square310x310Logo.scale-200.png",
+      "bytes": 42558,
+      "sha256": "770d0ae1859f7fe2416aac9e2334f9463d3e6872b798b6a9b75acf7118559c98"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square310x310Logo.scale-400.png",
+      "bytes": 138820,
+      "sha256": "d1f3cee65852cf462ed497e031063655f7e772bc19e3f7b2a2ea7060ebb8b5d1"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.scale-100.png",
+      "bytes": 1666,
+      "sha256": "08d903ae8340ddfeb6a021165b98aa22934c8af88284e024fbdc929ae81adff9"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.scale-125.png",
+      "bytes": 2264,
+      "sha256": "70b13c68a18b67a7c90ff9170d8d22c88a1d869bb617ebe37fefac3f7dc2cadd"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.scale-150.png",
+      "bytes": 2972,
+      "sha256": "b9e9c91121bc1fea270de92a65a0775bbf1f2dfd082a06d5913234f83c9764f6"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.scale-200.png",
+      "bytes": 4320,
+      "sha256": "8562b604ae1fa2f28b294233892007036cfa2cfdcee893dbbc4680372f566f97"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.scale-400.png",
+      "bytes": 11841,
+      "sha256": "20eb0f54833a93cc7cb018db080fa607dd9ccdd9142e4e183343b07c3e4a12d5"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-16.png",
+      "bytes": 676,
+      "sha256": "d4c83595780905a7a802103e51890b5943d27dd6ddf39b585571ab99db3bb448"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-16_altform-lightunplated.png",
+      "bytes": 694,
+      "sha256": "6bd79374381bf669360e2c852b2f5cf4680d972c30eff7f861d1959f2c48c2ee"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-16_altform-unplated.png",
+      "bytes": 676,
+      "sha256": "d4c83595780905a7a802103e51890b5943d27dd6ddf39b585571ab99db3bb448"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-24.png",
+      "bytes": 1158,
+      "sha256": "75cc3b4fa4a6df9e814aed8604185044cabf5672fefbba78abc9040c72e8f23b"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-24_altform-lightunplated.png",
+      "bytes": 1191,
+      "sha256": "9d0f3e54761f32ed4f059159a191f4237435eeb5f3f03079b1888fa734e5e23f"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-24_altform-unplated.png",
+      "bytes": 1158,
+      "sha256": "75cc3b4fa4a6df9e814aed8604185044cabf5672fefbba78abc9040c72e8f23b"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-256.png",
+      "bytes": 33527,
+      "sha256": "39f15d2cf5c8890dc30ffe124c6087255c1574911671ba58ea01da34166960ef"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-256_altform-lightunplated.png",
+      "bytes": 36221,
+      "sha256": "3cdc34a70bb08eaded4060ba1ce9e4cfa73757bba21ac9820dd8b3e700d1b204"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-256_altform-unplated.png",
+      "bytes": 33527,
+      "sha256": "39f15d2cf5c8890dc30ffe124c6087255c1574911671ba58ea01da34166960ef"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-32.png",
+      "bytes": 1611,
+      "sha256": "730a6b7e4b84888b7516f3dbe556537e40a70e863e5a415c3684219d10843225"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-32_altform-lightunplated.png",
+      "bytes": 1685,
+      "sha256": "501d1e99a8e938dfbc73b51198061181f9703faf4e5c8b565f57edf379851303"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-32_altform-unplated.png",
+      "bytes": 1611,
+      "sha256": "730a6b7e4b84888b7516f3dbe556537e40a70e863e5a415c3684219d10843225"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-48.png",
+      "bytes": 2833,
+      "sha256": "37f6102ec9df23e3986a290f9f115303132b7802f928a7f8ec6ec9e0f4f7293d"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-48_altform-lightunplated.png",
+      "bytes": 3022,
+      "sha256": "2b5a2a018feb24cc73e451cb9d84680e3f15493e0c3e8475cc1f2c613fac842c"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square44x44Logo.targetsize-48_altform-unplated.png",
+      "bytes": 2833,
+      "sha256": "37f6102ec9df23e3986a290f9f115303132b7802f928a7f8ec6ec9e0f4f7293d"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square71x71Logo.scale-100.png",
+      "bytes": 4147,
+      "sha256": "ecaab46aa6b66cdb4d3b5039c963ac3dd183c5bd24dda44bc818abadf2757a4d"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square71x71Logo.scale-125.png",
+      "bytes": 6172,
+      "sha256": "ecc7817c43fe29c39b6240fdcc842b6f455d54f4b9271b04bdfc426abe980a99"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square71x71Logo.scale-150.png",
+      "bytes": 7758,
+      "sha256": "39c3bb03fdf0a67ad52c403b757d56834dc6dd383f894be5b88efae1ad1ec604"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square71x71Logo.scale-200.png",
+      "bytes": 11788,
+      "sha256": "7a1258f62a217c872daa8433c7a5605bdba7d991270d338780641aad2456ad71"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Square71x71Logo.scale-400.png",
+      "bytes": 34198,
+      "sha256": "73aac844e1168bb5ca688de8a99e8ba637ae1bfa24183689b4c7756aafb0f245"
+    },
+    {
+      "path": "VisualElements/CopilotDev/StoreLogo.scale-100.png",
+      "bytes": 2061,
+      "sha256": "91f2bc06ac2aadb4c1aa858d55b1cae5914b92b16df9db2b0ec730b5ddd82bd7"
+    },
+    {
+      "path": "VisualElements/CopilotDev/StoreLogo.scale-125.png",
+      "bytes": 2941,
+      "sha256": "43ba6a64ad6fcd8fabf356f61844f731d62ac8cfd13f8685e01e9da5edece12b"
+    },
+    {
+      "path": "VisualElements/CopilotDev/StoreLogo.scale-150.png",
+      "bytes": 3608,
+      "sha256": "887f65825e2ea1d1b752a0bcbb941628a46b6721815a906852fb533c30d606a7"
+    },
+    {
+      "path": "VisualElements/CopilotDev/StoreLogo.scale-200.png",
+      "bytes": 5141,
+      "sha256": "f6bdf46def2efcc0895deae0e67a217cd05a24cdadefd0c4cd5ef4d8c46f2a02"
+    },
+    {
+      "path": "VisualElements/CopilotDev/StoreLogo.scale-400.png",
+      "bytes": 14499,
+      "sha256": "b63f98724bc1e380f2f4d76a5a7b167a2df285fdc49f151e36011e2ac485c2ee"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Wide310x150Logo.scale-100.png",
+      "bytes": 6215,
+      "sha256": "2dc22368cd31e0e4405e95de122e6a4d3757cc54e87ec981e5975f1ed7129b0a"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Wide310x150Logo.scale-125.png",
+      "bytes": 9400,
+      "sha256": "0b70c28419c41f2097659fcdd9766918337813d43f74ea280e223f4e193d078c"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Wide310x150Logo.scale-150.png",
+      "bytes": 12960,
+      "sha256": "b404219aca8d899a658247f5c355030217673fa1f24c8b1d735af81c790b79fc"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Wide310x150Logo.scale-200.png",
+      "bytes": 18432,
+      "sha256": "09818bd6f958fe66255b78d94fcbeda453d95a8593b7befd9cf72eee67475f17"
+    },
+    {
+      "path": "VisualElements/CopilotDev/Wide310x150Logo.scale-400.png",
+      "bytes": 59010,
+      "sha256": "3e62242d121fbfd45f13c9a89c115e5a8f5f547eda88394dc536c0f43d3cf230"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square150x150Logo.scale-100.png",
+      "bytes": 3332,
+      "sha256": "dfd4c03450db10284801be677afd8124ff78ca84605bd00c527b008e472abd97"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square150x150Logo.scale-125.png",
+      "bytes": 4364,
+      "sha256": "5fb6f0a532bbb0e6bc6853324c203fabcdfa7347bd0497c7ad725b81aab6513f"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square150x150Logo.scale-150.png",
+      "bytes": 5690,
+      "sha256": "9e9229cbb0b7e17bf689f2171bdb2046367867ae083991ca7eed306c61629ec7"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square150x150Logo.scale-200.png",
+      "bytes": 8255,
+      "sha256": "584afa296caff0c21eb276e5fc001f95c12db5c5edcf01a3e6df5fa1d4f6a68c"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square150x150Logo.scale-400.png",
+      "bytes": 21941,
+      "sha256": "b314b8f57783772973d5ecd23fa73871a987f34ce417cf81467a30327390e84a"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square310x310Logo.scale-100.png",
+      "bytes": 8500,
+      "sha256": "5b174f22a2f1de898a07b68852dadbc13c20f366271839a98a0f3b9669cfc926"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square310x310Logo.scale-125.png",
+      "bytes": 11809,
+      "sha256": "5302514b2ce7575cc9cd6493b550489ed47bd791a55ae3b860dd13af05163348"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square310x310Logo.scale-150.png",
+      "bytes": 15054,
+      "sha256": "6f49b090e1a529aa77a3791da20dcd812f21eba3676573354169f98fdfd82414"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square310x310Logo.scale-200.png",
+      "bytes": 23015,
+      "sha256": "417c9c3430433c4258ec6f8e8e2bdb805907fa432b735c081cdd90c98f842663"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square310x310Logo.scale-400.png",
+      "bytes": 67290,
+      "sha256": "2f7a260eb90e460544d4f19cfd07d37311804c8dc196a794bbf0b724d9200fbe"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.scale-100.png",
+      "bytes": 1854,
+      "sha256": "622da209a7d65d1ca1bcbe7cd30530394a08ede7ad5d5c216880f1bd4e16cec7"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.scale-125.png",
+      "bytes": 2526,
+      "sha256": "319872a38d59fe8ed44fee0f0f1f3563fc346bca6541cbe887bc187f6aa039e3"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.scale-150.png",
+      "bytes": 3214,
+      "sha256": "e2674d714196905d3dbd17f2d7ca959c85ed3cd96ce109a6346a9a50fdeb23d9"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.scale-200.png",
+      "bytes": 4530,
+      "sha256": "e2c82b79b4a0eff6f68e0c735efd914b45aa217c7e7577dd799e010852c6a65b"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.scale-400.png",
+      "bytes": 11211,
+      "sha256": "654b8a18e9babbfb9cd165fae3c78e09ea5ee339670a772ae56ed430ffb772d7"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-16.png",
+      "bytes": 733,
+      "sha256": "e350f572722e0283882cc0b025a017e0d2af86f27f7bc4aa0d43a947f7f34b9f"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-16_altform-lightunplated.png",
+      "bytes": 733,
+      "sha256": "e350f572722e0283882cc0b025a017e0d2af86f27f7bc4aa0d43a947f7f34b9f"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-16_altform-unplated.png",
+      "bytes": 693,
+      "sha256": "765fd8cc48b6a4b1555241bf891b268761d157a16677c66f22a3b870dffb2c80"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-24.png",
+      "bytes": 1242,
+      "sha256": "99b7b5b3c4e65cd3698b84f63843b46c3fed43890acedacb0a8a1216c780de0c"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-24_altform-lightunplated.png",
+      "bytes": 1242,
+      "sha256": "99b7b5b3c4e65cd3698b84f63843b46c3fed43890acedacb0a8a1216c780de0c"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-24_altform-unplated.png",
+      "bytes": 1069,
+      "sha256": "2d1afaa893144238ed0ba9029d790aca78ee6be545ec3abfce16ebcaf9b3ad42"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-256.png",
+      "bytes": 18522,
+      "sha256": "0c9d897605c2d7f3d8651af5da42f4cddcafeb5e3723e70ce8be43fad23ac938"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-256_altform-lightunplated.png",
+      "bytes": 26968,
+      "sha256": "82f48acd1a1f01068015f1cbbbff6e824680654865cef25d51f1b93172c00a7d"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-256_altform-unplated.png",
+      "bytes": 18522,
+      "sha256": "0c9d897605c2d7f3d8651af5da42f4cddcafeb5e3723e70ce8be43fad23ac938"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-32.png",
+      "bytes": 1815,
+      "sha256": "587931975cfa3e99eb58c0eb9dda54426570a168fe1069f947cf28b0bce9d01d"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-32_altform-lightunplated.png",
+      "bytes": 1815,
+      "sha256": "587931975cfa3e99eb58c0eb9dda54426570a168fe1069f947cf28b0bce9d01d"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-32_altform-unplated.png",
+      "bytes": 1567,
+      "sha256": "e4002fa6646b95ee9b10a8007643afdd1c3cd25b1ebe63a82a5c9223be6040f4"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-48.png",
+      "bytes": 2999,
+      "sha256": "0cc26eeb19dff61cf0c5b28d10d89eaa771b1596a95d3a469a79262fad7c283c"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-48_altform-lightunplated.png",
+      "bytes": 2999,
+      "sha256": "0cc26eeb19dff61cf0c5b28d10d89eaa771b1596a95d3a469a79262fad7c283c"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square44x44Logo.targetsize-48_altform-unplated.png",
+      "bytes": 2739,
+      "sha256": "fc0d83820988419f8e6e952fff4e48b5641b5398af639829456d5b0af2d99ce0"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square71x71Logo.scale-100.png",
+      "bytes": 2111,
+      "sha256": "eb9fb4ba49edfb0559ea7166eefb92ee2225abce94f7fdba00568b1c407ca01c"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square71x71Logo.scale-125.png",
+      "bytes": 2811,
+      "sha256": "25ad779810d29bd6b4c7b21ec15a252274576ba716b82189c476689100ba1e86"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square71x71Logo.scale-150.png",
+      "bytes": 3474,
+      "sha256": "c8c1a3b483f2b0ba57a3e6aff7ee52ff242910904191f44019b480e592c336ac"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square71x71Logo.scale-200.png",
+      "bytes": 5001,
+      "sha256": "f72572d70b0cea3840083908bc650351d220e5cb03a7927841dfa2d96a2a97d9"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Square71x71Logo.scale-400.png",
+      "bytes": 12960,
+      "sha256": "1ea542ef282247fce202b78eab5d9aa8b3d9da45186a4e2d7f55e9eff2643064"
+    },
+    {
+      "path": "VisualElements/CopilotStable/StoreLogo.scale-100.png",
+      "bytes": 3125,
+      "sha256": "1183fb06941b6bc0e9c39bd104747c4856698fe4fed92f1f0d650551bccf7e13"
+    },
+    {
+      "path": "VisualElements/CopilotStable/StoreLogo.scale-125.png",
+      "bytes": 4198,
+      "sha256": "d3bf18a9679edddb80c36eb99a157e8dc96491554f80d74573560090009e4163"
+    },
+    {
+      "path": "VisualElements/CopilotStable/StoreLogo.scale-150.png",
+      "bytes": 5285,
+      "sha256": "8b2f72912f932be07dc8f45bd9e13b1c8eaf0a7fa6ecbc9af344d61b1f7d0701"
+    },
+    {
+      "path": "VisualElements/CopilotStable/StoreLogo.scale-200.png",
+      "bytes": 7520,
+      "sha256": "6838afa2acf4c942c34b53a6abc752d53f136d519dbc3cb73813b9c6f8092cf4"
+    },
+    {
+      "path": "VisualElements/CopilotStable/StoreLogo.scale-400.png",
+      "bytes": 19029,
+      "sha256": "cf7108ee6a3520ac4562aff7c337787804f9794aaa31ef694de31aa9c019ef70"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Wide310x150Logo.scale-100.png",
+      "bytes": 3534,
+      "sha256": "419a4851e4011a2b3ad6bc8f489c0d82af9ec619832dd2c1e81a9febf6c4c21e"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Wide310x150Logo.scale-125.png",
+      "bytes": 4649,
+      "sha256": "a27e88c0fa96c7a6344e65cd72b9764e9a9278b2944b69a000e073c7f0943335"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Wide310x150Logo.scale-150.png",
+      "bytes": 6113,
+      "sha256": "0738922ba4f22b6ce38097d2645055ec40fc89d1ee31cb0b9a33728efd7badc6"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Wide310x150Logo.scale-200.png",
+      "bytes": 8972,
+      "sha256": "24cfa266b8c42244c590aeb01f9ccabfbc02cf2cbcb7a7f96e4fdb097aba03f9"
+    },
+    {
+      "path": "VisualElements/CopilotStable/Wide310x150Logo.scale-400.png",
+      "bytes": 24709,
+      "sha256": "1a9f83fa021f98046e2793c6bcadd8ce58606b80146a3911782fc058f1db5d7d"
+    },
+    {
+      "path": "VisualElements/Logo.png",
+      "bytes": 29175,
+      "sha256": "4eaf8c7a247db0985bb8c0412c00c9cdda927f27b5c333f855f0b4f5043fd120"
+    },
+    {
+      "path": "VisualElements/LogoBeta.png",
+      "bytes": 27112,
+      "sha256": "d2c06cae33602d7a49c718f5e079f9c0abdeab899d26c4c1ff7f0fbeb37ecf30"
+    },
+    {
+      "path": "VisualElements/LogoCanary.png",
+      "bytes": 27333,
+      "sha256": "86b786370f51a6cec29b7cc6092a56274a60bbaf361391e1844263b09c7012c7"
+    },
+    {
+      "path": "VisualElements/LogoCopilot.png",
+      "bytes": 21941,
+      "sha256": "b314b8f57783772973d5ecd23fa73871a987f34ce417cf81467a30327390e84a"
+    },
+    {
+      "path": "VisualElements/LogoCopilotApp.png",
+      "bytes": 51853,
+      "sha256": "be286065381c7f3cf76d16b9edbe138fcfdf54121636d73e8b81ea61bda4c230"
+    },
+    {
+      "path": "VisualElements/LogoCopilotDev.png",
+      "bytes": 52538,
+      "sha256": "aba3aed7773b241d6afb5990f816abf41f470a1798d015e843f20a2c7f4ce697"
+    },
+    {
+      "path": "VisualElements/LogoDev.png",
+      "bytes": 27104,
+      "sha256": "cc5674d80cb4484f16c03b273662b732c4465d34cdd5038990983601589456d6"
+    },
+    {
+      "path": "VisualElements/ResearcherOn.png",
+      "bytes": 7057,
+      "sha256": "af406717e7ae9f3b33da27fd9572ddfd193818a3d6f729bd0319c6818fe11f04"
+    },
+    {
+      "path": "VisualElements/resources.dev.pri",
+      "bytes": 79368,
+      "sha256": "2f38fd92ce7af301490481e42eec2dac76ff46bc450b8a3ef0e6839b8d81bc20"
+    },
+    {
+      "path": "VisualElements/resources.internal.pri",
+      "bytes": 79384,
+      "sha256": "629a2bfbb123b06b7950454069c4dd23569aa279351e34fa18285e56a5baa065"
+    },
+    {
+      "path": "VisualElements/resources.officehub.dev.pri",
+      "bytes": 79408,
+      "sha256": "bed8fcb733b93fcf58151da68d676498bba64a4d268a734442dad5eaa9d00c8b"
+    },
+    {
+      "path": "VisualElements/resources.officehub.internal.pri",
+      "bytes": 79432,
+      "sha256": "0355e331ac51ea9b84b51953a990d7ba8a591981b6dae0437d5fd685f8ff64df"
+    },
+    {
+      "path": "VisualElements/resources.officehub.pri",
+      "bytes": 79392,
+      "sha256": "4184810aa8ce32c54ce658e8a01ef2ee3581818a926cc4b6b54f4c844672cc71"
+    },
+    {
+      "path": "VisualElements/resources.pri",
+      "bytes": 79352,
+      "sha256": "074327df71135fc55d9589eacdfd0a55571e217d0cdd1d9ef9ed0d3987f2300a"
+    },
+    {
+      "path": "VisualElements/SmallLogo.png",
+      "bytes": 14830,
+      "sha256": "b228b0337b1a34287b92d8bc3df91ba817a358d07ffc610e452244873b0b317c"
+    },
+    {
+      "path": "VisualElements/SmallLogoBeta.png",
+      "bytes": 14316,
+      "sha256": "9d1a28640320bd4560a3f43127be8df02e5c4a0a18da725db359ab8b262a3bee"
+    },
+    {
+      "path": "VisualElements/SmallLogoCanary.png",
+      "bytes": 13874,
+      "sha256": "d9c92117542208cc96b91f78deef5c1f44369e2fd4a8bfde80a83cb2c7c7d6bc"
+    },
+    {
+      "path": "VisualElements/SmallLogoCopilot.png",
+      "bytes": 11211,
+      "sha256": "654b8a18e9babbfb9cd165fae3c78e09ea5ee339670a772ae56ed430ffb772d7"
+    },
+    {
+      "path": "VisualElements/SmallLogoCopilotApp.png",
+      "bytes": 12215,
+      "sha256": "8105a8f455ee67c4e0dbe36357213d8ad1c6ce9c3b8b83ef37514738a693a33c"
+    },
+    {
+      "path": "VisualElements/SmallLogoCopilotDev.png",
+      "bytes": 11841,
+      "sha256": "20eb0f54833a93cc7cb018db080fa607dd9ccdd9142e4e183343b07c3e4a12d5"
+    },
+    {
+      "path": "VisualElements/SmallLogoDev.png",
+      "bytes": 13783,
+      "sha256": "38069508ca742cf17efe8dd8ba5ac5686ebcf7b8387ad9ea48b4d006e857380e"
+    },
+    {
+      "path": "VisualElements/vision.contrast-black.svg",
+      "bytes": 1697,
+      "sha256": "d0e67f345be87b0b594769487c2058783dc64be0ce486ee4ce2b0d982eaa388b"
+    },
+    {
+      "path": "VisualElements/vision.contrast-white.svg",
+      "bytes": 1697,
+      "sha256": "4574b3b61dcbfe4b9910ef218ce308c363a6d4a5629e47384b34b36d2d4b1758"
+    },
+    {
+      "path": "VisualElements/vision.svg",
+      "bytes": 1702,
+      "sha256": "2643fc75bcc01ab8df55ca53690d3b3b6f0c3f734747055c0deb4dfdc1f9e790"
+    },
+    {
+      "path": "VisualElements/vision.theme-dark.svg",
+      "bytes": 1697,
+      "sha256": "d0e67f345be87b0b594769487c2058783dc64be0ce486ee4ce2b0d982eaa388b"
+    },
+    {
+      "path": "VisualElements/vision.theme-light.svg",
+      "bytes": 1702,
+      "sha256": "2643fc75bcc01ab8df55ca53690d3b3b6f0c3f734747055c0deb4dfdc1f9e790"
+    },
+    {
+      "path": "VisualElements/voice.contrast-black.svg",
+      "bytes": 1155,
+      "sha256": "6682eabc1213a4a061acfa0eb120f28a858ed5d781d4eea0e0002da0cd8f4a4a"
+    },
+    {
+      "path": "VisualElements/voice.contrast-white.svg",
+      "bytes": 1155,
+      "sha256": "b53e2ffcc3b495c639255961d4e250591e33d71e17b60346b3fce281f2f77c55"
+    },
+    {
+      "path": "VisualElements/voice.svg",
+      "bytes": 1160,
+      "sha256": "3bce7881de3bb31c51c4632c5a663069f634f3012979fca3fdf1ce47f940fdfe"
+    },
+    {
+      "path": "VisualElements/voice.theme-dark.svg",
+      "bytes": 1155,
+      "sha256": "6682eabc1213a4a061acfa0eb120f28a858ed5d781d4eea0e0002da0cd8f4a4a"
+    },
+    {
+      "path": "VisualElements/voice.theme-light.svg",
+      "bytes": 1160,
+      "sha256": "3bce7881de3bb31c51c4632c5a663069f634f3012979fca3fdf1ce47f940fdfe"
+    },
+    {
+      "path": "vk_swiftshader.dll",
+      "bytes": 4562760,
+      "sha256": "b04e79cc77389b2386a13de22db9a3c9bd226df790e7b813eb95cb47dee158e9"
+    },
+    {
+      "path": "vk_swiftshader_icd.json",
+      "bytes": 106,
+      "sha256": "32d83ff113fef532a9f97e0d2831f8656628ab1c99e9060f0332b1532839afd9"
+    },
+    {
+      "path": "vulkan-1.dll",
+      "bytes": 975176,
+      "sha256": "848022528eb3b4ba6b976396751e777e7b8ca150fa2e684c147965f9f99b052a"
+    },
+    {
+      "path": "wdag.dll",
+      "bytes": 251208,
+      "sha256": "7c989c11077149619947fd6c459c88e94cdbbcb83f59f122d4f1ffeed037b145"
+    },
+    {
+      "path": "webview2_integration.dll",
+      "bytes": 31560,
+      "sha256": "7ba9fe46e822f0b0c60235d10187a022d9aaecf23a1d06d2d6229651930a7c8a"
+    },
+    {
+      "path": "WidevineCdm/_platform_specific/win_x64/widevinecdm.dll",
+      "bytes": 22716072,
+      "sha256": "59164b77735ec6f799f774ac2dd1ddc1272a9d72d00023bacadcedf4f7c3c561"
+    },
+    {
+      "path": "WidevineCdm/_platform_specific/win_x64/widevinecdm.dll.sig",
+      "bytes": 1389,
+      "sha256": "431956dc1e7a00f2ca6cc3ae2d50927cace7d45c2a3de4642922459562c33ab8"
+    },
+    {
+      "path": "WidevineCdm/LICENSE",
+      "bytes": 473,
+      "sha256": "20de375707692099b3132084695377ce5fec0aec05813dedcce094b8eda44386"
+    },
+    {
+      "path": "WidevineCdm/manifest.json",
+      "bytes": 1002,
+      "sha256": "dca3cd7a673d0776a085c0b8958a85bdd8392923db21a0b55f4d37210f752322"
+    }
+  ]
+}

@@ -984,6 +984,34 @@ target_include_directories(rtaweb PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 add_test(NAME dsp_ringing_definition COMMAND dsp_ringing_reference --selftest)
 
+# 滤波器详情静态数据：生产系数在构建期测量，UI 只负责画。
+add_executable(filter_detail_reference tools/filter_detail_reference.cpp)
+target_include_directories(filter_detail_reference PRIVATE src tools)
+set(FILTER_DETAIL_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/filter_detail_reference.h)
+file(GLOB FILTER_DETAIL_TOOL_DEPS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tools/*.h)
+add_custom_command(OUTPUT ${FILTER_DETAIL_HEADER}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/generated
+  COMMAND filter_detail_reference --header ${FILTER_DETAIL_HEADER}
+  DEPENDS filter_detail_reference ${RING_DSP_DEPENDENCIES} ${FILTER_DETAIL_TOOL_DEPS}
+  VERBATIM)
+add_custom_target(generate_filter_detail DEPENDS ${FILTER_DETAIL_HEADER})
+add_dependencies(rtaweb generate_filter_detail)
+add_executable(test_filter_detail_reference tests/test_filter_detail_reference.cpp)
+target_include_directories(test_filter_detail_reference PRIVATE src tools ${CMAKE_CURRENT_BINARY_DIR}/generated)
+add_dependencies(test_filter_detail_reference generate_filter_detail)
+add_test(NAME filter_detail_reference COMMAND test_filter_detail_reference)
+add_executable(test_asio_buffer_policy tests/test_asio_buffer_policy.cpp)
+target_include_directories(test_asio_buffer_policy PRIVATE src tools)
+add_test(NAME asio_buffer_policy COMMAND test_asio_buffer_policy)
+add_executable(test_native_dsd_pack tests/test_native_dsd_pack.cpp)
+target_include_directories(test_native_dsd_pack PRIVATE src tools)
+add_test(NAME native_dsd_pack COMMAND test_native_dsd_pack)
+
+add_executable(test_cda_path tests/test_cda_path.cpp)
+target_include_directories(test_cda_path PRIVATE src tools)
+target_link_libraries(test_cda_path PRIVATE winmm)
+add_test(NAME cda_path COMMAND test_cda_path)
+
 add_executable(test_dsp_measure_stages tests/test_dsp_measure_stages.cpp)
 target_include_directories(test_dsp_measure_stages PRIVATE src tools)
 add_test(NAME dsp_measure_stages COMMAND test_dsp_measure_stages)
@@ -1303,6 +1331,9 @@ find_program(RLPLAYER_NODE_EXECUTABLE node REQUIRED)
 add_test(NAME app_lyrics_state COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_lyrics_state.js")
 add_test(NAME app_settings_state COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_settings_state.js")
 add_test(NAME app_i18n_dynamic COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_i18n_dynamic.js")
+# 2026-11-15：语言包完整性（六语种键集合一致 / 无专辑首字垃圾键 / 用户报过的文案都在）。
+# 纯 JSON 判据，不启动界面；漏一条键就是一个语种在界面上露中文。
+add_test(NAME i18n_packs COMMAND "${RLPLAYER_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_i18n_packs.js")
 add_test(NAME app_queue_persistence COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_queue_persistence.py" "${CMAKE_CXX_COMPILER}")
 add_test(NAME app_settings_persistence COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_settings_persistence.py" "${CMAKE_CXX_COMPILER}")
 add_test(NAME app_prewarm COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_app_prewarm.py" "${CMAKE_CXX_COMPILER}")
@@ -1631,3 +1662,65 @@ add_test(NAME profiles_migration336 COMMAND "${Python3_EXECUTABLE}"
   "${CMAKE_SOURCE_DIR}/tests/test_profiles_migration336.py"
   --build "${CMAKE_CURRENT_BINARY_DIR}" --evidence-dir "profiles-migration336-evidence")
 set_tests_properties(profiles_migration336 PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+
+# 3.4.0: real dither behavior, request scheduling, and pinned release runtime.
+add_executable(test_dither340 tests/test_dither340.cpp)
+target_link_libraries(test_dither340 PRIVATE rtadsp)
+add_test(NAME dither340 COMMAND test_dither340)
+set_tests_properties(dither340 PROPERTIES TIMEOUT 120)
+add_test(NAME ui_request_scheduling COMMAND "${RLPLAYER_NODE_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_ui_request_scheduling.js")
+set_tests_properties(ui_request_scheduling PROPERTIES TIMEOUT 60)
+add_test(NAME webview_runtime_pin COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_webview_pin.py")
+set_tests_properties(webview_runtime_pin PROPERTIES TIMEOUT 60)
+add_executable(test_crossfeed tests/test_crossfeed.cpp)
+target_link_libraries(test_crossfeed PRIVATE rtadsp)
+add_test(NAME crossfeed COMMAND test_crossfeed)
+set_tests_properties(crossfeed PROPERTIES TIMEOUT 120)
+add_test(NAME ui_shaper_guidance COMMAND "${RLPLAYER_NODE_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_ui_shaper_guidance.js")
+set_tests_properties(ui_shaper_guidance PROPERTIES TIMEOUT 60)
+add_test(NAME shaper_api340 COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_shaper_api340.py" "$<TARGET_FILE:rtaweb>"
+  --cli "$<TARGET_FILE:rtaplay>" --run-root "shaper-api340-evidence")
+set_tests_properties(shaper_api340 PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+add_test(NAME ui_crossfeed_controls COMMAND "${RLPLAYER_NODE_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_ui_crossfeed_controls.js")
+set_tests_properties(ui_crossfeed_controls PROPERTIES TIMEOUT 60)
+
+add_executable(test_pcm_valid_bits340 tests/test_pcm_valid_bits340.cpp)
+target_link_libraries(test_pcm_valid_bits340 PRIVATE rtadsp)
+add_test(NAME pcm_valid_bits340 COMMAND test_pcm_valid_bits340)
+set_tests_properties(pcm_valid_bits340 PROPERTIES TIMEOUT 120)
+
+add_executable(test_asio_pcm_precision340 tests/test_asio_pcm_precision340.cpp)
+target_link_libraries(test_asio_pcm_precision340 PRIVATE rtadsp ole32 uuid advapi32)
+add_test(NAME asio_pcm_precision340 COMMAND test_asio_pcm_precision340)
+set_tests_properties(asio_pcm_precision340 PROPERTIES TIMEOUT 120)
+
+add_executable(test_pcm_auto_runtime340 tests/test_pcm_auto_runtime340.cpp)
+target_link_libraries(test_pcm_auto_runtime340 PRIVATE rtadsp)
+add_test(NAME pcm_auto_runtime340 COMMAND test_pcm_auto_runtime340)
+set_tests_properties(pcm_auto_runtime340 PROPERTIES TIMEOUT 120)
+
+add_executable(test_pcm_live_volume340 tests/test_pcm_live_volume340.cpp)
+target_link_libraries(test_pcm_live_volume340 PRIVATE rtadsp)
+add_test(NAME pcm_live_volume340 COMMAND test_pcm_live_volume340)
+set_tests_properties(pcm_live_volume340 PROPERTIES TIMEOUT 120)
+
+add_executable(test_asio_probe_options340 tests/test_asio_probe_options340.cpp)
+target_link_libraries(test_asio_probe_options340 PRIVATE rtadsp)
+add_test(NAME asio_probe_options340 COMMAND test_asio_probe_options340)
+set_tests_properties(asio_probe_options340 PROPERTIES TIMEOUT 120)
+
+add_test(NAME asio_selection340 COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/tests/test_asio_selection340.py"
+  --compiler "${CMAKE_CXX_COMPILER}" --evidence "asio-selection340-evidence")
+set_tests_properties(asio_selection340 PROPERTIES TIMEOUT 120)
+
+# 3.4.0: exact renderer EOF race and actual ASIO callback lifetime without a device.
+add_executable(test_render_eof340 tests/test_render_eof340.cpp)
+target_link_libraries(test_render_eof340 PRIVATE rtadsp ole32 uuid advapi32)
+add_test(NAME render_eof340 COMMAND test_render_eof340)
+set_tests_properties(render_eof340 PROPERTIES TIMEOUT 120)

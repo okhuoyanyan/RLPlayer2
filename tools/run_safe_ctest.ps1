@@ -3,7 +3,10 @@ param(
  [Parameter(Mandatory=$true)][string]$BuildDir,
  [string]$SourceRoot='',
  [string]$RunRoot='', [string]$FfmpegDir='', [string]$LiteDir='',
- [string]$Manifest='', [string]$Include='.*', [string[]]$Group=@(), [switch]$AuditOnly
+ [string]$Manifest='', [string]$Include='.*', [string[]]$Group=@(), [switch]$AuditOnly,
+ # 2026-11-16：默认走增量门禁缓存（键 = 输入哈希，见 run_safe_tests.py）；
+ # -NoCache 强制从零全量跑（发布前做一次"无缓存全绿"时用）。
+ [switch]$NoCache
 )
 $ErrorActionPreference='Stop'
 if(-not $SourceRoot){$SourceRoot=Split-Path -Parent $PSScriptRoot}
@@ -12,6 +15,7 @@ $source=(Resolve-Path -LiteralPath $SourceRoot).Path
 if(-not $RunRoot){$RunRoot=Join-Path $build ('safe-tests-'+[guid]::NewGuid().ToString('N'))}
 $argsList=@((Join-Path $PSScriptRoot 'run_safe_tests.py'),'--build',$build,'--source',$source,'--run-root',$RunRoot,'--include',$Include)
 if($Manifest){$argsList+=@('--manifest',$Manifest)}
+if($NoCache){$argsList+='--no-cache'}
 if($AuditOnly){$argsList+='--audit-only'}else{
  if(-not $FfmpegDir){
   $ff=Get-Command ffmpeg.exe -ErrorAction SilentlyContinue

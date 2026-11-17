@@ -36,7 +36,7 @@ SACD_FILES = tuple('third_party/sacd-reference/' + name for name in (
     'COPYING.LGPLv2.1', 'COPYING.SACD', 'NOTICE.txt', 'PROVENANCE.json',
     'dstdec-reference.c', 'dvd_udf-reference.c', 'pcm-dvda-reference.c',
     'scarletbook.h', 'scarletbook_read.c'))
-DATA_FILES = ('data/opra_index.json',) + tuple('data/i18n/' + lang + '.json'
+DATA_FILES = ('data/opra_index.json', 'data/webview2-runtime-pin.json') + tuple('data/i18n/' + lang + '.json'
                                              for lang in ('ar','en','es','fr','ja','ru'))
 TEST_FIXTURE_FILES = ('tests/fixtures/waveform336.flac',)
 REQUIRED = ROOT_FILES[:8] + ('src/version.h', 'res/rlplayer.ico', 'res/rlplayer.rc.in') + \

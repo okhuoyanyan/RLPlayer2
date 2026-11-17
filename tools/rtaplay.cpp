@@ -4,7 +4,7 @@
 //   rtaplay --list
 //   rtaplay --gen <out.wav> [秒数] [Hz] [位深]
 //   rtaplay <in.wav> [--device <id>] [--rate N] [--taps N] [--bits N]
-//                    [--shaper none|NS1|NS4|NS5|NS9|LNS15|TPDF|RPDF|Gauss1]
+//                    [--shaper auto|none|NS1|NS4|NS5|NS9|LNS15|TPDF|RPDF|Gauss1|shaped]
 //                    [--buffer ms] [--seconds N] [--analyze] [--loop]
 #define NOMINMAX
 #include "audio/wav.h"
@@ -52,7 +52,9 @@ static unsigned st0Rate(const AudioBuffer& in, const eng::PipelineConfig& c) {
     return c.outRate ? c.outRate : in.rate;
 }
 
-static rta::dsp::Shaper parse_shaper(const std::string& s) {
+static rta::dsp::Shaper parse_shaper(const std::string& text) {
+    std::string s = text;
+    for (char& c : s) if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
     using S = rta::dsp::Shaper;
     if (s == "NS1") return S::NS1;
     if (s == "NS4") return S::NS4;
@@ -61,8 +63,8 @@ static rta::dsp::Shaper parse_shaper(const std::string& s) {
     if (s == "LNS15") return S::LNS15;
     if (s == "TPDF") return S::TPDF;
     if (s == "RPDF") return S::RPDF;
-    if (s == "Gauss1") return S::Gauss1;
-    if (s == "shaped") return S::Shaped;
+    if (s == "GAUSS1") return S::Gauss1;
+    if (s == "SHAPED") return S::Shaped;
     return S::None;
 }
 
@@ -226,7 +228,7 @@ static int play_asio_dop_dsd(const AsioDriverEntry& e, const DsdStream& s, doubl
 
 // 原生 DSD 播放。返回 0 成功；4 = 启动失败且 DoP 也失败；5 = DoP 回落失败；6 = 电平超限。
 static int play_asio_native_dsd(const AsioDriverEntry& e, const DsdStream& s, double limitSec,
-                                bool forceDop) {
+                                bool forceDop, double bufferMs = 100.0) {
     const int ch = s.channels;
     if (ch <= 0 || s.data.empty()) { printf("!! DSD 流为空\n"); return 4; }
     const double srcSec = s.seconds();
@@ -248,7 +250,7 @@ static int play_asio_native_dsd(const AsioDriverEntry& e, const DsdStream& s, do
     std::string err;
     bool nativeOk = !forceDop;
     if (forceDop) err = "（诊断开关 --force-dop-fallback：人为跳过原生 DSD）";
-    else nativeOk = drv.open_dsd(e.clsid, (double)s.rate, ch, err);
+    else nativeOk = drv.open_dsd(e.clsid, (double)s.rate, ch, err, nullptr, bufferMs);
     if (!nativeOk) {
         printf("\n❌ 原生 DSD 打开失败（驱动「%s」）：\n   %s\n", e.name.c_str(), err.c_str());
         printf("   ⟹ 显式回落 DoP（承载 %u Hz / 24-bit），不是静默降级\n", s.rate / 16u);
@@ -271,6 +273,8 @@ static int play_asio_native_dsd(const AsioDriverEntry& e, const DsdStream& s, do
     printf("    getBufferSize=%ld（单位=1-bit 样本）⟹ 每回调写 %ld 字节/声道（%.2f ms）\n",
            di.bufferBytes, di.writeBytes,
            (double)di.writeBytes * 8.0 * 1000.0 / (double)s.rate);
+    if (!di.bufferAttempts.empty())
+        printf("    createBuffers 阶梯 [%s]（目标 %.0f ms）\n", di.bufferAttempts.c_str(), bufferMs);
 
     // 本机 AudioByte 实测：DSD 会话的 start() 会间歇性失败（同一份参数前一次成功、后一次
     // "驱动拒绝启动"）。这不是我们传的参数问题（createBuffers 已经 ASE_OK），所以按
@@ -443,7 +447,10 @@ int main(int argc, char** argv) {
         printf("选项:\n");
         printf("  --rate N          升频目标采样率        --taps N    滤波器抽头数\n");
         printf("  --rate-policy prefer|strict|compatible  PCM采样率族策略（默认prefer，strict禁止手动跨族）\n");
-        printf("  --bits N          输出位深              --shaper X  抖动/整形 (NS1/NS4/NS5/NS9/LNS15/TPDF/...)\n");
+        printf("  --bits N          输出位深              --shaper X  抖动/整形 (auto/none/NS1/NS4/NS5/NS9/LNS15/RPDF/TPDF/Gauss1/shaped)\n");
+        printf("  --dac-bits 0|8..32  DAC 有效位深（0=自动；设备容器仍由 --bits 选择）\n");
+        printf("  --crossfeed off|light|standard  耳机交叉馈送（默认关闭；改变声像和频响）\n");
+        printf("  --crossfeed-freq 300..1200  --crossfeed-level 3..15（dB；数值越大效果越轻）\n");
         printf("  --eq <file.txt>   REW/AutoEq 参数 EQ    --ir <ir.wav> 卷积脉冲响应\n");
         printf("  --matrix <spec>   路由, 如 0>0:0,1>1:0,0>1:-6\n");
         printf("  --volume <dB>     音量                   --gpu       卷积优先用 GPU\n");
@@ -452,7 +459,7 @@ int main(int argc, char** argv) {
         printf("  --net <host:port> 走 RTANet 网络输出     --analyze   只跑管线不开设备\n");
         printf("  --buffer <ms> 独占缓冲   --seconds N 限时   --device <ID>   --loop\n");
         printf("  --asio-list       列出 ASIO 驱动（只读，不打开设备）\n");
-        printf("  --asio-device <名|序号|CLSID>  走 ASIO 输出；配 --native-dsd 走原生 DSD（失败显式回落 DoP）\n");
+        printf("  --asio-device <名|序号|CLSID>  CLI 仅支持配 --native-dsd 的 ASIO 原生 DSD；PCM/DoP 请用产品界面 ASIO 输出\n");
         printf("  --gen-dsd <out.dsf> [--seconds N] [--rate 64] [--silent|--amp -60]  生成 DSD 素材\n");
         printf("  --list-filters    列出全部命名滤波器（不需要输入文件）\n");
         printf("  --list-modulators 列出全部调制器族（不需要输入文件）\n");
@@ -548,6 +555,8 @@ int main(int argc, char** argv) {
     bool nativeDsd = false;      // 原生 DSD（ASIO IoFormat），失败显式回落 DoP
     bool forceDop = false;       // 诊断：强制走 DoP 回落路径（验证"回落真的能出声/静音"）
     bool cleanupModeCli=false,cleanupStrengthCli=false,cleanupNoiseCli=false;
+    bool shaperCli = false, autoShaper = false;
+    bool dacBitsCli=false,crossfeedCli=false,crossfeedFreqCli=false,crossfeedLevelCli=false;
     auto cleanupNumber=[](const std::string& text,double lo,double hi,double& value) {
         char* end=nullptr;const double x=strtod(text.c_str(),&end);
         if(text.empty()||end==text.c_str()||*end||!rta::audio::audio_finite(x)||x<lo||x>hi)return false;
@@ -566,7 +575,36 @@ int main(int argc, char** argv) {
         }
         else if (k == "--taps")   cfg.taps = atoi(next("65536").c_str());
         else if (k == "--bits")   cfg.outBits = atoi(next("0").c_str());
-        else if (k == "--shaper") cfg.shaper = parse_shaper(next("none"));
+        else if (k == "--dac-bits") {
+            double value=0;dacBitsCli=true;
+            if(!cleanupNumber(next(""),0,32,value)||value!=std::floor(value)||(value!=0&&value<8)){
+                printf("!! --dac-bits 须为 0（自动）或 8..32 整数\n");return 1;
+            }
+            cfg.pcmValidBits=(int)value;
+        }
+        else if(k=="--crossfeed") {
+            const auto value=next("");crossfeedCli=true;
+            if(value!="off"&&value!="light"&&value!="standard"){printf("!! --crossfeed 须为 off、light 或 standard\n");return 1;}
+            cfg.crossfeed.enabled=value!="off";
+            if(!crossfeedLevelCli)cfg.crossfeed.levelDb=value=="standard"?6.:12.;
+        }
+        else if(k=="--crossfeed-freq") {
+            crossfeedFreqCli=true;
+            if(!cleanupNumber(next(""),300,1200,cfg.crossfeed.cutoffHz)){printf("!! --crossfeed-freq 须为 300..1200 Hz\n");return 1;}
+        }
+        else if(k=="--crossfeed-level") {
+            crossfeedLevelCli=true;
+            if(!cleanupNumber(next(""),3,15,cfg.crossfeed.levelDb)){printf("!! --crossfeed-level 须为 3..15 dB\n");return 1;}
+        }
+        else if (k == "--shaper") {
+            const auto value = next("none");
+            shaperCli = true;
+            autoShaper = value == "auto" || value == "AUTO";
+            cfg.shaper = parse_shaper(value);
+            if (!autoShaper && cfg.shaper == rta::dsp::Shaper::None && value != "none" && value != "NONE") {
+                printf("!! 未知抖动/整形器: %s\n", value.c_str()); return 1;
+            }
+        }
         else if (k == "--buffer") bufferMs = atof(next("100").c_str());
         else if (k == "--seconds")limitSec = atof(next("5").c_str());
         else if (k == "--analyze")analyzeOnly = true;
@@ -635,14 +673,46 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // Read processing intent before the raw-DSD early return. Otherwise a
+    // saved processing option could be silently ignored before normal config loading.
+    if(!configFile.empty()) {
+        std::ifstream cf(configFile);std::string line;
+        while(std::getline(cf,line)) {
+            const auto comment=line.find('#');if(comment!=std::string::npos)line.resize(comment);
+            const auto split=line.find('=');if(split==std::string::npos)continue;
+            auto trim=[](std::string s){const auto a=s.find_first_not_of(" \t\r\n");if(a==std::string::npos)return std::string();return s.substr(a,s.find_last_not_of(" \t\r\n")-a+1);};
+            const auto key=trim(line.substr(0,split)),value=trim(line.substr(split+1));
+            if(key=="dacbits"&&!dacBitsCli) {
+                double bits=0;if(!cleanupNumber(value,0,32,bits)||bits!=std::floor(bits)||(bits!=0&&bits<8)){printf("!! 配置 dacbits 须为 0 或 8..32 整数\n");return 1;}
+                cfg.pcmValidBits=(int)bits;
+            } else if(key=="crossfeed"&&!crossfeedCli) {
+                if(value!="0"&&value!="1"&&value!="false"&&value!="true"){printf("!! 配置 crossfeed 须为 0 或 1\n");return 1;}
+                cfg.crossfeed.enabled=value=="1"||value=="true";
+            } else if(key=="crossfeed_freq"&&!crossfeedFreqCli) {
+                if(!cleanupNumber(value,300,1200,cfg.crossfeed.cutoffHz)){printf("!! 配置 crossfeed_freq 须为 300..1200 Hz\n");return 1;}
+            } else if(key=="crossfeed_level"&&!crossfeedLevelCli&&!crossfeedCli) {
+                if(!cleanupNumber(value,3,15,cfg.crossfeed.levelDb)){printf("!! 配置 crossfeed_level 须为 3..15 dB\n");return 1;}
+            } else if(key=="cleanup"&&!cleanupModeCli) {
+                if(value!="0"&&value!="1"&&value!="false"&&value!="true"){printf("!! 配置 cleanup 须为 0 或 1\n");return 1;}
+                cfg.recordingCleanup.enabled=value=="1"||value=="true";
+            }
+        }
+    }
+
     // ================= DirectSDM：DSD 文件 → ASIO 原生 DSD（不经过 PCM） =================
     // 为什么必须在 read_any 之前拦截：read_any 会把 .dsf 抽成 PCM（多一层量化、
     // 丢掉原始 1-bit 流），那样就谈不上"原生 DSD"了。
-    if (nativeDsd && !analyzeOnly && asioDevice.empty()) {
+    if(!analyzeOnly&&!asioDevice.empty()&&!netTarget.empty()){
+        printf("!! 同时指定 ASIO 与网络输出：请明确选择一个输出后端\n");return 2;
+    }
+    if(!analyzeOnly&&outFile.empty()&&netTarget.empty()&&!asioDevice.empty()&&!nativeDsd){
+        printf("!! CLI ASIO PCM/DoP 路由尚未实现，已拒绝播放；不会回退到 WASAPI 默认设备。请使用产品界面 ASIO 输出\n");return 2;
+    }
+    if (nativeDsd && !analyzeOnly && outFile.empty() && netTarget.empty() && asioDevice.empty()) {
         printf("!! --native-dsd 需要配合 --asio-device（原生 DSD 只走 ASIO）\n");
         return 1;
     }
-    if (nativeDsd && !analyzeOnly) {
+    if (nativeDsd && !analyzeOnly && outFile.empty() && netTarget.empty()) {
         std::string ext;
         const size_t dot = inPath.find_last_of('.');
         if (dot != std::string::npos) {
@@ -650,6 +720,9 @@ int main(int argc, char** argv) {
             for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
         }
         if (ext == ".dsf" || ext == ".dff") {
+            if (cfg.crossfeed.enabled || cfg.pcmValidBits>0) {
+                printf("!! DirectSDM 逐位输出不能运行耳机交叉馈送或 DAC 有效位深；请关闭这两项\n");return 1;
+            }
             if (cfg.recordingCleanup.enabled) {
                 printf("!! DirectSDM 逐位输出不能运行 PCM 录音清理；请关闭清理或使用 PCM/离线分析\n");return 1;
             }
@@ -665,7 +738,7 @@ int main(int argc, char** argv) {
             if (dsdMultiple > 0 && rta::dsp::dsd_rate(dsdMultiple) != ds.rate)
                 printf("  注意：文件是 DSD%u，--dsd %d 被忽略（DirectSDM 按源位率直通，不重调制）\n",
                        ds.rate / 44100u, dsdMultiple);
-            return play_asio_native_dsd(dev, ds, limitSec, forceDop);
+            return play_asio_native_dsd(dev, ds, limitSec, forceDop, bufferMs);
         }
     }
 
@@ -732,7 +805,14 @@ int main(int argc, char** argv) {
             else if (key == "rateFamilyPolicy" && !ratePolicyExplicit) { rateFamilyPolicy = val; ++applied; }
             else if (key == "bits"   && cfg.outBits == 0)  { cfg.outBits = atoi(val.c_str()); ++applied; }
             else if (key == "taps"   && cfg.taps == 65536){ cfg.taps = atoi(val.c_str()); ++applied; }
-            else if (key == "shaper" && cfg.shaper == rta::dsp::Shaper::None) { cfg.shaper = parse_shaper(val); ++applied; }
+            else if (key == "shaper" && !shaperCli) {
+                autoShaper = val == "auto" || val == "AUTO";
+                cfg.shaper = parse_shaper(val);
+                if (!autoShaper && cfg.shaper == rta::dsp::Shaper::None && val != "none" && val != "NONE") {
+                    printf("!! 配置含未知抖动/整形器: %s\n", val.c_str()); return 1;
+                }
+                ++applied;
+            }
             else if (key == "volume")                      { cfg.volumeEnabled = true; cfg.volumeDb = atof(val.c_str()); ++applied; }
             else if (key == "cleanup" && !cleanupModeCli) {
                 if(val!="0"&&val!="1"&&val!="false"&&val!="true"){printf("!! 配置 cleanup 必须是 0 或 1\n");return 1;}
@@ -776,6 +856,9 @@ int main(int argc, char** argv) {
     if (rateFamilyPolicy != "prefer" && rateFamilyPolicy != "strict" && rateFamilyPolicy != "compatible") {
         printf("!! --rate-policy / rateFamilyPolicy: use prefer, strict or compatible\n");
         return 2;
+    }
+    if(nativeDsd&&!analyzeOnly&&outFile.empty()&&netTarget.empty()&&dsdMultiple<=0){
+        printf("!! PCM 源的 ASIO Native DSD 输出需要明确 --dsd 倍率；已拒绝播放，不回退 WASAPI 默认设备\n");return 2;
     }
     if (dsdMultiple == 0) {
         const auto policy = rta::audio::parse_rate_family_policy(rateFamilyPolicy);
@@ -845,6 +928,27 @@ int main(int argc, char** argv) {
         printf("Matrix: %zu 条路由\n", cfg.matrix.size());
     }
 
+    // Resolve after source/config/rate selection, before either streaming path.
+    // Persist "auto" below so a later source at a different rate can choose again.
+    const int containerBits=cfg.outBits?cfg.outBits:in.bits;
+    const int quantizationBits=cfg.pcmValidBits>0?std::min(cfg.pcmValidBits,containerBits):containerBits;
+    if(dsdMultiple==0&&!autoShaper&&!rta::dsp::pcm_shaper_precision_supported(cfg.shaper,quantizationBits)){
+        printf("!! %s\n",rta::dsp::pcm_shaper_precision_error());return 2;
+    }
+    cfg.pcmAutoDither=autoShaper&&dsdMultiple==0;
+    auto previewShaper=cfg.shaper;
+    if (autoShaper && dsdMultiple == 0) {
+        cfg.shaper = rta::dsp::auto_pcm_shaper(quantizationBits, st0Rate(in, cfg));
+        eng::Pipeline probe(cfg);
+        previewShaper=(probe.willBeBitPerfect(in)||probe.willBeZeroPad(in))?rta::dsp::Shaper::None:cfg.shaper;
+    }
+    if (dsdMultiple == 0)
+        printf("PCM_SHAPER requested=%s resolved=%s rate=%u bits=%d containerBits=%d dacBitsRequested=%d\n",
+               autoShaper ? "auto" : rta::dsp::shaper_name(cfg.shaper), rta::dsp::shaper_name(previewShaper),
+               st0Rate(in, cfg), quantizationBits,containerBits,cfg.pcmValidBits);
+    else if(cfg.pcmValidBits>0)printf("DAC_BITS ignored: DSD 输出不进行 PCM 二次量化\n");
+    printf("CROSSFEED requested=%d cutoffHz=%.3f levelDb=%.3f\n",cfg.crossfeed.enabled?1:0,cfg.crossfeed.cutoffHz,cfg.crossfeed.levelDb);
+
     if (!saveConfigFile.empty()) {
         std::ofstream sf(saveConfigFile);
         if (!sf) { printf("!! 无法写入配置: %s\n", saveConfigFile.c_str()); return 1; }
@@ -852,8 +956,12 @@ int main(int argc, char** argv) {
         sf << "rate="   << st0Rate(in, cfg) << "\n";
         sf << "rateFamilyPolicy=" << rateFamilyPolicy << "\n";
         sf << "bits="   << (cfg.outBits ? cfg.outBits : in.bits) << "\n";
+        sf << "dacbits=" << cfg.pcmValidBits << "\n";
+        sf << "crossfeed=" << (cfg.crossfeed.enabled?1:0) << "\n";
+        sf << "crossfeed_freq=" << cfg.crossfeed.cutoffHz << "\n";
+        sf << "crossfeed_level=" << cfg.crossfeed.levelDb << "\n";
         sf << "taps="   << cfg.taps << "\n";
-        sf << "shaper=" << rta::dsp::shaper_name(cfg.shaper) << "\n";
+        sf << "shaper=" << (autoShaper ? "auto" : rta::dsp::shaper_name(cfg.shaper)) << "\n";
         sf << "volume=" << (cfg.volumeEnabled ? cfg.volumeDb : 0.0) << "\n";
         sf << "gpu="    << (useGpu ? 1 : 0) << "\n";
         sf << "buffer=" << bufferMs << "\n";
@@ -869,7 +977,9 @@ int main(int argc, char** argv) {
     // 与现有路径的区别：先只处理【第一小块】就打开设备开始播，
     // 之后在播放循环里按需继续处理后续块。
     // 由于流式改造（Round 33/34）后分块与整块输出逐位一致，这条路径的音质与整块完全相同。
-    if (lowLat && netTarget.empty() && !analyzeOnly && outFile.empty()) {
+    if (lowLat && dsdMultiple>0)printf("--lowlat: DSD 使用完整调制与尾部排空路径\n");
+    if (lowLat && dsdMultiple==0 && netTarget.empty() && !analyzeOnly && outFile.empty()) {
+        if(cfg.crossfeed.enabled||cfg.pcmValidBits>0){printf("!! --lowlat 实验路径不支持交叉馈送或 DAC 有效位深；请移除 --lowlat 使用完整播放路径\n");return 2;}
         // ⚠️ 未完成：能正确"首块即开流"（首个音频写入延迟 0 ms），
         //    但实测会在约 2 个事件后停摆（供数节奏与设备消耗的配合未调通）。
         //    因此【拒绝运行】——一个会静默产出卡顿播放的功能比直说"未实现"危险得多。
@@ -1003,7 +1113,7 @@ int main(int argc, char** argv) {
         while (done < total) {
             const size_t n = std::min(chunkFrames, total - done);
             AudioBuffer seg;
-            seg.rate = in.rate; seg.channels = in.channels; seg.bits = in.bits; seg.isFloat = false;
+            seg.rate = in.rate; seg.channels = in.channels; seg.bits = in.bits; seg.isFloat = in.isFloat;
             seg.raw.assign(in.raw.begin() + (ptrdiff_t)(done * (size_t)in.channels),
                            in.raw.begin() + (ptrdiff_t)((done + n) * (size_t)in.channels));
             eng::PipelineStats s2;
@@ -1034,16 +1144,16 @@ int main(int argc, char** argv) {
     }
     } catch (const std::exception& e) {
         printf("!! 管线准备失败：%s\n", e.what());
-        printf("   该滤波器在此输出采样率下的原型抽头数超出系数预算。\n");
-        printf("   可改选较短预设、降低输出采样率，或显式提高 maxPrototypeTaps。\n");
         return 3;
     }
+    printf("DSP_APPLIED crossfeed=%d quantizationBits=%d containerBits=%d shaper=%s volumeDb=%.6f\n",
+           st.usedCrossfeed?1:0,dsdMultiple>0?0:quantizationBits,out.bits,rta::dsp::shaper_name(st.pcmShaper),st.volumeDbObserved);
 
     // Offline/export paths retain the complete causal FIR/IR tail. Trim only
     // compensable delay; MP/IP filters deliberately report zero head trimming.
     {
         const size_t delay = (size_t)std::llround(pl.algorithmic_latency_out_frames());
-        const size_t tail = (size_t)std::ceil(pl.convolution_tail_out_frames() + pl.resampler_tail_out_frames() + pl.recording_cleanup_tail_out_frames());
+        const size_t tail = (size_t)std::ceil(pl.convolution_tail_out_frames() + pl.resampler_tail_out_frames() + pl.recording_cleanup_tail_out_frames() + pl.crossfeed_tail_out_frames());
         const size_t before = dsdMultiple > 0 ? (dsdPlanes.empty() ? 0 : dsdPlanes[0].size()) : out.frames();
         const size_t requested = delay + tail;
         size_t appended = 0;
@@ -1139,7 +1249,7 @@ int main(int argc, char** argv) {
             printf("(--analyze) DSD offline analysis complete; no output device opened\n");
             return 0;
         }
-        if (nativeDsd && !analyzeOnly) {
+        if (nativeDsd && !analyzeOnly && outFile.empty() && netTarget.empty()) {
             AsioDriverEntry dev;
             std::string derr;
             if (!asio_resolve_driver(asioDevice, dev, derr)) { printf("!! %s\n", derr.c_str()); return 1; }
@@ -1154,7 +1264,7 @@ int main(int argc, char** argv) {
                     if (sdm[(size_t)c][n] > 0.0) ds.setBit((size_t)c, n, true);
             printf("已把调制结果打包成 1-bit 流（%llu 位/声道），交给 ASIO 原生 DSD\n",
                    (unsigned long long)ds.bits);
-            return play_asio_native_dsd(dev, ds, limitSec, forceDop);
+            return play_asio_native_dsd(dev, ds, limitSec, forceDop, bufferMs);
         }
         std::vector<const double*> ip;
         for (auto& v : sdm) ip.push_back(v.data());

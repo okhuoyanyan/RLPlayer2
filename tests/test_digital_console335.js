@@ -99,7 +99,21 @@ async function main(){
   await evaluate("document.querySelector('[data-slot-name=B]').dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));var n=document.querySelector('[data-slot-name=B] input');n.value='Warm & precise';n.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))");
   await check('double click renames a group in place',"!RL_STUDIO.pending&&rlCompare.slots[1].name==='Warm & precise'&&D('rlStudioSlots').textContent.includes('Warm & precise')");
   await evaluate("document.querySelector('[data-studio-advanced=pcm]').click()");
-  await check('PCM advanced panel contains taps phase attenuation and cleanup',"D('rlStudioAdvancedDialog').open&&D('rlStudioAdvancedDialog').querySelectorAll('[data-studio-key]').length===9");
+   await check('PCM advanced panel opens for editable parameters',"D('rlStudioAdvancedDialog').open");
+   const pcmFields=[['phase','select','select-one'],['taps','input','number'],['atten','input','number'],['transition','input','number'],['isp','input','checkbox'],['cleanup','input','checkbox'],['cleanup_auto','input','checkbox'],['cleanup_strength','input','number'],['cleanup_noise_db','input','number'],['crossfeed','input','checkbox'],['crossfeed_freq','input','number'],['crossfeed_level','input','number']];
+   for(const [key,tag,type] of pcmFields){
+    await check('PCM advanced field '+key+' retains its unique control type','(()=>{const fields=D("rlStudioAdvancedDialog").querySelectorAll('+JSON.stringify('[data-studio-key="'+key+'"]')+');const f=fields[0];return fields.length===1&&f.localName==='+JSON.stringify(tag)+'&&f.type==='+JSON.stringify(type)+';})()');
+    if(key.startsWith('crossfeed'))await check('crossfeed control '+key+' is visible and enabled','(()=>{const f=D("rlStudioAdvancedDialog").querySelector('+JSON.stringify('[data-studio-key="'+key+'"]')+');return !f.disabled&&f.checkVisibility();})()');
+   }
+   await check('crossfeed starts disabled with safe frequency and attenuation defaults',"(()=>{const d=D('rlStudioAdvancedDialog'),f=d.querySelector('[data-studio-key=crossfeed_freq]'),l=d.querySelector('[data-studio-key=crossfeed_level]');return !d.querySelector('[data-studio-key=crossfeed]').checked&&f.value==='700'&&f.min==='300'&&f.max==='1200'&&l.value==='12'&&l.min==='3'&&l.max==='15';})()");
+   await evaluate("D('rlStudioAdvancedDialog').querySelector('[data-studio-key=crossfeed]').click()");
+   await check('crossfeed checkbox saves its enabled state to the active group',"!RL_STUDIO.pending&&rlCompare.slots[1].settings.crossfeed==='1'");
+   for(const [key,value] of [['crossfeed_freq','600'],['crossfeed_level','9']]){
+    await evaluate('var f=D("rlStudioAdvancedDialog").querySelector('+JSON.stringify('[data-studio-key="'+key+'"]')+');f.value='+JSON.stringify(value)+';f.dispatchEvent(new Event("input",{bubbles:true}));f.blur()');
+    await check('crossfeed '+key+' edit reaches the active group','!RL_STUDIO.pending&&rlCompare.slots[1].settings['+JSON.stringify(key)+']==='+JSON.stringify(value));
+   }
+   await evaluate("D('rlStudioAdvancedDialog').querySelector('[data-crossfeed-preset=off]').click()");
+   await check('crossfeed off preset restores bypass without changing the edited parameters',"!RL_STUDIO.pending&&rlCompare.slots[1].settings.crossfeed==='0'&&rlCompare.slots[1].settings.crossfeed_freq==='600'&&rlCompare.slots[1].settings.crossfeed_level==='9'&&!D('rlStudioAdvancedDialog').querySelector('[data-studio-key=crossfeed]').checked");
   await evaluate("var f=D('rlStudioAdvancedDialog').querySelector('[data-studio-key=taps]');f.value='4096';f.dispatchEvent(new Event('input',{bubbles:true}));f.blur()");
   await check('advanced changes automatically reach current group',"!RL_STUDIO.pending&&rlCompare.slots[1].settings.taps==='4096'");
   await evaluate("D('rlStudioAdvancedDialog').close();document.querySelector('[data-studio-advanced=sdm]').click()");
@@ -145,7 +159,9 @@ async function main(){
   await check('rename field opens for the selected saved EQ',"!!document.querySelector('.rlEqRenameInput')");
   await evaluate("var i=document.querySelector('.rlEqRenameInput');i.value='Renamed 1';i.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))");
   await check('renaming a saved EQ persists the new title',"RL_EQ.bank[0].name==='Renamed 1'");
-  await check('playback quick EQ separates headphone and custom entries',"D('rlStudioQuickEqCustom').options.length===11&&D('rlStudioQuickEqHeadphone').options.length===1");
+  await check('playback quick EQ lists all saved entries and an off entry',"D('rlStudioQuickEq').options.length===11&&D('rlStudioQuickEq').options[0].value===''");
+  await evaluate("var s=D('rlStudioQuickEq');s.value='';s.dispatchEvent(new Event('change',{bubbles:true}))");
+  await check('quick EQ empty value clears the active group link instead of keeping it',"!RL_STUDIO.pending&&rlCompare.slots[1].eqId===''&&D('rlStudioQuickEq').value===''");
   await evaluate("rlEqBankSelect('3',true)");await check('clicking a saved EQ loads it and updates enable curve and table',"!RL_STUDIO.pending&&rlCompare.slots[1].eqId==='3'&&D('rlEqEnabled').checked&&D('rlEqRows').querySelectorAll('.rlEqr').length===20");
   await evaluate("rlEqBankSelect('10');D('rlEqDelete').click()");await check('deleting a user EQ clears only its saved position',"!RL_STUDIO.pending&&!RL_EQ.bank[9].peq&&!!RL_EQ.bank[8].peq");
   await evaluate("D('rlEqOpraSearch').value='HD 600';D('rlEqOpraSearch').dispatchEvent(new Event('input',{bubbles:true}))");

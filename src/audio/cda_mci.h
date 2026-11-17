@@ -30,6 +30,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 #include <windows.h>
 #include <mmsystem.h>
 
@@ -38,6 +39,8 @@ namespace rta::audio {
 struct CdaState {
     bool        opened = false;
     bool        playing = false;
+    bool        paused = false;
+    std::string title;          // CD-Text 标题；无 CD-Text 时用 Track NN
     long long   posMs = 0;      // 轨内位置
     long long   lenMs = 0;      // 本轨时长
     int         tracks = 0;
@@ -58,18 +61,35 @@ public:
         if (!parseCdaPath(cdaPath, letter, track))
             return "不是可识别的 .cda 路径（需要形如 H:\\Track01.cda）";
         std::string err;
-        call([&] { err = playOnWorker(letter, track); });
+        call([&] {
+            // 浏览器/上传链路可能把 .cda 落到 C: 缓存目录，盘符已不是光驱。
+            // .cda 本身只有 44 字节索引，轨道号在文件名里；这里按轨道号去真实
+            // CD-ROM 上找（优先用户拖入的盘符，其次所有 CD-ROM）。
+            std::vector<char> drives;
+            if (isCdRom(letter[0])) drives.push_back(letter[0]);
+            for (char d = 'A'; d <= 'Z'; ++d)
+                if (d != letter[0] && isCdRom(d)) drives.push_back(d);
+            if (drives.empty()) {
+                err = "找不到 CD-ROM 光驱：.cda 只是 44 字节索引，音频在 CD 轨道里；请确认光驱已接好并放入音频 CD";
+                return;
+            }
+            for (char d : drives) {
+                err = playOnWorker(std::string(1, d), track);
+                if (err.empty()) return;
+            }
+        });
         return err;
     }
-    void stop()   { call([&] { if (opened_) mci("stop rlcd", nullptr, 0); }); }
-    void pause()  { call([&] { if (opened_) mci("pause rlcd", nullptr, 0); }); }
-    void resume() { call([&] { if (opened_) mci("resume rlcd", nullptr, 0); }); }
+    void stop()   { call([&] { if (opened_) { mci("stop rlcd", nullptr, 0); paused_ = false; } }); }
+    void pause()  { call([&] { if (opened_) { mci("pause rlcd", nullptr, 0); paused_ = true; } }); }
+    void resume() { call([&] { if (opened_) { mci("resume rlcd", nullptr, 0); paused_ = false; } }); }
     void close()  {
         call([&] {
             if (opened_) {
                 mci("stop rlcd", nullptr, 0);
                 mci("close rlcd", nullptr, 0);
                 opened_ = false;
+                paused_ = false;
             }
         });
     }
@@ -80,6 +100,12 @@ public:
             s.opened = opened_;
             s.track  = track_;
             s.tracks = tracks_;
+            s.paused = paused_;
+            if (track_ > 0) {
+                char tb[16];
+                std::snprintf(tb, sizeof(tb), "Track %02d", track_);
+                s.title = tb;
+            }
             if (!opened_) return;
             char buf[64] = {0};
             if (mci("status rlcd mode", buf, sizeof(buf))) {
@@ -117,13 +143,22 @@ public:
         letter = std::string(1, (char)std::toupper((unsigned char)p[0]));
         const size_t slash = p.find_last_of("\\/");
         const std::string base = (slash == std::string::npos) ? p : p.substr(slash + 1);
-        int n = 0; bool got = false;
+        // 取**最后一段连续数字**：上传链路会把文件名存成
+        // <hash>-<字节数>-Track01.cda，第一段数字是 hash/字节数，不是轨道号。
+        int last = 0, cur = 0;
+        bool have = false, inRun = false;
         for (char c : base) {
-            if (c >= '0' && c <= '9') { n = n * 10 + (c - '0'); got = true; }
-            else if (got) break;
+            if (c >= '0' && c <= '9') {
+                if (!inRun) { cur = 0; inRun = true; }
+                cur = cur * 10 + (c - '0');
+                last = cur;
+                have = true;
+            } else {
+                inRun = false;
+            }
         }
-        if (!got) return false;
-        track = n;
+        if (!have) return false;
+        track = last;
         return track >= 1 && track <= 99;
     }
 
@@ -174,6 +209,10 @@ private:
         std::snprintf(cmd, sizeof(cmd), "open %s: type cdaudio alias rlcd", letter.c_str());
         if (!mci(cmd, buf, sizeof(buf))) return std::string("打开 CD 设备失败：") + buf;
         opened_ = true;
+        // cdaudio 默认时间格式是 TMSF（轨:分:秒:帧），而下面用 msfToMs 解析
+        // 的是 MSF（分:秒:帧）。不显式设置会把 01:02:26 当成 1 分 2 秒，
+        // 进度/时长全错。设置失败不致命（老驱动仍可播），但不能静默当成 MSF。
+        mci("set rlcd time format msf", nullptr, 0);
         tracks_ = 0;
         if (mci("status rlcd number of tracks", buf, sizeof(buf))) tracks_ = std::atoi(buf);
         if (tracks_ <= 0) { mci("close rlcd", nullptr, 0); opened_ = false; return "读不到轨道数（光驱里没有音频 CD？）"; }
@@ -187,17 +226,26 @@ private:
         } else {
             if (!mci("status rlcd length", end, sizeof(end))) { mci("close rlcd", nullptr, 0); opened_ = false; return "取总长失败"; }
         }
-        std::snprintf(cmd, sizeof(cmd), "play rlcd from %s to %s", start, end);
+        // ★ 2026-11-15 实机：cdaudio 的 play from/to 参数是**轨道号**，不是 MSF。
+        //   旧实现传 "00:02:33" 这种 MSF，MCI 直接返回 282（无效参数），CD 永远不出声。
+        //   单轨 = from N to N+1（到下一轨起点）；最后一轨没有 N+1，用 from N 播到碟尾。
+        if (track < tracks_) std::snprintf(cmd, sizeof(cmd), "play rlcd from %d to %d", track, track + 1);
+        else                 std::snprintf(cmd, sizeof(cmd), "play rlcd from %d", track);
         if (!mci(cmd, buf, sizeof(buf))) {
             mci("close rlcd", nullptr, 0); opened_ = false;
             return std::string("播放第 ") + std::to_string(track) + " 轨失败：" + buf;
         }
         track_ = track;
+        paused_ = false;
         startMs_ = msfToMs(start);
         endMs_   = msfToMs(end);
         return {};
     }
 
+    static bool isCdRom(char letter) {
+        const char root[4] = { letter, ':', '\\', 0 };
+        return GetDriveTypeA(root) == DRIVE_CDROM;
+    }
     static bool mci(const char* cmd, char* out, DWORD outLen) {
         const MCIERROR e = mciSendStringA(cmd, out, outLen, nullptr);
         if (e != 0) {
@@ -222,6 +270,7 @@ private:
     std::deque<std::function<void()>> q_;
     bool quit_ = false;
     bool opened_ = false;
+    bool paused_ = false;
     int  track_ = 0;
     int  tracks_ = 0;
     int  startMs_ = 0;

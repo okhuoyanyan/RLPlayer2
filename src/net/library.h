@@ -740,7 +740,7 @@ inline bool lib_is_audio(const fsx::path& p) {
     for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
     static const char* kExt[] = { ".wav", ".wave", ".flac", ".m4a", ".alac", ".mp3", ".aac",
                                   ".ogg", ".opus", ".wma", ".ape", ".wv", ".dsf", ".dff",
-                                  ".aif", ".aiff", ".aifc", ".caf", ".mka", ".mpc", ".iso" };
+                                  ".aif", ".aiff", ".aifc", ".caf", ".mka", ".mpc", ".iso", ".cda" };
     for (auto* x : kExt) if (ext == x) return true;
     return false;
 }

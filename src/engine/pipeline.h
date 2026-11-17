@@ -24,6 +24,7 @@
 #include "dsp/gpu_bridge.h"
 #include "dsp/loudness.h"
 #include "dsp/recording_cleanup.h"
+#include "dsp/crossfeed.h"
 #include "dsp/peq.h"          // 261024-02 #6：20 段参数均衡（输入采样率、现有文件 EQ 之前）
 #include "dsp/dsd_rate_convert.h"   // 2026-10-27：DSD 异速率支路（DSD64→128/256…），PCM 路径不引用它
 #include "dsp/replaygain.h"         // 2026-10-27：ReplayGain 增益（只用 apply_gain / loudness_volume_db，纯头文件）
@@ -33,6 +34,7 @@
 #include <chrono>
 #include <memory>
 #include <atomic>
+#include <limits>
 
 namespace rta::engine {
 
@@ -91,9 +93,15 @@ struct PipelineConfig {
     // Independent, opt-in recording noise cleanup before matrix/upsampling.
     // This is a bounded adaptive denoiser, not an inverse model of an ADC.
     dsp::RecordingCleanupConfig recordingCleanup;
+    // Optional stereo headphone mix, at source rate before PEQ/convolution.
+    dsp::CrossfeedConfig crossfeed;
 
     // ---- 输出 ----
     int      outBits    = 0;          // 0 = 与源相同
+    // DAC effective precision is separate from the 16/24/32-bit transport.
+    // 0 follows the transport; 8..32 requests the final quantizer grid. A
+    // narrower container wins. PCM-to-DSD doubleOut never quantizes to this grid.
+    int      pcmValidBits = 0;
     int      outChannels= 0;          // 0 = 与源相同
     // Source precision metadata (0 = unknown). For integer PCM this may be
     // smaller than the decoder/container width. Lossy MP3/AAC has no intrinsic
@@ -102,6 +110,10 @@ struct PipelineConfig {
     // solely when the actual integer container is narrower than the output.
     int      sourceBits = 0;
     dsp::Shaper shaper  = dsp::Shaper::None;
+    // Preserve the user's auto intent across runtime volume changes. Integer
+    // unity playback stays transparent; processing selects a final quantizer
+    // from the actual output rate and effective DAC precision.
+    bool     pcmAutoDither = false;
     uint64_t seed       = 0xC0FFEEull;
 
     // ---- Matrix / 处理链 ----
@@ -189,6 +201,9 @@ struct PipelineStats {
     // 各阶段是否实际生效
     bool     usedMatrix = false, usedEq = false, usedDelay = false, usedPeq = false;
     bool     usedConvolution = false, usedResample = false, usedVolume = false;
+    bool     usedCrossfeed = false;
+    dsp::Shaper pcmShaper = dsp::Shaper::None; // Actually used in this block; DSD doubles never use PCM dither.
+    double   volumeDbObserved = 0.0;          // Requested target consumed by this process call, not instantaneous ramp gain.
     bool     usedReplayGain = false;       // 本次是否乘了 ReplayGain 增益（0 dB ⟹ false，样本逐位未动）
     bool     usedGpuConvolution = false;   // 本次是否真的走了 GPU
     bool     usedFixed = false;            // 261030-01 D-11：本次流是否走了定点卷积（可观测证据）
@@ -214,14 +229,15 @@ public:
 
     const PipelineConfig& config() const { return cfg_; }
 
-    bool hasAnyProcessing() const {
+    bool hasAnyProcessing(bool ignoreVolume = false) const {
 
+        if (cfg_.crossfeed.enabled || cfg_.pcmValidBits != 0) return true;
         if (cfg_.outRate && cfg_.outRate != 0) { /* 需与源率比较，见下 */ }
         if (cfg_.recordingCleanup.enabled && cfg_.recordingCleanup.strength > 0 &&
             cfg_.recordingCleanup.maxReductionDb > 0) return true;
         if (!cfg_.matrix.empty()) return true;
-        if (cfg_.shaper != dsp::Shaper::None) return true;
-        if (cfg_.volumeEnabled && (requestedVolumeDb_.load(std::memory_order_relaxed) != 0.0 ||
+        if (!cfg_.pcmAutoDither && cfg_.shaper != dsp::Shaper::None) return true;
+        if (!ignoreVolume && cfg_.volumeEnabled && (requestedVolumeDb_.load(std::memory_order_relaxed) != 0.0 ||
                                   volumeActive_.load(std::memory_order_relaxed))) return true;
         if (cfg_.replayGainDb != 0.0) return true;      // ReplayGain 改样本值 ⟹ 不是直通
         // ★ 2026-10-29（两轮审查 F21）：预衰减漏判。
@@ -260,8 +276,8 @@ public:
         requestedLoudnessDb_.store(db, std::memory_order_relaxed);
     }
 
-    // PCM rendering applies its live gain in the sink; only the listening level
-    // is forwarded here so loudness follows without applying the gain twice.
+    // For callers that deliberately apply gain elsewhere, update only the
+    // listening level. Normal PCM rendering uses set_volume_db before dither.
     // Setters publish requests only. Filter/volume state belongs to process().
     void set_loudness_volume_db(double db) const {
         if (rta::audio::audio_finite(db)) requestedLoudnessDb_.store(db, std::memory_order_relaxed);
@@ -323,6 +339,14 @@ public:
         return (double)ss_.cleanup->tail() * (double)outRate / (double)inRate;
     }
 
+    // Crossfeed has a direct path (no compensable latency) plus a short IIR tail.
+    double crossfeed_tail_out_frames() const {
+        if (!ss_.ready || !ss_.crossfeed) return 0.0;
+        const uint32_t inRate = ss_.inRate ? ss_.inRate : 1u;
+        const uint32_t outRate = cfg_.outRate ? cfg_.outRate : inRate;
+        return (double)ss_.crossfeed->tail_frames() * (double)outRate / (double)inRate;
+    }
+
     // Diagnostics on the processing thread only, like prepared_resampler().
     const dsp::RecordingCleanupStats* prepared_recording_cleanup_stats() const noexcept {
         return ss_.cleanup ? &ss_.cleanup->stats() : nullptr;
@@ -371,6 +395,7 @@ public:
     // 这里只把历史清零，配合调用方的"预卷"（提前解码 0.5 秒再丢掉）即可无拖尾。
     void seek_reset() const {
         if (ss_.cleanup) ss_.cleanup->reset();
+        if (ss_.crossfeed) ss_.crossfeed->reset();
         if (ss_.rs) ss_.rs->reset();
         // 卷积器按 IR 长度分块，跳转时用同一个 IR 重新装载即可清空历史
         for (size_t c = 0; c < ss_.conv.size(); ++c) {
@@ -395,7 +420,7 @@ public:
     // sourceBits is metadata; it cannot prove float decoder samples lie on an
     // integer grid, or justify shifting a wider integer container backwards.
     bool willBeBitPerfect(const AudioBuffer& in) const {
-        if (cfg_.forceBitPerfect) return true;
+        if (cfg_.forceBitPerfect) return !cfg_.crossfeed.enabled && cfg_.pcmValidBits == 0;
         if (in.isFloat) return false;          // float→int 是格式转换，不算「同格式逐位」
         const uint32_t orr = cfg_.outRate ? cfg_.outRate : in.rate;
         const int ob = cfg_.outBits ? cfg_.outBits : in.bits;
@@ -429,6 +454,20 @@ public:
         st.outRate = cfg_.outRate ? cfg_.outRate : in.rate;
         st.outBits = cfg_.outBits ? cfg_.outBits : in.bits;
         st.outChannels = cfg_.outChannels ? cfg_.outChannels : in.channels;
+        st.volumeDbObserved = requestedVolumeDb_.load(std::memory_order_relaxed);
+        if (cfg_.pcmValidBits != 0 && (cfg_.pcmValidBits < 8 || cfg_.pcmValidBits > 32))
+            throw std::invalid_argument("DAC effective PCM bits must be 0 (follow transport) or 8..32");
+        if (cfg_.forceBitPerfect && cfg_.pcmValidBits != 0)
+            throw std::invalid_argument("DAC effective PCM bits cannot run in forced bit-perfect mode");
+        if (cfg_.crossfeed.enabled &&
+            (cfg_.forceBitPerfect || in.channels != 2 || st.outChannels != 2))
+            throw std::invalid_argument("crossfeed requires stereo input/output and cannot run in forced bit-perfect mode");
+        if (!doubleOut) {
+            const int effectiveBits = cfg_.pcmValidBits ? std::min(cfg_.pcmValidBits, st.outBits) : st.outBits;
+            const auto mode = cfg_.pcmAutoDither ? dsp::auto_pcm_shaper(effectiveBits, st.outRate) : cfg_.shaper;
+            if (!dsp::pcm_shaper_precision_supported(mode, effectiveBits))
+                throw std::invalid_argument(dsp::pcm_shaper_precision_error());
+        }
 
         AudioBuffer out;
         out.rate = st.outRate;
@@ -443,6 +482,7 @@ public:
             st.bitPerfect = true;
             st.outChannels = in.channels;
             st.outFrames = out.frames();
+            if (st.outFrames > 0) transparentPcmSeen_ = true;
             if (stOut) *stOut = st;
             return out;
         }
@@ -455,6 +495,7 @@ public:
                 out.raw[i] = (int32_t)((uint32_t)in.raw[i] << shift);
             st.zeroPad = true;
             st.outFrames = out.frames();
+            if (st.outFrames > 0) transparentPcmSeen_ = true;
             if (stOut) *stOut = st;
             return out;
         }
@@ -463,6 +504,14 @@ public:
         const int inCh  = in.channels;
         const int outCh = st.outChannels;
         const size_t nIn = in.frames();
+        // Only a pure integer path can become transparent partway through a
+        // volume ramp. This decision excludes other DSP and manual DAC bits.
+        // Stop dither on the exact unity frame, not the next caller's block,
+        // so different chunk sizes produce identical output and RNG history.
+        const bool volumeOnlyAuto = cfg_.pcmAutoDither && !doubleOut && !in.isFloat &&
+            st.outRate == in.rate && st.outChannels == in.channels && st.outBits >= in.bits &&
+            !hasAnyProcessing(true);
+        size_t autoTransparentFrom = volumeOnlyAuto ? 0 : std::numeric_limits<size_t>::max();
 
         // 首次调用（或配置变化）时建立持久流式状态；此后跨调用保持
         if (!ss_.ready || ss_.inRate != in.rate || ss_.inChannels != in.channels)
@@ -470,6 +519,7 @@ public:
         // Consume control requests on this thread only; no GUI/render thread
         // writes VolumeControl or Loudness filter histories.
         const double volumeDb = requestedVolumeDb_.load(std::memory_order_relaxed);
+        st.volumeDbObserved = volumeDb;
         if (ss_.vol && volumeDb != ss_.volumeDb) {
             ss_.vol->set_gain_db(volumeDb);
             ss_.volumeDb = volumeDb;
@@ -555,6 +605,13 @@ public:
             for (int c = 0; c < cp; ++c) work[(size_t)c] = planes[(size_t)c];
             if (inCh == 1 && outCh > 1)
                 for (int c = 1; c < outCh; ++c) work[(size_t)c] = planes[0];
+        }
+
+        // Stereo crossfeed runs after routing, before PEQ, EQ and convolution.
+        // Its two histories persist across chunks and are cleared on seek.
+        if (ss_.crossfeed) {
+            ss_.crossfeed->process(work[0].data(), work[1].data(), nIn);
+            st.usedCrossfeed = true;
         }
 
         // ---- 阶段 3 前置：20 段 PEQ（输入采样率，现有文件 EQ 之前）----
@@ -721,7 +778,14 @@ public:
             vp.reserve(work.size());
             for (auto& w : work) vp.push_back(w.data());
             const bool wasActive = ss_.vol->current_gain() != 1.0 || ss_.vol->ramping();
-            ss_.vol->process_planes(vp.data(), (int)work.size(), nOut);
+            if (volumeOnlyAuto) {
+                autoTransparentFrom = nOut;
+                for (size_t n = 0; n < nOut; ++n) {
+                    const double gain = ss_.vol->step_frame();
+                    if (gain == 1.0 && !ss_.vol->ramping()) autoTransparentFrom = std::min(autoTransparentFrom, n);
+                    for (auto& w : work) w[n] = gain == 0.0 ? 0.0 : (gain == 1.0 ? w[n] : w[n] * gain);
+                }
+            } else ss_.vol->process_planes(vp.data(), (int)work.size(), nOut);
             const bool stillActive = ss_.vol->current_gain() != 1.0 || ss_.vol->ramping();
             st.usedVolume = wasActive || stillActive;
             volumeActive_.store(stillActive, std::memory_order_relaxed);
@@ -740,6 +804,7 @@ public:
         // ---- 阶段 7：抖动/整形 + 量化 ----
         out.raw.resize(nOut * (size_t)outCh);
         std::vector<dsp::Quantizer>& qz = ss_.quant;   // ★ 持久：噪声整形误差历史跨调用保持
+        if (!qz.empty() && autoTransparentFrom > 0) st.pcmShaper = ss_.quantShaper;
         if(qz.empty() && !out.isFloat) {
             std::vector<const double*> planes;
             planes.reserve(work.size());
@@ -751,6 +816,10 @@ public:
         }
         for (size_t n = 0; n < nOut; ++n) {
             for (int c = 0; c < outCh; ++c) {
+                if (n >= autoTransparentFrom) {
+                    out.raw[n * (size_t)outCh + c] = (int32_t)((uint32_t)in.raw[n * (size_t)in.channels + c] << (st.outBits - in.bits));
+                    continue;
+                }
                 const double x = work[(size_t)c][n];
                 double y;
                 if (!qz.empty()) y = qz[(size_t)c].process(x);
@@ -778,9 +847,11 @@ private:
         std::unique_ptr<dsp::PolyphaseResampler> rs;
         std::unique_ptr<dsp::VolumeControl>      vol;
         std::unique_ptr<dsp::RecordingCleanup>   cleanup;
+        std::unique_ptr<dsp::Crossfeed>           crossfeed;
         std::vector<dsp::Biquad>                 eq;      // 按输出声道展开的级联
         std::vector<size_t>                      eqPerCh; // 每声道的双二阶个数
         std::vector<dsp::Quantizer>              quant;
+        dsp::Shaper quantShaper = dsp::Shaper::None;
         std::vector<std::unique_ptr<dsp::StreamingConvolver>> conv;   // 每输出声道（CPU 兜底）
     // 2026-10-27（261026-08 #7）：GPU 流式卷积会话，每输出声道一个。
     // 与 CPU conv 二选一：GPU 可用且 IR 够长时用它，否则用 conv。
@@ -797,6 +868,7 @@ private:
         size_t coeffBytes = 0;       // 重采样器系数表字节数（多相 L × 每相抽头 × 8）
     };
     mutable StreamState ss_;
+    mutable bool transparentPcmSeen_ = false;
 
     void prepare_stream(const AudioBuffer& in, int outCh) const {
         const auto t_prep_0 = std::chrono::steady_clock::now();
@@ -806,6 +878,8 @@ private:
         if (cfg_.recordingCleanup.enabled && cfg_.recordingCleanup.strength > 0 &&
             cfg_.recordingCleanup.maxReductionDb > 0)
             ss_.cleanup = std::make_unique<dsp::RecordingCleanup>(cfg_.recordingCleanup, in.rate, in.channels);
+        if (cfg_.crossfeed.enabled)
+            ss_.crossfeed = std::make_unique<dsp::Crossfeed>(cfg_.crossfeed, in.rate);
 
         const uint32_t outRate = cfg_.outRate ? cfg_.outRate : in.rate;
         ss_.volumeDb = requestedVolumeDb_.load(std::memory_order_relaxed);
@@ -858,14 +932,20 @@ private:
             // ★ 2026-10-29（F01）：起播必须【立刻到位】，不能从单位增益淡入。
             //   旧写法 set_gain_db() 只启动 200 ms 从 1.0 → 目标的渐变 ⟹ 选 −60 dB 时
             //   开头 200 ms 是满幅（首样本 0.499947969 vs 目标 0.0005，差 59.9991 dB）。
-            ss_.vol->set_gain_db_snapped(ss_.volumeDb);
+            if (transparentPcmSeen_ && ss_.volumeDb != 0.0) {
+                ss_.vol->set_gain_db_snapped(0.0);
+                ss_.vol->set_gain_db(ss_.volumeDb);
+            } else ss_.vol->set_gain_db_snapped(ss_.volumeDb);
         }
+        transparentPcmSeen_ = false;
         const int ob = cfg_.outBits ? cfg_.outBits : in.bits;
-        if (cfg_.shaper != dsp::Shaper::None || ob < in.bits) {
+        const int quantBits = cfg_.pcmValidBits ? std::min(cfg_.pcmValidBits, ob) : ob;
+        ss_.quantShaper = cfg_.pcmAutoDither ? dsp::auto_pcm_shaper(quantBits, outRate) : cfg_.shaper;
+        if (ss_.quantShaper != dsp::Shaper::None || ob < in.bits || cfg_.pcmValidBits != 0) {
             for (int c = 0; c < outCh; ++c)
                 // 第四个参数是采样率：整形器的拐点要按输出采样率重标定，
                 // 否则 44.1k 输出时 NTF 会在 15~20 kHz 把噪声放大几百倍（见 dither.h 注释）
-                ss_.quant.emplace_back(cfg_.shaper, ob, cfg_.seed + (uint64_t)c * 7919ull, (double)outRate);
+                ss_.quant.emplace_back(ss_.quantShaper, quantBits, cfg_.seed + (uint64_t)c * 7919ull, (double)outRate);
         }
         ss_.conv.clear();
         ss_.conv.resize((size_t)outCh);      // unique_ptr 不可拷贝，不能用 assign(n, nullptr)

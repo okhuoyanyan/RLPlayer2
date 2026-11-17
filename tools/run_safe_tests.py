@@ -11,9 +11,40 @@ import shutil
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+# 增量门禁缓存的版本号：判据/键的构成变了就 +1，旧缓存自动作废。
+GATE_CACHE_SCHEMA = 2  # v1 hashed subtree-relative paths against the source root.
+
+
+def _sha_file(path: Path) -> str:
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return "missing"
+
+
+def _tree_files(root: Path):
+    if not root.is_dir():
+        return []
+    return [p.relative_to(root).as_posix() for p in sorted(root.rglob("*")) if p.is_file()]
+
+
+def _sha_paths(root: Path, rels) -> str:
+    h = hashlib.sha256()
+    for rel in sorted(rels):
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        h.update(_sha_file(root / rel).encode("ascii"))
+        h.update(b"\n")
+    return h.hexdigest()
 
 
 def bracket(value):
@@ -36,6 +67,13 @@ def main():
     p.add_argument("--include", default=".*")
     p.add_argument("--prepare-only", action="store_true")
     p.add_argument("--audit-only", action="store_true")
+    # 2026-11-16（用户：小改动出包要 1 小时，必须简化）：
+    #   增量门禁缓存。键 = 该测试**声明的源码哈希 + 它真正执行的二进制哈希 + 它读的运行时数据
+    #   （data/i18n、data/opra_index.json、tests/fixtures）+ 清单摘要**。
+    #   键没变 = 同一个测试、同一份输入、上次已经真跑绿 ⟹ 记 CACHED（不是 SKIP，不计入"零测试"）。
+    #   任何输入变了，键就变，必须重跑。--no-cache 强制全量（发布前做一次"从零全绿"时用）。
+    p.add_argument("--cache", type=Path)
+    p.add_argument("--no-cache", action="store_true")
     a = p.parse_args()
     # CTest changes directory before evaluating each test's WORKING_DIRECTORY.
     # Anchor CLI paths here so a relative private run root does not become nested
@@ -108,9 +146,11 @@ def main():
         for tool in ("ffmpeg.exe", "ffprobe.exe"):
             shutil.copy2((a.lite_dir / tool).resolve(), lite / tool)
     lines = []
+    blocks = []
     staged = []
     for test in selected:
         name = test["name"]
+        line_start = len(lines)
         rule = by_name[name]
         private = a.run_root / name
         private.mkdir()
@@ -268,6 +308,12 @@ def main():
             key, _, val = value.partition("=")
             if key not in env:
                 env[key] = val
+        # 2026-11-14（3.3.11）：把每个测试的 TEMP/TMP 钉在它自己的私有目录里。
+        # 之前若干测试用 %TEMP% 建临时目录，而本机 D: 根被当成了临时区，于是
+        # D:\ 根上堆出 300+ 个 rlpam-/rlpcl-/rlpcs-/RLGatesTmp-/pm- 目录。
+        # 用户要求「D 盘除 D:\RTA-hqplayer 外不允许有本项目的文件夹」，这里从源头掐断。
+        env["TEMP"] = str(temp)
+        env["TMP"] = str(temp)
         props["WORKING_DIRECTORY"] = str(private)
         props["ENVIRONMENT"] = [key + "=" + value.replace(";", "\\;") for key, value in env.items()]
         props.setdefault("TIMEOUT", rule.get("timeout_seconds", 600))
@@ -282,10 +328,87 @@ def main():
             if isinstance(value, bool):
                 value = "TRUE" if value else "FALSE"
             lines.append("set_tests_properties(" + bracket(name) + " PROPERTIES " + key + " " + bracket(value) + ")")
+        blocks.append((name, lines[line_start:]))
         staged.append(dict(name=name, category=rule["category"], command=cmd, private=str(private),
                            environment=env, source_hashes={f: hashlib.sha256((a.source/f).read_bytes()).hexdigest() for f in rule["sources"] if (a.source/f).is_file()}, executable_inputs=copies))
-    (a.run_root / "CTestTestfile.cmake").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    (a.run_root / "audit.json").write_text(json.dumps(dict(registered=len(found), certificate_python_path=audit_dependencies, selected=staged, excluded=rejected), indent=2), encoding="utf-8")
+
+    # ---- 增量门禁缓存（2026-11-16，用户要求简化出包）----
+    # 判据不是"上次跑过"，而是"这份输入上次已经真跑绿"：
+    #   键 = 清单摘要 + 该测试声明的源码哈希 + 它真正执行的二进制哈希 + 它读的运行时数据哈希。
+    #   任何一个变了，键就变 ⟹ 必须重跑。记 CACHED 的测试不进 CTestTestfile，也就不会
+    #   被当成 SKIP 计入"零测试"。
+    cache_path = (a.cache or (a.build / "safe-gate-cache.json")).resolve()
+    cache = {"schema": GATE_CACHE_SCHEMA, "entries": {}}
+    if cache_path.is_file() and not a.no_cache:
+        try:
+            loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+            if loaded.get("schema") == GATE_CACHE_SCHEMA and isinstance(loaded.get("entries"), dict):
+                cache = loaded
+        except (OSError, ValueError):
+            cache = {"schema": GATE_CACHE_SCHEMA, "entries": {}}
+    manifest_digest = _sha_file(a.manifest)
+    data_i18n = _sha_paths(a.source, ["data/i18n/" + n + ".json" for n in ("ar", "en", "es", "fr", "ja", "ru")])
+    data_opra = _sha_file(a.source / "data" / "opra_index.json")
+    fixtures_sha = _sha_paths(a.source / "tests" / "fixtures", _tree_files(a.source / "tests" / "fixtures"))
+    rtaweb_sha = _sha_file(a.build / "rtaweb.exe")
+    src_cache = {}
+
+    def src_tree_sha():
+        if "v" not in src_cache:
+            src_cache["v"] = _sha_paths(a.source / "src", _tree_files(a.source / "src"))
+        return src_cache["v"]
+
+    def needs_i18n(name, rule):
+        if rule["category"] == "loopback" or name.startswith("i18n"):
+            return True
+        for src in rule.get("sources", []):
+            src = str(src).replace("\\", "/")
+            if src.startswith("data/") or src.endswith(".js") or "/ui_" in src or src.startswith("src/net/ui_"):
+                return True
+        return False
+
+    keys = {}
+    for entry in staged:
+        name = entry["name"]
+        rule = by_name[name]
+        parts = [str(GATE_CACHE_SCHEMA), name, rule["category"], manifest_digest]
+        for fpath, digest in sorted(entry["source_hashes"].items()):
+            parts.append(fpath + ":" + digest)
+        exe = Path(entry["command"][0])
+        exe_is_file = exe.is_file()
+        parts.append("exe:" + (_sha_file(exe) if exe_is_file else "runtime"))
+        for cname, cpath in sorted(entry["executable_inputs"].items()):
+            parts.append("helper:" + cname + ":" + _sha_file(Path(cpath)))
+        parts.append("opra:" + data_opra)
+        parts.append("fixtures:" + fixtures_sha)
+        if needs_i18n(name, rule):
+            parts.append("i18n:" + data_i18n)
+        if not exe_is_file or rule["category"] == "loopback":
+            parts.append("rtaweb:" + rtaweb_sha)
+        if not exe_is_file:
+            parts.append("src:" + src_tree_sha())
+        keys[name] = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+    cached_names = []
+    if not a.no_cache and not a.prepare_only:
+        cached_names = [e["name"] for e in staged if cache["entries"].get(e["name"], {}).get("key") == keys[e["name"]]]
+    run_set = {e["name"] for e in staged} - set(cached_names)
+    print(f"GATE cache: executed={len(run_set)} cached={len(cached_names)} path={cache_path}", flush=True)
+    if cached_names:
+        print("GATE cached (inputs unchanged since last green): " + ", ".join(sorted(cached_names)), flush=True)
+    if not run_set:
+        (a.run_root / "audit.json").write_text(json.dumps(dict(registered=len(found), certificate_python_path=audit_dependencies,
+            selected=staged, excluded=rejected, cached=sorted(cached_names), executed=[]), indent=2), encoding="utf-8")
+        print("GATE all selected tests are cached green for these inputs; nothing to execute.", flush=True)
+        return 0
+
+    out_lines = []
+    for name, blk in blocks:
+        if name in run_set:
+            out_lines.extend(blk)
+    (a.run_root / "CTestTestfile.cmake").write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+    (a.run_root / "audit.json").write_text(json.dumps(dict(registered=len(found), certificate_python_path=audit_dependencies,
+        selected=staged, excluded=rejected, cached=sorted(cached_names), executed=sorted(run_set)), indent=2), encoding="utf-8")
     print(f"MANIFEST registered={len(found)} selected={len(selected)} excluded={len(rejected)} fresh_root={a.run_root}", flush=True)
     if a.prepare_only:
         return 0
@@ -320,7 +443,22 @@ def main():
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
         for line in proc.stdout:
             log.write(line); log.flush(); print(line, end="", flush=True)
-        return proc.wait()
+        rc = proc.wait()
+    # 只有整轮全绿才记缓存：红了就什么都不写，下次这些测试照样重跑（绝不把失败"记住"）。
+    if rc == 0 and not a.no_cache:
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for name in run_set:
+            cache["entries"][name] = {"key": keys[name], "at": stamp, "category": by_name[name]["category"]}
+        cache["entries"] = {k: v for k, v in cache["entries"].items() if k in by_name}
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(cache, indent=1, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, cache_path)
+            print(f"GATE cache updated: {cache_path} ({len(cache['entries'])} green entries)", flush=True)
+        except OSError as exc:
+            print(f"GATE cache not written ({exc}); gate result stands.", flush=True)
+    return rc
 
 
 if __name__ == "__main__":

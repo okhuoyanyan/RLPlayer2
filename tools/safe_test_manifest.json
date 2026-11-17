@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "reviewed_registration_count": 277,
+  "reviewed_registration_count": 296,
   "scope": "Windows only; private stage each entry. Hardware coverage never inferred from CPU/mock PASS.",
   "tests": [
     {
@@ -3973,7 +3973,15 @@
       "category": "offline",
       "sources": [
         "tests/test_app_settings_persistence.py",
-        "tools/rtaweb.cpp"
+        "tools/rtaweb.cpp",
+        "src/audio/wav.h",
+        "src/dsp/dither.h",
+        "src/dsp/kaiser.h",
+        "src/dsp/fp_strict.h",
+        "src/dsp/design_control.h",
+        "src/net/json.h",
+        "src/meta/store.h",
+        "src/net/workbench_config.h"
       ],
       "reason": "Extract production save functions, compile temp test and inject replacement failures on own fixture handles; no real config/profile read.",
       "required_source_guards": [],
@@ -4086,6 +4094,29 @@
         {
           "line": 1,
           "text": "Node VM only: static i18n maps, synthetic DOM/api promise, no real device or backend."
+        }
+      ]
+    },
+    {
+      "name": "i18n_packs",
+      "category": "offline",
+      "sources": [
+        "tests/test_i18n_packs.js",
+        "data/i18n/en.json",
+        "data/i18n/ja.json",
+        "data/i18n/fr.json",
+        "data/i18n/ru.json",
+        "data/i18n/es.json",
+        "data/i18n/ar.json"
+      ],
+      "reason": "Node only: reads the six runtime language packs and asserts key parity; no device, network or backend.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 600,
+      "boundary_evidence": [
+        {
+          "line": 1,
+          "text": "Node only: reads the six runtime language packs and asserts key parity; no device, network or backend."
         }
       ]
     },
@@ -4725,7 +4756,15 @@
       "sources": [
         "tests/test_app_sdm_signal_contract.py",
         "tools/rtaweb.cpp",
-        "src/net/json.h"
+        "src/net/json.h",
+        "src/dsp/dither.h",
+        "src/dsp/recording_cleanup.h",
+        "src/dsp/fft.h",
+        "src/dsp/kaiser.h",
+        "src/dsp/fp_strict.h",
+        "src/dsp/design_control.h",
+        "src/dsp/modulator.h",
+        "src/dsp/sdm_sections.h"
       ],
       "reason": "Extract actual signal JSON fields/normalization into private C++ stub parameters; no backend, DSP constructor, real config or devices.",
       "required_source_guards": [],
@@ -5453,7 +5492,14 @@
         "tests/test_ui_preferences_backend.py",
         "tests/test_app_settings_persistence.py",
         "tools/rtaweb.cpp",
-        "src/meta/store.h"
+        "src/meta/store.h",
+        "src/audio/wav.h",
+        "src/dsp/dither.h",
+        "src/dsp/kaiser.h",
+        "src/dsp/fp_strict.h",
+        "src/dsp/design_control.h",
+        "src/net/json.h",
+        "src/net/workbench_config.h"
       ],
       "reason": "Extracts production file-backed settings handler and literal scaffold; private TemporaryDirectory, compiler only, no server/device. Restart child checks preference durability and rejected partial writes.",
       "required_source_guards": [],
@@ -5791,6 +5837,295 @@
       "required_source_guards": [],
       "helpers": [],
       "timeout_seconds": 180,
+      "boundary_evidence": []
+    },
+    {
+      "name": "filter_detail_reference",
+      "category": "offline",
+      "sources": [
+        "tools/filter_detail_reference.cpp",
+        "tests/test_filter_detail_reference.cpp",
+        "src/dsp/filter_families.h",
+        "src/dsp/resampler.h"
+      ],
+      "reason": "Generated production-coefficient detail table contract: one row per preset, finite pass/stop/group-delay/impulse data, normalized impulse, no audio device.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 120,
+      "boundary_evidence": [
+        {
+          "line": 1,
+          "text": "Generated filter-detail data contract. No audio device is opened."
+        }
+      ]
+    },
+    {
+      "name": "asio_buffer_policy",
+      "category": "offline",
+      "sources": [
+        "src/audio/asio_out.h",
+        "tests/test_asio_buffer_policy.cpp"
+      ],
+      "reason": "Pure ASIO buffer-size selection: millisecond target, preferred floor, driver min/max/granularity clamp; no driver or device is opened.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 60,
+      "boundary_evidence": [
+        {
+          "line": 1,
+          "text": "ASIO buffer policy: pure selection logic, no driver or device is opened."
+        }
+      ]
+    },
+    {
+      "name": "native_dsd_pack",
+      "category": "offline",
+      "sources": [
+        "src/dsp/dop.h",
+        "tests/test_native_dsd_pack.cpp"
+      ],
+      "reason": "Exhaustive 65536-payload check that DoP 24-bit words map to ASIO MSB1 bytes without marker leakage or bit reversal; no device is opened.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 60,
+      "boundary_evidence": [
+        {
+          "line": 1,
+          "text": "DoP payload to native DSD byte mapping only; no driver or device is opened."
+        }
+      ]
+    },
+    {
+      "name": "cda_path",
+      "category": "offline",
+      "sources": [
+        "src/audio/cda_mci.h",
+        "tests/test_cda_path.cpp"
+      ],
+      "reason": "Pure path parser for .cda: last numeric run is the CD track, including upload-storage names <hash>-<bytes>-Track01.cda; no MCI call or device is opened.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 30,
+      "boundary_evidence": [
+        {
+          "line": 1,
+          "text": "Parses only; CdaMciPlayer::parseCdaPath is static and does not call MCI."
+        }
+      ]
+    },
+    {
+      "name": "dither340",
+      "category": "offline",
+      "sources": [
+        "tests/test_dither340.cpp",
+        "src/dsp/dither.h",
+        "src/engine/pipeline.h"
+      ],
+      "reason": "Synthetic in-memory PCM quantization: distribution, low-level linearity, PSD, overrange recovery, stereo separation and block continuity. No device/network opened.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 120,
+      "boundary_evidence": []
+    },
+    {
+      "name": "ui_request_scheduling",
+      "category": "offline",
+      "sources": [
+        "tests/test_ui_request_scheduling.js",
+        "src/net/ui_script.h"
+      ],
+      "reason": "Node VM with mocked fetch/timers and DOM verifies no retry of mutations, stale-search rejection, view ownership and one in-flight status poll. No sockets or audio.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 60,
+      "boundary_evidence": []
+    },
+    {
+      "name": "webview_runtime_pin",
+      "category": "offline",
+      "sources": [
+        "tests/test_webview_pin.py",
+        "tools/pinned_webview_runtime.py",
+        "data/webview2-runtime-pin.json"
+      ],
+      "reason": "Temporary synthetic runtime fixtures reject patch changes, missing files, path escapes and stale output; static production pin completeness. No executable is launched.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 60,
+      "boundary_evidence": []
+    },
+    {
+      "name": "crossfeed",
+      "category": "offline",
+      "sources": [
+        "tests/test_crossfeed.cpp",
+        "src/dsp/crossfeed.h",
+        "src/engine/pipeline.h"
+      ],
+      "reason": "In-memory real DSP/pipeline: off transparency, stereo response, bounded output, chunk continuity, seek reset, DSD double output and invalid-layout conflicts; no device.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 120,
+      "boundary_evidence": []
+    },
+    {
+      "name": "ui_shaper_guidance",
+      "category": "offline",
+      "sources": [
+        "tests/test_ui_shaper_guidance.js",
+        "src/net/ui_script.h",
+        "tools/rtaweb.cpp",
+        "data/i18n/en.json",
+        "data/i18n/ja.json",
+        "data/i18n/fr.json",
+        "data/i18n/ru.json",
+        "data/i18n/es.json",
+        "data/i18n/ar.json"
+      ],
+      "reason": "VM mocks check dither descriptions and actual format guidance in six locales; no browser, sockets, device, or user state.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 60,
+      "boundary_evidence": []
+    },
+    {
+      "name": "shaper_api340",
+      "category": "loopback",
+      "sources": [
+        "tests/test_shaper_api340.py",
+        "tools/rtaweb.cpp",
+        "tools/rtaplay.cpp",
+        "src/net/workbench_config.h",
+        "src/dsp/dither.h"
+      ],
+      "reason": "Private Null-only server with RTA_NO_DEVICE=1 and synthetic waveforms; canonical option persistence, actual-rate automatic quantization, metadata, CLI --analyze. No audio.",
+      "required_source_guards": [],
+      "helpers": [
+        "rtaweb.exe",
+        "rtaplay.exe"
+      ],
+      "timeout_seconds": 180,
+      "boundary_evidence": []
+    },
+    {
+      "name": "ui_crossfeed_controls",
+      "category": "offline",
+      "sources": [
+        "tests/test_ui_crossfeed_controls.js",
+        "src/net/ui_script.h",
+        "src/net/ui_studio.h",
+        "src/net/ui_workbench_state.h",
+        "data/i18n/en.json",
+        "data/i18n/ja.json",
+        "data/i18n/fr.json",
+        "data/i18n/ru.json",
+        "data/i18n/es.json",
+        "data/i18n/ar.json"
+      ],
+      "reason": "Production UI functions in Node VM with mocked controls verify all crossfeed and DAC precision values, A-D persistence key contract and truthful applied state. No browser/network/audio.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 60,
+      "boundary_evidence": []
+    },
+    {
+      "name": "pcm_valid_bits340",
+      "category": "offline",
+      "sources": [
+        "tests/test_pcm_valid_bits340.cpp",
+        "src/engine/pipeline.h",
+        "src/dsp/dither.h"
+      ],
+      "reason": "In-memory production pipeline verifies 18/20/24-bit quantization in wider PCM containers, exact lower zero bits, rounding grid, saturation, chunk consistency, transparent default, and DSD double-path exclusion. No device.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 120,
+      "boundary_evidence": []
+    },
+    {
+      "name": "asio_pcm_precision340",
+      "category": "offline",
+      "sources": [
+        "tests/test_asio_pcm_precision340.cpp",
+        "src/audio/asio_out.h",
+        "src/engine/pipeline.h"
+      ],
+      "reason": "Production ASIO integer packer through friend access: all valid PCM bits, full scale, unity identity, nonunity saturation and DoP payload; never opens a driver.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 120,
+      "boundary_evidence": []
+    },
+    {
+      "name": "pcm_auto_runtime340",
+      "category": "offline",
+      "sources": [
+        "tests/test_pcm_auto_runtime340.cpp",
+        "src/engine/pipeline.h",
+        "src/dsp/dither.h"
+      ],
+      "reason": "Actual in-memory Pipeline: runtime auto switches between exact integer transparency and dither under ramped live volume, rate/valid-bit policy, chunk identity, DSD exclusion.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 120,
+      "boundary_evidence": []
+    },
+    {
+      "name": "pcm_live_volume340",
+      "category": "offline",
+      "sources": [
+        "tests/test_pcm_live_volume340.cpp",
+        "src/audio/render_loop.h",
+        "src/engine/pipeline.h"
+      ],
+      "reason": "Actual producer Pipeline plus render loop with capturing in-memory sink: dynamic gain once before quantization, valid-bit grid, bounded response, no frame loss, negative old-mode control.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 120,
+      "boundary_evidence": []
+    },
+    {
+      "name": "asio_probe_options340",
+      "category": "offline",
+      "sources": [
+        "tests/test_asio_probe_options340.cpp",
+        "src/audio/asio_probe_options.h",
+        "tools/asio_probe.cpp"
+      ],
+      "reason": "Pure command-line parser with no Windows/ASIO calls: action and device selection independent, CLSID never implies DSD, malformed/conflicting options fail before driver creation.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 120,
+      "boundary_evidence": []
+    },
+    {
+      "name": "asio_selection340",
+      "category": "offline",
+      "sources": [
+        "tests/test_asio_selection340.py",
+        "tools/rtaweb.cpp"
+      ],
+      "reason": "Compiles the production pure ASIO selection function with inert driver metadata; verifies only empty requests permit automatic selection. No ASIO object/driver or endpoint is opened.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 120,
+      "boundary_evidence": []
+    },
+    {
+      "name": "render_eof340",
+      "category": "offline",
+      "sources": [
+        "tests/test_render_eof340.cpp",
+        "src/audio/render_loop.h",
+        "src/audio/asio_out.h",
+        "src/audio/wav.h",
+        "src/dsp/dop.h",
+        "src/audio/playback_segment.h"
+      ],
+      "reason": "Actual RenderQ/render_loop and ASIO buffer/callback code with inert driver access: delayed EOF logging race, priming, partial final block, dual-buffer drain, concurrent finish, Native DSD byte identity, clock-silence pause, cancellation and timeout. No COM driver creation or endpoint.",
+      "required_source_guards": [],
+      "helpers": [],
+      "timeout_seconds": 120,
       "boundary_evidence": []
     }
   ]

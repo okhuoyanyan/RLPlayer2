@@ -66,8 +66,16 @@ struct OutSink {
     // These sinks stay started and receive digital silence while the content
     // cursor is frozen. Stop/close still releases the device normally.
     virtual bool   keep_clock_on_pause() const { return false; }
+    // Called only after the final content frame was accepted. Backends with a
+    // hardware ring override this to wait for real playback completion.
+    virtual bool   drain(int bufferMs, const std::atomic<bool>* stop = nullptr) {
+        int remaining=std::max(10,bufferMs);
+        while(remaining>0&&!(stop&&stop->load())){const int ms=std::min(remaining,10);Sleep((DWORD)ms);remaining-=ms;}
+        return true;
+    }
     virtual void   close() {}
     virtual const std::string& last_error() const = 0;
+    virtual bool fatal_error() const {return false;}
     // RENDERFAIL 遥测：最近一次 GetBuffer 的 HRESULT（-999 = 从未调过）。
     // 各后端按需覆盖；mock sink 可以返回固定值。
     virtual long long last_gb_hr() const { return -999; }
@@ -123,6 +131,10 @@ struct RenderQ {
     std::atomic<uint64_t> epoch{1};        // 消费者每次跳转 +1
     std::atomic<long long> seekFrame{-1};  // 生产者看到就重建管线并从这里继续
     std::atomic<bool>     gpu{false};
+    // Producer progress is independent of device progress. These read-only
+    // diagnostics distinguish decoder/drain/logging/EOF stalls on a real sink.
+    std::atomic<const char*> producerStage{"not-started"};
+    std::atomic<uint64_t> eofEpoch{0};
 
     // A seek's position and epoch are one request. Reading the global epoch
     // after a slow pipeline/DoP reset can otherwise label old audio as new.
@@ -149,7 +161,7 @@ struct RenderQ {
     bool wait_after_eof(uint64_t finishedEpoch) {
         std::unique_lock<std::mutex> lock(mtx);
         if(!error&&epoch.load()!=finishedEpoch&&seekFrame.load()>=0){done=false;return true;}
-        done=true;cv.notify_all();
+        done=true;eofEpoch.store(finishedEpoch);producerStage.store("eof-wait");cv.notify_all();
         cv.wait(lock,[&]{return abort.load()||error||seekFrame.load()>=0;});
         if(abort.load()||error)return false;
         done=false;return true;
@@ -199,6 +211,7 @@ struct RenderHost {
     std::string deviceIdDesc;       // 端点 id（空 = 默认端点）
     bool fallbackEligible = false;  // 独占 RENDERFAIL 时是否允许自动回退共享
     bool dop = false;               // DoP/DSD 输出（不能回退共享）
+    bool volumeInPipeline = false;  // PCM gain already precedes its final quantizer; never apply it again in the sink.
     bool onShared = false;          // 当前已是共享后端（第二次尝试失败时的文案分支）
 
     // ---- 吞吐率判据（2026-10-22 用户真机反馈 20261022-02）----
@@ -562,10 +575,10 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
         //   接收端要么判非法、要么把噪音当 DSD 播出来 —— 而界面上音量滑块"正常工作"。
         //   DSD 的实时音量只能做在【调制之前】的 PCM 域，由生产者的
         //   Pipeline::set_volume_db() 负责（见 rtaweb 的 dop 分支）。
-        if (!h.dop) sink.set_live_gain_db(h.volDb->load() - h.startDb->load());
+        if (!h.dop) sink.set_live_gain_db(h.volumeInPipeline ? 0.0 : h.volDb->load() - h.startDb->load());
 
         // 先把待写缓冲填到至少一个周期（最多预攒 3 个周期，避免占内存）
-        while (pendFrames < period * 3 && !eos) {
+        while (pendFrames < period * (h.volumeInPipeline ? 1u : 3u) && !eos) {
             if (!pull_chunk(pendFrames < period)) break;
         }
         // 全部取完且不足一个周期：补静音凑满最后一块，然后把剩下的播完就退出。
@@ -663,6 +676,13 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                 publish(nowT);
             }
         }
+        // Logging may block on file I/O. EOF can become true while STAT is
+        // waiting, so never diagnose the previous snapshot as starvation.
+        if(pendFrames==0&&!eos){
+            std::lock_guard<std::mutex> lock(RQ.mtx);
+            if(RQ.done&&RQ.q.empty()&&RQ.epoch.load()==myEpoch)eos=true;
+        }
+        if(pendFrames==0&&eos){h.normalEnd=true;break;}
         // ★ P0-1/P0-2（2026-10-24 真机 A/B 定案）：旧顺序是「wait_event(20) → 写」，
         // 于是每一次补料都要先等到事件或 20ms 超时；而设备事件实测 100~105ms 才来一次
         //（evint），靠它唤醒等于每 100ms 才补一次。现场 DC-Elite 60s 实测 dry=547、
@@ -673,12 +693,14 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
         // 供既有 dry 用例继续用「时钟只在 wait_event 推进」的旧 mock 模型表达 dry 语义。
         const size_t pendBefore = pendFrames;
         size_t w = 0;
+        size_t lastRequested = 0;
         long long padBefore = 0;
         // 每次 write_available 调用都记一次 w0/wr（而不是每轮一次）：
         // 新时序下一轮最多调用两次，若仍按轮计，zp（按调用）会大于 w0，M4 的
         // 「zp+zs+zo == w0」就不成立（真机现场 19925 vs 9693 就是这么来的）。
         auto attemptWrite = [&]() -> size_t {
             const size_t permitted=segment.enabled?std::min(pendFrames,segmentEnd-played):pendFrames;
+            lastRequested=permitted;
             const size_t got = sink.write_available(pend.data(), permitted);
             if (got > 0) h.dbgWr->fetch_add(1); else h.dbgW0->fetch_add(1);
             return got;
@@ -726,6 +748,9 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
         // 所以这个式子在开播窗口内就是「设备真正消费了多少帧」——与 N300 现场
         // 推算 1680000 帧（1689600 写入 - 9600 水位）的口径完全一致。
         // ★ 必须与 writtenTotal 同一时刻取（两者都在本轮写之前）。
+        if(sink.fatal_error()){
+            h.renderFail=true;h.failMsg="OUTPUT_WRITE_FAILED "+sink.last_error();break;
+        }
         const long long padNow      = padBefore;
         const long long consumedNow = (long long)writtenTotal - padNow;
         h.dbgPad->store(padNow);
@@ -1081,6 +1106,15 @@ inline void render_loop(OutSink& sink, RenderHost& h) {
                            << " GetBuffer HRESULT=" << sink.last_gb_hr()
                            << " device=\"" << h.deviceLabel << "\""
                            << " id=" << (h.deviceIdDesc.empty() ? "(默认)" : h.deviceIdDesc);
+                        {
+                            std::lock_guard<std::mutex> lock(RQ.mtx);
+                            ss << " renderState{pend=" << pendFrames << ",pendBefore=" << pendBefore << ",eos=" << eos
+                               << ",requested=" << lastRequested << ",written=" << writtenTotal << ",qdone=" << RQ.done
+                               << ",qerror=" << RQ.error << ",queued=" << RQ.q.size()
+                               << ",epoch=" << myEpoch << ",queueEpoch=" << RQ.epoch.load()
+                               << ",eofEpoch=" << RQ.eofEpoch.load() << ",seek=" << RQ.seekFrame.load()
+                               << ",producer=" << RQ.producerStage.load() << "}";
+                        }
                         // 与 RENDERFAIL 的区别写清楚：这条不是「流死了」，而是「流活着但喂不饱」，
                         // 所以处置建议不同 —— 优先怀疑缓冲/周期配置与实时优先级，而非设备不可用。
                         ss << "。设备流仍在工作但供给不足："

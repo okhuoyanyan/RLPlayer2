@@ -1,7 +1,7 @@
 // test_dither.cpp — 抖动与噪声整形（按采样率重标定后的验证）
 //
 // 判据（铁律 3：先想清楚"这个指标能证明什么"）：
-//   1) NTF 在【可听带内】绝不能放大噪声 —— 这是旧实现最危险的地方：
+//   1) NTF 在【可听带内】不超过 +6 dB 设计预算 —— 这是旧实现最危险的地方：
 //      旧式 (1-z^-1)^N 在 44.1k 输出时 20 kHz 处是 +52 dB，等于把 15~20 kHz 的
 //      白噪放大 400 倍，而"0~20k 总功率"这种粗糙判据还可能看不出问题。
 //   2) 整形的收益必须【随输出采样率单调增加】：44.1k 几乎没有腾挪空间，
@@ -161,10 +161,10 @@ int main() {
             const long long n = (long long)(c.fs * 4.0);
             const long long ev = (long long)(c.fs * 2.0);   // 2 秒处插一个越界样本
             double lastPeak = 0.0, lastSum = 0.0;
-            long long lastN = 0, run = 0, maxRun = 0, evOverload = -1;
+            long long lastN = 0, run = 0, maxRun = 0, evOverload = -1, evBefore = -1;
             for (long long i = 0; i < n; ++i) {
                 double x = c.amp * std::sin(2.0 * kPi * 997.0 * (double)i / c.fs);
-                if (i == ev) x = 1.0005;                     // 单个越界样本（最坏情况）
+                if (i == ev) { x = 2.0; evBefore = q.overload(); } // 确定超过反馈补偿范围的单样本瞬态
                 const double y = q.process(x);
                 if (i == ev) evOverload = q.overload();
                 const double step = 2.0 / std::pow(2.0, (double)c.bits);
@@ -188,7 +188,7 @@ int main() {
                   "实测 " + std::to_string(lastRms));
             check(lastPeak <= 1.0 + 1e-12, "  输出不越界 @" + tag);
             // 过载样本本身必须真的把量化器推过界（否则这条用例没测到东西）
-            check(evOverload >= 0, "  越界样本确实触发过载（判据有效）@" + tag,
+            check(evOverload > evBefore && evBefore >= 0, "  越界样本确实新增过载（判据有效）@" + tag,
                   "overload=" + std::to_string(evOverload));
         }
     }

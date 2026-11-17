@@ -6,7 +6,10 @@
 namespace workbench {
 
 inline bool profile_key(const std::string& k) {
-    return audio_keys().count(k)&&k!="backend"&&k!="device"&&k!="buffer"&&k!="upnpdev"&&k!="gpuvendor";
+    // 2026-11-15（用户要求）：A–D 四组要能各自绑定输出后端/设备，方便 AB 两台设备。
+    // 旧口径把 endpoint 全部排除在配置组之外，于是切组只换处理、不换设备。
+    // 现在 backend/device/buffer/upnpdev 进入配置组；gpuvendor 仍属全局处理能力，不随组。
+    return audio_keys().count(k)&&k!="gpuvendor";
 }
 inline Values profile_values(const PlayParams& p) {
     auto v=parameters(p);

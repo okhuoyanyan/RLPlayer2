@@ -256,10 +256,13 @@ def main():
             return
         p = profiles()
         check(p["active"] == "A" and [s["id"] for s in p["slots"]] == list("ABCD"), "four complete server-owned groups initialize")
-        forbidden = {"volume", "backend", "device", "buffer", "file", "upnpdev", "gpuvendor"}
+        # 2026-11-15：backend/device/buffer/upnpdev 现在是**每组**的输出路由（用户要求 A–D 可接不同设备），
+        # 不再属于"全局传输字段"。仍然排除的是实时音量、曲目身份与 GPU 能力（全局）。
+        forbidden = {"volume", "file", "gpuvendor"}
         check(all(len(s["settings"]) >= 35 and not forbidden.intersection(s["settings"])
+                  and s["settings"].get("backend") and "device" in s["settings"]
                   and len(s["peq"]["bands"]) == 20 for s in p["slots"]),
-              "every group has full DSP/PEQ state and excludes transport, volume and track")
+              "every group has full DSP/PEQ state plus its own output route, excluding live volume and track identity")
         check(request("/api/workbench/profile")[0] == 405, "profile mutations reject GET")
         migrated = post("/api/workbench/profile", action="migrate", id="B", name="旧槽 B", rate="88200")
         post("/api/workbench/profile", action="migrate", id="B", name="overwrite", rate="96000")
@@ -272,6 +275,16 @@ def main():
         measurements["immediate_migration_peq"] = {"expected": legacy_peq, "slot": group("A")["peq"], "live": peq_snapshot(get()["peq"])}
         check(group("A")["peq"] == legacy_peq and peq_snapshot(get()["peq"]) == legacy_peq,
               "immediate selection of migrated active group applies the imported PEQ")
+        post("/api/workbench/profile", action="select", id="C")
+        post("/api/workbench/profile", action="update", id="C", backend="null", device="Null-C")
+        post("/api/workbench/profile", action="select", id="D")
+        post("/api/workbench/profile", action="update", id="D", backend="null", device="Null-D")
+        post("/api/workbench/profile", action="select", id="C")
+        check(group("C")["settings"]["device"] == "Null-C" and group("D")["settings"]["device"] == "Null-D",
+              "C and D retain different output devices independently")
+        post("/api/workbench/profile", action="select", id="D")
+        check(get()["settings"]["device"] == "Null-D", "selecting D applies D output device")
+        post("/api/workbench/profile", action="select", id="A")
         quit()
         start()
         post("/api/workbench/profile", action="select", id="A")
@@ -288,9 +301,12 @@ def main():
         post("/api/workbench/profile", action="update", id="A", phase="")
         check(request("/api/workbench/profile", {"action": "update", "id": "B", "rate": "96000"})[0] == 409,
               "a delayed edit cannot write another active group")
-        for key in ("volume", "device", "backend"):
+        for key in ("volume", "gpuvendor"):
             check(request("/api/workbench/profile", {"action": "update", "id": "A", key: "0"})[0] == 400,
                   "group rejects " + key + " override")
+        post("/api/workbench/profile", action="update", id="A", backend="null", device="Null-A")
+        check(group("A")["settings"]["backend"] == "null" and group("A")["settings"]["device"] == "Null-A",
+              "group accepts its own backend/device override")
         peq = get()["peq"]
         for n in range(1, 17):
             peq = {"bypass": False, "preamp": -n / 10, "bands": peq["bands"]}

@@ -30,6 +30,10 @@ param(
  # 跑两遍（27 分钟×2）。**只有本开关被显式传入时才会跳过**，默认行为不变。
  # 用法：先跑 tools/run_safe_ctest.ps1 拿到 PASS，再 make_dist -SkipTests。
  [switch]$SkipTests,
+ # 2026-11-16（用户：小改动出包要 1 小时，必须简化）：
+ #   默认走**增量门禁缓存**（run_safe_tests.py 的输入哈希键）：只有输入真变了的测试才重跑。
+ #   发版前要做一次"从零全绿"时加 -FullGate（等价 --no-cache），本开关只影响这一点。
+ [switch]$FullGate,
     [string]$DocumentationDir = "",
     [string]$CertificatePythonPath = ""
 )
@@ -90,7 +94,10 @@ Write-Host "=== build ==="
 #   再用 $LASTEXITCODE 判定。
 $savedEap = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
-$buildOut = (& cmake --build $B --parallel 2 2>&1 | Out-String)
+# 2026-11-16：并行度从写死的 2 提到 min(12, CPU-2)。本机 16 核，2 路构建让一次
+#   版本号变更（全树重编 203 目标）白等 4~5 分钟；12 路约 1 分钟。
+$buildJobs = [Math]::Max(1, [Math]::Min(12, [Environment]::ProcessorCount - 2))
+$buildOut = (& cmake --build $B --parallel $buildJobs 2>&1 | Out-String)
 $buildExit = $LASTEXITCODE
 $ErrorActionPreference = $savedEap
 $buildOut | Out-File -FilePath (Join-Path $B "make_dist_build.log") -Encoding utf8
@@ -103,13 +110,15 @@ $warnLines = @($buildOut -split [Environment]::NewLine | Where-Object { $_ -matc
 if ($warnLines.Count -gt 0) { Write-Host ("build warnings: " + $warnLines.Count + " lines (see build\make_dist_build.log)") }
 
 Write-Host "=== mandatory offline CTest gate ==="
-if ($true) {  # TEMP-PACKAGE-ONLY: 本次出包跳过内置门禁（门禁已在同一棵树上单独跑过），出包后立即恢复
+if ($SkipTests -or $env:RTA_SKIP_TESTS -eq '1') {
     # 显式跳过：调用方必须在同一棵源码树上已经跑过完整门禁并拿到 PASS。
     Write-Host "SKIP_TESTS: 内置门禁被 -SkipTests 跳过（调用方须已单独跑绿）；打包不因此放松其它检查。"
 } else {
     $testRunArgs=@()
     if($TestRunRoot){$testRunArgs+=@('-RunRoot',$TestRunRoot)}
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'run_safe_ctest.ps1') -BuildDir $B -SourceRoot $root -LiteDir (Join-Path $B 'ffmpeg-lite') @testRunArgs
+    $cacheArgs=@()
+    if($FullGate){$cacheArgs+=@('-NoCache')}
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'run_safe_ctest.ps1') -BuildDir $B -SourceRoot $root -LiteDir (Join-Path $B 'ffmpeg-lite') @testRunArgs @cacheArgs
     if ($LASTEXITCODE -ne 0) { Fail 'CTest gate failed; refusing to package' }
 }
 
@@ -183,18 +192,11 @@ Copy-Item $fpPath (Join-Path $out 'ffprobe.exe') -Force
 $ffmpegSources=Copy-RequiredFfmpegRedistribution -SourceRoot $root -LiteDir $liteDir -OutputDirectory (Join-Path $out 'third-party\ffmpeg')
 $ffmpegSources|ConvertTo-Json|Out-File -LiteralPath (Join-Path $B 'dist-ffmpeg-redistribution.json') -Encoding utf8
 
-# Fixed WebView2 runtime: copy the whole installed runtime next to the exe.
-# Bundling removes the Evergreen installation dependency. The vendor runtime
-# retains its own modern Windows requirements; this does not establish Win7 support.
-$wvBase = 'C:/Program Files (x86)/Microsoft/EdgeWebView/Application'
-if (-not (Test-Path $wvBase)) { Fail "WebView2 runtime not installed: $wvBase" }
-$wvVer = Get-ChildItem $wvBase -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'msedgewebview2.exe') } |
-         Sort-Object Name -Descending | Select-Object -First 1
-if (-not $wvVer) { Fail "no WebView2 runtime version with msedgewebview2.exe" }
+# The fallback runtime is pinned to the preceding reviewed release, including
+# each file's SHA256. Host Evergreen updates must not force a full app download.
 $wvOut = Join-Path $out 'WebView2Runtime'
-New-Item -ItemType Directory -Force -Path $wvOut | Out-Null
-Write-Host ("bundling WebView2 " + $wvVer.Name + " ...")
-Copy-Item (Join-Path $wvVer.FullName '*') $wvOut -Recurse -Force
+& python (Join-Path $here 'pinned_webview_runtime.py') --pin (Join-Path $root 'data\webview2-runtime-pin.json') --source-root $root --output $wvOut --report (Join-Path $B 'dist-webview-runtime-pin.json')
+if($LASTEXITCODE -ne 0){Fail 'Pinned WebView2 runtime content verification failed'}
 
 # P2（2026-10-23）裁剪 WebView2 Locales 语言包：
 # 原始运行时内置 168 个 .pak 语言包，总计 ~128.9 MB（未压缩），占包内死重显著。

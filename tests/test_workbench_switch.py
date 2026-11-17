@@ -41,9 +41,9 @@ std::string lowerExt(const std::string& file){return file=="dsd"?".dsf":".wav";}
 namespace rta::dsp { struct PeqSettings { bool bypass=false; }; }
 struct PlayParams {
  std::string file,rate,filter,filterNx,sdmFilter,sdmFilterNx,shaper,phase,modFamily,eqFile,convIr,rgMode;
- int taps=0,dsd=0,twoStage=-1,modOrder=5;
+ int taps=0,dsd=0,twoStage=-1,modOrder=5,dacBits=0;
  double atten=0,transition=0,volume=-67.25,trim[8]={};
- bool dsdNative=false,directSdm=false,convGpu=false,loudness=false,isp=false,roomCorrAuto=false,cleanup=false;
+ bool dsdNative=false,directSdm=false,convGpu=false,loudness=false,isp=false,roomCorrAuto=false,cleanup=false,crossfeed=false;
 };
 struct FakeDsd { uint32_t rate=2822400; };
 FakeDsd probe_dsd(const std::string&){return {};}
@@ -74,6 +74,10 @@ int main(){
  if(!run("pcm",48000,{48000,192000,384000,768000},256))return 1;
  if(!run("pcm",44100,{44100,88200},0))return 1;
  if(!run("pcm",96000,{44100,88200,176400},0))return 1;
+ PlayParams processed;processed.crossfeed=true;processed.dacBits=18;processed.cleanup=true;
+ rta::dsp::PeqSettings peq;std::string why;
+ if(!plan_profile({{"profile","bitperfect"}},processed,peq,why)||processed.crossfeed||processed.dacBits!=0||processed.cleanup||!peq.bypass)return 1;
+ ++checks;
  std::cout<<"CAPABILITY_CASES="<<checks<<" failures=0\n";return 0;
 }
 '''
@@ -87,8 +91,8 @@ int main(){
     checked = subprocess.run([str(exe)], capture_output=True, timeout=10)
     (root / "capability-results.log").write_bytes(checked.stdout + checked.stderr)
     checked.check_returncode()
-    assert b"CAPABILITY_CASES=6 failures=0" in checked.stdout
-    return {"cases": 6, "production_function_sha256": hashlib.sha256(planner.encode("utf8")).hexdigest()}
+    assert b"CAPABILITY_CASES=7 failures=0" in checked.stdout
+    return {"cases": 7, "production_function_sha256": hashlib.sha256(planner.encode("utf8")).hexdigest()}
 
 
 def verify_raw_control_contract(root, compiler):
@@ -109,8 +113,8 @@ using rta::audio::DsdInfo;using rta::audio::probe_dsd;
 namespace rta::audio {std::string lowerExt(const std::string& s){return s.substr(s.find_last_of('.'));}}
 struct PlayParams {
  std::string backend="asio",file="private.dsf",eqFile,convIr,rate="src",rgMode="off";
- double volume=0,trim[8]={};int dsd=64,outChannels=0;
- bool dsdNative=false,directSdm=true,loudness=false,cleanup=false,roomCorrAuto=false,isp=false;
+ double volume=0,trim[8]={};int dsd=64,outChannels=0,dacBits=0;
+ bool dsdNative=false,directSdm=true,loudness=false,cleanup=false,roomCorrAuto=false,isp=false,crossfeed=false;
 };
 struct State {std::mutex mtx;std::atomic<bool> playing{true};bool rawVolumeLocked=false;
  std::atomic<double> volDb{0},startDb{0};} g_ps;
@@ -139,6 +143,8 @@ int main(){
  p.isp=true;both(p,false,"peak protection requests processing");p.isp=false;
  p.loudness=true;both(p,false,"loudness requests processing");p.loudness=false;
  p.cleanup=true;both(p,false,"cleanup requests processing");p.cleanup=false;
+ p.crossfeed=true;both(p,false,"crossfeed requests processing");p.crossfeed=false;
+ p.dacBits=18;both(p,false,"DAC precision requests processing");p.dacBits=0;
  p.eqFile="eq";both(p,false,"file EQ requests processing");p.eqFile.clear();
  p.convIr="ir";both(p,false,"IR requests processing");p.convIr.clear();
  p.trim[0]=-.25;both(p,false,"channel gain requests processing");p.trim[0]=0;

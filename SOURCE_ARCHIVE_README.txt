@@ -1,4 +1,4 @@
-RLPlayer 3.3.11 corresponding-source snapshot
+RLPlayer 3.4.0 corresponding-source snapshot
 
 This is a snapshot of the actual working source, including uncommitted changes.
 The immutable SHA256 list identifies every delivered file. Existing LICENSE and

@@ -16,13 +16,41 @@ for label,e,x in [('missing-cubin','\n'.join(elf.splitlines()[1:]),exports),('PT
  except ValueError:ok=True
  ck(ok,label+' rejected')
 with tempfile.TemporaryDirectory(prefix='rlplayer-cuda-seal-') as tmp:
- r=pathlib.Path(tmp);s=r/'source';(s/'src/gpu').mkdir(parents=True);(s/'tools').mkdir();kit=r/'cuda'
+ r=pathlib.Path(tmp);s=r/'source';kit=r/'cuda'
+ for d in ['src/gpu','src/dsp/detail','src/net','tools']:(s/d).mkdir(parents=True)
  for d in ['bin','nvvm','include','lib/x64']:(kit/d).mkdir(parents=True)
- for n in ['build_gpu_cuda.ps1','cuda_build_provenance.py','check_cuda_artifact.py']:(s/'tools'/n).write_text('fixture')
- cu=s/'src/gpu/a.cu';cu.write_text('original');nvcc=kit/'bin/nvcc.exe';nvcc.write_bytes(b'never-run');(kit/'bin/cuobjdump.exe').write_bytes(b'never-run');(kit/'include/cuda.h').write_text('fixture');host=r/'host';host.mkdir();cl=host/'cl.exe';cl.write_bytes(b'never-run');(host/'dumpbin.exe').write_bytes(b'never-run');dll=r/'test.dll';dll.write_bytes(b'original-artifact');snap=r/'snapshot.json';record=r/'record.json'
- def run(mode,expected,label):
+ # Keep the source graph realistic: the build names both CUDA translation units,
+ # which reach a shared .cuh, a src-relative header and its relative child header.
+ units=['src/gpu/gpu_conv_cuda.cu','src/gpu/gpu_resample_cuda.cu']
+ (s/'tools/build_gpu_cuda.ps1').write_text('$src = @(\n'+',\n'.join(" (Join-Path $root '"+name.replace('/',chr(92))+"')" for name in units)+'\n)\n')
+ cu_text='#include "gpu_common.cuh"\nint fixture = 1;\n'
+ for name in units:(s/name).write_text(cu_text)
+ (s/'src/gpu/gpu_common.cuh').write_text('#include "dsp/fft.h"\n')
+ (s/'src/dsp/fft.h').write_text('#include "detail/twiddle.h"\n')
+ transitive=s/'src/dsp/detail/twiddle.h';transitive.write_text('#define TWIDDLE_FIXTURE 1\n')
+ ui=s/'src/net/ui_script.h';ui.write_text('unrelated UI version 1\n')
+ cu=s/units[0];nvcc=kit/'bin/nvcc.exe';nvcc.write_bytes(b'never-run');(kit/'bin/cuobjdump.exe').write_bytes(b'never-run');(kit/'include/cuda.h').write_text('fixture');host=r/'host';host.mkdir();cl=host/'cl.exe';cl.write_bytes(b'never-run');(host/'dumpbin.exe').write_bytes(b'never-run');dll=r/'test.dll';dll.write_bytes(b'original-artifact');snap=r/'snapshot.json';record=r/'record.json'
+ def run(mode,expected,label,error_contains=''):
   a=[sys.executable,str(here/'cuda_build_provenance.py'),mode,'--source',str(s),'--compiler',str(nvcc),'--host-compiler',str(cl),'--dll',str(dll),'--snapshot',str(snap),'--record',str(record)]
-  result=subprocess.run(a,capture_output=True);ck((result.returncode==0)==expected,label)
- run('verify',False,'missing seal rejected');run('snapshot',True,'content snapshot');run('seal',True,'unchanged build sealed');run('verify',True,'matching source+toolchain+DLL accepted')
- old=cu.stat();cu.write_text('changed');os.utime(cu,ns=(old.st_atime_ns,old.st_mtime_ns));run('verify',False,'.cu edit with old mtime rejected');run('seal',False,'source changed during build rejected');cu.write_text('original');dll.write_bytes(b'replaced DLL');run('verify',False,'replaced DLL rejected');dll.write_bytes(b'original-artifact');nvcc.write_bytes(b'changed-tool');run('verify',False,'changed nvcc rejected');nvcc.write_bytes(b'never-run');(kit/'include/cuda.h').write_text('changed-header');run('verify',False,'changed toolkit header rejected')
+  result=subprocess.run(a,capture_output=True,text=True)
+  ok=(result.returncode==0)==expected and (not error_contains or error_contains in result.stdout+result.stderr)
+  if not ok:print(result.stdout,result.stderr)
+  ck(ok,label)
+ run('verify',False,'missing seal rejected','missing successful CUDA build provenance');run('snapshot',True,'content snapshot')
+ inputs=json.loads(snap.read_text())['inputs']
+ ck({k for k in inputs if k.startswith('src/')}==set(units+['src/gpu/gpu_common.cuh','src/dsp/fft.h','src/dsp/detail/twiddle.h']),'exact reachable include closure excludes UI')
+ run('seal',True,'unchanged build sealed');run('verify',True,'matching source+toolchain+DLL accepted')
+ ui.write_text('unrelated UI version 2\n');run('verify',True,'unrelated UI change does not invalidate GPU seal')
+ old=cu.stat();cu.write_text(cu_text.replace('fixture = 1','fixture = 2'));os.utime(cu,ns=(old.st_atime_ns,old.st_mtime_ns))
+ run('verify',False,'.cu edit with old mtime rejected',"stale CUDA source/toolchain: ['src/gpu/gpu_conv_cuda.cu']")
+ run('seal',False,'source changed during build rejected',"stale CUDA source/toolchain: ['src/gpu/gpu_conv_cuda.cu']")
+ cu.write_text(cu_text);run('verify',True,'restored source accepted')
+ transitive.write_text('#define TWIDDLE_FIXTURE 2\n');run('verify',False,'transitive include edit rejected',"stale CUDA source/toolchain: ['src/dsp/detail/twiddle.h']")
+ transitive.write_text('#define TWIDDLE_FIXTURE 1\n')
+ unit=s/units[1];unit.unlink();run('verify',False,'missing listed translation unit rejected',"CUDA translation unit missing: ['src/gpu/gpu_resample_cuda.cu']")
+ unit.write_text(cu_text);run('verify',True,'restored include closure accepted')
+ dll.write_bytes(b'replaced DLL');run('verify',False,'replaced DLL rejected','CUDA DLL content differs')
+ dll.write_bytes(b'original-artifact');run('verify',True,'restored DLL accepted')
+ nvcc.write_bytes(b'changed-tool');run('verify',False,'changed nvcc rejected',"stale CUDA source/toolchain: ['cuda:bin/nvcc.exe']")
+ nvcc.write_bytes(b'never-run');(kit/'include/cuda.h').write_text('changed-header');run('verify',False,'changed toolkit header rejected',"stale CUDA source/toolchain: ['cuda:include/cuda.h']")
 print('PASS CUDA release controls='+str(checks)+' no GPU/no compilation')

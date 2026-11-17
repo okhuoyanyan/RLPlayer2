@@ -62,6 +62,7 @@ var ADV = {
   backend: 'wasapi', channels: 0, upnpDev: '',
   upnpUpsample: 0, upnpForceRate: 0, upnpRateCeiling: 192000,
   cleanup: 0, cleanupAuto: 1, cleanupStrength: .5, cleanupNoiseDb: -101.1,
+  crossfeed: 0, crossfeedFreq: 700, crossfeedLevel: 12, dacbits: 0,
   trim0: 0, trim1: 0, trim2: 0, trim3: 0, trim4: 0, trim5: 0, trim6: 0, trim7: 0,
   // 输入
   inBackend: 'none', inDev: '', inOffset: 0, inBuf: 100, inMonitor: 0, inSeconds: 0, inOut: '',
@@ -119,6 +120,9 @@ function i18nGet(map, raw) {
   return undefined;
 }
 function t(s) { var v = i18nGet(I18N.map, String(s == null ? "" : s)); return (v === undefined ? s : v); }
+// 2026-11-15：整串查表 + 正则规则 + 分段（·/|/、）三件一起做的版本，给**程序反复重设**的
+//   属性用（bit-perfect 徽标 title 每秒重写一次，靠 1.5 s 兜底扫描会闪一下中文）。
+function tr(s) { var v = i18nSeg(String(s == null ? "" : s)); return (v === null ? String(s == null ? "" : s) : v); }
 // 2026-11-02（用户三次报同一类问题：外语界面里仍夹中文）：
 //   「运行时拼出来的句子」整串查不到表 —— 数字一变就是新串，永远命中不了。
 //   以前靠"给每种数字长度写一条正则规则"兜，规则越写越多、还总有漏（本次截图里三处全漏）。
@@ -162,57 +166,59 @@ function i18nByPattern(s) {
 //   在外语界面下原样显示中文（属性不在扫描列表里，DOM 文本节点替换根本碰不到）。
 //   `data-tip` 必须一起进列表；同时 tipPlace() 里也要过 t()（见该函数）。
 function i18nAttrs() { return ["title", "placeholder", "aria-label", "alt", "data-tip"]; }
+// 2026-11-15（用户报「外语界面里还有中文」）：把「整串查表 → 正则规则 → 分段」抽成一个函数，
+//   **文本节点与属性共用**。旧实现里属性（title/aria-label/data-tip）只做整串精确查表 ⟹
+//   「音量 -60 dB、抖动/整形」这种后端拼出来的提示、「新建歌单」「音量旋钮」这类 aria-label
+//   在外语界面里永远是中文。分段里多认一个顿号「、」：后端 bit-perfect 原因是一串用「、」
+//   拼起来的短语（重采样 44100→48000 Hz、音量 -3 dB、抖动/整形），整串永远命中不了。
+//   非中文/日文界面把顿号换成 ", "（顿号不是拉丁标点）。
+function i18nJoinSep(sep) {
+  if (sep === '\u3001') return (I18N.lang === 'zh' || I18N.lang === 'ja') ? sep : ', ';
+  return sep;
+}
+function i18nSeg(raw) {
+  if (raw === null || raw === undefined) return null;
+  var s = String(raw); if (!s) return null;
+  var tr = i18nGet(I18N.map, s);
+  if (tr !== undefined && tr !== s) return tr;
+  var key = i18nNorm(s);
+  if (Object.prototype.hasOwnProperty.call(I18N.map, key)) {
+    // 2026-11-02：允许"翻成空串"（值 === ""），例如分析表里的裸量词单元格「个」。
+    var kv = I18N.map[key];
+    if (kv !== key && kv !== s) return kv;
+  }
+  // 规则要拿**归一化后**的串去试：DOM 里 "年份 2011" 中间可能是不换行空格或换行，
+  // 直接对原始串跑正则永远不匹配（实测英文界面里这一条一直是中文）。
+  // 空串也是**有效译文**（例如「【置信度擦线…】」整段要删掉）⟹ 用 null 表示"没命中"。
+  var byPat = i18nByPattern(key);
+  if (byPat === null || byPat === key) {
+    var byPat2 = i18nByPattern(s);
+    if (byPat2 !== null) byPat = byPat2;
+  }
+  if (byPat !== null && byPat !== s) return byPat;
+  // 2026-10-30：整串没命中时，按 " · " / " | " / "、" 拆开逐段译（实测界面上大量文本是
+  //   「未知艺术家 · 44.1k/16」「音量 -60 dB、抖动/整形」这种拼装串，整串永远查不到）。
+  var parts = s.split(/( \u00b7 | \| |\u3001)/);
+  if (parts.length > 1) {
+    var changed = false, buf = "";
+    for (var pi = 0; pi < parts.length; pi++) {
+      var p = parts[pi];
+      if (pi % 2 === 1) { buf += i18nJoinSep(p); continue; }
+      var pv = i18nSeg(p);
+      if (pv !== null && pv !== p) { buf += pv; changed = true; } else buf += p;
+    }
+    if (changed) return buf;
+  }
+  return null;
+}
 function i18nNode(n) {
   var o = n.nodeValue; if (!o) return;
   var rec = I18N.orig.get(n);
   // 值被程序改过（时钟/进度）⟹ 旧原文作废，重新记一份
   if (!rec || rec.trans !== o) { rec = { orig: o, trans: null }; I18N.orig.set(n, rec); }
   var key = i18nNorm(rec.orig); if (!key) return;
-  var tr = i18nGet(I18N.map, rec.orig); if (tr === undefined) tr = I18N.map[key];
-  // 2026-11-02：允许"翻成空串"（值 === ""），例如分析表里的裸量词单元格「个」。
-  //   旧代码用 !tr 判断，空串被当成"没翻"，那颗字就永远留在界面上。
-  var hasTr = (tr !== undefined) || Object.prototype.hasOwnProperty.call(I18N.map, key);
-  // 2026-10-30：整串没命中时，按 " · " / " | " 拆开逐段译（实测界面上大量文本是
-  //   「未知艺术家 · 44.1k/16」「艺术家 · 年份 · 44.1k/16」这种拼装串，
-  //   整串永远查不到，拆开后至少能把「未知艺术家」这类词条译掉）。
-  if (!hasTr || tr === key) {
-    // 规则要拿**归一化后**的串去试：DOM 里 "年份 2011" 中间可能是不换行空格或换行，
-    // 直接对原始串跑正则永远不匹配（实测英文界面里这一条一直是中文）。
-    // 2026-11-02：空串也是**有效译文**（例如「【置信度擦线…】」整段要删掉）。
-    //   旧判断用 if(!byPat) / if(byPat && …) 会把 "" 当成"没匹配" ⟹ 那条规则永远不生效，
-    //   外语界面里仍会冒出中文横幅。改用 null 表示未命中（与 hasOwnProperty 那条修法同源）。
-    var byPat = i18nByPattern(key);
-    if (byPat === null || byPat === key) {
-      var byPat2 = i18nByPattern(String(rec.orig));
-      if (byPat2 !== null) byPat = byPat2;
-    }
-    if (byPat !== null && byPat !== rec.orig) {
-      rec.trans = byPat;
-      if (n.nodeValue !== byPat) n.nodeValue = byPat;
-      return;
-    }
-    var parts = String(rec.orig).split(/( \u00b7 | \| )/);
-    if (parts.length > 1) {
-      var changed = false, buf = "";
-      for (var pi = 0; pi < parts.length; pi++) {
-        var pk = i18nNorm(parts[pi]);
-        var pv = I18N.map[pk];
-        // 拆开的每一段同样要过一遍规则表：像「队列末尾 · 共 7 首」这种，
-        // 前半段是词条、后半段是计数串，只做精确查表会把后半段漏成中文。
-        if (!pv || pv === pk) { var pp = i18nByPattern(pk); if (pp === null || pp === pk) { var pp2 = i18nByPattern(parts[pi]); if (pp2 !== null) pp = pp2; } if (pp !== null && pp !== pk) pv = pp; }
-        if (pv && pv !== pk) { buf += pv; changed = true; }
-        else buf += parts[pi];
-      }
-      if (changed) {
-        var l0 = rec.orig.match(/^\s*/)[0], t0 = rec.orig.match(/\s*$/)[0];
-        var nv0 = l0 + buf + t0;
-        rec.trans = nv0;
-        if (n.nodeValue !== nv0) n.nodeValue = nv0;
-        return;
-      }
-    }
-    return;
-  }
+  var tr = i18nSeg(rec.orig);
+  if (tr === null) return;
   var lead = rec.orig.match(/^\s*/)[0], tail = rec.orig.match(/\s*$/)[0];
   var nv = lead + tr + tail;
   rec.trans = nv;
@@ -224,10 +230,16 @@ function i18nEl(e) {
   var store = I18N.attrOrig.get(e); if (!store) { store = {}; I18N.attrOrig.set(e, store); }
   for (var i = 0; i < at.length; i++) {
     var a = at[i], v = e.getAttribute(a); if (!v) continue;
+    // 2026-11-15：属性值被程序改过（换歌/换设备/徽标刷新）时，旧原文作废。
+    //   旧实现只在第一次记原文，之后一直拿**第一份中文**去查表：新值要么翻不出来，
+    //   要么被上一份的译文覆盖（实测 bit-perfect 徽标 title 永远停在中文）。
     if (store[a] === undefined) store[a] = v;
-    var key = i18nNorm(store[a]), tr = i18nGet(I18N.map, store[a]);
-    if (tr === undefined) tr = I18N.map[key];
-    if (tr && tr !== key) { if (v !== tr) e.setAttribute(a, tr); }
+    else if (v !== store[a]) {
+      var prev = i18nSeg(store[a]);
+      if (prev === null || v !== prev) store[a] = v;
+    }
+    var tv = i18nSeg(store[a]);
+    if (tv !== null && tv !== '' && tv !== store[a] && v !== tv) e.setAttribute(a, tv);
   }
 }
 function applyI18n(root) {
@@ -355,6 +367,13 @@ function qaExec(cmd) {
       return;
     }
     if(action==='eqsave:close'){var eqd=D('rlEqSaveDialog');if(eqd&&eqd.open)eqd.close();return;}
+    if(action==='dither-help')selector='[data-shaper-help]';
+    else if(action==='dither-close')selector='#mclose';
+    else if(/^advanced:(pcm|sdm|output)$/.test(action))selector='[data-studio-advanced='+action.slice(9)+']';
+    else if(action==='crossfeed-toggle')selector='#rlStudioAdvancedDialog [data-studio-key=crossfeed]';
+    else if(/^crossfeed:(off|light|standard)$/.test(action))selector='#rlStudioAdvancedDialog [data-crossfeed-preset='+action.slice(10)+']';
+    else if(action==='advanced-close')selector='#rlStudioAdvancedDialog header button';
+    if(selector){var qaControl=document.querySelector(selector);if(qaControl&&!qaControl.disabled&&qaControl.getBoundingClientRect().width)qaControl.click();return;}
     if(action==='mode:listen'||action==='mode:pro'){rlSetMode(action.slice(5),false);return;}
     if(action==='save'){if(typeof rlStudioFlush==='function')rlStudioFlush().catch(function(){});return;}
     if(action==='pin'){if(typeof rlStudioSetBoundary==='function')rlStudioSetBoundary('start');return;}
@@ -734,7 +753,6 @@ function apiRaw(u, body) {
   var requestTimeout = /^\/api\/workbench\/(?:apply|profile|eqpresets)(?:\?|$)/.test(u) ? 35000 : (/^\/api\/enrich(?:\?|$)/.test(u) ? 22000 : 8000);
   var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, requestTimeout);
   return fetch(u, opt).then(function (r) {
-    clearTimeout(timer);
     if (!r.ok) {
       return r.text().then(function (txt) {
         var msg = '';
@@ -760,6 +778,11 @@ function apiRaw(u, body) {
         j.message = t('元数据网络整理已达到时间预算，可重试；已有结果不会丢失');
       return j;
     });
+  }).then(function (j) {
+    // Headers alone do not finish a request: a stalled body must still abort,
+    // otherwise every status caller could remain attached to one pending poll.
+    clearTimeout(timer);
+    return j;
   }, function (e) {
     clearTimeout(timer);
     throw e;
@@ -786,13 +809,15 @@ function apiGetRaw(u) {
   if (ctrl) opt.signal = ctrl.signal;
   var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 8000);
   return fetch(u, opt).then(function (r) {
-    clearTimeout(timer);
     if (!r.ok) {
       var err = new Error('HTTP ' + r.status);
       err.status = r.status;
       throw err;
     }
     return r.json();
+  }).then(function (j) {
+    clearTimeout(timer);
+    return j;
   }, function (e) {
     clearTimeout(timer);
     throw e;
@@ -817,12 +842,18 @@ function api(u, body, opts) {
     var kind=rlSettingsFence.kind(u,body);
     if(kind)return rlSettingsFence.request(function(){return api(u,body,Object.assign({},o,{parameterTransport:true}));},kind,o.parameterLease,body);
   }
-  var idem = (o.idempotent === true) || (body === undefined || body === null);
+  // URL parameters are also mutations: an absent body does not make sq/add,
+  // lib/enqueue or roomcorr/measure safe to repeat after a lost response.
+  // Unknown endpoints fail closed; only reviewed reads may retry by default.
+  var readPath = String(u).split(/[?#]/)[0];
+  var readOnly = (body === undefined || body === null) &&
+    /^\/api\/(?:status|queue|signal|meta|lyrics|recent|files|net|providers|filters|filter\/detail|shapers|shaper-info|gpu|asio|devices|fav\/list|sq\/(?:list|info)|lib\/(?:albums|album|search|stats|cover\/progress)|src\/(?:browse|config|ping)|input\/(?:devices|state)|cast\/(?:state|devices)|writeback\/status|peq|opra\/(?:index|presets)|preset\/caps|roomcorr\/(?:status|layouts)|update\/(?:check|progress|state))$/.test(readPath);
+  var idem = (o.idempotent === true) || readOnly;
   return apiRaw(u, body).catch(function (err) {
     if (err && err.status && err.status >= 400 && err.status < 500) {
       throw err;
     }
-    if (!idem && o.retry !== true) {
+    if (o.retry === false || (!idem && o.retry !== true)) {
       // 结果未知：明确告诉调用方"可能已执行、可能没有"，绝不自动重放
       var e2 = new Error((err && err.message ? err.message : "网络异常") + "（结果未知，请刷新确认）");
       e2.uncertain = true;
@@ -835,6 +866,64 @@ function api(u, body, opts) {
 }
 // 非幂等动作的显式入口：语义与 api(u, body) 相同，但"永不自动重试"是硬约定。
 function apiAct(u, body, lease) { return api(u, body, { retry: false, parameterLease:lease }); }
+
+// PCM word-length controls share server metadata with the actual quantizer.
+// A stopped player has no measured output rate: do not invent an auto result.
+var RL_SHAPER_INFO = { cache: {}, pending: {} };
+function rlShaperConditions() {
+  var j = typeof rlLastStatus !== 'undefined' ? rlLastStatus : null;
+  var active = !!(j && j.playing && Number(j.outRate) > 0 && Number(j.outBits) > 0);
+  var selected = D('sShap') ? D('sShap').value : 'auto';
+  var studio = D('rlStudioShaper');
+  if (studio && typeof rlMode !== 'undefined' && rlMode === 'pro' && S.view === 'listening') selected = studio.value;
+  var dsd = active ? (Number(j.outBits) === 1 || /^(?:dsd|dop|native)$/.test(j.outMode || ''))
+                   : !!(D('sDSD') && D('sDSD').value !== '0');
+  return {rate:active && !dsd ? Number(j.outRate) : 0,bits:active && !dsd ? Number(j.quantizationBits || 0) : 0,dsd:dsd,selected:selected === 'Shaped' ? 'shaped' : selected};
+}
+function rlLoadShaperInfo(rate, bits) {
+  var key = rate + '/' + bits;
+  if (RL_SHAPER_INFO.cache[key]) return Promise.resolve(RL_SHAPER_INFO.cache[key]);
+  if (RL_SHAPER_INFO.pending[key]) return RL_SHAPER_INFO.pending[key];
+  var request = apiGetRaw('/api/shaper-info?rate=' + rate + '&bits=' + bits).then(function (j) {
+    if (!j || !j.ok || !Array.isArray(j.options)) throw Error('Invalid shaper metadata');
+    RL_SHAPER_INFO.cache[key] = j; return j;
+  });
+  RL_SHAPER_INFO.pending[key] = request.then(function(j){delete RL_SHAPER_INFO.pending[key];return j;},function(e){delete RL_SHAPER_INFO.pending[key];throw e;});
+  return RL_SHAPER_INFO.pending[key];
+}
+function rlShaperSummary(j, c) {
+  if (c.dsd) return t('当前选择 DSD 输出；PCM 抖动不参与 1-bit 调制。');
+  var choice = j && j.options.find(function(o){return o.id === c.selected;});
+  var text = choice ? t(choice.description) : t('抖动用于减少降低位深时的量化失真；噪声整形把部分噪声移向高频。');
+  if (c.selected === 'auto') text = c.rate > 0 && c.bits > 0 && j.autoResolved
+    ? tf('按格式建议：{0} · {1} Hz / {2} bit；实际应用见信号链。', [j.autoResolved,c.rate,c.bits])
+    : t('播放后按实际输出采样率与位深选择。');
+  if (choice && c.rate > 0 && c.bits > 0 && choice.recommended === false)
+    text += ' ' + t('当前输出条件不在建议范围内；可选择 auto / TPDF。');
+  return text;
+}
+function rlRefreshShaperGuidance() {
+  var targets = ['rlStudioShaperHint','sp_shaper_hint'].map(D).filter(Boolean);
+  if (!targets.length) return;
+  var c = rlShaperConditions(), key = JSON.stringify(c) + '/' + (typeof I18N !== 'undefined' ? I18N.lang : 'zh');
+  targets = targets.filter(function(el){return el.dataset.shaperKey !== key;});
+  if (!targets.length) return;
+  targets.forEach(function(el){el.dataset.shaperKey=key;el.textContent=t(c.dsd?'当前选择 DSD 输出；PCM 抖动不参与 1-bit 调制。':'正在读取抖动说明…');});
+  rlLoadShaperInfo(c.rate,c.bits).then(function(j){targets.forEach(function(el){if(el.isConnected&&el.dataset.shaperKey===key)el.textContent=rlShaperSummary(j,c);});})
+    .catch(function(){targets.forEach(function(el){if(el.isConnected&&el.dataset.shaperKey===key)el.textContent=t('抖动说明暂时不可用，可点「抖动说明」重试。');});});
+}
+function rlOpenShaperInfo() {
+  var c = rlShaperConditions();
+  openModal(t('PCM 抖动与噪声整形'),'<div id=rlShaperInfoContent role=status>'+esc(t('正在读取抖动说明…'))+'</div>');
+  var host = D('rlShaperInfoContent');
+  rlLoadShaperInfo(c.rate,c.bits).then(function(j){
+    if(D('rlShaperInfoContent')!==host)return;
+    var h='<p>'+esc(t('抖动用于减少降低位深时的量化失真；噪声整形把部分噪声移向高频。'))+'</p><p class=hint>'+esc(rlShaperSummary(j,c))+'</p>';
+    h+='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse"><thead><tr><th style="padding:8px;text-align:left">'+esc(t('选项'))+'</th><th style="padding:8px;text-align:left">'+esc(t('用途与建议'))+'</th></tr></thead><tbody>';
+    j.options.forEach(function(o){h+='<tr'+(o.id===c.selected?' aria-current=true':'')+'><td style="padding:9px 8px;border-top:1px solid var(--line);white-space:nowrap">'+esc(t(o.label||o.id))+'</td><td style="padding:9px 8px;border-top:1px solid var(--line)">'+esc(t(o.description))+'</td></tr>';});
+    host.innerHTML=h+'</tbody></table></div><p class=hint>'+esc(t('高阶整形并不适合所有采样率；请按实际输出条件选择。'))+'</p><p class=hint>'+esc(t('选项名称用于描述本项目实现，不表示与 HQPlayer 的专有算法等同。'))+'</p>';
+  }).catch(function(){if(D('rlShaperInfoContent')!==host)return;host.textContent=t('抖动说明加载失败，请重试。');var b=document.createElement('button');b.className='btn';b.textContent=t('重新加载');b.onclick=rlOpenShaperInfo;host.appendChild(b);});
+}
 
 function renderPanelError(viewName, retryFn, err) {
   if (S.view !== viewName) return;
@@ -877,21 +966,27 @@ function validateProcessingSettings() {
   var strength=D('sp_cleanup_strength'), noise=D('sp_cleanup_noise');
   var valid=processingSettingsValid(strength?strength.value:ADV.cleanupStrength,noise?noise.value:ADV.cleanupNoiseDb);
   if(!valid)toast(t('清理强度须为 0～1，噪声底须为 -120～-60 dBFS，且必须是有限数字。请修正后再保存。'));
+  if(!valid)return false;
+  var freq=D('sp_crossfeed_freq'),level=D('sp_crossfeed_level');
+  var f=freq?freq.value:(ADV.crossfeedFreq===undefined?700:ADV.crossfeedFreq),l=level?level.value:(ADV.crossfeedLevel===undefined?12:ADV.crossfeedLevel);
+  if(String(f).trim()===''||String(l).trim()===''||!Number.isFinite(Number(f))||!Number.isFinite(Number(l))||Number(f)<300||Number(f)>1200||Number(l)<3||Number(l)>15){toast(t('交叉馈送频率须为 300～1200 Hz，交叉衰减须为 3～15 dB。'));return false;}
   return valid;
 }
 function processingSettingsParam() {
   return '&upnpUpsample='+(ADV.upnpUpsample?1:0)+'&upnpForceRate='+(ADV.upnpForceRate?1:0)
     +'&upnpRateCeiling='+ADV.upnpRateCeiling+'&cleanup='+(ADV.cleanup?1:0)
     +'&cleanup_auto='+(ADV.cleanupAuto===0?0:1)
-    +'&cleanup_strength='+ADV.cleanupStrength+'&cleanup_noise_db='+ADV.cleanupNoiseDb;
+    +'&cleanup_strength='+ADV.cleanupStrength+'&cleanup_noise_db='+ADV.cleanupNoiseDb
+    +'&crossfeed='+(ADV.crossfeed?1:0)+'&crossfeed_freq='+(ADV.crossfeedFreq===undefined?700:ADV.crossfeedFreq)
+    +'&crossfeed_level='+(ADV.crossfeedLevel===undefined?12:ADV.crossfeedLevel)+'&dacbits='+(ADV.dacbits||0);
 }
 function syncCleanupNoiseMode() {
   if(D('sp_cleanup_noise_mode'))D('sp_cleanup_noise_mode').value=ADV.cleanupAuto===0?'manual':'auto';
   if(D('sp_cleanup_noise'))D('sp_cleanup_noise').disabled=ADV.cleanupAuto!==0;
 }
 function syncProcessingControls() {
-  [['sp_upnp_upsample',ADV.upnpUpsample],['sp_upnp_force',ADV.upnpForceRate],['sp_cleanup',ADV.cleanup]].forEach(function(x){if(D(x[0]))D(x[0]).checked=!!x[1];});
-  [['sp_upnp_ceiling',ADV.upnpRateCeiling],['sp_cleanup_strength',ADV.cleanupStrength],['sp_cleanup_noise',ADV.cleanupNoiseDb]].forEach(function(x){if(D(x[0])){if(D(x[0]).tagName==='SELECT')setSelectValue(D(x[0]),String(x[1]));else D(x[0]).value=String(x[1]);}});
+  [['sp_upnp_upsample',ADV.upnpUpsample],['sp_upnp_force',ADV.upnpForceRate],['sp_cleanup',ADV.cleanup],['sp_crossfeed',ADV.crossfeed]].forEach(function(x){if(D(x[0]))D(x[0]).checked=!!x[1];});
+  [['sp_upnp_ceiling',ADV.upnpRateCeiling],['sp_cleanup_strength',ADV.cleanupStrength],['sp_cleanup_noise',ADV.cleanupNoiseDb],['sp_crossfeed_freq',ADV.crossfeedFreq],['sp_crossfeed_level',ADV.crossfeedLevel],['sp_dacbits',ADV.dacbits||0]].forEach(function(x){if(D(x[0])){if(D(x[0]).tagName==='SELECT')setSelectValue(D(x[0]),String(x[1]));else D(x[0]).value=String(x[1]);}});
   syncCleanupNoiseMode();
 }
 /* PROCESSING_SETTINGS_END */
@@ -2652,7 +2747,9 @@ function artaPoll() { /* 轮询已被泵取代（见 artaStart）：保留空函
 /* ---------------- 艺术家 ---------------- */
 // 2026-10-26（261026-05 #1）：支持按关键词过滤（搜索栏在艺术家页搜索时用）。
 // q 为空 = 全部；非空 = 只保留名字包含关键词的艺术家（不区分大小写）。
+var artistListRequest = 0;
 function loadArtists(q) {
+  var request = ++artistListRequest;
   if(typeof rlPageTransitionBegin==='function')rlPageTransitionBegin('artists');
   S.view = 'artists';
   var kw = String(q || '').trim().toLowerCase();
@@ -2667,6 +2764,7 @@ function loadArtists(q) {
   // 图片由 artaStart() 的泵逐个喂（后端缓存命中的图几百毫秒内就到，缺图的按退避重试）。
   artaWarmBackground();   // 去重版（首次进艺术家页时后台可能已经在跑）
   api('/api/lib/albums').then(function (j) {
+    if (S.view !== 'artists' || request !== artistListRequest) return;
     var m = {}, order = [];
     (j.albums || []).forEach(function (a) {
       var k = a.artist || '未知艺术家';
@@ -2712,6 +2810,7 @@ function loadArtists(q) {
       };
     });
   }).catch(function (e) {
+    if (S.view !== 'artists' || request !== artistListRequest) return;
     renderPanelError('artists', function () { loadArtists(); }, e);
   });
 }
@@ -3258,7 +3357,9 @@ function renderWorkVersions(workTitle, composer, j) {
     };
   });
 }
+var trackListRequest = 0;
 function loadTracks(q) {
+  var request = ++trackListRequest;
   if(typeof rlPageTransitionBegin==='function')rlPageTransitionBegin('tracks');
   S.view = 'tracks';
   S.tracksQuery = q || '';
@@ -3266,11 +3367,12 @@ function loadTracks(q) {
   if (D('q') && String(D('q').value) !== String(q || '')) D('q').value = q || '';
   head(q ? (tf('搜索：{0}', [q])) : '曲目', '搜索中…', '');
   api('/api/lib/search?q=' + encodeURIComponent(q || '')).then(function (j) {
-    if (S.view !== 'tracks') return;   // 已切走（261023-01 #4 同类问题）→ 丢弃，别覆写当前页面
+    if (S.view !== 'tracks' || request !== trackListRequest) return;
     var t = j.tracks || [];
     S.currentTracks = t;
     renderTracksView();
   }).catch(function (e) {
+    if (S.view !== 'tracks' || request !== trackListRequest) return;
     renderPanelError('tracks', function () { loadTracks(q); }, e);
   });
 }
@@ -4315,10 +4417,13 @@ function syncPlaybackCaption(j, srcCh) {
     D('npSub').textContent = artist + (caption ? '  ·  ' + caption : '');
   }
 }
-var statusRequest = 0, statusApplied = 0;
+var statusRequest = 0, statusApplied = 0, statusInFlight = null;
 function tick() {
+  // Slow backends must never accumulate a new request every 400 ms. Sharing
+  // the pending poll keeps playback controls free to reach the local server.
+  if (statusInFlight) return statusInFlight;
   var request = ++statusRequest;
-  api('/api/status').then(function (j) {
+  statusInFlight = api('/api/status').then(function (j) {
     // A delayed poll must not restore the preceding track, artwork, or seek position.
     if (!j || j.ok === false || request <= statusApplied) return;
     statusApplied = request;
@@ -4371,6 +4476,13 @@ function tick() {
     }
     if (j && j.qa && !QA.on) { QA.on = true; QA.timer = setInterval(qaTick, 500); }
     S.playing = !!j.playing; S.paused = !!j.paused; S.dur = j.dur; S.pos = j.pos;
+    S.cd = !!j.cd; S.cdTitle = j.cdTitle || '';
+    // CD 音轨没有本地文件元数据；标题用 /api/status 的 cdTitle（CD-Text 或 Track NN），
+    // 不让底栏显示 Track01.cda 这种索引文件名。
+    if (j.cd && D('npt')) {
+      var cdName = j.cdTitle || ('Track ' + String(j.cdTrack || 0).padStart(2, '0'));
+      if (D('npt').textContent !== cdName) { D('npt').textContent = cdName; D('npt').title = cdName; }
+    }
     // Re-label a cached report only when the existing playback state changes.
     // No signal request, measurement, or audio scan is started by this observer.
     var cleanupPlaybackKey = [j.current || '', S.playing, S.paused].join('|');
@@ -4423,7 +4535,13 @@ function tick() {
     D('icP').setAttribute('d', S.playing && !S.paused
       ? 'M7 5h4v14H7zM13 5h4v14h-4z'                     /* 暂停图标 */
       : 'M8 5v14l11-7z');                                 /* 播放图标 */
-    if (j.current) {
+    if (j.cd) {
+      // CD 没有本地元数据：不要拿上一首本地文件的 current 去 loadMeta，否则
+      // 底栏会显示上一首的标题/封面。标题由上面的 cdTitle 负责，这里只补播放状态行。
+      syncPlaybackCaption(j, 2);
+      if (D('fmt')) { D('fmt').textContent = '44.1k/16'; D('fmt').title = t('CD 音频（44.1 kHz / 16 bit / 2ch）'); }
+      updateNextTrackInfo();
+    } else if (j.current) {
       if (S.lastCur !== j.current) { S.lastCur = j.current; loadMeta(j.current); loadLyrics(j.current); }
       syncLyrics(j.pos);
       // P2（2026-10-27 261027-05 A4「多声道就都标记出来就好了」）：底栏这一行原来是
@@ -4460,15 +4578,17 @@ function tick() {
       // #11：unknown 时 text 为空 ⟹ 整个徽标收起（不给错误结论）
       D('bpBadge').textContent = bi.text;
       D('bpBadge').className = bi.cls;
-      D('bpBadge').title = bi.title;
+      D('bpBadge').title = tr(bi.title);
       D('bpBadge').style.display = bi.text ? '' : 'none';
     }
     if (j.error && !j.current) syncPlaybackCaption(j, 0);
     rlLastStatus = j;
+    rlRefreshShaperGuidance();
     if (S.view==='settings' && D('rlPresetApply')) rlPaintPreset();
     if (rlHomeActive()) rlPaintHome();
     syncAlbPlayAllBtn();
-  }).catch(function () { });
+  }).catch(function () { }).then(function () { statusInFlight = null; });
+  return statusInFlight;
 }
 
 /* ---------------- 播放设置持久化 ---------------- */
@@ -4702,6 +4822,10 @@ function loadSettings() {
     ADV.cleanupAuto=(kv.cleanup_auto==='0'||kv.cleanup_auto==='false')?0:1;
     if(kv.cleanup_strength!==undefined)ADV.cleanupStrength=Number(kv.cleanup_strength);
     if(kv.cleanup_noise_db!==undefined)ADV.cleanupNoiseDb=Number(kv.cleanup_noise_db);
+    ADV.crossfeed=(kv.crossfeed==='1'||kv.crossfeed==='true')?1:0;
+    ADV.crossfeedFreq=kv.crossfeed_freq===undefined?700:Number(kv.crossfeed_freq);
+    ADV.crossfeedLevel=kv.crossfeed_level===undefined?12:Number(kv.crossfeed_level);
+    ADV.dacbits=kv.dacbits===undefined?0:Number(kv.dacbits);
     syncProcessingControls();
     if (kv.trim !== undefined) {
       var tv = String(kv.trim).split(',');
@@ -5828,6 +5952,42 @@ function rlUpdateButtons(){
   var fallback=manual||String(j.error||'').indexOf('quota_exceeded')>=0;
   rlDailyNode('rlUpdateManual').hidden=!fallback||!(j.global||j.globalUrl);rlDailyNode('rlUpdateBaidu').hidden=!fallback||!(j.cn||j.cnUrl);
 }
+// 2026-11-15（用户报「Check failed: 拒绝版本回滚」）：后端 check 失败原因原本是**中文整句**，
+//   外语界面里 tf('检查失败：{0}') 只能译掉前半句，后半句原样是中文。
+//   后端 /api/update/check 已经给出 errorCode，这里按 code 取本地化文案；
+//   没有对应词条（或旧后端不给 code）时回落后端原文，不吞信息。
+var UPD_ERR = {
+  rollback: '拒绝版本回滚',
+  network: '网络不可用',
+  auth: '更新服务器鉴权失败',
+  quota_exceeded: '服务器本月增量配额已用完，请到百度网盘或 GitHub 下载完整版，或下月重试。',
+  expired: '更新清单已过期',
+  'signature-error': '更新清单签名校验失败',
+  'payload-size': '更新清单过大',
+  'payload-json': '更新 payload 不是严格 JSON 对象',
+  'payload-field': '更新清单字段非法',
+  schema: '更新 schema 必须为 2',
+  'metadata-version': '不支持的更新 metadata_version',
+  platform: '更新平台不是 windows',
+  channel: '更新 channel 不匹配',
+  version: '本地或目标版本号非法',
+  timestamp: 'published_at / expires_at 不是合法 UTC 时间',
+  'install-mode': 'install_mode 非法',
+  manual: '手动外链、提取码、摘要或大小非法',
+  files: '更新清单的文件条目非法',
+  delete: '更新清单的删除条目非法',
+  'empty-plan': '增量清单没有文件或删除项',
+  'bad-url': '更新地址不合法',
+  'parse-error': '更新清单解析失败'
+};
+function updWhy(j) {
+  var code = String((j && j.errorCode) || '');
+  if (code === 'http') return tf('更新服务器返回 HTTP {0}', [String((j && j.httpStatus) || '?')]);
+  // 单测的 vm 沙箱只塞被测函数（没有 UPD_ERR 这个 var）⟹ 必须容错，否则取不到原因就抛。
+  var table = (typeof UPD_ERR !== 'undefined' && UPD_ERR) ? UPD_ERR : null;
+  if (table && table[code]) return t(table[code]);
+  return String((j && (j.error || j.checkError)) || t('未知原因'));
+}
 function rlUpdateError(e){rlDailySay('rlUpdateMsg',e&&e.message||t('网络错误'));rlSettingsState.updateBusy=false;rlUpdateButtons();}
 function rlCheckUpdate(){
   var s=rlSettingsState;if(s.updateBusy||s.updateBlocked)return;
@@ -5835,7 +5995,7 @@ function rlCheckUpdate(){
   function check(force){apiGetRaw('/api/update/check'+(force?'?force=1':'')).then(function(j){
     if(j&&j.checking){setTimeout(function(){check(false);},700);return;}
     s.update=j||{};s.updateBusy=false;rlUpdateButtons();
-    if(!j||!j.ok)throw Error(tf('检查失败：{0}',[(j&&j.error)||t('未知原因')]));
+    if(!j||!j.ok)throw Error(tf('检查失败：{0}',[updWhy(j)]));
     rlDailySay('rlUpdateMsg',j.hasUpdate?tf('发现新版本 v{0}',[j.latest]):tf('已是最新版本 v{0}',[j.current||j.latest||'—']));
     rlDailySay('rlUpdateNotes',j.notes||'');
   }).catch(rlUpdateError);}check(true);
@@ -6909,6 +7069,7 @@ function showChain() {
     if (p.resample) nodes.push({ k: '采样率转换', v: (p.filter || 'Kaiser sinc') + '  \u00b7  ' + p.phase + '  \u00b7  ' + p.taps + t(' 抽头') + (p.twoStage ? t('  ·  两段式') : '') + '  \u2192  ' + p.outRate + ' Hz' + (sigGpuUsed ? '  \u00b7  GPU' : ''), gpu: !!sigGpuUsed });
     else nodes.push({ k: '采样率转换', v: '旁路（源采样率与输出一致，逐位直通）' });
     // 261024-04 #8：EQ / 卷积单独成一环，并且**只有卷积真的走 GPU 时**才标绿（后端 convGpu 字段）
+    if (p.crossfeedRequested || p.crossfeed) nodes.push({k:t('耳机交叉馈送'),v:p.crossfeed?tf('已启用 · {0} Hz / 交叉衰减 {1} dB',[p.crossfeedFreq,p.crossfeedLevelDb]):t('已请求，当前链路未应用')});
     if (p.eq || p.conv) {
       var eqParts = [];
       if (p.eq) eqParts.push(tf('参数 EQ{0}', [(ADV.eq ? (' ' + nam(ADV.eq)) : '')]));
@@ -6949,7 +7110,8 @@ function showChain() {
       // DoP 真正开给设备的率是 carrier（DSD64 -> 176400）。旧写法会把 2822400 说成"24-bit 载波"。
       nodes.push({ k: 'DoP 封装', v: t('24-bit 载波 ') + (p.carrier || p.outRate) + t(' Hz · 标记 0x05/0xFA 交替') });
     } else {
-      nodes.push({ k: '抖动 / 噪声整形', v: (p.shaper && p.shaper !== 'none') ? p.shaper : '无（逐位）' });
+      nodes.push({ k: '抖动 / 噪声整形', v: (p.shaper && p.shaper !== 'none') ? p.shaper : '无抖动（仅取整）' });
+      if (p.quantizationBits > 0) nodes.push({ k: t('DAC 有效位深'), v: tf('实际量化 {0} bit · 驱动容器 {1} bit',[p.quantizationBits,p.outBits]) });
     }
     // 原生 DSD 失败回落 DoP：原因原样显示，绝不让用户以为这一曲是原生 DSD
     if (p.dsdFallback) nodes.push({ k: 'DoP 回落', v: p.dsdFallback });
@@ -7898,6 +8060,467 @@ function bindPhaseHint() {
     + ' · ' + t('实际输出') + ' ' + t(actual) + (override ? '（' + t('强制覆盖') + '）' : '');
 }
 
+/* ---------------- 滤波器库 / 详情（2026-11-15） ----------------
+   用户要求：鼠标移到任何一个滤波上，右侧显示它的设计详情；要做得比参考图更清楚。
+   数据来源：/api/filters（设计参数与相位真相源）+ /api/filter/detail（构建期用生产系数
+   测出的幅频/群延迟/冲激）。前端不重算规则，只负责画图和解释。 */
+var RL_FB = { target: 'filter', items: [], chosen: '', preview: '', cache: {}, timer: 0, seq: 0, dialog: null };
+function rlFbHz(v) {
+  if (!isFinite(v)) return '—';
+  return v >= 1000 ? ((v / 1000).toFixed(v >= 10000 ? 1 : 2) + ' kHz') : (Math.round(v) + ' Hz');
+}
+function rlFbDb(v) {
+  if (!isFinite(v)) return '—';
+  return (v <= -299.5 ? '≤ −300 dB' : (v.toFixed(v > -10 ? 3 : 1) + ' dB'));
+}
+function rlFbMs(v) {
+  if (!isFinite(v)) return '—';
+  return (v < 0.01 ? v.toFixed(3) : v.toFixed(2)) + ' ms';
+}
+function rlFbGroup(it) {
+  if (it.name === 'auto') return '自动';
+  if (it.apodizing) return '切趾';
+  if (it.phase === 'minimum') return '最小相位';
+  if (it.phase === 'intermediate') return '混合相位';
+  if (it.forNx) return 'Nx 专用';
+  if (it.twoStage) return '两段式';
+  return '线性相位';
+}
+function rlFbChart(points, opt) {
+  var w = opt.w || 360, h = opt.h || 118, pl = 38, pr = 10, pt = 8, pb = 24;
+  var valid = (points || []).filter(function (p) { return p && isFinite(p[0]) && isFinite(p[1]); });
+  if (!valid.length) return '<div class=rlFbEmpty>无数据</div>';
+  var x0 = (opt.x0 !== undefined) ? opt.x0 : valid[0][0];
+  var x1 = (opt.x1 !== undefined) ? opt.x1 : valid[valid.length - 1][0];
+  var ys = valid.map(function (p) { return p[1]; });
+  var y0 = (opt.y0 !== undefined) ? opt.y0 : Math.min.apply(Math, ys);
+  var y1 = (opt.y1 !== undefined) ? opt.y1 : Math.max.apply(Math, ys);
+  if (y1 <= y0) { y1 = y0 + 1; }
+  function X(v) {
+    var t = opt.logX ? (Math.log10(Math.max(v, 1e-9)) - Math.log10(Math.max(x0, 1e-9))) /
+                       (Math.log10(Math.max(x1, 1e-9)) - Math.log10(Math.max(x0, 1e-9)))
+                     : (v - x0) / (x1 - x0);
+    return pl + Math.max(0, Math.min(1, t)) * (w - pl - pr);
+  }
+  function Y(v) {
+    var t = (v - y0) / (y1 - y0);
+    return pt + (1 - Math.max(0, Math.min(1, t))) * (h - pt - pb);
+  }
+  var path = '';
+  for (var i = 0; i < valid.length; ++i) {
+    path += (i ? 'L' : 'M') + X(valid[i][0]).toFixed(2) + ' ' + Y(valid[i][1]).toFixed(2);
+  }
+  var grid = '';
+  var yTicks = opt.yTicks || 5;
+  for (var g = 0; g <= yTicks; ++g) {
+    var yv = y0 + (y1 - y0) * g / yTicks;
+    grid += '<line x1=' + pl + ' y1=' + Y(yv).toFixed(1) + ' x2=' + (w - pr) + ' y2=' + Y(yv).toFixed(1) + ' class="rlFbGrid"/>';
+    grid += '<text x=' + (pl - 4) + ' y=' + (Y(yv) + 3).toFixed(1) + ' class=rlFbTick text-anchor=end>' + esc(opt.yFmt ? opt.yFmt(yv) : String(Math.round(yv))) + '</text>';
+  }
+  (opt.xTicks || []).forEach(function (v) {
+    if (!isFinite(v) || v < x0 || v > x1) return;
+    var mx = X(v);
+    grid += '<text x=' + mx.toFixed(1) + ' y=' + (h - 13) + ' class=rlFbTick text-anchor=middle>' +
+            esc(opt.xFmt ? opt.xFmt(v) : String(Math.round(v))) + '</text>';
+  });
+  var marks = '';
+  (opt.marks || []).forEach(function (m) {
+    if (!isFinite(m.x) || m.x < x0 || m.x > x1) return;
+    var mx = X(m.x);
+    marks += '<line x1=' + mx.toFixed(1) + ' y1=' + pt + ' x2=' + mx.toFixed(1) + ' y2=' + (h - pb) + ' class="rlFbMark" style="stroke:' + (m.color || 'var(--acc)') + '"/>';
+    marks += '<text x=' + (mx + 3).toFixed(1) + ' y=' + (pt + 9) + ' class=rlFbMarkText>' + esc(m.label || '') + '</text>';
+  });
+  return '<svg viewBox="0 0 ' + w + ' ' + h + '" class=rlFbChart role=img aria-label="' + esc(opt.label || '') + '">' +
+    grid + marks + '<path d="' + path + '" class="rlFbLine"/></svg>';
+}
+function rlFbMetrics(it) {
+  var trans = Math.max(0, it.stopStartHz - it.passHz);
+  var rows = [
+    ['通带边缘', rlFbHz(it.passHz)],
+    ['阻带起点', rlFbHz(it.stopStartHz)],
+    ['过渡带宽', rlFbHz(trans)],
+    ['设计衰减', rlFbDb(-Math.abs(it.designDb))],
+    ['实测阻带', rlFbDb(it.stopDb)],
+    ['全频带阻带', rlFbDb(it.fullBandStopDb || it.stopDb)],
+    ['通带最大偏差', rlFbDb(it.passDb)],
+    ['每相抽头 T', String(it.T)],
+    ['原型抽头', String(it.taps)],
+    ['群延迟 @1 kHz', rlFbMs(it.gd1kMs)],
+    ['峰前 / 峰后振铃', rlFbMs(it.preMs) + ' / ' + rlFbMs(it.postMs)],
+    ['参考配置', (it.inRate / 1000) + ' → ' + (it.outRate / 1000) + ' kHz'],
+    ['全频带证书', it.fullBandPoints ? (it.fullBandPoints.toLocaleString() + ' 点 FFT') : '—']
+  ];
+  return '<div class=rlFbGrid>' + rows.map(function (r) {
+    return '<div class=rlFbCell><span>' + esc(t(r[0])) + '</span><b>' + esc(r[1]) + '</b></div>';
+  }).join('') + '</div>';
+}
+function rlFbDetailHtml(it) {
+  if (!it) return '<div class=rlFbEmpty>把鼠标移到左侧任意滤波器上，这里显示它的设计详情。</div>';
+  var badges = [it.window, it.phase, it.family];
+  if (it.resolved) badges.push('自动 → ' + it.resolved);
+  if (it.apodizing) badges.push('切趾');
+  if (it.twoStage) badges.push('两段式');
+  if (it.forNx) badges.push('Nx 专用');
+  var audioTop = it.inRate / 2;
+  var resp = rlFbChart(it.response, {
+    label: '幅频响应', x0: 10, x1: it.fs / 2, logX: true, y0: -320, y1: 10,
+    xLabel: 'Hz（对数）', yFmt: function (v) { return v + ' dB'; },
+    xTicks: [100, 1000, 10000, audioTop], xFmt: function (v) { return v >= 1000 ? (v / 1000).toFixed(v >= 10000 ? 1 : 0) + 'k' : String(Math.round(v)); },
+    marks: [{ x: it.passHz, label: '通带', color: '#7fd1b9' }, { x: it.stopStartHz, label: '阻带', color: '#e6a23c' }, { x: audioTop, label: '音频上限', color: '#8ab4f8' }]
+  });
+  var pass = rlFbChart(it.passCurve, {
+    label: '通带放大', x0: 0, x1: it.passHz, y0: Math.min(-0.05, it.passDb * 1.4), y1: Math.max(0.05, it.passDb * 1.4),
+    xLabel: 'Hz（线性）', yFmt: function (v) { return v.toFixed(2); }, yTicks: 4,
+    xTicks: [0, it.passHz / 2, it.passHz], xFmt: function (v) { return v >= 1000 ? (v / 1000).toFixed(1) + 'k' : String(Math.round(v)); }
+  });
+  var gdTop = Math.min(20000, it.passHz);
+  var gd = rlFbChart(it.gdCurve, {
+    label: '群延迟', x0: 100, x1: gdTop, logX: true, y0: 0, y1: Math.max(0.1, it.gd1kMs * 1.25),
+    xLabel: 'Hz（对数）', yFmt: function (v) { return v.toFixed(1); }, yTicks: 4,
+    xTicks: [100, 1000, 10000, gdTop], xFmt: function (v) { return v >= 1000 ? (v / 1000).toFixed(v >= 10000 ? 1 : 0) + 'k' : String(Math.round(v)); },
+    marks: [{ x: 1000, label: '1 kHz', color: '#8ab4f8' }]
+  });
+  var imp = rlFbChart(it.impulse, {
+    label: '冲激响应', x0: -(it.impulse.length / 2) / it.fs * 1000, x1: (it.impulse.length / 2) / it.fs * 1000,
+    y0: -1.05, y1: 1.05, xLabel: 'ms（相对峰值）', yFmt: function (v) { return v.toFixed(2); }, yTicks: 4,
+    xTicks: [-(it.impulse.length / 2) / it.fs * 1000, 0, (it.impulse.length / 2) / it.fs * 1000], xFmt: function (v) { return v.toFixed(2); },
+    marks: [{ x: 0, label: '峰值', color: '#e6a23c' }]
+  });
+  return '<div class=rlFbDetailHead><h3>' + esc(it.name) + '</h3><div class=rlFbBadges>' +
+    badges.map(function (b) { return '<span>' + esc(t(b)) + '</span>'; }).join('') + '</div></div>' +
+    rlFbMetrics(it) +
+    '<div class=rlFbCharts><figure><figcaption>' + esc(t('幅频响应 · 全频段（含镜像）')) + '</figcaption>' + resp + '</figure>' +
+    '<figure><figcaption>' + esc(t('通带放大（偏差轴）')) + '</figcaption>' + pass + '</figure>' +
+    '<figure><figcaption>' + esc(t('群延迟（实测）')) + '</figcaption>' + gd + '</figure>' +
+    '<figure><figcaption>' + esc(t('冲激响应 · 峰值两侧')) + '</figcaption>' + imp + '</figure></div>' +
+    '<p class=rlFbNote>' + esc(tf('读数来自当前生产系数的 {0} 点全频带 FFT（10 Hz–Nyquist），UI 曲线 {1} 点；实际播放会按设备采样率重新设计，数值会随输出率与抽头预算变化。', [it.fullBandPoints || 0, it.responseCount || 0])) + '</p>';
+}
+function rlFbRender() {
+  var host = D('rlFbDetail');
+  if (!host) return;
+  var it = RL_FB.cache[RL_FB.preview];
+  host.innerHTML = rlFbDetailHtml(it);
+  var btn = D('rlFbUse');
+  if (btn) { btn.disabled = !RL_FB.chosen; btn.textContent = RL_FB.chosen ? tf('选用「{0}」', [RL_FB.chosen]) : t('选用此滤波器'); }
+  var st = D('rlFbState');
+  if (st) st.textContent = RL_FB.chosen ? tf('已选：{0}', [RL_FB.chosen]) : t('悬停预览，点击选定');
+}
+function rlFbPreview(name) {
+  if (!name || (name === RL_FB.preview && RL_FB.cache[name])) return;
+  RL_FB.preview = name;
+  var list = D('rlFbList');
+  if (list) Array.prototype.forEach.call(list.querySelectorAll('[data-fb-name]'), function (b) {
+    b.setAttribute('aria-current', String(b.dataset.fbName === name));
+  });
+  if (RL_FB.cache[name]) { rlFbRender(); return; }
+  var host = D('rlFbDetail');
+  if (host) host.innerHTML = '<div class=rlFbLoading>' + esc(t('正在读取设计数据…')) + '</div>';
+  var seq = ++RL_FB.seq;
+  api('/api/filter/detail?name=' + encodeURIComponent(name)).then(function (j) {
+    if (seq !== RL_FB.seq || !j || !j.ok || !j.item) return;
+    RL_FB.cache[name] = j.item;
+    if (RL_FB.preview === name) rlFbRender();
+  }).catch(function () {
+    if (seq === RL_FB.seq && host) host.innerHTML = '<div class=rlFbEmpty>' + esc(t('读取失败：该滤波器没有详情数据')) + '</div>';
+  });
+}
+function rlFbListHtml(items) {
+  var q = (D('rlFbSearch') && D('rlFbSearch').value || '').trim().toLowerCase();
+  var order = ['自动', '线性相位', '最小相位', '混合相位', '切趾', '两段式', 'Nx 专用'];
+  var groups = {};
+  items.forEach(function (it) {
+    if (q && it.name.toLowerCase().indexOf(q) < 0) return;
+    var g = rlFbGroup(it);
+    (groups[g] = groups[g] || []).push(it);
+  });
+  var h = '';
+  order.forEach(function (g) {
+    if (!groups[g] || !groups[g].length) return;
+    h += '<div class=rlFbGroup><div class=rlFbGroupTitle>' + esc(t(g)) + ' · ' + groups[g].length + '</div>';
+    groups[g].forEach(function (it) {
+      h += '<button type=button class=rlFbItem data-fb-name="' + esc(it.name) + '"' +
+           (it.name === RL_FB.chosen ? ' aria-pressed=true' : '') + '>' +
+           '<span>' + esc(it.name) + '</span><small>' + esc(rlFbHz(it.passHz)) + ' · ' + esc(rlFbDb(-Math.abs(it.ceilingDb))) + '</small></button>';
+    });
+    h += '</div>';
+  });
+  return h || '<div class=rlFbEmpty>' + esc(t('没有匹配的滤波器')) + '</div>';
+}
+function rlFbFill() {
+  var list = D('rlFbList');
+  if (!list) return;
+  list.innerHTML = rlFbListHtml(RL_FB.items);
+  if (RL_FB.preview) rlFbPreview(RL_FB.preview);
+}
+function rlFilterBrowserOpen(target) {
+  target = target === 'filterNx' ? 'filterNx' : 'filter';
+  RL_FB.target = target;
+  var old = D('rlFilterBrowser');
+  if (old) old.remove();
+  var dialog = document.createElement('dialog');
+  dialog.id = 'rlFilterBrowser';
+  dialog.className = 'rlFbDialog';
+  dialog.innerHTML = '<style>' +
+    '.rlFbDialog{width:min(1120px,96vw);max-height:92vh;padding:0;border:1px solid var(--line,#3a3a3a);border-radius:12px;background:var(--bg,#1b1b1b);color:var(--fg,#eee);overflow:hidden}' +
+    '.rlFbDialog::backdrop{background:#000a}' +
+    '.rlFbHead{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line,#3a3a3a)}' +
+    '.rlFbHead h2{margin:0;font:600 18px/1.3 Georgia,serif}.rlFbHead p{margin:2px 0 0;font-size:11px;color:var(--muted,#999)}' +
+    '.rlFbHead button{background:none;border:0;color:inherit;font-size:22px;cursor:pointer}' +
+    '.rlFbBody{display:grid;grid-template-columns:minmax(220px,300px) minmax(0,1fr);height:calc(92vh - 132px);min-height:360px;overflow:hidden}' +
+    '.rlFbLeft{border-right:1px solid var(--line,#3a3a3a);display:flex;flex-direction:column;min-height:0;height:100%}' +
+    '.rlFbSearchWrap{padding:10px 12px;border-bottom:1px solid var(--line,#3a3a3a)}' +
+    '.rlFbSearchWrap input{width:100%;padding:7px 9px;border-radius:6px;border:1px solid var(--line,#3a3a3a);background:var(--field,#111);color:inherit}' +
+    '.rlFbList{overflow:auto;padding:8px 8px 14px;min-height:0}' +
+    '.rlFbGroupTitle{font-size:10px;letter-spacing:.08em;color:var(--muted,#999);margin:10px 6px 5px;text-transform:uppercase}' +
+    '.rlFbItem{display:flex;justify-content:space-between;gap:8px;width:100%;text-align:start;padding:7px 9px;border:0;border-radius:6px;background:none;color:inherit;cursor:pointer;font:12px/1.35 ui-monospace,Consolas,monospace}' +
+    '.rlFbItem:hover,.rlFbItem:focus-visible,.rlFbItem[aria-current=true]{background:var(--tint,#2a2a2a);outline:none}' +
+    '.rlFbItem[aria-current=true]{box-shadow:inset 3px 0 var(--acc,#d9b875)}.rlFbItem small{color:var(--muted,#999);white-space:nowrap}' +
+    '.rlFbRight{overflow:auto;padding:14px 18px 18px;min-height:0;height:100%}' +
+    '.rlFbDetailHead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}.rlFbDetailHead h3{margin:0;font:600 20px/1.2 Georgia,serif}' +
+    '.rlFbBadges{display:flex;gap:6px;flex-wrap:wrap}.rlFbBadges span{font-size:10px;padding:3px 7px;border:1px solid var(--line,#3a3a3a);border-radius:999px;color:var(--muted,#bbb)}' +
+    '.rlFbGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin:8px 0 12px}' +
+    '.rlFbCell{border:1px solid var(--line,#3a3a3a);border-radius:7px;padding:7px 8px;min-width:0}' +
+    '.rlFbCell span{display:block;font-size:10px;color:var(--muted,#999);margin-bottom:3px}.rlFbCell b{font:600 13px/1.3 ui-monospace,Consolas,monospace;overflow-wrap:anywhere}' +
+    '.rlFbCharts{display:grid;grid-template-columns:1fr 1fr;gap:10px}.rlFbCharts figure{margin:0;border:1px solid var(--line,#3a3a3a);border-radius:8px;padding:7px 8px 4px;min-width:0}' +
+    '.rlFbCharts figcaption{font-size:10px;color:var(--muted,#999);margin-bottom:2px}.rlFbChart{display:block;width:100%;height:auto}' +
+    'line.rlFbGrid{stroke:#5556;stroke-width:.6}.rlFbTick{font-size:8px;fill:#999}.rlFbMark{stroke-width:.8;stroke-dasharray:2 2;opacity:.8}.rlFbMarkText{font-size:7.5px;fill:#bbb}' +
+    '.rlFbLine{fill:none;stroke:var(--acc,#d9b875);stroke-width:1.3;vector-effect:non-scaling-stroke}' +
+    '.rlFbNote{font-size:10px;line-height:1.6;color:var(--muted,#999);margin:10px 0 0}' +
+    '.rlFbLoading,.rlFbEmpty{padding:28px 10px;color:var(--muted,#999);font-size:12px;text-align:center}' +
+    '.rlFbFoot{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 18px;border-top:1px solid var(--line,#3a3a3a)}' +
+    '.rlFbFoot span{font-size:11px;color:var(--muted,#999)}.rlFbFoot .btn{min-height:32px;padding:6px 14px;border-radius:6px;border:1px solid var(--line,#3a3a3a);background:var(--field,#222);color:inherit;cursor:pointer}' +
+    '.rlFbFoot .btn.pri{background:var(--acc,#d9b875);color:#20180b;border-color:var(--acc,#d9b875)}.rlFbFoot .btn:disabled{opacity:.45;cursor:default}' +
+    '@media(max-width:760px){.rlFbBody{grid-template-columns:1fr}.rlFbLeft{max-height:220px;border-right:0;border-bottom:1px solid var(--line,#3a3a3a)}.rlFbGrid{grid-template-columns:1fr 1fr}.rlFbCharts{grid-template-columns:1fr}}' +
+    '</style>' +
+    '<header class=rlFbHead><div><h2>' + esc(t('滤波器库')) + '</h2><p>' + esc(t('悬停查看设计详情 · 点击选定 · 键盘 ↑↓ 浏览')) + '</p></div><button type=button aria-label="' + esc(t('关闭')) + '">×</button></header>' +
+    '<div class=rlFbBody><div class=rlFbLeft><div class=rlFbSearchWrap><input id=rlFbSearch type=search placeholder="' + esc(t('搜索滤波器名…')) + '" spellcheck=false></div><div class=rlFbList id=rlFbList></div></div>' +
+    '<div class=rlFbRight id=rlFbDetail></div></div>' +
+    '<footer class=rlFbFoot><span id=rlFbState></span><div><button type=button class=btn id=rlFbCancel>' + esc(t('取消')) + '</button> <button type=button class="btn pri" id=rlFbUse disabled>' + esc(t('选用此滤波器')) + '</button></div></footer>';
+  document.body.appendChild(dialog);
+  RL_FB.dialog = dialog;
+  dialog.querySelector('header button').onclick = function () { dialog.close(); };
+  dialog.addEventListener('click', function (e) { if (e.target === dialog) dialog.close(); });
+  dialog.addEventListener('close', function () { dialog.remove(); RL_FB.dialog = null; });
+  D('rlFbCancel').onclick = function () { dialog.close(); };
+  D('rlFbSearch').oninput = function () { rlFbFill(); };
+  var list = D('rlFbList');
+  list.addEventListener('mouseover', function (e) { var b = e.target.closest('[data-fb-name]'); if (b) rlFbPreview(b.dataset.fbName); });
+  list.addEventListener('focusin', function (e) { var b = e.target.closest('[data-fb-name]'); if (b) rlFbPreview(b.dataset.fbName); });
+  list.addEventListener('click', function (e) {
+    var b = e.target.closest('[data-fb-name]');
+    if (!b) return;
+    RL_FB.chosen = b.dataset.fbName;
+    Array.prototype.forEach.call(list.querySelectorAll('[data-fb-name]'), function (x) { x.setAttribute('aria-pressed', String(x === b)); });
+    rlFbPreview(RL_FB.chosen);
+    rlFbRender();
+  });
+  list.addEventListener('dblclick', function (e) { var b = e.target.closest('[data-fb-name]'); if (b) { RL_FB.chosen = b.dataset.fbName; rlFbApply(); } });
+  list.addEventListener('keydown', function (e) {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    e.preventDefault();
+    var all = Array.prototype.slice.call(list.querySelectorAll('[data-fb-name]'));
+    if (!all.length) return;
+    var i = all.indexOf(document.activeElement);
+    var next = all[Math.max(0, Math.min(all.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)))];
+    if (next) { next.focus(); rlFbPreview(next.dataset.fbName); }
+  });
+  D('rlFbUse').onclick = rlFbApply;
+  var fs = target === 'filterNx' ? 96000 : 44100;
+  var content = target === 'filterNx' ? 40000 : 20000;
+  var current = (D(target === 'filterNx' ? 'sp_filtNx' : 'sp_filt') || {}).value ||
+                (D(target === 'filterNx' ? 'sFiltNx' : 'sFilt') || {}).value || '';
+  api('/api/filters?fs=' + fs + '&content=' + content).then(function (j) {
+    RL_FB.items = (j && j.ok && j.items) || [];
+    RL_FB.chosen = current && RL_FB.items.some(function (x) { return x.name === current; }) ? current : '';
+    RL_FB.preview = RL_FB.chosen || (RL_FB.items[0] && RL_FB.items[0].name) || '';
+    rlFbFill();
+    if (RL_FB.preview) rlFbPreview(RL_FB.preview);
+    rlFbRender();
+    var first = list.querySelector('[data-fb-name="' + (RL_FB.preview || '').replace(/"/g, '') + '"]');
+    if (first) first.focus();
+  }).catch(function () {
+    D('rlFbList').innerHTML = '<div class=rlFbEmpty>' + esc(t('滤波器列表读取失败')) + '</div>';
+  });
+  dialog.showModal();
+}
+function rlFbApply() {
+  var name = RL_FB.chosen;
+  if (!name) return;
+  var isNx = RL_FB.target === 'filterNx';
+  var sp = D(isNx ? 'sp_filtNx' : 'sp_filt');
+  var s = D(isNx ? 'sFiltNx' : 'sFilt');
+  if (s) s.value = name;
+  if (sp) {
+    if (!Array.prototype.some.call(sp.options, function (o) { return o.value === name; })) sp.add(new Option(name, name));
+    sp.value = name;
+  }
+  var studio = D(isNx ? 'rlStudioFilterNx' : 'rlStudioFilter1');
+  if (studio) { RL_STUDIO.draft[isNx ? 'filterNx' : 'filter'] = name; rlStudioFlush().catch(function () {}); }
+  else if (typeof saveSettings === 'function') saveSettings();
+  if (D('rlFilterBrowser')) D('rlFilterBrowser').close();
+  toast(tf('已选用滤波器：{0}', [name]));
+}
+
+// ---- 2026-11-15：滤波器下拉框的内联详情面板 ----
+// 用户要求：点开下拉菜单时，在它右侧浮出与菜单同高的详情框，鼠标移到哪一项就显示哪一项。
+// 原生 <select> 的弹出层由浏览器绘制，DOM 收不到 option 的 hover 事件，所以这里拦截
+// mousedown（阻止原生弹层），用自绘列表 + 右侧详情替代；select 本身仍是表单值的唯一来源。
+var RL_FP = { pop: null, sel: null, seq: 0, rows: [], idx: -1, outside: null, key: null };
+function rlFpEnsureStyle() {
+  if (D('rlFpStyle')) return;
+  var st = document.createElement('style'); st.id = 'rlFpStyle';
+  st.textContent =
+    '.rlFpPop{position:fixed;z-index:99999;display:flex;gap:8px;align-items:flex-start}' +
+    '.rlFpList{background:#141414;border:1px solid #3a3a3a;border-radius:8px;box-shadow:0 12px 40px #000a;padding:4px;overflow:auto;min-width:220px}' +
+    '.rlFpGroup{font-size:10px;letter-spacing:.06em;color:#999;padding:8px 8px 4px;text-transform:uppercase}' +
+    '.rlFpRow{padding:6px 8px;border-radius:6px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font:12px/1.35 ui-monospace,Consolas,monospace;color:#ddd}' +
+    '.rlFpRow:hover,.rlFpRow.on{background:#2a2a2a;color:#fff}' +
+    '.rlFpDetail{background:#141414;border:1px solid #3a3a3a;border-radius:8px;box-shadow:0 12px 40px #000a;padding:10px 12px;overflow:auto}' +
+    '.rlFpDetail .rlFbGrid{grid-template-columns:repeat(2,minmax(0,1fr))}' +
+    '.rlFbDetailHead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}.rlFbDetailHead h3{margin:0;font:600 18px/1.2 Georgia,serif}' +
+    '.rlFbBadges{display:flex;gap:6px;flex-wrap:wrap}.rlFbBadges span{font-size:10px;padding:3px 7px;border:1px solid var(--line,#3a3a3a);border-radius:999px;color:var(--muted,#bbb)}' +
+    '.rlFbGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin:6px 0 10px}' +
+    '.rlFbCell{border:1px solid var(--line,#3a3a3a);border-radius:7px;padding:6px 7px;min-width:0}' +
+    '.rlFbCell span{display:block;font-size:10px;color:var(--muted,#999);margin-bottom:2px}.rlFbCell b{font:600 12px/1.3 ui-monospace,Consolas,monospace;overflow-wrap:anywhere}' +
+    '.rlFbCharts{display:grid;grid-template-columns:1fr 1fr;gap:8px}.rlFbCharts figure{margin:0;border:1px solid var(--line,#3a3a3a);border-radius:8px;padding:6px 7px 3px;min-width:0}' +
+    '.rlFbCharts figcaption{font-size:10px;color:var(--muted,#999);margin-bottom:2px}.rlFbChart{display:block;width:100%;height:auto}' +
+    'line.rlFbGrid{stroke:#5556;stroke-width:.6}.rlFbTick{font-size:8px;fill:#999}.rlFbMark{stroke-width:.8;stroke-dasharray:2 2;opacity:.8}.rlFbMarkText{font-size:7.5px;fill:#bbb}' +
+    '.rlFbLine{fill:none;stroke:var(--acc,#d9b875);stroke-width:1.3;vector-effect:non-scaling-stroke}' +
+    '.rlFbNote{font-size:10px;line-height:1.55;color:var(--muted,#999);margin:8px 0 0}' +
+    '.rlFbLoading,.rlFbEmpty{padding:24px 8px;color:var(--muted,#999);font-size:12px;text-align:center}';
+  document.head.appendChild(st);
+}
+function rlFpPreview(name) {
+  var host = D('rlFpDetail');
+  if (!host) return;
+  // 空值 = “自动（推荐）”：/api/filter/detail 的 auto 条目会解析到真实预设。
+  var key = name || 'auto';
+  var it = RL_FB.cache[key];
+  if (it) { host.innerHTML = rlFbDetailHtml(it); return; }
+  host.innerHTML = '<div class=rlFbLoading>' + esc(t('读取中…')) + '</div>';
+  var seq = ++RL_FP.seq;
+  api('/api/filter/detail?name=' + encodeURIComponent(key)).then(function (j) {
+    if (seq !== RL_FP.seq || !D('rlFpDetail')) return;
+    if (!j || !j.ok || !j.item) { host.innerHTML = '<div class=rlFbEmpty>' + esc(t('读取失败：该滤波器没有详情数据')) + '</div>'; return; }
+    RL_FB.cache[key] = j.item;
+    host.innerHTML = rlFbDetailHtml(j.item);
+  }).catch(function () {
+    if (seq === RL_FP.seq && D('rlFpDetail')) host.innerHTML = '<div class=rlFbEmpty>' + esc(t('读取失败：网络或服务未响应')) + '</div>';
+  });
+}
+function rlFpClose() {
+  if (RL_FP.outside) { document.removeEventListener('mousedown', RL_FP.outside, true); RL_FP.outside = null; }
+  if (RL_FP.key) { document.removeEventListener('keydown', RL_FP.key, true); RL_FP.key = null; }
+  if (RL_FP.pop) { RL_FP.pop.remove(); RL_FP.pop = null; }
+  RL_FP.sel = null; RL_FP.rows = []; RL_FP.idx = -1;
+}
+function rlFpPick(v) {
+  var sel = RL_FP.sel;
+  if (!sel) return;
+  sel.value = v;
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+  rlFpClose();
+}
+function rlFpMove(delta) {
+  if (!RL_FP.rows.length) return;
+  var i = RL_FP.idx + delta;
+  if (i < 0) i = RL_FP.rows.length - 1;
+  if (i >= RL_FP.rows.length) i = 0;
+  RL_FP.idx = i;
+  for (var k = 0; k < RL_FP.rows.length; ++k) RL_FP.rows[k].classList.toggle('on', k === i);
+  var row = RL_FP.rows[i], list = D('rlFpList');
+  if (list) list.scrollTop = Math.max(0, row.offsetTop - list.clientHeight / 2);
+  rlFpPreview(row.dataset.v);
+}
+function rlFpOpen(sel) {
+  if (RL_FP.sel === sel) { rlFpClose(); return; }
+  rlFpClose();
+  rlFpEnsureStyle();
+  var r = sel.getBoundingClientRect();
+  var vw = window.innerWidth, vh = window.innerHeight;
+  var w = Math.max(240, Math.round(r.width));
+  var dw = Math.min(560, Math.max(340, vw - w - 48));
+  var below = vh - r.bottom - 12, above = r.top - 12;
+  var listH = Math.min(430, Math.max(220, Math.max(below, above)));
+  var left = Math.round(r.left);
+  if (left + w + 8 + dw > vw - 8) left = Math.max(8, vw - 8 - w - 8 - dw);
+  var top = (below >= 300 || below >= above) ? Math.round(r.bottom + 4)
+                                              : Math.max(8, Math.round(r.top - listH - 4));
+  if (top + listH > vh - 8) listH = Math.max(160, vh - top - 8);
+  var pop = document.createElement('div');
+  pop.id = 'rlFpPop'; pop.className = 'rlFpPop';
+  pop.style.left = left + 'px'; pop.style.top = top + 'px';
+  pop.innerHTML = '<div class=rlFpList id=rlFpList></div><div class=rlFpDetail id=rlFpDetail></div>';
+  document.body.appendChild(pop);
+  RL_FP.pop = pop; RL_FP.sel = sel; RL_FP.rows = []; RL_FP.idx = -1;
+  var list = D('rlFpList'), detail = D('rlFpDetail');
+  list.style.width = w + 'px'; list.style.maxHeight = listH + 'px';
+  detail.style.width = dw + 'px'; detail.style.maxHeight = listH + 'px';
+  var seen = {}, seenLabel = {};
+  function addRow(v, label) {
+    // 设置页与音乐台可能各补一个空值“自动”，值或显示名重复都只保留第一次。
+    if (seen[v] || seenLabel[label]) return;
+    seen[v] = 1; seenLabel[label] = 1;
+    var d = document.createElement('div');
+    d.className = 'rlFpRow'; d.dataset.v = v; d.textContent = label; d.title = label;
+    d.addEventListener('mouseenter', function () {
+      for (var k = 0; k < RL_FP.rows.length; ++k) RL_FP.rows[k].classList.remove('on');
+      d.classList.add('on'); RL_FP.idx = RL_FP.rows.indexOf(d);
+      rlFpPreview(v);
+    });
+    d.addEventListener('click', function () { rlFpPick(v); });
+    list.appendChild(d); RL_FP.rows.push(d);
+    if (v === sel.value) RL_FP.idx = RL_FP.rows.length - 1;
+  }
+  for (var i = 0; i < sel.children.length; ++i) {
+    var ch = sel.children[i];
+    if (ch.tagName === 'OPTGROUP') {
+      var g = document.createElement('div'); g.className = 'rlFpGroup'; g.textContent = ch.label; list.appendChild(g);
+      for (var j = 0; j < ch.children.length; ++j) {
+        var op = ch.children[j];
+        if (op.tagName === 'OPTION') addRow(op.value, (op.textContent || '').trim());
+      }
+    } else if (ch.tagName === 'OPTION') {
+      addRow(ch.value, (ch.textContent || '').trim());
+    }
+  }
+  if (RL_FP.idx >= 0 && RL_FP.rows[RL_FP.idx]) {
+    RL_FP.rows[RL_FP.idx].classList.add('on');
+    list.scrollTop = Math.max(0, RL_FP.rows[RL_FP.idx].offsetTop - list.clientHeight / 2);
+    rlFpPreview(RL_FP.rows[RL_FP.idx].dataset.v);
+  } else if (RL_FP.rows[0]) {
+    RL_FP.idx = 0; RL_FP.rows[0].classList.add('on'); rlFpPreview(RL_FP.rows[0].dataset.v);
+  }
+  RL_FP.outside = function (e) {
+    if (RL_FP.pop && !RL_FP.pop.contains(e.target) && e.target !== sel) rlFpClose();
+  };
+  document.addEventListener('mousedown', RL_FP.outside, true);
+  RL_FP.key = function (e) {
+    if (!RL_FP.pop) return;
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); rlFpClose(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); e.stopPropagation(); rlFpMove(1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); e.stopPropagation(); rlFpMove(-1); }
+    else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); if (RL_FP.idx >= 0) rlFpPick(RL_FP.rows[RL_FP.idx].dataset.v); }
+  };
+  document.addEventListener('keydown', RL_FP.key, true);
+}
+function rlFpAttach(sel) {
+  if (!sel || sel.dataset.rlFp === '1') return;
+  sel.dataset.rlFp = '1';
+  sel.style.cursor = 'pointer';
+  sel.addEventListener('mousedown', function (e) { e.preventDefault(); rlFpOpen(sel); });
+  sel.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowDown' || e.key === 'Enter') { e.preventDefault(); rlFpOpen(sel); }
+  });
+}
+function rlFpAttachAll() {
+  ['rlStudioFilter1', 'rlStudioFilterNx', 'rlStudioSdmFilter1', 'rlStudioSdmFilterNx',
+   'sp_filt', 'sp_filtNx', 'sp_sdmo1', 'sp_sdmoNx'].forEach(function (id) {
+    var s = D(id); if (s) rlFpAttach(s);
+  });
+}
+setInterval(function () { try { rlFpAttachAll(); } catch (e) {} }, 1200);
+
 // ---- 功能4（用户 2026-10-22）：DeepSeek API Key 的界面入口 ----
 // 三条硬约束（对应后端 /api/llm）：
 //   ① 界面只显示掩码（sk-****abcd）：GET 只回 mask，输入框永不回填；
@@ -8210,7 +8833,7 @@ function applyPresetControls(applied, profile) {
     ['sp_eq','sp_ir','sp_phase'].forEach(function(id){if(D(id))D(id).value='';});
     ['sLoud','sp_loud'].forEach(function(id){if(D(id))D(id).checked=false;});
     if(profile==='bitperfect') {
-      ADV.roomcorrauto=0;ADV.cleanup=0;ADV.upnpUpsample=0;ADV.upnpForceRate=0;ADV.rgmode='off';
+      ADV.roomcorrauto=0;ADV.cleanup=0;ADV.crossfeed=0;ADV.dacbits=0;ADV.upnpUpsample=0;ADV.upnpForceRate=0;ADV.rgmode='off';
       if(D('sp_roomauto'))D('sp_roomauto').checked=false;
       if(D('sp_rgmode'))D('sp_rgmode').value='off';
       clearTimeout(PEQ_TIMER);if(PEQ_STATE)PEQ_STATE.bypass=true;if(D('peqBypass'))D('peqBypass').checked=true;
@@ -8426,9 +9049,8 @@ function renderSettingsPage() {
   h += '<div class="spane" data-g=out>'
      // 2026-10-26（261026-01 #2）：官方推荐预设放在「输出」面板最上方（用户要求「做到输出里面」）。
      + sgroup('输出后端', '独占 = bit-perfect；共享 = 兼容性最好（虚拟机 / 远程桌面）',
-         // 261024-04 #2：用户要求「放在后端那个选项的右边」—— bit-perfect 直通按钮从独立一行挪进
-         // 「后端」下拉的同一行（flex 行，底对齐；下拉可缩、按钮 nowrap，窄窗也不换行）。
-         // 原来铺在页面上的一长串判据收进按钮的 tooltip，行内只留一个按钮。
+         // 2026-11-15：原「切到 bit-perfect 直通」按钮已删除。A–D 四组的后端/滤波/EQ/音量
+         // 现在统一由数字音乐台管理，这里再放一套会直接改坏当前组（ASIO/DSD 组被改成 WASAPI PCM）。
          '<div class="sfld wide" style="display:flex;align-items:flex-end;gap:10px;flex-wrap:nowrap">'
        + '<div style="flex:1 1 auto;min-width:180px">'
        + '<label>后端' + tip('选到当前不可用的后端时，播放会直接返回原因，不会假装出声') + '</label>'
@@ -8441,8 +9063,6 @@ function renderSettingsPage() {
        +   opt('upnp', 'UPnP / DLNA 投放（局域网渲染器）', BK)
        +   opt('null', 'Null output（只跑 DSP，不出声）', BK)
        + '</select></div>'
-       + '<button class="btn pri" id=sp_bpfix style="flex:none;white-space:nowrap" ' +
-         'title="判据：输出采样率 = 源 / 抖动 = none / 音量 0 dB / 无 EQ·IR / 独占 WASAPI">切到 bit-perfect 直通</button>'
        + '</div>'
       // 261024-05：NAA 端点选择/发现区块已删除（整个后端一起去掉）。
       // 261024-01 #9：后端下拉新增「UPnP / DLNA 投放」。选中后这里直接选目标渲染器，
@@ -8459,8 +9079,7 @@ function renderSettingsPage() {
       + '<div class=hint>'+esc('先在本机准备完整 WAV，再向设备供源；准备时可以停止取消。')+'</div>'
       + '<div class=hint id=sp_upnp_msg>播放 / 切歌自动投放到该渲染器（与下方「投放」共用会话）</div>'
       + '</div>'
-       // 2026-10-24（261024-02 #8）：一键直通预设（源采样率 + 无抖动 + 0 dB + 无 EQ/IR + 独占）。
-       // 261024-04 #2：按钮已挪到「后端」下拉右侧的同一行（见上），这里不再占一行。
+       // 2026-11-15：一键直通按钮已删除，这里不再有第二套控制入口。
        + sel('sp_device', '输出设备', '<option value="">默认设备</option>', '独占模式会接管这个设备；共享模式经系统混音，不接管')
        + sel('sp_outmode', '输出模式',
              opt('pcm', 'PCM', outModeOf()) + opt('dsd', 'DSD（SDM）', outModeOf()),
@@ -8522,6 +9141,10 @@ function renderSettingsPage() {
          sel('sp_filt', '1x 滤波器（44.1 / 48 kHz 音源）', filts, '播放 44.1 / 48 kHz 文件时使用')
        + sel('sp_filtNx', 'Nx 滤波器（88.2 kHz 及以上音源）', filtsNx,
              '播放 88.2 / 96 / 176.4 kHz 等文件时使用；留空 = 与 1x 相同')
+       + '<div class="sfld wide" style="display:flex;gap:8px;flex-wrap:wrap">'
+       + '<button type=button class=btn id=sp_filt_browse>' + esc('滤波器库 · 1x 详情') + '</button>'
+       + '<button type=button class=btn id=sp_filtNx_browse>' + esc('滤波器库 · Nx 详情') + '</button>'
+       + '</div>'
        + sel('sp_phase', '相位（覆盖滤波器预设的相位）',
              opt('', '跟随预设（用所选滤波器自带的相位）', ADV.phase) +
              opt('linear', '强制线性相位', ADV.phase) +
@@ -8545,8 +9168,14 @@ function renderSettingsPage() {
        + sel('sp_cleanup_strength','清理强度',opt(.25,'轻柔',ADV.cleanupStrength)+opt(.5,'标准',ADV.cleanupStrength)+opt(.75,'强力',ADV.cleanupStrength),'强度范围 0～1；更高强度可能影响微弱细节。')
         + num({id:'sp_cleanup_noise',label:'手动噪声底（dBFS）'},ADV.cleanupNoiseDb,-120,-60,.1,'仅手动模式使用；自动模式保留此值，不把它当作测量结果。')
         + '<div class="sfld wide"><label>' + esc('清理实况') + '</label><div class=hint id=sp_cleanup_status role=status></div><button type=button class=btn id=sp_cleanup_refresh>' + esc('刷新清理状态') + '</button></div>')
-     + sgroup('抖动与保护', '按采样率自动重标定',
-         sel('sp_shaper', '抖动 / 噪声整形', shaps, 'auto = 按输出位深自动选型')
+     + sgroup('耳机交叉馈送', '耳机交叉馈送会改变声像和频响；默认关闭。',
+         chk('sp_crossfeed','启用耳机交叉馈送',!!ADV.crossfeed,'只用于两声道输入与两声道输出；不兼容逐位直通。',true)
+       + num({id:'sp_crossfeed_freq',label:'交叉馈送截止频率（Hz）'},ADV.crossfeedFreq,300,1200,10,'低于此频段的信号会少量送入另一声道。')
+       + num({id:'sp_crossfeed_level',label:'交叉声道衰减（dB）'},ADV.crossfeedLevel,3,15,.5,'值越大效果越轻；12 dB 轻度，6 dB 标准。'))
+     + sgroup('抖动与保护', '按实际输出采样率与位深选择',
+         sel('sp_shaper', 'PCM 抖动 / 噪声整形', shaps, 'auto = 按实际输出采样率与位深选择')
+       + sel('sp_dacbits','DAC 有效位深',opt(0,'自动（跟随输出容器）',ADV.dacbits)+Array.from({length:25},function(_,i){return opt(i+8,(i+8)+' bit',ADV.dacbits);}).join(''),'仅在已知 DAC 精度时手动设置；18/20 bit 可装入 24/32 bit 容器，不改变驱动传输位深。')
+       + '<div class="sfld wide"><div id=sp_shaper_hint class=hint role=status></div><button type=button class=btn id=sp_shaper_help>'+esc(t('抖动说明'))+'</button></div>'
        + chk('sp_isp', '过采样峰值保护（ISP）', D('sIsp').checked, '检测到插值峰值超满幅时预衰减'))
      + '</div>';
   // ---------- SDM ----------
@@ -8566,8 +9195,8 @@ function renderSettingsPage() {
              opt('dop', 'DoP（WASAPI / ASIO 均可）', dsdPackOf()) +
              opt('nat', 'Native（仅 ASIO）', dsdPackOf()),
              '两者数值等价，差别只在传输方式；Native 走 ASIO 原生 DSD（1-bit 直送驱动）。' +
-             '前提：后端 ASIO、源为 DSD、音量 0 dB、无 EQ / 卷积；支持设备可用的同族整数倍率转换；同位率未转换时可 bit-perfect，转换后非 bit-perfect；' +
-             '驱动拒绝原生 DSD 时自动回落 DoP，并在信号链里标出')
+             '前提：后端 ASIO。DSD 源走逐位直通（音量 0 dB、无 EQ / 卷积）；PCM 源会先经 SDM 调制再送 1-bit，音量 / EQ / 升频照常生效；' +
+             'DSD 源支持同族整数倍率转换；驱动拒绝原生 DSD 时自动回落 DoP，并在信号链里标出')
        // 2026-10-24（用户 261024-01 #12）：这两个控件不再灰掉（见 applyDsdState）。
        // 当前输出是 PCM 时，改这里会自动把输出模式联动到 DSD —— 一句常驻说明交代清楚。
        + '<div class="sfld wide" id=sp_dsdmodenote style="display:none"><div class=hint>' +
@@ -8933,6 +9562,8 @@ function renderSettingsPage() {
   };
 
   bindPresetCard();
+  if (D('sp_filt_browse')) D('sp_filt_browse').onclick = function () { rlFilterBrowserOpen('filter'); };
+  if (D('sp_filtNx_browse')) D('sp_filtNx_browse').onclick = function () { rlFilterBrowserOpen('filterNx'); };
   loadPresetCaps(false);
 
   // P1.5：源开关的绑定不在上面的静态清单里 —— 重建 HTML 后逐源重新绑定
@@ -8957,6 +9588,9 @@ function renderSettingsPage() {
     } else { a.value = b.value; }
   });
   syncRateFamilyPolicy();
+  if (D('sp_shaper_help')) D('sp_shaper_help').onclick = rlOpenShaperInfo;
+  if (D('sp_shaper')) D('sp_shaper').addEventListener('change',function(){if(D('sShap'))D('sShap').value=this.value;rlRefreshShaperGuidance();});
+  rlRefreshShaperGuidance();
   if (D('sp_rateFamilyPolicy')) D('sp_rateFamilyPolicy').onchange = function () {
     D('sRateFamilyPolicy').value = normalizeRateFamilyPolicy(this.value);
     syncRateFamilyPolicy();
@@ -9022,8 +9656,8 @@ function renderSettingsPage() {
     if (this.value === 'upnp') scanCastDevices(true);
   };
   // 261024-05：NAA 端点下拉绑定已删除（控件不再存在）
-  [['sp_upnp_upsample','upnpUpsample'],['sp_upnp_force','upnpForceRate'],['sp_cleanup','cleanup']].forEach(function(x){if(D(x[0]))D(x[0]).onchange=function(){ADV[x[1]]=this.checked?1:0;saveSettings();if(x[1]==='cleanup')refreshCleanupStatus();};});
-  [['sp_upnp_ceiling','upnpRateCeiling'],['sp_cleanup_strength','cleanupStrength'],['sp_cleanup_noise','cleanupNoiseDb']].forEach(function(x){if(D(x[0]))D(x[0]).onchange=function(){if(!validateProcessingSettings())return;ADV[x[1]]=Number(this.value);saveSettings();};});
+  [['sp_upnp_upsample','upnpUpsample'],['sp_upnp_force','upnpForceRate'],['sp_cleanup','cleanup'],['sp_crossfeed','crossfeed']].forEach(function(x){if(D(x[0]))D(x[0]).onchange=function(){ADV[x[1]]=this.checked?1:0;saveSettings();if(x[1]==='cleanup')refreshCleanupStatus();};});
+  [['sp_upnp_ceiling','upnpRateCeiling'],['sp_cleanup_strength','cleanupStrength'],['sp_cleanup_noise','cleanupNoiseDb'],['sp_crossfeed_freq','crossfeedFreq'],['sp_crossfeed_level','crossfeedLevel'],['sp_dacbits','dacbits']].forEach(function(x){if(D(x[0]))D(x[0]).onchange=function(){if(!validateProcessingSettings())return;ADV[x[1]]=Number(this.value);saveSettings();rlRefreshShaperGuidance();};});
   if(D('sp_cleanup_noise_mode'))D('sp_cleanup_noise_mode').onchange=function(){
     if(!validateProcessingSettings()){syncCleanupNoiseMode();return;}
     ADV.cleanupAuto=this.value==='manual'?0:1;syncCleanupNoiseMode();saveSettings();refreshCleanupStatus();
@@ -9034,45 +9668,10 @@ function renderSettingsPage() {
   // 261024-01 #9：目标渲染器与「投放」区块同一个选择（不出现两套互相打架的控制）
   if (D('sp_upnp_scan')) D('sp_upnp_scan').onclick = function () { scanCastDevices(true); };
   if (D('sp_upnp_dev')) D('sp_upnp_dev').onchange = function () { syncUpnpDev(this.value); backendHint(); };
-  // 2026-10-24（261024-02 #8）：一键切到 bit-perfect 直通。
-  // 用户只看到"非 bit-perfect"，不知道是哪一环：这里把判定口径对应的控件一次改到位。
-  if (D('sp_bpfix')) D('sp_bpfix').onclick = function () {
-    if (D('sp_backend')) { D('sp_backend').value = 'wasapi'; ADV.backend = 'wasapi'; }
-    if (D('sp_outmode')) D('sp_outmode').value = 'pcm';
-    if (D('sp_rate')) D('sp_rate').value = 'src';
-    if (D('sRate')) D('sRate').value = 'src';
-    if (D('sp_shaper')) D('sp_shaper').value = 'none';
-    if (D('sShap')) D('sShap').value = 'none';
-    if (D('sp_bits')) D('sp_bits').value = '0';
-    // ISP 过采样峰值保护会在峰值超满幅时做预衰减（非逐位一致）→ 直通模式必须关
-    if (D('sp_isp')) D('sp_isp').checked = false;
-    if (D('sIsp')) D('sIsp').checked = false;
-    ADV.isp = false;
-    // 关掉 EQ / IR 卷积（它们都会让输出不再是逐位一致）
-    if (D('sp_eq')) { D('sp_eq').value = ''; ADV.eq = ''; }
-    if (D('sp_ir')) { D('sp_ir').value = ''; ADV.ir = ''; }
-    // 音量：bit-perfect 必须 0 dB（不衰减），但 0 dB = 满幅输出，不能悄悄替用户拉满。
-    // 必须显式确认（铁律 1：向听音设备输出可闻电平要先告知）。
-    var volNow = (typeof S.vol === 'number') ? S.vol : 0;
-    var volSet = false;
-    if (Math.abs(volNow) > 1e-9) {
-      if (window.confirm('bit-perfect 要求音量 0 dB（不衰减、输出满幅）。\n当前音量 ' + volNow.toFixed(1) +
-                         ' dB。\n\n是否同时把音量设到 0 dB？\n（选"取消"则只改采样率/抖动/EQ，仍非 bit-perfect）')) {
-        S.vol = 0;
-        if (D('vol')) D('vol').value = '0';
-        if (D('volDb')) D('volDb').textContent = '0.0 dB';
-        volSet = true;
-      }
-    } else {
-      volSet = true;
-    }
-    saveSettings();
-    backendHint();
-    if (D('sp_backendmsg')) D('sp_backendmsg').textContent = volSet
-      ? '已切到 bit-perfect 直通：源采样率 + 无抖动 + 0 dB + 无 EQ/IR + 独占。下次播放生效。'
-      : tf('已改采样率/抖动/EQ，但音量仍是 {0} dB（非 0）→ 仍非 bit-perfect。', [volNow.toFixed(1)]);
-    toast(volSet ? '已切到 bit-perfect 直通（下次播放生效）' : '已改采样率/抖动/EQ；音量未动，仍非 bit-perfect');
-  };
+  // 2026-11-15：一键「切到 bit-perfect 直通」按钮已移除。
+  // 现在 A–D 四组的后端/滤波/EQ/音量全部由数字音乐台统一控制；这里再改一套
+  // 会直接和当前配置组打架（点一下可能把 ASIO/DSD 组改成 WASAPI PCM）。
+  // bit-perfect 的判定仍由底栏/信号链按实际播放参数给出，不再提供第二套入口。
   D('sp_ch').onchange = function () {
     ADV.channels = parseInt(this.value, 10) || 0;
     saveSettings();
@@ -11837,8 +12436,10 @@ function updShowCheck(j) {
   var card = D('sp_updcard');
   var dl = D('sp_upddl'), cn = D('sp_updcn'), global = D('sp_updglobal'), apply = D('sp_updapply');
   if (!j.ok) {
-    var why = String(j.error || j.checkError || '未知原因');
-    if (why.indexOf('quota_exceeded') >= 0) {
+    var why = updWhy(j);
+    // 2026-11-16：updWhy 之后 why 已是本地化文案，quota_exceeded 字样不一定还在 ⟹
+    //   判据要同时看 errorCode 与后端原始 error（旧前端契约就是靠这串字判的）。
+    if (String(j.errorCode || '') === 'quota_exceeded' || String(j.error || '').indexOf('quota_exceeded') >= 0) {
       if (card) card.style.display = '';
       updSet('sp_updver', j.latest ? ('v' + j.latest) : '—');
       updSet('sp_updplan', t('服务器本月增量配额已用完，请到百度网盘或 GitHub 下载完整版，或下月重试。'));
@@ -12337,6 +12938,10 @@ function drawRoots() {
 
 // 把设置页/快捷面板的值统一写回并保存
 function collectSettings() {
+  if(D('sp_crossfeed'))ADV.crossfeed=D('sp_crossfeed').checked?1:0;
+  if(D('sp_crossfeed_freq'))ADV.crossfeedFreq=Number(D('sp_crossfeed_freq').value);
+  if(D('sp_crossfeed_level'))ADV.crossfeedLevel=Number(D('sp_crossfeed_level').value);
+  if(D('sp_dacbits'))ADV.dacbits=Number(D('sp_dacbits').value);
   ADV.bits = parseInt(D('sp_bits').value, 10) || 0;
   ADV.taps = parseInt(D('sp_taps').value, 10) || 0;
   ADV.atten = parseFloat(D('sp_atten').value) || 0;
@@ -14237,7 +14842,7 @@ function addMany(paths) {
 // 就是"CD 拖不进去"。这里先按扩展名过滤，跳过的数量如实告诉用户。
 var RL_DROP_EXT = { wav:1, wave:1, flac:1, alac:1, m4a:1, mp3:1, aac:1, ogg:1, opus:1,
                     wma:1, ape:1, wv:1, aif:1, aiff:1, aifc:1, caf:1, mka:1,
-                    dsf:1, dff:1, cue:1, iso:1 };
+                    dsf:1, dff:1, cue:1, iso:1, cda:1 };
 function rlDropExt(name) {
   var m = /\.([A-Za-z0-9]+)$/.exec(String(name || ''));
   return m ? m[1].toLowerCase() : '';

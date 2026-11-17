@@ -83,6 +83,7 @@ using rta::render::SinkOpenOpts;
 #include "dsp/dop_stream.h"
 #include "dsp/dop_async.h"
 #include "dsp_ringing_reference.h"
+#include "filter_detail_reference.h"
 #include "dsp/direct_sdm.h"
 #include "version.h"
 #include "crash_dump.h"            // 崩溃转储 + OS/CPU/tester 诊断（1.0.5 可观测性）
@@ -181,6 +182,9 @@ struct PlayParams {
     bool cleanup = false, cleanupAuto = true;
     double cleanupStrength = .5, cleanupNoiseDb = -101.1;
     bool   loudness = false;
+    bool crossfeed = false;
+    double crossfeedFreq = 700.0, crossfeedLevelDb = 12.0;
+    int dacBits = 0;          // 0 = PCM container precision; otherwise 8..32 valid bits
     bool   isp = true;         // 过采样峰值保护
     // 两段式升频：三态（★ 2026-10-29 两轮审查 F23）
     //   −1 = 请求里【没提】⟹ 采用滤波器预设的值
@@ -353,6 +357,14 @@ struct PlayerState {
     std::string outFallbackWhy;
     double outRate = 0;
     int    outBits = 0;
+    std::atomic<int> quantizationBits{0};
+    std::atomic<bool> crossfeedUsed{false};
+    std::atomic<bool> pcmObserved{false};
+    std::atomic<int> pcmShaper{(int)rta::dsp::Shaper::None};
+    std::atomic<double> volumeDbObserved{0.0};
+    // pos/dur 的计时域：DoP/原生处理路径的 total/played 是载波帧，outRate 却是
+    // DSD 位率（给界面看 1-bit/45.1584M）。两者不能混，否则 4:22 会显示成 16.4 秒。
+    uint32_t timelineRate = 0;
     // ---- ReplayGain 自证（261027-01 #2；/api/status 的 rg / rgDb / rgClip）----
     // 为什么要报：mode=off 时用户必须能证明"输出逐位没动"，mode=track/album 时又必须能看到
     // 实际乘了多少 dB（标签值 vs 防削波改过的值）。只有后端说出来，这两件事才可证伪。
@@ -715,7 +727,7 @@ static PlayParams parseForm(const std::string& body) {
         if      (k == "file")     p.file = v;
         else if (k == "filter")   p.filter = v;
         else if (k == "filterNx") p.filterNx = v;
-        else if (k == "shaper")   p.shaper = v;
+        else if (k == "shaper")   p.shaper = (v == "Shaped" ? "shaped" : v);
         else if (k == "rate")     p.rate = v;
         else if (k == "rateFamilyPolicy") { p.rateFamilyPolicy = v; sawRateFamilyPolicy = true; }
         else if (k == "volume")   {
@@ -741,6 +753,10 @@ static PlayParams parseForm(const std::string& body) {
         else if (k == "dsdconv")  p.dsdConv = v;
         else if (k == "dsd2stage") p.dsd2Stage = (v == "1" || v == "true");
         else if (k == "loudness") p.loudness = (v == "1");
+        else if (k == "crossfeed") p.crossfeed = (v == "1" || v == "true");
+        else if (k == "crossfeed_freq") p.crossfeedFreq = atof(v.c_str());
+        else if (k == "crossfeed_level") p.crossfeedLevelDb = atof(v.c_str());
+        else if (k == "dacbits") p.dacBits = atoi(v.c_str());
         else if(k=="cleanup")p.cleanup=(v=="1"||v=="true");
         else if(k=="cleanup_auto")p.cleanupAuto=(v=="1"||v=="true");
         else if(k=="cleanup_strength"){double x=atof(v.c_str());p.cleanupStrength=rta::audio::audio_finite(x)?std::clamp(x,0.,1.):.5;}
@@ -849,7 +865,7 @@ static bool rta_is_playable_ext(std::string ext) {
     static const char* kExt[] = {
         ".wav", ".wave", ".flac", ".alac", ".m4a", ".mp3", ".aac", ".ogg", ".opus",
         ".wma", ".ape", ".wv", ".aif", ".aiff", ".aifc", ".caf", ".mka",
-        ".dsf", ".dff", ".cue", ".iso"
+        ".dsf", ".dff", ".cue", ".iso", ".cda"
     };
     for (const char* e : kExt) if (ext == e) return true;
     return false;
@@ -1370,20 +1386,34 @@ static bool is_asio_clsid(const std::string& s) {
     return SUCCEEDED(CLSIDFromString(w.c_str(), &c));
 }
 
+// Resolve intent without opening a driver. Only a genuinely empty selection
+// permits automatic probing; an explicit miss must never select another DAC.
+static bool resolve_asio_selection(const std::string& requested,
+                                   const std::vector<rta::audio::AsioDriverEntry>& drivers,
+                                   std::string& selected,std::string& error) {
+    selected.clear();error.clear();
+    if(requested.empty())return true;
+    if(is_asio_clsid(requested)){selected=requested;return true;}
+    for(const auto& entry:drivers)if(entry.name==requested&&is_asio_clsid(entry.clsid)){
+        selected=entry.clsid;return true;
+    }
+    error="指定的 ASIO 驱动不存在或标识无效："+requested+"；已拒绝自动切换到其它设备";
+    return false;
+}
+
 // ASIO：设备 id 就是驱动的 CLSID（由 /api/asiodevices 提供）；空则用第一个能开的驱动。
 class AsioSink : public OutSink {
 public:
+    ~AsioSink() override { close(); }
     bool open(const SinkOpenOpts& o, uint32_t rate, int ch, int bits) override {
-        com_ = (CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED) == S_OK || com_ == S_FALSE);
+        const HRESULT comResult=CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        com_=(comResult==S_OK||comResult==S_FALSE);
         auto list = rta::audio::asio_enum_drivers();
         if (list.empty()) { err_ = "本机没有 ASIO 驱动"; return false; }
-        std::string clsid = o.device;
+        std::string clsid;
+        if(!resolve_asio_selection(o.device,list,clsid,err_)){play_log("ASIO_SELECTION_REJECT "+err_);return false;}
         if (!is_asio_clsid(clsid)) {
-            clsid.clear();
-            for (const auto& e : list) if (e.name == o.device) { clsid = e.clsid; break; }
-        }
-        if (!is_asio_clsid(clsid)) {
-            // 设备没指定（或名字对不上）：逐个 preflight，第一个通过的就用。
+            // 只有未指定设备时逐个 preflight，第一个通过的就用。
             // 不能只看 list[0] —— 本机 [0] 是未连接的 Audient，会把真正可用的 MOTU 挡在后面，
             // 表现就是"选了 ASIO 但没声音/直接失败"（2026-10-23 现场）。
             std::string tried;
@@ -1403,11 +1433,18 @@ public:
             play_log("ASIO_PREFLIGHT_FAIL " + err_);
             return false;
         }
-        if (!drv_.open(clsid, (double)rate, ch, bits > 0 ? bits : 24, err_)) return false;
+        if (!drv_.open(clsid, (double)rate, ch, bits > 0 ? bits : 24, err_, nullptr, false, o.bufferMs)) return false;
         period_ = (size_t)drv_.buffer_size();
+        stream_.configure(false,rate,ch,&g_ps.stop);
+        opened_=true;driverClsid_=clsid;
+        play_log("ASIO_PCM_OPEN clsid="+clsid+" name=\""+jesc(drv_.name())+"\" requestedRate="+std::to_string(rate)+
+            " readbackRate="+std::to_string(drv_.sample_rate_readback())+
+            " requestedBits="+std::to_string(bits>0?bits:24)+" channels="+std::to_string(drv_.channels())+
+            " channelType="+std::to_string(drv_.channel_type(0))+" typeName="+rta::audio::asio_sample_type_name(drv_.channel_type(0))+
+            " bufferFrames="+std::to_string(period_));
         return true;
     }
-    bool start() override { std::string e; if (!drv_.start(e)) { err_ = e; return false; } return true; }
+    bool start() override { return stream_.start(); }
     size_t buffer_frames() const override { return period_ ? period_ : 1024; }
     // ★ 2026-10-29（F24）：旧实现没覆盖这个虚函数 ⟹ 基类空实现 ⟹ ASIO 后端上
     //   "播放中拖动音量"被静默忽略（返回成功、声音不变）。现在转发到驱动装箱阶段。
@@ -1416,32 +1453,108 @@ public:
     // 这样不必 stop/start 驱动（重启驱动会有咔哒声，还可能丢时钟）。
     void pause() override {}
     void resume() override {}
+    bool keep_clock_on_pause() const override {return true;}
     size_t write_one_period(const int32_t* pcm, size_t frames) override {
-        // 等环腾出空间再推（这就是节奏来源：由驱动回调的消费速度决定）
-        for (int i = 0; i < 200; ++i) {
-            if (drv_.free_frames() >= frames) {
-                const size_t w = drv_.push(pcm, frames);
-                if (w) written_ += w;
-                return w;
-            }
-            Sleep(1);
-        }
-        return 0;
+        return stream_.write(pcm,frames);
     }
+    bool drain(int,const std::atomic<bool>* =nullptr) override{return stream_.drain();}
+    bool fatal_error()const override{return stream_.failed();}
     void close() override {
+        if(opened_){
+            drv_.stop();const auto callbacks=drv_.callbacks(),underruns=drv_.underruns();opened_=false;
+            play_log("ASIO_PCM_CLOSE clsid="+driverClsid_+" callbacks="+std::to_string(callbacks)+
+                " underruns="+std::to_string(underruns)+" writtenFrames="+std::to_string(stream_.accepted_frames())+
+                " playedFrames="+std::to_string(drv_.played_units())+" buffered="+std::to_string(drv_.buffered())+
+                " eof="+(drv_.input_finished()?std::string("1"):std::string("0"))+
+                " eofSilenceCallbacks="+std::to_string(drv_.eof_silence_callbacks())+
+                " eofSilenceFrames="+std::to_string(drv_.eof_silence_units())+" drain="+stream_.drain_state());
+        }
         drv_.close();
         if (com_) { CoUninitialize(); com_ = false; }
     }
-    const std::string& last_error() const override { return err_; }
+    const std::string& last_error() const override { return stream_.last_error().empty()?err_:stream_.last_error(); }
     unsigned long long underruns() const { return drv_.underruns(); }
 private:
     rta::audio::AsioDriver drv_;
+    rta::audio::AsioBufferedStream stream_{drv_};
     size_t period_ = 1024;
-    size_t written_ = 0;
     bool com_ = false;
+    bool opened_=false;
+    std::string driverClsid_;
     std::string err_;
 };
 
+
+// 2026-11-15：PCM→DSD 的**原生 ASIO 1-bit 输出**。
+// 现有管线在 dop=true 时已经把 SDM 调制结果打包成 DoP 24-bit 帧（每帧 16 个 DSD 位）；
+// 这个 sink 把 DoP 帧里的 16 位载荷取出来、按 MSB-first 写成 2 个字节，直接推给
+// ASIO 2.3 的原生 DSD 通道。这样 PCM 升频到 DSD 不再受 DoP 载波限制（xDuoo 的
+// ASIO PCM setSampleRate 不支持 2.8224M+，但原生 DSD 通道支持 45.1584M）。
+// 注意：DoP 标记位在 bits16..23，直接丢弃；载荷 bits0..15 的 bit15 是第一个 DSD 样本，
+// 正好对应 ASIO MSB1 的 byte bit7。
+class NativeDsdSink : public OutSink {
+public:
+    ~NativeDsdSink() override { close(); }
+    bool open(const SinkOpenOpts& o, uint32_t rate, int ch, int) override {
+        const HRESULT comResult=CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        com_=(comResult==S_OK||comResult==S_FALSE);
+        if (ch <= 0) { err_ = "原生 DSD 声道数无效"; return false; }
+        ch_ = ch;
+        dsdRate_ = rate * 16u;              // rate 是 DoP 载波（DSD 位率 / 16）
+        std::string clsid = o.device;
+        if (!is_asio_clsid(clsid)) {
+            const auto list = rta::audio::asio_enum_drivers();
+            for (const auto& e : list) if (e.name == o.device) { clsid = e.clsid; break; }
+        }
+        if (!is_asio_clsid(clsid)) { err_ = "原生 DSD 需要指定 ASIO 驱动（当前设备为空或不是 CLSID）"; return false; }
+        if (!drv_.open_dsd(clsid, (double)dsdRate_, ch_, err_, nullptr, o.bufferMs)) return false;
+        const long bytes = drv_.dsd_buffer_bytes();
+        period_ = (size_t)std::max<long>(1, bytes / 2);   // 每周期承载的 DoP 帧数
+        stream_.configure(true,rate,ch_,&g_ps.stop);
+        opened_=true;driverClsid_=clsid;
+        const auto& actual=drv_.dsd_info();
+        play_log("ASIO_NATIVE_OPEN clsid="+clsid+" name=\""+jesc(drv_.name())+"\" requestedDsdRate="+std::to_string(dsdRate_)+
+            " readbackRate="+std::to_string(actual.rateReadback)+" channels="+std::to_string(drv_.channels())+
+            " channelType="+std::to_string(actual.type)+" typeName="+rta::audio::asio_sample_type_name(actual.type)+
+            " bufferBits="+std::to_string(drv_.buffer_size())+" bufferBytes="+std::to_string(bytes));
+        return true;
+    }
+    bool start() override { return stream_.start(); }
+    size_t buffer_frames() const override { return period_ ? period_ : 1024; }
+    void pause() override {}
+    void resume() override {}
+    bool keep_clock_on_pause() const override { return true; }
+    size_t write_one_period(const int32_t* pcm, size_t frames) override {
+        return stream_.write(pcm,frames);
+    }
+    bool drain(int,const std::atomic<bool>* =nullptr) override{return stream_.drain();}
+    bool fatal_error()const override{return stream_.failed();}
+    void close() override {
+        if(opened_){
+            drv_.stop();const auto callbacks=drv_.callbacks(),underruns=drv_.underruns();opened_=false;
+            play_log("ASIO_NATIVE_CLOSE clsid="+driverClsid_+" callbacks="+std::to_string(callbacks)+
+                " underruns="+std::to_string(underruns)+" pushedBytesPerChannel="+std::to_string(drv_.dsd_pushed_bytes())+
+                " playedBytesPerChannel="+std::to_string(drv_.played_units())+" buffered="+std::to_string(drv_.buffered())+
+                " eof="+(drv_.input_finished()?std::string("1"):std::string("0"))+
+                " eofSilenceCallbacks="+std::to_string(drv_.eof_silence_callbacks())+
+                " eofSilenceBytes="+std::to_string(drv_.eof_silence_units())+" drain="+stream_.drain_state());
+        }
+        drv_.close();
+        if (com_) { CoUninitialize(); com_ = false; }
+    }
+    const std::string& last_error() const override { return stream_.last_error().empty()?err_:stream_.last_error(); }
+    unsigned long long underruns() const { return drv_.underruns(); }
+private:
+    rta::audio::AsioDriver drv_;
+    rta::audio::AsioBufferedStream stream_{drv_};
+    size_t period_ = 1024;
+    uint32_t dsdRate_ = 0;
+    int ch_ = 2;
+    bool com_ = false;
+    bool opened_=false;
+    std::string driverClsid_;
+    std::string err_;
+};
 
 // 2026-11-02（用户反馈：板载声卡没开独占 ⟹ 永远不是 bit-perfect，但软件不提示）：
 //   共享 WASAPI 的采样要过 Windows 混音器（我们的 SharedSink 也没有 RAW 模式），
@@ -1474,7 +1587,11 @@ static void note_endpoint_busy(const PlayParams& p) {
              (busy > 0 ? " 仍独占（高音质优先，其他程序让路）" : ""));
 }
 
-static std::unique_ptr<OutSink> make_sink(const PlayParams& p) {
+static std::unique_ptr<OutSink> make_sink(const PlayParams& p, bool allowNativeProcessedDsd = false) {
+    // 2026-11-15：PCM→DSD 的原生 1-bit 输出。只有 PCM 处理管线（调制后）才允许，
+    // DirectSDM/DoP 回退仍走 PCM sink，避免把 DoP 载波误送进原生 DSD 通道。
+    if (allowNativeProcessedDsd && p.backend == "asio" && p.dsdNative && p.dsd >= 64)
+        return std::make_unique<NativeDsdSink>();
     // 守门（261024-01 #9）：backend=upnp 由 /api/play 直接转交投放会话，本地播放线程根本不该启动。
     // 万一将来有别的路径漏过来，也绝不能落到默认的 WasapiSink —— 那会真的接管本机声卡。
     if (p.backend == "upnp")           return std::make_unique<NullSink>();
@@ -1509,6 +1626,7 @@ static bool upnp_is_dsd_file(const std::string& file) {
 // 把一条曲目交给投放会话。切歌 / 重播都走这里：先停旧会话再起新会话
 //（CastManager 同一时刻只允许一条会话）。失败原因原样返回，界面直接显示，不假装成功。
 static bool upnp_start_track(const PlayParams& p, const std::string& file, std::string& err) {
+    if (p.crossfeed || p.dacBits > 0) {err="UPnP 投放暂不支持耳机交叉馈送或 DAC 有效位深；请关闭这两项后投放";return false;}
     if (rta_net_tests_disabled() && !cast_dev_is_loopback(p.upnpDev)) {err="测试模式已禁用非回环网络投放（RTA_NET_TESTS=0）";return false;}
     if (p.cueStart >= 0.0 || p.cueEnd >= 0.0) {err="UPnP 暂不支持 CUE 分轨；拒绝播放整个镜像";return false;}
     if (p.upnpDev.empty()) {
@@ -1639,6 +1757,8 @@ static std::vector<std::string> raw_dsd_processing(const PlayParams& p,
     if (p.roomCorrAuto) proc.push_back("自动房间校正");
     if (p.isp) proc.push_back("峰值保护");
     if (p.loudness) proc.push_back("等响度补偿");
+    if (p.crossfeed) proc.push_back("耳机交叉馈送");
+    if (p.dacBits > 0) proc.push_back("DAC 有效位深");
     if (p.cleanup) proc.push_back("录音噪声清理");
     for (int i = 0; i < 8; ++i) {
         if (p.trim[i] != 0.0) { proc.push_back("每声道增益"); break; }
@@ -1711,6 +1831,23 @@ static bool native_dsd_precheck(const PlayParams& p, std::string& why,
         why = "本设备原生 DSD 无法按请求的档位输出：" + br.why +
               "。可用的替代：①把「采样率」改成「跟随源」（设置 → 输出 → 采样率；等价写法 src / follow）"
               "按源位率直通；②改用 DoP 封装（PCM 载波，DSD 源照样会经 SDM 调制到目标档）。";
+        return false;
+    }
+    return true;
+}
+
+// 2026-11-15：PCM 源的原生 DSD（先经 SDM 调制，再把 1-bit 直送 ASIO）。
+// 与 DSD 源的 DirectSDM 不同：PCM 源本来就要过完整 DSP 链，所以音量/EQ/升频都允许；
+// 只要求后端 ASIO 且目标档位有效。
+static bool native_processed_dsd_precheck(const PlayParams& p, std::string& why) {
+    const std::string be = p.backend.empty() ? std::string("wasapi") : p.backend;
+    if (be != "asio") {
+        why = "PCM→原生 DSD 只能走 ASIO 后端（ASIO 2.3 的 1-bit IoFormat 通道）：当前后端是「" + be +
+              "」。WASAPI 没有 1-bit 通道；想用 WASAPI 请把封装改回 DoP。";
+        return false;
+    }
+    if (p.dsd < 64 || p.dsd > 1024) {
+        why = "PCM→原生 DSD 需要目标档位 DSD64…DSD1024：当前 dsd=" + std::to_string(p.dsd) + "。";
         return false;
     }
     return true;
@@ -1876,6 +2013,7 @@ static bool play_one_direct(const std::string& file, const PlayParams& p,
         }
 
         ps.outRate = carrier;
+        ps.timelineRate = carrier;
         ps.outBits = 24;
         set_dsd_out_state("dop", (srcRate % 48000u == 0) ? (int)(srcRate / 48000u) : (int)(srcRate / 44100u),
                           srcRate, std::string(), 0, opts.fallbackNote);
@@ -2177,8 +2315,13 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
     g_dbgClip.store(0);
     ps.dbgPad.store(0);
     ps.dbgSkips.store(0);
-    RtTune rt = rta::audio::apply_playback_tuning();
-    struct RtGuard { RtTune* t; ~RtGuard() { rta::audio::release_playback_tuning(*t); } } rtg{ &rt };
+    // 原生 DSD 写入线程是纯内存拷贝循环，实测 MMCSS Pro Audio + TIME_CRITICAL +
+    // 单核亲和反而让它每 90 秒丢掉约 40 个回调（rtaplay 不调这些，120 秒 ur=1）。
+    // 这里只保留 1 ms 定时器，调度交给 Windows；如果以后需要 MMCSS，必须单独
+    // 用 1 小时长曲复测，不能凭 PCM 路径的经验套过来。
+    RtTune rt;
+    timeBeginPeriod(1);
+    struct RtGuard { ~RtGuard() { timeEndPeriod(1); } } rtg;
 
     // ASIO 驱动是 COM 对象，必须在**本线程**初始化（播放线程 ≠ HTTP 线程）
     const bool comOk = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
@@ -2377,7 +2520,7 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
         for (const auto& e : cands) {
             lastDrv = e.name;
             std::string err;
-            if (drv.open_dsd(e.clsid, (double)srcRate, ch, err)) { opened = true; break; }
+            if (drv.open_dsd(e.clsid, (double)srcRate, ch, err, nullptr, p.bufferMs)) { opened = true; break; }
             play_log("NATIVE_DSD_OPEN_FAIL driver=" + e.name + " rate=" + std::to_string(srcRate) +
                      " ch=" + std::to_string(ch) + " err=" + err);
             openErr += (openErr.empty() ? std::string() : "；") + e.name + "：" + err;
@@ -2440,6 +2583,7 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
 
         ps.outRate = srcRate;
         ps.outBits = 1;
+        ps.timelineRate = srcRate;
         // Native describes the transport; rate conversion still uses a modulator.
         // Report its actual order instead of labelling converted audio bit-perfect.
         set_dsd_out_state("native",
@@ -2470,14 +2614,17 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
                     inter[i * (size_t)ch + (size_t)c] = (b < byteEnd) ? src.data[(size_t)c][b] : 0x69;
             }
         };
-        while (cursor < byteEnd && drv.free_frames() >= (size_t)period) {
+        while (cursor < byteEnd) {
+            const size_t freeNow = drv.free_frames();
+            if (!freeNow) break;
             if (p.workbenchResume >= 0.0 && p.workbenchPaused) {
-                const size_t w = drv.push_dsd(zeros.data(), (size_t)period);
+                const size_t n0 = std::min<size_t>((size_t)period, freeNow);
+                const size_t w = drv.push_dsd(zeros.data(), n0);
                 if (!w) break;
                 padPushed += w;
                 continue;
             }
-            const size_t n = std::min<size_t>((size_t)period, byteEnd - cursor);
+            const size_t n = std::min<size_t>(std::min<size_t>((size_t)period, freeNow), byteEnd - cursor);
             fill(n);
             const size_t w = drv.push_dsd(inter.data(), n);
             if (!w) break;
@@ -2489,21 +2636,6 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
         // 本机 AudioByte 实测：DSD 会话的 start() 会间歇性失败（同参数前一次成功、后一次
         // "驱动拒绝启动"）。createBuffers 已 ASE_OK ⟹ 不是参数问题，3 次递增间隔重试，
         // 三次都失败才回落 DoP（回落要写明原因，不许静默）。
-        bool started = false;
-        std::string serr;
-        for (int attempt = 1; attempt <= 3 && !started; ++attempt) {
-            started = drv.start(serr);
-            if (!started) {
-                play_log("NATIVE_DSD_START_FAIL attempt=" + std::to_string(attempt) + "/3 driver=" +
-                         drv.name() + " err=" + serr);
-                if (attempt < 3) Sleep((DWORD)(400 * attempt));
-            }
-        }
-        if (!started) return dop_fallback("原生 DSD 启动失败（重试 3 次：" + serr + "）", drv.name());
-        // 进 /api/dbg（界面 DEBUG 面板）—— 真机取证时不用去翻 exe 目录的日志文件
-        dlog("NATIVE_DSD START driver=" + drvName + " type=" + std::to_string((long)di.type) +
-             " dsdRate=" + std::to_string(srcRate) + " writeBytes=" + std::to_string(di.writeBytes));
-
         // 信号链快照：源 → ASIO 原生 DSD → 设备。字段名与 UI（src/net/ui_script.h）约定：
         //   dsdNative=true / dsdNativeType=MSB1|LSB1 / dsdNativeRate=DSD 位率 / dsdFallback=""。
         {
@@ -2566,10 +2698,33 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
                                         : "Native DSD：1-bit 流直送 ASIO（不经 PCM / DoP 封装），逐位一致";
         }
 
+        // ★ 2026-11-15：start() 必须放在日志/元数据/信号链之后。
+        //   旧顺序是 prefill → start → play_log/meta_on_play/signal（可达数百 ms），
+        //   驱动在元数据期间把 4 周期环抽空 ⟹ 全曲 ur=527。现在环灌满后先做这些准备，
+        //   最后才 start，回调一开始就有数据。
+        bool started = false;
+        std::string serr;
+        for (int attempt = 1; attempt <= 3 && !started; ++attempt) {
+            started = drv.start(serr);
+            if (!started) {
+                play_log("NATIVE_DSD_START_FAIL attempt=" + std::to_string(attempt) + "/3 driver=" +
+                         drv.name() + " err=" + serr);
+                if (attempt < 3) Sleep((DWORD)(400 * attempt));
+            }
+        }
+        if (!started) return dop_fallback("原生 DSD 启动失败（重试 3 次：" + serr + "）", drv.name());
+        dlog("NATIVE_DSD START driver=" + drvName + " type=" + std::to_string((long)di.type) +
+             " dsdRate=" + std::to_string(srcRate) + " writeBytes=" + std::to_string(di.writeBytes));
+
         bool pausedNow = false, segmentEnded=false;
         if (p.workbenchResume >= 0.0) ps.workbenchReady.store(true);
+        // 段信息在整曲内不变：旧实现每 1 ms 调一次 for_track（加锁/构造字符串），
+        // 实测把 DSD64 的写入吞吐拖慢约 9%，90 秒后环被抽空 ⟹ 全曲 798 次欠载。
+        const auto segment = g_segment.for_track(file, p.cueStart, p.cueEnd, p.queueIndex);
+        const size_t segmentEnd = segment.enabled
+            ? byteBegin + std::min(byteEnd - byteBegin, segment.end_frame(srcRate / 8.0))
+            : byteEnd;
         auto lastProgress = std::chrono::steady_clock::now();
-        auto lastLog = std::chrono::steady_clock::now();
         const auto tPlay0 = std::chrono::steady_clock::now();
 
         while (!ps.stop.load()) {
@@ -2583,7 +2738,8 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
                 // 暂停时不写数据会让驱动反复欠载，把"0 欠载"的证据变脏。
                 // Balanced 0x69 keeps the DSD clock running at zero mean;
                 // all-zero bytes would represent full-scale negative DC.
-                if (drv.free_frames() >= (size_t)period) padPushed += drv.push_dsd(zeros.data(), (size_t)period);
+                const size_t freeNow = drv.free_frames();
+                if (freeNow) padPushed += drv.push_dsd(zeros.data(), std::min<size_t>((size_t)period, freeNow));
                 lastProgress = std::chrono::steady_clock::now();
                 Sleep(2);
                 continue;
@@ -2609,8 +2765,6 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
                 lastProgress = std::chrono::steady_clock::now();
                 continue;
             }
-            const auto segment=g_segment.for_track(file,p.cueStart,p.cueEnd,p.queueIndex);
-            const size_t segmentEnd=segment.enabled?byteBegin+std::min(byteEnd-byteBegin,segment.end_frame(srcRate/8.0)):byteEnd;
             if(segment.enabled&&cursor>=segmentEnd){
                 if(segment.repeat)ps.seekReq.store(segment.start*(srcRate/8.0)/(double)(byteEnd-byteBegin));
                 else{segmentEnded=true;ps.pauseReq.store(true);}
@@ -2618,7 +2772,8 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
             }
             if(cursor>=byteEnd)break;
             bool progressed = false;
-            while (cursor < segmentEnd && drv.free_frames() >= (size_t)period) {
+            while (cursor < segmentEnd) {
+                if (drv.free_frames() < (size_t)period) break;
                 const size_t n = std::min<size_t>((size_t)period, segmentEnd - cursor);
                 fill(n);
                 const size_t w = drv.push_dsd(inter.data(), n);
@@ -2641,14 +2796,9 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
                 { std::lock_guard<std::mutex> lk(ps.mtx); ps.error = b; }
                 break;
             }
-            if (std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(5)) {
-                lastLog = std::chrono::steady_clock::now();
-                std::ostringstream ls;
-                ls << "STAT pos=" << (double)drv.dsd_pushed_bytes() * 8.0 / (double)srcRate
-                   << " rate=" << srcRate << " pad=" << ps.dbgPad.load()
-                   << " peak=0 clip=0 fpeak=0 w0=" << g_dbgW0.load() << " wr=" << g_dbgWr.load();
-                play_log(ls.str());
-            }
+            // ★ 2026-11-15：这里**不能**每 5 秒写 play_log。实测 180 秒 34 次欠载，
+            //   与 36 条 STAT 日志一一对应：文件 I/O 让写入线程错过一个 46 ms 回调。
+            //   位置/欠载由 /api/status 与收尾的 NATIVE_DSD OK 提供，不再从音频线程落盘。
             Sleep(1);
         }
 
@@ -2660,14 +2810,15 @@ static bool play_one_native_dsd(const std::string& file, const PlayParams& p) {
             const auto tTail = std::chrono::steady_clock::now();
             while (std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - tTail).count() < tailMs + 20.0) {
-                if (drv.free_frames() >= (size_t)period) padPushed += drv.push_dsd(zeros.data(), (size_t)period);
+                const size_t freeNow = drv.free_frames();
+                if (freeNow) padPushed += drv.push_dsd(zeros.data(), std::min<size_t>((size_t)period, freeNow));
                 Sleep(1);
             }
         }
+        drv.stop();
         const unsigned long long cb = drv.callbacks();
         const unsigned long long ur = drv.underruns();
         const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - tPlay0).count();
-        drv.stop();
         drv.close();
         ps.paused.store(false);
 
@@ -3320,6 +3471,7 @@ static std::string preset_apply_json(const std::string& path) {
         kv["isp"]        = (prof == PresetProfile::BitPerfect) ? "0" : "1";
     }
     if(prof==PresetProfile::BitPerfect) {
+        kv["crossfeed"]="0";kv["dacbits"]="0";
         kv["roomcorrauto"]="0";kv["cleanup"]="0";kv["upnpUpsample"]="0";kv["upnpForceRate"]="0";kv["rgmode"]="off";
         if(!g_peq)peq_load_current();
         auto peq=g_peq->settings();peq.bypass=true;
@@ -3576,19 +3728,35 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
     // 每次本地播放先复位"输出格式自证"字段：不复位的话 /api/status 会把上一曲的 outMode 当成本次事实
     // （与 ps.gpu 每曲复位同一个教训，见 261024-04 #8）。真正走 DSD 的分支会重新写。
     set_dsd_out_state("pcm", 0, 0, std::string(), 0, std::string());
+    ps.quantizationBits.store(0);ps.crossfeedUsed.store(false);
+    ps.pcmObserved.store(false);ps.pcmShaper.store((int)rta::dsp::Shaper::None);ps.volumeDbObserved.store(p.volume);
     // ---- Native DSD（ASIO 原生 1-bit）：单独一条路径，与 DoP 完全分开 ----
     // 参数门不满足 ⟹ **明确报错**（绝不静默退回 DoP）：用户选了 Native 却听到 DoP，
     // 本身就是一条会被误判成"成功"的假链路。
     if (p.dsdNative) {
+        const std::string ext = lowerExt(file);
+        const bool dsdSource = (ext == ".dsf" || ext == ".dff");
+        if (dsdSource) {
+            std::string why;
+            if (!claim_raw_dsd_volume(p, nullptr, why)) {
+                play_log("PLAY_REJECT dsdnative=1 " + why);
+                dlog(std::string("PLAY_REJECT dsdnative=1 ") + why);
+                std::lock_guard<std::mutex> lk(ps.mtx);
+                ps.error = "Native DSD 参数不满足：" + why;
+                return false;
+            }
+            return play_one_native_dsd(file, p);
+        }
+        // PCM 源：不直通 1-bit，而是先过完整 PCM/DSP 链 + SDM 调制，再由 NativeDsdSink
+        // 把调制后的 1-bit 直送 ASIO。音量/EQ/升频都允许，所以不能走 claim_raw_dsd_volume。
         std::string why;
-        if (!claim_raw_dsd_volume(p, nullptr, why)) {
+        if (!native_processed_dsd_precheck(p, why)) {
             play_log("PLAY_REJECT dsdnative=1 " + why);
             dlog(std::string("PLAY_REJECT dsdnative=1 ") + why);
             std::lock_guard<std::mutex> lk(ps.mtx);
-            ps.error = "Native DSD 参数不满足：" + why;
+            ps.error = "PCM→原生 DSD 参数不满足：" + why;
             return false;
         }
-        return play_one_native_dsd(file, p);
     }
     // ---- DirectSDM 判定：必须在解码之前（DSD256 整曲解成 PCM 要几百 MB）----
     // 不满足条件时把原因带到信号链里（不能只写 ps.info —— 紧接着 read_any 会覆盖它）
@@ -3833,6 +4001,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
         dlog("stage gpu-ok");
 
         eng::PipelineConfig cfg;
+        cfg.crossfeed.enabled=p.crossfeed;cfg.crossfeed.cutoffHz=p.crossfeedFreq;cfg.crossfeed.levelDb=p.crossfeedLevelDb;
+        cfg.pcmValidBits=p.dacBits;
         cfg.recordingCleanup.enabled=p.cleanup;cfg.recordingCleanup.strength=p.cleanupStrength;cfg.recordingCleanup.noiseFloorDbfs=p.cleanupNoiseDb;
         cfg.recordingCleanup.noiseMode=p.cleanupAuto?rta::dsp::RecordingCleanupNoiseMode::Auto:rta::dsp::RecordingCleanupNoiseMode::Manual;
         // 先声明：下面的 ReplayGain 判定要写 cfg.replayGainDb
@@ -3982,14 +4152,6 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
         const bool rateAuto = (p.rate == "max" || p.rate == "src" || p.rate.empty() ||
                                p.rate == "follow");
 
-        // 自动抖动：按输出位深选型（16 bit 用 NS9，24 bit 用 LNS15，更高位深不整形）
-        if (p.shaper == "auto") {
-            const int ob = cfg.outBits ? cfg.outBits : in.bits;
-            cfg.shaper = (ob <= 16) ? rta::dsp::Shaper::NS9
-                       : (ob <= 24) ? rta::dsp::Shaper::LNS15
-                                    : rta::dsp::Shaper::None;
-        }
-
         // 过采样峰值（ISP）检测：逐块扫描（4 相 × 8 抽头）。
         // ★ 旧实现把整曲铺成 double 平面（2 声道 × 8 字节 × 帧数）：384 s DSD64 就是 1034 MB，
         //   而且 detect_isp 全曲扫描要 2887 ms —— 这正是"点播放后 7 秒没声音"的一半原因。
@@ -4075,7 +4237,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
             // 自证（261025-02 #2）：**PCM 源同样走这里** —— dsd>=64 就是"要 DSD 输出"，
             // 与源是 PCM 还是 DSD 无关（PCM 源由 SdmModulator 调制出 1-bit 再装箱）。
             // 模块构造前实际阶数尚未确认；请求值保留在 signal 快照中，不能冒充实际值。
-            set_dsd_out_state("dop", p.dsd, dsdRate,
+            set_dsd_out_state(p.dsdNative ? "native" : "dop", p.dsd, dsdRate,
                               p.modFamily.empty() ? std::string("dsd") : p.modFamily,
                               0, directNote);
         }
@@ -4239,12 +4401,6 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
                     bitNote = bitNote.empty() ? bn : (bitNote + "；" + bn);
                 }
                 cfg.outBits = effBits;
-                if (p.shaper == "auto") {
-                    // 位深变了，自动抖动选型跟着变（16→NS9，24→LNS15，更高不整形）
-                    cfg.shaper = (cfg.outBits <= 16) ? rta::dsp::Shaper::NS9
-                               : (cfg.outBits <= 24) ? rta::dsp::Shaper::LNS15
-                                                     : rta::dsp::Shaper::None;
-                }
             }
         }
 
@@ -4298,6 +4454,16 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
                 appendNote(decision.reason);
             play_log("RATE_POLICY mode=" + p.rateFamilyPolicy + " input=" + std::to_string(in.rate) +
                      " output=" + std::to_string(finalRate) + " cross=" + (decision.crossFamily ? "1" : "0"));
+        }
+
+        // Resolve only after exclusive fallback and shared-mode rate selection.
+        // DSD has its own final one-bit quantizer; PCM dither must remain disabled.
+        if (!dop && p.shaper == "auto") {
+            cfg.pcmAutoDither=true;
+            const int containerBits=cfg.outBits ? cfg.outBits : in.bits;
+            const int validBits=p.dacBits>0?std::min(p.dacBits,containerBits):containerBits;
+            cfg.shaper = rta::dsp::auto_pcm_shaper(validBits,
+                                                cfg.outRate ? cfg.outRate : in.rate);
         }
 
         // 滤波器：1x 与 Nx 可以分开选（HQPlayer 的标准做法：
@@ -4415,6 +4581,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
         // 既会 OOM，VirtualLock 整块更会把系统拖死。分块后内存恒定在几秒量级，
         // 起播延迟也从「整曲处理时间」降到「一块的处理时间」。
         rta::render::RenderQ RQ;
+        if(!dop)RQ.cap=3; // Keep PCM controls responsive now that gain precedes final quantization.
 
         // outRate = 管线输出（DSD 时是 DSD 速率）；deviceRate = 设备真正打开的采样率
         // （DSD 时是 DoP 载波 = DSD/16）
@@ -4452,6 +4619,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
                  " auto=" + (p.roomCorrAuto ? "1" : "0") +
                  (rcAuto.why.empty() ? std::string() : (" why=" + rcAuto.why)));
         const int      outBits  = cfg.outBits ? cfg.outBits : 24;   // 跟随设置里的输出位深
+        const int quantizationBits=dop?0:(p.dacBits>0?std::min(p.dacBits,outBits):outBits);
+        if(dop && p.dacBits>0)appendNote("DAC 有效位深仅用于 PCM 输出；本次 DSD 调制不进行 PCM 二次量化");
         // 2026-10-24（261024-02 #8）：bit-perfect 的"位深降低"必须用**源文件真实位深**（p.srcBits，由界面从
         // 元数据带下来）。解码器容器位深（flac 恒为 32）会把 16bit 源 → 24bit 输出误判成"位深降低"。
         const int srcBitsEff = p.srcBits > 0 ? p.srcBits
@@ -4477,7 +4646,11 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
         // ★ CUE 分轨：总长按**本区间**（srcCount）算，不是整轨 —— 否则 /api/status 的 dur 与
         //   进度条都会是"整轨"的（实测会看到 dur=10s 而实际只播 4s）。
         const size_t   totalOut = (size_t)((double)srcCount * (double)deviceRate / (double)in.rate + 0.5);
-        ps.outRate = deviceRate; ps.outBits = outBits;
+        // 原生 PCM→DSD：对外报告真实 DSD 位率与 1-bit，而不是 DoP 载波/24-bit 容器。
+        // 内部 render_loop 仍按载波率计时（每个 DoP 帧 = 16 个 DSD 位），两者不能混。
+        ps.outRate = (dop && p.dsdNative) ? dsdRate : deviceRate;
+        ps.outBits = (dop && p.dsdNative) ? 1 : outBits;
+        ps.timelineRate = deviceRate;   // DoP/原生处理：total/played 是载波帧
         ps.total.store(totalOut);
 
         // 实际端点名称/id：信号链 JSON 与 RENDERFAIL 遥测共用同一来源（HF-02 + 本轮事故归因）
@@ -4507,6 +4680,10 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
             pipeBP  = probe.willBeBitPerfect(in);
             pipePad = probe.willBeZeroPad(in);
         }
+        if(!dop)play_log("PCM_SHAPER requested="+p.shaper+" resolved="+
+            rta::dsp::shaper_name((pipeBP||pipePad)?rta::dsp::Shaper::None:cfg.shaper)+
+            " rate="+std::to_string(outRate)+" bits="+std::to_string(quantizationBits)+
+            " containerBits="+std::to_string(outBits)+" dacBitsRequested="+std::to_string(p.dacBits));
         // 结论与原因**只在这里算一次**：信号链 JSON 与 /api/status 的 ps.bpState/bpWhy
         // 都引用它，两处口径不可能再漂移（这正是 F21 要修的东西）。
         const std::string bpState = [&]() -> std::string {
@@ -4544,6 +4721,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
             if (outRate != in.rate) why.push_back("重采样 " + std::to_string(in.rate) + "→" + std::to_string(outRate) + " Hz");
             if (cfg.volumeEnabled && std::fabs(cfg.volumeDb) > 1e-9) why.push_back("音量 " + std::to_string((int)std::lround(cfg.volumeDb)) + " dB");
             if (cfg.shaper != rta::dsp::Shaper::None) why.push_back("抖动/整形");
+            if (cfg.crossfeed.enabled) why.push_back("耳机交叉馈送");
+            if (!dop && p.dacBits>0) why.push_back("DAC 有效位深 "+std::to_string(quantizationBits)+" bit");
             if (std::fabs(cfg.replayGainDb) > 1e-9)
                 why.push_back("ReplayGain " + std::to_string((int)std::lround(cfg.replayGainDb)) + " dB");
             if (cfg.loudnessEnabled &&
@@ -4572,7 +4751,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
             if (eqLoaded) why.push_back("EQ");
             if (convLoaded) why.push_back("IR 卷积");
             if (rcAuto.applied) why.push_back("房间校正（" + rcAuto.file + "）");
-            if (dop) why.push_back("DoP 载波");
+            if (dop) why.push_back(p.dsdNative ? "PCM→DSD 原生 1-bit（经 SDM 调制）" : "DoP 载波");
             if (srcBitsEff > 0 && outBits > 0 && outBits < srcBitsEff) why.push_back("位深降低");
             // ★ 2026-10-30：补上三种以前落进「未归类」的情况。
             //   实测（2026-10-29 用户 mp3）：结论 "非直通" 而原因空 ⟹ 界面写「原因未归类」，
@@ -4623,6 +4802,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
             << ",\"crossFamilyPcm\":" << (!dop && rta::audio::validate_pcm_rate(
                    in.rate, outRate, false, rta::audio::RateFamilyPolicy::Compatible).crossFamily ? "true" : "false")
             << ",\"outBits\":" << outBits
+            << ",\"dacBitsRequested\":" << p.dacBits
             << ",\"outCh\":" << outCh
             << ",\"device\":\"" << jesc(dev) << "\""
             << ",\"deviceId\":\"" << jesc(devId) << "\""
@@ -4641,9 +4821,12 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
                 << ",\"gpuAvailable\":" << (rta::dsp::GpuBridge::instance().available() ? "true" : "false")
                 << ",\"phase\":\"" << (cfg.filterPhase == rta::dsp::PhaseKind::Minimum ? "最小相位"
                                   : (cfg.filterPhase == rta::dsp::PhaseKind::Intermediate ? "混合相位" : "线性相位")) << "\""
-                << ",\"shaper\":\"" << jesc(p.shaper == "auto" ? std::string(rta::dsp::shaper_name(cfg.shaper))
-                                                          : (p.shaper.empty() ? std::string("none") : p.shaper)) << "\""
+                << ",\"shaperRequested\":\"" << jesc(p.shaper) << "\""
+                << ",\"shaper\":\"" << (dop?"none":"") << "\""
                 << ",\"cleanupRequested\":" << (p.cleanup?"true":"false")
+                << ",\"crossfeedRequested\":" << (p.crossfeed?"true":"false")
+                << ",\"crossfeedFreq\":" << p.crossfeedFreq
+                << ",\"crossfeedLevelDb\":" << p.crossfeedLevelDb
                 << ",\"cleanupAuto\":" << (p.cleanupAuto?"true":"false")
                 << ",\"cleanupStrength\":" << p.cleanupStrength
                 << ",\"cleanupNoiseDb\":" << p.cleanupNoiseDb
@@ -4655,6 +4838,10 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
                 << ",\"dsdPassband\":" << dsdPassbandHz
                 << ",\"dsd\":" << (dop ? p.dsd : 0)
                 << ",\"dsdRate\":" << (dop ? dsdRate : 0)
+                // 2026-11-15：PCM→DSD 的原生 1-bit 输出（调制后直接进 ASIO DSD 通道，
+                // 不是 DoP 载波）。direct DSD 源走 play_one_native_dsd，不在这个 JSON 里。
+                << ",\"dsdNative\":" << ((dop && p.dsdNative) ? "true" : "false")
+                << ",\"dsdNativeMode\":\"" << ((dop && p.dsdNative) ? "processed-asio-1bit" : "") << "\""
                 << ",\"modFamily\":\"" << jesc(p.modFamily.empty() ? std::string("dsd") : p.modFamily) << "\""
                  << ",\"modOrder\":" << (dop ? (p.modOrder > 0 ? p.modOrder : 5) : 0)
                 << ",\"modOrderRequested\":" << (dop ? (p.modOrder > 0 ? p.modOrder : 5) : 0)
@@ -4756,11 +4943,14 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
         ps.startDb.store(p.volume);
         dlog("stage sig-ok");
         // Live volume belongs to the session, not this track's preparation.
-        // startDb is the pipeline baseline; the renderer applies live-startDb.
+        // PCM and DSD both consume live volume before their final quantizer.
         // Resetting live here would undo a slider change during preparation.
 
+        // Only the producer writes these. Read after join, once the sink is
+        // stopped: a slow filesystem must never delay EOF publication/audio.
+        std::string producerDrainLog,producerDopEofLog;
         std::thread prod([&]() {
-            const size_t kChunk = 4096;
+            const size_t kChunk = dop ? 4096u : std::clamp<size_t>(in.rate/50u,256u,4096u);
             uint64_t myEpoch = RQ.epoch.load();
             auto pl = std::make_unique<eng::Pipeline>(cfg);
             // ---- CUE 分轨（2026-10-25）：生产者在 [srcBase, srcBase+srcCount) 里跑 ----
@@ -4805,7 +4995,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
                         play_log("MOD_LEVELS_CLAMPED " + mods[0]->levels_clamp_reason());
                         modNote += " " + mods[0]->levels_clamp_reason();
                     }
-                    set_dsd_out_state("dop", p.dsd, dsdRate,
+                    set_dsd_out_state(p.dsdNative ? "native" : "dop", p.dsd, dsdRate,
                                       p.modFamily.empty() ? std::string("dsd") : p.modFamily,
                                       mods[0]->effectiveOrder(), modNote);
                 }
@@ -4876,6 +5066,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
             };
             for (;;) {
               try {
+                producerDrainLog.clear();producerDopEofLog.clear();
+                RQ.producerStage.store("source");
                 for (;;) {
                     if (RQ.abort.load()) break;
                     const auto [sf, requestedEpoch] = RQ.consume_seek();
@@ -4932,8 +5124,8 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
                     // ★ 2026-10-29（F04）：DoP/DSD 的实时音量在这里（调制之前的 PCM 域）。
                     //   render_loop 对 DoP 会跳过 sink 层增益（那会改坏 DoP marker），
                     //   所以这条是 DSD 播放中拖动音量的唯一生效路径。
-                    if (dop) pl->set_volume_db(ps.volDb.load());
-                    else pl->set_loudness_volume_db(ps.volDb.load());
+                    const double appliedVolumeDb=ps.volDb.load();
+                    pl->set_volume_db(appliedVolumeDb);
                     eng::PipelineStats pst;
                     std::vector<std::vector<double>> dsdPlanes;
                     AudioBuffer o = pl->process(c, &pst, dop ? &dsdPlanes : nullptr);
@@ -4955,7 +5147,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
                         //   总时长仍等于源时长，且末尾内容不丢。
                         const double latF = pl->algorithmic_latency_out_frames();
                         drainLeft = (size_t)(latF + 0.5);
-                        tailOut = (size_t)std::ceil(pl->convolution_tail_out_frames()+pl->recording_cleanup_tail_out_frames());
+                        tailOut = (size_t)std::ceil(pl->convolution_tail_out_frames()+pl->recording_cleanup_tail_out_frames()+pl->crossfeed_tail_out_frames());
                         resamplerTail = (size_t)std::ceil(pl->resampler_tail_out_frames());
                         ps.tailOut.store(tailOut);
                         if (drainLeft > 0) {
@@ -4969,6 +5161,36 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
                                      std::to_string(pst.maxIrLength) + "）：不截断混响衰减 file=" + file);
                     }
                     ps.cleanupObserved.store(true);ps.cleanupUsed.store(pst.usedRecordingCleanup);
+                    ps.crossfeedUsed.store(pst.usedCrossfeed);ps.quantizationBits.store(quantizationBits);
+                    ps.pcmShaper.store((int)pst.pcmShaper);ps.volumeDbObserved.store(pst.volumeDbObserved);ps.pcmObserved.store(!dop);
+                    if(!dop) {
+                        std::vector<std::string> reasons;
+                        const bool shared=g_outShared.load();
+                        const bool transparent=(pst.bitPerfect||pst.zeroPad)&&!shared;
+                        if(shared)reasons.push_back("WASAPI 共享输出经 Windows 混音器");
+                        if(pst.usedResample)reasons.push_back("重采样");
+                        if(pst.usedVolume)reasons.push_back("音量目标 "+std::to_string(pst.volumeDbObserved)+" dB（量化前渐变）");
+                        if(pst.pcmShaper!=rta::dsp::Shaper::None)reasons.push_back("抖动/整形 "+std::string(rta::dsp::shaper_name(pst.pcmShaper)));
+                        if(pst.usedCrossfeed)reasons.push_back("耳机交叉馈送");
+                        if(pst.usedLoudness)reasons.push_back("等响度补偿");
+                        if(pst.usedReplayGain)reasons.push_back("ReplayGain");
+                        if(pst.usedPeq)reasons.push_back("PEQ");
+                        if(pst.usedEq)reasons.push_back("EQ");
+                        if(pst.usedConvolution)reasons.push_back("IR 卷积");
+                        if(pst.usedMatrix)reasons.push_back("Matrix 路由");
+                        if(pst.usedChannelGain)reasons.push_back("声道增益");
+                        if(pst.usedDelay)reasons.push_back("声道延迟");
+                        if(pst.usedRecordingCleanup)reasons.push_back("录音噪声清理");
+                        if(std::fabs(cfg.preAttenDb)>1e-9)reasons.push_back("峰值预衰减");
+                        if(p.dacBits>0)reasons.push_back("DAC 有效位深 "+std::to_string(quantizationBits)+" bit");
+                        if(srcBitsEff>quantizationBits)reasons.push_back("位深降低");
+                        std::string reason;
+                        for(const auto& item:reasons){if(!reason.empty())reason+="、";reason+=item;}
+                        if(transparent)reason=srcLossy?"有损源，当前 PCM 链路未额外处理":pst.zeroPad?"整数 PCM 无损展宽":"整数 PCM 逐位一致";
+                        else if(reason.empty())reason="PCM 数值格式转换";
+                        std::lock_guard<std::mutex> lock(ps.mtx);
+                        ps.bpState=transparent?(srcLossy?"lossy":"yes"):"no";ps.bpWhy=reason;
+                    }
                     ps.cleanupMeanDb.store(pst.cleanupMeanReductionDb);ps.cleanupModifiedFraction.store(pst.cleanupModifiedBinFraction);
                     {const auto snap=cleanup_auto_snapshot(pst,pst.usedRecordingCleanup);
                      std::lock_guard<std::mutex> lock(ps.cleanupAutoMutex);ps.cleanupAuto=snap;}
@@ -4993,6 +5215,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
                 //   ★ 音质准则：排空量 = 延迟 D + 卷积尾部（IR 抽头数 − 1）。
                 //     只排 D 会把混响整段切掉；排 D + 尾部 才是"源 ⊗ IR"的完整输出。
                 const size_t drainTotal = drainLeft + tailOut + resamplerTail;
+                RQ.producerStage.store("drain");
                 if (!RQ.abort.load() && drainTotal > 0) {
                     size_t drained = 0;
                     while (drained < drainTotal && !RQ.abort.load()) {
@@ -5015,25 +5238,28 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
                         if (!emitted) break;
                         drained += take;
                     }
-                    if (drained > 0)
-                        play_log("DSP_DRAIN 末尾排空 " + std::to_string(drained) +
+                    if (drained > 0) {
+                        producerDrainLog="DSP_DRAIN 末尾排空 " + std::to_string(drained) +
                                  " 帧（算法延迟 " + std::to_string(drainLeft) +
                                  " + 卷积尾部 " + std::to_string(tailOut) +
-                                 " + 重采样自然尾 " + std::to_string(resamplerTail) + "）");
+                                 " + 重采样自然尾 " + std::to_string(resamplerTail) + "）";
+                    }
                 }
+                RQ.producerStage.store("dop-eof");
                 if (dop && !RQ.abort.load()) {
                     if (!flushDop()) throw std::runtime_error("DoP EOF aborted");
                     const size_t pending = dopAsync.pending_bits();
                     if (!emit(AudioBuffer{}, {}, true) || !flushDop())
                         throw std::runtime_error("DoP EOF aborted");
-                    play_log("DOP_EOF carryBits=" + std::to_string(pending) +
-                             " paddedBits=" + std::to_string(pending ? 16 - pending : 0));
+                    producerDopEofLog="DOP_EOF carryBits=" + std::to_string(pending) +
+                             " paddedBits=" + std::to_string(pending ? 16 - pending : 0);
                 }
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lk(RQ.mtx); RQ.err = e.what(); RQ.error = true;
             } catch (...) {
                 std::lock_guard<std::mutex> lk(RQ.mtx); RQ.err = "未知异常"; RQ.error = true;
             }
+              RQ.producerStage.store("publish-eof");
               if(!RQ.wait_after_eof(myEpoch))break;
             }
         });
@@ -5064,7 +5290,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
         // 输出后端：WASAPI 独占 / 共享 / ASIO / NAA / Null，由 make_sink 决定（pEff：可能已回退默认端点）
         // 261102-01 #1（终稿）：只记日志，**不降级** —— 高音质优先，别的程序给我们让路。
         note_endpoint_busy(pEff);
-        auto sink = make_sink(pEff);
+        auto sink = make_sink(pEff, true);
         if (!sink->open(sink_opts(pEff), deviceRate, outCh, outBits)) {
             RQ.abort.store(true); RQ.cv.notify_all(); prod.join();
             std::lock_guard<std::mutex> lk(ps.mtx);
@@ -5144,6 +5370,7 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
         rl.fallbackEligible = (sharedFallback != nullptr) && !dop &&
                               (p.backend.empty() || p.backend == "wasapi");
         rl.dop = dop;
+        rl.volumeInPipeline = true;
         if (p.workbenchResume >= 0.0) {
             // The renderer consumes this request before its first write. Its
             // seek epoch discards every primed block from the previous position.
@@ -5159,19 +5386,26 @@ static bool play_one_impl(const std::string& file, const PlayParams& requested, 
         rta::render::render_loop(*sink, rl);
 
         RQ.abort.store(true); RQ.cv.notify_all();
+        // Stop/drain the device before waiting for producer teardown or log
+        // I/O. EOF diagnostics must not keep an empty ASIO callback running.
+        if(rl.normalEnd&&!ps.stop.load()&&!sink->drain(p.bufferMs,&ps.stop)){
+            rl.renderFail=true;rl.normalEnd=false;
+            rl.failMsg="OUTPUT_DRAIN_FAILED "+sink->last_error();
+        }
+        if(ps.stop.load())rl.normalEnd=false;
+        sink->close();
         if (prod.joinable()) prod.join();
+        if(!producerDrainLog.empty())play_log(producerDrainLog);
+        if(!producerDopEofLog.empty())play_log(producerDopEofLog);
         if (rl.renderFail) {
             // 设备持续不接受数据：完整归因原样进 ps.error —— END 不再是 error="" 悬案
             // C3（N300 掉线）：端点已消失时绝不回退共享、也不从头重播 —— 用户要 bit-perfect，
             // 静默降级比报错更有害（方案 §7）。ps.error 已在 render_loop 里写成「输出设备已断开」。
             if (sharedFallback && rl.fallbackEligible && !rl.deviceLost) *sharedFallback = true;
-            sink->close();
             { std::lock_guard<std::mutex> lk(ps.mtx); ps.error = rl.failMsg; }
             return false;
         }
         ps.paused.store(false);
-        Sleep((DWORD)std::max(10, p.bufferMs));      // 让设备把缓冲里的尾音放完（RENDERFAIL 路径已提前 return，不睡）
-        sink->close();
         if (rl.normalEnd) {
             // 显式「正常结束」语义：此后 END 的 error="" 只可能是正常播完（有 RENDER_DONE 为证）
             play_log("RENDER_DONE 正常播完 pos=" +
@@ -9552,7 +9786,8 @@ static void queue_thread(PlayParams p, size_t start) {
         }
         p.workbenchResume = -1.0;
         p.workbenchPaused = false;
-        const double endPos = (ps.outRate > 0 ? (double)ps.played.load() / (double)ps.outRate : 0.0);
+        const double endRate = ps.timelineRate ? (double)ps.timelineRate : ps.outRate;
+        const double endPos = (endRate > 0 ? (double)ps.played.load() / endRate : 0.0);
         const size_t endPlayed = ps.played.load();
         std::string endErr = ps.error;
         const std::string endCur = cur.path;
@@ -11103,36 +11338,49 @@ static bool is_side_effect_exempt(const std::string& p) {
     return false;
 }
 
+static std::string pcm_shaper_request_error(const PlayParams& p) {
+    if(p.dsd>0||p.shaper=="auto")return {};
+    const int container=p.bits>0?p.bits:24;
+    const int effective=p.dacBits>0?std::min(p.dacBits,container):container;
+    return rta::dsp::pcm_shaper_precision_supported(parse_shaper(p.shaper),effective)?std::string{}:
+        std::string(rta::dsp::pcm_shaper_precision_error());
+}
+
 static std::string cleanup_input_error(const rta::net::HttpRequest& rq) {
     if(rq.path.rfind("/api/settings",0)!=0 && rq.path.rfind("/api/play",0)!=0 && rq.path.rfind("/api/cast/start",0)!=0)return {};
     std::map<std::string,std::string> values;
     if(!rq.body.empty() && rq.body.front()=='{') {
         const auto j=rta::net::json_parse(rq.body);
-        for(const auto* key:{"cleanup_strength","cleanup_noise_db"})if(j.has(key)){
-            if(j[key].type!=rta::net::Json::Num)return "录音清理参数必须是有限数字";
+        for(const auto* key:{"cleanup_strength","cleanup_noise_db","crossfeed_freq","crossfeed_level","dacbits"})if(j.has(key)){
+            if(j[key].type!=rta::net::Json::Num)return "音频处理参数必须是有限数字";
             values[key]=std::to_string(j[key].num);
         }
-        for(const auto* key:{"cleanup_auto","quickstart"})if(j.has(key)){
+        for(const auto* key:{"cleanup_auto","quickstart","crossfeed"})if(j.has(key)){
             const auto& value=j[key];
             if(value.type==rta::net::Json::Bool)values[key]=value.b?"1":"0";
             else if(value.type==rta::net::Json::Num && (value.num==0 || value.num==1))values[key]=value.num==1?"1":"0";
             else if(value.type==rta::net::Json::Str)values[key]=value.str;
-            else return "cleanup_auto and quickstart must be 0 or 1";
+            else return "cleanup_auto, quickstart and crossfeed must be 0 or 1";
         }
     }else{
         std::istringstream is(rq.body);std::string token;
         while(std::getline(is,token,'&')){const auto at=token.find('=');if(at!=std::string::npos)values[urlDecode(token.substr(0,at))]=urlDecode(token.substr(at+1));}
     }
-    for(const auto& spec:std::vector<std::pair<std::string,std::pair<double,double>>>{{"cleanup_strength",{0,1}},{"cleanup_noise_db",{-120,-60}}}) {
+    for(const auto& spec:std::vector<std::pair<std::string,std::pair<double,double>>>{{"cleanup_strength",{0,1}},{"cleanup_noise_db",{-120,-60}},{"crossfeed_freq",{300,1200}},{"crossfeed_level",{3,15}},{"dacbits",{0,32}}}) {
         const auto it=values.find(spec.first);if(it==values.end())continue;
         char* end=nullptr;const double value=strtod(it->second.c_str(),&end);
         if(it->second.empty()||end==it->second.c_str()||*end||!rta::audio::audio_finite(value)||value<spec.second.first||value>spec.second.second)
-            return spec.first=="cleanup_strength"?"清理强度必须是 0～1 的有限数字":"噪声底必须是 -120～-60 dBFS 的有限数字";
+            return "音频处理参数超出范围或不是有限数字："+spec.first;
+        if(spec.first=="dacbits" && (value!=std::floor(value)||(value!=0&&value<8)))return "DAC 有效位深须为自动 0 或 8～32 bit 整数";
     }
-    for(const auto* key:{"cleanup_auto","quickstart"}){
+    for(const auto* key:{"cleanup_auto","quickstart","crossfeed"}){
         const auto it=values.find(key);if(it==values.end())continue;
-        if(it->second!="0" && it->second!="1" && it->second!="true" && it->second!="false")return "cleanup_auto and quickstart must be 0 or 1";
+        if(it->second!="0" && it->second!="1" && it->second!="true" && it->second!="false")return "cleanup_auto, quickstart and crossfeed must be 0 or 1";
     }
+    if(rq.path.rfind("/api/cast/start",0)==0 &&
+       ((values.count("crossfeed")&&(values["crossfeed"]=="1"||values["crossfeed"]=="true")) ||
+        (values.count("dacbits")&&strtod(values["dacbits"].c_str(),nullptr)>0)))
+        return "UPnP 投放暂不支持耳机交叉馈送或 DAC 有效位深；请关闭这两项后投放";
     return {};
 }
 #include "net/workbench_config.h"
@@ -13137,6 +13385,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     if (rq.path == "/api/play" || rq.path.rfind("/api/play?", 0) == 0) {
         ct = "application/json; charset=utf-8";
         PlayParams p = parseForm(rq.body);   // 非 const：远程曲目会把 p.file 换成缓存路径
+        if(const auto why=pcm_shaper_request_error(p);!why.empty())return workbench::error(400,why);
         // 远程曲目：先把原始文件完整下载到缓存，再走与本地完全相同的解码与 DSP 路径
         if (!p.remoteId.empty()) {
             std::string ferr;
@@ -13153,6 +13402,15 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         {
             std::string cdLetter; int cdTrack = 0;
             if (rta::audio::CdaMciPlayer::parseCdaPath(p.file, cdLetter, cdTrack)) {
+                if(p.crossfeed || p.dacBits>0){rta::net::webui_set_status(400);return "{\"ok\":false,\"error\":\"CD 系统播放不经过 DSP；请关闭耳机交叉馈送和 DAC 有效位深\"}";}
+                // ★ 2026-11-15：本地文件正在播时切 CD，旧实现只开 MCI、不停本地管线 ⟹
+                //   两条播放线程/两个设备消费者并存，概率性卡死。先按 session 语义停旧再开 CD。
+                if (g_cdActive.exchange(false)) g_cdPlayer.close();
+                {
+                    std::lock_guard<std::mutex> lkSession(ps.sessionMx);
+                    ps.session_stop_join_locked();
+                    ps.pauseReq.store(false);
+                }
                 const std::string ce = g_cdPlayer.play(p.file);   // 内部投到 MCI 工作线程
                 if (!ce.empty()) {
                     play_log("CDPLAY_FAIL file=" + p.file + " " + ce);
@@ -13165,6 +13423,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                        R"(,"message":"CD 音轨通过 Windows 播放（不经过 DSP：音量/EQ/升频对它无效）"})";
             }
         }
+        // 2026-11-15：从 CD 切回本地文件时也必须关掉 MCI，否则 CD 继续出声、
+        // 本地管线又起一条，和上面的"本地→CD"一样会互相抢设备/卡死。
+        if (g_cdActive.exchange(false)) {
+            g_cdPlayer.close();
+            play_log("CDSTOP mci switch=local");
+        }
         // F1：file 会进队列 → 播放线程 recent_add/meta_on_play/fs::u8path 全链消费，
         // 非法字节在这里挡下（播放线程里抛异常没有兜底，等于整进程退出）。
         if (!valid_utf8(p.file)) return utf8_path_reject(p.file);
@@ -13173,7 +13437,11 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         // 放在起播放线程之前 ⟹ 用户点一下立刻拿到具体原因，而不是"HTTP 说 ok、线程里才失败"。
         if (p.dsdNative) {
             std::string why;
-            if (!native_dsd_precheck(p, why)) {
+            const std::string ext = rta::audio::lowerExt(p.file);
+            const bool dsdSource = (ext == ".dsf" || ext == ".dff");
+            const bool accepted = dsdSource ? native_dsd_precheck(p, why)
+                                            : native_processed_dsd_precheck(p, why);
+            if (!accepted) {
                 // 同时进 /api/dbg 的内存环：界面 DEBUG 面板能直接看到"为什么这次 Native 被拒"，
                 // 也是 tests/native_dsd_api_check.ps1 第 7 条断言的取证来源。
                 play_log("PLAY_REJECT dsdnative=1 file=" + p.file + " " + why);
@@ -13453,7 +13721,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             std::error_code ec;
             if (fs::is_directory(fs::u8path(p.file), ec) && !ec) {
                 static const char* kExt[] = { ".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus",
-                                              ".ape", ".wv", ".aiff", ".aif", ".dsf", ".dff", ".wma" };
+                                              ".ape", ".wv", ".aiff", ".aif", ".dsf", ".dff", ".wma", ".cda" };
                 int guard = 0;
                 for (auto it = fs::recursive_directory_iterator(fs::u8path(p.file), fs::directory_options::skip_permission_denied, ec);
                      it != fs::recursive_directory_iterator() && !ec && guard < 5000; it.increment(ec)) {
@@ -13472,7 +13740,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                     std::ostringstream jb;
                     jb << "{\"ok\":false,\"error\":\"不是可播放的音频文件："
                        << jesc(pathToUtf8(fs::u8path(p.file).filename()))
-                       << "（支持 wav / flac / mp3 / m4a / ape / wv / dsf / dff / cue / iso 等）\"}";
+                       << "（支持 wav / flac / mp3 / m4a / ape / wv / dsf / dff / cue / iso / cda 等）\"}";
                     return jb.str();
                 }
                 addList.push_back(p.file);
@@ -15236,11 +15504,13 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 const size_t e = tok.find((char)61);
                 if (e == std::string::npos) continue;
                 const std::string k = urlDecode(tok.substr(0, e));
-                const std::string v = urlDecode(tok.substr(e + 1));
+                std::string v = urlDecode(tok.substr(e + 1));
+                if (k == "shaper" && v == "Shaped") v = "shaped";
                 if (k.empty() || v.size() > 512) continue;
                 bool okKey = false;
                 for (const char* allow : { "rate", "rateFamilyPolicy", "filter", "filterNx", "shaper", "dsd", "modorder",
-                                           "buffer", "volume", "loudness", "isp", "twostage",
+                                            "buffer", "volume", "loudness", "isp", "twostage",
+                                            "crossfeed", "crossfeed_freq", "crossfeed_level", "dacbits",
                                            "device", "bits", "taps", "atten", "transition", "phase",
                                            "modfamily", "oobgain", "ahmbits", "modcut", "moddith", "ir", "irgpu", "ramp", "theme", "eq",
                                            "gpuvendor", "dsdnative", "directsdm", "dsdkind", "dsdconv", "dsd2stage",
@@ -15303,6 +15573,8 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 if (merged.find(k) == merged.end()) order.push_back(k);
                 merged[k] = clean;
             }
+            if(const auto why=pcm_shaper_request_error(parseForm(workbench::form(merged)));!why.empty())
+                return workbench::error(400,why);
             // 整体写回（合并后的全量键；顺序保持首次出现次序，便于人工排查）
             std::ostringstream settingsBytes;
             for (const auto& kk : order) {
@@ -15466,6 +15738,146 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
     // 滤波器预设表（含每个预设【自带的相位】）：
     // 用户 2026-10-22 功能2 的诉求是「'跟随预设'到底跟的是什么」说不清。
     // 让后端把真相源交出来，前端只负责显示 —— 避免前端再抄一份相位表（那必然漂移）。
+    // 滤波器详情（构建期测量的生产系数）：UI 悬停/键盘浏览时按名字取一条，
+    // 不在请求线程里重新设计系数（sinc-M 等百万抽头会把 UI 拖死）。
+    if (rq.path == "/api/shaper-info" || rq.path.rfind("/api/shaper-info?", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        if (rq.method != "GET") return workbench::error(405, "抖动说明只接受GET");
+        double rate = 0.0, bitsValue = 0.0;
+        const auto query = rq.path.find('?');
+        if (query != std::string::npos) {
+            std::istringstream fields(rq.path.substr(query + 1));
+            std::string field;
+            std::set<std::string> seen;
+            while (std::getline(fields, field, '&')) {
+                const auto split = field.find('=');
+                const auto key = urlDecode(field.substr(0, split));
+                if (key != "rate" && key != "bits") continue;
+                double value = 0.0;
+                if (split == std::string::npos || !seen.insert(key).second ||
+                    !parse_num_strict(urlDecode(field.substr(split + 1)), value) ||
+                    !rta::audio::audio_finite(value) || value < 0.0 || value != std::floor(value) ||
+                    value > (key == "rate" ? 1536000.0 : 32.0))
+                    return workbench::error(400, "输出采样率或位深无效");
+                if (key == "rate") rate = value; else bitsValue = value;
+            }
+        }
+        const int bits = (int)bitsValue;
+        struct Entry { const char* id; const char* description; };
+        static constexpr Entry entries[] = {
+            {"auto", "按实际输出采样率与位深选择；低采样率优先 TPDF。"},
+            {"none", "仅取整，不加入抖动；是否逐位直通还取决于整条处理链。"},
+            {"NS1", "一阶噪声整形，适合 176.4/192 kHz 及以上输出。"},
+            {"NS4", "四阶噪声整形，建议用于 88.2/96 kHz 及以上输出。"},
+            {"NS5", "五阶噪声整形，建议用于 192 kHz 及以上输出。"},
+            {"NS9", "九阶噪声整形，建议用于 176.4/192 kHz 及以上输出。"},
+            {"LNS15", "十五阶噪声整形，建议用于 24 bit、352.8/384 kHz 及以上输出。超声噪声较多，建议手动比较。"},
+            {"RPDF", "矩形概率抖动，建议用于 24 bit 及以上输出。"},
+            {"TPDF", "三角概率抖动，适合全部采样率，是低采样率的通用选择。"},
+            {"Gauss1", "高斯概率抖动，适合 96 kHz 及以下输出。"},
+            {"shaped", "高通整形抖动，建议用于 88.2/96 kHz 及以上输出。"}
+        };
+        const bool formatKnown = rate > 0.0 && bits > 0;
+        std::ostringstream out;
+        out << "{\"ok\":true,\"sampleRate\":" << rate << ",\"bitDepth\":" << bits
+            << ",\"autoResolved\":\"" << (formatKnown ? rta::dsp::shaper_name(rta::dsp::auto_pcm_shaper(bits, rate)) : "")
+            << "\",\"options\":[";
+        bool first = true;
+        for (const auto& entry : entries) {
+            const std::string id(entry.id);
+            const auto shaper = parse_shaper(id);
+            const double minimum = rta::dsp::shaper_recommended_min_rate(shaper);
+            const bool recommended = formatKnown && rate >= minimum &&
+                (id != "RPDF" || bits >= 24) && (id != "LNS15" || bits >= 24) &&
+                (id != "Gauss1" || rate <= 96000.0);
+            if (!first) out << ',';
+            first = false;
+            out << "{\"id\":\"" << id << "\",\"label\":\""
+                << (id == "auto" ? "自动（推荐）" : id == "none" ? "无抖动（仅取整）" : entry.id)
+                << "\",\"order\":" << rta::dsp::shaper_spec(shaper).order
+                << ",\"description\":\"" << entry.description << "\",\"minRecommendedRate\":" << minimum
+                << ",\"recommended\":" << (recommended ? "true" : "false") << '}';
+        }
+        out << "]}";
+        return out.str();
+    }
+
+    if (rq.path.rfind("/api/filter/detail", 0) == 0) {
+        ct = "application/json; charset=utf-8";
+        std::string name;
+        for (const char* key : {"?name=", "&name="}) {
+            const size_t q = rq.path.find(key);
+            if (q != std::string::npos) {
+                name = urlDecode(rq.path.substr(q + std::string(key).size()));
+                break;
+            }
+        }
+        // auto 是合成条目：解析到真实预设再取详情，但对外仍显示 auto（与 /api/filters 一致）。
+        const std::string requested = name;
+        std::string resolved;
+        if (name == "auto") {
+            resolved = rta::dsp::auto_preset_name();
+            name = resolved;
+        }
+        const rta::ui_reference::FilterDetail* d = nullptr;
+        for (int i = 0; i < rta::ui_reference::kFilterDetailCount; ++i) {
+            if (name == rta::ui_reference::kFilterDetails[i].name) {
+                d = &rta::ui_reference::kFilterDetails[i];
+                break;
+            }
+        }
+        if (!d) {
+            rta::net::webui_set_status(404);
+            return std::string("{\"ok\":false,\"error\":\"未找到滤波器\"}");
+        }
+        std::ostringstream j;
+        j << std::setprecision(7);
+        j << "{\"ok\":true,\"item\":{\"name\":\"" << jesc(requested)
+          << "\",\"resolved\":\"" << jesc(resolved)
+          << "\",\"window\":\"" << jesc(d->window)
+          << "\",\"phase\":\"" << jesc(d->phase)
+          << "\",\"family\":\"" << jesc(d->family)
+          << "\",\"taps\":" << d->taps << ",\"T\":" << d->T << ",\"L\":" << d->L
+          << ",\"apodizing\":" << (d->apodizing ? "true" : "false")
+          << ",\"twoStage\":" << (d->twoStage ? "true" : "false")
+          << ",\"forNx\":" << (d->forNx ? "true" : "false")
+          << ",\"passHz\":" << d->passHz << ",\"stopStartHz\":" << d->stopStartHz
+          << ",\"designDb\":" << d->designDb << ",\"targetDb\":" << d->targetDb
+          << ",\"passDb\":" << d->passDb << ",\"stopDb\":" << d->stopDb
+          << ",\"dcDb\":" << d->dcDb << ",\"preMs\":" << d->preMs
+          << ",\"postMs\":" << d->postMs << ",\"gd1kMs\":" << d->gd1kMs
+          << ",\"latencyMs\":" << d->latencyMs << ",\"fs\":" << d->fs
+          << ",\"inRate\":" << d->inRate << ",\"outRate\":" << d->outRate
+          << ",\"fullBandPoints\":" << d->fullBandPoints
+          << ",\"fullBandStopDb\":" << d->fullBandStopDb
+          << ",\"fullBandPassDevDb\":" << d->fullBandPassDevDb
+          << ",\"fullBandMaxStepDb\":" << d->fullBandMaxStepDb;
+        auto emit_curve = [&](const char* key, const float* v, int n,
+                              double x0, double x1, bool logAxis) {
+            j << ",\"" << key << "\":[";
+            for (int i = 0; i < n; ++i) {
+                const double t = (n > 1) ? (double)i / (double)(n - 1) : 0.0;
+                const double x = logAxis ? x0 * std::pow(x1 / x0, t) : x0 + (x1 - x0) * t;
+                if (i) j << ',';
+                j << '[' << x << ',' << v[i] << ']';
+            }
+            j << ']';
+        };
+        emit_curve("response", d->response, d->responseCount, 10.0, d->fs * 0.5, true);
+        emit_curve("passCurve", d->passCurve, d->passCount, 0.0, d->passHz, false);
+        const double gdTop = std::min(20000.0, (double)d->passHz);
+        emit_curve("gdCurve", d->gdCurve, d->gdCount, 100.0, gdTop, true);
+        // 冲激：x 轴是相对峰值的毫秒（65 点，中心=峰值）。
+        j << ",\"impulse\":[";
+        for (int i = 0; i < d->impulseCount; ++i) {
+            if (i) j << ',';
+            const double ms = ((double)i - (double)(d->impulseCount / 2)) / d->fs * 1000.0;
+            j << '[' << ms << ',' << d->impulse[i] << ']';
+        }
+        j << "]}}";
+        return j.str();
+    }
+
     if (rq.path.rfind("/api/filters", 0) == 0) {
         ct = "application/json; charset=utf-8";
         // 261030-01：content= 源的真实内容边缘（Hz）。默认 20000（CD）。
@@ -15819,6 +16231,15 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         if (monitor == "dsp" && mode != "monitor") {
             return R"({"ok":false,"error":"monitor=dsp 只能用于 mode=monitor（当前 mode=)" + jesc(mode) +
                    R"(）；这个参数在其它模式不会生效，故直接拒绝，别让它被静默忽略"})";
+        }
+        if(mode=="monitor") {
+            const auto saved=workbench::saved_values();
+            const auto on=[&](const std::string& key){const auto it=saved.find(key);return it!=saved.end()&&(it->second=="1"||it->second=="true");};
+            const auto bits=saved.find("dacbits");
+            const bool savedDacBits=bits!=saved.end()&&std::strtod(bits->second.c_str(),nullptr)>0;
+            if((monitor=="dsp"&&(on("crossfeed")||savedDacBits)) ||
+                params.count("crossfeed")||params.count("dacbits"))
+                return "{\"ok\":false,\"error\":\"输入监听暂不支持耳机交叉馈送或 DAC 有效位深；请关闭这两项后监听\"}";
         }
 
         // 2026-10-23 真机踩到：传 device=Widget+B（少个 v）被静默忽略 → 回落到默认端点，
@@ -16813,6 +17234,14 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                 s.replace(begin, end - begin, std::to_string(ps.outModOrder));
             }
         }
+        auto replaceString=[&](const char* field,const std::string& value){
+            const std::string key=std::string("\"")+field+"\":\"";const auto pos=s.find(key);
+            if(pos==std::string::npos)return;const auto begin=pos+key.size();size_t end=begin;bool escaped=false;
+            for(;end<s.size();++end){if(!escaped&&s[end]=='"')break;if(!escaped&&s[end]=='\\')escaped=true;else escaped=false;}
+            if(end<s.size())s.replace(begin,end-begin,jesc(value));
+        };
+        if(ps.pcmObserved.load())replaceString("shaper",rta::dsp::shaper_name((rta::dsp::Shaper)ps.pcmShaper.load()));
+        replaceString("bitPerfect",ps.bpState);replaceString("bitPerfectWhy",ps.bpWhy);
         if (!s.empty() && s.back() == '}') {
             s.pop_back();
             std::ostringstream dyn;
@@ -16827,6 +17256,10 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
                     << ",\"gpuAllResampleStagesUsed\":" << (ps.gpuAllResamplerStages.load() ? "true" : "false");
             }
             dyn << ",\"cleanupObserved\":" << (ps.cleanupObserved.load()?"true":"false")
+                << ",\"crossfeed\":" << (ps.crossfeedUsed.load()?"true":"false")
+                << ",\"quantizationBits\":" << ps.quantizationBits.load()
+                << ",\"shaperObserved\":" << (ps.pcmObserved.load()?"true":"false")
+                << ",\"volumeDbObserved\":" << ps.volumeDbObserved.load()
                 << ",\"cleanupApplied\":" << (ps.cleanupUsed.load()?"true":"false")
                 << ",\"cleanupMeanReductionDb\":" << ps.cleanupMeanDb.load()
                 << ",\"cleanupModifiedBinFraction\":" << ps.cleanupModifiedFraction.load();
@@ -17044,6 +17477,12 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             rta::net::CastManager::instance().set_paused(on != 0);
             return std::string("{\"ok\":true,\"paused\":") + ((on != 0) ? "true" : "false") + ",\"upnp\":true}";
         }
+        // CD 音轨走 MCI，ps.pauseReq 只对本地播放线程有效；旧实现把 CD 的暂停
+        // 请求丢进一个没有播放线程消费的标志 ⟹ UI 有反应、CD 照放。这里直接投 MCI。
+        if (g_cdActive.load()) {
+            if (on != 0) g_cdPlayer.pause(); else g_cdPlayer.resume();
+            return std::string("{\"ok\":true,\"paused\":") + ((on != 0) ? "true" : "false") + ",\"cd\":true}";
+        }
         ps.pauseReq.store(on != 0);
         return std::string("{\"ok\":true,\"paused\":") + ((on != 0) ? "true" : "false") + "}";
     }
@@ -17102,13 +17541,16 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
         const size_t pl2 = ps.played.load(), tt = ps.total.load();
         // CD 音轨（MCI）模式：状态全部来自 MCI，不能拿上一首本地播放的残留值冒充
         const bool cdMode = g_cdActive.load();
-        bool  cdPlaying = false; long long cdPosMs = 0, cdLenMs = 0;
+        bool  cdPlaying = false, cdPaused = false; long long cdPosMs = 0, cdLenMs = 0;
         int   cdTracks = 0, cdTrackNo = 0;
+        std::string cdTitle;
         static std::string cdRawMode, cdRawPos;
         if (cdMode) {
             // state() 内部把查询投到 MCI 工作线程（alias 是线程局部的，不能在 HTTP 线程直接查）
             const rta::audio::CdaState cs = g_cdPlayer.state();
             cdPlaying = cs.playing;
+            cdPaused  = cs.paused;
+            cdTitle   = cs.title;
             cdPosMs   = cs.posMs;
             cdLenMs   = cs.lenMs;
             cdTracks  = cs.tracks;
@@ -17116,14 +17558,15 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
             cdRawMode = cs.rawMode;
             cdRawPos  = cs.rawPos;
         }
+        const uint32_t timelineRate = ps.timelineRate ? ps.timelineRate : (uint32_t)std::max(0.0, ps.outRate);
         const double pos = cdMode ? (double)cdPosMs / 1000.0
                                     : (castMode ? castSt.positionSec
-                                                : (ps.outRate > 0 ? (double)pl2 / ps.outRate : 0.0));
+                                                : (timelineRate > 0 ? (double)pl2 / timelineRate : 0.0));
         const double dur = cdMode ? (double)cdLenMs / 1000.0
                                     : (castMode ? castSt.durationSec
-                                                : (ps.outRate > 0 ? (double)tt / ps.outRate : 0.0));
-        const bool playingStat = cdMode ? cdPlaying : (castMode ? true : ps.playing.load());
-        const bool pausedStat = castMode ? castSt.paused : ps.paused.load();
+                                                : (timelineRate > 0 ? (double)tt / timelineRate : 0.0));
+        const bool playingStat = cdMode ? (cdPlaying || cdPaused) : (castMode ? true : ps.playing.load());
+        const bool pausedStat = cdMode ? cdPaused : (castMode ? castSt.paused : ps.paused.load());
         const std::string curStat = castMode ? castSt.sourceFile : ps.current;
         const std::string errStat = castMode ? castSt.error : ps.error;
         // CD 是红皮书标准：44100 Hz / 16 bit / 2ch
@@ -17152,6 +17595,7 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
           << ",\"cdNoDsp\":" << (cdMode ? "true" : "false")
           << ",\"cdRawMode\":\"" << jesc(cdRawMode) << "\""
           << ",\"cdRawPos\":\"" << jesc(cdRawPos) << "\""
+          << ",\"cdTitle\":\"" << jesc(cdTitle) << "\""
           << ",\"current\":\"" << jesc(curStat) << "\""
           << ",\"cueStart\":" << ((castMode||cdMode)?-1:ps.activeCueStart)
           << ",\"cueEnd\":" << ((castMode||cdMode)?-1:ps.activeCueEnd)
@@ -17169,6 +17613,10 @@ static std::string handle_impl(const rta::net::HttpRequest& rq, std::string& ct)
           << ",\"qa\":" << ([&]{ const char* v = std::getenv("RLPLAYER_QA"); return (v && v[0] && std::string(v) != "0"); }() ? "true" : "false")
           << ",\"outRate\":" << rateStat
           << ",\"outBits\":" << bitsStat
+          << ",\"quantizationBits\":" << ((!playingStat||castMode||cdMode)?0:ps.quantizationBits.load())
+          << ",\"pcmShaper\":\"" << (playingStat&&!castMode&&!cdMode&&ps.pcmObserved.load()?rta::dsp::shaper_name((rta::dsp::Shaper)ps.pcmShaper.load()):"") << "\""
+          << ",\"volumeDbObserved\":" << ps.volumeDbObserved.load()
+          << ",\"crossfeed\":" << (playingStat&&!castMode&&!cdMode&&ps.crossfeedUsed.load()?"true":"false")
           // ReplayGain（261027-01 #2）：rg = 模式（off/track/album），rgDb = 本次实际乘的 dB，
           // rgClip = 是否被防削波改过。mode=off 时 rgDb 必须是 0（= 一个样本都没碰）。
           << ",\"rg\":\"" << jesc(castMode ? std::string("off") : ps.rgMode) << "\""
@@ -17375,10 +17823,10 @@ static std::string page() {
     auto shaper_label = [&](const char* s) -> std::string {
         const std::string k(s);
         if (k == "auto")  return shaperZh ? "自动（推荐）" : "Auto (recommended)";
-        if (k == "none")  return shaperZh ? "无（逐位）" : "None (bit-perfect)";
+        if (k == "none")  return shaperZh ? "无抖动（仅取整）" : "None (rounding only)";
         return k;
     };
-    for (const char* s : {"auto", "none", "NS1", "NS4", "NS5", "NS9", "LNS15", "RPDF", "TPDF", "Gauss1", "Shaped"}) {
+    for (const char* s : {"auto", "none", "NS1", "NS4", "NS5", "NS9", "LNS15", "RPDF", "TPDF", "Gauss1", "shaped"}) {
         so += std::string("<option value=\"") + s + "\">" + shaper_label(s) + "</option>";
     }
     // 占位符要【全部】替换：FILTER_OPTS 同时被 1x 和 Nx 两个下拉使用，

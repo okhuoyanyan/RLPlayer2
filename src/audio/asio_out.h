@@ -36,6 +36,9 @@
 #include <cctype>
 #include <cstdio>
 #include <cmath>
+#include <algorithm>
+#include <functional>
+#include "dsp/dop.h"
 #include "pcm_dump.h"
 
 namespace rta::audio {
@@ -124,6 +127,26 @@ inline const char* asio_sample_type_name(ASIOSampleType t) {
 inline long asio_dsd_bytes_per_buffer(long bufferSize) {
     const long b = bufferSize / 8;
     return b > 0 ? b : 1;
+}
+
+// 目标缓冲（ASIO 的 bufferSize，单位=样本；DSD 时 1 样本=1 bit）。
+// 为什么需要：驱动报的 preferredSize 只保证「默认能用」，不代表「高码率不欠载」。
+//   xDuoo USB Audio Device 在 DSD1024（45.1584 MHz）下 pref=8192 bit = 1024 字节/声道
+//   = 0.18 ms，实测 2 秒欠载 94 次；改用驱动上限 131072 bit = 2.9 ms 后欠载 0。
+// 规则：以用户缓冲毫秒为目标，不低于 pref、不超过 max，按 granularity 向上对齐。
+inline long asio_pick_buffer_size(long mn, long mx, long pref, long gran,
+                                  double rate, double ms) {
+    long target = pref > 0 ? pref : (mx > 0 ? mx : 512);
+    if (ms > 0.0 && rate > 0.0) {
+        const double want = ms / 1000.0 * rate;
+        if (want > (double)target) target = (long)std::llround(want);
+    }
+    if (mx > 0 && target > mx) target = mx;
+    if (mn > 0 && target < mn) target = mn;
+    if (gran > 1) target = ((target + gran - 1) / gran) * gran;
+    if (mx > 0 && target > mx) target = mx;
+    if (target < 8) target = 8;
+    return target;
 }
 
 // A zero byte is full negative DC in packed 1-bit DSD, not silence.
@@ -413,13 +436,15 @@ public:
     ~AsioDriver() { close(); }
 
     // srcBits = 管线输出位深：AudioBuffer 的 int32 是按这个位深定标的（24-bit 就落在 ±2^23）。
-    // 驱动要的是各类型自己的满幅标度，所以必须归一化后再换算，不能直接拷。
+    // 驱动采用各类型的 2^(bits-1) 标度；同位深 unity 必须逐位复制，展宽只补零。
     // sysHandle: 部分驱动的 init() 需要一个有效 HWND；diagNopCallback: 诊断用，回调里不写缓冲
     bool open(const std::string& clsidStr, ASIOSampleRate rate, int wantChannels, int srcBits,
-              std::string& err, void* sysHandle = nullptr, bool diagNopCallback = false) {
+              std::string& err, void* sysHandle = nullptr, bool diagNopCallback = false,
+              double bufferMs = 100.0) {
         close();
         rate_ = rate;
         wantCh_ = wantChannels;
+        bufferMs_ = bufferMs > 0.0 ? bufferMs : 100.0;
         srcBits_ = (srcBits >= 8 && srcBits <= 32) ? srcBits : 24;
 
         wchar_t wc[128] = {0};
@@ -448,7 +473,7 @@ public:
         long mn = 0, mx = 0, pref = 0, gran = 0;
         if (drv_->getBufferSize(&mn, &mx, &pref, &gran) != ASE_OK) { err = "getBufferSize 失败"; free_drv(); return false; }
         minBuf_ = mn; maxBuf_ = mx; prefBuf_ = pref; granBuf_ = gran;
-        bufSize_ = pref > 0 ? pref : (mx > 0 ? mx : 512);
+        bufSize_ = asio_pick_buffer_size(mn, mx, pref, gran, rate_, bufferMs_);
 
         const ASIOError cr = drv_->canSampleRate(rate_);
         if (cr != ASE_OK) {
@@ -497,13 +522,23 @@ public:
             cb_.bufferSwitchTimeInfo = &AsioDriver::s_buffer_switch_time;
         }
 
-        if (drv_->createBuffers(bufs_.data(), (long)ch_, (long)bufSize_, &cb_) != ASE_OK) {
-            err = "createBuffers 失败"; free_drv(); return false;
+        {
+            std::string attempts;
+            const long used = create_buffers_resilient(bufSize_, attempts);
+            if (used == 0) {
+                err = "createBuffers 失败（尝试 " + attempts + "）";
+                free_drv();
+                return false;
+            }
         }
         buffersCreated_ = true;
-        ring_.assign(kRingFrames * (size_t)ch_, 0);
+        // 环形缓冲必须装得下至少 4 个驱动周期：高码率下 100 ms 的 ASIO 缓冲可能远大于
+        // 旧的固定 65536 帧，否则「回调一次要 262144 字节、环里只有 65536」会永远喂不满。
+        ringFrames_ = std::max<size_t>(kRingFrames, (size_t)bufSize_ * 4);
+        ring_.assign(ringFrames_ * (size_t)ch_, 0);
         ringR_ = ringW_ = ringCount_ = 0;
         underruns_ = 0;
+        reset_completion_state();
         // outputReady 不再主动探测：在 start() 之前调用它在部分驱动上会破坏内部状态
         // （实测 Portacapture 之后不再回调、约 2 秒后访问冲突）。默认不调用。
         outReadySupported_ = false;
@@ -523,6 +558,7 @@ public:
         long bufferBytes = 0, bufferMin = 0, bufferMax = 0;  // ASIO 报的 bufferSize（单位=DSD 样本/bit）
         long writeBytes = 0;                      // 实际每次回调能写的字节 = bufferSize/8
         long createBuffers = ASE_NotPresent;
+        std::string bufferAttempts;   // createBuffers 的阶梯尝试与原始 ASE 码
         int channels = 0;
         double dsdRate = 0.0;
     };
@@ -530,13 +566,14 @@ public:
     // 打开原生 DSD 流。顺序按 SDK 要求：先切 IoFormat，再设采样率，最后 createBuffers。
     // 失败时 err 里带上：驱动名 / 请求的 DSD 类型 / 原始 ASE 码。
     bool open_dsd(const std::string& clsidStr, ASIOSampleRate dsdRate, int wantChannels,
-                  std::string& err, void* sysHandle = nullptr) {
+                  std::string& err, void* sysHandle = nullptr, double bufferMs = 100.0) {
         close();
         dsd_ = AsioDsdInfo{};
         dsd_.dsdRate = (double)dsdRate;
         rate_ = dsdRate;
         wantCh_ = wantChannels;
         dsdRate_ = dsdRate;
+        bufferMs_ = bufferMs > 0.0 ? bufferMs : 100.0;
 
         wchar_t wc[128] = {0};
         MultiByteToWideChar(CP_UTF8, 0, clsidStr.c_str(), -1, wc, 127);
@@ -602,7 +639,9 @@ public:
             err = "驱动「" + name_ + "」getBufferSize 失败（原生 DSD）"; restore_pcm_format(); free_drv(); return false;
         }
         minBuf_ = mn; maxBuf_ = mx; prefBuf_ = pref; granBuf_ = gran;
-        bufSize_ = pref > 0 ? pref : (mx > 0 ? mx : 512);
+        // DSD 的 bufferSize 单位是 1-bit 样本：按毫秒目标选，默认 100 ms 在 DSD1024 下会被
+        // 驱动上限 131072 bit（2.9 ms）截断；这已经比 pref=8192 bit（0.18 ms）稳得多。
+        bufSize_ = asio_pick_buffer_size(mn, mx, pref, gran, dsdRate_, bufferMs_);
         dsd_.bufferBytes = bufSize_; dsd_.bufferMin = mn; dsd_.bufferMax = mx;
         // ★ ASIO 的 bufferSize 单位是"样本"；DSD 的 1 个样本只有 1 bit，8 个样本才占 1 字节。
         //   所以每次回调能写的字节数 = bufferSize / 8。
@@ -669,41 +708,62 @@ public:
         cb_.sampleRateDidChange = &AsioDriver::s_rate_changed;
         cb_.asioMessage = &AsioDriver::s_message;
         cb_.bufferSwitchTimeInfo = &AsioDriver::s_buffer_switch_time;
-        dsd_.createBuffers = asio_guarded_create_buffers(drv_, bufs_.data(), (long)ch_, (long)bufSize_, &cb_);
-        if (dsd_.createBuffers != ASE_OK) {
-            std::snprintf(eb, sizeof(eb),
-                "驱动「%s」原生 DSD 下 ASIOCreateBuffers 返回 0x%08lx（ASE_OK 才是成功）："
-                "%d 声道 x bufferSize=%ld（单位=1-bit 样本 ⟹ 每回调 %ld 字节/声道），类型 %ld（%s）",
-                name_.c_str(), (unsigned long)dsd_.createBuffers, ch_, bufSize_, dsdBufBytes_,
-                (long)dsd_.type, asio_sample_type_name(dsd_.type));
-            err = eb; restore_pcm_format(); free_drv(); return false;
+        {
+            std::string attempts;
+            const long used = create_buffers_resilient(bufSize_, attempts);
+            dsd_.bufferAttempts = attempts;
+            dsd_.createBuffers = used ? ASE_OK : (long)ASE_NotPresent;
+            if (used == 0) {
+                std::snprintf(eb, sizeof(eb),
+                    "驱动「%s」原生 DSD 下 ASIOCreateBuffers 全部失败（ASE_OK 才是成功）："
+                    "%d 声道，类型 %ld（%s），bufferSize 尝试 [%s]（单位=1-bit 样本）",
+                    name_.c_str(), ch_, (long)dsd_.type, asio_sample_type_name(dsd_.type),
+                    attempts.c_str());
+                err = eb; restore_pcm_format(); free_drv(); return false;
+            }
+            dsdBufBytes_ = asio_dsd_bytes_per_buffer(bufSize_);
+            dsd_.writeBytes = dsdBufBytes_;
         }
         buffersCreated_ = true;
         dsdMode_ = true;
 
-        ring_.assign(kRingFrames * (size_t)ch_, 0);
+        // 原生 DSD 的环要更深：DSD64 一个回调周期约 46 ms，4 周期只有 185 ms，
+        // 系统一次 200 ms 的调度抖动就会让回调抓到空环（实测全曲 527 次欠载）。
+        // 8 周期（约 370 ms）配合"按剩余空间部分填充"把欠载压到 0。
+        ringFrames_ = std::max<size_t>(kRingFrames, (size_t)dsdBufBytes_ * 32);
+        ring_.assign(ringFrames_ * (size_t)ch_, 0);
         ringR_ = ringW_ = ringCount_ = 0;
         underruns_ = 0;
         dsdPushed_ = 0;
         callbacks_ = 0;
+        reset_completion_state();
         outReadySupported_ = false;
         return true;
     }
 
+    // 原生 DSD 环形缓冲的空闲字节数（每声道）；供 sink 在写之前等待，避免
+    // push_dsd 返回 0 被上层记成 WFAIL。
+    size_t free_dsd_bytes() const {
+        std::lock_guard<std::mutex> lk(mx_);
+        return ringFrames_ > ringCount_ ? ringFrames_ - ringCount_ : 0;
+    }
+
     // 推交错 DSD 字节（每声道 1 字节 = 8 个 1-bit 样本）；返回实际接收的字节数（每声道）
-    size_t push_dsd(const uint8_t* bytes, size_t nBytes) {
+    size_t push_dsd(const uint8_t* bytes, size_t nBytes, bool final = false) {
         if (!dsdMode_ || !drv_) return 0;
         size_t ok = 0;
         {
             std::lock_guard<std::mutex> lk(mx_);
-            while (ok < nBytes && ringCount_ < kRingFrames) {
+            if(inputFinished_)return 0;
+            while (ok < nBytes && ringCount_ < ringFrames_) {
                 const size_t dst = ringW_ * (size_t)ch_;
                 const size_t src = ok * (size_t)ch_;
                 for (int c = 0; c < ch_; ++c) ring_[dst + (size_t)c] = (int32_t)bytes[src + (size_t)c];
-                ringW_ = (ringW_ + 1) % kRingFrames;
+                ringW_ = (ringW_ + 1) % ringFrames_;
                 ++ringCount_;
                 ++ok;
             }
+            if(final&&ok==nBytes)inputFinished_=true;
         }
         dsdPushed_ += ok;
         return ok;
@@ -711,6 +771,14 @@ public:
 
     bool dsd_mode() const { return dsdMode_; }
     const AsioDsdInfo& dsd_info() const { return dsd_; }
+    // Driver observation only. Do not substitute the requested rate when the
+    // device cannot report it: callers must distinguish unknown from verified.
+    double sample_rate_readback() const {
+        ASIOSampleRate actual = 0.0;
+        if (!drv_ || drv_->getSampleRate(&actual) != ASE_OK || !std::isfinite(actual) || actual <= 0.0)
+            return 0.0;
+        return actual;
+    }
     // 每个回调周期写入的字节数（= 驱动 bufferSize/8）；rtaplay 按它切片
     long dsd_buffer_bytes() const { return dsdBufBytes_; }
     // 实时音量微调（与 WASAPI 同语义：相对播放起点的差值 dB，0 = 逐位原路径）。
@@ -738,6 +806,33 @@ public:
     unsigned long long dsd_pushed_bytes() const { return dsdPushed_; }
     unsigned long long callbacks() const { return callbacks_; }
 
+    // 驱动对 bufferSize 的接受度不一致：先按「缓冲毫秒 → 样本数」算目标值（不低于 pref、
+    // 不超过 max），createBuffers 失败时按阶梯重试（max → pref → 目标折半…），
+    // 每一次的原始 ASE 码都记进 attempts。返回 0 = 全部失败。
+    long create_buffers_resilient(long target, std::string& attempts) {
+        std::vector<long> tries;
+        auto add = [&](long v) {
+            if (v <= 0) return;
+            if (minBuf_ > 0 && v < minBuf_) v = minBuf_;
+            if (maxBuf_ > 0 && v > maxBuf_) v = maxBuf_;
+            if (v < 8) v = 8;
+            if (std::find(tries.begin(), tries.end(), v) == tries.end()) tries.push_back(v);
+        };
+        add(target);
+        add(maxBuf_);
+        add(prefBuf_);
+        for (long v = target / 2; v >= 512; v /= 2) add(v);
+        add(minBuf_);
+        attempts.clear();
+        for (long v : tries) {
+            for (auto& b : bufs_) b.isInput = ASIOFalse;
+            const ASIOError e = asio_guarded_create_buffers(drv_, bufs_.data(), (long)ch_, v, &cb_);
+            if (!attempts.empty()) attempts += ", ";
+            attempts += std::to_string(v) + ":" + std::to_string((long)e);
+            if (e == ASE_OK) { bufSize_ = v; return v; }
+        }
+        return 0;
+    }
     bool start(std::string& err) {
         if (!drv_ || !buffersCreated_) { err = "驱动未打开"; return false; }
         g_inst = this;
@@ -766,19 +861,21 @@ public:
         if (g_inst == this) g_inst = nullptr;
     }
     // 推交错 int32；返回实际接收帧数
-    size_t push(const int32_t* pcm, size_t frames) {
+    size_t push(const int32_t* pcm, size_t frames, bool final = false) {
         detail::pcm_dump("asio", pcm, frames * (size_t)ch_, srcBits_);   // 取证（默认关闭）
         size_t ok = 0;
         {
             std::lock_guard<std::mutex> lk(mx_);
-            while (ok < frames && ringCount_ < kRingFrames) {
+            if(inputFinished_)return 0;
+            while (ok < frames && ringCount_ < ringFrames_) {
                 const size_t dst = ringW_ * (size_t)ch_;
                 const size_t src = ok * (size_t)ch_;
                 for (int c = 0; c < ch_; ++c) ring_[dst + (size_t)c] = pcm[src + (size_t)c];
-                ringW_ = (ringW_ + 1) % kRingFrames;
+                ringW_ = (ringW_ + 1) % ringFrames_;
                 ++ringCount_;
                 ++ok;
             }
+            if(final&&ok==frames)inputFinished_=true;
         }
         // 通知驱动"数据已就绪"——放在写入方线程，避免与回调重入
         if (ok && drv_ && outReadySupported_) drv_->outputReady();
@@ -786,13 +883,24 @@ public:
     }
     size_t free_frames() const {
         std::lock_guard<std::mutex> lk(mx_);
-        return kRingFrames - ringCount_;
+        return ringFrames_ - ringCount_;
     }
     // 环里还压着多少（DSD 模式单位是字节）——收尾时要按它等驱动把尾巴吃完，否则统计里会冒出假欠载
     size_t buffered() const {
         std::lock_guard<std::mutex> lk(mx_);
         return ringCount_;
     }
+    // An explicit EOF is a promise that no more source data will arrive.
+    // The final push can publish it under the same lock as its partial tail.
+    void finish_input() {std::lock_guard<std::mutex> lock(mx_);inputFinished_=true;}
+    bool input_finished() const {std::lock_guard<std::mutex> lock(mx_);return inputFinished_;}
+    bool drain_complete() const {
+        std::lock_guard<std::mutex> lock(mx_);
+        return inputFinished_&&ringCount_==0&&inFlightUnits_[0]==0&&inFlightUnits_[1]==0;
+    }
+    unsigned long long eof_silence_callbacks() const {std::lock_guard<std::mutex> lock(mx_);return eofSilenceCallbacks_;}
+    unsigned long long eof_silence_units() const {std::lock_guard<std::mutex> lock(mx_);return eofSilenceUnits_;}
+    unsigned long long played_units() const {std::lock_guard<std::mutex> lock(mx_);return playedUnits_;}
     long buffer_size() const { return bufSize_; }
     const std::string& name() const { return name_; }
     int channels() const { return ch_; }
@@ -871,16 +979,23 @@ private:
         std::vector<int32_t> tmp;
         {
             std::lock_guard<std::mutex> lk(mx_);
+            // ASIO returns the now inactive buffer index. Its previous content
+            // has been consumed; merely copying the last ring frame into this
+            // buffer is not playback completion (there are two driver buffers).
+            playedUnits_+=inFlightUnits_[(size_t)idx];
+            inFlightUnits_[(size_t)idx]=0;
             tmp.resize(period * (size_t)ch_);
             const size_t take = ringCount_ < period ? ringCount_ : period;
             for (size_t i = 0; i < take; ++i) {
                 const size_t s = ringR_ * (size_t)ch_;
                 for (int c = 0; c < ch_; ++c) tmp[i * (size_t)ch_ + (size_t)c] = ring_[s + (size_t)c];
-                ringR_ = (ringR_ + 1) % kRingFrames;
+                ringR_ = (ringR_ + 1) % ringFrames_;
             }
             ringCount_ -= take;
+            inFlightUnits_[(size_t)idx]=take;
             if (take < period) {
-                ++underruns_;
+                if(inputFinished_){++eofSilenceCallbacks_;eofSilenceUnits_+=period-take;}
+                else ++underruns_;
                 const int32_t silence = dsdMode_ ? asio_silence_value(ASIOSTDSDInt8MSB1) : 0;
                 for (size_t i = take * (size_t)ch_; i < tmp.size(); ++i) tmp[i] = silence;
             }
@@ -928,29 +1043,46 @@ private:
         if (!std::isfinite(v)) return 0.0;
         return v < lo ? lo : (v > hi ? hi : v);
     }
+    void reset_completion_state() {
+        inputFinished_=false;inFlightUnits_[0]=inFlightUnits_[1]=0;
+        playedUnits_=eofSilenceCallbacks_=eofSilenceUnits_=0;callbacks_=0;
+    }
+    static int32_t pcm_to_bits(int32_t sample, int srcBits, int dstBits, double gain) {
+        const int64_t lim = int64_t(1) << (dstBits - 1);
+        if (gain == 1.0) {
+            // Integer unity never normalizes through 2^N-1: that scale used to
+            // change every sample above half scale by one bit, including the
+            // deliberately zero low bits of an 18/20/24-bit DAC in a 32-bit box.
+            int64_t value = sample;
+            if (dstBits >= srcBits) value *= int64_t(1) << (dstBits - srcBits);
+            else {
+                const int shift = srcBits - dstBits;
+                const int64_t half = int64_t(1) << (shift - 1);
+                value = value < 0 ? -((-value + half) >> shift) : (value + half) >> shift;
+            }
+            return (int32_t)std::clamp(value, -lim, lim - 1);
+        }
+        // Non-unity gain is a genuine requantization. Use the same asymmetric
+        // signed rails as PCM/WASAPI, including the representable -full scale.
+        const double value = std::ldexp((double)sample * gain, dstBits - srcBits);
+        return (int32_t)std::llround(asio_saturate(value, -(double)lim, (double)(lim - 1)));
+    }
     static void write_channel(void* dst, const int32_t* src, size_t stride, size_t n,
                               ASIOSampleType t, int srcBits, double gain = 1.0) {
         // 归一化因子：管线 int32 = srcBits 位定标
         const double inv = 1.0 / (double)(1LL << (srcBits - 1));
-        // gain == 1.0 时下面每一次乘法都是精确的（IEEE ×1.0 不改值），
-        // 所以 0 dB 的逐位契约与是否走这个参数无关 —— 但这里仍然显式短路，
-        // 让"未启用微调"这条路径与改造前逐条指令一致（也便于断言）。
         const bool unity = (gain == 1.0);
         switch (t) {
             case ASIOSTInt32LSB: {
                 int32_t* d = (int32_t*)dst;
-                for (size_t i = 0; i < n; ++i) {
-                    const double v = (double)src[i * stride] * inv;
-                    d[i] = (int32_t)llround(asio_saturate((unity ? v : v * gain) * 2147483647.0, -2147483647.0, 2147483647.0));
-                }
+                for (size_t i = 0; i < n; ++i) d[i] = pcm_to_bits(src[i * stride], srcBits, 32, gain);
                 break;
             }
             case ASIOSTInt24LSB: {
                 unsigned char* d = (unsigned char*)dst;
                 for (size_t i = 0; i < n; ++i) {
-                    const double v = (double)src[i * stride] * inv;
-                    // 24-bit 满幅：DoP 的标记位在最低 8 位，round-trip 必须精确
-                    const int32_t q = (int32_t)llround(asio_saturate((unity ? v : v * gain) * 8388607.0, -8388607.0, 8388607.0));
+                    // DoP marker is the high byte; payload and marker stay exact.
+                    const int32_t q = pcm_to_bits(src[i * stride], srcBits, 24, gain);
                     const uint32_t u = (uint32_t)q;
                     d[i * 3 + 0] = (unsigned char)(u & 0xFF);
                     d[i * 3 + 1] = (unsigned char)((u >> 8) & 0xFF);
@@ -960,10 +1092,7 @@ private:
             }
             case ASIOSTInt16LSB: {
                 int16_t* d = (int16_t*)dst;
-                for (size_t i = 0; i < n; ++i) {
-                    const double v = (double)src[i * stride] * inv;
-                    d[i] = (int16_t)llround(asio_saturate((unity ? v : v * gain) * 32767.0, -32767.0, 32767.0));
-                }
+                for (size_t i = 0; i < n; ++i) d[i] = (int16_t)pcm_to_bits(src[i * stride], srcBits, 16, gain);
                 break;
             }
             case ASIOSTFloat32LSB: {
@@ -998,6 +1127,7 @@ private:
     std::atomic<unsigned long long> callbacks_{0};
     long inCh_ = 0, outCh_ = 0;
     long minBuf_ = 0, maxBuf_ = 0, prefBuf_ = 0, granBuf_ = 0, bufSize_ = 512;
+    double bufferMs_ = 100.0;
     ASIOCallbacks cb_{};
     std::vector<ASIOBufferInfo> bufs_;
     std::vector<ASIOSampleType> types_;
@@ -1006,10 +1136,112 @@ private:
 
     mutable std::mutex mx_;
     std::vector<int32_t> ring_;
+    size_t ringFrames_ = kRingFrames;
     size_t ringR_ = 0, ringW_ = 0, ringCount_ = 0;
+    bool inputFinished_=false;
+    size_t inFlightUnits_[2]={0,0};
+    unsigned long long playedUnits_=0,eofSilenceCallbacks_=0,eofSilenceUnits_=0;
     std::atomic<unsigned long long> underruns_{0};
 };
 
 inline AsioDriver* AsioDriver::g_inst = nullptr;
+
+// The Web renderer supplies arbitrary-sized PCM/DoP blocks. Keep at most one
+// such block here, submit complete callback periods, and prime before start.
+// Explicit EOF and its partial last push are atomic in AsioDriver; normal EOF
+// silence is distinct from, and never clears, a mid-stream underrun.
+class AsioBufferedStream {
+public:
+    explicit AsioBufferedStream(AsioDriver& driver):driver_(driver){}
+    void configure(bool nativeDsd,uint32_t carrierRate,int channels,const std::atomic<bool>* stop=nullptr){
+        native_=nativeDsd;rate_=carrierRate;channels_=channels;stop_=stop;
+        period_=native_?std::max<size_t>(1,(size_t)driver_.dsd_buffer_bytes()/2):std::max<size_t>(1,(size_t)driver_.buffer_size());
+        pending_.clear();pendingOffset_=0;bytes_.clear();armed_=started_=fatal_=false;accepted_=0;err_.clear();drainState_="not-requested";
+    }
+    bool start(){armed_=true;return true;}
+    size_t write(const int32_t* words,size_t frames){
+        if(!frames||fatal_||cancelled()||driver_.input_finished())return 0;
+        if(!flush(false))return 0;
+        if(pendingOffset_){pending_.erase(pending_.begin(),pending_.begin()+(long long)pendingOffset_);pendingOffset_=0;}
+        pending_.insert(pending_.end(),words,words+frames*(size_t)channels_);
+        accepted_+=frames;
+        // These frames are now owned by pending_, even if a later device wait
+        // fails. Reporting zero here would duplicate them on a retry.
+        flush(false);
+        return frames;
+    }
+    bool drain(){
+        drainState_="draining";
+        if(cancelled()){drainState_="cancelled";return true;}
+        if(!flush(true)){drainState_=cancelled()?"cancelled":"write-failed";return cancelled();}
+        driver_.finish_input();
+        if(!ensure_started(true)){drainState_="start-failed";return false;}
+        if(!started_){drainState_="complete";return true;}
+        const double queuedFrames=(double)driver_.buffered()/(native_?2.:1.);
+        const double deadline=now_ms()+std::max(500.,1000.*(queuedFrames+3.*period_)/std::max<uint32_t>(1,rate_)+500.);
+        while(!driver_.drain_complete()){
+            if(cancelled()){drainState_="cancelled";return true;}
+            if(now_ms()>=deadline){err_="ASIO drain timeout before both driver buffers completed";drainState_="timeout";fatal_=true;return false;}
+            wait_ms(1);
+        }
+        drainState_="complete";return true;
+    }
+    bool failed()const{return fatal_;}
+    const std::string& last_error()const{return err_;}
+    const std::string& drain_state()const{return drainState_;}
+    size_t accepted_frames()const{return accepted_;}
+    size_t pending_frames()const{return (pending_.size()-pendingOffset_)/(size_t)std::max(1,channels_);}
+private:
+    friend struct AsioBufferedStreamTestAccess;
+    bool cancelled()const{return stop_&&stop_->load();}
+    double now_ms()const{return clockHook_?clockHook_():(double)GetTickCount64();}
+    void wait_ms(int ms){if(waitHook_)waitHook_(ms);else Sleep((DWORD)ms);}
+    bool ensure_started(bool force){
+        if(started_)return true;
+        const size_t buffered=driver_.buffered();
+        if(!buffered||(!force&&buffered<2*period_*(native_?2u:1u)))return true;
+        if(!armed_){err_="ASIO stream was not armed";fatal_=true;return false;}
+        if(!(startHook_?startHook_(err_):driver_.start(err_))){fatal_=true;return false;}
+        started_=true;return true;
+    }
+    bool flush(bool final){
+        while(pending_frames()>=period_||(final&&pending_frames()>0)){
+            const size_t take=std::min(period_,pending_frames());
+            const size_t units=take*(native_?2u:1u);
+            const double deadline=now_ms()+std::max(200.,3000.*period_/std::max<uint32_t>(1,rate_)+100.);
+            while(driver_.free_frames()<units){
+                if(cancelled())return false;
+                if(!ensure_started(false))return false;
+                if(now_ms()>=deadline){err_="ASIO ring did not accept a complete callback period";fatal_=true;return false;}
+                wait_ms(1);
+            }
+            const bool last=final&&take==pending_frames();
+            size_t got=0;
+            if(native_){
+                bytes_.resize(units*(size_t)channels_);
+                for(size_t n=0;n<take;++n)for(int c=0;c<channels_;++c){
+                    uint8_t hi=0,lo=0;rta::dsp::dop_word_to_dsd_bytes((uint32_t)pending_[pendingOffset_+n*(size_t)channels_+(size_t)c],hi,lo);
+                    bytes_[(2*n)*(size_t)channels_+(size_t)c]=hi;bytes_[(2*n+1)*(size_t)channels_+(size_t)c]=lo;
+                }
+                got=driver_.push_dsd(bytes_.data(),units,last)/2;
+            }else got=driver_.push(pending_.data()+pendingOffset_,take,last);
+            if(got!=take){err_="ASIO ring rejected a reserved callback period";fatal_=true;return false;}
+            pendingOffset_+=take*(size_t)channels_;
+            if(pendingOffset_==pending_.size()){pending_.clear();pendingOffset_=0;}
+            if(!ensure_started(false))return false;
+        }
+        return true;
+    }
+    AsioDriver& driver_;
+    bool native_=false,armed_=false,started_=false,fatal_=false;
+    uint32_t rate_=48000;int channels_=2;size_t period_=512,accepted_=0;
+    const std::atomic<bool>* stop_=nullptr;
+    std::vector<int32_t> pending_;std::vector<uint8_t> bytes_;
+    size_t pendingOffset_=0;
+    std::string err_,drainState_="not-requested";
+    std::function<bool(std::string&)> startHook_;
+    std::function<void(int)> waitHook_;
+    std::function<double()> clockHook_;
+};
 
 } // namespace rta::audio

@@ -35,6 +35,14 @@ struct DopPackState {
     std::vector<char> phaseA;      // 每声道一个：true 表示本帧该用 0x05
 };
 
+// 2026-11-15：DoP 24-bit 帧 → 原生 DSD 的 2 个字节（MSB-first）。
+// DoP 帧：bits16..23 是 0x05/0xFA 标记，bits0..15 是 16 个 DSD 位（bit15 最早）。
+// ASIO 原生 DSD（类型 33 MSB1）每字节 bit7 最早，所以高字节在前，正好不用翻转位序。
+inline void dop_word_to_dsd_bytes(uint32_t word, uint8_t& hi, uint8_t& lo) {
+    hi = (uint8_t)((word >> 8) & 0xFF);
+    lo = (uint8_t)(word & 0xFF);
+}
+
 // 流式版本：相位跨调用保持。frames 必须是 16 的整数倍，否则尾部会被丢掉。
 inline void dop_pack(const double* const* sdm, int channels, size_t frames,
                      std::vector<int32_t>& out, DopPackState& st) {

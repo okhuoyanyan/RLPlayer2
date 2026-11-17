@@ -7,7 +7,7 @@ inline const char* rta_ui_workbench_state_js() {
 // One transport tail owns parameter-changing HTTP only. Reads and UI refreshes
 // run outside it; an intent epoch invalidates older captured settings forms.
 var rlSettingsFence={epoch:0,pending:0,version:0,versions:{},tail:Promise.resolve(),waiters:[],
- keys:['filter','filterNx','rate','rateFamilyPolicy','dsd','dsdnative','directsdm','shaper','twostage','taps','atten','transition','phase','modorder','modfamily','modcut','moddith','oobgain','ahmbits','sdmfilt','sdmfiltnx','isp','eq','ir','irgpu','roomcorrauto','loudness','rgmode','rgclip','cleanup','cleanup_auto','cleanup_strength','cleanup_noise_db','dsdkind','dsdconv','dsd2stage','bits','channels','trim','backend','device','buffer','gpuvendor','upnpdev','ramp','opraproduct','oprapreset'],
+ keys:['filter','filterNx','rate','rateFamilyPolicy','dsd','dsdnative','directsdm','shaper','dacbits','crossfeed','crossfeed_freq','crossfeed_level','twostage','taps','atten','transition','phase','modorder','modfamily','modcut','moddith','oobgain','ahmbits','sdmfilt','sdmfiltnx','isp','eq','ir','irgpu','roomcorrauto','loudness','rgmode','rgclip','cleanup','cleanup_auto','cleanup_strength','cleanup_noise_db','dsdkind','dsdconv','dsd2stage','bits','channels','trim','backend','device','buffer','gpuvendor','upnpdev','ramp','opraproduct','oprapreset'],
  group:function(){return typeof rlCompare==='undefined'?'':rlCompare.activeId||'';},
  signature:function(){var s=typeof rlConsole!=='undefined'&&rlConsole.state;return JSON.stringify([this.keys.map(function(k){return s&&s.settings&&s.settings[k];}),s&&s.peq]);},
  busy:function(){return this.pending>0||(typeof rlConsole!=='undefined'&&rlConsole.busy)||(typeof rlCompare!=='undefined'&&rlCompare.parameterSaving)||(typeof rlWorkbenchQueue!=='undefined'&&rlWorkbenchQueue.active&&rlWorkbenchQueue.active.parameter);},
@@ -103,10 +103,11 @@ var rlWorkbenchQueue={tail:Promise.resolve(),pending:0,active:null,run:function(
 var rlCompare = {
   slots:[],activeId:'',loop:{enabled:false,start:0,end:0,file:''},saving:false,parameterSaving:false,error:'',listeners:[],read:null,generation:0,migrationRead:null,
   storageKey:'rlplayer-comparison-v1',legacy:null,migrationAttempted:false,
-  keys:['filter','filterNx','rate','rateFamilyPolicy','dsd','dsdnative','directsdm','shaper','twostage',
+  keys:['filter','filterNx','rate','rateFamilyPolicy','dsd','dsdnative','directsdm','shaper','dacbits','crossfeed','crossfeed_freq','crossfeed_level','twostage',
     'taps','atten','transition','phase','modorder','modfamily','modcut','moddith','oobgain','ahmbits',
     'sdmfilt','sdmfiltnx','isp','eq','ir','irgpu','roomcorrauto','loudness','rgmode','rgclip','cleanup',
-    'cleanup_auto','cleanup_strength','cleanup_noise_db','dsdkind','dsdconv','dsd2stage','bits','channels','trim'],
+    'cleanup_auto','cleanup_strength','cleanup_noise_db','dsdkind','dsdconv','dsd2stage','bits','channels','trim',
+    'backend','device','buffer','upnpdev'],
   subscribe:function(fn){if(this.listeners.indexOf(fn)<0)this.listeners.push(fn);},
   notify:function(){this.listeners.forEach(function(fn){try{fn();}catch(e){console.error('Comparison UI',e);}});},
   copy:function(value){return JSON.parse(JSON.stringify(value));},

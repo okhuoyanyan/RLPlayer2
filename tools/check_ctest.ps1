@@ -18,6 +18,11 @@ try {
   $env:RTA_NO_DEVICE='1'; $env:RTA_NET_TESTS='0'; $env:PYTHONOPTIMIZE=''
   $ErrorActionPreference='Continue'
   $rcAll=0
+  # 2026-11-16（用户：错一个为什么要重跑全部）：迭代时可以让门禁**首红即停**。
+  #   默认关闭（发布口径不变：跑完全部再汇总）；设 RTA_GATE_FAILFAST=1 时，
+  #   第一阶段一红就不再跑第二阶段，几秒钟就能看到是哪一个失败。
+  $failFast=($env:RTA_GATE_FAILFAST -eq '1')
+  if($failFast){ $base+=@('--stop-on-failure'); Write-Host 'GATE fail-fast enabled (RTA_GATE_FAILFAST=1)' }
   $twoPhase=($Parallel -gt 1) -and (-not [string]::IsNullOrWhiteSpace($SerialTests))
   if ($twoPhase) {
     $par=$Report+'.par.xml'; $ser=$Report+'.ser.xml'
@@ -25,7 +30,8 @@ try {
     $a1=$base+@('--parallel',[string]$Parallel,'-E',$SerialTests,'--output-junit',$par)
     & ctest @a1
     if ($LASTEXITCODE -ne 0) {$rcAll=1}
-    Write-Host 'GATE phase 2/2: load-sensitive set, serial'
+    if($failFast -and $rcAll -ne 0){ Write-Host 'GATE fail-fast: phase 1 had failures, skipping phase 2'; $twoPhase=$false }
+    if($twoPhase){ Write-Host 'GATE phase 2/2: load-sensitive set, serial'
     # 2026-11-14：第二段必须允许"零匹配" —— 当调用方用 -Include 只选了一小批测试
     # （例如 verify_ffmpeg_lite 只选 ffmpeg 相关），这一批里可能一个负载敏感项都没有，
     # 此时 --no-tests=error 会把"本来就该空"判成失败。空集合的守门交给第一段与末尾的
@@ -34,7 +40,9 @@ try {
     $a2=$baseNoErr+@('-R',$SerialTests,'--output-junit',$ser)
     & ctest @a2
     if ($LASTEXITCODE -ne 0) {$rcAll=1}
-    $reports=@($par,$ser)
+    }
+    if(Test-Path -LiteralPath $par){ $reports+= $par }
+    if(Test-Path -LiteralPath $ser){ $reports+= $ser }
   } else {
     $a=$base
     if ($Parallel -gt 0) {$a=$a+@('--parallel',[string]$Parallel)}

@@ -10,6 +10,7 @@
 #pragma once
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #ifdef _WIN32
@@ -41,7 +42,13 @@ inline const std::string& pcm_dump_dir() {
 // tag 区分后端（"asio" / "wasapi-ex"）；bits = 管线有效位深（16/24/32）。
 // 内部统一归一到 24 位再落盘，所以两条路径的文件可以直接逐字节比对。
 inline void pcm_dump(const char* tag, const int32_t* src, size_t n, int bits) {
-    static const size_t kFrames = 44100;    // 固定 1 秒 @44.1k，等长才好比哈希
+    // 默认 1 秒 @44.1k；高码率取证用 RTA_PCM_DUMP_FRAMES 指定帧数（等长仍由调用方保证）。
+    static const size_t kFrames = []() -> size_t {
+        const char* e = std::getenv("RTA_PCM_DUMP_FRAMES");
+        if (!e || !*e) return 44100;
+        const unsigned long long v = std::strtoull(e, nullptr, 10);
+        return v ? (size_t)v : 44100;
+    }();
     static FILE* f = nullptr;
     static std::string cur;
     static size_t frames = 0;

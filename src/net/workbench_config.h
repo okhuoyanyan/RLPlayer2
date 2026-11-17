@@ -14,7 +14,8 @@ inline const std::set<std::string>& audio_keys() {
         "modcut", "moddith", "oobgain", "ahmbits", "sdmfilt", "sdmfiltnx", "isp", "eq", "ir",
         "irgpu", "roomcorrauto", "loudness", "rgmode", "rgclip", "cleanup", "cleanup_auto",
         "cleanup_strength", "cleanup_noise_db", "dsdkind", "dsdconv", "dsd2stage", "bits",
-        "channels", "trim", "backend", "device", "buffer", "gpuvendor", "upnpdev"
+        "channels", "trim", "backend", "device", "buffer", "gpuvendor", "upnpdev",
+        "crossfeed", "crossfeed_freq", "crossfeed_level", "dacbits"
     };
     return keys;
 }
@@ -63,6 +64,8 @@ inline Values parameters(const PlayParams& p) {
         {"sdmfilt",p.sdmFilter},{"sdmfiltnx",p.sdmFilterNx},{"isp",p.isp?"1":"0"},
         {"eq",p.eqFile},{"ir",p.convIr},{"irgpu",p.convGpu?"1":"0"},
         {"roomcorrauto",p.roomCorrAuto?"1":"0"},{"loudness",p.loudness?"1":"0"},
+        {"crossfeed",p.crossfeed?"1":"0"},{"crossfeed_freq",number(p.crossfeedFreq)},
+        {"crossfeed_level",number(p.crossfeedLevelDb)},{"dacbits",std::to_string(p.dacBits)},
         {"rgmode",p.rgMode},{"rgclip",p.rgClip?"1":"0"},{"cleanup",p.cleanup?"1":"0"},
         {"cleanup_auto",p.cleanupAuto?"1":"0"},{"cleanup_strength",number(p.cleanupStrength)},
         {"cleanup_noise_db",number(p.cleanupNoiseDb)},{"dsdkind",p.dsdKind},{"dsdconv",p.dsdConv},
@@ -88,7 +91,7 @@ inline std::string mode(const PlayParams& p, const rta::dsp::PeqSettings& peq) {
     for (double value : p.trim) trim |= value != 0.0;
     if ((p.rate.empty() || p.rate == "src") && p.filter.empty() && p.filterNx.empty() &&
         p.shaper == "none" && p.eqFile.empty() && p.convIr.empty() && !p.loudness &&
-        !p.isp && !p.cleanup && !p.roomCorrAuto && p.rgMode == "off" && !trim && peq.bypass &&
+        !p.isp && !p.cleanup && !p.crossfeed && p.dacBits==0 && !p.roomCorrAuto && p.rgMode == "off" && !trim && peq.bypass &&
         (p.dsd == 0 || p.directSdm))
         return "bitperfect";
     if (p.dsd > 0) return "dsd";
@@ -191,7 +194,7 @@ inline bool parse_body(const std::string& body, Values& out, std::string& why) {
         }
         if (!valid_utf8(value)) { why="配置不是有效 UTF-8"; return false; }
         for (unsigned char c:value) if (c<32 || c==127) { why="配置含控制字符"; return false; }
-        out[key]=value;
+        out[key]=(key=="shaper" && value=="Shaped") ? "shaped" : value;
     }
     if (!out.count("expected_file") || !out.count("expected_revision")) {
         why="请先读取当前工作台，再提交配置"; return false;
@@ -207,9 +210,9 @@ inline bool validate_fields(const Values& patch, std::string& why) {
         {"rgmode","|off|track|album|"}, {"modfamily","|dsd|chebyshev|ec|ahm|"},
         {"profile","|bitperfect|pcm|dsd|"}, {"style","|warm|balanced|sharp|"}
     };
-    const std::set<std::string> flags={"dsdnative","directsdm","isp","irgpu","roomcorrauto","loudness","rgclip","cleanup","cleanup_auto","dsd2stage"};
+    const std::set<std::string> flags={"dsdnative","directsdm","isp","irgpu","roomcorrauto","loudness","rgclip","cleanup","cleanup_auto","dsd2stage","crossfeed"};
     const std::map<std::string,std::pair<double,double>> bounds = {
-        {"dsd",{0,1024}},{"bits",{0,32}},{"channels",{0,8}},{"buffer",{10,2000}},
+        {"dsd",{0,1024}},{"bits",{0,32}},{"dacbits",{0,32}},{"crossfeed_freq",{300,1200}},{"crossfeed_level",{3,15}},{"channels",{0,8}},{"buffer",{10,2000}},
         {"taps",{0,4194304}},{"atten",{0,400}},{"transition",{0,1}},
         {"modorder",{0,15}},{"modcut",{0,1000}},{"moddith",{-1,1}},
         {"oobgain",{0,100}},{"ahmbits",{2,16}},{"cleanup_strength",{0,1}},{"cleanup_noise_db",{-120,-60}}
@@ -220,10 +223,11 @@ inline bool validate_fields(const Values& patch, std::string& why) {
         if (const auto it=bounds.find(key);it!=bounds.end()) {
             double n=0;
             if (!parse_num_strict(value,n) || !rta::audio::audio_finite(n) || n<it->second.first || n>it->second.second) {why="参数超出范围："+key;return false;}
-            if ((key=="dsd"||key=="bits"||key=="channels"||key=="buffer"||key=="taps"||key=="modorder"||key=="ahmbits") && n!=std::floor(n)) {why="参数须为整数："+key;return false;}
+            if ((key=="dsd"||key=="bits"||key=="dacbits"||key=="channels"||key=="buffer"||key=="taps"||key=="modorder"||key=="ahmbits") && n!=std::floor(n)) {why="参数须为整数："+key;return false;}
+            if(key=="dacbits" && n!=0 && n<8){why="DAC 有效位深须为自动 0 或 8～32 bit";return false;}
         }
         if ((key=="filter"||key=="filterNx"||key=="sdmfilt"||key=="sdmfiltnx") && !value.empty() && value!="auto" && !rta::dsp::find_preset(value)) {why="未找到滤波器："+value;return false;}
-        if (key=="shaper" && value!="none" && std::string("|auto|none|NS1|NS4|NS5|NS9|LNS15|RPDF|TPDF|Gauss1|shaped|").find('|'+value+'|')==std::string::npos) {why="未找到抖动整形器："+value;return false;}
+        if (key=="shaper" && value!="none" && std::string("|auto|none|NS1|NS4|NS5|NS9|LNS15|RPDF|TPDF|Gauss1|shaped|Shaped|").find('|'+value+'|')==std::string::npos) {why="未找到抖动整形器："+value;return false;}
         if (key=="rate" && value!="src" && value!="max" && value!="follow") {
             double n=0;if(!parse_num_strict(value,n)||!rta::audio::audio_finite(n)||n!=std::floor(n)||n<8000||n>49152000){why="输出采样率无效";return false;}
         }
@@ -302,6 +306,7 @@ inline bool plan_profile(const Values& patch, PlayParams& candidate, rta::dsp::P
         candidate.eqFile.clear();candidate.convIr.clear();candidate.convGpu=false;
         candidate.loudness=false;candidate.isp=false;candidate.roomCorrAuto=false;
         candidate.cleanup=false;candidate.rgMode="off";peq.bypass=true;
+        candidate.crossfeed=false;candidate.dacBits=0;
         for(double& trim:candidate.trim)trim=0;
     }
     return true;
@@ -328,6 +333,7 @@ inline std::string apply(const std::string& body, bool sessionAlreadyLocked = fa
     auto peq=previousPeq;
     if(patch.count("peq")&&!parse_peq(patch.at("peq"),peq,why))return error(400,why);
     if(!plan_profile(patch,candidate,peq,why))return error(400,why);
+    if(const auto precisionError=pcm_shaper_request_error(candidate);!precisionError.empty())return error(400,precisionError);
     if(patch.count("style")){
         if(mode(candidate,peq)=="bitperfect")return error(400,"原音直通不应用听音风格，请先选择升频方式");
         const auto value=patch.at("style");

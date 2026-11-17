@@ -1,4 +1,5 @@
-// dither.h — 抖动与噪声整形（对应 HQPlayer 手册 4.4 的 10 个选项）
+// dither.h — PCM 抖动与噪声整形（10 个选项，均为 RLPlayer 自有实现）
+// 名称/类别参考 HQPlayer 的公开手册；不宣称系数、曲线或听感与其专有实现等效。
 //
 // 结构：误差反馈型噪声整形
 //   u[n] = x[n] + sum_{k=1..N} h[k] * e[n-k]      （反馈过去的量化误差）
@@ -7,24 +8,27 @@
 // 由此得  Y(z) = X(z) + NTF(z) * E(z)，其中
 //   NTF(z) = 1 + sum_{k>=1} h[k] z^-k
 //
-// 本实现取 NTF(z) = (1 - r*z^-1)^N ：直流处 N 阶零点，把量化噪声推向高频。
+// NS 系列取 NTF(z) = (1 - r*z^-1)^N。仅 r=1 时直流处有 N 阶零点；
+// r<1 时直流增益为 (1-r)^N，以较浅的整形换取低采样率下受控的高频增益。
 //
 // ★ 关键：r 必须按【输出采样率】重标定
-//   |NTF(f)| = (2r·sin(πf/fs))^N
+//   |NTF(f)| = [(1-r)^2 + 4r·sin²(πf/fs)]^(N/2)
 //   r=1 时高频端增益是 2^N。fs=44.1k 下 20 kHz 处有 +52 dB ——
 //   等于把 15~20 kHz 的白噪放大 400 倍（听感：高频嘶声）；
 //   而同样的系数在 fs=705.6k 下 20 kHz 处只有 -28 dB，非常温和。
 //   同一组系数不可能同时适合所有采样率。
-//   于是取 r = min(1, 1/(2·sin(π·20k/fs)))，保证可听带上端 |NTF| <= 1：
-//     44.1k -> r≈0.505（温和整形，绝不放大可听带）
-//     96k   -> r≈0.82
-//     176.4k 及以上 -> r=1（完整 N 阶整形）
-//   代价为零（仍是 N 次乘加），收益是任何输出采样率下都不会产生高频嘶声。
+//   下方 shaper_radius_for_rate() 解完整二次式，将 20 kHz 处的增益限制在
+//   +6 dB 预算内，而非错误宣称“可听带绝不放大”。半径还随阶数变化；
+//   NS9 在 44.1k/96k 时约为 0.083/0.741，176.4k 起为 1。
+//   超声噪声依然可能很高，尤其低位深/高阶组合；自动策略不会给低于24bit选LNS15。
 //
 // 手册对应关系（严格按手册描述设定阶数，不臆造 NS2/NS3/NS6/NS7/NS8）：
 //   NS1   1 阶，温和          NS4  4 阶
 //   NS5   5 阶，"相当激进"    NS9  9 阶，"非常激进"
-//   LNS15 15 阶，"平滑斜率"
+//   LNS15 15 阶。这里仍是二项式误差反馈，不是 HQPlayer 的未知专有曲线。
+// shaped 使用一阶高通 TPDF：d[n] = q * (U[n] - U[n-1])。
+// 每个样本的边缘分布仍为完整 TPDF（2 LSB 峰峰值），使低电平量化保持线性；
+// 其噪声频谱由真实输出测量，不能拿 NS 的 NTF 当作 shaped 的输出噪声曲线。
 #pragma once
 #include "fp_strict.h"   // 261030-01 审计：DSP 路径严格 IEEE（见该头注释）
 #include "kaiser.h"          // 提供 kPi
@@ -80,6 +84,41 @@ inline const char* shaper_name(Shaper s) {
         case Shaper::Shaped: return "shaped";
     }
     return "?";
+}
+
+// 公开手册的适用率建议，仅用于解释选择；不是本实现的硬性可用率限制。
+inline double shaper_recommended_min_rate(Shaper s) {
+    switch (s) {
+        case Shaper::NS1: case Shaper::NS9: return 176400.0;
+        case Shaper::NS4: case Shaper::Shaped: return 88200.0;
+        case Shaper::NS5: return 192000.0;
+        case Shaper::LNS15: return 352800.0;
+        default: return 0.0;
+    }
+}
+
+// 必须在设备实际输出率/位深确定后调用。低速率用完整 TPDF 避免量化音调；
+// 32bit 维持已有的纯舍入策略，手选的选项始终由调用方保留。
+// 高率自动只用 NS9：离线实测 24bit LNS15 的总带超声噪声比 NS9 高约 35dB，
+// 而 NS9 的 20Hz–20kHz 残差已很低。LNS15 留给显式手选；这不是对真实 DAC
+// 模拟互调的测量，也不把双精度数值噪底当成可听音质提升。
+// 8..15bit 的粗量化步长不适合自动高阶整形：8bit NS9 实测在过载后的
+// 小信号段仍会顶轨。自动固定 TPDF，手动选择的 NS9/LNS15 不受影响。
+inline Shaper auto_pcm_shaper(int bits, double actualRate) {
+    if (bits >= 32) return Shaper::None;
+    if (bits < 16 || !finite_bits(actualRate) || actualRate < 176400.0) return Shaper::TPDF;
+    return Shaper::NS9;
+}
+
+// This is a conservative public PCM boundary, not a claim that every rejected
+// pair failed. The 8..15-bit sweep found sustained low-level overload in NS9
+// at 8/9 bits and in LNS15 through 15 bits. Resolve actual container/DAC bits
+// before calling; auto resolves to TPDF here, and pre-DSD doubles are exempt.
+inline bool pcm_shaper_precision_supported(Shaper mode, int effectiveBits) {
+    return effectiveBits >= 16 || (mode != Shaper::NS9 && mode != Shaper::LNS15);
+}
+inline const char* pcm_shaper_precision_error() {
+    return "NS9/LNS15 不支持低于 16 bit 的 PCM 有效位深；请选择 TPDF，或将 DAC 有效位深和输出容器位深提高至至少 16 bit。";
 }
 
 // 确定性的 xorshift64*，保证测试可复现
@@ -183,7 +222,8 @@ public:
         h_.assign((size_t)order_ + 1, 0.0);
         for (int k = 1; k <= order_; ++k) h_[(size_t)k] = ntf_[(size_t)k];
         err_.assign((size_t)order_ + 1, 0.0);
-        dithHist_.assign((size_t)order_ + 1, 0.0);
+        // 预取前一随机数，使 shaped 首样本也有完整、零均值的 TPDF 分布。
+        if (s_ == Shaper::Shaped) ditherPrev_ = rng_.uniform();
     }
 
     int order() const { return order_; }
@@ -203,38 +243,26 @@ public:
 
     // 处理一个样本。x 必须落在 [-1, 1)。
     double process(double x) {
-        const size_t sz = (size_t)order_ + 1;
         double u = x;
         if (order_ > 0) {
             // 1) 误差反馈（只用过去的误差，严格因果）
             for (int k = 1; k <= order_; ++k)
-                u += h_[(size_t)k] * err_[(epos_ + sz - (size_t)k) % sz];
+                u += h_[(size_t)k] * err_[(size_t)k - 1];
 
-            // 2) 抖动
-            switch (s_) {
-                case Shaper::RPDF:   u += (rng_.uniform() - 0.5) * q_;                 break;
-                case Shaper::TPDF:   u += (rng_.uniform() + rng_.uniform() - 1.0) * q_; break;
-                case Shaper::Gauss1: u += rng_.gauss() * q_ * 0.5;                      break;
-                case Shaper::Shaped: {
-                    // 整形抖动：白噪经同一条 NTF 整形后注入
-                    const double w = (rng_.uniform() + rng_.uniform() - 1.0) * q_ * 0.5;
-                    double d = w;
-                    for (int k = 1; k <= order_; ++k)
-                        d += h_[(size_t)k] * dithHist_[(dpos_ + sz - (size_t)k) % sz];
-                    dithHist_[dpos_] = w;
-                    dpos_ = (dpos_ + 1) % sz;
-                    u += d;
-                    break;
-                }
-                default: break;
+        }
+        // 2) 抖动与误差反馈阶数无关。旧版把 shaped 放在 order>0 的分支，
+        // 但 shaped 的反馈阶数是0，整段永远不可达，实际退化成了 none。
+        switch (s_) {
+            case Shaper::RPDF:   u += (rng_.uniform() - 0.5) * q_;                 break;
+            case Shaper::TPDF:   u += (rng_.uniform() + rng_.uniform() - 1.0) * q_; break;
+            case Shaper::Gauss1: u += rng_.gauss() * q_ * 0.5;                     break;
+            case Shaper::Shaped: {
+                const double current = rng_.uniform();
+                u += (current - ditherPrev_) * q_;
+                ditherPrev_ = current;
+                break;
             }
-        } else {
-            switch (s_) {
-                case Shaper::RPDF:   u += (rng_.uniform() - 0.5) * q_;                 break;
-                case Shaper::TPDF:   u += (rng_.uniform() + rng_.uniform() - 1.0) * q_; break;
-                case Shaper::Gauss1: u += rng_.gauss() * q_ * 0.5;                      break;
-                default: break;
-            }
+            default: break;
         }
 
         // 防 NaN/Inf：坏 IR、EQ 系数或上游数值错误都可能送进来一个非有限值。
@@ -249,7 +277,8 @@ public:
         //   推过 1.0），误差 e = y - u 就变成 O(1)，再经 (1-z^-1)^15 反馈
         //   放大 90 dB，环路锁死在满幅方波 —— 听感是「播了几秒突然变成噪音」。
         //   把钳位放在量化【之前】后，|e| <= q/2 恒成立，反馈有界；过载只
-        //   表现为一次不足 1 LSB 的削顶，不会锁死（见 test_dither 第 4 节）。
+        //   不会把大过载误差送回环路。削顶损失取决于输入与反馈幅度，不能声称
+        //   一定不足1 LSB；高阶整形仍需要合理前级余量（见 test_dither 第 4 节）。
         const double uMax = 1.0 - q_;      // 最大可表示码值 2^(b-1)-1 对应的归一化值
         if (u > uMax) { u = uMax; ++overload_; }
         if (u < -1.0) { u = -1.0; ++overload_; }
@@ -263,16 +292,17 @@ public:
             const double eMax = 1024.0 * q_;
             if (e >  eMax) { e =  eMax; ++clamped_; }
             if (e < -eMax) { e = -eMax; ++clamped_; }
-            err_[epos_] = e;
-            epos_ = (epos_ + 1) % sz;
+            // 至多15个历史值；连续后移去掉每tap的整数取模。
+            // 乘加仍按 k=1..N 原顺序执行，保持既有 NS 输出逐位相同。
+            for (int k = order_ - 1; k > 0; --k) err_[(size_t)k] = err_[(size_t)k - 1];
+            err_[0] = e;
         }
         return y;
     }
 
     void reset() {
         std::fill(err_.begin(), err_.end(), 0.0);
-        std::fill(dithHist_.begin(), dithHist_.end(), 0.0);
-        epos_ = dpos_ = 0;
+        if (s_ == Shaper::Shaped) ditherPrev_ = rng_.uniform();
         clamped_ = 0;
         overload_ = 0;
         nonFinite_ = 0;
@@ -285,8 +315,8 @@ private:
     double q_ = 1.0;
     double fs_ = 44100.0;
     double radius_ = 1.0;
-    std::vector<double> ntf_, h_, err_, dithHist_;
-    size_t epos_ = 0, dpos_ = 0;
+    std::vector<double> ntf_, h_, err_;
+    double ditherPrev_ = 0.0;
     long long clamped_ = 0;
     long long overload_ = 0;
     long long nonFinite_ = 0;

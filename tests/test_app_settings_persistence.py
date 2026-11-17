@@ -23,6 +23,19 @@ atomic = store[store.index('inline std::recursive_mutex& meta_file_mutex('):stor
 workbench = (root/'src/net/workbench_config.h').read_text(encoding='utf-8')
 error_start = workbench.index('inline std::string error(')
 workbench_error = workbench[error_start:workbench.index('\n}', error_start)+2]
+def production_function(text, marker):
+    start = text.index(marker)
+    return text[start:text.index('\n}', start)+2]
+
+form = production_function(workbench, 'inline std::string form(')
+params_start = source.index('struct PlayParams {')
+params = source[params_start:source.index('\n};', params_start)+3]
+helpers = '\n'.join(production_function(source, marker) for marker in (
+    'static std::string jesc(', 'static std::string urlDecode(',
+    'static std::string artistimg_pct(', 'static rta::dsp::Shaper parse_shaper(',
+    'static std::string saved_backend_setting()', 'static double saved_volume_setting()',
+    'static bool saved_roomcorr_auto()', 'static std::string saved_rate_family_policy()',
+    'static PlayParams parseForm(', 'static std::string pcm_shaper_request_error('))
 prefix = r'''
 #define NOMINMAX
 #include <windows.h>
@@ -39,12 +52,16 @@ prefix = r'''
 #include <thread>
 #include <chrono>
 #include <cstdio>
+#include <charconv>
+#include <algorithm>
+#include <cctype>
+#include "audio/wav.h"
+#include "dsp/dither.h"
+#include "net/json.h"
 namespace fs=std::filesystem;
 static std::string base;
 static void filter_prewarm_cancel(){}
 static std::string path_in_exe_dir(const std::string& s){return (fs::path(base)/s).string();}
-static std::string urlDecode(const std::string& s){return s;}
-static std::string jesc(const std::string& s){return s;}
 struct Library{static Library& instance(){static Library x;return x;}void setScanThreads(size_t){}};
 namespace rta{namespace audio{inline bool valid_rate_family_policy(const std::string&){return true;}inline void set_stream_decode_enabled(bool){}}
 namespace net{static thread_local int lastStatus=200;inline void webui_set_status(int s){lastStatus=s;}inline std::string i18n_resolve(const std::string& s){return s;}}
@@ -54,11 +71,15 @@ inline void pp_set_output_lang(const std::string&){}
 '''
 wrapper = r'''
 }}
+// PRODUCTION_PLAY_PARAMS
+// PRODUCTION_SETTINGS_HELPERS
 // The extracted handler uses the same shared session lock as playback. Keep
 // one mutex for all fixture requests, including the concurrent partial saves.
 struct TestPlayerState { std::mutex sessionMx; };
 static TestPlayerState ps;
 namespace workbench {
+using Values = std::map<std::string,std::string>;
+// PRODUCTION_WORKBENCH_FORM
 static std::atomic<int> syncCalls{0};
 static std::atomic<bool> syncSuccess{true};
 static std::string lastSavedBytes;
@@ -126,6 +147,28 @@ int main(int argc,char**argv){base=argv[1];int failures=0,checks=0;
  }
  check(readerEarly==0,"extracted production metadata reader waits for the real settings file mutex");
  check(readerFresh==20,"production reader observes committed bytes only after writer unlocks");
+  auto ok=[&](const std::string& body){const auto response=settings({"/api/settings","POST",body});rta::net::Json j;return rta::net::lastStatus==200&&rta::net::json_parse_strict(response,j)&&j["ok"].b;};
+  auto precisionDenied=[&](const std::string& body,const char* what){
+    const auto bytes=read(file);const auto calls=workbench::syncCalls.load();
+    const auto response=settings({"/api/settings","POST",body});rta::net::Json j;
+    check(rta::net::lastStatus==400&&rta::net::json_parse_strict(response,j)&&!j["ok"].b&&j["error"].s().find("16 bit")!=std::string::npos&&j["error"].s().find("TPDF")!=std::string::npos,what);
+    check(read(file)==bytes&&workbench::syncCalls==calls,"precision rejection neither replaces saved bytes nor synchronizes the profile");
+  };
+  check(ok("bits=32&dacbits=18&shaper=NS9&dsd=0"),"valid 18-bit NS9 settings commit in a 32-bit container");
+  check(read(file).find("bits=32\n")!=std::string::npos&&read(file).find("dacbits=18\n")!=std::string::npos,"container and effective precision persist as distinct keys");
+  for(const char* shaper:{"NS9","LNS15"})for(int bits=8;bits<16;++bits)
+    precisionDenied(std::string("shaper=")+shaper+"&dacbits="+std::to_string(bits),"partial settings merge rejects unsupported low-bit manual shaping");
+  precisionDenied("bits=8&dacbits=32&shaper=NS9","precision restriction uses the smaller container even when DAC request is 32 bit");
+  check(ok("bits=16&dacbits=32&shaper=NS9"),"a 16-bit container with a wider DAC request remains supported");
+  check(ok("bits=32&dacbits=8&shaper=auto"),"automatic dither remains valid at 8-bit effective precision");
+  check(ok("shaper=TPDF"),"partial TPDF change preserves valid low-bit settings");
+  check(ok("shaper=Shaped"),"legacy Shaped input remains accepted");
+  const workbench::Values roundtrip{{"shaper","Shaped"},{"file","C:/A & B/100%+music.wav"},{"bits","32"},{"dacbits","18"}};
+  const auto parsed=parseForm(workbench::form(roundtrip));
+  check(parsed.shaper=="shaped"&&parsed.bits==32&&parsed.dacBits==18&&parsed.file==roundtrip.at("file"),"production form encoder and parser preserve escaped values and normalize Shaped");
+  check(ok("dsd=64&bits=24&dacbits=8&shaper=NS9"),"DSD double-precision route is exempt from PCM shaper precision rejection");
+  precisionDenied("dsd=0","partial return to PCM checks retained low-bit manual shaper before persistence");
+  check(ok("dsd=0&shaper=TPDF"),"a corrected PCM request can recover after precision rejection");
  printf("production_reader_early_returns=%d/20 production_reader_fresh_reads=%d/20 blocked_atomic_preserved=%d/100\n",readerEarly,readerFresh,deniedTrials);
  printf("original_checks=%d added_workbench_checks=%d sync_calls=%d sync_failure_http_status=%d\n",originalChecks,checks-originalChecks,workbench::syncCalls.load(),failedStatus);
  printf("checks=%d failures=%d\n",checks,failures);return failures?1:0;}
@@ -133,9 +176,9 @@ int main(int argc,char**argv){base=argv[1];int failures=0,checks=0;
 compiler = sys.argv[1] if len(sys.argv)>1 else r'C:/Program Files/AMD/ROCm/7.2/bin/clang++.exe'
 with tempfile.TemporaryDirectory(prefix='rlplayer-settings-test-') as folder:
     folder=pathlib.Path(folder);cpp=folder/'test.cpp';exe=folder/'test.exe'
-    fixture=prefix+atomic+wrapper.replace('// PRODUCTION_WORKBENCH_ERROR',workbench_error).replace('// PRODUCTION_SETTINGS_READER',reader)+handler+main
+    fixture=prefix+atomic+wrapper.replace('// PRODUCTION_PLAY_PARAMS',params).replace('// PRODUCTION_SETTINGS_HELPERS',helpers).replace('// PRODUCTION_WORKBENCH_FORM',form).replace('// PRODUCTION_WORKBENCH_ERROR',workbench_error).replace('// PRODUCTION_SETTINGS_READER',reader)+handler+main
     cpp.write_text(fixture,encoding='utf-8')
-    subprocess.run([compiler,'-std=c++17','-O0',str(cpp),'-o',str(exe)],check=True)
+    subprocess.run([compiler,'-std=c++17','-O0','-I'+str(root/'src'),str(cpp),'-o',str(exe)],check=True)
     result=subprocess.run([str(exe),str(folder)],capture_output=True,text=True,encoding='utf-8',errors='replace')
     print(result.stdout,end='');print(result.stderr,end='',file=sys.stderr)
     report={'exit':result.returncode,'stdout':result.stdout,'stderr':result.stderr,'audioOpened':False,'serverStarted':False,
@@ -143,6 +186,8 @@ with tempfile.TemporaryDirectory(prefix='rlplayer-settings-test-') as folder:
             'productionSourceSHA256':hashlib.sha256((root/'tools/rtaweb.cpp').read_bytes()).hexdigest(),
             'productionHandlerSHA256':hashlib.sha256(handler.encode()).hexdigest(),
             'productionReaderExtracted':True,'productionReaderSHA256':hashlib.sha256(reader.encode()).hexdigest(),
+            'productionFormExtracted':True,'productionFormSHA256':hashlib.sha256(form.encode()).hexdigest(),
+            'productionParsingAndPrecisionHelpersSHA256':hashlib.sha256(helpers.encode()).hexdigest(),
             'productionErrorSHA256':hashlib.sha256(workbench_error.encode()).hexdigest(),
             'fixtureSHA256':hashlib.sha256(fixture.encode()).hexdigest(),'executedEXESHA256':hashlib.sha256(exe.read_bytes()).hexdigest()}
     if os.environ.get('RLPLAYER_TEST_EVIDENCE_DIR'):

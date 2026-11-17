@@ -115,12 +115,14 @@ async function main(){
     await ready('window.S && S.curMeta && PLAYBACK_SETTINGS.ready');
     report.geometry.push(await itemGeometry());
     await evaluate('openNowPlaying()');await canvasColor(files.A,'255,0,0');
-    holdStatus=true;await evaluate('tick();tick()');await waitFor(()=>statusWait.length>=2,'two overlapping polls');
-    const early=statusWait.shift();file=files.B;await poll(file);
+    holdStatus=true;await evaluate('for(var i=0;i<20;i++)tick();void 0');await waitFor(()=>statusWait.length===1,'one shared in-flight status poll');
+    await delay(700);
+    check('twenty ticks and interval polling share one stalled status request',statusWait.length===1);
+    const early=statusWait.shift();await send(early,status(files.A));file=files.B;await poll(file);
     report.art.push({stage:'B loaded',...await canvasColor(file,'0,128,255')});
-    await send(early,status(files.A));await delay(220);
-    const stale=await art();report.art.push({stage:'older A status delivered',...stale});
-    check('late A status cannot replace decoded B artwork or title',stale.file===files.B&&stale.color==='0,128,255'&&stale.title==='Two');
+    await delay(220);
+    const stale=await art();report.art.push({stage:'single-flight poll advanced to B',...stale});
+    check('polling recovers from a stalled A response and retains decoded B artwork',stale.file===files.B&&stale.color==='0,128,255'&&stale.title==='Two');
     await screenshot('late-status');
     if(!gate){
       file=files.A;metaDelay=files.A;await poll(file);await waitFor(()=>metadataWait.length,'delayed A metadata');

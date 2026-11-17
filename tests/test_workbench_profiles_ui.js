@@ -6,14 +6,14 @@ const root=process.env.RLPLAYER_TEST_SOURCE_ROOT||path.resolve(__dirname,'..');
 const script=fs.readFileSync(path.join(root,'src/net/ui_workbench_state.h'),'utf8').match(/return R"WORKBENCH\(([\s\S]*?)\)WORKBENCH";/)[1];
 let checks=0;function check(label,fn){fn();checks++;console.log('PASS '+label);}const copy=v=>JSON.parse(JSON.stringify(v));
 function fixture(server,legacy){
- const initial={filter:'poly-sinc-short-lp',filterNx:'',rate:'88200',rateFamilyPolicy:'prefer',dsd:'0',dsdnative:'0',twostage:'0',modorder:'5',modfamily:'dsd'};
+ const initial={filter:'poly-sinc-short-lp',filterNx:'',rate:'88200',rateFamilyPolicy:'prefer',dsd:'0',dsdnative:'0',twostage:'0',modorder:'5',modfamily:'dsd',backend:'wasapi',device:'Fixture Device',buffer:'100',upnpdev:''};
  const peq={bypass:1,preamp:0,bands:Array.from({length:20},(_,i)=>({i:i+1,on:true,type:'PK',freq:20*Math.pow(1000,i/19),gain:0,q:1.41}))};
  server=server||{active:'A',slots:['A','B','C','D'].map(id=>({id,name:id,settings:copy(initial),peq:copy(peq),eqId:'',eqName:'',migrated:false})),loop:{enabled:false,start:0,end:0,file:''},state:{ok:true,settings:{...initial,backend:'null',device:'Fixture Null',volume:'-64.5'},peq,file:'Q:/Fixture.wav',position:12.5,duration:40,cueStart:0,cueEnd:40,queueIndex:0,revision:'1',playing:true,paused:false}};
  const requests=[],writes=[],store=new Map();if(legacy)store.set('rlplayer-comparison-v1',JSON.stringify(legacy));
  const env={Promise,URLSearchParams,Date,console,window:{},localStorage:{getItem:k=>store.get(k)||null,setItem:()=>{throw Error('legacy write forbidden');}},t:x=>x,ready:true,ensurePlaybackSettings:()=>env.ready,_capsCache:null,loadSettings:()=>Promise.resolve({ok:true}),failApply:false,
  apiGetRaw:async url=>{requests.push(url);if(env.failRead)throw Error('read unavailable');if(url==='/api/workbench/profiles')return copy({ok:true,active:server.active,slots:server.slots,loop:server.loop});return copy(server.state);},
  apiAct:async(url,body)=>{const p=Object.fromEntries(new URLSearchParams(body));writes.push({url,...p});if(env.failApply)return {ok:false,error:'Unsupported format'};
-  const active=()=>server.slots.find(s=>s.id===server.active),safe=()=>Object.fromEntries(Object.entries(server.state.settings).filter(([k])=>!['backend','device','volume'].includes(k))),snapshot=()=>Object.assign(active(),{settings:safe(),peq:copy(server.state.peq),migrated:true});
+  const active=()=>server.slots.find(s=>s.id===server.active),safe=()=>Object.fromEntries(Object.entries(server.state.settings).filter(([k])=>k!=='volume')),snapshot=()=>Object.assign(active(),{settings:safe(),peq:copy(server.state.peq),migrated:true});
   if(url==='/api/workbench/profile'){
    const target=server.slots.find(s=>s.id===p.id);if(!target)return {ok:false,error:'unknown slot'};
    if(p.action==='rename')target.name=p.name;
@@ -30,9 +30,13 @@ function fixture(server,legacy){
  check('boot is read only and performs no device or configuration action',()=>{assert.equal(f.writes.length,0);assert.equal(f.requests.length,0);assert.equal(c.slots.length,4);});
  await ui.refresh();await c.refresh();
  check('four real independent server groups initialize without a manual save',()=>{assert.equal(c.activeId,'A');assert.equal(c.slots.length,4);assert(c.slots.every(s=>s.settings));assert.equal(f.writes.length,0);});
- check('comparison snapshots exclude global volume, backend and device',()=>{const settings=c.selectedSettings(ui.state.settings);for(const k of ['volume','backend','device'])assert(!Object.hasOwn(settings,k));});
+ check('comparison snapshots exclude live volume but retain per-group backend/device',()=>{const settings=c.selectedSettings(ui.state.settings);assert(!Object.hasOwn(settings,'volume'));for(const k of ['backend','device','buffer','upnpdev'])assert(Object.hasOwn(settings,k),k+' must be per-group');});
  for(const [i,id] of ['A','B','C','D'].entries()){await c.load(id);await c.update({filter:'filter-'+id,rate:String(88200*(i+1)),taps:String(i*1024)},id);}
  check('A through D retain four distinct automatically saved parameter sets',()=>{assert.deepEqual(Array.from(c.slots,s=>s.settings.filter),['filter-A','filter-B','filter-C','filter-D']);});
+ await c.load('A');await c.update({backend:'wasapi',device:'Device-A'},'A');
+ await c.load('B');await c.update({backend:'asio',device:'Device-B'},'B');
+ await c.load('A');check('A and B keep independent output backends and devices',()=>{assert.equal(ui.state.settings.backend,'wasapi');assert.equal(ui.state.settings.device,'Device-A');});
+ await c.load('B');check('switching to B restores its ASIO device, not A device',()=>{assert.equal(ui.state.settings.backend,'asio');assert.equal(ui.state.settings.device,'Device-B');});
  await c.load('A');check('letter selection applies the corresponding saved parameters',()=>{assert.equal(c.activeId,'A');assert.equal(ui.state.settings.filter,'filter-A');assert.equal(ui.state.settings.rate,'88200');});
  await c.move(1);check('next group switches to B',()=>{assert.equal(c.activeId,'B');assert.equal(ui.state.settings.filter,'filter-B');});
  await c.move(-1);check('previous group returns to A',()=>assert.equal(c.activeId,'A'));

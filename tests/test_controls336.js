@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const {spawn, spawnSync} = require('node:child_process');
-const {once} = require('node:events');
+const {once, EventEmitter} = require('node:events');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function option(name, fallback) {
   const i = process.argv.indexOf(name);
@@ -38,30 +38,77 @@ function startBrowser() {
   if (!exe) throw Error('The production DOM regression requires Microsoft Edge.');
   // Chromium reads commands from FD 3 and writes its NUL-delimited replies to FD 4.
   const proc=spawn(exe,['--headless=new','--disable-gpu','--disable-background-networking','--disable-component-update','--no-first-run','--mute-audio','--remote-debugging-pipe','--user-data-dir='+path.join(run,'profile'),'about:blank'],{windowsHide:true,stdio:['ignore','ignore','ignore','pipe','pipe']});
+  return connectBrowser(proc);
+}
+function connectBrowser(proc, reportError=error=>errors.push(String(error))) {
   const pending=new Map(); let seq=0, buffer=Buffer.alloc(0), sessionId;
-  const closed=once(proc,'exit');
-  function send(method,params={},session=sessionId) {
+  let closing=false, exited=false, closePromise;
+  const closed=once(proc,'exit');closed.catch(()=>{}); // attach() still reports spawn errors; close() awaits this promise.
+  const ended=()=>Object.assign(Error('DevTools browser is closing or closed'),{code:'CDP_CLOSED'});
+  function rejectPending(error){for(const p of pending.values()){clearTimeout(p.timeout);p.reject(error);}pending.clear();}
+  function transportError(error){if(!closing)reportError(error);rejectPending(error);}
+  proc.once('exit',()=>{exited=true;const error=ended();if(!closing)reportError(error);rejectPending(error);});
+  proc.once('error',transportError);
+  proc.stdio[3].on('error',transportError);proc.stdio[4].on('error',transportError);
+  function command(method,params,session,shutdown=false) {
+    if((closing&&!shutdown)||exited||proc.stdio[3].destroyed||proc.stdio[3].writableEnded)return Promise.reject(ended());
     return new Promise((resolve,reject)=>{
       // 2026-11-14（3.3.11）：8 s 对冷启动的无头 Edge 太紧 —— 机器上有其它活时 Page.navigate
  // 会在 8 s 处被掐断（实测门禁里随机挂在 controls336 / workspace335_integration）。
  // 放宽到 30 s：真挂死仍会被 ctest 的 TIMEOUT 收掉，不会变成静默假绿。
   const id=++seq;const timeout=setTimeout(()=>{pending.delete(id);reject(Error('DevTools timed out on '+method));},30000);
       pending.set(id,{resolve,reject,timeout});
-      proc.stdio[3].write(JSON.stringify(session ? {id,method,params,sessionId:session} : {id,method,params})+'\0');
+      function failed(error){if(!error||!pending.has(id))return;pending.delete(id);clearTimeout(timeout);reject(error);}
+      try{proc.stdio[3].write(JSON.stringify(session ? {id,method,params,sessionId:session} : {id,method,params})+'\0',failed);}catch(error){failed(error);}
     });
   }
-  const api={send,async attach(){const {targetId}=await send('Target.createTarget',{url:'about:blank'});const result=await send('Target.attachToTarget',{targetId,flatten:true});sessionId=result.sessionId;},async close(){if(proc.exitCode===null){try{await send('Browser.close',{},null);}catch{}proc.stdio[3].end();}await closed;},onRequest:null};
+  function send(method,params={},session=sessionId){return command(method,params,session);}
+  const api={send,async attach(){const {targetId}=await send('Target.createTarget',{url:'about:blank'});const result=await send('Target.attachToTarget',{targetId,flatten:true});sessionId=result.sessionId;},close(){
+    if(closePromise)return closePromise;
+    // Stop new fixture work before Browser.close; delayed handlers may only receive CDP_CLOSED.
+    closing=true;api.onRequest=null;rejectPending(ended());
+    closePromise=(async()=>{try{if(!exited&&proc.exitCode===null){try{await command('Browser.close',{},null,true);}catch(error){if(error.code!=='CDP_CLOSED')throw error;}}}finally{if(!proc.stdio[3].destroyed&&!proc.stdio[3].writableEnded)proc.stdio[3].end();await closed;rejectPending(ended());}})();
+    return closePromise;
+  },onRequest:null};
   proc.stdio[4].on('data',chunk=>{
     buffer=Buffer.concat([buffer,chunk]);
     let split;
     while((split=buffer.indexOf(0))!==-1){
       const msg=JSON.parse(buffer.subarray(0,split).toString('utf8'));buffer=buffer.subarray(split+1);
       if(msg.id&&pending.has(msg.id)){const p=pending.get(msg.id);pending.delete(msg.id);clearTimeout(p.timeout);msg.error?p.reject(Error(msg.error.message)):p.resolve(msg.result);}
-      else if(msg.method==='Runtime.exceptionThrown')errors.push(msg.params.exceptionDetails.exception?.description||msg.params.exceptionDetails.text);
-      else if(msg.method==='Fetch.requestPaused'&&api.onRequest)api.onRequest(msg.params).catch(e=>{errors.push(String(e));});
+      else if(msg.method==='Runtime.exceptionThrown')reportError(msg.params.exceptionDetails.exception?.description||msg.params.exceptionDetails.text);
+      else if(msg.method==='Fetch.requestPaused'&&!closing&&api.onRequest)api.onRequest(msg.params).catch(error=>{if(!(closing&&error.code==='CDP_CLOSED'))reportError(error);});
     }
   });
   return api;
+}
+async function checkBrowserLifecycle(){
+  const failures=[],writes=[],verified=[];let endCalls=0;
+  async function verify(label,check){await check();verified.push(label);}
+  const proc=new EventEmitter();proc.exitCode=null;proc.stdio=[];
+  proc.stdio[3]=Object.assign(new EventEmitter(),{writableEnded:false,destroyed:false,write(value,callback){assert.equal(this.writableEnded,false,'never write an ended pipe');writes.push(JSON.parse(value.slice(0,-1)));callback?.();},end(){this.writableEnded=true;endCalls++;}});
+  proc.stdio[4]=new EventEmitter();
+  const browser=connectBrowser(proc,error=>failures.push(String(error)));
+  const reply=message=>proc.stdio[4].emit('data',Buffer.from(JSON.stringify(message)+'\0'));
+  const rejected=browser.send('Runtime.fixtureError');reply({id:writes.at(-1).id,error:{message:'visible fixture protocol error'}});
+  await verify('protocol errors reject during normal operation',()=>assert.rejects(rejected,/visible fixture protocol error/));
+  const transport=browser.send('Runtime.transportError');proc.stdio[3].emit('error',Error('visible fixture transport error'));
+  await verify('transport errors reject during normal operation',()=>assert.rejects(transport,/visible fixture transport error/));
+  await verify('transport errors are reported rather than swallowed',()=>assert.deepEqual(failures,['Error: visible fixture transport error']));failures.length=0;
+  const stalled=browser.send('Runtime.pending'),cancelled=verify('pending requests reject when shutdown starts',()=>assert.rejects(stalled,{code:'CDP_CLOSED'}));
+  let requestCalls=0,release;const held=new Promise(resolve=>release=resolve);
+  browser.onRequest=async()=>{requestCalls++;await held;await browser.send('Fetch.fulfillRequest');};
+  reply({method:'Fetch.requestPaused',params:{requestId:'in-flight'}});
+  const closing=browser.close();reply({method:'Fetch.requestPaused',params:{requestId:'late'}});release();await cancelled;
+  await verify('closing stops newly arriving fixture requests',()=>assert.equal(requestCalls,1));
+  await verify('only the private close command may write during shutdown',()=>assert.equal(writes.at(-1).method,'Browser.close'));reply({id:writes.at(-1).id,result:{}});
+  proc.exitCode=0;proc.emit('exit',0);await closing;await browser.close();
+  const written=writes.length;await verify('closed send explicitly rejects',()=>assert.rejects(browser.send('Fetch.fulfillRequest'),{code:'CDP_CLOSED'}));
+  await verify('closed send never touches the pipe',()=>assert.equal(writes.length,written));
+  await verify('close is idempotent',()=>assert.equal(endCalls,1));
+  await verify('delayed fixture rejection is clean during shutdown',()=>assert.deepEqual(failures,[]));
+  fs.writeFileSync(path.join(run,'cdp-lifecycle.json'),JSON.stringify({checks:verified,failures:0,writes:writes.map(x=>x.method),requestCalls,endCalls},null,2));
+  console.log('PASS CDP lifecycle: '+verified.length+' offline boundary checks');
 }
 const settings={quickstart:'1',uilang:'zh',filter:'poly-sinc-short-lp',filterNx:'',backend:'null',device:'null',volume:'-64.5',rate:'88200',dsd:'0',dsdnative:'0',twostage:'auto',shaper:'auto',modfamily:'dsd',modorder:'5',sdmfilt:'',sdmfiltnx:'',directsdm:'0',gpuvendor:'off',metaon:'0',metallm:'0',anlmaster:'1',autoanl:'1',roomcorrauto:'0',ui_profile:'pcm',ui_style:'balanced'};
 const mutations=[],volumeWrites=[],preferenceWrites=[],requests=[],forbidden=[],errors=[],checks=[],geometry=[];
@@ -151,6 +198,8 @@ function mock(url,method,body){
 }
 
 async function main(){
+ await checkBrowserLifecycle();
+ if(process.argv.includes('--cdp-self-test'))return;
  const assets=exportPage(),browser=startBrowser();let scenario='startup';const aborted=[];
  const evaluate=async expression=>{const r=await browser.send('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});if(r.exceptionDetails)throw Error(r.exceptionDetails.exception?.description||r.exceptionDetails.text);return r.result.value;};
  const until=async(expression,label)=>{const end=Date.now()+10000;while(Date.now()<end){if(await evaluate('Boolean('+expression+')'))return;await delay(30);}throw Error('Not ready '+(label||expression));};
@@ -373,6 +422,6 @@ async function main(){
   checked('all production JavaScript ran without an uncaught error',errors.length===0);checked('no physical playback or outside network action was made',forbidden.length===0);
   console.log(JSON.stringify({checks:checks.length,failures:0,evidence:run}));
  }catch(error){try{const pic=await browser.send('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(run,'failure.png'),Buffer.from(pic.data,'base64'));}catch{}console.error({scenario,errors,forbidden,evidence:run});throw error;}
- finally{fs.writeFileSync(path.join(run,'result.json'),JSON.stringify({checks,geometry,volumeWrites,preferenceWrites,requests,errors,forbidden,aborted,scenario},null,2));await browser.close();}
+ finally{try{await browser.close();}finally{fs.writeFileSync(path.join(run,'result.json'),JSON.stringify({checks,geometry,volumeWrites,preferenceWrites,requests,errors,forbidden,aborted,scenario},null,2));}assert.deepEqual(errors,[],'DevTools fixture remains error-free through browser shutdown');}
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

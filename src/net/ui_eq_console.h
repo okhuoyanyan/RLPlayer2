@@ -514,6 +514,19 @@ function rlEqRestore(){
   rlEqRender(RL_EQ_STATE);rlEqMsg('已一键复原：全部频段 0 dB、前级 0 dB、均衡关闭');
  }).catch(function(e){rlEqMsg(e.message,true);});
 }
+// 关闭当前组的均衡：只置 bypass=1，保留频段值（用户以后重新启用/保存时还在）。
+// 与"复原"不同：复原会把 20 段全部清零；这里只取消 EQ 的参与。
+function rlEqUnload(){
+ var current=RL_EQ_STATE||(typeof rlConsole!=='undefined'&&rlConsole.state&&rlConsole.state.peq)||null;
+ var bands=(current&&Array.isArray(current.bands))?current.bands:(typeof rlEqCollectBands==='function'?rlEqCollectBands():[]);
+ if(!bands.length)return Promise.resolve();
+ var value={bypass:1,preamp:Number(current&&current.preamp)||0,bands:bands};
+ RL_EQ.editVersion++;
+ return rlEqCommit(value,false).then(function(){
+  RL_EQ.loadedId='';RL_EQ.source='custom';RL_EQ.revision='';
+  rlEqMsg('均衡已关闭（旁路，频段保留）');
+ });
+}
 function rlEqLoadBank(){return apiGetRaw('/api/workbench/eqpresets').then(function(j){if(!j||!j.ok||!Array.isArray(j.slots))throw Error(j&&j.error||t('无法读取我的均衡'));RL_EQ.bank=j.slots;rlEqPaintBank();if(typeof rlEqPaintOpraSlots==='function')rlEqPaintOpraSlots();rlStudioQuickEq();return j;});}
 function rlEqPaintBank(){
  var grid='',activeSlot=rlCompare.slots.find(function(s){return s.id===rlCompare.activeId;}),activeEq=activeSlot&&activeSlot.eqId||'';

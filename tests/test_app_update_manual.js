@@ -7,7 +7,7 @@ let checks=0,failures=0;function ck(ok,label){checks++;if(!ok){failures++;consol
  const map=JSON.parse(fs.readFileSync(path.join(root,'data/i18n/'+lang+'.json'),'utf8'));
  const nodes={};for(const id of ['sp_updcur','sp_updstate','sp_updcard','sp_updver','sp_updplan','sp_updfiles','sp_updsize','sp_updnotes','sp_upddl','sp_updapply','sp_updcn','sp_updglobal','sp_updskip','sp_updmsg','sp_updbar'])nodes[id]={textContent:'',style:{},disabled:false};
  const c={I18N:{map},UPD:{recoveryBlocked:false},D:id=>nodes[id]||null,t:s=>map[s]||s,tf:(s,a)=>(map[s]||s).replace(/\{(\d+)\}/g,(_,i)=>a[i])};vm.createContext(c);
- for(const n of ['updNum','updSet','updShowCheck','updPollProgress'])vm.runInContext(fn(n),c);
+ for(const n of ['updNum','updSet','updWhy','updShowCheck','updPollProgress'])vm.runInContext(fn(n),c);
  c.updShowCheck({ok:true,hasUpdate:true,latest:'4.0.0',installMode:'manual',reason:'major-upgrade',cn:'https://pan.baidu.com/s/fixture',global:'https://github.com/okhuoyanyan/RLPlayer2/releases/v4.0.0',extractionCode:'test',fullSize:409276280});
  ck(nodes.sp_updplan.textContent.includes(map['跨大版本更新需要重新安装完整版。']),lang+' major upgrade is manual');
  ck(nodes.sp_updcn.style.display===''&&nodes.sp_updglobal.style.display==='',lang+' both regional manual links are visible');

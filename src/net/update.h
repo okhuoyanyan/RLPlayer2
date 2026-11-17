@@ -286,6 +286,9 @@ inline std::string check_json(){
     j+=",\"current\":\""+json_escape(current_version())+"\",\"latest\":\""+json_escape(result.remoteVersion)+"\"";
     j+=",\"hasUpdate\":"+std::string(result.available()?"true":"false")+",\"upToDate\":"+(result.up_to_date()?"true":"false");
     j+=",\"error\":\""+json_escape(error)+"\",\"errorCode\":\""+json_escape(result.errorCode)+"\"";
+    // 2026-11-15：外语界面按 errorCode 给本地化文案；HTTP 状态码单独给出来，
+    // 前端才能拼「Update server returned HTTP 429」，而不是回落中文整句。
+    j+=",\"httpStatus\":"+std::to_string(result.status);
     j+=",\"notes\":\""+json_escape(result.notes)+"\",\"publishedAt\":\""+json_escape(manifest.publishedAt)+"\"";
     j+=",\"expiresAt\":\""+json_escape(manifest.expiresAt)+"\",\"manifestUrl\":\""+json_escape(url)+"\"";
     j+=",\"checking\":"+std::string(checking?"true":"false")+",\"checked\":"+(checked?"true":"false")+",\"ageSec\":"+std::to_string(age);
