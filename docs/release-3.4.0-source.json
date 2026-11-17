@@ -1,0 +1,32 @@
+{
+  "version": "3.4.0",
+  "sourceCommit": "679111833eddff982a1323ea80218a8481fce424",
+  "frozenSourceFiles": 779,
+  "archiveEntries": 782,
+  "sourceArchive": {
+    "bytes": 20625059,
+    "sha256": "c357e4f98212dc9abcb362b735c589267770e56e586ce97f89734012c6a9a59b",
+    "file": "RLPlayer-3.4.0-source.zip"
+  },
+  "acceptedPackage": {
+    "bytes": 423950581,
+    "sha256": "a6bc93d637fc7a1f89a1ae50135b1bd0ed062e5c6ff37876e515d7013ef17cf5",
+    "file": "RLPlayer-3.4.0-win64.zip"
+  },
+  "sourcePolicy": "The source snapshot commit reproduces all 782 accepted source ZIP entries byte for byte. This documentation commit changes README.md and adds only the documentation/image paths enumerated here; the remaining 778 frozen files are unchanged.",
+  "readmeOverride": {
+    "path": "README.md",
+    "frozenSHA256": "77e7c9dcff1b0147758389037c17583bf1eb8776cec06bb49958e861b2ac5df2",
+    "publishedSHA256": "3bf2a0f0ccc5e106d75a6737025ab3e0deed89cc955ac42e0ac0eb8979822ad5"
+  },
+  "addedDocumentation": [
+    "docs/release-3.4.0-source.json",
+    "docs/images/homepage/provenance.json",
+    "docs/images/homepage/listening-albums.webp",
+    "docs/images/homepage/listening-room.webp",
+    "docs/images/homepage/pro-console.webp"
+  ],
+  "snapshotMetadataNote": "SOURCE_ARCHIVE_README.txt retains a historical 3.3.18 title, and SOURCE_MANIFEST.json/SOURCE_SHA256SUMS.txt describe the accepted source ZIP before this explicitly listed README documentation override. The actual product version is src/version.h = 3.4.0.",
+  "homepage": "https://rlplayer.rainlain.com/",
+  "sourceArchiveSHA256": "c357e4f98212dc9abcb362b735c589267770e56e586ce97f89734012c6a9a59b"
+}

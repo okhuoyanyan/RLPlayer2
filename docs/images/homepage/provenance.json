@@ -1,0 +1,23 @@
+{
+  "scope": "Existing official homepage UI assets reused without recapture or editing; these are presentation images, not 3.4.0 acceptance screenshots.",
+  "images": [
+    {
+      "file": "listening-albums.webp",
+      "source": "https://rlplayer.rainlain.com/assets/img/v3/listening-albums.webp",
+      "bytes": 192138,
+      "sha256": "07efd98ba5450f48fd48078c89da0c54a1246a9293f32c9553e2a3714e25665c"
+    },
+    {
+      "file": "listening-room.webp",
+      "source": "https://rlplayer.rainlain.com/assets/img/v3/listening-room.webp",
+      "bytes": 90042,
+      "sha256": "d36bd24e12c88634833a31202f5ba46c4f98a2919f2afd9946618311030e2212"
+    },
+    {
+      "file": "pro-console.webp",
+      "source": "https://rlplayer.rainlain.com/assets/img/v3/pro-console.webp",
+      "bytes": 80962,
+      "sha256": "326ae05c1a34f6b4dfb70583c4209e8fe9a265f822a01471b505848d1e5c3efb"
+    }
+  ]
+}

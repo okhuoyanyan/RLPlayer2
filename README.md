@@ -1,196 +1,129 @@
-# RLPlayer 3.3.17
+# RLPlayer 3.4.0
 
-> **免费、开源（GPL-3.0）、面向 Windows 的本地高保真播放器。**
-> 新界面「数字音乐台」把 PCM 滤波、DSD 调制、输出规格、EQ、房间校正和同曲片段对比放进同一页；
-> 每一个滤波器都能看到全频带证书，每一次输出都能追溯到实际参数。
+**免费、开源的 Windows 本地高保真音乐播放器。**
 
-![平台](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
-![协议](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
-![版本](https://img.shields.io/badge/version-3.3.17-green)
+聆听模式把复杂设置收起来，让你专心选音乐；专业模式把输出、升频、滤波、DSD、均衡与实际信号路径放进数字音乐台。两种方式，共用同一套播放引擎。
 
----
+[获取 Windows 正式发布版](https://github.com/okhuoyanyan/RLPlayer2/releases/tag/v3.4.0) · [官方网站](https://rlplayer.rainlain.com/) · [使用说明](https://rlplayer.rainlain.com/manual.html) · [技术细节](https://rlplayer.rainlain.com/features.html) · [实测数据](https://rlplayer.rainlain.com/measurements.html)
 
-## 3.3.17 更新重点
+![Windows 10/11 x64](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D6) ![GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
 
-- **全新数字音乐台**：A–D 四组独立调音，组内保存歌曲、位置、滤波、DSD、EQ、音量与输出设备；切组即切整套声音。
-- **滤波器详情全频带证书**：65,536 点 FFT（32,769 个频点）直接计算阻带/通带，不再只给 512 点插值曲线；面板显示「全频带证书」。
-- **PCM → 原生 DSD**：PCM 源经 SDM 调制后剥掉 DoP 标记，按 ASIO 2.3 原生 1-bit 直送 DAC；xDuoo USB Audio Device 上 DSD64–DSD1024 实机通过。
-- **1.536 MHz PCM**：ZiSan UAC2 / xDuoo 等高码率设备实测 12 档 PCM；1.536M 用 pcm_dump 取证，送给 ASIO 驱动的 2 秒 24-bit 样本与源 WAV 逐字节相同。
-- **CD 音轨**：.cda 拖入、播放、暂停/继续、本地文件与 CD 来回切换已修；MCI 直通不经过 DSP（音量/EQ/升频对 CD 无效）。
-- **播放台 EQ 收口**：原来的「耳机 EQ / 自定义 EQ」两栏合并为一个「加载 EQ」，列出 16 个已保存槽位；选「不载入（关闭均衡）」会真正关闭并清空当前组关联，频段值保留。
-- **设置-输出移除「切到 bit-perfect 直通」按钮**：A–D 的后端/滤波/EQ/音量已全部由数字音乐台统一管理，第二套入口会改坏当前组。
-- **稳定性**：DSD64 原生直通全曲 383.99 秒 ur=0；10 个 6:24 曲目连续 1 小时 ur=0；0 dBFS 4:22 长曲 DSD512/DSD1024 全曲通过。
+## 先听音乐，也能掌控每一环
 
----
+### 聆听模式
 
-## 这是什么
+以专辑、文件夹、歌单和艺术家浏览本地收藏。封面、歌词与音乐资料可以在线补全；温和、均衡、锐利三种听音风格，让首次使用无需逐项理解参数。
 
-一个装在 Windows 上的本地音乐播放器。它不联网听歌，也不做社交，只做一件事：
+![聆听模式的专辑音乐库](docs/images/homepage/listening-albums.webp)
 
-**把你已经收藏在硬盘里的音乐，用尽可能高的保真度放出来，并把「为什么这样放」摊开给你看。**
+*图片直接复用新版官网现有素材，展示聆听模式的音乐库；这是官网界面展示图，不作为 3.4.0 新增功能的验收截图。*
 
-适合：有大量 FLAC / DSD / APE，在意升频算法、抖动整形、房间驻波、耳机频响的人。
-不适合：只用手机听流媒体、只想要一个「能响」的播放器的人。
+![墨绿色聆听室](docs/images/homepage/listening-room.webp)
 
----
+### 专业模式
 
-## 新界面：数字音乐台
+A—D 四组分别保存整套播放配置。不同音乐、耳机和 DAC，可以留下各自的输出、升频、滤波、调制与已保存均衡。
 
-专业模式下的主工作区。四个配置组 **A–D** 各自保存一整套声音：
+![数字音乐台与四组独立配置](docs/images/homepage/pro-console.webp)
 
-| 模块 | 内容 |
+| 能力 | 具体内容 |
 |---|---|
-| **PCM 滤波** | 1x / Nx 独立选择；79 个命名预设；相位、抽头、阻带衰减、过渡带可高级覆盖 |
-| **SDM / DSD** | DSD64–DSD1024；EC / DSD / AHM 调制族；DoP 或 ASIO 原生 1-bit；1x/Nx 滤波 |
-| **输出规格** | PCM 位深、采样率族、DSD 倍率、输出声道；每组可独立指定后端与设备 |
-| **EQ 调音台** | 20 段参数 EQ；16 个保存槽位；OPRA 耳机校准库 6,230 款；保存后才能被播放台加载 |
-| **同曲片段** | 波形拖选、整段平移、循环；播放中拖动跟手试听 |
-| **实际信号路径** | 源 → 处理 → 设备逐节点显示；bit-perfect 结论按本次真实参数给出 |
+| PCM 滤波 | 79 个命名预设，1x / Nx 独立选择，参数详情与频响、群延迟、冲激图 |
+| DSD 路径 | DoP 与 ASIO 原生 1-bit，PCM 转 DSD，最高 DSD1024；可用路径取决于驱动、设备与算力 |
+| 数字音乐台 | A—D 配置组、每组输出后端与设备、实际信号路径、同曲片段对比 |
+| 均衡与校准 | 20 段参数 EQ、16 套保存槽位、OPRA 耳机 EQ、房间校准 |
+| 音频分析 | 波形、音质监控、版本对比与可查阅的测量数据 |
+| 网络播放 | UPnP / DLNA 投放；实际接收格式以接收端能力和状态为准 |
+| GPU | AMD HIP 与 NVIDIA CUDA；无适配设备时回退 CPU |
+| 多语言 | 中文、英文、日文、法文、俄文、西班牙文、阿拉伯文 |
 
-### 滤波器详情
+官网图片均复用现有素材，来源与 SHA256 见 [图片来源清单](docs/images/homepage/provenance.json)。
 
-点击滤波器下拉，右侧浮出与列表同高的详情：
+## 3.4.0 更新
 
-- 通带边缘、阻带起点、过渡带宽、设计衰减、实测阻带、通带最大偏差；
-- 原型抽头、群延迟、峰前/峰后振铃；
-- 幅频（含镜像）、通带放大、群延迟、冲激四张图；
-- **全频带证书**：65,536 点 FFT / 32,769 个频点。
+- **抖动与噪声整形修正**：修复 `shaped` 实际落入无抖动分支的问题，恢复高通 TPDF；已有的 10 个手动名称保留，自动模式按实际输出采样率和有效位深选择。这里没有把已有名称当成新算法。
+- **DAC 有效位深**：PCM 主卡增加独立设置，支持自动或 8—32 bit。它决定实际量化精度，与传输容器的 16 / 24 / 32 bit 分开；不等于声卡模拟端的实测精度。
+- **耳机交叉馈送**：PCM 高级页增加轻度、标准与参数调节，默认关闭。它把左右声道的一部分交叉混合，用于调整耳机的声像体验。
+- **ASIO 精度与曲尾**：修正单位增益的整数舍入、启停与收尾处理、Native DSD 状态，以及探测参数的解析。
+- **响应与界面**：合并重叠状态请求，防止旧搜索、旧艺术家响应覆盖新页面；修复请求正文超时与变更请求丢回复后的自动重发。抖动、DAC 位深与帮助说明直接出现在 PCM 主卡。
 
-这仍然是「该 FIR 的 DTFT 在 32,769 个频点上的精确采样」，不是数学连续统；但 65,536 点 FFT 远大于最大 16,380 抽头，阻带里不可能夹着比 bin 间隔更窄的尖峰而漏测。
+自上一个 GitHub 版本 3.3.11 以来，还包含 PCM 转 ASIO 原生 DSD、滤波器详情、CD 播放/暂停与切换修复、统一加载 EQ，以及六种外语的界面翻译修正。
 
----
+### 验证结果与适用范围
 
-## 格式与输出
+本次正式包对应 **779 个冻结源文件**。最终覆盖 293 项门禁，跳过 0、未解决失败 0；包含首次执行、针对修正的重跑与打包后复核，累计 451 次实际执行。23 项测试仍含部分未覆盖分支。
 
-- **PCM**：WAV / FLAC / ALAC / APE / WV / MP3 / AAC / OGG / OPUS / WMA / AIFF / CAF / MKA
-- **DSD**：DSF / DFF；DSD64–DSD1024
-- **CD**：.cda 音轨（MCI 直通；见下方限制）
-- **镜像**：SACD ISO / DVD-Audio ISO 内部导航；DST 压缩不支持
-- **ASIO 原生 DSD**：ASIOSTDSDInt8MSB1 / LSB1，类型 33；xDuoo 实机 DSD64–1024 全部通过
-- **PCM 高码率**：44.1k–1.536M；DSD512 DoP 载波 1.4112M
-- **GPU**：AMD HIP（25 架构 fat binary，内置运行时）+ NVIDIA CUDA 12.9（19 架构）；无匹配显卡自动回退 CPU
+- ASIO 实际装箱验证：5,473,719 个样本、222 项断言。
+- xDuoo 实机：PCM 1536 kHz 与 Native DSD1024 各使用约 −66 dBFS 的 4 秒素材，驱动格式回读正确、欠载 0、缓冲排空完成。
+- 最终包真实 WebView2 窗口核验了抖动、PCM 主卡和交叉馈送。
+- 自包含包的静态兼容检查、AMD 仅 System32 PATH 实卡运行、包内 FLAC / DSF 离线解码通过；CUDA 完成 19 架构与导出符号检查，本机没有 NVIDIA 实卡。
 
----
+这些数字描述指定条件下的数字处理、驱动与缓冲行为，不代表 DAC 模拟回录、听感评分或与商业播放器专有算法等效。
 
-## 下载与安装
+## 下载与使用
 
-### 系统要求
+系统：**Windows 10 / Windows 11，x64**。GPU 为可选加速；显卡和音频设备仍需各自的厂商驱动。解压后的程序与内置运行时约需 1 GB，缓存和音乐文件另计。
 
-| 项 | 要求 |
-|---|---|
-| 系统 | Windows 10 1809 (x64) 或更新 / Windows 11 |
-| 内存 | 4 GB（大 DSD 库建议 8 GB+） |
-| 硬盘 | 约 400 MB（含内置运行时） |
-| 显卡 | 集显即可；有 AMD/NVIDIA 独显可开启 GPU 加速 |
+1. 从 [3.4.0 发布页](https://github.com/okhuoyanyan/RLPlayer2/releases/tag/v3.4.0) 下载 `RLPlayer-3.4.0-win64.zip`。
+2. 解压到普通、可写目录，例如 `D:\RLPlayer`。
+3. 双击 `RLPlayer.exe`，选择音乐文件夹与输出设备。
+4. 在聆听模式选择一种听音风格，或进入专业模式配置数字音乐台。
 
-### 安装
+正式发布版内置 FFmpeg / ffprobe、AMD HIP 运行时、GPU DLL、WebView2、ASIO 探测与命令行工具，无需另装 ROCm。
 
-**解压即用，不需要安装任何运行库。**
+**已有用户升级前先备份程序目录与配置。** 程序内更新由自有服务器的签名清单决定；GitHub 仅提供手动完整包。本次完整包保留 WebView2 `157.0.4341.46`，没有跟随构建机自动升级运行时。
 
-1. 下载 RLPlayer-3.3.17-win64.zip
-2. 解压到任意目录（**不要放进 Program Files**，那里写入需要管理员权限）
-3. 双击 RLPlayer.exe
-4. 首次启动选择音乐文件夹，等扫描完成
+| 文件 | 字节数 | SHA256 |
+|---|---:|---|
+| `RLPlayer-3.4.0-win64.zip` | 423,950,581 | `a6bc93d637fc7a1f89a1ae50135b1bd0ed062e5c6ff37876e515d7013ef17cf5` |
+| `RLPlayer-3.4.0-source.zip` | 20,625,059 | `c357e4f98212dc9abcb362b735c589267770e56e586ce97f89734012c6a9a59b` |
 
-包内已内置：FFmpeg、AMD HIP 运行时、NVIDIA CUDA 运行时、WebView2 固定版、全部命令行工具。
-**不需要另外装 .NET、VC++ 运行库或 WebView2。**
+正式包与源码 ZIP 均保持已验收字节；发布页提供 `SHA256SUMS.txt`。源码 ZIP 为 779 个源文件加 3 个快照元数据文件。本仓库额外更新 README 与官网图片说明，生产代码与冻结清单逐项一致，见 [发布源码说明](docs/release-3.4.0-source.json)。
 
-### 卸载
+国内访问 GitHub 较慢时，可从 [官网获取下载入口](https://rlplayer.rainlain.com/download.html)。国内完整包分享由管理员维护。
 
-直接删掉整个目录。设置、曲库索引、封面缓存、房间校正集都在程序目录内，不写注册表、不往 AppData 塞东西。
+## 已知边界
 
----
+- **日志收尾延迟仍待定位**：曾观察到 Native 设备关闭后，结束状态仍等待收尾日志约 4.47 秒；Windows 具体慢 I/O 层尚未唯一定位，长曲 STAT 仍同步写日志。本轮以短段实机与 466 项离线收尾判据为回归基线。
+- **硬件证据有范围**：本轮实机为上述两条 4 秒路径；没有新的模拟回录、主观听感、NVIDIA 实卡或所有设备长时稳定性结论。驱动缓冲逐次协商差异也未定位。
+- **高阶整形有使用条件**：手动 NS9 / LNS15 在 PCM 有效位深低于 16 bit 时拒绝启用；高阶整形的超声噪声可能较高。名称相同不代表与 HQPlayer 的未知专有曲线一致。
+- **CD 使用 Windows MCI 直通**：不经过本播放器的 DSP；没有可读 CD-Text 时显示 Track NN。
+- **DSD 与其它能力**：纯 DSD 域异速率转换、实时多电平 AHM、D3D12 / oneAPI 后端，以及部分专用硬件校正尚未实现。
+- **测量不是无限条件证明**：滤波器图表与证书需要结合输入、采样率与频率网格阅读；有限频点不构成连续全频带数学证明。软件侧样本一致也不证明 DAC 内部处理或模拟输出一致。
 
-## 下载渠道
+## 联网与反馈
 
-| 渠道 | 地址 |
-|---|---|
-| GitHub Releases（国外/手动全量） | https://github.com/okhuoyanyan/RLPlayer2/releases |
-| 官方更新服务器（增量） | https://rlplayer.rainlain.com |
-| 百度网盘（国内手动） | 由管理员在发布页更新（提取码见更新清单） |
+本地播放和扫描无需账号。封面、歌词、音乐资料、AI、更新与主动反馈涉及外部服务，可在设置中管理。部分自动补全与预取会在启用对应功能后后台执行。
 
-程序内「设置 → 关于与更新」会走 rlplayer.rainlain.com 的签名增量清单；服务器只提供增量对象，不代理完整包。
-国内网络打不开 GitHub 时，用百度网盘完整包；更新清单里的 cn_url 由管理员维护。
+遇到问题，优先使用程序里的 **意见反馈**：提交前可预览脱敏诊断信息，不上传音乐文件。新反馈进入自有服务，不再自动创建公开 GitHub 工单。
 
----
-
-## 关于数据与隐私
-
-**RLPlayer 不收集任何遥测。**
-
-- 曲库扫描、播放、分析全部在本地完成；
-- 联网只发生在你主动触发的场景：补全标签/封面/歌词、AI 整理资料、检查更新、提交反馈；
-- 所有联网请求都可以在设置里逐个关掉；
-- 提交反馈时诊断包先脱敏（token / 密码 / 路径中的用户名 → ***），不会上传音乐文件；
-- 没有账号系统，不需要注册。
-
----
-
-## 已知限制（3.3.17）
-
-我们把这些写在最显眼的地方，而不是藏进 FAQ：
-
-1. **CD 音轨通过 Windows MCI 播放，不经过 RLPlayer 的 DSP**：音量/EQ/升频/房间校正对 CD 全部无效；这是为了避免 SPTI 抓轨导致 USB 光驱掉线。
-2. **CD 歌曲名**：本机 TEAC 光驱 + 测试碟没有 CD-Text（IOCTL_CDROM_READ_TOC_EX 返回 ERROR_NOT_SUPPORTED），当前回退为 Track 01；带 CD-Text 的碟/光驱还需要接 CDTEXT pack 解析，当前没有真实样本，不能声称已支持真实歌名。
-3. **DSD→DSD 纯 DSD 域异速率转换尚未实现**：DSD64→DSD128 仍解成 PCM 再调制。
-4. **SACD DST 压缩不支持**：只识别并提示转 DSF/DFF，没有 DST 算术解码器。
-5. **D3D12 / oneAPI 通用 GPU 后端尚未实现**：Intel Arc / 核显仍只能 CPU；AMD 走 HIP，NVIDIA 走 CUDA。
-6. **实时多电平 AHM 未开放**：实时 DSD 仍强制 1-bit；多电平只在离线工具格式里。
-7. **0 dB 满幅长曲**：4:22 的 DSD512/DSD1024 全曲已通过；0 dB 连续 1 小时未测。
-8. **1.536M 逐位证明的边界**：已证明「送给 ASIO 驱动的字节与源 WAV 相同」；DAC 内部处理没有数字回环，无法从应用侧观测。
-9. **NVIDIA 实卡**：本机无 NVIDIA 显卡，CUDA 只做 19 架构离线制品校验；运行时行为需有 N 卡的用户复现。
-10. **版本对比对音乐素材上的少量谐波失真不敏感**：合成测试信号正常，音乐素材有盲区，已立项修复。
-
----
-
-## 反馈
-
-| 渠道 | 地址 |
-|---|---|
-| 粉丝和反馈 Q 群 | **895816505** |
-| 问题跟踪 | https://github.com/okhuoyanyan/RLPlayer-feedback/issues |
-| 官方主页 | https://rlplayer.rainlain.com |
-
-程序内也有一键反馈：**设置 → 关于与更新 → 意见反馈**，会自动附带脱敏后的诊断信息。
-
----
+- 官网：[rlplayer.rainlain.com](https://rlplayer.rainlain.com/)
+- 粉丝和反馈 Q 群：**895816505**
+- macOS 独立项目：[BH2VOQ/RLPlayer-Mac](https://github.com/BH2VOQ/RLPlayer-Mac)
 
 ## 开发与构建
 
-源码：https://github.com/okhuoyanyan/RLPlayer2
+这是 Windows 主线；macOS 项目独立维护。构建需要 Windows SDK、MSVC 工具链环境、Clang C++23、CMake、Ninja 与 Python。默认构建不会开启音频设备。
 
-    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-    cmake --build build --parallel
-    ctest --test-dir build --output-on-failure
+下面使用本版验证过的 ROCm Clang 路径；未安装该工具链时，需按实际 Clang 路径调整。命令在源码根目录的 PowerShell 中运行，Python 依赖只安装到当前目录。
 
-- C++20 / CMake / Ninja；Windows 10/11 x64。
-- 离线门禁：tools/run_safe_ctest.ps1；需要完整 FFmpeg 与 Git OpenSSL。
-- 发行包：tools/make_dist.ps1；GPU 制品用 tools/build_gpu.ps1（HIP）与 tools/build_gpu_cuda.ps1（CUDA）重建。
-- 测试与证据：docs/、tests/；每个版本的门禁数字与残余项都写在交付摘要里。
+```powershell
+python -m pip install --target .source-audit-deps -r tools/requirements-audit.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+$auditDeps = (Resolve-Path -LiteralPath '.source-audit-deps').Path
+cmake -G Ninja -S . -B build-source -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="C:/Program Files/AMD/ROCm/7.2/bin/clang++.exe" -DCMAKE_RC_COMPILER="C:/Program Files/AMD/ROCm/7.2/bin/llvm-rc.exe" "-DRTA_CERTIFICATE_PYTHON_PATH=$auditDeps"
+cmake --build build-source --parallel 2
+```
 
----
+测试前阅读 [安全门禁脚本](tools/run_safe_ctest.ps1) 和 [测试清单](tools/safe_test_manifest.json)，准备完整 FFmpeg 夹具生成器、包内精简解码器与独立运行目录。硬件测试单独执行；不要直接在默认听音设备上播放测试音。
+
+自包含出包还需要外部依赖与文档载荷，见 [打包脚本](tools/make_dist.ps1)、[HIP 构建](tools/build_gpu.ps1)、[CUDA 构建](tools/build_gpu_cuda.ps1)。源码快照附带的 `SOURCE_ARCHIVE_README.txt` 首行保留了历史基线名称；本版版本以 `src/version.h`、发布标签和冻结 SHA256 清单为准。
 
 ## 开发与致谢
 
-| 角色 | 成员 |
-|---|---|
-| 项目开发者 | **RainLain**、**猫与小行星** |
-| 协助开发者 | 聆听风暴 |
-| 媒体与美术 | Gosed |
-| 测试鸣谢 | Miyu、正在下载99% |
+项目开发：**RainLain、猫与小行星**。协助开发：聆听风暴。媒体与美术：Gosed。测试鸣谢：Miyu、正在下载99%，以及提交反馈和帮助验证的朋友。
 
-以及所有提交过 issue、帮忙试听、报告过问题的朋友。
+## 许可
 
----
+[GPL-3.0-or-later](LICENSE)。第三方组件各自遵循原许可，见 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) 与 [OPRA-NOTICE.txt](OPRA-NOTICE.txt)。AMD、NVIDIA、Microsoft 等厂商组件不因随包分发而改用本项目许可。
 
-## 协议
-
-**GNU General Public License v3.0 or later**（GPL-3.0-or-later），见 [LICENSE](LICENSE)。
-
-随包分发的第三方组件（FFmpeg / AMD HIP / NVIDIA CUDA / WebView2 / OPRA）各自遵循其原始许可，见 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt)。
-
-AMD HIP 与 NVIDIA CUDA 为厂商专有二进制，按「可分离第三方组件」处理，不在本项目的 GPL 授权范围内。
-
----
-
-*RLPlayer 是一个独立的开源项目，与任何商业播放器厂商无关。*
+RLPlayer 为独立开源项目，与商业播放器厂商无隶属关系。
